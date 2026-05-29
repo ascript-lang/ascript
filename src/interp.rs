@@ -1223,6 +1223,19 @@ mod tests {
         assert_eq!(run(src).await, "10\n2\n{\"a\":1,\"b\":\"hi\"}\n");
     }
 
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_encoding_end_to_end() {
+        let src = "import * as encoding from \"std/encoding\"\n\
+                   print(encoding.base64Encode(\"hi\"))\n\
+                   print(encoding.hexEncode(\"AB\"))\n\
+                   let [raw, e] = encoding.base64Decode(\"aGVsbG8=\")\n\
+                   let [text, e2] = encoding.utf8Decode(raw)\n\
+                   print(text)\n\
+                   print(encoding.urlEncode(\"a b&c\"))";
+        assert_eq!(run(src).await, "aGk=\n4142\nhello\na%20b%26c\n");
+    }
+
     #[tokio::test]
     async fn range_as_general_expression() {
         assert_eq!(run("let r = 0..5\nprint(r)").await, "[0, 1, 2, 3, 4]\n");

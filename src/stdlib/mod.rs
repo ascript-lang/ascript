@@ -8,6 +8,8 @@ pub mod array;
 pub mod bytes;
 pub mod convert;
 #[cfg(feature = "data")]
+pub mod encoding;
+#[cfg(feature = "data")]
 pub mod json;
 pub mod map;
 pub mod math;
@@ -38,6 +40,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/convert" => convert::exports(),
         #[cfg(feature = "data")]
         "std/json" => json::exports(),
+        #[cfg(feature = "data")]
+        "std/encoding" => encoding::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -62,6 +66,8 @@ impl Interp {
             "convert" => convert::call(func, args, span),
             #[cfg(feature = "data")]
             "json" => json::call(func, args, span),
+            #[cfg(feature = "data")]
+            "encoding" => encoding::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
