@@ -463,25 +463,37 @@ impl<'a> Parser<'a> {
 
     fn postfix(&mut self) -> Result<Expr, AsError> {
         let mut expr = self.primary()?;
-        while *self.peek() == Tok::LParen {
-            self.advance();
-            let mut args = Vec::new();
-            if *self.peek() != Tok::RParen {
-                loop {
-                    args.push(self.expr()?);
-                    if *self.peek() == Tok::Comma {
-                        self.advance();
-                    } else {
-                        break;
+        loop {
+            match self.peek() {
+                Tok::LParen => {
+                    self.advance();
+                    let mut args = Vec::new();
+                    if *self.peek() != Tok::RParen {
+                        loop {
+                            args.push(self.expr()?);
+                            if *self.peek() == Tok::Comma {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
                     }
+                    self.eat(&Tok::RParen)?;
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Call { callee: Box::new(expr), args }, span };
                 }
+                Tok::LBracket => {
+                    self.advance();
+                    let index = self.expr()?;
+                    self.eat(&Tok::RBracket)?;
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr {
+                        kind: ExprKind::Index { object: Box::new(expr), index: Box::new(index) },
+                        span,
+                    };
+                }
+                _ => break,
             }
-            self.eat(&Tok::RParen)?;
-            let span = Span::new(expr.span.start, self.prev_end());
-            expr = Expr {
-                kind: ExprKind::Call { callee: Box::new(expr), args },
-                span,
-            };
         }
         Ok(expr)
     }
@@ -500,6 +512,22 @@ impl<'a> Parser<'a> {
                 self.eat(&Tok::RParen)?;
                 return Ok(inner);
             }
+            Tok::LBracket => {
+                let mut items = Vec::new();
+                if *self.peek() != Tok::RBracket {
+                    loop {
+                        items.push(self.expr()?);
+                        if *self.peek() == Tok::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat(&Tok::RBracket)?;
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Array(items), span });
+            }
             other => return Err(AsError::at(format!("unexpected token {:?}", other), tok_span)),
         };
         Ok(Expr { kind, span: tok_span })
@@ -508,7 +536,7 @@ impl<'a> Parser<'a> {
 
 /// Whether an expression can be the target of an assignment.
 fn is_assignable(expr: &Expr) -> bool {
-    matches!(expr.kind, ExprKind::Ident(_))
+    matches!(expr.kind, ExprKind::Ident(_) | ExprKind::Index { .. })
 }
 
 #[cfg(test)]

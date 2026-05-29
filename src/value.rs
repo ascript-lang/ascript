@@ -4,6 +4,7 @@
 
 use crate::ast::Stmt;
 use crate::env::Environment;
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
@@ -25,6 +26,7 @@ pub enum Value {
     Builtin(Rc<str>),
     /// A user-defined function carrying its closure environment.
     Function(Rc<Function>),
+    Array(Rc<RefCell<Vec<Value>>>),
 }
 
 impl Value {
@@ -46,6 +48,7 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             // Functions compare by identity.
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
+            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -62,12 +65,19 @@ impl fmt::Debug for Value {
             Value::Function(func) => {
                 write!(f, "Function({})", func.name.as_deref().unwrap_or("<anonymous>"))
             }
+            Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
         }
     }
 }
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.write_display(f, &mut Vec::new())
+    }
+}
+
+impl Value {
+    fn write_display(&self, f: &mut fmt::Formatter<'_>, seen: &mut Vec<usize>) -> fmt::Result {
         match self {
             Value::Nil => write!(f, "nil"),
             Value::Bool(b) => write!(f, "{}", b),
@@ -79,6 +89,32 @@ impl fmt::Display for Value {
                 Some(n) => write!(f, "<function {}>", n),
                 None => write!(f, "<function>"),
             },
+            Value::Array(a) => {
+                let ptr = Rc::as_ptr(a) as usize;
+                if seen.contains(&ptr) {
+                    return write!(f, "[...]");
+                }
+                seen.push(ptr);
+                write!(f, "[")?;
+                for (i, v) in a.borrow().iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    v.write_element(f, seen)?;
+                }
+                write!(f, "]")?;
+                seen.pop();
+                Ok(())
+            }
+        }
+    }
+
+    /// Like `write_display`, but quotes bare strings (used for nested elements
+    /// so `[1, "two"]` shows the quotes while top-level `print("x")` stays raw).
+    fn write_element(&self, f: &mut fmt::Formatter<'_>, seen: &mut Vec<usize>) -> fmt::Result {
+        match self {
+            Value::Str(s) => write!(f, "{:?}", s),
+            _ => self.write_display(f, seen),
         }
     }
 }
@@ -119,5 +155,18 @@ mod tests {
         assert_ne!(Value::Builtin("print".into()), Value::Builtin("len".into()));
         assert!(Value::Builtin("print".into()).is_truthy());
         assert_eq!(Value::Builtin("print".into()).to_string(), "<builtin print>");
+    }
+
+    #[test]
+    fn arrays_compare_by_identity_and_display() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let a = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0), Value::Str("two".into())])));
+        assert_eq!(a.to_string(), "[1, \"two\"]");
+        // identity: a clone of the SAME Rc is equal; a fresh array is not
+        assert_eq!(a.clone(), a);
+        let b = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])));
+        assert_ne!(a, b);
+        assert!(a.is_truthy());
     }
 }

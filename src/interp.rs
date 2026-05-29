@@ -7,6 +7,8 @@ use crate::error::AsError;
 use crate::span::Span;
 use crate::value::Value;
 use async_recursion::async_recursion;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Non-local control-flow signal produced while executing statements.
 #[derive(Debug)]
@@ -222,6 +224,27 @@ impl Interp {
                     closure: env.clone(),
                 })))
             }
+            ExprKind::Array(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_expr(item, env).await?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(values))))
+            }
+            ExprKind::Index { object, index } => {
+                let obj = self.eval_expr(object, env).await?;
+                let idx = self.eval_expr(index, env).await?;
+                match obj {
+                    Value::Array(arr) => {
+                        let i = array_index(&idx, expr.span)?;
+                        let arr = arr.borrow();
+                        arr.get(i)
+                            .cloned()
+                            .ok_or_else(|| AsError::at(format!("index {} out of bounds (len {})", i, arr.len()), expr.span))
+                    }
+                    _ => Err(AsError::at("cannot index a non-array value", object.span)),
+                }
+            }
         }
     }
 
@@ -282,8 +305,36 @@ impl Interp {
                     target.span,
                 )),
             },
+            ExprKind::Index { object, index } => {
+                let obj = self.eval_expr(object, env).await?;
+                let idx = self.eval_expr(index, env).await?;
+                match obj {
+                    Value::Array(arr) => {
+                        let i = array_index(&idx, target.span)?;
+                        let mut arr = arr.borrow_mut();
+                        if i >= arr.len() {
+                            return Err(AsError::at(
+                                format!("index {} out of bounds (len {})", i, arr.len()),
+                                target.span,
+                            ));
+                        }
+                        arr[i] = value.clone();
+                        Ok(value)
+                    }
+                    _ => Err(AsError::at("cannot index-assign a non-array value", object.span)),
+                }
+            }
             _ => Err(AsError::at("invalid assignment target", target.span)),
         }
+    }
+}
+
+/// Validate that a value is a usable array index (a non-negative integer).
+fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
+    match v {
+        Value::Number(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
+        Value::Number(_) => Err(AsError::at("array index must be a non-negative integer", span)),
+        _ => Err(AsError::at("array index must be a number", span)),
     }
 }
 
@@ -618,5 +669,35 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "pos\n");
+    }
+
+    #[tokio::test]
+    async fn array_literal_and_indexing() {
+        let src = "let a = [10, 20, 30]\nprint(a[0])\nprint(a[2])";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "10\n30\n");
+    }
+
+    #[tokio::test]
+    async fn index_assignment() {
+        let src = "let a = [1, 2, 3]\na[1] = 99\nprint(a[1])\nprint(a)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "99\n[1, 99, 3]\n");
+    }
+
+    #[tokio::test]
+    async fn out_of_bounds_index_errors() {
+        let src = "let a = [1]\nprint(a[5])";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("out of bounds"));
     }
 }

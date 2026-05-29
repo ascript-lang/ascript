@@ -22,6 +22,8 @@ pub enum ExprKind {
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Assign { target: Box<Expr>, value: Box<Expr> },
     Arrow { params: Vec<String>, body: Box<ArrowBody> },
+    Array(Vec<Expr>),
+    Index { object: Box<Expr>, index: Box<Expr> },
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +116,17 @@ impl fmt::Display for ExprKind {
             }
             ExprKind::Assign { target, value } => write!(f, "(= {} {})", target, value),
             ExprKind::Arrow { params, .. } => write!(f, "(arrow [{}])", params.join(" ")),
+            ExprKind::Array(items) => {
+                write!(f, "[")?;
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}", it)?;
+                }
+                write!(f, "]")
+            }
+            ExprKind::Index { object, index } => write!(f, "(index {} {})", object, index),
         }
     }
 }

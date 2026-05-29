@@ -50,6 +50,8 @@ pub enum Tok {
     Continue,
     Fn,
     FatArrow,
+    LBracket,
+    RBracket,
     Eof,
 }
 

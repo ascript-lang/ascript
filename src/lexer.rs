@@ -142,6 +142,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
             ';' => push(&mut tokens, Tok::Semicolon, start, &mut i),
             '{' => push(&mut tokens, Tok::LBrace, start, &mut i),
             '}' => push(&mut tokens, Tok::RBrace, start, &mut i),
+            '[' => push(&mut tokens, Tok::LBracket, start, &mut i),
+            ']' => push(&mut tokens, Tok::RBracket, start, &mut i),
             '"' => {
                 i += 1;
                 let mut s = String::new();
