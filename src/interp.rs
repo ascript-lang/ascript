@@ -87,8 +87,13 @@ impl Interp {
                 self.eval_expr(e, env).await?;
                 Ok(Flow::Normal)
             }
-            Stmt::Let { name, ty: _, value, mutable } => {
+            Stmt::Let { name, ty, value, mutable } => {
                 let v = self.eval_expr(value, env).await?;
+                if let Some(ty) = ty {
+                    if !check_type(&v, ty) {
+                        return Err(contract_panic(ty, &v, value.span));
+                    }
+                }
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
@@ -575,6 +580,49 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
+/// Runtime contract check (spec §5). Eagerly checks parametric types to full depth.
+fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
+    use crate::ast::Type;
+    match ty {
+        Type::Any => true,
+        Type::Number => matches!(value, Value::Number(_)),
+        Type::String => matches!(value, Value::Str(_)),
+        Type::Bool => matches!(value, Value::Bool(_)),
+        Type::Nil => matches!(value, Value::Nil),
+        Type::Object => matches!(value, Value::Object(_)),
+        Type::Fn => matches!(value, Value::Function(_) | Value::Builtin(_)),
+        Type::Error => matches!(value, Value::Object(_) | Value::Nil),
+        Type::Array(elem) => match value {
+            Value::Array(a) => a.borrow().iter().all(|v| check_type(v, elem)),
+            _ => false,
+        },
+        Type::Result(inner) => match value {
+            Value::Array(a) => {
+                let b = a.borrow();
+                b.len() == 2 && check_type(&b[0], inner) && check_type(&b[1], &Type::Error)
+            }
+            _ => false,
+        },
+        Type::Tuple(types) => match value {
+            Value::Array(a) => {
+                let b = a.borrow();
+                b.len() == types.len() && b.iter().zip(types.iter()).all(|(v, t)| check_type(v, t))
+            }
+            _ => false,
+        },
+        Type::Union(a, b) => check_type(value, a) || check_type(value, b),
+    }
+}
+
+/// Build a contract-violation panic.
+fn contract_panic(ty: &crate::ast::Type, value: &Value, span: Span) -> Control {
+    AsError::at(
+        format!("type contract violated: expected {}, got {} ({})", ty, type_name(value), value),
+        span,
+    )
+    .into()
+}
+
 impl Default for Interp {
     fn default() -> Self {
         Self::new()
@@ -603,6 +651,52 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "6\n");
+    }
+
+    #[tokio::test]
+    async fn let_contract_passes_and_fails() {
+        // passes
+        let src = "let x: number = 5\nprint(x)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\n");
+
+        // fails
+        let bad = "let x: number = \"oops\"";
+        let stmts = parse(&lex(bad).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("type contract violated"));
+        assert!(err.message.contains("expected number"));
+    }
+
+    #[tokio::test]
+    async fn parametric_and_union_contracts() {
+        // array<number> with a bad element fails
+        let bad = "let xs: array<number> = [1, \"two\", 3]";
+        let stmts = parse(&lex(bad).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        assert!(interp.exec(&stmts, &env).await.is_err());
+
+        // union passes for either member
+        let ok = "let a: number | nil = nil\nlet b: number | nil = 7\nprint(b)";
+        let stmts = parse(&lex(ok).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "7\n");
+
+        // Result<number>: Ok(5) passes, Ok("x") fails
+        let r = "let r: Result<number> = Ok(5)\nprint(r[0])";
+        let stmts = parse(&lex(r).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\n");
     }
 
     #[tokio::test]
