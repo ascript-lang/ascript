@@ -45,6 +45,22 @@ fn runs_functions_example() {
 }
 
 #[test]
+fn runs_data_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/data.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    // ages 36+41+45 = 122; average 122/3 ≈ 40.66...; oldest is Grace
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("sum of ages: 122"));
+    assert!(out.contains("Grace"));
+}
+
+#[test]
 fn reports_usage_without_args() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin).output().unwrap();
