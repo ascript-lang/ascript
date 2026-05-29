@@ -1,0 +1,16 @@
+[package]
+name = "ascript"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ascript"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ascript"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+async-recursion = "1"
