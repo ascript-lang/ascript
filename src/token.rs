@@ -45,6 +45,9 @@ pub enum Tok {
     DotDot,
     For,
     In,
+    Return,
+    Break,
+    Continue,
     Eof,
 }
 

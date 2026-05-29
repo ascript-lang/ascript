@@ -8,6 +8,15 @@ use crate::span::Span;
 use crate::value::Value;
 use async_recursion::async_recursion;
 
+/// Non-local control-flow signal produced while executing statements.
+#[derive(Debug)]
+pub enum Flow {
+    Normal,
+    Return(Value),
+    Break,
+    Continue,
+}
+
 pub struct Interp {
     /// Captured program output (what `print` writes). Exposed for testing and
     /// flushed to stdout by the CLI.
@@ -20,41 +29,53 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    pub async fn exec(&mut self, program: &[Stmt], env: &Environment) -> Result<(), AsError> {
+    pub async fn exec(&mut self, program: &[Stmt], env: &Environment) -> Result<Flow, AsError> {
         for stmt in program {
-            self.exec_stmt(stmt, env).await?;
+            match self.exec_stmt(stmt, env).await? {
+                Flow::Normal => {}
+                other => return Ok(other),
+            }
         }
-        Ok(())
+        Ok(Flow::Normal)
     }
 
     #[async_recursion(?Send)]
-    async fn exec_stmt(&mut self, stmt: &Stmt, env: &Environment) -> Result<(), AsError> {
+    async fn exec_stmt(&mut self, stmt: &Stmt, env: &Environment) -> Result<Flow, AsError> {
         match stmt {
             Stmt::Expr(e) => {
                 self.eval_expr(e, env).await?;
+                Ok(Flow::Normal)
             }
             Stmt::Let { name, value, mutable } => {
                 let v = self.eval_expr(value, env).await?;
                 env.define(name, v, *mutable).map_err(AsError::new)?;
+                Ok(Flow::Normal)
             }
             Stmt::Block(stmts) => {
                 let child = env.child();
-                self.exec(stmts, &child).await?;
+                self.exec(stmts, &child).await
             }
             Stmt::If { cond, then_branch, else_branch } => {
                 if self.eval_expr(cond, env).await?.is_truthy() {
                     let child = env.child();
-                    self.exec(then_branch, &child).await?;
+                    self.exec(then_branch, &child).await
                 } else if let Some(else_stmts) = else_branch {
                     let child = env.child();
-                    self.exec(else_stmts, &child).await?;
+                    self.exec(else_stmts, &child).await
+                } else {
+                    Ok(Flow::Normal)
                 }
             }
             Stmt::While { cond, body } => {
                 while self.eval_expr(cond, env).await?.is_truthy() {
                     let child = env.child();
-                    self.exec(body, &child).await?;
+                    match self.exec(body, &child).await? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Continue | Flow::Normal => {}
+                    }
                 }
+                Ok(Flow::Normal)
             }
             Stmt::ForRange { var, start, end, body } => {
                 let start_v = self.eval_expr(start, env).await?;
@@ -67,12 +88,25 @@ impl Interp {
                 while i < hi {
                     let child = env.child();
                     child.define(var, Value::Number(i), false).map_err(AsError::new)?;
-                    self.exec(body, &child).await?;
+                    match self.exec(body, &child).await? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Continue | Flow::Normal => {}
+                    }
                     i += 1.0;
                 }
+                Ok(Flow::Normal)
             }
+            Stmt::Return(e) => {
+                let v = match e {
+                    Some(e) => self.eval_expr(e, env).await?,
+                    None => Value::Nil,
+                };
+                Ok(Flow::Return(v))
+            }
+            Stmt::Break => Ok(Flow::Break),
+            Stmt::Continue => Ok(Flow::Continue),
         }
-        Ok(())
     }
 
     #[async_recursion(?Send)]
@@ -392,5 +426,41 @@ mod tests {
         let env = Environment::global();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "0\n1\n2\n");
+    }
+
+    #[tokio::test]
+    async fn break_exits_loop_early() {
+        let src = "let sum = 0\nfor (i in 0..10) { if (i == 5) { break }\nsum += i }\nprint(sum)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "10\n"); // 0+1+2+3+4
+    }
+
+    #[tokio::test]
+    async fn continue_skips_iteration() {
+        let src = "let sum = 0\nfor (i in 0..5) { if (i == 2) { continue }\nsum += i }\nprint(sum)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "8\n"); // 0+1+3+4
+    }
+
+    #[tokio::test]
+    async fn break_in_while() {
+        let src = "let i = 0\nwhile (true) { if (i >= 3) { break }\ni += 1 }\nprint(i)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "3\n");
+    }
+
+    #[tokio::test]
+    async fn break_outside_loop_errors_at_top_level() {
+        let err = crate::run_source("break").await.unwrap_err();
+        assert!(err.message.contains("outside of a loop"));
     }
 }

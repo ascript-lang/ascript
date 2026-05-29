@@ -18,6 +18,10 @@ pub async fn run_source(src: &str) -> Result<String, AsError> {
     let program = parser::parse(&tokens)?;
     let mut interp = Interp::new();
     let env = Environment::global();
-    interp.exec(&program, &env).await?;
+    match interp.exec(&program, &env).await? {
+        crate::interp::Flow::Break => return Err(AsError::new("'break' outside of a loop")),
+        crate::interp::Flow::Continue => return Err(AsError::new("'continue' outside of a loop")),
+        crate::interp::Flow::Normal | crate::interp::Flow::Return(_) => {}
+    }
     Ok(interp.output)
 }

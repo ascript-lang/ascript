@@ -187,6 +187,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "while" => Tok::While,
                     "for" => Tok::For,
                     "in" => Tok::In,
+                    "return" => Tok::Return,
+                    "break" => Tok::Break,
+                    "continue" => Tok::Continue,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });

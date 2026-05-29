@@ -72,7 +72,28 @@ impl<'a> Parser<'a> {
             Tok::If => self.if_stmt(),
             Tok::While => self.while_stmt(),
             Tok::For => self.for_stmt(),
+            Tok::Return => self.return_stmt(),
+            Tok::Break => {
+                self.advance();
+                Ok(Stmt::Break)
+            }
+            Tok::Continue => {
+                self.advance();
+                Ok(Stmt::Continue)
+            }
             _ => Ok(Stmt::Expr(self.expr()?)),
+        }
+    }
+
+    fn return_stmt(&mut self) -> Result<Stmt, AsError> {
+        self.advance(); // consume `return`
+        // No value if the next token cannot begin an expression in this position.
+        match self.peek() {
+            Tok::RBrace | Tok::Eof | Tok::Semicolon => Ok(Stmt::Return(None)),
+            _ => {
+                let value = self.expr()?;
+                Ok(Stmt::Return(Some(value)))
+            }
         }
     }
 
