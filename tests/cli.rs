@@ -61,6 +61,20 @@ fn runs_data_example() {
 }
 
 #[test]
+fn runs_result_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/result.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    // compute(100,5,2): 100/5=20, 20/2=10 -> good[0]=10
+    assert!(out.contains("10\n"));
+    // compute(100,0,2): first ? propagates -> bad[0]=nil, message "division by zero"
+    assert!(out.contains("division by zero"));
+    // recover catches the OOB panic
+    assert!(out.contains("out of bounds"));
+}
+
+#[test]
 fn reports_usage_without_args() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin).output().unwrap();

@@ -19,12 +19,43 @@ pub enum Flow {
     Continue,
 }
 
+/// Non-local exit from expression/statement evaluation.
+#[derive(Debug)]
+pub enum Control {
+    /// An unrecoverable programmer error (spec §6 Tier 2). Aborts unless caught
+    /// by `recover`. Carries the diagnostic.
+    Panic(AsError),
+    /// A `?`-operator early return: the enclosing function should return this
+    /// `[nil, err]` Result pair.
+    Propagate(Value),
+}
+
+impl From<AsError> for Control {
+    fn from(e: AsError) -> Self {
+        Control::Panic(e)
+    }
+}
+
 /// A fresh global environment with the built-in functions installed.
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    env.define("print", Value::Builtin("print".into()), false)
-        .expect("global env starts empty");
+    for name in ["print", "Ok", "Err", "assert", "recover"] {
+        env.define(name, Value::Builtin(name.into()), false)
+            .expect("global env starts empty");
+    }
     env
+}
+
+/// Build a `[value, err]` Result pair.
+fn make_pair(value: Value, err: Value) -> Value {
+    Value::Array(Rc::new(RefCell::new(vec![value, err])))
+}
+
+/// Build an error object `{ message: <msg> }`.
+fn make_error(msg: Value) -> Value {
+    let mut map = indexmap::IndexMap::new();
+    map.insert("message".to_string(), msg);
+    Value::Object(Rc::new(RefCell::new(map)))
 }
 
 pub struct Interp {
@@ -39,7 +70,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    pub async fn exec(&mut self, program: &[Stmt], env: &Environment) -> Result<Flow, AsError> {
+    pub async fn exec(&mut self, program: &[Stmt], env: &Environment) -> Result<Flow, Control> {
         for stmt in program {
             match self.exec_stmt(stmt, env).await? {
                 Flow::Normal => {}
@@ -50,7 +81,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    async fn exec_stmt(&mut self, stmt: &Stmt, env: &Environment) -> Result<Flow, AsError> {
+    async fn exec_stmt(&mut self, stmt: &Stmt, env: &Environment) -> Result<Flow, Control> {
         match stmt {
             Stmt::Expr(e) => {
                 self.eval_expr(e, env).await?;
@@ -92,7 +123,7 @@ impl Interp {
                 let end_v = self.eval_expr(end, env).await?;
                 let (lo, hi) = match (start_v, end_v) {
                     (Value::Number(a), Value::Number(b)) => (a, b),
-                    _ => return Err(AsError::at("for-range bounds must be numbers", start.span)),
+                    _ => return Err(AsError::at("for-range bounds must be numbers", start.span).into()),
                 };
                 let mut i = lo;
                 while i < hi {
@@ -116,7 +147,8 @@ impl Interp {
                         return Err(AsError::at(
                             format!("value of type {} is not iterable", type_name(&other)),
                             iter.span,
-                        ))
+                        )
+                        .into())
                     }
                 };
                 for item in items {
@@ -153,7 +185,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    pub async fn eval_expr(&mut self, expr: &Expr, env: &Environment) -> Result<Value, AsError> {
+    pub async fn eval_expr(&mut self, expr: &Expr, env: &Environment) -> Result<Value, Control> {
         match &expr.kind {
             ExprKind::Number(n) => Ok(Value::Number(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
@@ -161,7 +193,7 @@ impl Interp {
             ExprKind::Nil => Ok(Value::Nil),
             ExprKind::Ident(name) => env
                 .get(name)
-                .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span)),
+                .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span).into()),
             ExprKind::Assign { target, value } => {
                 let v = self.eval_expr(value, env).await?;
                 self.assign_to(target, v, env).await
@@ -171,7 +203,7 @@ impl Interp {
                 match op {
                     UnOp::Neg => match v {
                         Value::Number(n) => Ok(Value::Number(-n)),
-                        _ => Err(AsError::at("cannot negate a non-number", operand.span)),
+                        _ => Err(AsError::at("cannot negate a non-number", operand.span).into()),
                     },
                     UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
                 }
@@ -211,7 +243,7 @@ impl Interp {
 
                 let (a, b) = match (&l, &r) {
                     (Value::Number(a), Value::Number(b)) => (*a, *b),
-                    _ => return Err(AsError::at("operator requires two numbers", expr.span)),
+                    _ => return Err(AsError::at("operator requires two numbers", expr.span).into()),
                 };
                 let result = match op {
                     BinOp::Add => Value::Number(a + b),
@@ -271,6 +303,30 @@ impl Interp {
                 Ok(Value::Str(out.into()))
             }
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
+            ExprKind::Try(inner) => {
+                let v = self.eval_expr(inner, env).await?;
+                // Must be a 2-element Result pair [value, err].
+                let arr = match &v {
+                    Value::Array(a) if a.borrow().len() == 2 => a.clone(),
+                    _ => {
+                        return Err(AsError::at(
+                            "the ? operator requires a Result pair [value, err]",
+                            expr.span,
+                        )
+                        .into())
+                    }
+                };
+                let (value, err) = {
+                    let b = arr.borrow();
+                    (b[0].clone(), b[1].clone())
+                };
+                if err == Value::Nil {
+                    Ok(value)
+                } else {
+                    // Early-return [nil, err] from the enclosing function.
+                    Err(Control::Propagate(make_pair(Value::Nil, err)))
+                }
+            }
             ExprKind::OptMember { .. }
             | ExprKind::Member { .. }
             | ExprKind::Index { .. }
@@ -285,7 +341,7 @@ impl Interp {
     /// `short_circuited == true` means an earlier `?.` link hit nil and the rest
     /// of the chain must yield nil without being accessed/called.
     #[async_recursion(?Send)]
-    async fn eval_chain(&mut self, expr: &Expr, env: &Environment) -> Result<(Value, bool), AsError> {
+    async fn eval_chain(&mut self, expr: &Expr, env: &Environment) -> Result<(Value, bool), Control> {
         match &expr.kind {
             ExprKind::OptMember { object, name } => {
                 let (obj, sc) = self.eval_chain(object, env).await?;
@@ -332,11 +388,7 @@ impl Interp {
                 for a in args {
                     values.push(self.eval_expr(a, env).await?);
                 }
-                let v = match callee_v {
-                    Value::Builtin(name) => self.call_builtin(&name, &values, expr.span),
-                    Value::Function(func) => self.call_function(&func, values, expr.span).await,
-                    _ => Err(AsError::at("value is not callable", callee.span)),
-                };
+                let v = self.call_value(callee_v, values, expr.span).await;
                 Ok((v?, false))
             }
             _ => Ok((self.eval_expr(expr, env).await?, false)),
@@ -352,12 +404,21 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
+    async fn call_value(&mut self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
+        match callee {
+            Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
+            Value::Function(func) => self.call_function(&func, args, span).await,
+            _ => Err(AsError::at("value is not callable", span).into()),
+        }
+    }
+
+    #[async_recursion(?Send)]
     async fn call_function(
         &mut self,
         func: &crate::value::Function,
         args: Vec<Value>,
         span: Span,
-    ) -> Result<Value, AsError> {
+    ) -> Result<Value, Control> {
         if args.len() != func.params.len() {
             return Err(AsError::at(
                 format!(
@@ -367,22 +428,27 @@ impl Interp {
                     args.len()
                 ),
                 span,
-            ));
+            )
+            .into());
         }
         // New scope chained to the closure's captured environment.
         let call_env = func.closure.child();
         for (param, arg) in func.params.iter().zip(args.into_iter()) {
             call_env.define(param, arg, true).map_err(AsError::new)?;
         }
-        match self.exec(&func.body, &call_env).await? {
-            Flow::Return(v) => Ok(v),
-            Flow::Normal => Ok(Value::Nil),
-            Flow::Break => Err(AsError::at("'break' outside of a loop", span)),
-            Flow::Continue => Err(AsError::at("'continue' outside of a loop", span)),
+        match self.exec(&func.body, &call_env).await {
+            Ok(Flow::Return(v)) => Ok(v),
+            Ok(Flow::Normal) => Ok(Value::Nil),
+            Ok(Flow::Break) => Err(AsError::at("'break' outside of a loop", span).into()),
+            Ok(Flow::Continue) => Err(AsError::at("'continue' outside of a loop", span).into()),
+            // A `?` inside the body wants THIS function to return the pair.
+            Err(Control::Propagate(v)) => Ok(v),
+            Err(Control::Panic(e)) => Err(Control::Panic(e)),
         }
     }
 
-    fn call_builtin(&mut self, name: &str, args: &[Value], span: Span) -> Result<Value, AsError> {
+    #[async_recursion(?Send)]
+    async fn call_builtin(&mut self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         match name {
             "print" => {
                 let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect();
@@ -390,23 +456,58 @@ impl Interp {
                 self.output.push('\n');
                 Ok(Value::Nil)
             }
-            other => Err(AsError::at(format!("'{}' is not a function", other), span)),
+            "Ok" => {
+                let value = args.first().cloned().unwrap_or(Value::Nil);
+                Ok(make_pair(value, Value::Nil))
+            }
+            "Err" => {
+                let msg = args.first().cloned().unwrap_or(Value::Nil);
+                Ok(make_pair(Value::Nil, make_error(msg)))
+            }
+            "assert" => {
+                let cond = args.first().cloned().unwrap_or(Value::Nil);
+                if cond.is_truthy() {
+                    Ok(Value::Nil)
+                } else {
+                    let msg = match args.get(1) {
+                        Some(Value::Str(s)) => s.to_string(),
+                        Some(v) => v.to_string(),
+                        None => "assertion failed".to_string(),
+                    };
+                    Err(AsError::at(msg, span).into())
+                }
+            }
+            "recover" => {
+                let callee = args.first().cloned().unwrap_or(Value::Nil);
+                match self.call_value(callee, Vec::new(), span).await {
+                    Ok(v) => Ok(make_pair(v, Value::Nil)),
+                    Err(Control::Panic(e)) => {
+                        Ok(make_pair(Value::Nil, make_error(Value::Str(e.message.into()))))
+                    }
+                    // A `?` propagation inside `fn` is already converted to fn's return
+                    // value by call_function, so this is unreachable in practice; pass it through.
+                    Err(Control::Propagate(v)) => Err(Control::Propagate(v)),
+                }
+            }
+            other => Err(AsError::at(format!("'{}' is not a function", other), span).into()),
         }
     }
 
     #[async_recursion(?Send)]
-    async fn assign_to(&mut self, target: &Expr, value: Value, env: &Environment) -> Result<Value, AsError> {
+    async fn assign_to(&mut self, target: &Expr, value: Value, env: &Environment) -> Result<Value, Control> {
         match &target.kind {
             ExprKind::Ident(name) => match env.assign(name, value.clone()) {
                 Ok(()) => Ok(value),
                 Err(AssignError::Undefined) => Err(AsError::at(
                     format!("cannot assign to undefined variable '{}'", name),
                     target.span,
-                )),
+                )
+                .into()),
                 Err(AssignError::Immutable) => Err(AsError::at(
                     format!("cannot assign to immutable binding '{}'", name),
                     target.span,
-                )),
+                )
+                .into()),
             },
             ExprKind::Index { object, index } => {
                 let obj = self.eval_expr(object, env).await?;
@@ -419,7 +520,8 @@ impl Interp {
                             return Err(AsError::at(
                                 format!("index {} out of bounds (len {})", i, arr.len()),
                                 target.span,
-                            ));
+                            )
+                            .into());
                         }
                         arr[i] = value.clone();
                         Ok(value)
@@ -429,9 +531,9 @@ impl Interp {
                             map.borrow_mut().insert(key.to_string(), value.clone());
                             Ok(value)
                         }
-                        _ => Err(AsError::at("object index must be a string", target.span)),
+                        _ => Err(AsError::at("object index must be a string", target.span).into()),
                     },
-                    _ => Err(AsError::at("cannot index-assign a non-array value", object.span)),
+                    _ => Err(AsError::at("cannot index-assign a non-array value", object.span).into()),
                 }
             }
             ExprKind::Member { object, name } => {
@@ -441,10 +543,10 @@ impl Interp {
                         map.borrow_mut().insert(name.clone(), value.clone());
                         Ok(value)
                     }
-                    _ => Err(AsError::at(format!("cannot set property '{}' on this value", name), object.span)),
+                    _ => Err(AsError::at(format!("cannot set property '{}' on this value", name), object.span).into()),
                 }
             }
-            _ => Err(AsError::at("invalid assignment target", target.span)),
+            _ => Err(AsError::at("invalid assignment target", target.span).into()),
         }
     }
 }
@@ -482,6 +584,117 @@ mod tests {
     use super::*;
     use crate::lexer::lex;
     use crate::parser::parse;
+
+    /// Extract the panic's AsError from a Control (test helper).
+    fn panic_of(c: Control) -> AsError {
+        match c {
+            Control::Panic(e) => e,
+            Control::Propagate(_) => panic!("expected a panic, got a `?` propagation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ok_and_err_construct_result_pairs() {
+        let src = "let r = Ok(5)\nprint(r[0])\nprint(r[1])\nlet e = Err(\"boom\")\nprint(e[0])\nprint(e[1].message)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\nnil\nnil\nboom\n");
+    }
+
+    #[tokio::test]
+    async fn assert_passes_and_panics() {
+        // passing assert returns nil
+        let ok = "assert(1 < 2)\nprint(\"ok\")";
+        let stmts = parse(&lex(ok).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "ok\n");
+
+        // failing assert panics with the message
+        let bad = "assert(false, \"nope\")";
+        let stmts = parse(&lex(bad).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn question_unwraps_ok_and_propagates_err() {
+        // A function that uses `?`: returns the value on Ok, propagates [nil, err] on Err.
+        let src = "
+fn parse(x) {
+  if (x < 0) { return Err(\"negative\") }
+  return Ok(x * 2)
+}
+fn run(x) {
+  let v = parse(x)?
+  return Ok(v + 1)
+}
+let good = run(5)
+print(good[0])
+print(good[1])
+let bad = run(-1)
+print(bad[0])
+print(bad[1].message)
+";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        // run(5): parse->Ok(10), v=10, returns Ok(11) -> [11, nil]
+        // run(-1): parse->Err, ? propagates [nil, {message:"negative"}]
+        assert_eq!(interp.output, "11\nnil\nnil\nnegative\n");
+    }
+
+    #[tokio::test]
+    async fn question_on_non_result_panics() {
+        let src = "let x = 5\nlet y = x?";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("requires a Result pair"));
+    }
+
+    #[tokio::test]
+    async fn recover_catches_a_panic() {
+        // A function that panics (index out of bounds) is recovered into [nil, err].
+        let src = "
+fn boom() {
+  let a = [1]
+  return a[10]
+}
+let r = recover(boom)
+print(r[0])
+print(r[1].message)
+";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        // r[0] is nil; r[1].message carries the panic text (index out of bounds).
+        assert!(interp.output.starts_with("nil\n"));
+        assert!(interp.output.contains("out of bounds"));
+    }
+
+    #[tokio::test]
+    async fn recover_passes_through_success() {
+        let src = "
+fn good() { return 42 }
+let r = recover(good)
+print(r[0])
+print(r[1])
+";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "42\nnil\n");
+    }
 
     async fn eval_to_value(src: &str) -> Value {
         let stmts = parse(&lex(src).unwrap()).unwrap();
@@ -561,7 +774,7 @@ mod tests {
         let stmts = parse(&lex("nope(1)").unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined variable"));
     }
 
@@ -571,7 +784,7 @@ mod tests {
         let stmts = parse(&lex("nope(1)").unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined variable"));
         assert!(err.span.is_some());
 
@@ -579,7 +792,7 @@ mod tests {
         let stmts = parse(&lex("(1)(2)").unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("not callable"));
         assert!(err.span.is_some());
     }
@@ -598,7 +811,7 @@ mod tests {
         let stmts = parse(&lex("print(missing)").unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined variable 'missing'"));
         assert!(err.span.is_some());
     }
@@ -638,7 +851,7 @@ mod tests {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("immutable"));
     }
 
@@ -668,7 +881,7 @@ mod tests {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined variable 'y'"));
     }
 
@@ -781,7 +994,7 @@ mod tests {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("expected 2 argument"));
     }
 
@@ -851,7 +1064,7 @@ mod tests {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("out of bounds"));
     }
 
@@ -881,7 +1094,7 @@ mod tests {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("cannot read property 'foo' of nil"));
     }
 
@@ -935,7 +1148,7 @@ mod tests {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("cannot read property 'c' of nil"));
     }
 
@@ -965,7 +1178,7 @@ mod tests {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
         let env = global_env();
-        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("not iterable"));
     }
 

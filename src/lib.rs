@@ -17,10 +17,13 @@ pub async fn run_source(src: &str) -> Result<String, AsError> {
     let program = parser::parse(&tokens)?;
     let mut interp = Interp::new();
     let env = crate::interp::global_env();
-    match interp.exec(&program, &env).await? {
-        crate::interp::Flow::Break => return Err(AsError::new("'break' outside of a loop")),
-        crate::interp::Flow::Continue => return Err(AsError::new("'continue' outside of a loop")),
-        crate::interp::Flow::Normal | crate::interp::Flow::Return(_) => {}
+    match interp.exec(&program, &env).await {
+        Ok(crate::interp::Flow::Break) => Err(AsError::new("'break' outside of a loop")),
+        Ok(crate::interp::Flow::Continue) => Err(AsError::new("'continue' outside of a loop")),
+        Ok(crate::interp::Flow::Normal) | Ok(crate::interp::Flow::Return(_)) => Ok(interp.output),
+        // A panic aborts the program with its diagnostic.
+        Err(crate::interp::Control::Panic(e)) => Err(e),
+        // A top-level `?` propagation simply ends the program.
+        Err(crate::interp::Control::Propagate(_)) => Ok(interp.output),
     }
-    Ok(interp.output)
 }

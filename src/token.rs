@@ -60,6 +60,7 @@ pub enum Tok {
     TemplateStart(String),  // `...${   — text before the first interpolation
     TemplateMiddle(String), // }...${    — text between interpolations
     TemplateEnd(String),    // }...`     — text after the last interpolation
+    Question,
     Eof,
 }
 
