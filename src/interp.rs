@@ -173,6 +173,15 @@ impl Interp {
         self.resources.get(&id)
     }
 
+    /// Number of live OS resources in the table. Tests use this to prove that
+    /// stream/child resources are reclaimed (no fd accumulation across spawns).
+    /// Only exercised by the `sys` process tests, hence dead under other configs.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
+
     /// Look up the live `rusqlite::Connection` behind a handle id, or `None` if the
     /// handle was closed (`take_resource`'d) — the caller turns that into the
     /// "use after close" panic.

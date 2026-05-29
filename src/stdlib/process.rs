@@ -537,12 +537,24 @@ impl Interp {
             }
             "wait" => {
                 // `wait` consumes the child: take it so the resource is gone afterward.
-                let child = match self.take_resource(id) {
+                let mut child = match self.take_resource(id) {
                     Some(ResourceState::ChildProcess(c)) => c,
                     _ => return Err(use_after_close(span)),
                 };
-                let mut child = child;
-                match child.wait().await {
+                let result = child.wait().await;
+                // After `wait()` reaps the process, finalize its stream resources
+                // (stdin/stdout/stderr, whose ids are stashed in the handle's fields)
+                // so any still-open pipe fds drop. Done AFTER wait so we don't close
+                // the child's stdout/stderr out from under it (which would deliver
+                // SIGPIPE). After `wait()` the streams are gone, so reading a stream
+                // afterward returns nil (drain BEFORE wait — the normal pattern);
+                // a writer used after wait degrades to a use-after-close panic.
+                for name in ["stdin", "stdout", "stderr"] {
+                    if let Some(Value::Native(n)) = m.receiver.fields.get(name) {
+                        self.take_resource(n.id);
+                    }
+                }
+                match result {
                     Ok(status) => {
                         let (code, signal, success) = status_fields(status);
                         Ok(status_object(code, signal, success))
@@ -585,13 +597,19 @@ impl Interp {
                         n as usize
                     }
                 };
+                // A Reader degrades to EOF (nil) once its resource is gone, rather
+                // than panicking: EOF is a reader's natural terminal state.
                 let (reader, capture) = match self.proc_reader_mut(id) {
                     Some(r) => r,
-                    None => return Err(use_after_close(span)),
+                    None => return Ok(Value::Nil),
                 };
                 let mut buf = Vec::new();
                 match reader.read_upto(n, &mut buf).await {
-                    Ok(0) => Ok(Value::Nil), // EOF
+                    Ok(0) => {
+                        // EOF: finalize the reader so its pipe fd is dropped now.
+                        self.take_resource(id);
+                        Ok(Value::Nil)
+                    }
                     Ok(_) => Ok(captured_value(buf, capture)),
                     Err(e) => Err(AsError::at(format!("reader.read failed: {}", e), span).into()),
                 }
@@ -599,11 +617,15 @@ impl Interp {
             "readLine" => {
                 let (reader, capture) = match self.proc_reader_mut(id) {
                     Some(r) => r,
-                    None => return Err(use_after_close(span)),
+                    None => return Ok(Value::Nil), // gone → EOF
                 };
                 let mut buf = Vec::new();
                 match reader.read_line_bytes(&mut buf).await {
-                    Ok(0) => Ok(Value::Nil), // EOF
+                    Ok(0) => {
+                        // EOF: finalize the reader so its pipe fd is dropped now.
+                        self.take_resource(id);
+                        Ok(Value::Nil)
+                    }
                     Ok(_) => {
                         // Strip a single trailing '\n' and an optional preceding '\r'.
                         if buf.last() == Some(&b'\n') {
@@ -620,11 +642,16 @@ impl Interp {
             "readToEnd" => {
                 let (reader, capture) = match self.proc_reader_mut(id) {
                     Some(r) => r,
-                    None => return Err(use_after_close(span)),
+                    None => return Ok(Value::Nil), // gone → EOF
                 };
                 let mut buf = Vec::new();
                 match reader.read_to_end_bytes(&mut buf).await {
-                    Ok(_) => Ok(captured_value(buf, capture)),
+                    Ok(_) => {
+                        // readToEnd consumes the whole stream: finalize the reader so
+                        // its pipe fd is dropped now.
+                        self.take_resource(id);
+                        Ok(captured_value(buf, capture))
+                    }
                     Err(e) => Err(AsError::at(format!("reader.readToEnd failed: {}", e), span).into()),
                 }
             }
@@ -714,6 +741,17 @@ fn use_after_close(span: Span) -> Control {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use crate::interp::Interp;
+
+    /// Lex/parse/exec `src` against a caller-held `Interp` (so the resource table
+    /// can be inspected afterward). Returns the interp for `resource_count()` checks.
+    async fn run_on(interp: &mut Interp, src: &str) {
+        let tokens = crate::lexer::lex(src).expect("lex");
+        let program = crate::parser::parse(&tokens).expect("parse");
+        let env = crate::interp::global_env().child();
+        interp.exec(&program, &env).await.expect("exec");
+    }
+
     /// Run an AScript program and return its captured output.
     async fn run(src: &str) -> String {
         crate::run_source(src).await.expect("program should run")
@@ -888,5 +926,50 @@ print(all)
 await child.wait()
 "#).await;
         assert_eq!(out, "abc\n");
+    }
+
+    #[tokio::test]
+    async fn read_after_wait_returns_nil_not_panic() {
+        // `wait()` finalizes the child's streams; reading a stream afterward must
+        // gracefully return nil (EOF), not panic with use-after-close.
+        let out = run(r#"
+import { spawn } from "std/process"
+let [child, _] = spawn("sh", ["-c", "echo hi"])
+let status = await child.wait()
+print(status.success)
+let after = await child.stdout.readLine()
+print(after)
+"#).await;
+        assert_eq!(out, "true\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn spawn_drain_wait_does_not_accumulate_resources() {
+        // Spawn + fully drain (readToEnd) + wait K children in a loop; afterward the
+        // resource table must return to its baseline (every child + its stdin/stdout/
+        // stderr stream resource reclaimed). Proves no fd accumulation.
+        let mut interp = Interp::new();
+        let baseline = interp.resource_count();
+        run_on(
+            &mut interp,
+            r#"
+import { spawn } from "std/process"
+let i = 0
+while (i < 5) {
+  let [child, _] = spawn("sh", ["-c", "printf 'hello'"])
+  await child.stdin.close()
+  let all = await child.stdout.readToEnd()
+  let drained = await child.stderr.readToEnd()
+  let status = await child.wait()
+  i = i + 1
+}
+"#,
+        )
+        .await;
+        assert_eq!(
+            interp.resource_count(),
+            baseline,
+            "all spawned children + streams should be reclaimed"
+        );
     }
 }
