@@ -2121,6 +2121,21 @@ print(r[1])
     }
 
     #[tokio::test]
+    async fn std_convert_end_to_end() {
+        let src = "import * as convert from \"std/convert\"\n\
+                   let [n, err] = convert.parseNumber(\"42\")\n\
+                   print(n)\n\
+                   print(err)\n\
+                   let [bad, e2] = convert.parseNumber(\"nope\")\n\
+                   print(bad)\n\
+                   print(e2.message)\n\
+                   print(convert.parseInt(\"ff\", 16)[0])\n\
+                   print(convert.toString(123))\n\
+                   print(convert.toBool(0))";
+        assert_eq!(run(src).await, "42\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\ntrue\n");
+    }
+
+    #[tokio::test]
     async fn std_object_end_to_end() {
         let src = "import * as object from \"std/object\"\n\
                    let p = { name: \"Ada\", age: 36 }\n\
