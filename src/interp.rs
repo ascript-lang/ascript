@@ -6,8 +6,11 @@ use crate::env::{AssignError, Environment};
 use crate::error::AsError;
 use crate::span::Span;
 use crate::value::Value;
+use crate::{lexer, parser};
 use async_recursion::async_recursion;
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// The callable parts shared by plain functions and methods: parameter list,
@@ -66,15 +69,67 @@ fn make_error(msg: Value) -> Value {
     Value::Object(Rc::new(RefCell::new(map)))
 }
 
+#[derive(Clone)]
+pub struct ModuleEntry {
+    pub env: Environment,
+    pub exports: Rc<RefCell<HashSet<String>>>,
+}
+
 pub struct Interp {
     /// Captured program output (what `print` writes). Exposed for testing and
     /// flushed to stdout by the CLI.
     pub output: String,
+    modules: HashMap<PathBuf, ModuleEntry>,
+    module_dir: PathBuf,
+    current_exports: Rc<RefCell<HashSet<String>>>,
 }
 
 impl Interp {
     pub fn new() -> Self {
-        Interp { output: String::new() }
+        Interp {
+            output: String::new(),
+            modules: HashMap::new(),
+            module_dir: PathBuf::from("."),
+            current_exports: Rc::new(RefCell::new(HashSet::new())),
+        }
+    }
+
+    /// Load (or fetch from cache) the module at `path`, returning its entry.
+    #[async_recursion(?Send)]
+    pub async fn load_module(&mut self, path: &Path) -> Result<ModuleEntry, Control> {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(entry) = self.modules.get(&canon) {
+            return Ok(entry.clone()); // cached, or in-progress (circular)
+        }
+        let src = std::fs::read_to_string(&canon)
+            .map_err(|e| Control::Panic(AsError::new(format!("cannot read module {}: {}", canon.display(), e))))?;
+        let env = global_env();
+        let exports = Rc::new(RefCell::new(HashSet::new()));
+        let entry = ModuleEntry { env: env.clone(), exports: exports.clone() };
+        // Cache BEFORE executing so circular imports resolve to this entry.
+        self.modules.insert(canon.clone(), entry.clone());
+
+        let dir = canon.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let prev_dir = std::mem::replace(&mut self.module_dir, dir);
+        let prev_exports = std::mem::replace(&mut self.current_exports, exports);
+
+        let tokens = lexer::lex(&src).map_err(Control::Panic)?;
+        let program = parser::parse(&tokens).map_err(Control::Panic)?;
+        let result = self.exec(&program, &env).await;
+
+        self.module_dir = prev_dir;
+        self.current_exports = prev_exports;
+
+        result?; // propagate a panic from the module body
+        Ok(entry)
+    }
+
+    fn resolve_import(&self, source: &str) -> PathBuf {
+        let mut p = self.module_dir.join(source);
+        if p.extension().is_none() {
+            p.set_extension("as");
+        }
+        p
     }
 
     #[async_recursion(?Send)]
@@ -237,6 +292,37 @@ impl Interp {
                     def_env: env.clone(),
                 }));
                 env.define(name, class, false).map_err(AsError::new)?;
+                Ok(Flow::Normal)
+            }
+            Stmt::Export(inner) => {
+                let flow = self.exec_stmt(inner, env).await?;
+                if let Some(name) = exported_name(inner) {
+                    self.current_exports.borrow_mut().insert(name);
+                }
+                Ok(flow)
+            }
+            Stmt::Import { names, source } => {
+                let resolved = self.resolve_import(source);
+                let entry = self.load_module(&resolved).await?;
+                match names {
+                    crate::ast::ImportNames::Named(names) => {
+                        for name in names {
+                            if !entry.exports.borrow().contains(name) {
+                                return Err(AsError::new(format!("module '{}' has no export '{}'", source, name)).into());
+                            }
+                            let v = entry.env.get(name).unwrap_or(Value::Nil);
+                            env.define(name, v, false).map_err(AsError::new)?;
+                        }
+                    }
+                    crate::ast::ImportNames::Namespace(alias) => {
+                        let mut map = indexmap::IndexMap::new();
+                        for name in entry.exports.borrow().iter() {
+                            map.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
+                        }
+                        env.define(alias, Value::Object(Rc::new(RefCell::new(map))), false)
+                            .map_err(AsError::new)?;
+                    }
+                }
                 Ok(Flow::Normal)
             }
         }
@@ -774,6 +860,16 @@ fn type_name(v: &Value) -> &'static str {
         Value::Class(_) => "class",
         Value::Instance(_) => "instance",
         Value::BoundMethod(_) | Value::Super(_) => "function",
+    }
+}
+
+fn exported_name(stmt: &Stmt) -> Option<String> {
+    match stmt {
+        Stmt::Let { name, .. } => Some(name.clone()),
+        Stmt::Fn { name, .. } => Some(name.clone()),
+        Stmt::Class { name, .. } => Some(name.clone()),
+        Stmt::Enum { name, .. } => Some(name.clone()),
+        _ => None,
     }
 }
 

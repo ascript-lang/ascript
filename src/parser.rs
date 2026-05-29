@@ -76,6 +76,8 @@ impl<'a> Parser<'a> {
             Tok::Fn => self.fn_decl(),
             Tok::Enum => self.enum_decl(),
             Tok::Class => self.class_decl(),
+            Tok::Import => self.import_decl(),
+            Tok::Export => self.export_decl(),
             Tok::Break => {
                 self.advance();
                 Ok(Stmt::Break)
@@ -86,6 +88,66 @@ impl<'a> Parser<'a> {
             }
             _ => Ok(Stmt::Expr(self.expr()?)),
         }
+    }
+
+    fn import_decl(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::Import)?;
+        let names = if *self.peek() == Tok::Star {
+            self.advance();
+            // `as`
+            if !matches!(self.peek(), Tok::Ident(s) if s == "as") {
+                return Err(AsError::at("expected 'as' after '*' in import", self.span()));
+            }
+            self.advance();
+            let alias = match self.advance() {
+                Tok::Ident(n) => n,
+                other => return Err(AsError::at(format!("expected namespace alias, found {:?}", other), self.tokens[self.pos - 1].span)),
+            };
+            crate::ast::ImportNames::Namespace(alias)
+        } else {
+            self.eat(&Tok::LBrace)?;
+            let mut names = Vec::new();
+            if *self.peek() != Tok::RBrace {
+                loop {
+                    match self.advance() {
+                        Tok::Ident(n) => names.push(n),
+                        other => return Err(AsError::at(format!("expected import name, found {:?}", other), self.tokens[self.pos - 1].span)),
+                    }
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                        if *self.peek() == Tok::RBrace { break; }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.eat(&Tok::RBrace)?;
+            crate::ast::ImportNames::Named(names)
+        };
+        // `from`
+        if !matches!(self.peek(), Tok::Ident(s) if s == "from") {
+            return Err(AsError::at("expected 'from' in import", self.span()));
+        }
+        self.advance();
+        let source = match self.advance() {
+            Tok::Str(s) => s,
+            other => return Err(AsError::at(format!("expected module path string, found {:?}", other), self.tokens[self.pos - 1].span)),
+        };
+        Ok(Stmt::Import { names, source })
+    }
+
+    fn export_decl(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::Export)?;
+        // Only declarations are exportable.
+        let inner = match self.peek() {
+            Tok::Let => self.let_stmt(true)?,
+            Tok::Const => self.let_stmt(false)?,
+            Tok::Fn => self.fn_decl()?,
+            Tok::Class => self.class_decl()?,
+            Tok::Enum => self.enum_decl()?,
+            other => return Err(AsError::at(format!("only let/const/fn/class/enum can be exported, found {:?}", other), self.span())),
+        };
+        Ok(Stmt::Export(Box::new(inner)))
     }
 
     fn return_stmt(&mut self) -> Result<Stmt, AsError> {

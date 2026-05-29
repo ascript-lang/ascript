@@ -65,6 +65,8 @@ pub enum Tok {
     Enum,
     Match,
     Class,
+    Import,
+    Export,
     Eof,
 }
 

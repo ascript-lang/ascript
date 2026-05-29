@@ -12,15 +12,7 @@ async fn main() -> ExitCode {
     }
 
     let path = &args[2];
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot read {}: {}", path, e);
-            return ExitCode::from(1);
-        }
-    };
-
-    match ascript::run_source(&src).await {
+    match ascript::run_file(std::path::Path::new(path)).await {
         Ok(output) => {
             print!("{}", output);
             ExitCode::SUCCESS
