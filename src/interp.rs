@@ -17,6 +17,14 @@ pub enum Flow {
     Continue,
 }
 
+/// A fresh global environment with the built-in functions installed.
+pub fn global_env() -> Environment {
+    let env = Environment::global();
+    env.define("print", Value::Builtin("print".into()), false)
+        .expect("global env starts empty");
+    env
+}
+
 pub struct Interp {
     /// Captured program output (what `print` writes). Exposed for testing and
     /// flushed to stdout by the CLI.
@@ -191,15 +199,15 @@ impl Interp {
                 Ok(result)
             }
             ExprKind::Call { callee, args } => {
-                let name = match &callee.kind {
-                    ExprKind::Ident(n) => n.clone(),
-                    _ => return Err(AsError::at("expression is not callable", callee.span)),
-                };
+                let callee_v = self.eval_expr(callee, env).await?;
                 let mut values = Vec::new();
                 for a in args {
                     values.push(self.eval_expr(a, env).await?);
                 }
-                self.call_builtin(&name, &values, expr.span)
+                match callee_v {
+                    Value::Builtin(name) => self.call_builtin(&name, &values, expr.span),
+                    _ => Err(AsError::at("value is not callable", callee.span)),
+                }
             }
         }
     }
@@ -226,14 +234,13 @@ impl Default for Interp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::Environment;
     use crate::lexer::lex;
     use crate::parser::parse;
 
     async fn eval_to_value(src: &str) -> Value {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         let (last, rest) = stmts.split_last().expect("at least one statement");
         interp.exec(rest, &env).await.unwrap();
         match last {
@@ -254,7 +261,7 @@ mod tests {
     async fn print_writes_to_the_output_buffer() {
         let stmts = parse(&lex("print(1 + 2 * 3)").unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "7\n");
     }
@@ -282,28 +289,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn calling_a_non_builtin_is_an_error() {
+    async fn calling_an_undefined_name_is_an_error() {
+        // `nope` is not a binding, so resolving the callee fails before the call.
         let stmts = parse(&lex("nope(1)").unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
-        assert!(err.message.contains("is not a function"));
+        assert!(err.message.contains("undefined variable"));
     }
 
     #[tokio::test]
     async fn call_site_errors_carry_a_span() {
-        // Unknown builtin: "is not a function" error must carry the call span.
+        // Undefined callee name: the resolution error must carry a span.
         let stmts = parse(&lex("nope(1)").unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
-        assert!(err.message.contains("is not a function"));
+        assert!(err.message.contains("undefined variable"));
         assert!(err.span.is_some());
 
-        // Non-identifier callee: "not callable" error must carry the callee span.
+        // Non-callable callee value: "not callable" error must carry the callee span.
         let stmts = parse(&lex("(1)(2)").unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("not callable"));
         assert!(err.span.is_some());
@@ -313,7 +321,7 @@ mod tests {
     async fn let_binding_resolves() {
         let stmts = parse(&lex("let x = 5\nprint(x + 1)").unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "6\n");
     }
@@ -322,7 +330,7 @@ mod tests {
     async fn undefined_variable_errors_with_span() {
         let stmts = parse(&lex("print(missing)").unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("undefined variable 'missing'"));
         assert!(err.span.is_some());
@@ -332,7 +340,7 @@ mod tests {
     async fn optional_semicolons_are_accepted() {
         let stmts = parse(&lex("let x = 1; print(x);").unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "1\n");
     }
@@ -342,7 +350,7 @@ mod tests {
         let src = "let x = 1\nx = x + 4\nprint(x)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "5\n");
     }
@@ -352,7 +360,7 @@ mod tests {
         let src = "let x = 10\nx *= 3\nprint(x)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "30\n");
     }
@@ -362,7 +370,7 @@ mod tests {
         let src = "const x = 1\nx = 2";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("immutable"));
     }
@@ -372,7 +380,7 @@ mod tests {
         let src = "let x = 3\nif (x < 5) { print(\"small\") } else { print(\"big\") }";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "small\n");
     }
@@ -382,7 +390,7 @@ mod tests {
         let src = "let x = 7\nif (x < 5) { print(\"a\") } else if (x < 10) { print(\"b\") } else { print(\"c\") }";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "b\n");
     }
@@ -392,7 +400,7 @@ mod tests {
         let src = "{ let y = 1 }\nprint(y)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("undefined variable 'y'"));
     }
@@ -402,7 +410,7 @@ mod tests {
         let src = "let i = 1\nlet sum = 0\nwhile (i <= 5) { sum += i\ni += 1 }\nprint(sum)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "15\n");
     }
@@ -412,7 +420,7 @@ mod tests {
         let src = "let sum = 0\nfor (i in 0..5) { sum += i }\nprint(sum)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         // 0 + 1 + 2 + 3 + 4
         assert_eq!(interp.output, "10\n");
@@ -423,7 +431,7 @@ mod tests {
         let src = "for (i in 0..3) { print(i) }";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "0\n1\n2\n");
     }
@@ -433,7 +441,7 @@ mod tests {
         let src = "let sum = 0\nfor (i in 0..10) { if (i == 5) { break }\nsum += i }\nprint(sum)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "10\n"); // 0+1+2+3+4
     }
@@ -443,7 +451,7 @@ mod tests {
         let src = "let sum = 0\nfor (i in 0..5) { if (i == 2) { continue }\nsum += i }\nprint(sum)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "8\n"); // 0+1+3+4
     }
@@ -453,9 +461,14 @@ mod tests {
         let src = "let i = 0\nwhile (true) { if (i >= 3) { break }\ni += 1 }\nprint(i)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let env = Environment::global();
+        let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "3\n");
+    }
+
+    #[tokio::test]
+    async fn print_is_a_resolvable_builtin_value() {
+        assert_eq!(eval_to_value("print").await, Value::Builtin("print".into()));
     }
 
     #[tokio::test]

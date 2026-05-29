@@ -4,12 +4,14 @@
 use std::fmt;
 use std::rc::Rc;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub enum Value {
     Nil,
     Bool(bool),
     Number(f64),
     Str(Rc<str>),
+    /// A native built-in function, dispatched by name in the interpreter.
+    Builtin(Rc<str>),
 }
 
 impl Value {
@@ -17,6 +19,32 @@ impl Value {
     /// (including `0` and `""`) is truthy.
     pub fn is_truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Str(a), Value::Str(b)) => a == b,
+            // Built-ins are equal iff they name the same function.
+            (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Nil => write!(f, "Nil"),
+            Value::Bool(b) => write!(f, "Bool({})", b),
+            Value::Number(n) => write!(f, "Number({})", n),
+            Value::Str(s) => write!(f, "Str({:?})", s),
+            Value::Builtin(name) => write!(f, "Builtin({:?})", name),
+        }
     }
 }
 
@@ -28,6 +56,7 @@ impl fmt::Display for Value {
             // Rust's f64 Display already prints 7.0 as "7" and 2.5 as "2.5".
             Value::Number(n) => write!(f, "{}", n),
             Value::Str(s) => write!(f, "{}", s),
+            Value::Builtin(name) => write!(f, "<builtin {}>", name),
         }
     }
 }
@@ -60,5 +89,13 @@ mod tests {
         assert_eq!(Value::Str("a".into()), Value::Str("a".into()));
         assert_ne!(Value::Number(1.0), Value::Str("1".into()));
         assert_ne!(Value::Bool(true), Value::Number(1.0));
+    }
+
+    #[test]
+    fn builtins_compare_by_name_and_are_truthy() {
+        assert_eq!(Value::Builtin("print".into()), Value::Builtin("print".into()));
+        assert_ne!(Value::Builtin("print".into()), Value::Builtin("len".into()));
+        assert!(Value::Builtin("print".into()).is_truthy());
+        assert_eq!(Value::Builtin("print".into()).to_string(), "<builtin print>");
     }
 }
