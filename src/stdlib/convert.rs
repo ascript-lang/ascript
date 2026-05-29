@@ -19,6 +19,12 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     let ctx = |f: &str| format!("convert.{}", f);
     match func {
+        // parseNumber/parseInt: bad input is a VALUE, not a bug → recoverable [value, err] pair (Tier-1).
+        // Contrast toNumber below, which coerces-or-panics (Tier-2): a non-coercible argument is a caller error.
+        //
+        // parseNumber parses via Rust `f64::from_str`: scientific notation ("1e3") and the IEEE-754
+        // specials "inf"/"-inf"/"NaN" are accepted as values (matching AScript's deliberate IEEE-754
+        // stance, e.g. `1/0`→inf). Use parseInt for strict integer parsing.
         "parseNumber" => {
             let s = want_string(&arg(args, 0), span, &ctx("parseNumber"))?;
             match s.trim().parse::<f64>() {
@@ -47,6 +53,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             }
         }
         "toString" => Ok(Value::Str(arg(args, 0).to_string().into())),
+        // toNumber: coerce-or-panic (Tier-2). Unlike parseNumber, a string that won't parse PANICS,
+        // because toNumber's contract is "this IS a number-like value" — use parseNumber for untrusted input.
         "toNumber" => {
             let v = arg(args, 0);
             let n = match &v {
@@ -104,5 +112,29 @@ mod tests {
     #[test]
     fn to_number_uncoercible_panics() {
         assert!(matches!(call("toNumber", &[s("xyz")], sp()), Err(Control::Panic(_))));
+    }
+
+    #[test]
+    fn parse_number_scientific_and_special() {
+        let sp = sp();
+        assert_eq!(call("parseNumber", &[s("1e3")], sp).unwrap().to_string(), "[1000, nil]");
+        // inf/NaN are accepted (IEEE-754 stance); confirm they parse to a [value, nil] pair, not Err.
+        let inf = call("parseNumber", &[s("inf")], sp).unwrap();
+        assert!(inf.to_string().starts_with("[inf, nil]") || inf.to_string().starts_with("[inf,"));
+    }
+
+    #[test]
+    fn additional_misuse_and_overflow() {
+        let sp = sp();
+        // toNumber on a non-string, non-coercible value (array) → Tier-2 panic (distinct arm)
+        let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![])));
+        assert!(matches!(call("toNumber", &[arr], sp), Err(Control::Panic(_))));
+        // parseInt overflow → recoverable Err pair (NOT a panic)
+        let over = call("parseInt", &[s("99999999999999999999999999")], sp).unwrap();
+        assert!(over.to_string().starts_with("[nil, {message:"));
+        // parseNumber on a non-string arg → Tier-2 panic (want_string)
+        assert!(matches!(call("parseNumber", &[Value::Number(1.0)], sp), Err(Control::Panic(_))));
+        // toString on a compound value
+        assert_eq!(call("toString", &[Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![Value::Number(1.0), Value::Number(2.0)])))], sp).unwrap().to_string(), "[1, 2]");
     }
 }
