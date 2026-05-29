@@ -811,6 +811,20 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
             _ => false,
         },
         Type::Union(a, b) => check_type(value, a) || check_type(value, b),
+        Type::Named(name) => match value {
+            Value::Instance(inst) => {
+                let mut cur = Some(inst.borrow().class.clone());
+                while let Some(c) = cur {
+                    if &c.name == name {
+                        return true;
+                    }
+                    cur = c.superclass.clone();
+                }
+                false
+            }
+            Value::EnumVariant(v) => &v.enum_name == name,
+            _ => false,
+        },
     }
 }
 
@@ -1671,5 +1685,27 @@ print(r[1])
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined superclass"));
+    }
+
+    #[tokio::test]
+    async fn named_type_contracts() {
+        let src = "class Animal { fn init() { self.ok = true } }\nclass Dog extends Animal {}\nenum Color { Red, Green }\nfn pet(a: Animal): bool { return a.ok }\nlet d: Dog = Dog()\nprint(pet(d))\nlet c: Color = Color.Red\nprint(c.name)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        // Dog is-an Animal (subclass), so pet(d) passes; c: Color accepts a Color variant.
+        assert_eq!(interp.output, "true\nRed\n");
+    }
+
+    #[tokio::test]
+    async fn named_contract_rejects_wrong_type() {
+        let src = "class Animal { fn init() {} }\nclass Plant { fn init() {} }\nfn pet(a: Animal) { return a }\npet(Plant())";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("type contract violated"));
+        assert!(err.message.contains("expected Animal"));
     }
 }

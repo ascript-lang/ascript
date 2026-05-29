@@ -248,10 +248,7 @@ impl<'a> Parser<'a> {
                     "map<K,V> type annotations arrive in Milestone 8",
                     span,
                 )),
-                other => Err(AsError::at(
-                    format!("unknown type '{}' (class/enum types arrive in Milestone 7)", other),
-                    span,
-                )),
+                _ => Ok(Type::Named(name)),
             },
             other => Err(AsError::at(format!("expected a type, found {:?}", other), span)),
         }
