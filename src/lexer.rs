@@ -161,7 +161,20 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 }
             }
             '/' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                if i + 1 < chars.len() && chars[i + 1] == '/' {
+                    // line comment `// ...` to end of line (spec grammar: line_comment)
+                    i += 2;
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                } else if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    // block comment `/* ... */` (spec grammar: block_comment)
+                    i += 2;
+                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token { tok: Tok::SlashEq, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {

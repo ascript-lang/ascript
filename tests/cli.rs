@@ -75,6 +75,18 @@ fn runs_result_example() {
 }
 
 #[test]
+fn runs_typed_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/typed.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("12\n"));            // area(3,4)
+    assert!(out.contains("hello, Ada"));      // greet
+    assert!(out.contains("12\n"));            // total 3+4+5=12
+    assert!(out.contains("type contract violated")); // recovered contract panic
+}
+
+#[test]
 fn reports_usage_without_args() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin).output().unwrap();
