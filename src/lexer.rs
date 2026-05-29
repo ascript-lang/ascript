@@ -311,6 +311,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "continue" => Tok::Continue,
                     "fn" => Tok::Fn,
                     "enum" => Tok::Enum,
+                    "match" => Tok::Match,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });

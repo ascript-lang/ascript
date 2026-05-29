@@ -765,6 +765,38 @@ impl<'a> Parser<'a> {
                 let span = Span::new(tok_span.start, self.prev_end());
                 return Ok(Expr { kind: ExprKind::Template { parts }, span });
             }
+            Tok::Match => {
+                let subject = self.expr()?;
+                self.eat(&Tok::LBrace)?;
+                let mut arms = Vec::new();
+                while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+                    // pattern: `_` (wildcard) or expr ( `|` expr )*
+                    // The identifier `_` lexes as `Tok::Ident("_")`.
+                    let is_wildcard = matches!(self.peek(), Tok::Ident(s) if s == "_");
+                    let patterns = if is_wildcard {
+                        self.advance();
+                        None
+                    } else {
+                        let mut pats = vec![self.expr()?];
+                        while *self.peek() == Tok::Pipe {
+                            self.advance();
+                            pats.push(self.expr()?);
+                        }
+                        Some(pats)
+                    };
+                    self.eat(&Tok::FatArrow)?;
+                    let body = self.expr()?;
+                    arms.push(crate::ast::MatchArm { patterns, body });
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.eat(&Tok::RBrace)?;
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Match { subject: Box::new(subject), arms }, span });
+            }
             other => return Err(AsError::at(format!("unexpected token {:?}", other), tok_span)),
         };
         Ok(Expr { kind, span: tok_span })

@@ -29,6 +29,7 @@ pub enum ExprKind {
     OptMember { object: Box<Expr>, name: String },
     Try(Box<Expr>),
     Template { parts: Vec<TemplatePart> },
+    Match { subject: Box<Expr>, arms: Vec<MatchArm> },
     /// A parenthesized expression, kept distinct (not flattened) so parentheses
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
     /// short-circuiting (spec §4, matching JS).
@@ -113,6 +114,14 @@ pub enum Stmt {
     Continue,
     Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt> },
     Enum { name: String, variants: Vec<EnumVariantDecl> },
+}
+
+#[derive(Clone, Debug)]
+pub struct MatchArm {
+    /// Patterns are value-expressions compared with `==`; `None` patterns list
+    /// means a wildcard `_`. Multiple patterns = an or-pattern.
+    pub patterns: Option<Vec<Expr>>,
+    pub body: Expr,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +228,7 @@ impl fmt::Display for ExprKind {
             ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
             ExprKind::Try(e) => write!(f, "(? {})", e),
             ExprKind::Template { .. } => write!(f, "(template)"),
+            ExprKind::Match { .. } => write!(f, "(match)"),
             ExprKind::Paren(inner) => write!(f, "{}", inner),
         }
     }

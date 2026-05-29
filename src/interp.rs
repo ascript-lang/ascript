@@ -327,6 +327,28 @@ impl Interp {
                 }
                 Ok(Value::Str(out.into()))
             }
+            ExprKind::Match { subject, arms } => {
+                let subj = self.eval_expr(subject, env).await?;
+                for arm in arms {
+                    let matched = match &arm.patterns {
+                        None => true, // wildcard
+                        Some(pats) => {
+                            let mut hit = false;
+                            for p in pats {
+                                if self.eval_expr(p, env).await? == subj {
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            hit
+                        }
+                    };
+                    if matched {
+                        return self.eval_expr(&arm.body, env).await;
+                    }
+                }
+                Err(AsError::at("no matching arm in match expression", expr.span).into())
+            }
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
             ExprKind::Try(inner) => {
                 let v = self.eval_expr(inner, env).await?;
@@ -694,6 +716,36 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "Color.Red\ntrue\nfalse\n404\nOk\n");
+    }
+
+    #[tokio::test]
+    async fn match_on_literals_and_wildcard() {
+        let src = "fn label(n) { return match n { 0 => \"zero\", 1 | 2 => \"small\", _ => \"many\" } }\nprint(label(0))\nprint(label(2))\nprint(label(9))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "zero\nsmall\nmany\n");
+    }
+
+    #[tokio::test]
+    async fn match_on_enum_variants() {
+        let src = "enum Color { Red, Green, Blue }\nfn warm(c) { return match c { Color.Red => true, _ => false } }\nprint(warm(Color.Red))\nprint(warm(Color.Blue))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "true\nfalse\n");
+    }
+
+    #[tokio::test]
+    async fn match_no_arm_panics() {
+        let src = "match 5 { 1 => \"a\" }";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("no matching arm"));
     }
 
     #[tokio::test]
