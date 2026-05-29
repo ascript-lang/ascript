@@ -131,6 +131,9 @@ impl<'a> Parser<'a> {
                 }
                 if *self.peek() == Tok::Comma {
                     self.advance();
+                    if *self.peek() == Tok::RParen {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -486,6 +489,9 @@ impl<'a> Parser<'a> {
                             args.push(self.expr()?);
                             if *self.peek() == Tok::Comma {
                                 self.advance();
+                                if *self.peek() == Tok::RParen {
+                                    break;
+                                }
                             } else {
                                 break;
                             }
@@ -560,6 +566,9 @@ impl<'a> Parser<'a> {
                         items.push(self.expr()?);
                         if *self.peek() == Tok::Comma {
                             self.advance();
+                            if *self.peek() == Tok::RBracket {
+                                break;
+                            }
                         } else {
                             break;
                         }
@@ -588,6 +597,9 @@ impl<'a> Parser<'a> {
                         entries.push((key, value));
                         if *self.peek() == Tok::Comma {
                             self.advance();
+                            if *self.peek() == Tok::RBrace {
+                                break;
+                            }
                         } else {
                             break;
                         }
@@ -650,6 +662,20 @@ mod tests {
             Stmt::Expr(e) => e.to_string(),
             _ => panic!("expected an expression statement"),
         }
+    }
+
+    #[test]
+    fn trailing_commas_are_allowed() {
+        // arrays, calls, objects, and (separately) param lists
+        assert_eq!(sexpr("[1, 2, 3,]"), "[1 2 3]");
+        assert_eq!(sexpr("f(1, 2,)"), "(call f 1 2)");
+        assert_eq!(sexpr("({a: 1, b: 2,}).a"), "(. {a: 1 b: 2} a)");
+        // param lists with a trailing comma must parse
+        assert!(parse(&lex("fn g(a, b,) { return a }").unwrap()).is_ok());
+        // empty literals and non-trailing forms still work
+        assert_eq!(sexpr("[]"), "[]");
+        assert_eq!(sexpr("f()"), "(call f)");
+        assert_eq!(sexpr("[1, 2, 3]"), "[1 2 3]");
     }
 
     #[test]

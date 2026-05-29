@@ -1,7 +1,7 @@
 let people = [
   { name: "Ada", age: 36 },
   { name: "Alan", age: 41 },
-  { name: "Grace", age: 45 }
+  { name: "Grace", age: 45 },
 ]
 
 let total = 0
