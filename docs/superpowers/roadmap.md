@@ -98,8 +98,19 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 
 ## Phase 3 — Standard library: system & async
 
-- ⬜ **M13 — System.** `std/fs` (incl. `grep`), `std/process` (subprocess
-  run/spawn), `std/env`, `std/crypto`, `std/compress`, `std/sqlite`.
+- ✅ **M13 — System.** `std/fs` (read/write/append/stat/mkdir/remove/readDir/walk/path
+  helpers + recursive **`grep`** §11.3), `std/process` (async `run`+`spawn`, §11.4 — non-zero
+  exit≠err, spawn-fail=err, check/timeout/capture/shell/env, child handle with async
+  reader/writer), `std/env`, `std/crypto` (sha256/512/md5/hmac/randomBytes/argon2/bcrypt —
+  vectors cross-checked, constant-time verify), `std/compress` (gzip/deflate/zip), `std/sqlite`
+  (connections/statements/transactions). Introduced the **native resource-handle mechanism**
+  (`Value::Native` + `Value::NativeMethod` + an interp `resources` table; non-Clone OS resources
+  live in the table, the value is a cheap id-handle; `read_member`→method binding→async
+  `call_native_method`) — sqlite + process are its first consumers; **reused by M14** (http
+  streaming/sse/sockets). Resource lifecycle verified leak-free (spawn+drain+wait → table
+  returns to baseline). Features `sys`/`crypto`/`compress`/`sql` (default-on). 346 lib + 19 cli
+  + 2 frontend + 5 module + 2 conformance (374 default; 245 `--no-default`). Merged.
+  Plan: `plans/2026-05-29-ascript-m13-system.md`.
 - ⬜ **M14 — Async I/O.** `std/net/tcp`, `std/net/http` (client),
   `std/http/server`, `std/net/ws`. **Introduces a real awaitable/future `Value` kind**
   so `await` actually suspends (the surface syntax exists since M9; today `await`
@@ -360,7 +371,47 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   cfg-gated registration, `run`/`run_err` test helpers, per-module unit + interp e2e + capstone
   example + holistic review.
 
-## Roadmap status: M1–M12 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10–M12 done).**
+### M14 design guidance (from M13 holistic review — read before planning M14)
+
+- **M14 is the big async I/O milestone + the §11.5 modern HTTP client (the most detailed spec
+  section after §11.4).** Modules: `std/net/tcp`, `std/net/http` (client, §11.5), `std/http/server`
+  (hyper), `std/net/ws` (tokio-tungstenite). Backing: `reqwest` (http client), `hyper` (server),
+  `tokio-tungstenite` (ws), all under a `net` feature; HTTP/3 behind a nested `http3` feature
+  (default-OFF per §11.5 deferrals). SOCKS proxy + response trailers are §11.5-documented
+  best-effort/feature-gated deferrals — carry them forward.
+- **The native resource-handle mechanism (M13) is the foundation — REUSE it.** `Value::Native` +
+  `Value::NativeMethod` + the interp `resources` table + `read_member`→method-binding→
+  `call_native_method` dispatch are in place and proven (sqlite/process). HTTP streaming bodies,
+  the SSE stream's `next()`, and TCP/WS sockets are all new `NativeKind`s with async methods —
+  add variants to `NativeKind` + `ResourceState` and a `call_<module>_method` handler + a cfg arm
+  in `call_native_method`, exactly like process did. **The §11.4 reader idiom IS the §11.5
+  streaming-body idiom — keep `read(n?)`/`readLine()`/`readToEnd()` identical** (the `ProcReader`/
+  resource-finalize-on-EOF patterns transfer directly; remember to finalize stream resources to
+  avoid the fd leak M13 fixed).
+- **M14 introduces a REAL future/awaitable `Value` kind** so `await` actually suspends on a value
+  (today `ExprKind::Await(inner)` in interp.rs is identity — it just evaluates inner; `time.sleep`
+  and `process` suspend *inside the call* via async dispatch, which works for fire-and-await but
+  NOT for "hold a future, await later"). Sockets/http need `await someFuture` to suspend. Decide:
+  (a) keep the "async builtin awaits inline" model where it suffices (simplest — http `get` can
+  await inline like process.run), and (b) add a real awaitable kind only where the spec's API
+  hands back a future the user awaits separately. §11.5's `await get(...)` / `await resp.json()`
+  can all be inline-await (the call itself is async) — so a full future kind may STILL be deferrable
+  if every async API awaits at its own call site. Re-examine §11.5/§7 carefully when planning;
+  the async-dispatch precedent (call_time/call_array/call_process) likely covers http/ws too,
+  with handles (connections/streams) as `Value::Native` and their methods async. Document the
+  decision.
+- **§11.5 is large** — SSE first-class (`http.sse`, not a request flag), streaming request+response
+  bodies, HTTP/1.1+2+3, retries/backoff, redirects+policy, decompression, timeouts, cancellation,
+  TLS config, cookies, multipart, proxy, auth helpers. Plan it as MANY tasks (likely split the http
+  client across several). reqwest bundles most of this — lean on it. `std/http/server` (hyper) and
+  `std/net/ws` are separate sub-areas.
+- **Patterns persist:** shared `want_*`/`ctx`/`make_pair`/`make_error`; Tier-1 for network failures
+  (connect/TLS/timeout/DNS = err; non-2xx = normal resp with `ok=false` unless `errorOnStatus`);
+  Tier-2 for arg-type misuse; cfg-gated registration; dual-config builds; `run`/`run_err` helpers;
+  per-module unit + interp e2e (network tests need a local test server or mocking — consider a
+  `hyper`/`tokio` in-process test server, or gate live-network tests); capstone example; holistic.
+
+## Roadmap status: M1–M13 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10–M13 done).**
 The AScript language (spec §§2–9) + tooling (§10: diagnostics, REPL, fmt, test,
 Tree-sitter conformance) + async/await surface (§7) are fully implemented, unit- and
 example-tested, clippy-clean, and merged to `main`. Remaining: Phase 2+ standard
