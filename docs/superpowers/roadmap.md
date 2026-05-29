@@ -25,9 +25,12 @@ working, tested software on its own.
   `break`/`continue`; arrow functions; callable `Value::Builtin`/`Value::Function`
   with uniform call dispatch; recursion + arity checks. 62 lib + 4 integration
   tests. Merged. Plan: `plans/2026-05-29-ascript-m3-functions.md`.
-- ⬜ **M4 — Data structures.** Arrays `[…]`, objects `{…}`, maps; member access
-  `.`, indexing `[]`, optional chaining `?.`; l-value (member/index) assignment;
-  `for (x of iterable)`; template strings.
+- ✅ **M4 — Data structures.** Arrays `[…]`, objects `{…}` (insertion-ordered),
+  member access `.`, indexing `[]`, optional chaining `?.` (full-chain
+  short-circuit, spec §4), l-value member/index assignment, `for (x of …)` over
+  arrays/strings, template strings, string `+` concat, trailing commas, `Paren`
+  node. 86 lib + 5 integration tests. Merged. (Map kind → M8: no literal syntax.)
+  Plan: `plans/2026-05-29-ascript-m4-data-structures.md`.
 - ⬜ **M5 — Result & error model.** `Ok`/`Err`, the `?` propagation operator,
   Result tier vs panic tier, `recover` boundary (spec §6).
 - ⬜ **M6 — Gradual type contracts.** Annotation grammar; runtime contract checks
@@ -114,3 +117,20 @@ working, tested software on its own.
 - **Watch (not a bug):** `return`/statement boundaries are newline-insensitive
   (optional `;`); revisit newline-significant termination before the surface grows
   much larger (templates, multiline literals).
+
+### M5 design guidance (from M4 holistic review — read before planning M5)
+
+- **Reclassify into Tier-2 panics (spec §6):** out-of-bounds index reads/writes
+  (`interp.rs` `Index` arm + `assign_to`) and member-of-nil (`read_member`) are
+  currently plain `AsError`s; M5 makes them panics. Safe accessors (`?.`, `??`,
+  and a future `arr.get(i)`) stay nil-returning.
+- **`AsError` likely needs a tier/severity** (Error vs Panic) so the `?` operator
+  propagates recoverable Results distinctly from fatal panics; add `recover`
+  boundary for the REPL/test-runner/host.
+- **`Ok`/`Err` + `?`:** `Ok(v)`→`[v,nil]`, `Err(msg)`→`[nil,errObj]`; `?` postfix
+  early-returns `[nil,err]` from the enclosing fn. Lexer `?` arm already reserved.
+- **Known pre-existing (not M4):** very deep nesting (~450 levels of `[`/`(`/`.`/`${`)
+  overflows the native stack (recursive parser+evaluator). A parser depth-guard
+  returning an `AsError` would close it across the board — future hardening.
+- **`(x) = 5`** (parenthesized assignment target) is rejected as "invalid
+  assignment target" (Paren not assignable). Acceptable; revisit only if needed.
