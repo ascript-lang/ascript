@@ -111,10 +111,22 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   returns to baseline). Features `sys`/`crypto`/`compress`/`sql` (default-on). 346 lib + 19 cli
   + 2 frontend + 5 module + 2 conformance (374 default; 245 `--no-default`). Merged.
   Plan: `plans/2026-05-29-ascript-m13-system.md`.
-- ⬜ **M14 — Async I/O.** `std/net/tcp`, `std/net/http` (client),
-  `std/http/server`, `std/net/ws`. **Introduces a real awaitable/future `Value` kind**
-  so `await` actually suspends (the surface syntax exists since M9; today `await`
-  is identity because nothing suspends).
+- ✅ **M14 — Async I/O.** `std/net/tcp` (listener+stream), `std/net/http` (the full §11.5
+  modern client — verbs/headers/query/auth, body json/form/multipart/streamed, timeouts/
+  redirects/retries/decompress/tls/cookies/proxy/httpVersion/errorOnStatus/cancel, streaming
+  response bodies, and first-class `http.sse` SSE with auto-reconnect), `std/http/server`
+  (hand-rolled HTTP/1 over hyper deps, routes/handlers/middleware/params, sequential — handler
+  panic→500 with the loop surviving, header/body limits + read timeout), `std/net/ws`
+  (WebSocket client+server, opts headers/auth). **Design note: NO new future/awaitable kind was
+  needed** — §7 + §11.5 await every async API at its own call site (no hold-a-future /
+  concurrent-spawn primitive), so the existing inline-async-dispatch model (`await` identity;
+  async builtins/NativeMethods await inside their dispatch) already satisfies §7. Network handles
+  are `Value::Native` (M13 mechanism); the §11.4 reader idiom is reused for http streaming bodies.
+  Feature `net` (default-on); `http3` nested (default-off, needs `RUSTFLAGS=--cfg reqwest_unstable`).
+  §11.5 deferrals: HTTP/3 (feature-gated), response trailers (best-effort empty object), SOCKS
+  (shipped via reqwest feature). All tests use in-process `127.0.0.1:0` fixtures (no external
+  network). 426 lib + 20 cli + 2 frontend + 5 module + 2 conformance (455 default; 245
+  `--no-default`). Merged. Plan: `plans/2026-05-29-ascript-m14-async-io.md`.
   **`std/net/http` client must be modern — full spec in §11.5:**
   - **SSE:** first-class `http.sse(url, opts)` (dedicated entry, not a request flag) —
     parses `event:`/`data:`/`id:`/`retry:`, dispatches on blank-line boundaries,
@@ -411,7 +423,37 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   per-module unit + interp e2e (network tests need a local test server or mocking — consider a
   `hyper`/`tokio` in-process test server, or gate live-network tests); capstone example; holistic.
 
-## Roadmap status: M1–M13 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10–M13 done).**
+### M15/M16 design guidance (from M14 holistic review — read before planning M15)
+
+- **M15 — `std/tui`** (`crossterm`/`ratatui`, under a `tui` feature, default-on): raw mode, alt
+  screen, screen buffer, key/mouse events, basic widgets & drawing. Mostly synchronous terminal
+  I/O + an event loop. crossterm's event read is blocking/pollable — model an event source as a
+  `Value::Native` handle with `pollEvent(timeoutMs?)`/`readEvent()` (async via `tokio` or a
+  blocking read on a spawned task — but the interp is single-threaded; crossterm `event::poll`
+  with a timeout on the current thread is simplest). A terminal/screen is a `Value::Native` handle
+  (raw-mode guard, alt-screen enter/leave, draw cells, flush). ratatui for widgets is optional —
+  the spec says "basic widgets & drawing", so a minimal buffer + a few widgets (text/box/list) may
+  suffice; lean on ratatui if it integrates cleanly, else hand-draw via crossterm. TUI tests are
+  hard (no real terminal in CI) — test the buffer/diff logic + event PARSING in isolation; gate
+  any real-terminal test or skip it (document). The resource-handle + cfg-gating + Tier-1/2
+  patterns all transfer.
+- **M16 — `ascript lsp`** (`tower-lsp`, the LAST milestone): `ascript lsp` CLI subcommand running a
+  language server over stdio. Reuse the shared front-end (lexer/parser → the conformance-tested
+  grammar) + the `SourceInfo`/ariadne diagnostics groundwork from M9. Capabilities: diagnostics
+  (lex/parse/runtime-contract errors via the existing `AsError`+`SourceInfo`), hover, completion
+  (keywords + stdlib module/function names — you have the full stdlib registry in
+  `std_module_exports`), goto-definition (within a file/module graph), document symbols. The
+  cross-module deferred-error diagnostics limitation (M9 note: AST spans lack module provenance) is
+  best addressed HERE — thread a module id into spans/`AsError` so multi-file diagnostics point at
+  the right file. tower-lsp + tokio; the LSP is its own binary path (`ascript lsp`), tested via
+  the lsp protocol (send initialize/didOpen/etc. and assert responses) or by unit-testing the
+  analysis functions directly. This completes the spec (§10 tooling + §16) — after M16, EVERYTHING
+  in the spec is implemented.
+- **Patterns that persist:** writing-plans → subagent-driven-development (Opus implementer + independent
+  reviewer per task + holistic) → merge --no-ff; cfg-gated features + dual-config builds; Value::Native
+  for handles; Tier-1/Tier-2; `run`/`run_err` + in-process fixtures; capstone example + conformance.
+
+## Roadmap status: M1–M14 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10–M14 done). Remaining: M15 (tui), M16 (lsp).**
 The AScript language (spec §§2–9) + tooling (§10: diagnostics, REPL, fmt, test,
 Tree-sitter conformance) + async/await surface (§7) are fully implemented, unit- and
 example-tested, clippy-clean, and merged to `main`. Remaining: Phase 2+ standard
