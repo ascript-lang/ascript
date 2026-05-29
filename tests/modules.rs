@@ -29,3 +29,35 @@ fn importing_non_export_errors() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("has no export 'B'"));
 }
+
+#[test]
+fn module_body_runs_once() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let d = temp_dir("once");
+    // side.as prints when loaded; importing it from two places must print once.
+    fs::write(d.join("side.as"), "print(\"loaded\")\nexport const V = 1").unwrap();
+    fs::write(d.join("a.as"), "import { V } from \"./side\"\nexport const A = V").unwrap();
+    fs::write(d.join("main.as"),
+        "import { V } from \"./side\"\nimport { A } from \"./a\"\nprint(V)\nprint(A)").unwrap();
+    let out = std::process::Command::new(bin).arg("run").arg(d.join("main.as")).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // "loaded" appears exactly once despite two import paths to side.as.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "loaded\n1\n1\n");
+}
+
+#[test]
+fn circular_import_resolves_partial() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let d = temp_dir("circular");
+    // a imports b; b imports a. a defines X before importing b, so b can use it.
+    fs::write(d.join("a.as"),
+        "export const X = 10\nimport { Y } from \"./b\"\nexport fn sum() { return X + Y }").unwrap();
+    fs::write(d.join("b.as"),
+        "import { X } from \"./a\"\nexport const Y = X + 5").unwrap();
+    fs::write(d.join("main.as"),
+        "import { sum } from \"./a\"\nprint(sum())").unwrap();
+    let out = std::process::Command::new(bin).arg("run").arg(d.join("main.as")).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // a.X=10 is defined before a imports b; b reads X=10, sets Y=15; a.sum()=25.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "25\n");
+}
