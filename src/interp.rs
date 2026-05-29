@@ -220,6 +220,18 @@ impl Interp {
                     _ => Err(AsError::at("value is not callable", callee.span)),
                 }
             }
+            ExprKind::Arrow { params, body } => {
+                let body_stmts = match body.as_ref() {
+                    crate::ast::ArrowBody::Block(stmts) => stmts.clone(),
+                    crate::ast::ArrowBody::Expr(e) => vec![Stmt::Return(Some((**e).clone()))],
+                };
+                Ok(Value::Function(std::rc::Rc::new(crate::value::Function {
+                    name: None,
+                    params: params.clone(),
+                    body: body_stmts,
+                    closure: env.clone(),
+                })))
+            }
         }
     }
 
@@ -568,5 +580,35 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "nil\n");
+    }
+
+    #[tokio::test]
+    async fn arrow_expression_body() {
+        let src = "let double = x => x * 2\nprint(double(21))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "42\n");
+    }
+
+    #[tokio::test]
+    async fn arrow_multi_param_and_closure() {
+        let src = "let base = 100\nlet f = (a, b) => a + b + base\nprint(f(1, 2))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "103\n");
+    }
+
+    #[tokio::test]
+    async fn arrow_block_body_with_return() {
+        let src = "let f = (n) => { if (n > 0) { return \"pos\" }\nreturn \"nonpos\" }\nprint(f(5))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "pos\n");
     }
 }

@@ -49,6 +49,7 @@ pub enum Tok {
     Break,
     Continue,
     Fn,
+    FatArrow,
     Eof,
 }
 

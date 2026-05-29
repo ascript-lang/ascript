@@ -1,6 +1,6 @@
 //! Recursive-descent / precedence-climbing parser.
 
-use crate::ast::{BinOp, Expr, ExprKind, Stmt, UnOp};
+use crate::ast::{ArrowBody, BinOp, Expr, ExprKind, Stmt, UnOp};
 use crate::error::AsError;
 use crate::span::Span;
 use crate::token::{Tok, Token};
@@ -223,6 +223,12 @@ impl<'a> Parser<'a> {
     }
 
     fn assignment(&mut self) -> Result<Expr, AsError> {
+        // Arrow functions: `x => …` or `(a, b) => …`. Detect without breaking
+        // ordinary parenthesized expressions by checking ahead for `=>`.
+        if let Some(arrow) = self.try_arrow()? {
+            return Ok(arrow);
+        }
+
         let target = self.coalesce()?;
 
         // Map a compound-assignment token to the binary op it desugars to.
@@ -266,6 +272,72 @@ impl<'a> Parser<'a> {
     fn make_binary(left: Expr, op: BinOp, right: Expr) -> Expr {
         let span = Span::new(left.span.start, right.span.end);
         Expr { kind: ExprKind::Binary { op, lhs: Box::new(left), rhs: Box::new(right) }, span }
+    }
+
+    /// Attempt to parse an arrow function at the current position. Returns
+    /// `Ok(None)` (without consuming) if what follows is not an arrow.
+    fn try_arrow(&mut self) -> Result<Option<Expr>, AsError> {
+        let start = self.span().start;
+        // Single-parameter form: `ident => …`
+        if let Tok::Ident(name) = self.peek().clone() {
+            if self.tokens[self.pos + 1].tok == Tok::FatArrow {
+                self.advance(); // ident
+                self.advance(); // =>
+                let body = self.arrow_body()?;
+                let end = self.prev_end();
+                return Ok(Some(Expr {
+                    kind: ExprKind::Arrow { params: vec![name], body: Box::new(body) },
+                    span: Span::new(start, end),
+                }));
+            }
+            return Ok(None);
+        }
+        // Parenthesized form: `( params ) => …`. Scan ahead to find the matching
+        // `)` and check whether `=>` follows; only then commit to arrow parsing.
+        if *self.peek() == Tok::LParen && self.parens_then_arrow() {
+            let params = self.param_list()?;
+            self.eat(&Tok::FatArrow)?;
+            let body = self.arrow_body()?;
+            let end = self.prev_end();
+            return Ok(Some(Expr {
+                kind: ExprKind::Arrow { params, body: Box::new(body) },
+                span: Span::new(start, end),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Look ahead from a `(` to its matching `)` and report whether the next
+    /// token after the `)` is `=>`. Does not consume tokens.
+    fn parens_then_arrow(&self) -> bool {
+        let mut depth = 0usize;
+        let mut i = self.pos;
+        while i < self.tokens.len() {
+            match self.tokens[i].tok {
+                Tok::LParen => depth += 1,
+                Tok::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(i + 1).map(|t| &t.tok),
+                            Some(Tok::FatArrow)
+                        );
+                    }
+                }
+                Tok::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    fn arrow_body(&mut self) -> Result<ArrowBody, AsError> {
+        if *self.peek() == Tok::LBrace {
+            Ok(ArrowBody::Block(self.block()?))
+        } else {
+            Ok(ArrowBody::Expr(Box::new(self.assignment()?)))
+        }
     }
 
     fn coalesce(&mut self) -> Result<Expr, AsError> {
@@ -505,6 +577,21 @@ mod tests {
     #[test]
     fn compound_assignment_desugars() {
         assert_eq!(sexpr("x += 2"), "(= x (+ x 2))");
+    }
+
+    #[test]
+    fn parses_single_param_arrow() {
+        assert_eq!(sexpr("x => x + 1"), "(arrow [x])");
+    }
+
+    #[test]
+    fn parses_multi_param_arrow() {
+        assert_eq!(sexpr("(a, b) => a + b"), "(arrow [a b])");
+    }
+
+    #[test]
+    fn parenthesized_non_arrow_still_works() {
+        assert_eq!(sexpr("(1 + 2) * 3"), "(* (+ 1 2) 3)");
     }
 
     #[test]

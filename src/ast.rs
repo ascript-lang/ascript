@@ -21,6 +21,13 @@ pub enum ExprKind {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Assign { name: String, value: Box<Expr> },
+    Arrow { params: Vec<String>, body: Box<ArrowBody> },
+}
+
+#[derive(Clone, Debug)]
+pub enum ArrowBody {
+    Expr(Box<Expr>),
+    Block(Vec<Stmt>),
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +113,7 @@ impl fmt::Display for ExprKind {
                 write!(f, ")")
             }
             ExprKind::Assign { name, value } => write!(f, "(= {} {})", name, value),
+            ExprKind::Arrow { params, .. } => write!(f, "(arrow [{}])", params.join(" ")),
         }
     }
 }

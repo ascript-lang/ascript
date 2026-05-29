@@ -62,6 +62,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token { tok: Tok::EqEq, span: Span::new(start, start + 2) });
                     i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    tokens.push(Token { tok: Tok::FatArrow, span: Span::new(start, start + 2) });
+                    i += 2;
                 } else {
                     tokens.push(Token { tok: Tok::Eq, span: Span::new(start, start + 1) });
                     i += 1;
@@ -287,6 +290,14 @@ mod tests {
                 Tok::SlashEq, Tok::Ident("e".into()),
                 Tok::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn lexes_fat_arrow() {
+        assert_eq!(
+            kinds("x => x"),
+            vec![Tok::Ident("x".into()), Tok::FatArrow, Tok::Ident("x".into()), Tok::Eof]
         );
     }
 
