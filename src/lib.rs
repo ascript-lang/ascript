@@ -8,7 +8,6 @@ pub mod span;
 pub mod token;
 pub mod value;
 
-use crate::env::Environment;
 use crate::error::AsError;
 use crate::interp::Interp;
 
@@ -17,7 +16,11 @@ pub async fn run_source(src: &str) -> Result<String, AsError> {
     let tokens = lexer::lex(src)?;
     let program = parser::parse(&tokens)?;
     let mut interp = Interp::new();
-    let env = Environment::global();
-    interp.exec(&program, &env).await?;
+    let env = crate::interp::global_env();
+    match interp.exec(&program, &env).await? {
+        crate::interp::Flow::Break => return Err(AsError::new("'break' outside of a loop")),
+        crate::interp::Flow::Continue => return Err(AsError::new("'continue' outside of a loop")),
+        crate::interp::Flow::Normal | crate::interp::Flow::Return(_) => {}
+    }
     Ok(interp.output)
 }

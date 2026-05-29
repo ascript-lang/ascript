@@ -62,6 +62,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token { tok: Tok::EqEq, span: Span::new(start, start + 2) });
                     i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    tokens.push(Token { tok: Tok::FatArrow, span: Span::new(start, start + 2) });
+                    i += 2;
                 } else {
                     tokens.push(Token { tok: Tok::Eq, span: Span::new(start, start + 1) });
                     i += 1;
@@ -107,7 +110,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     i += 2;
                 } else {
                     return Err(AsError::at(
-                        "unexpected character '?' (the ?. and ? operators arrive in Milestone 3)",
+                        "unexpected character '?' (?. arrives in Milestone 4, the ? operator in Milestone 5)",
                         Span::new(start, start + 1),
                     ));
                 }
@@ -127,7 +130,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     i += 2;
                 } else {
                     return Err(AsError::at(
-                        "unexpected character '.' (member access arrives in Milestone 3)",
+                        "unexpected character '.' (member access arrives in Milestone 4)",
                         Span::new(start, start + 1),
                     ));
                 }
@@ -187,6 +190,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "while" => Tok::While,
                     "for" => Tok::For,
                     "in" => Tok::In,
+                    "return" => Tok::Return,
+                    "break" => Tok::Break,
+                    "continue" => Tok::Continue,
+                    "fn" => Tok::Fn,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });
@@ -283,6 +290,14 @@ mod tests {
                 Tok::SlashEq, Tok::Ident("e".into()),
                 Tok::Eof,
             ]
+        );
+    }
+
+    #[test]
+    fn lexes_fat_arrow() {
+        assert_eq!(
+            kinds("x => x"),
+            vec![Tok::Ident("x".into()), Tok::FatArrow, Tok::Ident("x".into()), Tok::Eof]
         );
     }
 

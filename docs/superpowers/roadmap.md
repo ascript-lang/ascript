@@ -20,10 +20,11 @@ working, tested software on its own.
   assignment + compound assignment; optional `;`; blocks; `if/else`; `while`;
   `for (i in a..b)`. 44 lib + 3 integration tests. Merged.
   Plan: `plans/2026-05-29-ascript-phase1-m2-variables-control-flow.md`.
-- ⬜ **M3 — Functions & control-flow completion.** Flow signal
-  (`Normal/Return/Break/Continue`) threaded through `exec`; `fn` declarations +
-  closures (capturing `Environment`) + `return`; `break`/`continue`; generalize
-  call dispatch to a callable `Value::Function`/builtin.
+- ✅ **M3 — Functions & control-flow completion.** Flow signal
+  (`Normal/Return/Break/Continue`); `fn` declarations + closures + `return`;
+  `break`/`continue`; arrow functions; callable `Value::Builtin`/`Value::Function`
+  with uniform call dispatch; recursion + arity checks. 62 lib + 4 integration
+  tests. Merged. Plan: `plans/2026-05-29-ascript-m3-functions.md`.
 - ⬜ **M4 — Data structures.** Arrays `[…]`, objects `{…}`, maps; member access
   `.`, indexing `[]`, optional chaining `?.`; l-value (member/index) assignment;
   `for (x of iterable)`; template strings.
@@ -94,3 +95,22 @@ working, tested software on its own.
   on `in` vs `of` after reading the loop var.
 - Known acceptable edge (not a bug): for-range with non-integer/`inf` bounds follows
   IEEE semantics (`0.5..3.5` steps by 1.0; `0..(1/0)` loops forever).
+
+### M4 design guidance (from M3 holistic review — read before planning M4)
+
+- **Member access slots into `postfix()`** (parser): it currently loops only on
+  `Tok::LParen` (call). Add `.`-member, `[]`-index, and `?.`-optional-chaining as
+  sibling suffix arms. Because `Call` dispatches on an evaluated callee `Value`,
+  method calls (`obj.f()`) compose for free once member access yields the callee.
+- **l-value assignment:** `ExprKind::Assign` takes `name: String`. Member/index
+  targets (`obj.x = …`, `arr[i] = …`) need a structured place; revisit
+  `assignment()` and the `Assign` shape (likely `target: Box<Expr>`).
+- **`for-of`:** add `Stmt::ForOf { var, iter, body }`; `for_stmt` branches on `in`
+  (range) vs `of` (iterable) after reading the loop var.
+- **Equality:** keep `Function` identity-compared (`Rc::ptr_eq`); arrays/objects get
+  structural equality. `Value`'s manual `PartialEq`/`Debug` already anticipate this.
+- **Lexer reservations updated:** lone `.` now points to M4, lone `?` points to
+  M4 (`?.`) / M5 (`?` operator).
+- **Watch (not a bug):** `return`/statement boundaries are newline-insensitive
+  (optional `;`); revisit newline-significant termination before the surface grows
+  much larger (templates, multiline literals).

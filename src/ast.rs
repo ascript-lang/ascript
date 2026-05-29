@@ -21,6 +21,13 @@ pub enum ExprKind {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Assign { name: String, value: Box<Expr> },
+    Arrow { params: Vec<String>, body: Box<ArrowBody> },
+}
+
+#[derive(Clone, Debug)]
+pub enum ArrowBody {
+    Expr(Box<Expr>),
+    Block(Vec<Stmt>),
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +38,10 @@ pub enum Stmt {
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
     ForRange { var: String, start: Expr, end: Expr, body: Vec<Stmt> },
+    Return(Option<Expr>),
+    Break,
+    Continue,
+    Fn { name: String, params: Vec<String>, body: Vec<Stmt> },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -102,6 +113,7 @@ impl fmt::Display for ExprKind {
                 write!(f, ")")
             }
             ExprKind::Assign { name, value } => write!(f, "(= {} {})", name, value),
+            ExprKind::Arrow { params, .. } => write!(f, "(arrow [{}])", params.join(" ")),
         }
     }
 }
