@@ -19,14 +19,126 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
         }
 
         match c {
-            '+' => push(&mut tokens, Tok::Plus, start, &mut i),
-            '-' => push(&mut tokens, Tok::Minus, start, &mut i),
-            '*' => push(&mut tokens, Tok::Star, start, &mut i),
-            '/' => push(&mut tokens, Tok::Slash, start, &mut i),
+            '+' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::PlusEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Plus, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '-' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::MinusEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Minus, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    tokens.push(Token { tok: Tok::StarStar, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::StarEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Star, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '!' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::BangEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Bang, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '=' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::EqEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Eq, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '<' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::Le, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Lt, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '>' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::Ge, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Gt, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '&' => {
+                if i + 1 < chars.len() && chars[i + 1] == '&' {
+                    tokens.push(Token { tok: Tok::AmpAmp, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    return Err(AsError::at("unexpected character '&'", Span::new(start, start + 1)));
+                }
+            }
+            '|' => {
+                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    tokens.push(Token { tok: Tok::PipePipe, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    return Err(AsError::at("unexpected character '|'", Span::new(start, start + 1)));
+                }
+            }
+            '?' => {
+                if i + 1 < chars.len() && chars[i + 1] == '?' {
+                    tokens.push(Token { tok: Tok::QuestionQuestion, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    return Err(AsError::at(
+                        "unexpected character '?' (the ?. and ? operators arrive in Milestone 3)",
+                        Span::new(start, start + 1),
+                    ));
+                }
+            }
+            '/' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::SlashEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Slash, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '.' => {
+                if i + 1 < chars.len() && chars[i + 1] == '.' {
+                    tokens.push(Token { tok: Tok::DotDot, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    return Err(AsError::at(
+                        "unexpected character '.' (member access arrives in Milestone 3)",
+                        Span::new(start, start + 1),
+                    ));
+                }
+            }
             '%' => push(&mut tokens, Tok::Percent, start, &mut i),
             '(' => push(&mut tokens, Tok::LParen, start, &mut i),
             ')' => push(&mut tokens, Tok::RParen, start, &mut i),
             ',' => push(&mut tokens, Tok::Comma, start, &mut i),
+            ';' => push(&mut tokens, Tok::Semicolon, start, &mut i),
+            '{' => push(&mut tokens, Tok::LBrace, start, &mut i),
+            '}' => push(&mut tokens, Tok::RBrace, start, &mut i),
             '"' => {
                 i += 1;
                 let mut s = String::new();
@@ -45,7 +157,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 while j < chars.len() && chars[j].is_ascii_digit() {
                     j += 1;
                 }
-                if j < chars.len() && chars[j] == '.' {
+                if j + 1 < chars.len() && chars[j] == '.' && chars[j + 1].is_ascii_digit() {
                     j += 1;
                     while j < chars.len() && chars[j].is_ascii_digit() {
                         j += 1;
@@ -68,6 +180,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "true" => Tok::True,
                     "false" => Tok::False,
                     "nil" => Tok::Nil,
+                    "let" => Tok::Let,
+                    "const" => Tok::Const,
+                    "if" => Tok::If,
+                    "else" => Tok::Else,
+                    "while" => Tok::While,
+                    "for" => Tok::For,
+                    "in" => Tok::In,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });
@@ -119,6 +238,51 @@ mod tests {
         assert_eq!(
             kinds("\"hi\" true nil"),
             vec![Tok::Str("hi".into()), Tok::True, Tok::Nil, Tok::Eof]
+        );
+    }
+
+    #[test]
+    fn lexes_multi_char_operators() {
+        assert_eq!(
+            kinds("a ** b == c != d <= e >= f && g || h ?? i"),
+            vec![
+                Tok::Ident("a".into()), Tok::StarStar, Tok::Ident("b".into()),
+                Tok::EqEq, Tok::Ident("c".into()),
+                Tok::BangEq, Tok::Ident("d".into()),
+                Tok::Le, Tok::Ident("e".into()),
+                Tok::Ge, Tok::Ident("f".into()),
+                Tok::AmpAmp, Tok::Ident("g".into()),
+                Tok::PipePipe, Tok::Ident("h".into()),
+                Tok::QuestionQuestion, Tok::Ident("i".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_single_char_comparisons_and_bang() {
+        assert_eq!(
+            kinds("!a < b > c"),
+            vec![
+                Tok::Bang, Tok::Ident("a".into()),
+                Tok::Lt, Tok::Ident("b".into()),
+                Tok::Gt, Tok::Ident("c".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_compound_assignment_operators() {
+        assert_eq!(
+            kinds("a += b -= c *= d /= e"),
+            vec![
+                Tok::Ident("a".into()), Tok::PlusEq, Tok::Ident("b".into()),
+                Tok::MinusEq, Tok::Ident("c".into()),
+                Tok::StarEq, Tok::Ident("d".into()),
+                Tok::SlashEq, Tok::Ident("e".into()),
+                Tok::Eof,
+            ]
         );
     }
 

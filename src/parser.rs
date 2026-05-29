@@ -1,6 +1,6 @@
-//! Recursive-descent / precedence-climbing parser for the skeleton subset.
+//! Recursive-descent / precedence-climbing parser.
 
-use crate::ast::{BinOp, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Stmt, UnOp};
 use crate::error::AsError;
 use crate::span::Span;
 use crate::token::{Tok, Token};
@@ -24,6 +24,11 @@ impl<'a> Parser<'a> {
         self.tokens[self.pos].span
     }
 
+    /// End offset of the most recently consumed token.
+    fn prev_end(&self) -> usize {
+        self.tokens[self.pos - 1].span.end
+    }
+
     fn advance(&mut self) -> Tok {
         let t = self.tokens[self.pos].tok.clone();
         self.pos += 1;
@@ -44,14 +49,221 @@ impl<'a> Parser<'a> {
 
     fn program(&mut self) -> Result<Vec<Stmt>, AsError> {
         let mut stmts = Vec::new();
+        self.skip_semicolons();
         while *self.peek() != Tok::Eof {
-            stmts.push(Stmt::Expr(self.expr()?));
+            stmts.push(self.statement()?);
+            self.skip_semicolons();
         }
         Ok(stmts)
     }
 
+    /// `;` is an optional statement separator; consume any run of them.
+    fn skip_semicolons(&mut self) {
+        while *self.peek() == Tok::Semicolon {
+            self.advance();
+        }
+    }
+
+    fn statement(&mut self) -> Result<Stmt, AsError> {
+        match self.peek() {
+            Tok::Let => self.let_stmt(true),
+            Tok::Const => self.let_stmt(false),
+            Tok::LBrace => Ok(Stmt::Block(self.block()?)),
+            Tok::If => self.if_stmt(),
+            Tok::While => self.while_stmt(),
+            Tok::For => self.for_stmt(),
+            _ => Ok(Stmt::Expr(self.expr()?)),
+        }
+    }
+
+    /// Parse `{ stmt* }` (with optional `;` separators) and return the inner statements.
+    fn block(&mut self) -> Result<Vec<Stmt>, AsError> {
+        self.eat(&Tok::LBrace)?;
+        let mut stmts = Vec::new();
+        self.skip_semicolons();
+        while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            stmts.push(self.statement()?);
+            self.skip_semicolons();
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(stmts)
+    }
+
+    fn if_stmt(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::If)?;
+        self.eat(&Tok::LParen)?;
+        let cond = self.expr()?;
+        self.eat(&Tok::RParen)?;
+        let then_branch = self.block()?;
+        let else_branch = if *self.peek() == Tok::Else {
+            self.advance();
+            if *self.peek() == Tok::If {
+                Some(vec![self.if_stmt()?]) // `else if`
+            } else {
+                Some(self.block()?)
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If { cond, then_branch, else_branch })
+    }
+
+    fn while_stmt(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::While)?;
+        self.eat(&Tok::LParen)?;
+        let cond = self.expr()?;
+        self.eat(&Tok::RParen)?;
+        let body = self.block()?;
+        Ok(Stmt::While { cond, body })
+    }
+
+    fn for_stmt(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::For)?;
+        self.eat(&Tok::LParen)?;
+        let var = match self.advance() {
+            Tok::Ident(name) => name,
+            other => {
+                return Err(AsError::at(
+                    format!("expected a loop variable name, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
+        };
+        self.eat(&Tok::In)?;
+        let start = self.expr()?;
+        self.eat(&Tok::DotDot)?;
+        let end = self.expr()?;
+        self.eat(&Tok::RParen)?;
+        let body = self.block()?;
+        Ok(Stmt::ForRange { var, start, end, body })
+    }
+
+    fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
+        self.advance(); // consume `let` / `const`
+        let name = match self.advance() {
+            Tok::Ident(name) => name,
+            other => {
+                return Err(AsError::at(
+                    format!("expected a variable name, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
+        };
+        self.eat(&Tok::Eq)?;
+        let value = self.expr()?;
+        Ok(Stmt::Let { name, value, mutable })
+    }
+
     fn expr(&mut self) -> Result<Expr, AsError> {
-        self.additive()
+        self.assignment()
+    }
+
+    fn assignment(&mut self) -> Result<Expr, AsError> {
+        let target = self.coalesce()?;
+
+        // Map a compound-assignment token to the binary op it desugars to.
+        let compound = match self.peek() {
+            Tok::Eq => None,
+            Tok::PlusEq => Some(BinOp::Add),
+            Tok::MinusEq => Some(BinOp::Sub),
+            Tok::StarEq => Some(BinOp::Mul),
+            Tok::SlashEq => Some(BinOp::Div),
+            _ => return Ok(target),
+        };
+        self.advance(); // consume the assignment operator
+        let value = self.assignment()?; // right-associative
+
+        let name = match &target.kind {
+            ExprKind::Ident(name) => name.clone(),
+            _ => return Err(AsError::at("invalid assignment target", target.span)),
+        };
+
+        // For `x += e`, desugar the value to `x + e` (a fresh Binary over the
+        // target identifier and the rhs), preserving spans for diagnostics.
+        let span = Span::new(target.span.start, value.span.end);
+        let value = match compound {
+            None => value,
+            Some(op) => {
+                let target_ident = Expr {
+                    kind: ExprKind::Ident(name.clone()),
+                    span: target.span,
+                };
+                Self::make_binary(target_ident, op, value)
+            }
+        };
+
+        Ok(Expr {
+            kind: ExprKind::Assign { name, value: Box::new(value) },
+            span,
+        })
+    }
+
+    /// Build a left-associative binary node from an already-parsed left side.
+    fn make_binary(left: Expr, op: BinOp, right: Expr) -> Expr {
+        let span = Span::new(left.span.start, right.span.end);
+        Expr { kind: ExprKind::Binary { op, lhs: Box::new(left), rhs: Box::new(right) }, span }
+    }
+
+    fn coalesce(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.logic_or()?;
+        while *self.peek() == Tok::QuestionQuestion {
+            self.advance();
+            let right = self.logic_or()?;
+            left = Self::make_binary(left, BinOp::Coalesce, right);
+        }
+        Ok(left)
+    }
+
+    fn logic_or(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.logic_and()?;
+        while *self.peek() == Tok::PipePipe {
+            self.advance();
+            let right = self.logic_and()?;
+            left = Self::make_binary(left, BinOp::Or, right);
+        }
+        Ok(left)
+    }
+
+    fn logic_and(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.equality()?;
+        while *self.peek() == Tok::AmpAmp {
+            self.advance();
+            let right = self.equality()?;
+            left = Self::make_binary(left, BinOp::And, right);
+        }
+        Ok(left)
+    }
+
+    fn equality(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.comparison()?;
+        loop {
+            let op = match self.peek() {
+                Tok::EqEq => BinOp::Eq,
+                Tok::BangEq => BinOp::Ne,
+                _ => break,
+            };
+            self.advance();
+            let right = self.comparison()?;
+            left = Self::make_binary(left, op, right);
+        }
+        Ok(left)
+    }
+
+    fn comparison(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.additive()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Lt => BinOp::Lt,
+                Tok::Le => BinOp::Le,
+                Tok::Gt => BinOp::Gt,
+                Tok::Ge => BinOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let right = self.additive()?;
+            left = Self::make_binary(left, op, right);
+        }
+        Ok(left)
     }
 
     fn additive(&mut self) -> Result<Expr, AsError> {
@@ -64,13 +276,13 @@ impl<'a> Parser<'a> {
             };
             self.advance();
             let right = self.multiplicative()?;
-            left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right) };
+            left = Self::make_binary(left, op, right);
         }
         Ok(left)
     }
 
     fn multiplicative(&mut self) -> Result<Expr, AsError> {
-        let mut left = self.unary()?;
+        let mut left = self.exponent()?;
         loop {
             let op = match self.peek() {
                 Tok::Star => BinOp::Mul,
@@ -79,17 +291,39 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.advance();
-            let right = self.unary()?;
-            left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right) };
+            let right = self.exponent()?;
+            left = Self::make_binary(left, op, right);
         }
         Ok(left)
     }
 
-    fn unary(&mut self) -> Result<Expr, AsError> {
-        if *self.peek() == Tok::Minus {
+    fn exponent(&mut self) -> Result<Expr, AsError> {
+        let base = self.unary()?;
+        if *self.peek() == Tok::StarStar {
             self.advance();
-            let expr = self.unary()?;
-            return Ok(Expr::Unary { op: UnOp::Neg, expr: Box::new(expr) });
+            // right-associative: 2 ** 3 ** 2 == 2 ** (3 ** 2)
+            let exp = self.exponent()?;
+            Ok(Self::make_binary(base, BinOp::Pow, exp))
+        } else {
+            Ok(base)
+        }
+    }
+
+    fn unary(&mut self) -> Result<Expr, AsError> {
+        let start = self.span().start;
+        let op = match self.peek() {
+            Tok::Minus => Some(UnOp::Neg),
+            Tok::Bang => Some(UnOp::Not),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.advance();
+            let operand = self.unary()?;
+            let span = Span::new(start, operand.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Unary { op, expr: Box::new(operand) },
+                span,
+            });
         }
         self.postfix()
     }
@@ -110,27 +344,32 @@ impl<'a> Parser<'a> {
                 }
             }
             self.eat(&Tok::RParen)?;
-            expr = Expr::Call { callee: Box::new(expr), args };
+            let span = Span::new(expr.span.start, self.prev_end());
+            expr = Expr {
+                kind: ExprKind::Call { callee: Box::new(expr), args },
+                span,
+            };
         }
         Ok(expr)
     }
 
     fn primary(&mut self) -> Result<Expr, AsError> {
-        let span = self.span();
-        match self.advance() {
-            Tok::Number(n) => Ok(Expr::Number(n)),
-            Tok::Str(s) => Ok(Expr::Str(s)),
-            Tok::True => Ok(Expr::Bool(true)),
-            Tok::False => Ok(Expr::Bool(false)),
-            Tok::Nil => Ok(Expr::Nil),
-            Tok::Ident(name) => Ok(Expr::Ident(name)),
+        let tok_span = self.span();
+        let kind = match self.advance() {
+            Tok::Number(n) => ExprKind::Number(n),
+            Tok::Str(s) => ExprKind::Str(s),
+            Tok::True => ExprKind::Bool(true),
+            Tok::False => ExprKind::Bool(false),
+            Tok::Nil => ExprKind::Nil,
+            Tok::Ident(name) => ExprKind::Ident(name),
             Tok::LParen => {
                 let inner = self.expr()?;
                 self.eat(&Tok::RParen)?;
-                Ok(inner)
+                return Ok(inner);
             }
-            other => Err(AsError::at(format!("unexpected token {:?}", other), span)),
-        }
+            other => return Err(AsError::at(format!("unexpected token {:?}", other), tok_span)),
+        };
+        Ok(Expr { kind, span: tok_span })
     }
 }
 
@@ -144,6 +383,7 @@ mod tests {
         let stmts = parse(&tokens).unwrap();
         match &stmts[0] {
             Stmt::Expr(e) => e.to_string(),
+            _ => panic!("expected an expression statement"),
         }
     }
 
@@ -160,5 +400,56 @@ mod tests {
     #[test]
     fn parses_a_call() {
         assert_eq!(sexpr("print(\"hi\")"), "(call print \"hi\")");
+    }
+
+    #[test]
+    fn comparison_binds_looser_than_arithmetic() {
+        assert_eq!(sexpr("1 + 2 < 3"), "(< (+ 1 2) 3)");
+    }
+
+    #[test]
+    fn logical_and_binds_tighter_than_or() {
+        assert_eq!(sexpr("a || b && c"), "(|| a (&& b c))");
+    }
+
+    #[test]
+    fn coalesce_is_loosest() {
+        assert_eq!(sexpr("a || b ?? c"), "(?? (|| a b) c)");
+    }
+
+    #[test]
+    fn exponent_is_right_associative_and_tightest() {
+        assert_eq!(sexpr("2 ** 3 ** 2"), "(** 2 (** 3 2))");
+        assert_eq!(sexpr("2 * 3 ** 2"), "(* 2 (** 3 2))");
+    }
+
+    #[test]
+    fn not_is_unary() {
+        assert_eq!(sexpr("!a"), "(! a)");
+    }
+
+    #[test]
+    fn parses_assignment() {
+        assert_eq!(sexpr("x = 5"), "(= x 5)");
+    }
+
+    #[test]
+    fn assignment_is_right_associative() {
+        assert_eq!(sexpr("x = y = 1"), "(= x (= y 1))");
+    }
+
+    #[test]
+    fn compound_assignment_desugars() {
+        assert_eq!(sexpr("x += 2"), "(= x (+ x 2))");
+    }
+
+    #[test]
+    fn binary_span_covers_both_operands() {
+        let tokens = lex("1 + 2").unwrap();
+        let stmts = parse(&tokens).unwrap();
+        match &stmts[0] {
+            Stmt::Expr(e) => assert_eq!(e.span, Span::new(0, 5)),
+            _ => panic!("expected an expression statement"),
+        }
     }
 }

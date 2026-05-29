@@ -16,6 +16,20 @@ fn runs_a_program_file_and_prints_result() {
 }
 
 #[test]
+fn runs_factorial_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/factorial.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    // 1*2*3*4*5 = 120, which is > 100, then the value itself.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "big\n120\n");
+}
+
+#[test]
 fn reports_usage_without_args() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin).output().unwrap();
