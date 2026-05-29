@@ -146,9 +146,14 @@ impl HttpBodyState {
     }
 
     async fn read_upto(&mut self, n: usize, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        buf.resize(n, 0);
-        let got = self.reader.read(buf).await?;
-        buf.truncate(got);
+        // `read_buf` over a `take(n)` adapter appends only the bytes actually
+        // available, capped at `n` — bounding the read at `n` with NO 64KB zero-fill
+        // on every small frame (the old `resize(n, 0)` + `truncate` did). `reserve`
+        // alone is insufficient: it can over-allocate, and `read_buf` fills to the
+        // vec's full spare capacity, so a hard `take(n)` cap is required.
+        buf.clear();
+        buf.reserve(n);
+        let got = (&mut self.reader).take(n as u64).read_buf(buf).await?;
         Ok(got)
     }
 
@@ -2254,5 +2259,24 @@ print(data.body)
         );
         let out = run(&src).await;
         assert_eq!(out, "part1-part2\n");
+    }
+
+    #[tokio::test]
+    async fn request_body_stream_reader_handle_is_drained_and_reflected() {
+        let base = fixture::start().await;
+        // A reader-handle source (variant b): open a STREAMING response body (an
+        // HttpBody reader) from /stream and pipe THAT into a POST /echo body. The
+        // reader is drained (readToEnd) then sent; /echo reflects the full content.
+        let src = format!(
+            r#"
+import {{ get, post }} from "std/net/http"
+let [src, _se] = await get("{base}/stream", {{ stream: true }})
+let [resp, _e] = await post("{base}/echo", {{ body: {{ stream: src.body }} }})
+let [data, _je] = await resp.json()
+print(data.body)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "chunk1\nchunk2\nchunk3\n\n");
     }
 }

@@ -79,12 +79,17 @@ pub enum ProcReader {
 
 impl ProcReader {
     async fn read_upto(&mut self, n: usize, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        buf.resize(n, 0);
+        // `read_buf` over a `take(n)` adapter appends only the bytes actually
+        // available, capped at `n` — bounding the read at `n` with NO 64KB zero-fill
+        // on every small read (the old `resize(n, 0)` + `truncate` did). `reserve`
+        // alone is insufficient: it can over-allocate, and `read_buf` fills to the
+        // vec's full spare capacity, so a hard `take(n)` cap is required.
+        buf.clear();
+        buf.reserve(n);
         let got = match self {
-            ProcReader::Out(r) => r.read(buf).await?,
-            ProcReader::Err(r) => r.read(buf).await?,
+            ProcReader::Out(r) => (&mut *r).take(n as u64).read_buf(buf).await?,
+            ProcReader::Err(r) => (&mut *r).take(n as u64).read_buf(buf).await?,
         };
-        buf.truncate(got);
         Ok(got)
     }
 
