@@ -6,6 +6,7 @@
 
 pub mod array;
 pub mod math;
+pub mod object;
 pub mod string;
 
 use crate::error::AsError;
@@ -26,6 +27,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/math" => math::exports(),
         "std/string" => string::exports(),
         "std/array" => array::exports(),
+        "std/object" => object::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -44,6 +46,7 @@ impl Interp {
             "math" => math::call(func, args, span),
             "string" => string::call(func, args, span),
             "array" => self.call_array(func, args, span).await,
+            "object" => object::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -76,9 +79,8 @@ pub(crate) fn want_array(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cel
     }
 }
 
-// want_object: used by the object module landing later in M10; the type-error
-// message shape is defined here so all std modules stay consistent.
-#[allow(dead_code)]
+// want_object: used by the std/object module; the type-error message shape is
+// defined here so all std modules stay consistent.
 pub(crate) fn want_object(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cell::RefCell<indexmap::IndexMap<String, Value>>>, Control> {
     match v {
         Value::Object(o) => Ok(o.clone()),

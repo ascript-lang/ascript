@@ -2074,6 +2074,19 @@ print(r[1])
     }
 
     #[tokio::test]
+    async fn std_object_end_to_end() {
+        let src = "import * as object from \"std/object\"\n\
+                   let p = { name: \"Ada\", age: 36 }\n\
+                   print(object.keys(p))\n\
+                   print(object.values(p))\n\
+                   print(object.has(p, \"age\"))\n\
+                   print(object.delete(p, \"age\"))\n\
+                   print(object.keys(p))\n\
+                   print(object.merge({ x: 1 }, { x: 2, y: 3 }))";
+        assert_eq!(run(src).await, "[\"name\", \"age\"]\n[\"Ada\", 36]\ntrue\ntrue\n[\"name\"]\n{x: 2, y: 3}\n");
+    }
+
+    #[tokio::test]
     async fn std_array_map_filter_reduce() {
         let src = "import * as array from \"std/array\"\n\
                    let xs = [1, 2, 3, 4]\n\
