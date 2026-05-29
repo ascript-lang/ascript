@@ -17,3 +17,4 @@ async-recursion = "1"
 indexmap = "2"
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.6"
+rustyline = "14"

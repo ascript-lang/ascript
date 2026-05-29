@@ -129,3 +129,21 @@ fn runs_modules_example() {
     assert!(out.contains("12\n"));     // Rect(3,4).area()
     assert!(out.contains("3.14159"));  // geo.PI
 }
+
+#[test]
+fn repl_evaluates_and_persists_bindings() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let mut child = Command::new(bin)
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"let x = 21\nx * 2\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("42"));
+}

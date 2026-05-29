@@ -36,10 +36,13 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Command::Repl => {
-            eprintln!("repl: implemented in a later step");
-            ExitCode::from(1)
-        }
+        Command::Repl => match ascript::repl::run_repl().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("repl error: {}", e);
+                ExitCode::from(1)
+            }
+        },
         Command::Fmt { .. } => {
             eprintln!("fmt: implemented in a later step");
             ExitCode::from(1)
