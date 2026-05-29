@@ -155,10 +155,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     tokens.push(Token { tok: Tok::QuestionDot, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {
-                    return Err(AsError::at(
-                        "unexpected character '?' (the ? operator arrives in Milestone 5)",
-                        Span::new(start, start + 1),
-                    ));
+                    tokens.push(Token { tok: Tok::Question, span: Span::new(start, start + 1) });
+                    i += 1;
                 }
             }
             '/' => {
@@ -316,6 +314,17 @@ mod tests {
 
     fn kinds(src: &str) -> Vec<Tok> {
         lex(src).unwrap().into_iter().map(|t| t.tok).collect()
+    }
+
+    #[test]
+    fn lexes_question_variants() {
+        assert_eq!(kinds("a ? b ?? c?.d"),
+            vec![
+                Tok::Ident("a".into()), Tok::Question,
+                Tok::Ident("b".into()), Tok::QuestionQuestion,
+                Tok::Ident("c".into()), Tok::QuestionDot, Tok::Ident("d".into()),
+                Tok::Eof,
+            ]);
     }
 
     #[test]

@@ -27,6 +27,7 @@ pub enum ExprKind {
     Object(Vec<(String, Expr)>),
     Member { object: Box<Expr>, name: String },
     OptMember { object: Box<Expr>, name: String },
+    Try(Box<Expr>),
     Template { parts: Vec<TemplatePart> },
     /// A parenthesized expression, kept distinct (not flattened) so parentheses
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
@@ -154,6 +155,7 @@ impl fmt::Display for ExprKind {
             }
             ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
             ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
+            ExprKind::Try(e) => write!(f, "(? {})", e),
             ExprKind::Template { .. } => write!(f, "(template)"),
             ExprKind::Paren(inner) => write!(f, "{}", inner),
         }

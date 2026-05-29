@@ -303,6 +303,30 @@ impl Interp {
                 Ok(Value::Str(out.into()))
             }
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
+            ExprKind::Try(inner) => {
+                let v = self.eval_expr(inner, env).await?;
+                // Must be a 2-element Result pair [value, err].
+                let arr = match &v {
+                    Value::Array(a) if a.borrow().len() == 2 => a.clone(),
+                    _ => {
+                        return Err(AsError::at(
+                            "the ? operator requires a Result pair [value, err]",
+                            expr.span,
+                        )
+                        .into())
+                    }
+                };
+                let (value, err) = {
+                    let b = arr.borrow();
+                    (b[0].clone(), b[1].clone())
+                };
+                if err == Value::Nil {
+                    Ok(value)
+                } else {
+                    // Early-return [nil, err] from the enclosing function.
+                    Err(Control::Propagate(make_pair(Value::Nil, err)))
+                }
+            }
             ExprKind::OptMember { .. }
             | ExprKind::Member { .. }
             | ExprKind::Index { .. }
@@ -578,6 +602,44 @@ mod tests {
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn question_unwraps_ok_and_propagates_err() {
+        // A function that uses `?`: returns the value on Ok, propagates [nil, err] on Err.
+        let src = "
+fn parse(x) {
+  if (x < 0) { return Err(\"negative\") }
+  return Ok(x * 2)
+}
+fn run(x) {
+  let v = parse(x)?
+  return Ok(v + 1)
+}
+let good = run(5)
+print(good[0])
+print(good[1])
+let bad = run(-1)
+print(bad[0])
+print(bad[1].message)
+";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        // run(5): parse->Ok(10), v=10, returns Ok(11) -> [11, nil]
+        // run(-1): parse->Err, ? propagates [nil, {message:"negative"}]
+        assert_eq!(interp.output, "11\nnil\nnil\nnegative\n");
+    }
+
+    #[tokio::test]
+    async fn question_on_non_result_panics() {
+        let src = "let x = 5\nlet y = x?";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("requires a Result pair"));
     }
 
     async fn eval_to_value(src: &str) -> Value {

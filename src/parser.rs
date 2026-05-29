@@ -539,6 +539,11 @@ impl<'a> Parser<'a> {
                     let span = Span::new(expr.span.start, self.prev_end());
                     expr = Expr { kind: ExprKind::OptMember { object: Box::new(expr), name }, span };
                 }
+                Tok::Question => {
+                    self.advance();
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
+                }
                 _ => break,
             }
         }
@@ -665,6 +670,11 @@ mod tests {
             Stmt::Expr(e) => e.to_string(),
             _ => panic!("expected an expression statement"),
         }
+    }
+
+    #[test]
+    fn parses_try_operator() {
+        assert_eq!(sexpr("readFile(p)?"), "(? (call readFile p))");
     }
 
     #[test]
