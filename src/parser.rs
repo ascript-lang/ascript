@@ -724,8 +724,8 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// The range operator `..` (grammar PREC.range = 7): binds looser than
-    /// comparison but tighter than additive (`1+1..5` parses as `(1+1)..5`).
+    /// The range operator `..` (grammar PREC.range = 7): binds tighter than
+    /// comparison but looser than additive (`1+1..5` parses as `(1+1)..5`).
     /// Left-associative, like the other binary levels.
     fn range(&mut self) -> Result<Expr, AsError> {
         let mut left = self.additive()?;

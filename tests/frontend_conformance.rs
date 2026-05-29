@@ -49,8 +49,10 @@ fn interpreter_parses_each_grammar_construct() {
         // --- ranges ---
         "let r = 0..5",
         "let r2 = (1 + 1)..n",
+        "let rr = f()..g()",
         "for (i in 0..5) { print(i) }",
         "for (i in r) { print(i) }",
+        "for (i in items()) { print(i) }",
         "for (x of [1, 2]) { print(x) }",
         "for (ch of \"abc\") { print(ch) }",
         // --- array / object literals (incl. quoted keys, trailing commas) ---
@@ -96,6 +98,8 @@ fn interpreter_parses_each_grammar_construct() {
         "let mem = o.a.b",
         "let ch = o?.a?.b",
         "let tryp = readFile(p)?",
+        "o.method(1)",
+        "fn m() { return self.x }",
         // --- arrow functions: single / multi / async ---
         "let sa = x => x + 1",
         "let ma = (a, b) => a + b",
