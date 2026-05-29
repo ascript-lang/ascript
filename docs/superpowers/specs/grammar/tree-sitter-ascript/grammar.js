@@ -1,19 +1,19 @@
 /**
  * Tree-sitter grammar for AScript (.as)
  *
- * Source of truth for AScript *syntax*. Mirrors the grammar sketch in
- * docs/superpowers/specs/2026-05-29-ascript-design.md (§3) and the lexical
- * rules in §2. This grammar powers editor syntax highlighting, structural
- * selection, and the LSP — it is error-tolerant and incremental, and is
- * intentionally separate from the interpreter's recursive-descent parser.
+ * Source of truth for AScript *syntax*, reconciled with the implemented
+ * interpreter (src/lexer.rs, src/parser.rs, src/ast.rs). It powers editor
+ * highlighting, structural selection, and the LSP. It is intentionally
+ * separate from the interpreter's recursive-descent parser, and is
+ * conformance-tested against it over the example corpus (see
+ * tests/treesitter_conformance.rs).
  *
- * Notes / known follow-ups:
- *  - Automatic semicolon insertion (ASI-lite, §2) is approximated here by
- *    making the statement terminator optional. Faithful newline-sensitive ASI
- *    needs an external scanner (scanner.c) — tracked as a follow-up.
- *  - A handful of conflicts (arrow-fn vs parenthesized expr, object literal vs
- *    block) are resolved with `conflicts`/precedence and may need tuning when
- *    the grammar is generated.
+ * Notes:
+ *  - ASI-lite (§2) is approximated by making `;` an optional terminator; the
+ *    interpreter treats newlines as soft separators and `;` is purely optional.
+ *  - `self`, `super`, `extends`, `Ok`, `Err`, `recover`, and the primitive
+ *    type names are plain identifiers / soft keywords in the interpreter, so
+ *    they are NOT reserved here.
  */
 
 // Precedence ladder, low (loosest) to high (tightest binding).
@@ -44,10 +44,10 @@ module.exports = grammar({
     $.block_comment,
   ],
 
-  // Optional statement terminators + a couple of intentional ambiguities.
   conflicts: $ => [
-    [$.object_literal, $.block],
-    [$.arrow_function, $.parenthesized_expression],
+    // `(x)` could be a one-arg parameter list (arrow fn) or a parenthesized
+    // identifier — needs a GLR split until the `=>` (or lack of it) is seen.
+    [$.parameter, $._primary_expression],
   ],
 
   rules: {
@@ -68,7 +68,7 @@ module.exports = grammar({
     import_declaration: $ => seq(
       'import',
       choice(
-        seq('{', commaSep($.import_specifier), '}'),
+        seq('{', commaSep($.import_specifier), optional(','), '}'),
         seq('*', 'as', field('namespace', $.identifier)),
       ),
       'from',
@@ -100,8 +100,10 @@ module.exports = grammar({
       $.while_statement,
       $.for_statement,
       $.return_statement,
-      $.expression_statement,
+      $.break_statement,
+      $.continue_statement,
       $.block,
+      $.expression_statement,
     ),
 
     block: $ => seq('{', repeat($._statement), '}'),
@@ -125,7 +127,7 @@ module.exports = grammar({
 
     // `let [a, b] = ...` array destructuring (Result returns, §6).
     _binding_target: $ => choice($.identifier, $.array_pattern),
-    array_pattern: $ => seq('[', commaSep($.identifier), ']'),
+    array_pattern: $ => seq('[', commaSep($.identifier), optional(','), ']'),
 
     function_declaration: $ => seq(
       optional('async'),
@@ -136,7 +138,7 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
-    parameter_list: $ => seq('(', commaSep($.parameter), ')'),
+    parameter_list: $ => seq('(', commaSep($.parameter), optional(','), ')'),
     parameter: $ => seq(
       field('name', $.identifier),
       optional(seq(':', field('type', $._type))),
@@ -169,7 +171,7 @@ module.exports = grammar({
     ),
     enum_variant: $ => seq(
       field('name', $.identifier),
-      optional(seq('=', field('value', choice($.number, $.string)))),
+      optional(seq('=', field('value', $._expression))),
     ),
 
     // ----- Control flow ----------------------------------------------------
@@ -184,7 +186,7 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
-    // for (x of iterable)  and  for (i in 0..n)
+    // for (x of iterable)  and  for (i in start..end)
     for_statement: $ => seq(
       'for', '(',
       field('binding', $.identifier),
@@ -194,7 +196,14 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
-    return_statement: $ => seq('return', optional($._expression), optional(';')),
+    return_statement: $ => prec.right(seq(
+      'return',
+      optional($._expression),
+      optional(';'),
+    )),
+
+    break_statement: $ => seq('break', optional(';')),
+    continue_statement: $ => seq('continue', optional(';')),
 
     expression_statement: $ => seq($._expression, optional(';')),
 
@@ -247,15 +256,17 @@ module.exports = grammar({
 
     await_expression: $ => prec.right(PREC.unary, seq('await', $._expression)),
 
-    // match c { Pattern => expr, _ => expr, }  (§3, §8.2)
-    match_expression: $ => seq(
+    // match subj { Pattern => expr, _ => expr, }  (§3, §8.2)
+    // The subject is parsed at coalesce precedence so the trailing `{` opens
+    // the arm block rather than being read as an object literal.
+    match_expression: $ => prec(PREC.primary, seq(
       'match',
-      field('subject', $._expression),
+      field('subject', $._match_subject),
       '{',
       commaSep($.match_arm),
       optional(','),
       '}',
-    ),
+    )),
     match_arm: $ => seq(
       field('pattern', $._match_pattern),
       '=>',
@@ -264,10 +275,13 @@ module.exports = grammar({
     _match_pattern: $ => choice(
       $.wildcard_pattern,
       $.or_pattern,
-      $._expression, // literal / enum-variant / identifier pattern
+      $._match_subject, // literal / enum-variant / identifier pattern
     ),
     wildcard_pattern: _ => '_',
-    or_pattern: $ => prec.left(seq($._expression, repeat1(seq('|', $._expression)))),
+    or_pattern: $ => prec.left(seq(
+      $._match_subject,
+      repeat1(seq('|', $._match_subject)),
+    )),
 
     arrow_function: $ => prec(PREC.assign, seq(
       optional('async'),
@@ -288,9 +302,9 @@ module.exports = grammar({
 
     call_expression: $ => prec(PREC.postfix, seq(
       field('function', $._postfix_expression),
-      field('arguments', $.argument_list),
+      field('arguments', $.arguments),
     )),
-    argument_list: $ => seq('(', commaSep($._expression), ')'),
+    arguments: $ => seq('(', commaSep($._expression), optional(','), ')'),
 
     member_expression: $ => prec(PREC.postfix, seq(
       field('object', $._postfix_expression),
@@ -328,11 +342,22 @@ module.exports = grammar({
       $.parenthesized_expression,
     ),
 
+    // Subject of a `match` / a match pattern: any expression EXCEPT an object
+    // literal, so the `{` after the subject opens the match body. Mirrors the
+    // interpreter, which parses the subject at coalesce precedence.
+    _match_subject: $ => choice(
+      $.binary_expression,
+      $.unary_expression,
+      $._postfix_expression,
+    ),
+
     parenthesized_expression: $ => seq('(', $._expression, ')'),
 
     array_literal: $ => seq('[', commaSep($._expression), optional(','), ']'),
 
-    object_literal: $ => seq('{', commaSep($.object_entry), optional(','), '}'),
+    object_literal: $ => prec(PREC.primary, seq(
+      '{', commaSep($.object_entry), optional(','), '}',
+    )),
     object_entry: $ => seq(
       field('key', choice($.identifier, $.string)),
       ':',
@@ -359,7 +384,7 @@ module.exports = grammar({
     array_type: $ => seq('array', '<', $._type, '>'),
     map_type: $ => seq('map', '<', $._type, ',', $._type, '>'),
     result_type: $ => seq('Result', '<', $._type, '>'),
-    tuple_type: $ => seq('[', commaSep1($._type), ']'),
+    tuple_type: $ => seq('[', commaSep1($._type), optional(','), ']'),
 
     // ----- Literals (§2) ---------------------------------------------------
     identifier: _ => /[A-Za-z_][A-Za-z0-9_]*/,
