@@ -118,7 +118,10 @@ pub enum NativeKind {
     ChildProcess,
     Reader,
     Writer,
-    // M14 adds: HttpBody, SseStream, TcpStream, ...
+    // M14 networking handles (registered only under feature `net`).
+    TcpListener,
+    TcpStream,
+    // M14 adds: HttpBody, SseStream, ...
 }
 
 impl NativeKind {
@@ -129,6 +132,8 @@ impl NativeKind {
             NativeKind::ChildProcess => "childProcess",
             NativeKind::Reader => "reader",
             NativeKind::Writer => "writer",
+            NativeKind::TcpListener => "tcpListener",
+            NativeKind::TcpStream => "tcpStream",
         }
     }
 }

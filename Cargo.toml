@@ -51,7 +51,7 @@ cc = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
@@ -61,3 +61,6 @@ sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "tokio/process",
 crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex"]
 compress = ["dep:flate2", "dep:zip"]
 sql = ["dep:rusqlite"]
+# M14 networking. Task 1 (std/net/tcp) needs only tokio's net + io-util; later
+# tasks (http/ws) ADD dep:reqwest/dep:hyper/etc. to this feature.
+net = ["tokio/net", "tokio/io-util"]

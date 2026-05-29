@@ -102,6 +102,12 @@ pub(crate) enum ResourceState {
     // A streaming writer over a spawned child's stdin. `close()`/EOF takes it.
     #[cfg(feature = "sys")]
     Writer(tokio::process::ChildStdin),
+    // M14 std/net/tcp: a bound listener and a buffered client/accepted stream. The
+    // stream carries a `BufReader` so `readLine` works (mirrors the process Reader).
+    #[cfg(feature = "net")]
+    TcpListener(tokio::net::TcpListener),
+    #[cfg(feature = "net")]
+    TcpStream(crate::stdlib::net_tcp::TcpStreamState),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -221,6 +227,28 @@ impl Interp {
     pub(crate) fn proc_writer_mut(&mut self, id: u64) -> Option<&mut tokio::process::ChildStdin> {
         match self.resources.get_mut(&id) {
             Some(ResourceState::Writer(w)) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a buffered TCP stream behind a handle id, or `None` once
+    /// the handle was finalized (closed / EOF) — read methods turn `None` into nil.
+    #[cfg(feature = "net")]
+    pub(crate) fn tcp_stream_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::net_tcp::TcpStreamState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::TcpStream(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a bound TCP listener behind a handle id (for `accept`).
+    #[cfg(feature = "net")]
+    pub(crate) fn tcp_listener_mut(&mut self, id: u64) -> Option<&mut tokio::net::TcpListener> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::TcpListener(l)) => Some(l),
             _ => None,
         }
     }
@@ -891,6 +919,13 @@ impl Interp {
             use crate::value::NativeKind::*;
             if matches!(m.receiver.kind, ChildProcess | Reader | Writer) {
                 return self.call_process_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "net")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, TcpListener | TcpStream) {
+                return self.call_tcp_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
