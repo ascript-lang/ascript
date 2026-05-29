@@ -881,7 +881,7 @@ impl Interp {
                     Value::Bytes(b) => b.borrow().len(),
                     _ => {
                         return Err(AsError::at(
-                            format!("len() expects a string, array, object, or map, got {}", type_name(&v)),
+                            format!("len() expects a string, array, object, map, or bytes, got {}", type_name(&v)),
                             span,
                         )
                         .into())
