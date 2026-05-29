@@ -45,8 +45,9 @@
 //!     reuse within that request's client). A shared cross-request jar handle is a
 //!     documented follow-up.
 //!   - `proxy` "http://…"/"https://…"/"socks5://…" (socks feature enabled)/"system"/"none".
-//!   - `httpVersion` "auto"|"1.1"|"2"|"3" — "3" returns a clean error until the http3
-//!     build feature lands (Task 8). `resp.version` reports the negotiated version.
+//!   - `httpVersion` "auto"|"1.1"|"2"|"3" — "3" requires the `http3` build feature
+//!     (default-off, see §11.5 deferrals below); without it, "3" returns a clean
+//!     Tier-1 error. `resp.version` reports the negotiated version.
 //!   - `errorOnStatus: true` → a non-2xx response becomes a Tier-1 err.
 //!   - `cancel` → a `cancelToken()` handle whose `cancel()` aborts the in-flight send
 //!     via a `tokio::select!` against a shared `Notify`.
@@ -73,7 +74,20 @@
 //! `retry:` interval (or `opts.retryDefault`, default 3000ms), reconnects with
 //! `Last-Event-ID`, and resumes; `opts.maxReconnects` caps attempts. See `SseState`.
 //!
-//! Deferred to later M14 tasks: the `http3` build feature gate (Task 8).
+//! §11.5 deferrals (documented, owned, opt-in where applicable):
+//!   - HTTP/3: feature-gated, default-OFF. The `http3` Cargo feature wires
+//!     `reqwest/http3` and turns the `httpVersion:"3"` path (above) into a real
+//!     http3 pin (`http3_prior_knowledge`); with the feature off it returns a clean
+//!     Tier-1 error ("HTTP/3 requires the 'http3' build feature"). reqwest's http3
+//!     is UNSTABLE, so enabling the feature ALSO needs `RUSTFLAGS=--cfg
+//!     reqwest_unstable` — hence it is intentionally not in `default`.
+//!   - Response trailers: best-effort / not surfaced. reqwest's high-level
+//!     response API does not expose HTTP trailers, so there is no `resp.trailers`
+//!     field; trailing headers from chunked/h2 responses are dropped. Revisit if a
+//!     low-level (hyper) client path is added.
+//!   - SOCKS proxy: SUPPORTED. reqwest's `socks` feature is enabled in `[features]
+//!     net`, so `proxy:"socks5://…"` works and compiles cleanly; it is listed under
+//!     §11.5 only because it ships behind that reqwest feature.
 
 use super::{arg, bi, want_string};
 use crate::error::AsError;
@@ -602,6 +616,14 @@ fn build_client(opts: &Value, span: Span) -> Result<reqwest::Client, Control> {
             "auto" => {}
             "1.1" => b = b.http1_only(),
             "2" => b = b.http2_prior_knowledge(),
+            // HTTP/3 is a §11.5 deferral: opt-in via the `http3` build feature
+            // (default-off), which additionally needs `RUSTFLAGS=--cfg
+            // reqwest_unstable` because reqwest's http3 support is unstable. When
+            // the feature is on, pin http3 prior-knowledge on the client; when it
+            // is off, surface a clean Tier-1 error rather than silently downgrading.
+            #[cfg(feature = "http3")]
+            "3" => b = b.http3_prior_knowledge(),
+            #[cfg(not(feature = "http3"))]
             "3" => {
                 return Err(AsError::at(
                     "HTTP/3 requires the 'http3' build feature",
@@ -2420,9 +2442,10 @@ print(resp.version)
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "http3"))]
     async fn http_version_3_errors_cleanly_without_feature() {
         let base = fixture::start().await;
-        // httpVersion:"3" must surface a clean Tier-2 error (no http3 build feature).
+        // httpVersion:"3" must surface a clean Tier-1 error (no http3 build feature).
         let mut interp = Interp::new();
         let src = format!(
             r#"

@@ -72,3 +72,8 @@ sql = ["dep:rusqlite"]
 # M14 networking. Task 1 (std/net/tcp) needs only tokio's net + io-util; later
 # tasks (http/ws) ADD dep:reqwest/dep:hyper/etc. to this feature.
 net = ["dep:reqwest", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "dep:http", "dep:tokio-util", "dep:tokio-tungstenite", "dep:base64", "tokio/net", "tokio/io-util"]
+# §11.5 deferral: HTTP/3 (default-OFF, opt-in). Enables reqwest's http3 backend so
+# `httpVersion:"3"` pins http3; without it that path returns a clean Tier-1 error.
+# reqwest's http3 is UNSTABLE: building with this feature ALSO requires
+# `RUSTFLAGS="--cfg reqwest_unstable"`. Kept out of `default` for that reason.
+http3 = ["net", "reqwest/http3"]

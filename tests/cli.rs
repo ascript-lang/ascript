@@ -316,3 +316,19 @@ fn runs_system_example() {
     // env: round-tripped variable.
     assert!(out.contains("demo-value"));
 }
+
+// std/net/tcp loopback echo example (examples/net.as). Gated on `net` (the module)
+// + `unix` (the loopback-into-backlog sequencing is exercised on unix in CI; the
+// example itself is portable, but we keep the gate consistent with other socket
+// tests). Asserts the full round-trip: no errors, then "ping" (server read what
+// the client wrote) then "pong" (client read the server's echo).
+#[test]
+#[cfg(all(feature = "net", unix))]
+fn runs_net_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/net.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    // Three nil error slots (listen/connect/accept), then the round-tripped lines.
+    assert_eq!(out, "nil\nnil\nnil\nping\npong\n");
+}
