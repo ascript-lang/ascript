@@ -18,6 +18,17 @@ pub enum Tok {
     True,
     False,
     Nil,
+    StarStar,
+    Bang,
+    BangEq,
+    EqEq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    AmpAmp,
+    PipePipe,
+    QuestionQuestion,
     Eof,
 }
 

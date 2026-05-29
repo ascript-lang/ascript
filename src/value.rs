@@ -4,12 +4,20 @@
 use std::fmt;
 use std::rc::Rc;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Nil,
     Bool(bool),
     Number(f64),
     Str(Rc<str>),
+}
+
+impl Value {
+    /// Spec §4: only `nil` and `false` are falsy. Everything else
+    /// (including `0` and `""`) is truthy.
+    pub fn is_truthy(&self) -> bool {
+        !matches!(self, Value::Nil | Value::Bool(false))
+    }
 }
 
 impl fmt::Display for Value {
@@ -35,5 +43,22 @@ mod tests {
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Nil.to_string(), "nil");
         assert_eq!(Value::Str("hi".into()).to_string(), "hi");
+    }
+
+    #[test]
+    fn truthiness_follows_spec() {
+        assert!(Value::Bool(true).is_truthy());
+        assert!(Value::Number(0.0).is_truthy());
+        assert!(Value::Str("".into()).is_truthy());
+        assert!(!Value::Bool(false).is_truthy());
+        assert!(!Value::Nil.is_truthy());
+    }
+
+    #[test]
+    fn equality_is_structural_and_cross_kind_is_false() {
+        assert_eq!(Value::Number(1.0), Value::Number(1.0));
+        assert_eq!(Value::Str("a".into()), Value::Str("a".into()));
+        assert_ne!(Value::Number(1.0), Value::Str("1".into()));
+        assert_ne!(Value::Bool(true), Value::Number(1.0));
     }
 }

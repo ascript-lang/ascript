@@ -41,26 +41,60 @@ impl Interp {
             )),
             ExprKind::Unary { op, expr: operand } => {
                 let v = self.eval_expr(operand).await?;
-                match (op, v) {
-                    (UnOp::Neg, Value::Number(n)) => Ok(Value::Number(-n)),
-                    (UnOp::Neg, _) => Err(AsError::new("cannot negate a non-number")),
+                match op {
+                    UnOp::Neg => match v {
+                        Value::Number(n) => Ok(Value::Number(-n)),
+                        _ => Err(AsError::at("cannot negate a non-number", operand.span)),
+                    },
+                    UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
+                match op {
+                    BinOp::And => {
+                        let l = self.eval_expr(lhs).await?;
+                        return if l.is_truthy() { self.eval_expr(rhs).await } else { Ok(l) };
+                    }
+                    BinOp::Or => {
+                        let l = self.eval_expr(lhs).await?;
+                        return if l.is_truthy() { Ok(l) } else { self.eval_expr(rhs).await };
+                    }
+                    BinOp::Coalesce => {
+                        let l = self.eval_expr(lhs).await?;
+                        return if l == Value::Nil { self.eval_expr(rhs).await } else { Ok(l) };
+                    }
+                    _ => {}
+                }
+
                 let l = self.eval_expr(lhs).await?;
                 let r = self.eval_expr(rhs).await?;
-                let (a, b) = match (l, r) {
-                    (Value::Number(a), Value::Number(b)) => (a, b),
-                    _ => return Err(AsError::new("arithmetic requires two numbers")),
+
+                match op {
+                    BinOp::Eq => return Ok(Value::Bool(l == r)),
+                    BinOp::Ne => return Ok(Value::Bool(l != r)),
+                    _ => {}
+                }
+
+                let (a, b) = match (&l, &r) {
+                    (Value::Number(a), Value::Number(b)) => (*a, *b),
+                    _ => return Err(AsError::at("operator requires two numbers", expr.span)),
                 };
                 let result = match op {
-                    BinOp::Add => a + b,
-                    BinOp::Sub => a - b,
-                    BinOp::Mul => a * b,
-                    BinOp::Div => a / b,
-                    BinOp::Mod => a % b,
+                    BinOp::Add => Value::Number(a + b),
+                    BinOp::Sub => Value::Number(a - b),
+                    BinOp::Mul => Value::Number(a * b),
+                    BinOp::Div => Value::Number(a / b),
+                    BinOp::Mod => Value::Number(a % b),
+                    BinOp::Pow => Value::Number(a.powf(b)),
+                    BinOp::Lt => Value::Bool(a < b),
+                    BinOp::Le => Value::Bool(a <= b),
+                    BinOp::Gt => Value::Bool(a > b),
+                    BinOp::Ge => Value::Bool(a >= b),
+                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or | BinOp::Coalesce => {
+                        unreachable!("handled above")
+                    }
                 };
-                Ok(Value::Number(result))
+                Ok(result)
             }
             ExprKind::Call { callee, args } => {
                 let name = match &callee.kind {
@@ -122,6 +156,28 @@ mod tests {
         let mut interp = Interp::new();
         interp.exec(&stmts).await.unwrap();
         assert_eq!(interp.output, "7\n");
+    }
+
+    #[tokio::test]
+    async fn comparison_and_equality() {
+        assert_eq!(eval_to_value("1 < 2").await, Value::Bool(true));
+        assert_eq!(eval_to_value("2 == 2").await, Value::Bool(true));
+        assert_eq!(eval_to_value("1 != 2").await, Value::Bool(true));
+        assert_eq!(eval_to_value("\"a\" == \"a\"").await, Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn exponent_evaluates() {
+        assert_eq!(eval_to_value("2 ** 10").await, Value::Number(1024.0));
+    }
+
+    #[tokio::test]
+    async fn short_circuit_and_coalesce() {
+        assert_eq!(eval_to_value("false && nope").await, Value::Bool(false));
+        assert_eq!(eval_to_value("true || nope").await, Value::Bool(true));
+        assert_eq!(eval_to_value("nil ?? 5").await, Value::Number(5.0));
+        assert_eq!(eval_to_value("3 ?? nope").await, Value::Number(3.0));
+        assert_eq!(eval_to_value("!0").await, Value::Bool(false));
     }
 
     #[tokio::test]

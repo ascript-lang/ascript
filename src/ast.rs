@@ -29,16 +29,15 @@ pub enum Stmt {
 
 #[derive(Clone, Copy, Debug)]
 pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
+    Add, Sub, Mul, Div, Mod, Pow,
+    Lt, Le, Gt, Ge, Eq, Ne,
+    And, Or, Coalesce,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum UnOp {
     Neg,
+    Not,
 }
 
 impl fmt::Display for BinOp {
@@ -49,6 +48,16 @@ impl fmt::Display for BinOp {
             BinOp::Mul => "*",
             BinOp::Div => "/",
             BinOp::Mod => "%",
+            BinOp::Pow => "**",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::And => "&&",
+            BinOp::Or => "||",
+            BinOp::Coalesce => "??",
         };
         write!(f, "{}", s)
     }
@@ -58,6 +67,7 @@ impl fmt::Display for UnOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             UnOp::Neg => write!(f, "-"),
+            UnOp::Not => write!(f, "!"),
         }
     }
 }

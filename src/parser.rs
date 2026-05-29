@@ -56,7 +56,75 @@ impl<'a> Parser<'a> {
     }
 
     fn expr(&mut self) -> Result<Expr, AsError> {
-        self.additive()
+        self.coalesce()
+    }
+
+    /// Build a left-associative binary node from an already-parsed left side.
+    fn make_binary(left: Expr, op: BinOp, right: Expr) -> Expr {
+        let span = Span::new(left.span.start, right.span.end);
+        Expr { kind: ExprKind::Binary { op, lhs: Box::new(left), rhs: Box::new(right) }, span }
+    }
+
+    fn coalesce(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.logic_or()?;
+        while *self.peek() == Tok::QuestionQuestion {
+            self.advance();
+            let right = self.logic_or()?;
+            left = Self::make_binary(left, BinOp::Coalesce, right);
+        }
+        Ok(left)
+    }
+
+    fn logic_or(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.logic_and()?;
+        while *self.peek() == Tok::PipePipe {
+            self.advance();
+            let right = self.logic_and()?;
+            left = Self::make_binary(left, BinOp::Or, right);
+        }
+        Ok(left)
+    }
+
+    fn logic_and(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.equality()?;
+        while *self.peek() == Tok::AmpAmp {
+            self.advance();
+            let right = self.equality()?;
+            left = Self::make_binary(left, BinOp::And, right);
+        }
+        Ok(left)
+    }
+
+    fn equality(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.comparison()?;
+        loop {
+            let op = match self.peek() {
+                Tok::EqEq => BinOp::Eq,
+                Tok::BangEq => BinOp::Ne,
+                _ => break,
+            };
+            self.advance();
+            let right = self.comparison()?;
+            left = Self::make_binary(left, op, right);
+        }
+        Ok(left)
+    }
+
+    fn comparison(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.additive()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Lt => BinOp::Lt,
+                Tok::Le => BinOp::Le,
+                Tok::Gt => BinOp::Gt,
+                Tok::Ge => BinOp::Ge,
+                _ => break,
+            };
+            self.advance();
+            let right = self.additive()?;
+            left = Self::make_binary(left, op, right);
+        }
+        Ok(left)
     }
 
     fn additive(&mut self) -> Result<Expr, AsError> {
@@ -69,17 +137,13 @@ impl<'a> Parser<'a> {
             };
             self.advance();
             let right = self.multiplicative()?;
-            let span = Span::new(left.span.start, right.span.end);
-            left = Expr {
-                kind: ExprKind::Binary { op, lhs: Box::new(left), rhs: Box::new(right) },
-                span,
-            };
+            left = Self::make_binary(left, op, right);
         }
         Ok(left)
     }
 
     fn multiplicative(&mut self) -> Result<Expr, AsError> {
-        let mut left = self.unary()?;
+        let mut left = self.exponent()?;
         loop {
             let op = match self.peek() {
                 Tok::Star => BinOp::Mul,
@@ -88,24 +152,37 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.advance();
-            let right = self.unary()?;
-            let span = Span::new(left.span.start, right.span.end);
-            left = Expr {
-                kind: ExprKind::Binary { op, lhs: Box::new(left), rhs: Box::new(right) },
-                span,
-            };
+            let right = self.exponent()?;
+            left = Self::make_binary(left, op, right);
         }
         Ok(left)
     }
 
+    fn exponent(&mut self) -> Result<Expr, AsError> {
+        let base = self.unary()?;
+        if *self.peek() == Tok::StarStar {
+            self.advance();
+            // right-associative: 2 ** 3 ** 2 == 2 ** (3 ** 2)
+            let exp = self.exponent()?;
+            Ok(Self::make_binary(base, BinOp::Pow, exp))
+        } else {
+            Ok(base)
+        }
+    }
+
     fn unary(&mut self) -> Result<Expr, AsError> {
         let start = self.span().start;
-        if *self.peek() == Tok::Minus {
+        let op = match self.peek() {
+            Tok::Minus => Some(UnOp::Neg),
+            Tok::Bang => Some(UnOp::Not),
+            _ => None,
+        };
+        if let Some(op) = op {
             self.advance();
             let operand = self.unary()?;
             let span = Span::new(start, operand.span.end);
             return Ok(Expr {
-                kind: ExprKind::Unary { op: UnOp::Neg, expr: Box::new(operand) },
+                kind: ExprKind::Unary { op, expr: Box::new(operand) },
                 span,
             });
         }
@@ -183,6 +260,32 @@ mod tests {
     #[test]
     fn parses_a_call() {
         assert_eq!(sexpr("print(\"hi\")"), "(call print \"hi\")");
+    }
+
+    #[test]
+    fn comparison_binds_looser_than_arithmetic() {
+        assert_eq!(sexpr("1 + 2 < 3"), "(< (+ 1 2) 3)");
+    }
+
+    #[test]
+    fn logical_and_binds_tighter_than_or() {
+        assert_eq!(sexpr("a || b && c"), "(|| a (&& b c))");
+    }
+
+    #[test]
+    fn coalesce_is_loosest() {
+        assert_eq!(sexpr("a || b ?? c"), "(?? (|| a b) c)");
+    }
+
+    #[test]
+    fn exponent_is_right_associative_and_tightest() {
+        assert_eq!(sexpr("2 ** 3 ** 2"), "(** 2 (** 3 2))");
+        assert_eq!(sexpr("2 * 3 ** 2"), "(* 2 (** 3 2))");
+    }
+
+    #[test]
+    fn not_is_unary() {
+        assert_eq!(sexpr("!a"), "(! a)");
     }
 
     #[test]
