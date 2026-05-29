@@ -39,9 +39,23 @@ impl From<AsError> for Control {
 /// A fresh global environment with the built-in functions installed.
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    env.define("print", Value::Builtin("print".into()), false)
-        .expect("global env starts empty");
+    for name in ["print", "Ok", "Err", "assert", "recover"] {
+        env.define(name, Value::Builtin(name.into()), false)
+            .expect("global env starts empty");
+    }
     env
+}
+
+/// Build a `[value, err]` Result pair.
+fn make_pair(value: Value, err: Value) -> Value {
+    Value::Array(Rc::new(RefCell::new(vec![value, err])))
+}
+
+/// Build an error object `{ message: <msg> }`.
+fn make_error(msg: Value) -> Value {
+    let mut map = indexmap::IndexMap::new();
+    map.insert("message".to_string(), msg);
+    Value::Object(Rc::new(RefCell::new(map)))
 }
 
 pub struct Interp {
@@ -412,6 +426,27 @@ impl Interp {
                 self.output.push('\n');
                 Ok(Value::Nil)
             }
+            "Ok" => {
+                let value = args.first().cloned().unwrap_or(Value::Nil);
+                Ok(make_pair(value, Value::Nil))
+            }
+            "Err" => {
+                let msg = args.first().cloned().unwrap_or(Value::Nil);
+                Ok(make_pair(Value::Nil, make_error(msg)))
+            }
+            "assert" => {
+                let cond = args.first().cloned().unwrap_or(Value::Nil);
+                if cond.is_truthy() {
+                    Ok(Value::Nil)
+                } else {
+                    let msg = match args.get(1) {
+                        Some(Value::Str(s)) => s.to_string(),
+                        Some(v) => v.to_string(),
+                        None => "assertion failed".to_string(),
+                    };
+                    Err(AsError::at(msg, span).into())
+                }
+            }
             other => Err(AsError::at(format!("'{}' is not a function", other), span).into()),
         }
     }
@@ -514,6 +549,35 @@ mod tests {
             Control::Panic(e) => e,
             Control::Propagate(_) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn ok_and_err_construct_result_pairs() {
+        let src = "let r = Ok(5)\nprint(r[0])\nprint(r[1])\nlet e = Err(\"boom\")\nprint(e[0])\nprint(e[1].message)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\nnil\nnil\nboom\n");
+    }
+
+    #[tokio::test]
+    async fn assert_passes_and_panics() {
+        // passing assert returns nil
+        let ok = "assert(1 < 2)\nprint(\"ok\")";
+        let stmts = parse(&lex(ok).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "ok\n");
+
+        // failing assert panics with the message
+        let bad = "assert(false, \"nope\")";
+        let stmts = parse(&lex(bad).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("nope"));
     }
 
     async fn eval_to_value(src: &str) -> Value {
