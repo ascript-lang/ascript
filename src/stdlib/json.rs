@@ -144,6 +144,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_preserves_key_order() {
+        // serde_json's preserve_order feature keeps object keys in source order
+        // (not alphabetical), matching AScript's insertion-ordered objects.
+        let parsed = call("parse", &[Value::Str("{\"name\": 1, \"age\": 2, \"zoo\": 3}".into())], Span::new(0, 0)).unwrap();
+        assert!(parsed.to_string().starts_with("[{name: 1, age: 2, zoo: 3}, nil]"));
+    }
+
+    #[test]
     fn stringify_and_errors() {
         let obj = {
             let mut m = IndexMap::new();

@@ -19,7 +19,7 @@ clap = { version = "4", features = ["derive"] }
 ariadne = "0.6"
 rustyline = "14"
 serde = { version = "1.0.228", features = ["derive"], optional = true }
-serde_json = { version = "1.0.150", optional = true }
+serde_json = { version = "1.0.150", features = ["preserve_order"], optional = true }
 regex = { version = "1.12.3", optional = true }
 base64 = { version = "0.22", optional = true }
 hex = { version = "0.4", optional = true }

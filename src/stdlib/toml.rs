@@ -49,12 +49,11 @@ mod tests {
 
     #[test]
     fn parse_basic() {
-        // NOTE: the `toml` crate deserializes into serde_json::Value via a
-        // key-sorted map, so keys come out alphabetically (`age` before
-        // `name`), not in source order. The integer `36` renders as `36`
-        // (not `36.0`) thanks to the json converter's integer handling.
+        // Keys come out in source order (serde_json's preserve_order feature
+        // backs the bridge map with an IndexMap). The integer `36` renders as
+        // `36` (not `36.0`) thanks to the json converter's integer handling.
         let parsed = call("parse", &[s("name = \"Ada\"\nage = 36")], sp()).unwrap();
-        assert_eq!(parsed.to_string(), "[{age: 36, name: \"Ada\"}, nil]");
+        assert_eq!(parsed.to_string(), "[{name: \"Ada\", age: 36}, nil]");
     }
 
     #[test]
