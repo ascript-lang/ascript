@@ -13,6 +13,8 @@ pub mod date;
 pub mod csv;
 #[cfg(feature = "data")]
 pub mod encoding;
+#[cfg(feature = "sys")]
+pub mod env;
 #[cfg(feature = "intl")]
 pub mod intl;
 #[cfg(feature = "data")]
@@ -62,6 +64,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/json" => json::exports(),
         #[cfg(feature = "data")]
         "std/encoding" => encoding::exports(),
+        #[cfg(feature = "sys")]
+        "std/env" => env::exports(),
         #[cfg(feature = "data")]
         "std/regex" => regex::exports(),
         #[cfg(feature = "data")]
@@ -103,6 +107,8 @@ impl Interp {
             "json" => json::call(func, args, span),
             #[cfg(feature = "data")]
             "encoding" => encoding::call(func, args, span),
+            #[cfg(feature = "sys")]
+            "env" => env::call(func, args, span),
             #[cfg(feature = "data")]
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "data")]

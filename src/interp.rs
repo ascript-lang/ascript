@@ -83,7 +83,10 @@ pub struct ModuleEntry {
 pub(crate) enum ResourceState {
     #[cfg(feature = "sql")]
     SqliteConnection(rusqlite::Connection),
-    #[cfg(feature = "sys")]
+    // The process child handle requires tokio's `process` feature, wired up by
+    // M13 Task 7 (`std/process`). Gated on `process` so `sys` can ship `std/env`
+    // (Task 2) without pulling tokio/process yet.
+    #[cfg(feature = "process")]
     ChildProcess(tokio::process::Child),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
@@ -1381,6 +1384,17 @@ mod tests {
                    print(doc.a)\n\
                    print(doc.b[1])";
         assert_eq!(run(src).await, "1\ny\n");
+    }
+
+    #[cfg(feature = "sys")]
+    #[tokio::test]
+    async fn std_env_end_to_end() {
+        let src = "import * as env from \"std/env\"\n\
+                   env.set(\"ASCRIPT_E2E_ENV_d4a1\", \"world\")\n\
+                   print(env.get(\"ASCRIPT_E2E_ENV_d4a1\"))\n\
+                   env.unset(\"ASCRIPT_E2E_ENV_d4a1\")\n\
+                   print(env.get(\"ASCRIPT_E2E_ENV_d4a1\"))";
+        assert_eq!(run(src).await, "world\nnil\n");
     }
 
     #[tokio::test]
