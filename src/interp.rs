@@ -50,7 +50,7 @@ impl From<AsError> for Control {
 /// A fresh global environment with the built-in functions installed.
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    for name in ["print", "Ok", "Err", "assert", "recover", "test"] {
+    for name in ["print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range"] {
         env.define(name, Value::Builtin(name.into()), false)
             .expect("global env starts empty");
     }
@@ -843,6 +843,68 @@ impl Interp {
                 self.tests.push((name, func));
                 Ok(Value::Nil)
             }
+            "len" => {
+                let v = args.first().cloned().unwrap_or(Value::Nil);
+                let n = match &v {
+                    Value::Str(s) => s.chars().count(),
+                    Value::Array(a) => a.borrow().len(),
+                    Value::Object(o) => o.borrow().len(),
+                    _ => {
+                        return Err(AsError::at(
+                            format!("len() expects a string, array, object, or map, got {}", type_name(&v)),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                Ok(Value::Number(n as f64))
+            }
+            "type" => {
+                let v = args.first().cloned().unwrap_or(Value::Nil);
+                Ok(Value::Str(type_name(&v).into()))
+            }
+            "range" => {
+                let want_num = |i: usize| -> Result<f64, Control> {
+                    match args.get(i) {
+                        Some(Value::Number(n)) => Ok(*n),
+                        Some(v) => Err(AsError::at(
+                            format!("range() expects number arguments, got {}", type_name(v)),
+                            span,
+                        )
+                        .into()),
+                        None => Ok(0.0),
+                    }
+                };
+                let (start, end, step) = match args.len() {
+                    1 => (0.0, want_num(0)?, 1.0),
+                    2 => (want_num(0)?, want_num(1)?, 1.0),
+                    3 => (want_num(0)?, want_num(1)?, want_num(2)?),
+                    n => {
+                        return Err(AsError::at(
+                            format!("range() expects 1 to 3 arguments, got {}", n),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                if step == 0.0 {
+                    return Err(AsError::at("range() step must not be zero", span).into());
+                }
+                let mut out = Vec::new();
+                let mut i = start;
+                if step > 0.0 {
+                    while i < end {
+                        out.push(Value::Number(i));
+                        i += step;
+                    }
+                } else {
+                    while i > end {
+                        out.push(Value::Number(i));
+                        i += step;
+                    }
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
             other => Err(AsError::at(format!("'{}' is not a function", other), span).into()),
         }
     }
@@ -1048,6 +1110,27 @@ mod tests {
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn core_len_type_range() {
+        assert_eq!(run("print(len([1,2,3]))").await, "3\n");
+        assert_eq!(run("print(len(\"hello\"))").await, "5\n");
+        assert_eq!(run("print(len({a:1, b:2}))").await, "2\n");
+        assert_eq!(run("print(type(1))").await, "number\n");
+        assert_eq!(run("print(type(\"x\"))").await, "string\n");
+        assert_eq!(run("print(type([1]))").await, "array\n");
+        assert_eq!(run("print(type(nil))").await, "nil\n");
+        assert_eq!(run("print(range(3))").await, "[0, 1, 2]\n");
+        assert_eq!(run("print(range(2, 5))").await, "[2, 3, 4]\n");
+        assert_eq!(run("print(range(0, 10, 3))").await, "[0, 3, 6, 9]\n");
+        assert_eq!(run("print(range(5, 0, -2))").await, "[5, 3, 1]\n");
+    }
+
+    #[tokio::test]
+    async fn len_of_wrong_type_panics() {
+        let err = run_err("len(5)").await;
+        assert!(err.message.contains("len"));
     }
 
     #[tokio::test]
