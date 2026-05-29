@@ -13,9 +13,54 @@ use crate::parser;
 use crate::span::Span;
 use crate::token::Tok;
 use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, DocumentSymbol, Hover, HoverContents, MarkupContent,
-    MarkupKind, Position, Range, SymbolKind,
+    CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity, DocumentSymbol, Hover,
+    HoverContents, MarkupContent, MarkupKind, Position, Range, SymbolKind,
 };
+
+/// The AScript keywords offered as completions (KEYWORD kind). Mirrors the lexer's
+/// keyword table (`src/lexer.rs`) plus `match` (which the lexer maps to `Tok::Match`).
+const KEYWORDS: &[&str] = &[
+    "let", "const", "fn", "return", "if", "else", "while", "for", "of", "in", "match", "async",
+    "await", "class", "enum", "import", "export", "nil", "true", "false", "break", "continue",
+];
+
+/// The global builtins offered as completions (FUNCTION kind). Mirrors `builtin_doc`.
+const BUILTINS: &[&str] = &["print", "len", "type", "assert", "range", "Ok", "Err", "recover"];
+
+/// The known stdlib module paths offered when completing an `import ... from "..."`
+/// string. Hardcoded (rather than derived from `std_module_exports`) so the list is
+/// stable regardless of which cargo features are enabled at build time — editors
+/// should see every documented module path. Kept in sync with `std_module_exports`
+/// in `src/stdlib/mod.rs`.
+const STD_MODULE_PATHS: &[&str] = &[
+    "std/string",
+    "std/array",
+    "std/object",
+    "std/map",
+    "std/math",
+    "std/convert",
+    "std/json",
+    "std/regex",
+    "std/encoding",
+    "std/bytes",
+    "std/uuid",
+    "std/csv",
+    "std/toml",
+    "std/yaml",
+    "std/time",
+    "std/date",
+    "std/intl",
+    "std/env",
+    "std/fs",
+    "std/crypto",
+    "std/compress",
+    "std/sqlite",
+    "std/net/tcp",
+    "std/net/http",
+    "std/http/server",
+    "std/net/ws",
+    "std/tui",
+];
 
 /// Lex + parse `text`, reporting the first lex-or-parse error as a single
 /// `Diagnostic`. Valid programs produce an empty vec.
@@ -272,6 +317,213 @@ fn decl_doc(name: &str, text: &str) -> Option<String> {
     Some(format!("```\n{kind} {name}\n```"))
 }
 
+/// A baseline completion item (keyword or builtin).
+fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
+    CompletionItem { label: label.to_string(), kind: Some(kind), ..CompletionItem::default() }
+}
+
+/// The always-offered baseline completions: every keyword + every global builtin.
+fn baseline_completions() -> Vec<CompletionItem> {
+    let mut out = Vec::with_capacity(KEYWORDS.len() + BUILTINS.len());
+    for kw in KEYWORDS {
+        out.push(item(kw, CompletionItemKind::KEYWORD));
+    }
+    for b in BUILTINS {
+        out.push(item(b, CompletionItemKind::FUNCTION));
+    }
+    out
+}
+
+/// Completions at char `offset` in `text`. Pure and robust: never panics, and
+/// always returns at least the baseline (keywords + builtins) even on partial or
+/// syntactically broken input (completion is requested mid-edit).
+///
+/// Context detection is done by simple, parser-free scanning of the raw text around
+/// the cursor, so it works on documents that do not yet parse:
+/// - inside an `import ... from "..."` / `'...'` string → stdlib module paths;
+/// - right after `<ident>.` where `<ident>` is a `import * as <ident>` namespace of a
+///   known std module → that module's exports.
+pub fn completions(text: &str, offset: usize) -> Vec<CompletionItem> {
+    let chars: Vec<char> = text.chars().collect();
+    let offset = offset.min(chars.len());
+
+    // Context 1: inside an import-from string literal → offer module paths.
+    if in_import_path_string(&chars, offset) {
+        return STD_MODULE_PATHS
+            .iter()
+            .map(|p| item(p, CompletionItemKind::MODULE))
+            .collect();
+    }
+
+    // Context 2: member access `<ident>.` where ident is a namespace import.
+    if let Some(alias) = member_access_alias(&chars, offset) {
+        if let Some(module) = namespace_import_module(text, &alias) {
+            if let Some(exports) = crate::stdlib::std_module_exports(&module) {
+                if !exports.is_empty() {
+                    return exports
+                        .into_iter()
+                        .map(|(name, _)| item(&name, CompletionItemKind::FUNCTION))
+                        .collect();
+                }
+            }
+        }
+    }
+
+    baseline_completions()
+}
+
+/// Whether `offset` sits inside the still-open string of a `from "..."` / `from '...'`
+/// on the current line. Scans backward from the cursor within the current line for an
+/// opening quote with no closing quote before the cursor, then checks the text before
+/// that quote ends with `from`.
+fn in_import_path_string(chars: &[char], offset: usize) -> bool {
+    // Restrict to the current line (imports are single-line).
+    let line_start = chars[..offset].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1);
+    let line = &chars[line_start..offset];
+
+    // Find the last unmatched quote: scan for the opening quote of the string the
+    // cursor is in. Walk from the cursor backward to the most recent quote char.
+    let Some(rel_quote) = line.iter().rposition(|&c| c == '"' || c == '\'') else {
+        return false;
+    };
+    let quote = line[rel_quote];
+    // The quote must be unclosed before the cursor: count quotes of that kind after
+    // it; an opening quote has an even count of *following* same-quotes (0 here since
+    // it's the last one). If there were a closing quote it'd be the last instead.
+    // Already guaranteed it's the last quote, so it's open.
+
+    // Check the text before the opening quote ends with `from` (allowing whitespace).
+    let before: String = line[..rel_quote].iter().collect();
+    let before = before.trim_end();
+    let _ = quote;
+    before.ends_with("from")
+}
+
+/// If the text immediately before `offset` is `<ident>.`, return `<ident>`.
+fn member_access_alias(chars: &[char], offset: usize) -> Option<String> {
+    if offset == 0 {
+        return None;
+    }
+    // The char right before the cursor must be a dot.
+    if chars[offset - 1] != '.' {
+        return None;
+    }
+    // Collect the identifier ending just before the dot.
+    let dot = offset - 1;
+    let mut start = dot;
+    while start > 0 && is_ident_char(chars[start - 1]) {
+        start -= 1;
+    }
+    if start == dot {
+        return None; // no ident before the dot
+    }
+    // The first char must be a valid identifier start (not a digit).
+    if chars[start].is_ascii_digit() {
+        return None;
+    }
+    Some(chars[start..dot].iter().collect())
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Scan `text` for `import * as <alias> from "std/<mod>"` and return the module path.
+/// Parser-free (works on broken docs): a regex-like manual scan per line.
+fn namespace_import_module(text: &str, alias: &str) -> Option<String> {
+    for line in text.lines() {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix("import") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('*') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix("as") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        // The alias is the next identifier.
+        let name: String = rest.chars().take_while(|&c| is_ident_char(c)).collect();
+        if name != alias {
+            continue;
+        }
+        let rest = &rest[name.len()..];
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix("from") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        // Extract the quoted module path.
+        let mut chars = rest.chars();
+        let q = chars.next()?;
+        if q != '"' && q != '\'' {
+            continue;
+        }
+        let path: String = chars.take_while(|&c| c != q).collect();
+        return Some(path);
+    }
+    None
+}
+
+/// Go-to-definition at char `offset` in `text`. Pure. Identifies the identifier token
+/// at the offset and resolves it to a top-level declaration's name span, returned as a
+/// `Range`.
+///
+/// Scope: top-level declarations only (`fn`/`class`/`enum`/`let`/`const`, including
+/// destructured lets and `export`-wrapped decls). Function params and local lets are
+/// NOT resolved — `Param` carries no `Span` in the AST (`src/ast.rs`), so a param's
+/// name range can't be reported precisely; resolving them is deferred. If the cursor
+/// is on the declaration's own name, that decl's range is returned (self-location).
+/// Unknown identifiers, or any lex/parse failure, yield `None`.
+pub fn definition(text: &str, offset: usize) -> Option<Range> {
+    let tokens = lexer::lex(text).ok()?;
+    // Identify the identifier token under the cursor (same boundary rule as hover).
+    let token = tokens
+        .iter()
+        .find(|t| t.tok != Tok::Eof && offset >= t.span.start && offset < t.span.end)?;
+    let Tok::Ident(name) = &token.tok else {
+        return None;
+    };
+
+    let stmts = parser::parse(&tokens).ok()?;
+    let index = LineIndex::new(text);
+    let mut name_span = None;
+    for stmt in &stmts {
+        collect_decl_name_span(stmt, name, &mut name_span);
+    }
+    name_span.map(|s| span_range(s, &index))
+}
+
+/// If a top-level statement declares `name`, record its name span (first match wins).
+fn collect_decl_name_span(stmt: &Stmt, name: &str, out: &mut Option<Span>) {
+    if out.is_some() {
+        return;
+    }
+    match stmt {
+        Stmt::Export(inner) => collect_decl_name_span(inner, name, out),
+        Stmt::Fn { name: n, name_span, .. }
+        | Stmt::Class { name: n, name_span, .. }
+        | Stmt::Enum { name: n, name_span, .. }
+        | Stmt::Let { name: n, name_span, .. } => {
+            if n == name {
+                *out = Some(*name_span);
+            }
+        }
+        Stmt::LetDestructure { names, name_spans, .. } => {
+            for (n, s) in names.iter().zip(name_spans.iter()) {
+                if n == name {
+                    *out = Some(*s);
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +682,126 @@ export fn bar() {}
     fn hover_on_unknown_ident_is_none() {
         let src = "zzz";
         assert!(hover(src, 0).is_none());
+    }
+
+    // ---- completions ----
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
+
+    #[test]
+    fn completions_baseline_has_keywords_and_builtins() {
+        // Anywhere (here, end of a trivial doc) the baseline is offered.
+        let src = "let x = 1\n";
+        let items = completions(src, src.chars().count());
+        let ls = labels(&items);
+        for expected in ["fn", "let", "match", "print", "Ok"] {
+            assert!(ls.contains(&expected), "baseline should contain {expected:?}: {ls:?}");
+        }
+        // Kinds are set.
+        let fnkw = items.iter().find(|i| i.label == "fn").unwrap();
+        assert_eq!(fnkw.kind, Some(CompletionItemKind::KEYWORD));
+        let pr = items.iter().find(|i| i.label == "print").unwrap();
+        assert_eq!(pr.kind, Some(CompletionItemKind::FUNCTION));
+    }
+
+    #[test]
+    fn completions_in_import_path_offers_module_paths() {
+        let src = "import { x } from \"std/";
+        let items = completions(src, src.chars().count());
+        let ls = labels(&items);
+        for expected in ["std/string", "std/json", "std/net/http"] {
+            assert!(ls.contains(&expected), "import ctx should contain {expected:?}: {ls:?}");
+        }
+        assert!(items.iter().all(|i| i.kind == Some(CompletionItemKind::MODULE)));
+    }
+
+    #[test]
+    fn completions_in_import_path_single_quote() {
+        let src = "import { x } from 'std/ma";
+        let items = completions(src, src.chars().count());
+        assert!(labels(&items).contains(&"std/math"));
+    }
+
+    #[test]
+    fn completions_member_access_offers_module_exports() {
+        let src = "import * as math from \"std/math\"\nlet y = math.";
+        let items = completions(src, src.chars().count());
+        let ls = labels(&items);
+        for expected in ["sqrt", "abs", "pi"] {
+            assert!(ls.contains(&expected), "math. should contain {expected:?}: {ls:?}");
+        }
+    }
+
+    #[test]
+    fn completions_member_access_unknown_alias_falls_back_to_baseline() {
+        // `foo` is not a namespace import → baseline.
+        let src = "let foo = 1\nfoo.";
+        let items = completions(src, src.chars().count());
+        assert!(labels(&items).contains(&"print"));
+    }
+
+    #[test]
+    fn completions_on_garbage_returns_baseline_no_panic() {
+        for src in ["", "@#$%^", "fn fn fn (((", "import * as", "\"unterminated"] {
+            let items = completions(src, src.chars().count());
+            assert!(
+                labels(&items).contains(&"let"),
+                "garbage {src:?} should still yield baseline"
+            );
+        }
+        // An out-of-range offset must not panic.
+        let _ = completions("let x", 9999);
+    }
+
+    // ---- definition ----
+
+    #[test]
+    fn definition_resolves_fn_call_to_decl() {
+        let src = "fn foo() { return 1 }\nlet x = foo()";
+        // Offset of the `foo` call (the second occurrence — the use, not the decl).
+        let first = src.find("foo").unwrap();
+        let call = src[first + 3..].find("foo").unwrap() + first + 3;
+        let r = definition(src, call).expect("should resolve foo call");
+        // foo's name_span is on line 0 (`fn foo`).
+        assert_eq!(r.start.line, 0);
+        assert_eq!(r.start.character, 3); // after "fn "
+    }
+
+    #[test]
+    fn definition_resolves_class_use_to_decl() {
+        let src = "class C {}\nlet c = C()";
+        let use_off = src.rfind('C').unwrap();
+        let r = definition(src, use_off).expect("should resolve C use");
+        assert_eq!(r.start.line, 0);
+        assert_eq!(r.start.character, 6); // after "class "
+    }
+
+    #[test]
+    fn definition_unknown_ident_is_none() {
+        let src = "let x = 1\nprint(zzz)";
+        let off = src.find("zzz").unwrap();
+        assert!(definition(src, off).is_none());
+    }
+
+    #[test]
+    fn definition_on_non_ident_is_none() {
+        let src = "let x = 1";
+        // Offset on the `=`.
+        let off = src.find('=').unwrap();
+        assert!(definition(src, off).is_none());
+    }
+
+    #[test]
+    fn definition_resolves_const_and_destructured_let() {
+        let src = "const K = 1\nlet [a, b] = pair\nprint(K)\nprint(a)";
+        let k_use = src.rfind('K').unwrap();
+        let rk = definition(src, k_use).expect("K");
+        assert_eq!(rk.start.line, 0);
+        // The `a` use is in `print(a)` on the last line.
+        let a_use = src.rfind("(a)").unwrap() + 1;
+        let ra = definition(src, a_use).expect("a");
+        assert_eq!(ra.start.line, 1);
     }
 }

@@ -38,6 +38,12 @@ pub fn server_capabilities() -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_symbol_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        completion_provider: Some(CompletionOptions {
+            // `.` for member-access completions; `"` / `'` for import-path strings.
+            trigger_characters: Some(vec![".".to_string(), "\"".to_string(), "'".to_string()]),
+            ..CompletionOptions::default()
+        }),
+        definition_provider: Some(OneOf::Left(true)),
         ..ServerCapabilities::default()
     }
 }
@@ -111,6 +117,38 @@ impl LanguageServer for Backend {
         Ok(analysis::hover(text, offset))
     }
 
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let docs = self.documents.lock().await;
+        let Some(text) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
+        let items = analysis::completions(text, offset);
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some(text) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
+        let Some(range) = analysis::definition(text, offset) else {
+            return Ok(None);
+        };
+        Ok(Some(GotoDefinitionResponse::Scalar(Location { uri, range })))
+    }
+
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
         Ok(())
     }
@@ -146,6 +184,26 @@ mod tests {
             caps.hover_provider.is_some(),
             "expected a hover provider, got {:?}",
             caps.hover_provider
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_completion_and_definition() {
+        let caps = server_capabilities();
+        let completion = caps.completion_provider.expect("expected a completion provider");
+        let triggers = completion.trigger_characters.expect("expected trigger characters");
+        assert!(triggers.contains(&".".to_string()), "triggers: {triggers:?}");
+        assert!(
+            triggers.contains(&"\"".to_string()) || triggers.contains(&"'".to_string()),
+            "expected a quote trigger char, got {triggers:?}"
+        );
+        assert!(
+            matches!(
+                caps.definition_provider,
+                Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+            ),
+            "expected a definition provider, got {:?}",
+            caps.definition_provider
         );
     }
 }
