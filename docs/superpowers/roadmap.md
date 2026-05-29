@@ -51,30 +51,41 @@ working, tested software on its own.
   `.as` path resolution, once-only cached eval, circular-import partial-init,
   `run_file` entry point + module loader. 120 lib + 9 cli + 4 module tests. Merged.
   Plan: `plans/2026-05-29-ascript-m8-modules.md`.
-- ⬜ **M9 — Tooling.** Rich diagnostics (ariadne/miette); REPL; `ascript fmt`;
-  `ascript test` runner; Tree-sitter grammar conformance test.
+- ✅ **M9 — Tooling.** clap multi-command CLI; ariadne source-pointing diagnostics;
+  REPL (rustyline, TTY/non-TTY, persistence, panic isolation); `ascript fmt`
+  (idempotent); `ascript test` (`test()` builtin + runner); Tree-sitter grammar
+  reconciled + generated + conformance test; **async/await surface syntax (§7)**.
+  128 lib + 14 cli + 4 module + 2 conformance tests. Merged.
+  Plan: `plans/2026-05-29-ascript-m9-tooling.md`.
 
-(Phase 2+ stdlib milestones below shift accordingly; renumber when reached.)
+## ✅✅ PHASE 1 COMPLETE — language core + modules + tooling (spec §§2–10). ✅✅
+Everything below is **Phase 2+** (the standard library + LSP), deferred to the next
+goal. A fresh conversation starts here; see "Phase 2 starting point" notes at the end.
 
 ## Phase 2 — Standard library: data & text
 
-- ⬜ **M8 — Core collections.** `core` globals, `std/string`, `std/array`,
-  `std/object`, `std/map`, `std/math`, `std/convert`.
-- ⬜ **M9 — Serialization & encoding.** `std/json`, `std/regex`, `std/encoding`,
+- ⬜ **M10 — Core collections.** `core` globals, `std/string`, `std/array`,
+  `std/object`, `std/map`, `std/math`, `std/convert`. **Introduces the `Map` value
+  kind + `map<K,V>` contract type** (the one §4/§5 item deferred from the language).
+- ⬜ **M11 — Serialization & encoding.** `std/json`, `std/regex`, `std/encoding`,
   `std/bytes`, `std/uuid`, `std/csv`, `std/toml`, `std/yaml`.
-- ⬜ **M10 — Time & locale.** `std/time`, `std/date`, `std/intl` (pragmatic icu4x).
+- ⬜ **M12 — Time & locale.** `std/time`, `std/date`, `std/intl` (pragmatic icu4x).
 
 ## Phase 3 — Standard library: system & async
 
-- ⬜ **M11 — System.** `std/fs` (incl. `grep`), `std/process` (subprocess
+- ⬜ **M13 — System.** `std/fs` (incl. `grep`), `std/process` (subprocess
   run/spawn), `std/env`, `std/crypto`, `std/compress`, `std/sqlite`.
-- ⬜ **M12 — Async I/O.** `std/net/tcp`, `std/net/http` (client),
-  `std/http/server`, `std/net/ws`.
-- ⬜ **M13 — Terminal UI.** `std/tui`.
+- ⬜ **M14 — Async I/O.** `std/net/tcp`, `std/net/http` (client),
+  `std/http/server`, `std/net/ws`. **Introduces a real awaitable/future `Value` kind**
+  so `await` actually suspends (the surface syntax exists since M9; today `await`
+  is identity because nothing suspends).
+- ⬜ **M15 — Terminal UI.** `std/tui`.
 
 ## Phase 4 — Tooling completion
 
-- ⬜ **M14 — Language Server.** `ascript lsp` (tower-lsp) over the shared front-end.
+- ⬜ **M16 — Language Server.** `ascript lsp` (tower-lsp) over the shared front-end +
+  the conformance-tested Tree-sitter grammar. Reuses the `SourceInfo`/ariadne
+  groundwork from M9.
 
 ---
 
@@ -217,5 +228,67 @@ working, tested software on its own.
 - **REPL note (from M8):** a module whose body panics still leaves a cached entry; for a
   long-lived REPL, consider evicting failed modules so re-import re-runs them.
 
-## Roadmap status: M1–M8 ✅ merged. Language core + modules COMPLETE.
-Remaining: M9 (tooling) + Phase 2+ standard library.
+## Roadmap status: M1–M9 ✅ merged. **PHASE 1 COMPLETE.**
+The AScript language (spec §§2–9) + tooling (§10: diagnostics, REPL, fmt, test,
+Tree-sitter conformance) + async/await surface (§7) are fully implemented, unit- and
+example-tested, clippy-clean, and merged to `main`. Remaining: Phase 2+ standard
+library (M10–M15) + the LSP (M16).
+
+---
+
+## Phase 2 starting point (read this first in a fresh conversation)
+
+**Where things are.** `main` is green: ~148 tests (128 lib + 14 cli + 4 module + 2
+tree-sitter conformance), `cargo clippy --all-targets` clean. Single crate `ascript`
+(lib + bin), single-threaded `Rc`/`RefCell`, current-thread tokio. The CLI has
+`run`/`repl`/`fmt`/`test` subcommands (clap). Examples live in `examples/`; each is
+covered by an integration test and the fmt-idempotence + tree-sitter conformance suites.
+
+**Process (unchanged).** Per milestone: writing-plans → subagent-driven TDD (Opus
+implementer + an independent Opus reviewer that checks spec-compliance AND code quality
+AND runs the tests) → a final holistic review → merge `--no-ff`. One milestone per
+feature branch off `main`. See [[prefers-opus-for-subagents]] and
+[[ascript-full-build-goal]] in agent memory.
+
+**The `std/*` resolution hook (the key Phase-2 seam).** `resolve_import`/`load_module`
+in `src/interp.rs` currently canonicalize against the filesystem. Phase 2 must add a
+`source.starts_with("std/")` branch BEFORE that, dispatching to a registry of built-in
+modules. Two viable designs: (a) embed `.as` source for std modules written in AScript;
+(b) native modules whose exports are Rust-backed builtins (`Value::Builtin` names the
+interp dispatches in `call_builtin`). Most stdlib (string/array/math/json/regex/fs/…) is
+native (b); use a non-path cache key (e.g. a synthetic `PathBuf` like `<std>/string`).
+
+**`Value::Builtin` is the stdlib dispatch mechanism.** `call_builtin(name, args, span)`
+in `src/interp.rs` already dispatches builtins by name (`print`, `Ok`, `Err`, `assert`,
+`recover`, `test`). Stdlib functions are added as more arms (or a registry). Module-scoped
+stdlib functions (`string.split`) resolve via the std module's exports → `Value::Builtin`.
+
+**M10 (first stdlib milestone) introduces the `Map` value kind.** Add `Value::Map`
+(`Rc<RefCell<…>>` with a hashable key — define a `MapKey` for number/string/bool/nil) and
+new arms in `PartialEq`/`Debug`/`Display`/`is_truthy`/`type_name` (value.rs) and
+`check_type` (interp.rs). Wire the `map<K,V>` type: `parse_type_atom` (parser.rs) currently
+errors on `map` with "arrive in Milestone 8" — replace with real parsing; `check_type`
+gains a `Map` arm. There is NO map literal syntax — maps are constructed by `std/map` (e.g.
+`Map.new()`), which is why the kind waited for the stdlib.
+
+**M14 (async I/O) introduces a real future/awaitable `Value` kind** so `await` actually
+suspends on it (today `ExprKind::Await` is identity — see interp.rs; `is_async` flags are
+carried but inert). Timers/sockets/http return awaitables; `await` drives them on the
+existing current-thread tokio runtime. The async surface (parse/AST/fmt/grammar) is
+already done and conformance-tested (`examples/async.as`).
+
+### Known Phase-1 limitations to carry forward (none block Phase 1; address in noted phases)
+- **Cross-module deferred-error diagnostics (M9 review):** a function defined in module A
+  but called from B whose body panics renders B's source, not A's, because AST spans lack
+  module provenance. The error MESSAGE is always correct; only the caret's file can be
+  wrong for that case. Single-file + during-import diagnostics are perfect. Fix needs span
+  provenance (tag spans/`AsError` with a module id) — do it in **M16 (LSP)** where
+  multi-file diagnostics matter most. `SourceInfo` on `AsError` is the groundwork.
+- **REPL is single-line:** multi-line blocks typed across lines aren't accumulated (single-
+  line blocks work). Sanctioned v1 limitation; accumulate-on-incomplete is a nice follow-up.
+- **fmt drops comments** (AST pretty-printer) and re-emits string literals with `"` + raw
+  contents (round-trips for current corpus). Future fmt hardening.
+- **Live module bindings:** imports snapshot values at import time (spec-adequate).
+- **Spec authority:** `docs/superpowers/specs/2026-05-29-ascript-design.md`. The
+  Tree-sitter grammar is the syntax source of truth, conformance-tested; keep it in
+  lockstep when adding any new surface syntax (add an example exercising it).
