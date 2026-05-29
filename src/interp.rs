@@ -632,8 +632,7 @@ impl Interp {
     ) -> Result<Value, Control> {
         let call_env = bm.defining_class.def_env.child();
         call_env.define("self", bm.receiver.clone(), false).map_err(AsError::new)?;
-        // `super` lookup begins at the defining class's superclass (always None
-        // until inheritance lands in Task 4).
+        // `super` lookup begins at the defining class's superclass.
         let super_ref = Value::Super(std::rc::Rc::new(crate::value::SuperRef {
             receiver: bm.receiver.clone(),
             start: bm.defining_class.superclass.clone(),

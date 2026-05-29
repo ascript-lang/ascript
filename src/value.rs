@@ -1,5 +1,6 @@
-//! Runtime values. Eight value kinds (nil, bool, number, string, builtin,
-//! function, array, object); the `Map` kind arrives in Milestone 8.
+//! Runtime values. Kinds: nil, bool, number, string, builtin, function, array,
+//! object, enum, enum-variant, class, instance, bound-method, super-ref. The
+//! `Map` kind arrives in Milestone 8.
 
 use crate::ast::Stmt;
 use crate::env::Environment;
