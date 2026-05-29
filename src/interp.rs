@@ -137,19 +137,9 @@ impl Interp {
             ExprKind::Ident(name) => env
                 .get(name)
                 .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span)),
-            ExprKind::Assign { name, value } => {
+            ExprKind::Assign { target, value } => {
                 let v = self.eval_expr(value, env).await?;
-                match env.assign(name, v.clone()) {
-                    Ok(()) => Ok(v),
-                    Err(AssignError::Undefined) => Err(AsError::at(
-                        format!("cannot assign to undefined variable '{}'", name),
-                        expr.span,
-                    )),
-                    Err(AssignError::Immutable) => Err(AsError::at(
-                        format!("cannot assign to immutable binding '{}'", name),
-                        expr.span,
-                    )),
-                }
+                self.assign_to(target, v, env).await
             }
             ExprKind::Unary { op, expr: operand } => {
                 let v = self.eval_expr(operand, env).await?;
@@ -275,6 +265,24 @@ impl Interp {
                 Ok(Value::Nil)
             }
             other => Err(AsError::at(format!("'{}' is not a function", other), span)),
+        }
+    }
+
+    #[async_recursion(?Send)]
+    async fn assign_to(&mut self, target: &Expr, value: Value, env: &Environment) -> Result<Value, AsError> {
+        match &target.kind {
+            ExprKind::Ident(name) => match env.assign(name, value.clone()) {
+                Ok(()) => Ok(value),
+                Err(AssignError::Undefined) => Err(AsError::at(
+                    format!("cannot assign to undefined variable '{}'", name),
+                    target.span,
+                )),
+                Err(AssignError::Immutable) => Err(AsError::at(
+                    format!("cannot assign to immutable binding '{}'", name),
+                    target.span,
+                )),
+            },
+            _ => Err(AsError::at("invalid assignment target", target.span)),
         }
     }
 }

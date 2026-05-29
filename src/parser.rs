@@ -240,30 +240,27 @@ impl<'a> Parser<'a> {
             Tok::SlashEq => Some(BinOp::Div),
             _ => return Ok(target),
         };
-        self.advance(); // consume the assignment operator
+        self.advance(); // assignment operator
         let value = self.assignment()?; // right-associative
 
-        let name = match &target.kind {
-            ExprKind::Ident(name) => name.clone(),
-            _ => return Err(AsError::at("invalid assignment target", target.span)),
-        };
+        // Only assignable expressions are valid targets. (Index/Member added later
+        // in this milestone are also assignable; identifiers always are.)
+        if !is_assignable(&target) {
+            return Err(AsError::at("invalid assignment target", target.span));
+        }
 
-        // For `x += e`, desugar the value to `x + e` (a fresh Binary over the
-        // target identifier and the rhs), preserving spans for diagnostics.
         let span = Span::new(target.span.start, value.span.end);
         let value = match compound {
             None => value,
             Some(op) => {
-                let target_ident = Expr {
-                    kind: ExprKind::Ident(name.clone()),
-                    span: target.span,
-                };
-                Self::make_binary(target_ident, op, value)
+                // x += e  =>  x = (x + e). Re-uses the target expression as the lhs.
+                let lhs = target.clone();
+                Self::make_binary(lhs, op, value)
             }
         };
 
         Ok(Expr {
-            kind: ExprKind::Assign { name, value: Box::new(value) },
+            kind: ExprKind::Assign { target: Box::new(target), value: Box::new(value) },
             span,
         })
     }
@@ -507,6 +504,11 @@ impl<'a> Parser<'a> {
         };
         Ok(Expr { kind, span: tok_span })
     }
+}
+
+/// Whether an expression can be the target of an assignment.
+fn is_assignable(expr: &Expr) -> bool {
+    matches!(expr.kind, ExprKind::Ident(_))
 }
 
 #[cfg(test)]
