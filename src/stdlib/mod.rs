@@ -13,6 +13,8 @@ pub mod date;
 pub mod csv;
 #[cfg(feature = "data")]
 pub mod encoding;
+#[cfg(feature = "intl")]
+pub mod intl;
 #[cfg(feature = "data")]
 pub mod json;
 pub mod map;
@@ -54,6 +56,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/time" => time::exports(),
         #[cfg(feature = "datetime")]
         "std/date" => date::exports(),
+        #[cfg(feature = "intl")]
+        "std/intl" => intl::exports(),
         #[cfg(feature = "data")]
         "std/json" => json::exports(),
         #[cfg(feature = "data")]
@@ -93,6 +97,8 @@ impl Interp {
             "time" => self.call_time(func, args, span).await,
             #[cfg(feature = "datetime")]
             "date" => date::call(func, args, span),
+            #[cfg(feature = "intl")]
+            "intl" => intl::call(func, args, span),
             #[cfg(feature = "data")]
             "json" => json::call(func, args, span),
             #[cfg(feature = "data")]

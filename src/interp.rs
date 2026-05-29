@@ -2450,4 +2450,19 @@ print(r[1])
                    print(date.diffMs(later, d))";
         assert_eq!(run(src).await, "2021\n6\n2021/06/15\n25\n864000000\n");
     }
+
+    #[cfg(feature = "intl")]
+    #[tokio::test]
+    async fn std_intl_end_to_end() {
+        let src = "import * as intl from \"std/intl\"\n\
+                   print(intl.formatNumber(1234567, \"en-US\"))\n\
+                   print(intl.formatNumber(1234567, \"de-DE\"))\n\
+                   print(intl.caseUpper(\"istanbul\", \"tr\"))\n\
+                   print(intl.caseUpper(\"istanbul\", \"en\"))\n\
+                   print(intl.compare(\"apple\", \"banana\", \"en\"))";
+        assert_eq!(
+            run(src).await,
+            "1,234,567\n1.234.567\nİSTANBUL\nISTANBUL\n-1\n"
+        );
+    }
 }
