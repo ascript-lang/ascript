@@ -261,6 +261,14 @@ impl Interp {
                 let obj = self.eval_expr(object, env).await?;
                 self.read_member(&obj, name, object.span)
             }
+            ExprKind::OptMember { object, name } => {
+                let obj = self.eval_expr(object, env).await?;
+                if obj == Value::Nil {
+                    Ok(Value::Nil)
+                } else {
+                    self.read_member(&obj, name, object.span)
+                }
+            }
         }
     }
 
@@ -770,5 +778,26 @@ mod tests {
         let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("cannot read property 'foo' of nil"));
+    }
+
+    #[tokio::test]
+    async fn optional_chaining_short_circuits_on_nil() {
+        let src = "let o = { a: nil }\nprint(o?.a)\nprint(o.a?.deep)\nprint((o.a ?? 42))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        // o?.a -> nil; o.a is nil so o.a?.deep -> nil; nil ?? 42 -> 42
+        assert_eq!(interp.output, "nil\nnil\n42\n");
+    }
+
+    #[tokio::test]
+    async fn optional_chaining_reads_when_present() {
+        let src = "let o = { a: { b: 7 } }\nprint(o?.a?.b)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "7\n");
     }
 }

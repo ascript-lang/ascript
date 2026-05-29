@@ -108,9 +108,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 if i + 1 < chars.len() && chars[i + 1] == '?' {
                     tokens.push(Token { tok: Tok::QuestionQuestion, span: Span::new(start, start + 2) });
                     i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '.' {
+                    tokens.push(Token { tok: Tok::QuestionDot, span: Span::new(start, start + 2) });
+                    i += 2;
                 } else {
                     return Err(AsError::at(
-                        "unexpected character '?' (?. arrives in Milestone 4, the ? operator in Milestone 5)",
+                        "unexpected character '?' (the ? operator arrives in Milestone 5)",
                         Span::new(start, start + 1),
                     ));
                 }

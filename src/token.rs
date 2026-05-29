@@ -54,6 +54,7 @@ pub enum Tok {
     RBracket,
     Dot,
     Colon,
+    QuestionDot,
     Eof,
 }
 

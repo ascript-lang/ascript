@@ -26,6 +26,7 @@ pub enum ExprKind {
     Index { object: Box<Expr>, index: Box<Expr> },
     Object(Vec<(String, Expr)>),
     Member { object: Box<Expr>, name: String },
+    OptMember { object: Box<Expr>, name: String },
 }
 
 #[derive(Clone, Debug)]
@@ -140,6 +141,7 @@ impl fmt::Display for ExprKind {
                 write!(f, "}}")
             }
             ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
+            ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
         }
     }
 }

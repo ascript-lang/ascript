@@ -506,6 +506,20 @@ impl<'a> Parser<'a> {
                     let span = Span::new(expr.span.start, self.prev_end());
                     expr = Expr { kind: ExprKind::Member { object: Box::new(expr), name }, span };
                 }
+                Tok::QuestionDot => {
+                    self.advance();
+                    let name = match self.advance() {
+                        Tok::Ident(name) => name,
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected a property name after '?.', found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    };
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::OptMember { object: Box::new(expr), name }, span };
+                }
                 _ => break,
             }
         }
