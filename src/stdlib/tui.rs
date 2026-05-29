@@ -296,7 +296,7 @@ impl TerminalState {
 // ---- module exports + dispatch ----
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("init", bi("tui.init"))]
+    vec![("init", bi("tui.init")), ("buffer", bi("tui.buffer"))]
 }
 
 fn err_pair(msg: String) -> Value {
@@ -312,11 +312,12 @@ impl Interp {
     pub(crate) fn call_tui(
         &mut self,
         func: &str,
-        _args: &[Value],
+        args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
         match func {
             "init" => self.tui_init(),
+            "buffer" => self.tui_buffer(args, span),
             _ => Err(AsError::at(format!("std/tui has no function '{}'", func), span).into()),
         }
     }
@@ -332,6 +333,30 @@ impl Interp {
             ResourceState::Terminal(Box::new(state)),
         );
         Ok(make_pair(handle, Value::Nil))
+    }
+
+    /// `buffer(width, height) -> term`. An OFF-SCREEN, explicit-size variant of
+    /// `init()`: it builds the SAME kind of `Terminal` handle (the `NativeKind::Terminal`
+    /// resource with a `ResourceState::Terminal`) sized to `width × height` WITHOUT
+    /// querying the real terminal. Use it for off-screen drawing, testing, and deterministic
+    /// `dump()`s. It supports every drawing method + `dump()`. `flush()` on such a
+    /// handle still runs the diff and writes to stdout like any terminal (harmless on
+    /// a non-tty, but pointless off-screen) — the example/tests just don't call it.
+    ///
+    /// Unlike `init()` (which can't fail in a way we surface, hence its `[term,err]`),
+    /// `buffer` returns the handle DIRECTLY: the only failure is arg/size misuse,
+    /// which is a Tier-2 panic (per `want_dim`: non-number / non-integer / negative /
+    /// zero / > u16::MAX). A `[term, err]` pair here would be pure noise.
+    fn tui_buffer(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let w = want_dim(&super::arg(args, 0), span, "tui.buffer width")?;
+        let h = want_dim(&super::arg(args, 1), span, "tui.buffer height")?;
+        let state = TerminalState::new(w, h);
+        let handle = self.register_resource(
+            NativeKind::Terminal,
+            indexmap::IndexMap::new(),
+            ResourceState::Terminal(Box::new(state)),
+        );
+        Ok(handle)
     }
 
     /// Dispatch a method on a `Terminal` handle. Async-signature for dispatch
@@ -668,6 +693,21 @@ fn want_u16(v: &Value, span: Span, ctx: &str) -> Result<u16, Control> {
     if n < 0.0 || n.fract() != 0.0 || n > u16::MAX as f64 {
         return Err(AsError::at(
             format!("{} must be an integer 0..={}", ctx, u16::MAX),
+            span,
+        )
+        .into());
+    }
+    Ok(n as u16)
+}
+
+/// Like `want_u16` but for a buffer DIMENSION: requires a positive integer in
+/// `1..=u16::MAX`. A zero-sized off-screen buffer is degenerate (nothing to draw
+/// into), so we reject it up front rather than hand back an unusable handle.
+fn want_dim(v: &Value, span: Span, ctx: &str) -> Result<u16, Control> {
+    let n = super::want_number(v, span, ctx)?;
+    if n < 1.0 || n.fract() != 0.0 || n > u16::MAX as f64 {
+        return Err(AsError::at(
+            format!("{} must be an integer 1..={}", ctx, u16::MAX),
             span,
         )
         .into());
@@ -1117,6 +1157,54 @@ print(type(s.height))
         )
         .await;
         assert_eq!(out, "true\ntrue\nnumber\nnumber\n");
+    }
+
+    #[tokio::test]
+    async fn buffer_makes_offscreen_handle_with_given_size() {
+        // tui.buffer(w,h) returns the handle DIRECTLY (not a [term, err] pair) —
+        // it can only fail on bad args (which panic), so a pair would be noise.
+        let out = run(
+            r#"
+import { buffer } from "std/tui"
+let term = buffer(10, 3)
+print(type(term))
+let s = term.size()
+print(s.width)
+print(s.height)
+"#,
+        )
+        .await;
+        assert_eq!(out, "terminal\n10\n3\n");
+    }
+
+    #[tokio::test]
+    async fn buffer_rejects_bad_args_with_panic() {
+        // Non-number / negative / huge → Tier-2 panic (want_u16-style validation).
+        for bad in ["buffer(\"x\", 3)", "buffer(-1, 3)", "buffer(10, 0)"] {
+            let src = format!("import {{ buffer }} from \"std/tui\"\nlet t = {}\n", bad);
+            let msg = run_err(&src).await;
+            assert!(
+                msg.contains("buffer") || msg.contains("must be"),
+                "for `{}` got: {}",
+                bad,
+                msg
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn buffer_supports_drawing_and_dump() {
+        let out = run(
+            r#"
+import { buffer } from "std/tui"
+let term = buffer(4, 3)
+term.box(0, 0, 4, 3, { fg: "cyan" })
+print(term.dump())
+"#,
+        )
+        .await;
+        // dump() ends each row with "\n" (3 rows); print adds one more "\n".
+        assert_eq!(out, "┌──┐\n│  │\n└──┘\n\n");
     }
 
     #[tokio::test]

@@ -332,3 +332,28 @@ fn runs_net_example() {
     // Three nil error slots (listen/connect/accept), then the round-tripped lines.
     assert_eq!(out, "nil\nnil\nnil\nping\npong\n");
 }
+
+// std/tui off-screen-buffer demo (examples/tui.as). Gated on `tui` (the module).
+// The example draws into a fixed 14×4 off-screen buffer via tui.buffer(w,h) and
+// prints dump() — fully deterministic (no real tty, no raw mode, no flush), so we
+// assert the exact rendered frame: the box border chars plus the placed text.
+#[test]
+#[cfg(feature = "tui")]
+fn runs_tui_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/tui.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("AScript"), "missing AScript text:\n{}", out);
+    assert!(out.contains("TUI demo"), "missing TUI demo text:\n{}", out);
+    // Box-drawing border chars.
+    assert!(out.contains('┌'), "missing top-left corner:\n{}", out);
+    assert!(out.contains('│'), "missing vertical border:\n{}", out);
+    assert!(out.contains('┘'), "missing bottom-right corner:\n{}", out);
+    // Full exact frame (dump trims trailing spaces per row).
+    assert!(
+        out.contains("┌────────────┐\n│ AScript    │\n│ TUI demo   │\n└────────────┘\n"),
+        "frame mismatch:\n{}",
+        out
+    );
+}
