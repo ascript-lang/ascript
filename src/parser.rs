@@ -89,7 +89,47 @@ impl<'a> Parser<'a> {
     }
 
     fn expr(&mut self) -> Result<Expr, AsError> {
-        self.coalesce()
+        self.assignment()
+    }
+
+    fn assignment(&mut self) -> Result<Expr, AsError> {
+        let target = self.coalesce()?;
+
+        // Map a compound-assignment token to the binary op it desugars to.
+        let compound = match self.peek() {
+            Tok::Eq => None,
+            Tok::PlusEq => Some(BinOp::Add),
+            Tok::MinusEq => Some(BinOp::Sub),
+            Tok::StarEq => Some(BinOp::Mul),
+            Tok::SlashEq => Some(BinOp::Div),
+            _ => return Ok(target),
+        };
+        self.advance(); // consume the assignment operator
+        let value = self.assignment()?; // right-associative
+
+        let name = match &target.kind {
+            ExprKind::Ident(name) => name.clone(),
+            _ => return Err(AsError::at("invalid assignment target", target.span)),
+        };
+
+        // For `x += e`, desugar the value to `x + e` (a fresh Binary over the
+        // target identifier and the rhs), preserving spans for diagnostics.
+        let span = Span::new(target.span.start, value.span.end);
+        let value = match compound {
+            None => value,
+            Some(op) => {
+                let target_ident = Expr {
+                    kind: ExprKind::Ident(name.clone()),
+                    span: target.span,
+                };
+                Self::make_binary(target_ident, op, value)
+            }
+        };
+
+        Ok(Expr {
+            kind: ExprKind::Assign { name, value: Box::new(value) },
+            span,
+        })
     }
 
     /// Build a left-associative binary node from an already-parsed left side.
@@ -320,6 +360,21 @@ mod tests {
     #[test]
     fn not_is_unary() {
         assert_eq!(sexpr("!a"), "(! a)");
+    }
+
+    #[test]
+    fn parses_assignment() {
+        assert_eq!(sexpr("x = 5"), "(= x 5)");
+    }
+
+    #[test]
+    fn assignment_is_right_associative() {
+        assert_eq!(sexpr("x = y = 1"), "(= x (= y 1))");
+    }
+
+    #[test]
+    fn compound_assignment_desugars() {
+        assert_eq!(sexpr("x += 2"), "(= x (+ x 2))");
     }
 
     #[test]

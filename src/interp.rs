@@ -2,7 +2,7 @@
 //! the event-loop seam from spec §7, even though the skeleton never suspends.
 
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, UnOp};
-use crate::env::Environment;
+use crate::env::{AssignError, Environment};
 use crate::error::AsError;
 use crate::value::Value;
 use async_recursion::async_recursion;
@@ -48,6 +48,20 @@ impl Interp {
             ExprKind::Ident(name) => env
                 .get(name)
                 .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span)),
+            ExprKind::Assign { name, value } => {
+                let v = self.eval_expr(value, env).await?;
+                match env.assign(name, v.clone()) {
+                    Ok(()) => Ok(v),
+                    Err(AssignError::Undefined) => Err(AsError::at(
+                        format!("cannot assign to undefined variable '{}'", name),
+                        expr.span,
+                    )),
+                    Err(AssignError::Immutable) => Err(AsError::at(
+                        format!("cannot assign to immutable binding '{}'", name),
+                        expr.span,
+                    )),
+                }
+            }
             ExprKind::Unary { op, expr: operand } => {
                 let v = self.eval_expr(operand, env).await?;
                 match op {
@@ -231,5 +245,35 @@ mod tests {
         let env = Environment::global();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "1\n");
+    }
+
+    #[tokio::test]
+    async fn assignment_updates_a_mutable_binding() {
+        let src = "let x = 1\nx = x + 4\nprint(x)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\n");
+    }
+
+    #[tokio::test]
+    async fn compound_assignment_runs() {
+        let src = "let x = 10\nx *= 3\nprint(x)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "30\n");
+    }
+
+    #[tokio::test]
+    async fn assigning_to_const_errors() {
+        let src = "const x = 1\nx = 2";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("immutable"));
     }
 }

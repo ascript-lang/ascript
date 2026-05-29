@@ -33,6 +33,10 @@ pub enum Tok {
     Semicolon,
     Let,
     Const,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
     Eof,
 }
 

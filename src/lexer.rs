@@ -19,11 +19,30 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
         }
 
         match c {
-            '+' => push(&mut tokens, Tok::Plus, start, &mut i),
-            '-' => push(&mut tokens, Tok::Minus, start, &mut i),
+            '+' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::PlusEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Plus, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
+            '-' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::MinusEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Minus, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
             '*' => {
                 if i + 1 < chars.len() && chars[i + 1] == '*' {
                     tokens.push(Token { tok: Tok::StarStar, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::StarEq, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {
                     tokens.push(Token { tok: Tok::Star, span: Span::new(start, start + 1) });
@@ -93,7 +112,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     ));
                 }
             }
-            '/' => push(&mut tokens, Tok::Slash, start, &mut i),
+            '/' => {
+                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                    tokens.push(Token { tok: Tok::SlashEq, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    tokens.push(Token { tok: Tok::Slash, span: Span::new(start, start + 1) });
+                    i += 1;
+                }
+            }
             '%' => push(&mut tokens, Tok::Percent, start, &mut i),
             '(' => push(&mut tokens, Tok::LParen, start, &mut i),
             ')' => push(&mut tokens, Tok::RParen, start, &mut i),
@@ -222,6 +249,20 @@ mod tests {
                 Tok::Bang, Tok::Ident("a".into()),
                 Tok::Lt, Tok::Ident("b".into()),
                 Tok::Gt, Tok::Ident("c".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_compound_assignment_operators() {
+        assert_eq!(
+            kinds("a += b -= c *= d /= e"),
+            vec![
+                Tok::Ident("a".into()), Tok::PlusEq, Tok::Ident("b".into()),
+                Tok::MinusEq, Tok::Ident("c".into()),
+                Tok::StarEq, Tok::Ident("d".into()),
+                Tok::SlashEq, Tok::Ident("e".into()),
                 Tok::Eof,
             ]
         );
