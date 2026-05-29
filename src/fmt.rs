@@ -68,7 +68,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_expr(out, e, 0);
             out.push('\n');
         }
-        Stmt::Let { name, ty, value, mutable } => {
+        Stmt::Let { name, ty, value, mutable, .. } => {
             indent(out, level);
             out.push_str(if *mutable { "let " } else { "const " });
             out.push_str(name);
@@ -83,7 +83,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             }
             out.push('\n');
         }
-        Stmt::LetDestructure { names, value, mutable } => {
+        Stmt::LetDestructure { names, value, mutable, .. } => {
             indent(out, level);
             out.push_str(if *mutable { "let " } else { "const " });
             out.push('[');
@@ -164,7 +164,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("continue\n");
         }
-        Stmt::Fn { name, params, ret, body, is_async } => {
+        Stmt::Fn { name, params, ret, body, is_async, .. } => {
             indent(out, level);
             if *is_async {
                 out.push_str("async ");
@@ -180,7 +180,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_block(out, body, level);
             out.push('\n');
         }
-        Stmt::Enum { name, variants } => {
+        Stmt::Enum { name, variants, .. } => {
             indent(out, level);
             out.push_str("enum ");
             out.push_str(name);
@@ -191,7 +191,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("}\n");
         }
-        Stmt::Class { name, superclass, methods } => {
+        Stmt::Class { name, superclass, methods, .. } => {
             indent(out, level);
             out.push_str("class ");
             out.push_str(name);

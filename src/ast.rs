@@ -61,6 +61,8 @@ pub enum Type {
 pub struct Param {
     pub name: String,
     pub ty: Option<Type>,
+    /// Span of just the parameter name (for LSP go-to-definition).
+    pub name_span: Span,
 }
 
 impl std::fmt::Display for Type {
@@ -108,8 +110,25 @@ pub enum ArrowBody {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Expr(Expr),
-    Let { name: String, ty: Option<Type>, value: Option<Expr>, mutable: bool },
-    LetDestructure { names: Vec<String>, value: Expr, mutable: bool },
+    /// `span` covers the whole declaration; `name_span` covers just the bound name
+    /// (used by the LSP for symbol selection ranges and go-to-definition).
+    Let {
+        name: String,
+        ty: Option<Type>,
+        value: Option<Expr>,
+        mutable: bool,
+        span: Span,
+        name_span: Span,
+    },
+    /// `name_spans[i]` covers the i-th destructured name; `span` covers the whole
+    /// declaration.
+    LetDestructure {
+        names: Vec<String>,
+        value: Expr,
+        mutable: bool,
+        span: Span,
+        name_spans: Vec<Span>,
+    },
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
@@ -118,9 +137,23 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break,
     Continue,
-    Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt>, is_async: bool },
-    Enum { name: String, variants: Vec<EnumVariantDecl> },
-    Class { name: String, superclass: Option<String>, methods: Vec<MethodDecl> },
+    Fn {
+        name: String,
+        params: Vec<Param>,
+        ret: Option<Type>,
+        body: Vec<Stmt>,
+        is_async: bool,
+        span: Span,
+        name_span: Span,
+    },
+    Enum { name: String, variants: Vec<EnumVariantDecl>, span: Span, name_span: Span },
+    Class {
+        name: String,
+        superclass: Option<String>,
+        methods: Vec<MethodDecl>,
+        span: Span,
+        name_span: Span,
+    },
     Import { names: ImportNames, source: String },
     Export(Box<Stmt>),
 }
@@ -138,6 +171,10 @@ pub struct MethodDecl {
     pub ret: Option<Type>,
     pub body: Vec<Stmt>,
     pub is_async: bool,
+    /// Span of the method (for LSP symbol range).
+    pub span: Span,
+    /// Span of just the method name (for LSP selection range).
+    pub name_span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +189,8 @@ pub struct MatchArm {
 pub struct EnumVariantDecl {
     pub name: String,
     pub value: Option<Expr>,
+    /// Span of the variant name (for LSP selection range).
+    pub name_span: Span,
 }
 
 #[derive(Clone, Copy, Debug)]

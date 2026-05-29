@@ -157,9 +157,18 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 
 ## Phase 4 — Tooling completion
 
-- ⬜ **M16 — Language Server.** `ascript lsp` (tower-lsp) over the shared front-end +
-  the conformance-tested Tree-sitter grammar. Reuses the `SourceInfo`/ariadne
-  groundwork from M9.
+- ✅ **M16 — Language Server.** `ascript lsp` (tower-lsp, feature `lsp`, default-on) over the
+  SHARED lexer/parser/AST (no second front-end): inline diagnostics (lex/parse errors with
+  UTF-16-correct ranges), document symbols (fn/class+methods/enum+variants/const/let), completion
+  (keywords + builtins + `std/*` module paths in import context + namespace-import exports after
+  `alias.`), hover (keyword/builtin/decl markdown), go-to-definition (params → local lets →
+  top-level decls). **Static-analysis only** (never runs the interpreter) → `Send+Sync` Backend
+  (`Mutex<HashMap<Url,String>>`, no `Rc`/`Value`), runs on the current-thread runtime. Added
+  `span`/`name_span` to AST declaration nodes + `Param.name_span` (purely additive — every match
+  site uses `..`, zero behavior change). A real end-to-end protocol smoke test spawns `ascript lsp`
+  and drives initialize→didOpen→publishDiagnostics→documentSymbol→hover→shutdown over framed
+  JSON-RPC (bounded against hangs). 509 lib + 21 cli + 1 lsp + 2 frontend + 5 module + 2 conformance
+  (540 default; 245 `--no-default`). Merged. Plan: `plans/2026-05-29-ascript-m16-lsp.md`.
 
 ---
 
@@ -463,7 +472,31 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   reviewer per task + holistic) → merge --no-ff; cfg-gated features + dual-config builds; Value::Native
   for handles; Tier-1/Tier-2; `run`/`run_err` + in-process fixtures; capstone example + conformance.
 
-## Roadmap status: M1–M15 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 NEARLY COMPLETE (M10–M15 done). Remaining: M16 (LSP) — the FINAL milestone.**
+## Roadmap status: M1–M16 ✅ ALL MERGED. **🎉 THE ENTIRE SPEC (§§2–16) IS IMPLEMENTED. 🎉**
+
+AScript is **complete** per `specs/2026-05-29-ascript-design.md`:
+- **Language (§§2–9):** lexer (incl. hex/binary/scientific/underscore number literals, single+double+
+  template strings with escapes), precedence-climbing parser, async tree-walking interpreter; full
+  operator set incl. range `..`; `let`/`const` (with destructuring + uninitialized); control flow;
+  functions/closures/arrows; arrays/objects/maps/bytes; optional chaining + `??`; the two-tier
+  error model (`Ok`/`Err`/`?`/`assert`/panic/`recover`); gradual runtime-checked type contracts
+  (incl. `map<K,V>`); classes+inheritance+`super`/`self`; enums; `match`; ESM modules.
+- **Tooling (§10):** `run`/`repl`/`fmt`/`test`/`lsp` CLI; ariadne source-pointing diagnostics; the
+  conformance-tested Tree-sitter grammar; a differential front-end-conformance guardrail.
+- **Standard library (§11):** all 28 `std/*` modules across data/text, serialization/encoding,
+  time/locale, system (incl. the `Value::Native` resource-handle mechanism), async I/O (the full
+  §11.5 modern HTTP client + server + TCP + WebSocket), and terminal UI.
+
+**540 tests pass** (default features); **245** with `--no-default-features`; `cargo clippy
+--all-targets` clean in both configs. Everything is unit- and example/integration-tested,
+production quality, spec-compliant, merged to `main`. **Documented deferrals** (the only non-default
+items, each justified + owner-noted): HTTP/3 (Cargo feature `http3`, default-off; needs
+`RUSTFLAGS=--cfg reqwest_unstable`); HTTP response trailers (best-effort — reqwest high-level API);
+SOCKS proxy (reqwest `socks` feature, shipped); pragmatic subsets of `icu` (intl) and `crossterm`-
+over-`ratatui` (tui); LSP cross-file goto-def/rename/incremental-sync (per-document analysis ships).
+Nothing else remains.
+
+## Previous status: M1–M15 ✅ merged. PHASE 1 COMPLETE; PHASE 2 (M10–M15) done.
 The AScript language (spec §§2–9) + tooling (§10: diagnostics, REPL, fmt, test,
 Tree-sitter conformance) + async/await surface (§7) are fully implemented, unit- and
 example-tested, clippy-clean, and merged to `main`. Remaining: Phase 2+ standard
