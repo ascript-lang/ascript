@@ -129,10 +129,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     tokens.push(Token { tok: Tok::DotDot, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {
-                    return Err(AsError::at(
-                        "unexpected character '.' (member access arrives in Milestone 4)",
-                        Span::new(start, start + 1),
-                    ));
+                    tokens.push(Token { tok: Tok::Dot, span: Span::new(start, start + 1) });
+                    i += 1;
                 }
             }
             '%' => push(&mut tokens, Tok::Percent, start, &mut i),
@@ -140,6 +138,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
             ')' => push(&mut tokens, Tok::RParen, start, &mut i),
             ',' => push(&mut tokens, Tok::Comma, start, &mut i),
             ';' => push(&mut tokens, Tok::Semicolon, start, &mut i),
+            ':' => push(&mut tokens, Tok::Colon, start, &mut i),
             '{' => push(&mut tokens, Tok::LBrace, start, &mut i),
             '}' => push(&mut tokens, Tok::RBrace, start, &mut i),
             '[' => push(&mut tokens, Tok::LBracket, start, &mut i),

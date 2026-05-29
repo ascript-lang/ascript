@@ -242,9 +242,33 @@ impl Interp {
                             .cloned()
                             .ok_or_else(|| AsError::at(format!("index {} out of bounds (len {})", i, arr.len()), expr.span))
                     }
-                    _ => Err(AsError::at("cannot index a non-array value", object.span)),
+                    Value::Object(map) => match idx {
+                        Value::Str(key) => Ok(map.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)),
+                        _ => Err(AsError::at("object index must be a string", expr.span)),
+                    },
+                    _ => Err(AsError::at("cannot index this value", object.span)),
                 }
             }
+            ExprKind::Object(entries) => {
+                let mut map = indexmap::IndexMap::with_capacity(entries.len());
+                for (k, v) in entries {
+                    let value = self.eval_expr(v, env).await?;
+                    map.insert(k.clone(), value);
+                }
+                Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(map))))
+            }
+            ExprKind::Member { object, name } => {
+                let obj = self.eval_expr(object, env).await?;
+                self.read_member(&obj, name, object.span)
+            }
+        }
+    }
+
+    fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
+        match obj {
+            Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
+            Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
+            _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
     }
 
@@ -321,7 +345,24 @@ impl Interp {
                         arr[i] = value.clone();
                         Ok(value)
                     }
+                    Value::Object(map) => match idx {
+                        Value::Str(key) => {
+                            map.borrow_mut().insert(key.to_string(), value.clone());
+                            Ok(value)
+                        }
+                        _ => Err(AsError::at("object index must be a string", target.span)),
+                    },
                     _ => Err(AsError::at("cannot index-assign a non-array value", object.span)),
+                }
+            }
+            ExprKind::Member { object, name } => {
+                let obj = self.eval_expr(object, env).await?;
+                match obj {
+                    Value::Object(map) => {
+                        map.borrow_mut().insert(name.clone(), value.clone());
+                        Ok(value)
+                    }
+                    _ => Err(AsError::at(format!("cannot set property '{}' on this value", name), object.span)),
                 }
             }
             _ => Err(AsError::at("invalid assignment target", target.span)),
@@ -699,5 +740,35 @@ mod tests {
         let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("out of bounds"));
+    }
+
+    #[tokio::test]
+    async fn object_literal_member_and_computed_access() {
+        let src = "let o = { name: \"Ada\", age: 36 }\nprint(o.name)\nprint(o[\"age\"])\nprint(o.missing)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "Ada\n36\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn member_and_computed_assignment() {
+        let src = "let o = { a: 1 }\no.b = 2\no[\"c\"] = 3\nprint(o.a + o.b + o.c)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "6\n");
+    }
+
+    #[tokio::test]
+    async fn member_of_nil_errors() {
+        let src = "let x = nil\nprint(x.foo)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("cannot read property 'foo' of nil"));
     }
 }

@@ -4,6 +4,7 @@
 
 use crate::ast::Stmt;
 use crate::env::Environment;
+use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
@@ -27,6 +28,7 @@ pub enum Value {
     /// A user-defined function carrying its closure environment.
     Function(Rc<Function>),
     Array(Rc<RefCell<Vec<Value>>>),
+    Object(Rc<RefCell<IndexMap<String, Value>>>),
 }
 
 impl Value {
@@ -49,6 +51,7 @@ impl PartialEq for Value {
             // Functions compare by identity.
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -66,6 +69,7 @@ impl fmt::Debug for Value {
                 write!(f, "Function({})", func.name.as_deref().unwrap_or("<anonymous>"))
             }
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
+            Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
         }
     }
 }
@@ -103,6 +107,24 @@ impl Value {
                     v.write_element(f, seen)?;
                 }
                 write!(f, "]")?;
+                seen.pop();
+                Ok(())
+            }
+            Value::Object(o) => {
+                let ptr = Rc::as_ptr(o) as usize;
+                if seen.contains(&ptr) {
+                    return write!(f, "{{...}}");
+                }
+                seen.push(ptr);
+                write!(f, "{{")?;
+                for (i, (k, v)) in o.borrow().iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: ", k)?;
+                    v.write_element(f, seen)?;
+                }
+                write!(f, "}}")?;
                 seen.pop();
                 Ok(())
             }
@@ -168,5 +190,19 @@ mod tests {
         let b = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])));
         assert_ne!(a, b);
         assert!(a.is_truthy());
+    }
+
+    #[test]
+    fn objects_display_and_compare_by_identity() {
+        use indexmap::IndexMap;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut m = IndexMap::new();
+        m.insert("a".to_string(), Value::Number(1.0));
+        m.insert("b".to_string(), Value::Str("x".into()));
+        let o = Value::Object(Rc::new(RefCell::new(m)));
+        assert_eq!(o.to_string(), "{a: 1, b: \"x\"}");
+        assert_eq!(o.clone(), o);
+        assert!(o.is_truthy());
     }
 }

@@ -492,6 +492,20 @@ impl<'a> Parser<'a> {
                         span,
                     };
                 }
+                Tok::Dot => {
+                    self.advance();
+                    let name = match self.advance() {
+                        Tok::Ident(name) => name,
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected a property name after '.', found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    };
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Member { object: Box::new(expr), name }, span };
+                }
                 _ => break,
             }
         }
@@ -528,6 +542,34 @@ impl<'a> Parser<'a> {
                 let span = Span::new(tok_span.start, self.prev_end());
                 return Ok(Expr { kind: ExprKind::Array(items), span });
             }
+            Tok::LBrace => {
+                let mut entries = Vec::new();
+                if *self.peek() != Tok::RBrace {
+                    loop {
+                        let key = match self.advance() {
+                            Tok::Ident(name) => name,
+                            Tok::Str(s) => s,
+                            other => {
+                                return Err(AsError::at(
+                                    format!("expected object key, found {:?}", other),
+                                    self.tokens[self.pos - 1].span,
+                                ))
+                            }
+                        };
+                        self.eat(&Tok::Colon)?;
+                        let value = self.expr()?;
+                        entries.push((key, value));
+                        if *self.peek() == Tok::Comma {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat(&Tok::RBrace)?;
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Object(entries), span });
+            }
             other => return Err(AsError::at(format!("unexpected token {:?}", other), tok_span)),
         };
         Ok(Expr { kind, span: tok_span })
@@ -536,7 +578,10 @@ impl<'a> Parser<'a> {
 
 /// Whether an expression can be the target of an assignment.
 fn is_assignable(expr: &Expr) -> bool {
-    matches!(expr.kind, ExprKind::Ident(_) | ExprKind::Index { .. })
+    matches!(
+        expr.kind,
+        ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::Member { .. }
+    )
 }
 
 #[cfg(test)]
@@ -622,6 +667,11 @@ mod tests {
     #[test]
     fn parenthesized_non_arrow_still_works() {
         assert_eq!(sexpr("(1 + 2) * 3"), "(* (+ 1 2) 3)");
+    }
+
+    #[test]
+    fn parses_object_and_member() {
+        assert_eq!(sexpr("({a: 1}).a"), "(. {a: 1} a)");
     }
 
     #[test]

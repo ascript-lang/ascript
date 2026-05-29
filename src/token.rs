@@ -52,6 +52,8 @@ pub enum Tok {
     FatArrow,
     LBracket,
     RBracket,
+    Dot,
+    Colon,
     Eof,
 }
 

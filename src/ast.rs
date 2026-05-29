@@ -24,6 +24,8 @@ pub enum ExprKind {
     Arrow { params: Vec<String>, body: Box<ArrowBody> },
     Array(Vec<Expr>),
     Index { object: Box<Expr>, index: Box<Expr> },
+    Object(Vec<(String, Expr)>),
+    Member { object: Box<Expr>, name: String },
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +129,17 @@ impl fmt::Display for ExprKind {
                 write!(f, "]")
             }
             ExprKind::Index { object, index } => write!(f, "(index {} {})", object, index),
+            ExprKind::Object(entries) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
+            ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
         }
     }
 }
