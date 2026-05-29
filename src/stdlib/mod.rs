@@ -8,6 +8,8 @@ pub mod array;
 pub mod bytes;
 pub mod convert;
 #[cfg(feature = "data")]
+pub mod csv;
+#[cfg(feature = "data")]
 pub mod encoding;
 #[cfg(feature = "data")]
 pub mod json;
@@ -50,6 +52,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/regex" => regex::exports(),
         #[cfg(feature = "data")]
         "std/uuid" => uuid::exports(),
+        #[cfg(feature = "data")]
+        "std/csv" => csv::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -80,6 +84,8 @@ impl Interp {
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "data")]
             "uuid" => uuid::call(func, args, span),
+            #[cfg(feature = "data")]
+            "csv" => csv::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

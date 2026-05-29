@@ -1263,6 +1263,18 @@ mod tests {
         assert_eq!(run("import * as uuid from \"std/uuid\"\nprint(len(uuid.v4()))").await, "36\n");
     }
 
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_csv_end_to_end() {
+        let src = "import * as csv from \"std/csv\"\n\
+                   let [rows, err] = csv.parse(\"name,age\\nAda,36\\nAlan,41\")\n\
+                   print(rows[1][0])\n\
+                   print(rows[2][1])\n\
+                   let [text, e2] = csv.stringify([[\"a\", \"b\"], [1, 2]])\n\
+                   print(text)";
+        assert_eq!(run(src).await, "Ada\n41\na,b\n1,2\n\n");
+    }
+
     #[tokio::test]
     async fn user_can_shadow_builtins() {
         assert_eq!(run("let len = 5\nprint(len)").await, "5\n");
