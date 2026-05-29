@@ -144,6 +144,12 @@ pub enum NativeKind {
     // M14 std/net/ws: an accept-based WebSocket server listener (binds a TcpListener;
     // `accept()` performs the handshake → WsConnection). Carries a `port` field.
     WsListener,
+    // M15 std/tui: a terminal handle owning the back/flushed screen buffers, the
+    // cursor position, and the active raw/alt-screen flags. Methods: size/clear/
+    // moveCursor/enterRaw/leaveRaw/enterAltScreen/leaveAltScreen/showCursor/draw
+    // (setCell/text/hline/vline/box/fill)/flush/pollEvent/readEvent/restore/close.
+    // Registered only under feature `tui`.
+    Terminal,
 }
 
 impl NativeKind {
@@ -164,6 +170,7 @@ impl NativeKind {
             NativeKind::HttpNext => "httpNext",
             NativeKind::WsConnection => "wsConnection",
             NativeKind::WsListener => "wsListener",
+            NativeKind::Terminal => "terminal",
         }
     }
 }

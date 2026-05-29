@@ -157,6 +157,10 @@ pub(crate) enum ResourceState {
     // `accept()` does the TCP accept + WebSocket handshake → WsConnection).
     #[cfg(feature = "net")]
     WsListener(tokio::net::TcpListener),
+    // M15 std/tui: a terminal handle's screen buffers + cursor + raw/alt flags.
+    // Boxed to keep the `ResourceState` enum compact (the two buffers are sizeable).
+    #[cfg(feature = "tui")]
+    Terminal(Box<crate::stdlib::tui::TerminalState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -381,6 +385,17 @@ impl Interp {
     pub(crate) fn ws_listener_mut(&mut self, id: u64) -> Option<&mut tokio::net::TcpListener> {
         match self.resources.get_mut(&id) {
             Some(ResourceState::WsListener(l)) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a `Terminal` handle's screen state behind a handle id,
+    /// or `None` once the handle was closed (`restore`/`close` removes it) — the
+    /// caller turns `None` into the "use after close" Tier-2 panic.
+    #[cfg(feature = "tui")]
+    pub(crate) fn terminal_mut(&mut self, id: u64) -> Option<&mut crate::stdlib::tui::TerminalState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::Terminal(s)) => Some(s.as_mut()),
             _ => None,
         }
     }
@@ -1103,6 +1118,12 @@ impl Interp {
             }
             if matches!(m.receiver.kind, WsConnection | WsListener) {
                 return self.call_ws_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "tui")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::Terminal) {
+                return self.call_terminal_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())

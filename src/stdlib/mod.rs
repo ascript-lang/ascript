@@ -44,6 +44,8 @@ pub mod regex;
 pub mod sqlite;
 pub mod string;
 pub mod time;
+#[cfg(feature = "tui")]
+pub mod tui;
 #[cfg(feature = "data")]
 pub mod toml;
 #[cfg(feature = "data")]
@@ -112,6 +114,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/toml" => toml::exports(),
         #[cfg(feature = "data")]
         "std/yaml" => yaml::exports(),
+        #[cfg(feature = "tui")]
+        "std/tui" => tui::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -173,6 +177,8 @@ impl Interp {
             "toml" => toml::call(func, args, span),
             #[cfg(feature = "data")]
             "yaml" => yaml::call(func, args, span),
+            #[cfg(feature = "tui")]
+            "tui" => self.call_tui(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
