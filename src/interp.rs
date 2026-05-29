@@ -2064,6 +2064,16 @@ print(r[1])
     }
 
     #[tokio::test]
+    async fn std_string_end_to_end() {
+        let src = "import * as string from \"std/string\"\n\
+                   print(string.upper(\"hi\"))\n\
+                   print(string.join(string.split(\"a-b-c\", \"-\"), \"+\"))\n\
+                   print(string.format(\"{}={}\", \"x\", 9))\n\
+                   print(string.padStart(\"5\", 3, \"0\"))";
+        assert_eq!(run(src).await, "HI\na+b+c\nx=9\n005\n");
+    }
+
+    #[tokio::test]
     async fn named_import_from_std() {
         let out = run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))").await;
         assert_eq!(out, "12\n7\n");

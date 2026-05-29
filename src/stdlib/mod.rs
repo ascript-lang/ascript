@@ -5,6 +5,7 @@
 //! are ordinary `function` values; argument-type misuse is a Tier-2 panic.
 
 pub mod math;
+pub mod string;
 
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
@@ -22,6 +23,7 @@ pub(crate) fn bi(qualified: &str) -> Value {
 pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
         "std/math" => math::exports(),
+        "std/string" => string::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -38,6 +40,7 @@ impl Interp {
     ) -> Result<Value, Control> {
         match module {
             "math" => math::call(func, args, span),
+            "string" => string::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -58,7 +61,6 @@ pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Contr
 
 // Used by the string/array/object modules landing later in M10; the contract
 // (type-error message shape) is defined here so all modules stay consistent.
-#[allow(dead_code)]
 pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, Control> {
     match v {
         Value::Str(s) => Ok(s.clone()),
@@ -66,7 +68,6 @@ pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, C
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn want_array(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cell::RefCell<Vec<Value>>>, Control> {
     match v {
         Value::Array(a) => Ok(a.clone()),
@@ -85,7 +86,6 @@ pub(crate) fn want_object(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::ce
 /// Resolve a possibly-negative index against a length, clamping into `0..=len`.
 /// Negative counts from the end. Fractional inputs truncate toward zero (e.g.
 /// `slice(1.9)` → index 1). Used by string/array `slice`.
-#[allow(dead_code)]
 pub(crate) fn clamp_index(i: f64, len: usize) -> usize {
     if i < 0.0 {
         let from_end = len as f64 + i;
