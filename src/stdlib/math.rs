@@ -112,4 +112,11 @@ mod tests {
         let e = call("sqrt", &[Value::Str("x".into())], Span::new(0, 0));
         assert!(matches!(e, Err(Control::Panic(_))));
     }
+
+    #[test]
+    fn min_max_zero_args_panic() {
+        let sp = Span::new(0, 0);
+        assert!(matches!(call("min", &[], sp), Err(Control::Panic(_))));
+        assert!(matches!(call("max", &[], sp), Err(Control::Panic(_))));
+    }
 }

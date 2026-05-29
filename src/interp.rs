@@ -58,11 +58,13 @@ pub fn global_env() -> Environment {
 }
 
 /// Build a `[value, err]` Result pair.
+// pub(crate): used by std/* modules (std/convert) later in M10.
 pub(crate) fn make_pair(value: Value, err: Value) -> Value {
     Value::Array(Rc::new(RefCell::new(vec![value, err])))
 }
 
 /// Build an error object `{ message: <msg> }`.
+// pub(crate): used by std/* modules (std/convert) later in M10.
 pub(crate) fn make_error(msg: Value) -> Value {
     let mut map = indexmap::IndexMap::new();
     map.insert("message".to_string(), msg);
@@ -694,6 +696,7 @@ impl Interp {
         }
     }
 
+    // pub(crate): used by std/* modules (std/array callbacks) later in M10.
     #[async_recursion(?Send)]
     pub(crate) async fn call_value(&mut self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
         match callee {
@@ -2070,5 +2073,11 @@ print(r[1])
     async fn unknown_std_module_errors() {
         let err = run_err("import { x } from \"std/nope\"").await;
         assert!(err.message.contains("unknown standard library module"));
+    }
+
+    #[tokio::test]
+    async fn std_module_import_is_cached() {
+        let out = run("import * as m1 from \"std/math\"\nimport { abs } from \"std/math\"\nprint(m1.floor(3.7))\nprint(abs(-2))").await;
+        assert_eq!(out, "3\n2\n");
     }
 }

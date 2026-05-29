@@ -56,6 +56,8 @@ pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Contr
     }
 }
 
+// Used by the string/array/object modules landing later in M10; the contract
+// (type-error message shape) is defined here so all modules stay consistent.
 #[allow(dead_code)]
 pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, Control> {
     match v {
@@ -81,7 +83,8 @@ pub(crate) fn want_object(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::ce
 }
 
 /// Resolve a possibly-negative index against a length, clamping into `0..=len`.
-/// Negative counts from the end. Used by string/array `slice`.
+/// Negative counts from the end. Fractional inputs truncate toward zero (e.g.
+/// `slice(1.9)` → index 1). Used by string/array `slice`.
 #[allow(dead_code)]
 pub(crate) fn clamp_index(i: f64, len: usize) -> usize {
     if i < 0.0 {
