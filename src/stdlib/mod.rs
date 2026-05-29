@@ -11,6 +11,8 @@ pub mod convert;
 pub mod crypto;
 #[cfg(feature = "datetime")]
 pub mod date;
+#[cfg(feature = "compress")]
+pub mod compress;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "data")]
@@ -70,6 +72,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/encoding" => encoding::exports(),
         #[cfg(feature = "crypto")]
         "std/crypto" => crypto::exports(),
+        #[cfg(feature = "compress")]
+        "std/compress" => compress::exports(),
         #[cfg(feature = "sys")]
         "std/env" => env::exports(),
         #[cfg(feature = "sys")]
@@ -117,6 +121,8 @@ impl Interp {
             "encoding" => encoding::call(func, args, span),
             #[cfg(feature = "crypto")]
             "crypto" => crypto::call(func, args, span),
+            #[cfg(feature = "compress")]
+            "compress" => compress::call(func, args, span),
             #[cfg(feature = "sys")]
             "env" => env::call(func, args, span),
             #[cfg(feature = "sys")]
