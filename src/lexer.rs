@@ -271,22 +271,84 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 }
             }
             c if c.is_ascii_digit() => {
+                // note: leading-dot floats (e.g. `.5`) are intentionally
+                // unsupported — this arm is only entered on a digit, and a
+                // leading `.` is reserved for member access / the `..` range
+                // operator. Write `0.5` instead.
                 let mut j = i;
-                while j < chars.len() && chars[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j + 1 < chars.len() && chars[j] == '.' && chars[j + 1].is_ascii_digit() {
-                    j += 1;
-                    while j < chars.len() && chars[j].is_ascii_digit() {
+                // Hex / binary prefixes must be checked FIRST: `0x..` / `0b..`.
+                // (A bare `0`, `0.5`, `0e1` fall through to the decimal scan.)
+                if chars[i] == '0'
+                    && i + 1 < chars.len()
+                    && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B')
+                {
+                    let radix_char = chars[i + 1];
+                    let (radix, is_digit): (u32, fn(char) -> bool) = match radix_char {
+                        'x' | 'X' => (16, |d| d.is_ascii_hexdigit()),
+                        _ => (2, |d| d == '0' || d == '1'),
+                    };
+                    j = i + 2;
+                    while j < chars.len() && (is_digit(chars[j]) || chars[j] == '_') {
                         j += 1;
                     }
+                    let span = Span::new(i, j);
+                    let digits: String =
+                        chars[i + 2..j].iter().filter(|&&ch| ch != '_').collect();
+                    let label = if radix == 16 {
+                        "invalid hex number literal"
+                    } else {
+                        "invalid binary number literal"
+                    };
+                    if digits.is_empty() {
+                        return Err(AsError::at(label, span));
+                    }
+                    let n = u64::from_str_radix(&digits, radix)
+                        .map_err(|_| AsError::at(label, span))?
+                        as f64;
+                    tokens.push(Token { tok: Tok::Number(n), span });
+                    i = j;
+                } else {
+                    // Decimal / float / scientific: \d[\d_]* (.\d[\d_]*)? ([eE][+-]?\d+)?
+                    let is_dec = |d: char| d.is_ascii_digit() || d == '_';
+                    while j < chars.len() && is_dec(chars[j]) {
+                        j += 1;
+                    }
+                    // Optional fraction — only when `.` is followed by a digit,
+                    // so `0..5` (range) and `a.0` (member) are preserved.
+                    if j + 1 < chars.len() && chars[j] == '.' && chars[j + 1].is_ascii_digit() {
+                        j += 1;
+                        while j < chars.len() && is_dec(chars[j]) {
+                            j += 1;
+                        }
+                    }
+                    // Optional exponent: e/E, optional sign, then a digit run.
+                    if j < chars.len() && matches!(chars[j], 'e' | 'E') {
+                        let after = j + 1;
+                        let exp_ok = if after < chars.len() && chars[after].is_ascii_digit() {
+                            true
+                        } else {
+                            after + 1 < chars.len()
+                                && matches!(chars[after], '+' | '-')
+                                && chars[after + 1].is_ascii_digit()
+                        };
+                        if exp_ok {
+                            j += 1; // consume e/E
+                            if matches!(chars[j], '+' | '-') {
+                                j += 1;
+                            }
+                            while j < chars.len() && chars[j].is_ascii_digit() {
+                                j += 1;
+                            }
+                        }
+                    }
+                    let span = Span::new(i, j);
+                    let text: String = chars[i..j].iter().filter(|&&ch| ch != '_').collect();
+                    let n: f64 = text
+                        .parse()
+                        .map_err(|_| AsError::at("invalid number", span))?;
+                    tokens.push(Token { tok: Tok::Number(n), span });
+                    i = j;
                 }
-                let text: String = chars[i..j].iter().collect();
-                let n: f64 = text
-                    .parse()
-                    .map_err(|_| AsError::at("invalid number", Span::new(i, j)))?;
-                tokens.push(Token { tok: Tok::Number(n), span: Span::new(i, j) });
-                i = j;
             }
             c if c.is_alphabetic() || c == '_' => {
                 let mut j = i;
@@ -495,5 +557,62 @@ mod tests {
     fn unterminated_block_comment_errors() {
         let err = lex("/* oops no end").unwrap_err();
         assert!(err.message.contains("unterminated block comment"));
+    }
+
+    #[test]
+    fn lexes_hex_literals() {
+        assert_eq!(kinds("0xFF"), vec![Tok::Number(255.0), Tok::Eof]);
+        assert_eq!(kinds("0xFF_FF"), vec![Tok::Number(65535.0), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_binary_literals() {
+        assert_eq!(kinds("0b1010"), vec![Tok::Number(10.0), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_scientific_literals() {
+        assert_eq!(kinds("1e9"), vec![Tok::Number(1e9), Tok::Eof]);
+        assert_eq!(kinds("1.5e-3"), vec![Tok::Number(0.0015), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_underscore_separators() {
+        assert_eq!(kinds("1_000"), vec![Tok::Number(1000.0), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_plain_decimals_and_floats() {
+        assert_eq!(kinds("255"), vec![Tok::Number(255.0), Tok::Eof]);
+        assert_eq!(kinds("2.5"), vec![Tok::Number(2.5), Tok::Eof]);
+    }
+
+    #[test]
+    fn range_operator_not_consumed_as_float() {
+        // `0..5` must lex as Number(0), DotDot, Number(5) — not `0.` float.
+        assert_eq!(
+            kinds("0..5"),
+            vec![Tok::Number(0.0), Tok::DotDot, Tok::Number(5.0), Tok::Eof]
+        );
+    }
+
+    #[test]
+    fn member_access_after_ident_unaffected() {
+        assert_eq!(
+            kinds("a.b"),
+            vec![Tok::Ident("a".into()), Tok::Dot, Tok::Ident("b".into()), Tok::Eof]
+        );
+    }
+
+    #[test]
+    fn invalid_hex_literal_errors() {
+        let err = lex("0xZZ").unwrap_err();
+        assert!(err.message.contains("invalid hex number literal"));
+    }
+
+    #[test]
+    fn invalid_binary_literal_errors() {
+        let err = lex("0b2").unwrap_err();
+        assert!(err.message.contains("invalid binary number literal"));
     }
 }

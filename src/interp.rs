@@ -1171,6 +1171,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn number_literals_hex_binary_scientific_underscore() {
+        assert_eq!(
+            run("print(0xFF)\nprint(0b1010)\nprint(1e3)\nprint(1_000)\nprint(0xFF_FF)").await,
+            "255\n10\n1000\n1000\n65535\n"
+        );
+    }
+
+    #[tokio::test]
     async fn map_type_contract_enforced() {
         let ok = run("import * as map from \"std/map\"\nlet m: map<string, number> = map.new()\nmap.set(m, \"a\", 1)\nprint(len(m))").await;
         assert_eq!(ok, "1\n");
