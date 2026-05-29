@@ -55,12 +55,9 @@ default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
-# Task 2 wires `dotenvy` for std/env; Task 3 (fs) adds walkdir/ignore/regex and
-# Task 7 (process) adds the tokio process/io-util/fs features to `sys`.
-sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex"]
-# Wired up by M13 Task 7 (std/process); enables tokio's process plumbing. Empty
-# until then so the cfg-gated `ResourceState::ChildProcess` variant compiles.
-process = ["tokio/process", "tokio/io-util"]
+# Task 2 wires `dotenvy` for std/env; Task 3 (fs) adds walkdir/ignore/regex; Task 7
+# (process, std/process) adds tokio's process + io-util plumbing for subprocesses.
+sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "tokio/process", "tokio/io-util"]
 crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex"]
 compress = ["dep:flate2", "dep:zip"]
 sql = ["dep:rusqlite"]

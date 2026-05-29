@@ -90,11 +90,18 @@ pub(crate) enum ResourceState {
     // statement internally, so there's no re-parse cost). See std/sqlite.
     #[cfg(feature = "sql")]
     SqliteStatement { conn_id: u64, sql: String },
-    // The process child handle requires tokio's `process` feature, wired up by
-    // M13 Task 7 (`std/process`). Gated on `process` so `sys` can ship `std/env`
-    // (Task 2) without pulling tokio/process yet.
-    #[cfg(feature = "process")]
+    // The process child handle requires tokio's `process` feature, which `sys`
+    // enables (M13 Task 7, `std/process`). `spawn` registers the live child plus
+    // its piped stdout/stderr (as `Reader`s) and stdin (as a `Writer`).
+    #[cfg(feature = "sys")]
     ChildProcess(tokio::process::Child),
+    // A streaming reader over one of a spawned child's pipes. `capture` is the
+    // child's capture mode, which decides whether chunks come back as Str or Bytes.
+    #[cfg(feature = "sys")]
+    Reader { reader: crate::stdlib::process::ProcReader, capture: crate::stdlib::process::Capture },
+    // A streaming writer over a spawned child's stdin. `close()`/EOF takes it.
+    #[cfg(feature = "sys")]
+    Writer(tokio::process::ChildStdin),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -173,6 +180,38 @@ impl Interp {
     pub(crate) fn sqlite_conn(&self, id: u64) -> Option<&rusqlite::Connection> {
         match self.resources.get(&id) {
             Some(ResourceState::SqliteConnection(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the live child process behind a handle id (for `wait`/
+    /// `kill`), or `None` if the handle was already taken (`wait`/EOF removes it).
+    #[cfg(feature = "sys")]
+    pub(crate) fn process_child_mut(&mut self, id: u64) -> Option<&mut tokio::process::Child> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::ChildProcess(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a process reader (stdout/stderr pipe) behind a handle id,
+    /// returning the reader and its capture mode together.
+    #[cfg(feature = "sys")]
+    pub(crate) fn proc_reader_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<(&mut crate::stdlib::process::ProcReader, crate::stdlib::process::Capture)> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::Reader { reader, capture }) => Some((reader, *capture)),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a process writer (stdin pipe) behind a handle id.
+    #[cfg(feature = "sys")]
+    pub(crate) fn proc_writer_mut(&mut self, id: u64) -> Option<&mut tokio::process::ChildStdin> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::Writer(w)) => Some(w),
             _ => None,
         }
     }
@@ -838,8 +877,13 @@ impl Interp {
                 return self.call_sqlite_method(&m, args, span).await;
             }
         }
-        // Task 7 adds the `#[cfg(feature = "sys")]` arm routing Child/Reader/Writer
-        // to `call_process_method`. Any other kind has no method.
+        #[cfg(feature = "sys")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, ChildProcess | Reader | Writer) {
+                return self.call_process_method(&m, args, span).await;
+            }
+        }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
     }
 

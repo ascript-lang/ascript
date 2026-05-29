@@ -23,6 +23,8 @@ pub mod env;
 pub mod fs;
 #[cfg(feature = "intl")]
 pub mod intl;
+#[cfg(feature = "sys")]
+pub mod process;
 #[cfg(feature = "data")]
 pub mod json;
 pub mod map;
@@ -80,6 +82,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/env" => env::exports(),
         #[cfg(feature = "sys")]
         "std/fs" => fs::exports(),
+        #[cfg(feature = "sys")]
+        "std/process" => process::exports(),
         #[cfg(feature = "data")]
         "std/regex" => regex::exports(),
         #[cfg(feature = "sql")]
@@ -131,6 +135,8 @@ impl Interp {
             "env" => env::call(func, args, span),
             #[cfg(feature = "sys")]
             "fs" => fs::call(func, args, span),
+            #[cfg(feature = "sys")]
+            "process" => self.call_process(func, args, span).await,
             #[cfg(feature = "data")]
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "sql")]
