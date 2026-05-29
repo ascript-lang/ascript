@@ -1,0 +1,770 @@
+# AScript — Language & Runtime Design Spec
+
+- **Status:** Draft for review
+- **Date:** 2026-05-29
+- **File extension:** `.as`
+- **Runtime:** Rust (single binary `ascript`)
+
+---
+
+## 1. Vision & Design Priorities
+
+AScript is a small, dynamically-typed scripting language with **JavaScript-flavored
+syntax**, a **batteries-included standard library**, and **optional runtime-checked
+type annotations**, executed by a **tree-walking interpreter written in Rust**.
+
+The guiding model is **"Lua-simple language, Go/Deno-class standard library"**:
+
+- The *language core* stays as simple as Lua — a tree-walking interpreter, ~8 value
+  kinds, gradual contracts, no hidden control flow.
+- The *standard library and tooling* are deliberately rich, because Rust's crate
+  ecosystem makes high-quality batteries cheap to include.
+
+Design priorities, in strict order:
+
+1. **Simplicity** — a beginner can hold the whole language in their head.
+2. **Safety** — errors are explicit; mistakes fail loudly, not silently.
+3. **Familiarity** — anyone who knows JavaScript can read AScript immediately.
+4. **Performance** — adequate for scripting; never at the expense of the above.
+
+### Non-goals (v1)
+
+- No static type inference or compile-time type checking (types are runtime contracts).
+- No bytecode VM or JIT (tree-walker only).
+- No multithreading in user code (single-threaded event loop; see §7).
+- No macro system, operator overloading, or metaprogramming.
+- No package manager / registry (deferred to a future spec).
+- No audio or graphics/windowing in v1 — these imply a main-thread windowing event
+  loop that conflicts with the single-threaded Tokio model (§7), plus heavy
+  platform/GPU dependencies. Deferred to a future **"AScript Media"** spec / optional
+  build (see §15).
+- No tagged-union enums with typed payloads — enums are simple named variants only
+  (§8.2); use a class for per-variant data.
+
+---
+
+## 2. Lexical Structure
+
+- **Encoding:** source files are UTF-8.
+- **Comments:** `// line` and `/* block */`.
+- **Statement termination:** newline-terminated with lightweight automatic
+  semicolon insertion (ASI-lite). Explicit `;` is allowed but never required.
+- **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`.
+- **Keywords:** `let const fn return if else while for of in match async await
+  class extends super self enum import export nil true false`.
+- **Literals:**
+  - Numbers: `42`, `3.14`, `1e9`, `0xFF`, `0b1010` (all become one `number` type).
+  - Strings: `"double"`, `'single'`, and template strings `` `hi ${name}` ``.
+  - Booleans: `true`, `false`.
+  - Nil: `nil`.
+  - Array: `[1, 2, 3]`.
+  - Object: `{ key: value, "quoted": 1 }`.
+- **Operators:** `+ - * / % ** == != < <= > >= && || ! ?? ?. = += -= *= /=`
+  plus the Result-propagation postfix `?` (§6) and the range operator `..`.
+
+Every token carries a **source span** (byte offsets + line/col). Spans flow through
+the AST into runtime values where useful, so diagnostics (§10) can point at exact
+source locations.
+
+---
+
+## 3. Syntax Overview
+
+```ascript
+// Bindings
+let count = 0          // mutable
+const name = "Ada"     // immutable (rebind is a compile-time error)
+
+// Functions
+fn add(a, b) { return a + b }
+const double = (x) => x * 2          // arrow, expression body
+const greet  = (who) => { return `hi ${who}` }  // arrow, block body
+
+// Control flow
+if (count > 0) { print("positive") } else { print("non-positive") }
+
+while (count < 3) { count += 1 }
+
+for (item of [10, 20, 30]) { print(item) }   // iterate values
+for (i in 0..10) { print(i) }                // numeric range [0,10)
+
+// match expression (returns a value)
+const label = match count {
+  0       => "zero",
+  1 | 2   => "small",
+  _       => "many",
+}
+```
+
+### Grammar sketch (informal EBNF)
+
+```
+program     := item*
+item        := import | export | statement
+statement   := letDecl | constDecl | fnDecl | classDecl | enumDecl
+             | ifStmt | whileStmt | forStmt
+             | returnStmt | exprStmt | block
+block       := "{" statement* "}"
+exprStmt    := expr
+expr        := assignment
+assignment  := logicOr ( ("=" | "+=" | ...) assignment )?
+logicOr     := logicAnd ( "||" logicAnd )*
+... (standard precedence climbing) ...
+unary       := ("!" | "-") unary | postfix
+postfix     := primary ( call | index | member | "?" )*
+primary     := literal | identifier | "(" expr ")" | arrayLit | objectLit
+             | arrowFn | matchExpr | "await" expr
+```
+
+Precedence (high → low): `() [] . ?` → unary `! -` → `**` → `* / %` →
+`+ -` → comparison → `==`/`!=` → `&&` → `||` → `??` → assignment.
+
+---
+
+## 4. Value Model
+
+AScript has **eight value kinds**:
+
+| Kind | Description | Mutability |
+|---|---|---|
+| `nil` | absence of a value | — |
+| `bool` | `true` / `false` | immutable |
+| `number` | IEEE-754 float64 (one numeric type) | immutable |
+| `string` | immutable UTF-8 text | immutable |
+| `array` | ordered list, `[...]` | mutable, shared by reference |
+| `object` | string-keyed record, `{...}` | mutable, shared by reference |
+| `map` | hash map with arbitrary keys | mutable, shared by reference |
+| `function` | closure (incl. async fns and methods) | immutable |
+
+Class instances are `object` values **tagged** with their class (§8).
+
+**Reference semantics:** `array`, `object`, `map`, and class instances are heap
+values shared by reference (assignment copies the handle, not the contents).
+`nil`, `bool`, `number`, `string` are value-semantic.
+
+**Truthiness:** only `nil` and `false` are falsy. `0`, `""`, `[]`, `{}` are truthy
+(closer to Lua than JS — fewer surprises).
+
+**Equality:** `==` is structural for `string`/`number`/`bool`/`nil`; identity-based
+for `array`/`object`/`map`/`function`. No implicit type coercion across kinds
+(`1 == "1"` is `false`).
+
+**Safe access operators:** reading a field of `nil` or indexing out of bounds with
+`[]` *panics* (Tier 2, §6). Two operators opt into safe, nil-returning access
+instead: optional chaining `obj?.field` evaluates to `nil` when `obj` is `nil`
+(short-circuiting the rest of the chain), and nil-coalescing `a ?? b` evaluates to
+`b` when `a` is `nil`. Together `cfg?.db?.port ?? 5432` reads a deep optional path
+with a default and never panics.
+
+---
+
+## 5. Type System — Gradual, Runtime-Checked Contracts
+
+Type annotations are **optional**. When present, they are enforced **at runtime as
+contracts** (not statically checked, not erased). This keeps the runtime small
+while still catching type mistakes the moment they happen.
+
+```ascript
+fn add(a: number, b: number): number {
+  return a + b
+}
+
+let userName: string = "ada"
+const ids: array<number> = [1, 2, 3]
+```
+
+**Where contracts fire:**
+
+- On a typed `let`/`const` binding (the assigned value is checked).
+- On entry to a typed function parameter.
+- On a typed function's `return`.
+
+**Type grammar:**
+
+```
+type := "number" | "string" | "bool" | "nil" | "any" | "fn"
+      | "array" "<" type ">"
+      | "map" "<" type "," type ">"
+      | "object"
+      | "error"                 // an error object or nil  ( object | nil ), §6
+      | "Result" "<" type ">"   // sugar for the tuple  [ type, error ]
+      | "[" type ("," type)* "]" // fixed-length tuple, e.g. [number, error]
+      | ClassName
+      | EnumName                // an enum type; accepts any of its variants
+      | type "|" type          // union, e.g.  number | nil
+```
+
+`any` disables checking for that position. Omitting an annotation is equivalent to
+`any`. A failed contract is a **programmer bug**, not a recoverable error — it
+**panics** (§6), it does not produce a Result.
+
+**Parametric depth:** a contract is checked *eagerly and to its full declared
+depth* at the check site. `array<number>` verifies the value is an array **and**
+that every current element is a `number`; `map<string, array<number>>` recurses
+likewise. This is O(n) in the collection size at the check point, which is
+acceptable because checks happen only at typed binding/parameter/return sites, not
+on every element access. Use `array` (unparameterized) or `any` to opt out of the
+element scan.
+
+---
+
+## 6. Error Handling — Result Values (Two Tiers)
+
+AScript has **no exceptions** (`throw`/`try`/`catch` do not exist). Errors come in
+two tiers with a sharp boundary.
+
+### Tier 1 — Recoverable errors are *values*
+
+Fallible functions return a two-element pair `[value, err]` (using ordinary array
+destructuring — Go-style multiple returns, JS-shaped):
+
+```ascript
+let [data, err] = readFile("config.toml")
+if (err != nil) {
+  print("failed: " + err.message)
+  return [nil, err]
+}
+use(data)
+```
+
+Helpers:
+
+- `Ok(v)` → `[v, nil]`
+- `Err(msg)` → `[nil, { message: msg }]` (an *error object*: an `object` with at
+  least a `message` field; modules may attach more, e.g. `code`).
+
+**Types:** the annotation `error` means `object | nil` (an error object or its
+absence). `Result<T>` is sugar for the pair type `[T, error]`. So
+`fn load(): Result<object>` is the readable, *correct* way to type a fallible
+function — it permits both `[value, nil]` on success and `[nil, errObj]` on failure,
+which a naive `[object, object]` would wrongly reject under the contract system (§5).
+
+### The `?` propagation operator
+
+The postfix `?` unwraps a Result, returning early from the **enclosing function**
+if the error is non-nil:
+
+```ascript
+fn load(): Result<object> {
+  let data = readFile("config.toml")?   // returns [nil, err] on failure
+  let cfg  = toml.parse(data)?
+  return Ok(cfg)
+}
+```
+
+`expr?` evaluates `expr` to a `[value, err]` pair; if `err != nil` it makes the
+enclosing function `return [nil, err]`, otherwise it evaluates to `value`. Using `?`
+in a function that does not return a Result pair is a compile-time error.
+
+### Tier 2 — Programmer bugs *panic*
+
+Unrecoverable bugs do **not** return Results (that would force every call site to
+check the impossible). Instead they **panic**: unwind to the runtime, print a
+diagnostic + stack trace, and exit non-zero. Panics include:
+
+- A failed type contract (§5).
+- Indexing out of bounds via the *unchecked* accessor `arr[i]`
+  (the checked accessor `arr.get(i)` returns `nil` instead).
+- Calling a non-function, or reading a field of `nil`.
+- An explicit `assert(cond, msg)` failure.
+
+Panics are **not catchable** in normal code — this keeps the value-based model
+honest. A single host/REPL boundary, `recover(fn)`, runs `fn` and converts a panic
+into a Result `[nil, err]`; it exists for the REPL, the test runner, and embedding,
+not for routine control flow.
+
+---
+
+## 7. Concurrency — async/await on a Single-Threaded Event Loop
+
+AScript supports `async fn` and `await`. The implementation (**approach A**) makes
+the interpreter's core `eval` an `async fn` in Rust running on a single-threaded
+Tokio executor, which *is* the event loop:
+
+- A script-level `await expr` maps to a Rust `.await`.
+- Async stdlib functions (I/O, timers, sockets, HTTP, WebSockets) return awaitables
+  that the Tokio runtime drives.
+- Synchronous programs never touch the executor and pay no async cost.
+- User code is **single-threaded** — no data races, so heap values use
+  `Rc<RefCell<…>>` rather than `Arc<Mutex<…>>` (§9).
+
+Async composes with the Result model:
+
+```ascript
+async fn fetchUser(id: number): Result<object> {
+  let resp = await http.get(`https://api.example.com/users/${id}`)?
+  let user = json.parse(resp.body)?
+  return Ok(user)
+}
+```
+
+The top-level program may be `async`; the runtime blocks on it to completion.
+
+---
+
+## 8. Classes & Enums
+
+### 8.1 Classes (JS-style, Single Inheritance)
+
+```ascript
+class Animal {
+  fn init(name) { self.name = name }      // constructor
+  fn speak() { return `${self.name} makes a sound` }
+}
+
+class Dog extends Animal {
+  fn init(name, breed) {
+    super.init(name)
+    self.breed = breed
+  }
+  fn speak() { return super.speak() + " — woof" }
+}
+
+const d = Dog("Rex", "Husky")   // no `new` keyword; class is callable
+print(d.speak())
+```
+
+- `self` is the receiver inside methods.
+- `init` is the constructor; calling `ClassName(args)` allocates an instance,
+  tags it with the class, and runs `init`.
+- Single inheritance via `extends`; `super.method(...)` calls the parent.
+- Method resolution walks the class chain; instance fields shadow nothing
+  (fields and methods share the object namespace, methods found via the class tag).
+- A class name is a valid **type** for contracts (§5): `fn walk(a: Animal) {...}`
+  accepts `Animal` and its subclasses.
+
+### 8.2 Enums (simple, named variants)
+
+An `enum` declares a closed set of named variants. Variants may optionally carry a
+backing value (a `number` or `string`); without one they are opaque, unique values.
+
+```ascript
+enum Color { Red, Green, Blue }                 // opaque variants
+enum Status { Ok = 200, NotFound = 404, Err = 500 }  // number-backed
+enum Mode { Read = "r", Write = "w" }           // string-backed
+```
+
+- **Access:** `Color.Red`, `Status.NotFound`.
+- **Backing value:** `Status.NotFound.value == 404`. Opaque variants have
+  `.value == nil`. The variant's name is available as `.name` (`"NotFound"`).
+- **Equality:** variants are interned singletons — `Color.Red == Color.Red` is
+  `true`, and a variant is never equal to a variant of another enum or to its raw
+  backing value (`Status.Ok == 200` is `false`; compare `.value` for that).
+- **Contracts:** an enum name is a type (§5). `fn paint(c: Color) {...}` panics
+  unless given a `Color` variant.
+- **`match`:** variants are matched by their qualified name, and `_` is the
+  catch-all:
+
+```ascript
+fn describe(c: Color): string {
+  return match c {
+    Color.Red   => "warm",
+    Color.Green => "cool",
+    _           => "other",
+  }
+}
+```
+
+**Representation:** an enum variant is a *tagged value* carrying its enum tag,
+variant name, and optional backing value — built on the same object-tagging
+mechanism as class instances (§8.1), so it adds no new conceptual value kind to §4.
+Enums are intentionally *simple*: no associated typed payloads and no methods
+(tagged-union ADTs are a deliberate non-goal for v1; use a class if you need
+per-variant data or behavior).
+
+---
+
+## 9. Module System — ESM-style
+
+- `export` declarations: `export fn f() {}`, `export const X = 1`,
+  `export class C {}`.
+- Named imports: `import { f, X } from "./util"`.
+- Namespace import: `import * as util from "./util"`.
+- **No default exports** (keeps resolution trivial and unambiguous).
+- One file = one module. Paths are resolved relative to the importing file;
+  `std/*` paths resolve to built-in modules.
+- Each module is **evaluated once** and cached; circular imports resolve to the
+  partially-initialized module (a load-order error if a binding is used before init).
+
+---
+
+## 10. Developer Tooling (shipped in the `ascript` binary)
+
+The single `ascript` binary is multi-command (`clap`-based CLI):
+
+| Command | Purpose | Backing crate(s) |
+|---|---|---|
+| `ascript run file.as` | execute a program | — |
+| `ascript repl` | interactive shell: history, line editing, multi-line input | `reedline`/`rustyline` |
+| `ascript fmt [paths]` | canonical code formatter (idempotent) | own pretty-printer |
+| `ascript test [paths]` | built-in test runner with assertions, runs under `recover()` | own + `recover()` |
+| `ascript lsp` | Language Server: completion, hover, go-to-def, inline diagnostics | `tower-lsp` |
+
+**Rich diagnostics** are a cross-cutting feature, not a command: every error
+(lex/parse/contract/panic) renders as a colored, source-pointing message with
+carets, spans, and hints, using the spans threaded through the pipeline.
+
+- Backing crate: `ariadne` or `miette`.
+- This is the highest-leverage DX investment and is required for v1.
+
+The LSP and `fmt` reuse the same lexer/parser/AST as the interpreter — no second
+front-end.
+
+### 10.1 Tree-sitter Grammar
+
+AScript ships an official **Tree-sitter grammar** as a first-class spec artifact:
+
+- `grammar/tree-sitter-ascript/grammar.js` — the grammar definition.
+- `grammar/tree-sitter-ascript/queries/highlights.scm` — syntax-highlighting
+  queries using standard capture names (`@keyword`, `@function`, `@type`, …).
+- (Future) `queries/locals.scm`, `queries/folds.scm`, `queries/indents.scm`.
+
+**Why a second parser?** This grammar is *separate from* the interpreter's
+recursive-descent parser (§12) by design. Tree-sitter parsers are **error-tolerant
+and incremental** — they keep producing a usable syntax tree mid-edit, even with
+syntax errors — which is exactly what editors and the LSP need. The interpreter's
+parser instead optimizes for precise diagnostics on complete programs. The grammar
+is the **single source of truth for syntax** and MUST stay in lockstep with the
+grammar sketch in §3 and the lexical rules in §2.
+
+**Consumers:**
+
+- Editors with native Tree-sitter support (Neovim, Helix, Zed) — highlighting,
+  structural selection, code folding.
+- The AScript LSP (§10) — semantic tokens and structural navigation can be derived
+  from the Tree-sitter tree, avoiding a bespoke editor parser.
+- `ascript fmt` may optionally use the CST for layout-preserving formatting.
+
+**Known follow-ups (documented in the grammar header):**
+
+- Faithful newline-sensitive automatic semicolon insertion (ASI-lite, §2) needs an
+  external scanner (`scanner.c`); the committed grammar approximates it with
+  optional `;` terminators.
+- A few grammar ambiguities (arrow-fn vs. parenthesized expr, object literal vs.
+  block) are handled via `conflicts`/precedence and may need tuning at
+  `tree-sitter generate` time.
+
+A **conformance test** keeps the two parsers honest: the golden `.as` corpus (§13)
+is parsed by both the interpreter and the generated Tree-sitter parser, and any file
+that one accepts but the other rejects fails CI.
+
+---
+
+## 11. Standard Library
+
+### 11.1 Always-global core
+
+`print`, `len`, `type`, `assert`, `range`, `Ok`, `Err`, `recover`.
+
+### 11.2 Importable modules
+
+Legend: ⚡ = async (returns awaitables); ⬡ = backed by a Rust crate.
+
+**Data & text**
+
+| Module | Contents | Backing |
+|---|---|---|
+| `std/string` | split, join, slice, trim, case, find, replace, format, pad, repeat | — |
+| `std/array` | map, filter, reduce, push, pop, slice, sort, contains, get | — |
+| `std/object` | keys, values, entries, has, delete, merge | — |
+| `std/map` | new, get, set, has, delete, keys, values, entries | — |
+| `std/math` | abs, floor, ceil, round, sqrt, pow, min, max, random, pi, e | — |
+| `std/convert` | parseNumber, parseInt, toString, coercions | — |
+| `std/regex` | compile, test, find, findAll, replace, split | ⬡ `regex` |
+| `std/json` | parse, stringify | ⬡ `serde_json` |
+| `std/csv` | parse, stringify | ⬡ `csv` |
+| `std/toml` | parse, stringify | ⬡ `toml` |
+| `std/yaml` | parse, stringify | ⬡ `serde_yaml` |
+| `std/encoding` | base64, hex, url-encode/decode, utf8↔bytes | ⬡ `base64`, `hex` |
+| `std/bytes` | buffer type, read/write ints, endian handling | — |
+| `std/uuid` | v4 (random), v7 (time-ordered) | ⬡ `uuid` |
+
+**Time & locale**
+
+| Module | Contents | Backing |
+|---|---|---|
+| `std/time` | now, monotonic, sleep ⚡, durations | ⬡ `tokio` (sleep) |
+| `std/date` | civil dates, parse/format, arithmetic, timezones | ⬡ `chrono`/`time` |
+| `std/intl` | locale-aware number/currency/date formatting, case folding, basic collation (pragmatic subset of ICU) | ⬡ trimmed `icu4x` |
+
+**System & data stores**
+
+| Module | Contents | Backing |
+|---|---|---|
+| `std/fs` | read/write/append, exists, stat, mkdir, remove, walk dir, path manipulation, **grep** (recursive content search) | ⬡ `walkdir`, `grep`/`regex`, `ignore` |
+| `std/process` | `run` (one-shot capture) + `spawn` (streaming handle), stdin/stdout/stderr, exit code, signals, cwd/env, timeout — cross-platform (§11.4) | ⬡ `tokio` process |
+| `std/env` | get/set env vars, dotenv loading | ⬡ `dotenvy` |
+| `std/crypto` | sha256/sha512, md5, hmac, random bytes, argon2/bcrypt password hashing | ⬡ RustCrypto / `ring` |
+| `std/compress` | gzip/deflate compress & decompress, zip read/write | ⬡ `flate2`, `zip` |
+| `std/sqlite` | open, exec, query, prepared statements, transactions | ⬡ `rusqlite` |
+
+**Networking & servers** (all ⚡)
+
+| Module | Contents | Backing |
+|---|---|---|
+| `std/net/tcp` | listener + stream (connect, read, write) | ⬡ `tokio` |
+| `std/net/http` | client: get, post, request, headers, body | ⬡ `hyper`/`reqwest` |
+| `std/http/server` | routes, handlers, middleware, params | ⬡ `hyper` |
+| `std/net/ws` | WebSocket client + server | ⬡ `tokio-tungstenite` |
+
+**Terminal UI**
+
+| Module | Contents | Backing |
+|---|---|---|
+| `std/tui` | raw mode, alt screen, screen buffer, key/mouse events, basic widgets & drawing | ⬡ `crossterm`/`ratatui` |
+
+### 11.3 Stdlib design rules
+
+- Networking/server/timer modules return awaitables and ride the §7 event loop.
+- Fallible stdlib functions follow the Tier-1 Result convention (`[value, err]`);
+  misuse (wrong arg type) is a Tier-2 panic via the contract system.
+- Native (Rust-implemented) functions are exposed as ordinary `function` values
+  so they are indistinguishable from user functions at the call site.
+- `fs.grep(pattern, dir, opts?)` performs a recursive content search and returns
+  `[matches, err]`, where each match is `{ path, line, column, text }`. `pattern`
+  is a `std/regex` pattern; `opts` may set `glob` (filename filter), `ignoreCase`,
+  `maxResults`, and `respectGitignore` (default `true`, via the `ignore` crate).
+  It reuses the regex engine and the directory walker rather than introducing a new
+  search stack.
+
+### 11.4 Subprocesses (`std/process`)
+
+Cross-platform (Linux / macOS / Windows) process execution, built on
+`tokio::process` so it rides the §7 event loop. Two entry points share one options
+object: `run` for one-shot capture (the ffmpeg case) and `spawn` for live,
+long-running, or interactive processes.
+
+**Portable by default:** a program plus an explicit **argument list** is passed
+straight to the OS — no shell, no word-splitting, no quoting differences. A shell is
+strictly opt-in.
+
+#### One-shot: `run`
+
+```ascript
+import { run } from "std/process"
+import * as bytes from "std/bytes"
+
+async fn transcode(): Result<object> {
+  // ffmpeg writes MP3 to stdout (pipe:1); capture it as raw bytes.
+  let result = await run("ffmpeg",
+    ["-i", "input.mp4", "-f", "mp3", "pipe:1"],
+    { capture: "bytes", cwd: "/tmp" })?
+
+  if (!result.success) {
+    return Err(`ffmpeg exited ${result.code}: ${result.stderrText}`)
+  }
+  return Ok(result.stdout)   // bytes buffer
+}
+```
+
+`run` resolves to a Tier-1 Result `[result, err]`. **Spawn failure** (binary not
+found, permission denied, timeout) is the `err`. A **non-zero exit is NOT an error**
+— it comes back as a normal `result` with `success == false` (pass `check: true` to
+flip non-zero into an `err`). The `result` object:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `stdout` | `string` or `bytes` | captured stdout (kind set by `capture`) |
+| `stderr` | `string` or `bytes` | captured stderr |
+| `stderrText` | `string` | stderr decoded lossy-UTF-8 (always present, for messages) |
+| `code` | `number \| nil` | exit code; `nil` if terminated by a signal |
+| `signal` | `string \| nil` | terminating signal name on unix (e.g. `"SIGKILL"`); `nil` on Windows |
+| `success` | `bool` | `code == 0` |
+
+#### Options (shared by `run` and `spawn`)
+
+| Option | Default | Notes |
+|---|---|---|
+| `cwd` | inherit | working directory for the child |
+| `env` | inherit | object merged onto the parent env; `null` a key to unset |
+| `clearEnv` | `false` | start from an empty environment instead of inheriting |
+| `stdin` | none | `string` or `bytes` written to the child's stdin then closed (`run` only) |
+| `capture` | `"string"` | `"string"` (lossy UTF-8) · `"bytes"` (raw — use for ffmpeg/binary) · `"inherit"` (child shares our stdio) · `"null"` (discard) |
+| `shell` | `false` | run via `/bin/sh -c` (unix) or `cmd.exe /C` (Windows). Convenience only — the command string is **not portable**; prefer argv |
+| `timeout` | none | milliseconds; on expiry the child is killed and `run` returns a `timeout` `err` |
+| `check` | `false` | when `true`, a non-zero exit becomes a Tier-1 `err` |
+
+#### Streaming / interactive: `spawn`
+
+```ascript
+import { spawn } from "std/process"
+
+async fn tailLogs(): Result<nil> {
+  let child = spawn("tail", ["-f", "/var/log/app.log"], { capture: "string" })?
+
+  let line = await child.stdout.readLine()
+  while (line != nil) {
+    print(line)
+    if (shouldStop()) { child.kill("TERM") ; break }
+    line = await child.stdout.readLine()
+  }
+  let status = await child.wait()      // { code, signal, success }
+  return Ok(nil)
+}
+```
+
+`spawn` returns a Tier-1 Result whose value is a **child handle**:
+
+| Member | Kind | Description |
+|---|---|---|
+| `pid` | `number` | OS process id |
+| `stdin` | writer | `await child.stdin.write(data)`, `child.stdin.close()` (data is `string`/`bytes`) |
+| `stdout` / `stderr` | async reader | `await r.read(n?)` → next chunk or `nil` at EOF; `await r.readLine()`; `await r.readToEnd()`. Chunk type matches `capture` |
+| `wait()` | async | resolves to `{ code, signal, success }` when the child exits |
+| `kill(sig?)` | sync | terminate; `sig` defaults to `"KILL"` (see signals below) |
+
+#### Cross-platform behavior (explicit)
+
+- **Executable lookup** uses the OS `PATH`. On Windows the usual extensions
+  (`.exe`, `.com`) resolve automatically. **`.bat`/`.cmd` scripts on Windows are run
+  through the shell** (a documented consequence of Windows batch handling), so use
+  `shell: true` for them.
+- **Signals:** `kill()` / `kill("KILL")` is forceful everywhere (SIGKILL on unix,
+  `TerminateProcess` on Windows). `kill("TERM")`, `"INT"`, `"HUP"` send the
+  corresponding POSIX signal on unix; **Windows has no POSIX signals**, so any
+  non-KILL signal maps to forceful termination with a documented caveat.
+- **Exit codes:** unix exit codes are `0..255`; a process killed by a signal reports
+  `code == nil` and a non-nil `signal`. Windows exit codes may be larger and
+  `signal` is always `nil`.
+- **Output bytes are returned raw** — `capture: "string"` decodes UTF-8 lossily but
+  does **not** normalize `\r\n`; the caller decides. Use `capture: "bytes"` for any
+  binary payload (images, audio, video) to avoid lossy decoding — this is why the
+  ffmpeg example pipes to `bytes`.
+- **Shell quoting** differs between `/bin/sh` and `cmd.exe`; `shell: true` is
+  therefore inherently non-portable and flagged as such in diagnostics/docs.
+
+The API surface is portable; **portability of the commands themselves is the user's
+responsibility** (e.g. a `bash` script won't run on a stock Windows host). The spec
+documents this boundary rather than hiding it.
+
+---
+
+## 12. Runtime Architecture (Rust)
+
+### 12.1 Pipeline
+
+```
+source(.as)
+  → lexer      → tokens (with spans)
+  → parser     → AST   (with spans)
+  → resolver   → scope + module binding, ?-validity, const checks
+  → interp     → async tree-walking evaluator on the Tokio executor
+```
+
+### 12.2 Crate/module layout (workspace)
+
+| Module / crate | Responsibility |
+|---|---|
+| `ascript-lexer` | tokenization, source spans |
+| `ascript-ast` | AST node definitions |
+| `ascript-parser` | recursive-descent / precedence-climbing parser |
+| `ascript-resolver` | lexical scoping, module graph, static validations |
+| `ascript-value` | `Value` enum, `Rc<RefCell<…>>` heap, equality/truthiness |
+| `ascript-interp` | `async fn eval`, environments, call stack, panic/Result machinery |
+| `ascript-stdlib` | all `std/*` modules (feature-gated by group) |
+| `ascript-diagnostics` | span → rendered error (ariadne/miette) |
+| `ascript-lsp` | language server (tower-lsp) over the shared front-end |
+| `ascript-cli` | the `ascript` binary: run/repl/fmt/test/lsp |
+
+### 12.3 Value representation (sketch)
+
+```rust
+enum Value {
+    Nil,
+    Bool(bool),
+    Number(f64),
+    Str(Rc<str>),
+    Array(Rc<RefCell<Vec<Value>>>),
+    Object(Rc<RefCell<Object>>),   // Object carries optional class tag
+    Map(Rc<RefCell<HashMap<MapKey, Value>>>),
+    Function(Rc<Function>),        // user closure or native fn, sync or async
+}
+```
+
+Single-threaded ⇒ `Rc`/`RefCell`, never `Arc`/`Mutex`.
+
+### 12.4 Dependency feature gating
+
+Stdlib groups are Cargo features (`data`, `net`, `sql`, `tui`, `intl`, `crypto`)
+so an embedder can build a smaller `ascript` without, say, SQLite or TUI.
+
+---
+
+## 13. Testing Strategy
+
+- **Unit tests** per pipeline stage (lexer, parser, resolver) on small inputs.
+- **Golden-file end-to-end suite:** each `examples/*.as` is paired with an expected
+  `stdout` (and expected diagnostic for error cases); the runner executes and diffs.
+- **Tier tests:** assert that recoverable failures produce Results and that
+  programmer bugs panic with the correct diagnostic.
+- **Stdlib tests:** written *in AScript* using the built-in `ascript test` runner,
+  dogfooding the language.
+- **Async tests:** drive timers/sockets/HTTP against in-process loopback servers.
+
+---
+
+## 14. Phased Build Plan
+
+The stdlib is too large for one effort; the spec is implemented in tractable,
+independently-testable phases (each gets its own implementation plan):
+
+1. **Core language + interpreter** — lexer, parser, resolver, async tree-walker,
+   value model, contracts, Result/`?`, panic tier, classes, enums, `match`,
+   modules. Plus `ascript run`, rich diagnostics, REPL, and the **Tree-sitter
+   grammar** (§10.1) authored alongside the syntax with a two-parser conformance
+   test. *(Minimum viable language.)*
+2. **Data & text stdlib** — string, array, object, map, math, convert, regex,
+   json, csv, toml, yaml, encoding, bytes, uuid, time, date, intl. Plus
+   `ascript fmt` and `ascript test`.
+3. **System & data stores** — fs, process, env, crypto, compress, sqlite.
+4. **Async I/O stack** — net/tcp → net/http (client) → http/server → net/ws,
+   built in that dependency order.
+5. **TUI** — std/tui.
+6. **LSP** — `ascript lsp` over the shared front-end.
+
+Phase 1 delivers a usable language; each later phase adds a coherent capability
+band without touching the core.
+
+---
+
+## 15. Open Questions (to revisit, not blocking v1)
+
+- Package manager / dependency resolution (deferred to a separate spec).
+- Whether `map` literals get dedicated syntax or stay constructor-only.
+- Source-map / debugger protocol support.
+- Exact `icu4x` subset boundary for `std/intl`.
+- **"AScript Media" (future spec):** audio (playback/synthesis via `rodio`/`cpal`)
+  and 2D/3D graphics + windowing (via `macroquad`/`pixels`/`wgpu`). Must resolve the
+  main-thread event-loop vs. Tokio-loop interaction before adoption — likely a
+  distinct runtime mode rather than plain stdlib modules.
+
+---
+
+## 16. Example Program (tying it together)
+
+```ascript
+import { get } from "std/net/http"
+import * as json from "std/json"
+
+class WeatherClient {
+  fn init(base: string) { self.base = base }
+
+  async fn current(city: string): Result<object> {
+    let resp = await get(`${self.base}/weather?q=${city}`)?
+    let data = json.parse(resp.body)?
+    return Ok({ city: city, tempC: data.temp })
+  }
+}
+
+async fn main() {
+  const client = WeatherClient("https://api.example.com")
+  let [w, err] = await client.current("Cairo")
+  if (err != nil) {
+    print("error: " + err.message)
+    return
+  }
+  print(`${w.city}: ${w.tempC}°C`)
+}
+
+await main()
+```
