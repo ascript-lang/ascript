@@ -87,7 +87,14 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   `tests/frontend_conformance.rs` (a ~150-snippet differential guardrail). 241 lib + 16
   cli + 2 frontend + 5 module + 2 conformance tests (266 default; 236 `--no-default`).
   Merged. Plan: `plans/2026-05-29-ascript-m11-serialization.md`.
-- ⬜ **M12 — Time & locale.** `std/time`, `std/date`, `std/intl` (pragmatic icu4x).
+- ✅ **M12 — Time & locale.** `std/time` (now/monotonic/sleep⚡/durations — **the first
+  async stdlib fn**, awaits `tokio::time::sleep` via `call_time`, suspension verified),
+  `std/date` (chrono; instants as plain objects, parse/format/arithmetic with month-clamping,
+  offset timezones), `std/intl` (pragmatic `icu` subset — real CLDR number/case/collation;
+  documented currency/date fallbacks per the spec's "trimmed icu4x"). Features `datetime`
+  (chrono) + `intl` (icu) added to default; tokio gained `time`. NO new value kind (dates are
+  objects). 268 lib + 17 cli + 2 frontend + 5 module + 2 conformance (294 default; 244
+  `--no-default`). Merged. Plan: `plans/2026-05-29-ascript-m12-time-locale.md`.
 
 ## Phase 3 — Standard library: system & async
 
@@ -321,7 +328,39 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 - **Front-end is now solid** (numbers/strings/range/let/shadowing all conform to the grammar;
   the differential guardrail catches grammar-vs-parser drift). No known remaining Phase-1 gaps.
 
-## Roadmap status: M1–M11 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10, M11 done).**
+### M13 design guidance (from M12 holistic review — read before planning M13)
+
+- **`std/process` + `std/fs` are the next async area** (after `time.sleep`). The async dispatch
+  pattern is set: an `impl Interp { async fn call_<module> }` registered as
+  `"<module>" => self.call_<module>(...).await` in `call_stdlib` (see `call_time`/`call_array`).
+  `std/process` uses `tokio::process`; `std/fs` can be sync (std::fs) or async (tokio::fs) — the
+  spec lists fs as non-async (no ⚡), so std::fs is fine; process is async.
+- **The §11.4 reader idiom is shared with M14 http streaming.** `spawn`'s child handle exposes
+  `stdout`/`stderr` as async readers with `read(n?)`/`readLine()`/`readToEnd()` (string-or-bytes
+  per `capture`, `nil` at EOF), and `stdin` as a writer. This SAME reader/writer shape is reused
+  by M14's `std/net/http` streaming bodies. **Strongly consider introducing a reusable async
+  reader/writer representation now** (e.g. an object carrying a handle + native methods, or a
+  small dedicated value kind) so M14 inherits it. A child handle / reader is the first stdlib
+  object that owns OS resources + async methods — decide its representation carefully (object
+  with `Value::Builtin` methods bound to an interp-side handle table, vs a new `Value` kind).
+- **`std/fs.grep`** (spec §11.3) returns `[matches, err]` with `{path,line,column,text}`; reuse
+  `std/regex` + a `walkdir`/`ignore` directory walker (respect `.gitignore` by default). Don't
+  build a new search stack.
+- **Features (§12.4):** add `sys`/`fs` (fs/process/env), `crypto` (RustCrypto: sha256/512, md5,
+  hmac, random bytes, argon2/bcrypt), `compress` (flate2 + zip), `sql` (rusqlite). Gate each;
+  add to default so tests run; keep `--no-default-features` building (no new ungated value kind,
+  or cfg-gate it like `Value::Regex`).
+- **`std/env`:** get/set env vars + dotenv loading (`dotenvy`). **`std/process`** cross-platform
+  per §11.4 (run = one-shot capture, spawn = streaming handle; argv-by-default, shell opt-in;
+  capture string/bytes/inherit/null; timeout; signals; exit code/signal). Read §11.4 carefully —
+  it's the most detailed spec section after §11.5 (http).
+- **Patterns to reuse:** shared `want_*` helpers, `ctx` closure, Tier-1 `make_pair`/`make_error`
+  for fallible I/O (a non-zero process exit is NOT an err — it's a normal result with
+  `success==false`; spawn FAILURE is the err — see §11.4), Tier-2 panic for arg-type misuse,
+  cfg-gated registration, `run`/`run_err` test helpers, per-module unit + interp e2e + capstone
+  example + holistic review.
+
+## Roadmap status: M1–M12 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10–M12 done).**
 The AScript language (spec §§2–9) + tooling (§10: diagnostics, REPL, fmt, test,
 Tree-sitter conformance) + async/await surface (§7) are fully implemented, unit- and
 example-tested, clippy-clean, and merged to `main`. Remaining: Phase 2+ standard
