@@ -108,7 +108,7 @@ pub enum ArrowBody {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Expr(Expr),
-    Let { name: String, ty: Option<Type>, value: Expr, mutable: bool },
+    Let { name: String, ty: Option<Type>, value: Option<Expr>, mutable: bool },
     LetDestructure { names: Vec<String>, value: Expr, mutable: bool },
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
@@ -159,6 +159,7 @@ pub enum BinOp {
     Add, Sub, Mul, Div, Mod, Pow,
     Lt, Le, Gt, Ge, Eq, Ne,
     And, Or, Coalesce,
+    Range,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +186,7 @@ impl fmt::Display for BinOp {
             BinOp::And => "&&",
             BinOp::Or => "||",
             BinOp::Coalesce => "??",
+            BinOp::Range => "..",
         };
         write!(f, "{}", s)
     }

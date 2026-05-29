@@ -214,12 +214,21 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::Let { name, ty, value, mutable } => {
-                let v = self.eval_expr(value, env).await?;
-                if let Some(ty) = ty {
-                    if !check_type(&v, ty) {
-                        return Err(contract_panic(ty, &v, value.span));
+                let v = match value {
+                    Some(value) => {
+                        let v = self.eval_expr(value, env).await?;
+                        if let Some(ty) = ty {
+                            if !check_type(&v, ty) {
+                                return Err(contract_panic(ty, &v, value.span));
+                            }
+                        }
+                        v
                     }
-                }
+                    // `let x` / `let x: T` with no initializer binds nil. The type
+                    // annotation is not enforced here: there is no value to check,
+                    // and the language does not contract-check later assignments.
+                    None => Value::Nil,
+                };
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
@@ -465,6 +474,24 @@ impl Interp {
                     _ => {}
                 }
 
+                // Range `a..b`: eager, half-open `array<number>` with step 1,
+                // matching ForRange and the `range()` builtin. Returns an Array,
+                // so it must be handled before the generic "two numbers → Number"
+                // path below.
+                if let BinOp::Range = op {
+                    let (start, end) = match (&l, &r) {
+                        (Value::Number(a), Value::Number(b)) => (*a, *b),
+                        _ => return Err(AsError::at("range bounds must be numbers", expr.span).into()),
+                    };
+                    let mut items = Vec::new();
+                    let mut i = start;
+                    while i < end {
+                        items.push(Value::Number(i));
+                        i += 1.0;
+                    }
+                    return Ok(Value::Array(Rc::new(RefCell::new(items))));
+                }
+
                 // String concatenation: `+` joins two strings.
                 if let BinOp::Add = op {
                     if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
@@ -487,7 +514,8 @@ impl Interp {
                     BinOp::Le => Value::Bool(a <= b),
                     BinOp::Gt => Value::Bool(a > b),
                     BinOp::Ge => Value::Bool(a >= b),
-                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or | BinOp::Coalesce => {
+                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or | BinOp::Coalesce
+                    | BinOp::Range => {
                         unreachable!("handled above")
                     }
                 };
@@ -1193,6 +1221,35 @@ mod tests {
                    let [s, e2] = json.stringify({ a: 1, b: \"hi\" })\n\
                    print(s)";
         assert_eq!(run(src).await, "10\n2\n{\"a\":1,\"b\":\"hi\"}\n");
+    }
+
+    #[tokio::test]
+    async fn range_as_general_expression() {
+        assert_eq!(run("let r = 0..5\nprint(r)").await, "[0, 1, 2, 3, 4]\n");
+        assert_eq!(run("print(2..2)").await, "[]\n");
+        assert_eq!(run("import * as array from \"std/array\"\nprint(array.contains(1..4, 2))").await, "true\n");
+        // for-in over a non-literal range value (array)
+        assert_eq!(run("let r = 0..3\nlet s = 0\nfor (i in r) { s = s + i }\nprint(s)").await, "3\n");
+        // common literal for-in still works (lazy ForRange path)
+        assert_eq!(run("let s = 0\nfor (i in 0..4) { s = s + i }\nprint(s)").await, "6\n");
+        // precedence: .. tighter than comparison, looser than +
+        assert_eq!(run("print(1+1..5)").await, "[2, 3, 4]\n");
+    }
+
+    #[tokio::test]
+    async fn range_bounds_must_be_numbers() {
+        let err = run_err("print(\"a\"..3)").await;
+        assert!(err.message.contains("range bounds must be numbers"));
+    }
+
+    #[tokio::test]
+    async fn let_without_initializer() {
+        assert_eq!(run("let x\nx = 5\nprint(x)").await, "5\n");
+        assert_eq!(run("let y: number\ny = 3\nprint(y)").await, "3\n");
+        // uninitialized reads as nil
+        assert_eq!(run("let z\nprint(z)").await, "nil\n");
+        // const still requires initializer
+        assert!(parse(&lex("const c").unwrap()).is_err());
     }
 
     #[tokio::test]
