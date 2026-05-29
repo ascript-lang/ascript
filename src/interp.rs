@@ -107,6 +107,29 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::ForOf { var, iter, body } => {
+                let iterable = self.eval_expr(iter, env).await?;
+                let items: Vec<Value> = match iterable {
+                    Value::Array(arr) => arr.borrow().clone(),
+                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string().into())).collect(),
+                    other => {
+                        return Err(AsError::at(
+                            format!("value of type {} is not iterable", type_name(&other)),
+                            iter.span,
+                        ))
+                    }
+                };
+                for item in items {
+                    let child = env.child();
+                    child.define(var, item, false).map_err(AsError::new)?;
+                    match self.exec(body, &child).await? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Continue | Flow::Normal => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Return(e) => {
                 let v = match e {
                     Some(e) => self.eval_expr(e, env).await?,
@@ -177,6 +200,13 @@ impl Interp {
                     BinOp::Eq => return Ok(Value::Bool(l == r)),
                     BinOp::Ne => return Ok(Value::Bool(l != r)),
                     _ => {}
+                }
+
+                // String concatenation: `+` joins two strings.
+                if let BinOp::Add = op {
+                    if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
+                        return Ok(Value::Str(format!("{}{}", a, b).into()));
+                    }
                 }
 
                 let (a, b) = match (&l, &r) {
@@ -384,6 +414,19 @@ fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
         Value::Number(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
         Value::Number(_) => Err(AsError::at("array index must be a non-negative integer", span)),
         _ => Err(AsError::at("array index must be a number", span)),
+    }
+}
+
+/// Human-readable type name for diagnostics.
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Nil => "nil",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::Str(_) => "string",
+        Value::Builtin(_) | Value::Function(_) => "function",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -799,5 +842,35 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "7\n");
+    }
+
+    #[tokio::test]
+    async fn for_of_iterates_array() {
+        let src = "let total = 0\nfor (x of [10, 20, 30]) { total += x }\nprint(total)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "60\n");
+    }
+
+    #[tokio::test]
+    async fn for_of_iterates_string_chars() {
+        let src = "let out = \"\"\nfor (c of \"abc\") { out = out + c + \".\" }\nprint(out)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "a.b.c.\n");
+    }
+
+    #[tokio::test]
+    async fn for_of_non_iterable_errors() {
+        let src = "for (x of 42) { print(x) }";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("not iterable"));
     }
 }

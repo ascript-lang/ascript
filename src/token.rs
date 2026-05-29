@@ -55,6 +55,7 @@ pub enum Tok {
     Dot,
     Colon,
     QuestionDot,
+    Of,
     Eof,
 }
 

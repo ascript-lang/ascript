@@ -43,6 +43,7 @@ pub enum Stmt {
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
     ForRange { var: String, start: Expr, end: Expr, body: Vec<Stmt> },
+    ForOf { var: String, iter: Expr, body: Vec<Stmt> },
     Return(Option<Expr>),
     Break,
     Continue,

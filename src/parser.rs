@@ -193,13 +193,26 @@ impl<'a> Parser<'a> {
                 ))
             }
         };
-        self.eat(&Tok::In)?;
-        let start = self.expr()?;
-        self.eat(&Tok::DotDot)?;
-        let end = self.expr()?;
-        self.eat(&Tok::RParen)?;
-        let body = self.block()?;
-        Ok(Stmt::ForRange { var, start, end, body })
+        match self.advance() {
+            Tok::In => {
+                let start = self.expr()?;
+                self.eat(&Tok::DotDot)?;
+                let end = self.expr()?;
+                self.eat(&Tok::RParen)?;
+                let body = self.block()?;
+                Ok(Stmt::ForRange { var, start, end, body })
+            }
+            Tok::Of => {
+                let iter = self.expr()?;
+                self.eat(&Tok::RParen)?;
+                let body = self.block()?;
+                Ok(Stmt::ForOf { var, iter, body })
+            }
+            other => Err(AsError::at(
+                format!("expected 'in' or 'of' in for-loop, found {:?}", other),
+                self.tokens[self.pos - 1].span,
+            )),
+        }
     }
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {

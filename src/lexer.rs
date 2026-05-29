@@ -194,6 +194,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "while" => Tok::While,
                     "for" => Tok::For,
                     "in" => Tok::In,
+                    "of" => Tok::Of,
                     "return" => Tok::Return,
                     "break" => Tok::Break,
                     "continue" => Tok::Continue,
