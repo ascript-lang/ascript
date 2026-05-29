@@ -1130,7 +1130,7 @@ mod tests {
     #[tokio::test]
     async fn len_of_wrong_type_panics() {
         let err = run_err("len(5)").await;
-        assert!(err.message.contains("len"));
+        assert!(err.message.contains("len() expects"));
     }
 
     #[tokio::test]
