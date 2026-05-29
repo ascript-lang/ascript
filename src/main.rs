@@ -43,9 +43,31 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Command::Fmt { .. } => {
-            eprintln!("fmt: implemented in a later step");
-            ExitCode::from(1)
+        Command::Fmt { files } => {
+            let mut code = ExitCode::SUCCESS;
+            for file in &files {
+                match std::fs::read_to_string(file) {
+                    Ok(src) => match ascript::fmt::format_source(&src) {
+                        Ok(formatted) => {
+                            if let Err(e) = std::fs::write(file, &formatted) {
+                                eprintln!("error: could not write {}: {}", file, e);
+                                code = ExitCode::from(1);
+                            } else {
+                                println!("formatted {}", file);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("error: could not format {}: {}", file, e);
+                            code = ExitCode::from(1);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("error: could not read {}: {}", file, e);
+                        code = ExitCode::from(1);
+                    }
+                }
+            }
+            code
         }
         Command::Test { .. } => {
             eprintln!("test: implemented in a later step");
