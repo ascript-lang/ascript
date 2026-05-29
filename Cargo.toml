@@ -28,6 +28,7 @@ toml = { version = "0.8", optional = true }
 serde_yaml = { version = "0.9", optional = true }
 percent-encoding = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4", "v7"], optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -36,5 +37,6 @@ cc = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data"]
+default = ["data", "datetime"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
+datetime = ["dep:chrono"]

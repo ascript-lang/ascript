@@ -2436,4 +2436,18 @@ print(r[1])
         .await;
         assert_eq!(out, "true\n");
     }
+
+    #[cfg(feature = "datetime")]
+    #[tokio::test]
+    async fn std_date_end_to_end() {
+        let src = "import * as date from \"std/date\"\n\
+                   let [d, err] = date.parse(\"2021-06-15T12:30:00Z\")\n\
+                   print(d.year)\n\
+                   print(d.month)\n\
+                   print(date.format(d, \"%Y/%m/%d\"))\n\
+                   let later = date.addDays(d, 10)\n\
+                   print(later.day)\n\
+                   print(date.diffMs(later, d))";
+        assert_eq!(run(src).await, "2021\n6\n2021/06/15\n25\n864000000\n");
+    }
 }

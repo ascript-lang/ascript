@@ -7,6 +7,8 @@
 pub mod array;
 pub mod bytes;
 pub mod convert;
+#[cfg(feature = "datetime")]
+pub mod date;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "data")]
@@ -50,6 +52,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
         "std/time" => time::exports(),
+        #[cfg(feature = "datetime")]
+        "std/date" => date::exports(),
         #[cfg(feature = "data")]
         "std/json" => json::exports(),
         #[cfg(feature = "data")]
@@ -87,6 +91,8 @@ impl Interp {
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
             "time" => self.call_time(func, args, span).await,
+            #[cfg(feature = "datetime")]
+            "date" => date::call(func, args, span),
             #[cfg(feature = "data")]
             "json" => json::call(func, args, span),
             #[cfg(feature = "data")]
