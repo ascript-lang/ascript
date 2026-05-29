@@ -116,6 +116,26 @@ fn num_field(o: &IndexMap<String, Value>, key: &str) -> Option<f64> {
     }
 }
 
+/// Read a numeric field strictly: `Ok(Some(n))` if it's a number, `Ok(None)` if
+/// absent or nil, and a Tier-2 type error (`"<ctx> expects a number"`) for any
+/// other present type. Used where a wrong type must fail loudly (not coerce).
+fn strict_num_field(
+    o: &IndexMap<String, Value>,
+    key: &str,
+    ctx: &str,
+    span: Span,
+) -> Result<Option<f64>, Control> {
+    match o.get(key) {
+        Some(Value::Number(n)) => Ok(Some(*n)),
+        Some(Value::Nil) | None => Ok(None),
+        Some(other) => Err(AsError::at(
+            format!("net/http {} expects a number, got {}", ctx, crate::interp::type_name(other)),
+            span,
+        )
+        .into()),
+    }
+}
+
 /// HTTP methods considered idempotent (safe to auto-retry on a server/connection
 /// error even without an explicit `retryOn` match).
 fn is_idempotent(method: &reqwest::Method) -> bool {
@@ -147,22 +167,55 @@ fn parse_retry(opts: &Value, span: Span) -> Result<Option<RetryConfig>, Control>
             .into())
         }
     };
-    let max = num_field(&o, "max").unwrap_or(0.0).max(0.0) as u32;
+    // A present-but-wrong-type field is a type error (parity with timeout/redirect);
+    // absent or nil fields fall back to the documented default.
+    let max = strict_num_field(&o, "max", "retry.max", span)?.unwrap_or(0.0).max(0.0) as u32;
     let exponential = match o.get("backoff") {
-        Some(Value::Str(s)) => s.as_ref() != "constant",
-        _ => true, // default exponential
+        Some(Value::Nil) | None => true, // default exponential
+        Some(Value::Str(s)) if s.as_ref() == "exponential" => true,
+        Some(Value::Str(s)) if s.as_ref() == "constant" => false,
+        Some(_) => {
+            return Err(AsError::at(
+                "net/http retry.backoff expects \"exponential\" or \"constant\"",
+                span,
+            )
+            .into())
+        }
     };
-    let base_delay_ms = num_field(&o, "baseDelay").unwrap_or(100.0).max(0.0) as u64;
+    let base_delay_ms = strict_num_field(&o, "baseDelay", "retry.baseDelay", span)?
+        .unwrap_or(100.0)
+        .max(0.0) as u64;
     let retry_on = match o.get("retryOn") {
-        Some(Value::Array(a)) => a
-            .borrow()
-            .iter()
-            .filter_map(|v| match v {
-                Value::Number(n) => Some(*n as u16),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
+        Some(Value::Nil) | None => Vec::new(),
+        Some(Value::Array(a)) => {
+            let mut out = Vec::new();
+            for v in a.borrow().iter() {
+                match v {
+                    Value::Number(n) => out.push(*n as u16),
+                    other => {
+                        return Err(AsError::at(
+                            format!(
+                                "net/http retry.retryOn expects an array of numbers, got a {} entry",
+                                crate::interp::type_name(other)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                }
+            }
+            out
+        }
+        Some(other) => {
+            return Err(AsError::at(
+                format!(
+                    "net/http retry.retryOn expects an array of numbers, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into())
+        }
     };
     Ok(Some(RetryConfig {
         max,
@@ -321,7 +374,7 @@ fn apply_tls(
     // caBundle: a PEM string or a path to a PEM file → an extra trusted root.
     if let Some(ca) = o.get("caBundle") {
         let ca = want_string(ca, span, "net/http tls.caBundle")?;
-        let pem = read_pem_or_inline(&ca);
+        let pem = read_pem_or_inline(&ca, "tls.caBundle", span)?;
         let cert = reqwest::Certificate::from_pem(pem.as_bytes())
             .map_err(|e| Control::from(AsError::at(format!("net/http tls.caBundle: {}", e), span)))?;
         b = b.add_root_certificate(cert);
@@ -329,7 +382,7 @@ fn apply_tls(
     // clientCert: a PEM string (cert + private key) → a client identity (mTLS).
     if let Some(cc) = o.get("clientCert") {
         let cc = want_string(cc, span, "net/http tls.clientCert")?;
-        let pem = read_pem_or_inline(&cc);
+        let pem = read_pem_or_inline(&cc, "tls.clientCert", span)?;
         let id = reqwest::Identity::from_pem(pem.as_bytes())
             .map_err(|e| Control::from(AsError::at(format!("net/http tls.clientCert: {}", e), span)))?;
         b = b.identity(id);
@@ -361,14 +414,21 @@ fn apply_tls(
     Ok(b)
 }
 
-/// If `s` looks like inline PEM (`-----BEGIN`), use it verbatim; otherwise treat
-/// it as a filesystem path and read the file (falling back to the raw string if
-/// the read fails, so a bad path surfaces as a PEM-parse error downstream).
-fn read_pem_or_inline(s: &str) -> String {
-    if s.trim_start().starts_with("-----BEGIN") {
-        s.to_string()
+/// Resolve a PEM source for `ctx` (a `tls.caBundle`/`tls.clientCert` value): if `s`
+/// contains a `-----BEGIN` header it's inline PEM (used verbatim); otherwise it's a
+/// filesystem path and the file is read. A path that can't be read yields a clear
+/// error naming the path — not a downstream "PEM parse" error from inline-treating
+/// a typo'd path.
+fn read_pem_or_inline(s: &str, ctx: &str, span: Span) -> Result<String, Control> {
+    if s.contains("-----BEGIN") {
+        Ok(s.to_string())
     } else {
-        std::fs::read_to_string(s).unwrap_or_else(|_| s.to_string())
+        std::fs::read_to_string(s).map_err(|e| {
+            Control::from(AsError::at(
+                format!("net/http {}: could not read PEM file '{}': {}", ctx, s, e),
+                span,
+            ))
+        })
     }
 }
 
@@ -1360,6 +1420,28 @@ print(body)
     }
 
     #[tokio::test]
+    async fn retry_max_wrong_type_is_tier2_panic() {
+        let base = fixture::start().await;
+        // A non-number retry.max is a type error (parity with timeout/redirect),
+        // not a silent "retries off" — it must Tier-2 panic with a clear message.
+        let mut interp = Interp::new();
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [_r, _e] = await get("{base}/text", {{ retry: {{ max: "y" }} }})
+"#
+        );
+        let res = run_on(&mut interp, &src).await;
+        match res {
+            Err(crate::interp::Control::Panic(e)) => {
+                let msg = e.to_string();
+                assert!(msg.contains("retry.max expects a number"), "got: {}", msg);
+            }
+            other => panic!("expected a Tier-2 panic, got ok={:?}", other.is_ok()),
+        }
+    }
+
+    #[tokio::test]
     async fn retry_disabled_by_default_returns_first_503() {
         let base = fixture::start().await;
         // Without a retry opt, the first 503 is returned as-is (no retry).
@@ -1538,6 +1620,33 @@ print(resp.status)
         );
         let out = run(&src).await;
         assert_eq!(out, "nil\n200\n");
+    }
+
+    #[tokio::test]
+    async fn tls_cabundle_bad_path_reports_clear_read_error() {
+        let base = fixture::start().await;
+        // A non-PEM string with no -----BEGIN header is treated as a file path; a
+        // missing file must yield a clear "could not read PEM file" error naming the
+        // path — not a confusing downstream PEM-parse error.
+        let mut interp = Interp::new();
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [_r, _e] = await get("{base}/text", {{ tls: {{ caBundle: "/no/such/ca.pem" }} }})
+"#
+        );
+        let res = run_on(&mut interp, &src).await;
+        match res {
+            Err(crate::interp::Control::Panic(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("could not read PEM file '/no/such/ca.pem'"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected a clear path-read error, got ok={:?}", other.is_ok()),
+        }
     }
 
     #[tokio::test]
