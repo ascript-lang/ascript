@@ -7,7 +7,13 @@
 //! plus the screen `Buffer`/`Cell` types and the terminal lifecycle methods
 //! (size / clear / raw / alt screen / cursor / restore). The buffer, the size
 //! query, and the close lifecycle are unit-testable WITHOUT a real tty (`size()`
-//! falls back to an 80x24 default on a non-tty); drawing + styling arrive in Task 2.
+//! falls back to an 80x24 default on a non-tty); drawing + styling arrive in Task 2;
+//! Task 3 adds the diff-based `flush` plus key/mouse/resize events.
+//!
+//! The testable core stays pure + tty-free: [`Buffer::diff`] computes the minimal
+//! set of changed cells and [`event_to_value`] converts a crossterm `Event` to an
+//! AScript object — both unit-tested directly. The actual stdout write
+//! ([`flush_changes`]) is exercised but its escape output isn't asserted in CI.
 //!
 //! Tier policy (spec §11.3): fallible terminal I/O (enable/disable raw mode, alt
 //! screen, cursor show/hide) → Tier-1 `[nil, err]`; argument-type misuse and
@@ -37,7 +43,6 @@ pub enum Color {
 
 impl Color {
     /// The crossterm color this maps to (for flushing).
-    #[allow(dead_code)] // used by Task 2's flush diff.
     pub fn to_crossterm(self) -> crossterm::style::Color {
         match self {
             Color::Reset => crossterm::style::Color::Reset,
@@ -207,6 +212,31 @@ impl Buffer {
             }
             self.hline(x, cy, w, ch, style);
         }
+    }
+
+    /// The list of `(x, y, cell)` triples where `self` (the back buffer) differs
+    /// from `prev` (the last-flushed buffer) — the minimal set of cells `flush`
+    /// must repaint. A PURE function (no I/O) so it's unit-testable without a tty.
+    ///
+    /// If the two buffers' dimensions differ (e.g. just after a resize), every cell
+    /// of `self` is reported changed (a full repaint).
+    pub fn diff(&self, prev: &Buffer) -> Vec<(u16, u16, Cell)> {
+        let mut out = Vec::new();
+        let same_dims = self.width == prev.width && self.height == prev.height;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let cur = self.cells[y as usize * self.width as usize + x as usize];
+                let changed = if same_dims {
+                    prev.cells[y as usize * prev.width as usize + x as usize] != cur
+                } else {
+                    true
+                };
+                if changed {
+                    out.push((x, y, cur));
+                }
+            }
+        }
+        out
     }
 
     /// One row's characters as a string, with trailing spaces trimmed (for readable
@@ -490,6 +520,45 @@ impl Interp {
                 }
                 Ok(Value::Nil)
             }
+            "flush" => {
+                let state = self.terminal_mut(id).expect("checked present");
+                // Pure diff first (unit-tested separately), then the crossterm write.
+                let changes = state.back.diff(&state.flushed);
+                let cursor = state.cursor;
+                let res = flush_changes(&changes, cursor);
+                // Sync flushed←back regardless of write outcome (the back buffer is
+                // the source of truth; a failed write just means the screen may lag).
+                let state = self.terminal_mut(id).expect("checked present");
+                state.flushed = state.back.clone();
+                match res {
+                    Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
+                    Err(e) => Ok(err_pair(format!("terminal.flush failed: {}", e))),
+                }
+            }
+            "pollEvent" => {
+                let ms = match &super::arg(&args, 0) {
+                    Value::Nil => 0,
+                    other => want_u16(other, span, "terminal.pollEvent timeoutMs")? as u64,
+                };
+                match crossterm::event::poll(std::time::Duration::from_millis(ms)) {
+                    Ok(true) => match crossterm::event::read() {
+                        Ok(ev) => {
+                            self.apply_event_resize(id, &ev);
+                            Ok(make_pair(event_to_value(ev), Value::Nil))
+                        }
+                        Err(e) => Ok(err_pair(format!("terminal.pollEvent read failed: {}", e))),
+                    },
+                    Ok(false) => Ok(make_pair(Value::Nil, Value::Nil)),
+                    Err(e) => Ok(err_pair(format!("terminal.pollEvent failed: {}", e))),
+                }
+            }
+            "readEvent" => match crossterm::event::read() {
+                Ok(ev) => {
+                    self.apply_event_resize(id, &ev);
+                    Ok(make_pair(event_to_value(ev), Value::Nil))
+                }
+                Err(e) => Ok(err_pair(format!("terminal.readEvent failed: {}", e))),
+            },
             "dump" => {
                 let state = self.terminal_mut(id).expect("checked present");
                 Ok(Value::Str(state.back.dump().into()))
@@ -504,6 +573,63 @@ impl Interp {
             }
         }
     }
+}
+
+impl Interp {
+    /// On a `Resize(w, h)` event, resize the terminal's `back` and `flushed`
+    /// buffers to the new dimensions. We CLEAR rather than preserve content (the
+    /// simplest, race-free choice — the caller is expected to redraw + flush after
+    /// a resize anyway); `flushed` is also cleared so the next flush fully repaints
+    /// the resized screen. Non-resize events are ignored. The handle is assumed
+    /// live (every event caller has already passed the presence check).
+    fn apply_event_resize(&mut self, id: u64, ev: &crossterm::event::Event) {
+        if let crossterm::event::Event::Resize(w, h) = ev {
+            if let Some(state) = self.terminal_mut(id) {
+                state.back = Buffer::new(*w, *h);
+                state.flushed = Buffer::new(*w, *h);
+            }
+        }
+    }
+}
+
+/// Write the `(x, y, cell)` diff list to stdout via crossterm, then position the
+/// cursor and flush. Each cell gets a `MoveTo`, its fg/bg colors, its attributes
+/// (reset-then-apply so a cell never inherits a previous cell's bold/underline),
+/// and its char. Fallible (stdout write) → surfaced as Tier-1 by the caller.
+///
+/// NOTE: this performs real stdout writes. On a non-tty (CI) the ANSI escapes go
+/// to the captured stream but are not asserted — the diff computation (pure) and
+/// the `flushed`←`back` sync are what the tests cover.
+fn flush_changes(changes: &[(u16, u16, Cell)], cursor: (u16, u16)) -> std::io::Result<()> {
+    use crossterm::style::{
+        Attribute, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    };
+    use crossterm::{cursor::MoveTo, queue, style::Print};
+    let mut out = std::io::stdout();
+    for &(x, y, cell) in changes {
+        queue!(out, MoveTo(x, y))?;
+        // Reset attributes first so each cell starts from a clean slate, then apply.
+        queue!(out, SetAttribute(Attribute::Reset))?;
+        queue!(out, SetForegroundColor(cell.fg.to_crossterm()))?;
+        queue!(out, SetBackgroundColor(cell.bg.to_crossterm()))?;
+        if cell.attrs.bold {
+            queue!(out, SetAttribute(Attribute::Bold))?;
+        }
+        if cell.attrs.underline {
+            queue!(out, SetAttribute(Attribute::Underlined))?;
+        }
+        if cell.attrs.italic {
+            queue!(out, SetAttribute(Attribute::Italic))?;
+        }
+        if cell.attrs.reverse {
+            queue!(out, SetAttribute(Attribute::Reverse))?;
+        }
+        queue!(out, Print(cell.ch))?;
+    }
+    // Clear residual styling, then park the cursor at the logical position.
+    queue!(out, SetAttribute(Attribute::Reset))?;
+    queue!(out, MoveTo(cursor.0, cursor.1))?;
+    out.flush()
 }
 
 /// A non-negative integer coordinate in `0..=u16::MAX` (Tier-2 on misuse).
@@ -665,6 +791,116 @@ fn want_bool(v: &Value, span: Span, ctx: &str) -> Result<bool, Control> {
             span,
         )
         .into()),
+    }
+}
+
+/// Build an AScript object `Value` from `(key, value)` pairs (insertion-ordered).
+fn make_object(pairs: Vec<(&str, Value)>) -> Value {
+    let mut m = indexmap::IndexMap::new();
+    for (k, v) in pairs {
+        m.insert(k.to_string(), v);
+    }
+    Value::Object(Rc::new(std::cell::RefCell::new(m)))
+}
+
+/// A readable name for a crossterm `KeyCode`. `Char(c)` becomes the single-char
+/// string; named keys map to their CamelCase name; `F(n)` → `"F<n>"`. Less-common
+/// keys (media, modifier-only, caps/scroll/num lock, null) fall back to a lowercase
+/// debug-ish name so they round-trip to *something* rather than being dropped.
+fn key_code_name(code: crossterm::event::KeyCode) -> String {
+    use crossterm::event::KeyCode as K;
+    match code {
+        K::Char(c) => c.to_string(),
+        K::Enter => "Enter".into(),
+        K::Esc => "Esc".into(),
+        K::Tab => "Tab".into(),
+        K::BackTab => "BackTab".into(),
+        K::Backspace => "Backspace".into(),
+        K::Delete => "Delete".into(),
+        K::Insert => "Insert".into(),
+        K::Up => "Up".into(),
+        K::Down => "Down".into(),
+        K::Left => "Left".into(),
+        K::Right => "Right".into(),
+        K::Home => "Home".into(),
+        K::End => "End".into(),
+        K::PageUp => "PageUp".into(),
+        K::PageDown => "PageDown".into(),
+        K::F(n) => format!("F{}", n),
+        K::Null => "Null".into(),
+        K::CapsLock => "CapsLock".into(),
+        K::ScrollLock => "ScrollLock".into(),
+        K::NumLock => "NumLock".into(),
+        K::PrintScreen => "PrintScreen".into(),
+        K::Pause => "Pause".into(),
+        K::Menu => "Menu".into(),
+        K::KeypadBegin => "KeypadBegin".into(),
+        K::Media(_) | K::Modifier(_) => format!("{:?}", code),
+    }
+}
+
+/// Convert a `crossterm` `Event` into an AScript object. PURE + unit-testable: it
+/// touches no terminal state. Shapes:
+/// - `Key`   → `{type:"key", key, ctrl, alt, shift}`
+/// - `Mouse` → `{type:"mouse", x, y, kind, button}` (`button` is `nil` when N/A)
+/// - `Resize`→ `{type:"resize", width, height}`
+/// - `FocusGained`/`FocusLost` → `{type:"focus", focused}`
+/// - `Paste` → `{type:"paste", text}`
+pub fn event_to_value(ev: crossterm::event::Event) -> Value {
+    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEventKind};
+    match ev {
+        Event::Key(k) => {
+            let m = k.modifiers;
+            make_object(vec![
+                ("type", Value::Str("key".into())),
+                ("key", Value::Str(key_code_name(k.code).into())),
+                ("ctrl", Value::Bool(m.contains(KeyModifiers::CONTROL))),
+                ("alt", Value::Bool(m.contains(KeyModifiers::ALT))),
+                ("shift", Value::Bool(m.contains(KeyModifiers::SHIFT))),
+            ])
+        }
+        Event::Mouse(me) => {
+            let (kind, button) = match me.kind {
+                MouseEventKind::Down(b) => ("down", Some(b)),
+                MouseEventKind::Up(b) => ("up", Some(b)),
+                MouseEventKind::Drag(b) => ("drag", Some(b)),
+                MouseEventKind::Moved => ("moved", None),
+                MouseEventKind::ScrollUp => ("scrollUp", None),
+                MouseEventKind::ScrollDown => ("scrollDown", None),
+                MouseEventKind::ScrollLeft => ("scrollLeft", None),
+                MouseEventKind::ScrollRight => ("scrollRight", None),
+            };
+            let button = match button {
+                Some(MouseButton::Left) => Value::Str("left".into()),
+                Some(MouseButton::Right) => Value::Str("right".into()),
+                Some(MouseButton::Middle) => Value::Str("middle".into()),
+                None => Value::Nil,
+            };
+            make_object(vec![
+                ("type", Value::Str("mouse".into())),
+                ("x", Value::Number(me.column as f64)),
+                ("y", Value::Number(me.row as f64)),
+                ("kind", Value::Str(kind.into())),
+                ("button", button),
+            ])
+        }
+        Event::Resize(w, h) => make_object(vec![
+            ("type", Value::Str("resize".into())),
+            ("width", Value::Number(w as f64)),
+            ("height", Value::Number(h as f64)),
+        ]),
+        Event::FocusGained => make_object(vec![
+            ("type", Value::Str("focus".into())),
+            ("focused", Value::Bool(true)),
+        ]),
+        Event::FocusLost => make_object(vec![
+            ("type", Value::Str("focus".into())),
+            ("focused", Value::Bool(false)),
+        ]),
+        Event::Paste(text) => make_object(vec![
+            ("type", Value::Str("paste".into())),
+            ("text", Value::Str(text.into())),
+        ]),
     }
 }
 
@@ -991,6 +1227,201 @@ print("[" + term.dumpRow(0) + "]")
         )
         .await;
         assert_eq!(out, "[]\n");
+    }
+
+    // ---- diff computation (pure, no tty) ----
+
+    #[test]
+    fn diff_lists_only_changed_cells() {
+        let prev = Buffer::new(5, 2);
+        let mut back = prev.clone();
+        back.set_cell(1, 0, 'A', Style::default());
+        back.set_cell(3, 1, 'B', Style::default());
+        let mut d = back.diff(&prev);
+        d.sort_by_key(|&(x, y, _)| (y, x));
+        assert_eq!(d.len(), 2);
+        assert_eq!((d[0].0, d[0].1, d[0].2.ch), (1, 0, 'A'));
+        assert_eq!((d[1].0, d[1].1, d[1].2.ch), (3, 1, 'B'));
+    }
+
+    #[test]
+    fn diff_detects_style_only_changes() {
+        let prev = Buffer::new(3, 1);
+        let mut back = prev.clone();
+        // Same char, different fg → still a change.
+        back.set_cell(0, 0, ' ', Style { fg: Color::Rgb(1, 2, 3), ..Style::default() });
+        let d = back.diff(&prev);
+        assert_eq!(d.len(), 1);
+        assert_eq!((d[0].0, d[0].1), (0, 0));
+    }
+
+    #[test]
+    fn diff_empty_after_notional_flush() {
+        let mut flushed = Buffer::new(6, 3);
+        let mut back = flushed.clone();
+        back.draw_box(0, 0, 6, 3, Style::default());
+        back.text(2, 1, "hi", Style::default());
+        assert!(!back.diff(&flushed).is_empty());
+        // Notional flush: copy back→flushed (what flush() does), then no changes.
+        flushed = back.clone();
+        assert!(back.diff(&flushed).is_empty());
+        // A further identical draw still produces no diff.
+        back.text(2, 1, "hi", Style::default());
+        assert!(back.diff(&flushed).is_empty());
+    }
+
+    #[test]
+    fn diff_full_repaint_on_dim_change() {
+        let prev = Buffer::new(2, 2); // 4 cells
+        let back = Buffer::new(3, 2); // 6 cells, different dims
+        // Mismatched dims → every cell of `back` reported.
+        assert_eq!(back.diff(&prev).len(), 6);
+    }
+
+    // ---- event_to_value conversion (pure, no tty) ----
+
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind,
+    };
+
+    /// Read a string field from an event object Value.
+    fn field_str(v: &Value, key: &str) -> String {
+        let Value::Object(o) = v else { panic!("not an object: {:?}", v) };
+        match o.borrow().get(key) {
+            Some(Value::Str(s)) => s.to_string(),
+            other => panic!("field {} not a string: {:?}", key, other),
+        }
+    }
+    fn field_bool(v: &Value, key: &str) -> bool {
+        let Value::Object(o) = v else { panic!("not an object") };
+        match o.borrow().get(key) {
+            Some(Value::Bool(b)) => *b,
+            other => panic!("field {} not a bool: {:?}", key, other),
+        }
+    }
+    fn field_num(v: &Value, key: &str) -> f64 {
+        let Value::Object(o) = v else { panic!("not an object") };
+        match o.borrow().get(key) {
+            Some(Value::Number(n)) => *n,
+            other => panic!("field {} not a number: {:?}", key, other),
+        }
+    }
+    fn field_is_nil(v: &Value, key: &str) -> bool {
+        let Value::Object(o) = v else { panic!("not an object") };
+        matches!(o.borrow().get(key), Some(Value::Nil) | None)
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: mods,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn event_char_with_ctrl() {
+        let v = event_to_value(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(field_str(&v, "type"), "key");
+        assert_eq!(field_str(&v, "key"), "a");
+        assert!(field_bool(&v, "ctrl"));
+        assert!(!field_bool(&v, "alt"));
+        assert!(!field_bool(&v, "shift"));
+    }
+
+    #[test]
+    fn event_named_keys() {
+        assert_eq!(field_str(&event_to_value(key(KeyCode::Enter, KeyModifiers::NONE)), "key"), "Enter");
+        assert_eq!(field_str(&event_to_value(key(KeyCode::Up, KeyModifiers::NONE)), "key"), "Up");
+        assert_eq!(field_str(&event_to_value(key(KeyCode::Esc, KeyModifiers::NONE)), "key"), "Esc");
+        assert_eq!(field_str(&event_to_value(key(KeyCode::Tab, KeyModifiers::NONE)), "key"), "Tab");
+        assert_eq!(field_str(&event_to_value(key(KeyCode::F(5), KeyModifiers::NONE)), "key"), "F5");
+        assert_eq!(field_str(&event_to_value(key(KeyCode::PageDown, KeyModifiers::NONE)), "key"), "PageDown");
+    }
+
+    #[test]
+    fn event_key_modifiers_combine() {
+        let v = event_to_value(key(KeyCode::Char('Z'), KeyModifiers::ALT | KeyModifiers::SHIFT));
+        assert_eq!(field_str(&v, "key"), "Z");
+        assert!(!field_bool(&v, "ctrl"));
+        assert!(field_bool(&v, "alt"));
+        assert!(field_bool(&v, "shift"));
+    }
+
+    #[test]
+    fn event_mouse_left_down() {
+        let v = event_to_value(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(field_str(&v, "type"), "mouse");
+        assert_eq!(field_num(&v, "x"), 3.0);
+        assert_eq!(field_num(&v, "y"), 4.0);
+        assert_eq!(field_str(&v, "kind"), "down");
+        assert_eq!(field_str(&v, "button"), "left");
+    }
+
+    #[test]
+    fn event_mouse_scroll_has_nil_button() {
+        let v = event_to_value(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(field_str(&v, "kind"), "scrollUp");
+        assert!(field_is_nil(&v, "button"));
+    }
+
+    #[test]
+    fn event_resize() {
+        let v = event_to_value(Event::Resize(100, 40));
+        assert_eq!(field_str(&v, "type"), "resize");
+        assert_eq!(field_num(&v, "width"), 100.0);
+        assert_eq!(field_num(&v, "height"), 40.0);
+    }
+
+    #[test]
+    fn event_focus_and_paste() {
+        let g = event_to_value(Event::FocusGained);
+        assert_eq!(field_str(&g, "type"), "focus");
+        assert!(field_bool(&g, "focused"));
+        let p = event_to_value(Event::Paste("hi".into()));
+        assert_eq!(field_str(&p, "type"), "paste");
+        assert_eq!(field_str(&p, "text"), "hi");
+    }
+
+    // ---- pollEvent on a non-tty returns without hanging/panicking ----
+
+    #[tokio::test]
+    async fn poll_event_zero_timeout_does_not_hang() {
+        // On a non-tty (CI), poll(0ms) returns Ok(false) (→ [nil, nil]) or Err (→ a
+        // Tier-1 [nil, {message}]); either is fine. The point: it returns promptly
+        // with no event (no panic, no hang). `err` is nil or an error object.
+        let out = run(
+            r#"
+import { init } from "std/tui"
+let [term, _] = init()
+let [ev, err] = term.pollEvent(0)
+print(ev == nil)
+print(err == nil || type(err) == "object")
+"#,
+        )
+        .await;
+        assert_eq!(out, "true\ntrue\n");
+    }
+
+    // ---- flush syncs flushed←back (the write isn't asserted on a non-tty) ----
+
+    #[test]
+    fn flush_changes_on_empty_diff_is_ok() {
+        // No changes → flush_changes only resets styling + parks the cursor; on a
+        // captured (non-tty) stdout this still returns Ok.
+        assert!(flush_changes(&[], (0, 0)).is_ok());
     }
 
     #[tokio::test]

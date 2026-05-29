@@ -146,8 +146,9 @@ pub enum NativeKind {
     WsListener,
     // M15 std/tui: a terminal handle owning the back/flushed screen buffers, the
     // cursor position, and the active raw/alt-screen flags. Methods: size/clear/
-    // moveCursor/enterRaw/leaveRaw/enterAltScreen/leaveAltScreen/showCursor/
-    // restore/close. Registered only under feature `tui`.
+    // moveCursor/enterRaw/leaveRaw/enterAltScreen/leaveAltScreen/showCursor/draw
+    // (setCell/text/hline/vline/box/fill)/flush/pollEvent/readEvent/restore/close.
+    // Registered only under feature `tui`.
     Terminal,
 }
 
