@@ -187,6 +187,24 @@ impl Interp {
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
+            Stmt::Enum { name, variants } => {
+                let mut map = indexmap::IndexMap::new();
+                for v in variants {
+                    let backing = match &v.value {
+                        Some(e) => self.eval_expr(e, env).await?,
+                        None => Value::Nil,
+                    };
+                    let variant = Value::EnumVariant(std::rc::Rc::new(crate::value::EnumVariant {
+                        enum_name: name.clone(),
+                        name: v.name.clone(),
+                        value: backing,
+                    }));
+                    map.insert(v.name.clone(), variant);
+                }
+                let def = Value::Enum(std::rc::Rc::new(crate::value::EnumDef { name: name.clone(), variants: map }));
+                env.define(name, def, false).map_err(AsError::new)?;
+                Ok(Flow::Normal)
+            }
         }
     }
 
@@ -405,6 +423,16 @@ impl Interp {
     fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
         match obj {
             Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
+            Value::Enum(e) => e
+                .variants
+                .get(name)
+                .cloned()
+                .ok_or_else(|| AsError::at(format!("enum {} has no variant '{}'", e.name, name), span)),
+            Value::EnumVariant(v) => match name {
+                "name" => Ok(Value::Str(v.name.as_str().into())),
+                "value" => Ok(v.value.clone()),
+                other => Err(AsError::at(format!("enum variant has no property '{}'", other), span)),
+            },
             Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
             _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
@@ -588,6 +616,8 @@ fn type_name(v: &Value) -> &'static str {
         Value::Builtin(_) | Value::Function(_) => "function",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+        Value::Enum(_) => "enum",
+        Value::EnumVariant(_) => "enum variant",
     }
 }
 
@@ -654,6 +684,16 @@ mod tests {
             Control::Panic(e) => e,
             Control::Propagate(_) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn enum_variants_access_and_equality() {
+        let src = "enum Color { Red, Green, Blue }\nenum Status { Ok = 200, NotFound = 404 }\nprint(Color.Red)\nprint(Color.Red == Color.Red)\nprint(Color.Red == Color.Green)\nprint(Status.NotFound.value)\nprint(Status.Ok.name)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "Color.Red\ntrue\nfalse\n404\nOk\n");
     }
 
     #[tokio::test]

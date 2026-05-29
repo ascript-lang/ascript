@@ -112,6 +112,13 @@ pub enum Stmt {
     Break,
     Continue,
     Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt> },
+    Enum { name: String, variants: Vec<EnumVariantDecl> },
+}
+
+#[derive(Clone, Debug)]
+pub struct EnumVariantDecl {
+    pub name: String,
+    pub value: Option<Expr>,
 }
 
 #[derive(Clone, Copy, Debug)]

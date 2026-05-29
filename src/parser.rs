@@ -74,6 +74,7 @@ impl<'a> Parser<'a> {
             Tok::For => self.for_stmt(),
             Tok::Return => self.return_stmt(),
             Tok::Fn => self.fn_decl(),
+            Tok::Enum => self.enum_decl(),
             Tok::Break => {
                 self.advance();
                 Ok(Stmt::Break)
@@ -118,6 +119,36 @@ impl<'a> Parser<'a> {
         };
         let body = self.block()?;
         Ok(Stmt::Fn { name, params, ret, body })
+    }
+
+    fn enum_decl(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::Enum)?;
+        let name = match self.advance() {
+            Tok::Ident(n) => n,
+            other => return Err(AsError::at(format!("expected enum name, found {:?}", other), self.tokens[self.pos - 1].span)),
+        };
+        self.eat(&Tok::LBrace)?;
+        let mut variants = Vec::new();
+        while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            let vname = match self.advance() {
+                Tok::Ident(n) => n,
+                other => return Err(AsError::at(format!("expected variant name, found {:?}", other), self.tokens[self.pos - 1].span)),
+            };
+            let value = if *self.peek() == Tok::Eq {
+                self.advance();
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            variants.push(crate::ast::EnumVariantDecl { name: vname, value });
+            if *self.peek() == Tok::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(Stmt::Enum { name, variants })
     }
 
     fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {

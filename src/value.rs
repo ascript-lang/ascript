@@ -8,6 +8,17 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
+pub struct EnumDef {
+    pub name: String,
+    pub variants: IndexMap<String, Value>, // each is a Value::EnumVariant
+}
+
+pub struct EnumVariant {
+    pub enum_name: String,
+    pub name: String,
+    pub value: Value, // backing value, or Nil
+}
+
 /// A user-defined function with its captured (closure) environment.
 pub struct Function {
     pub name: Option<String>,
@@ -29,6 +40,8 @@ pub enum Value {
     Function(Rc<Function>),
     Array(Rc<RefCell<Vec<Value>>>),
     Object(Rc<RefCell<IndexMap<String, Value>>>),
+    Enum(Rc<EnumDef>),
+    EnumVariant(Rc<EnumVariant>),
 }
 
 impl Value {
@@ -52,6 +65,9 @@ impl PartialEq for Value {
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            // Enums and their (interned) variants compare by identity.
+            (Value::Enum(a), Value::Enum(b)) => Rc::ptr_eq(a, b),
+            (Value::EnumVariant(a), Value::EnumVariant(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -70,6 +86,8 @@ impl fmt::Debug for Value {
             }
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
             Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
+            Value::Enum(e) => write!(f, "Enum({})", e.name),
+            Value::EnumVariant(v) => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
         }
     }
 }
@@ -128,6 +146,8 @@ impl Value {
                 seen.pop();
                 Ok(())
             }
+            Value::Enum(e) => write!(f, "<enum {}>", e.name),
+            Value::EnumVariant(v) => write!(f, "{}.{}", v.enum_name, v.name),
         }
     }
 

@@ -62,6 +62,7 @@ pub enum Tok {
     TemplateEnd(String),    // }...`     — text after the last interpolation
     Question,
     Pipe,
+    Enum,
     Eof,
 }
 
