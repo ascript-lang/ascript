@@ -114,6 +114,16 @@ impl Interp {
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
+            Stmt::Fn { name, params, body } => {
+                let func = Value::Function(std::rc::Rc::new(crate::value::Function {
+                    name: Some(name.clone()),
+                    params: params.clone(),
+                    body: body.clone(),
+                    closure: env.clone(),
+                }));
+                env.define(name, func, false).map_err(AsError::new)?;
+                Ok(Flow::Normal)
+            }
         }
     }
 
@@ -206,9 +216,41 @@ impl Interp {
                 }
                 match callee_v {
                     Value::Builtin(name) => self.call_builtin(&name, &values, expr.span),
+                    Value::Function(func) => self.call_function(&func, values, expr.span).await,
                     _ => Err(AsError::at("value is not callable", callee.span)),
                 }
             }
+        }
+    }
+
+    #[async_recursion(?Send)]
+    async fn call_function(
+        &mut self,
+        func: &crate::value::Function,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, AsError> {
+        if args.len() != func.params.len() {
+            return Err(AsError::at(
+                format!(
+                    "{} expected {} argument(s), got {}",
+                    func.name.as_deref().unwrap_or("function"),
+                    func.params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+        }
+        // New scope chained to the closure's captured environment.
+        let call_env = func.closure.child();
+        for (param, arg) in func.params.iter().zip(args.into_iter()) {
+            call_env.define(param, arg, true).map_err(AsError::new)?;
+        }
+        match self.exec(&func.body, &call_env).await? {
+            Flow::Return(v) => Ok(v),
+            Flow::Normal => Ok(Value::Nil),
+            Flow::Break => Err(AsError::at("'break' outside of a loop", span)),
+            Flow::Continue => Err(AsError::at("'continue' outside of a loop", span)),
         }
     }
 
@@ -475,5 +517,56 @@ mod tests {
     async fn break_outside_loop_errors_at_top_level() {
         let err = crate::run_source("break").await.unwrap_err();
         assert!(err.message.contains("outside of a loop"));
+    }
+
+    #[tokio::test]
+    async fn calls_a_user_function() {
+        let src = "fn add(a, b) { return a + b }\nprint(add(2, 3))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\n");
+    }
+
+    #[tokio::test]
+    async fn recursion_works() {
+        let src = "fn fact(n) { if (n <= 1) { return 1 }\nreturn n * fact(n - 1) }\nprint(fact(5))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "120\n");
+    }
+
+    #[tokio::test]
+    async fn closures_capture_their_environment() {
+        // makeAdder returns a function that closes over `x`.
+        let src = "fn makeAdder(x) { fn adder(y) { return x + y }\nreturn adder }\nlet add10 = makeAdder(10)\nprint(add10(5))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "15\n");
+    }
+
+    #[tokio::test]
+    async fn arity_mismatch_errors() {
+        let src = "fn f(a, b) { return a }\nf(1)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("expected 2 argument"));
+    }
+
+    #[tokio::test]
+    async fn function_without_return_yields_nil() {
+        let src = "fn noop() { let x = 1 }\nprint(noop())";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "nil\n");
     }
 }

@@ -1,8 +1,18 @@
 //! Runtime values. The skeleton supports four of the eight value kinds
 //! from spec §4; the rest arrive in later milestones.
 
+use crate::ast::Stmt;
+use crate::env::Environment;
 use std::fmt;
 use std::rc::Rc;
+
+/// A user-defined function with its captured (closure) environment.
+pub struct Function {
+    pub name: Option<String>,
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
+    pub closure: Environment,
+}
 
 #[derive(Clone)]
 pub enum Value {
@@ -12,6 +22,8 @@ pub enum Value {
     Str(Rc<str>),
     /// A native built-in function, dispatched by name in the interpreter.
     Builtin(Rc<str>),
+    /// A user-defined function carrying its closure environment.
+    Function(Rc<Function>),
 }
 
 impl Value {
@@ -31,6 +43,8 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             // Built-ins are equal iff they name the same function.
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
+            // Functions compare by identity.
+            (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -44,6 +58,9 @@ impl fmt::Debug for Value {
             Value::Number(n) => write!(f, "Number({})", n),
             Value::Str(s) => write!(f, "Str({:?})", s),
             Value::Builtin(name) => write!(f, "Builtin({:?})", name),
+            Value::Function(func) => {
+                write!(f, "Function({})", func.name.as_deref().unwrap_or("<anonymous>"))
+            }
         }
     }
 }
@@ -57,6 +74,10 @@ impl fmt::Display for Value {
             Value::Number(n) => write!(f, "{}", n),
             Value::Str(s) => write!(f, "{}", s),
             Value::Builtin(name) => write!(f, "<builtin {}>", name),
+            Value::Function(func) => match &func.name {
+                Some(n) => write!(f, "<function {}>", n),
+                None => write!(f, "<function>"),
+            },
         }
     }
 }

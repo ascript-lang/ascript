@@ -73,6 +73,7 @@ impl<'a> Parser<'a> {
             Tok::While => self.while_stmt(),
             Tok::For => self.for_stmt(),
             Tok::Return => self.return_stmt(),
+            Tok::Fn => self.fn_decl(),
             Tok::Break => {
                 self.advance();
                 Ok(Stmt::Break)
@@ -95,6 +96,48 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::Return(Some(value)))
             }
         }
+    }
+
+    fn fn_decl(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::Fn)?;
+        let name = match self.advance() {
+            Tok::Ident(name) => name,
+            other => {
+                return Err(AsError::at(
+                    format!("expected a function name, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
+        };
+        let params = self.param_list()?;
+        let body = self.block()?;
+        Ok(Stmt::Fn { name, params, body })
+    }
+
+    /// Parse `( ident, ident, … )` — a comma-separated list of parameter names.
+    fn param_list(&mut self) -> Result<Vec<String>, AsError> {
+        self.eat(&Tok::LParen)?;
+        let mut params = Vec::new();
+        if *self.peek() != Tok::RParen {
+            loop {
+                match self.advance() {
+                    Tok::Ident(name) => params.push(name),
+                    other => {
+                        return Err(AsError::at(
+                            format!("expected a parameter name, found {:?}", other),
+                            self.tokens[self.pos - 1].span,
+                        ))
+                    }
+                }
+                if *self.peek() == Tok::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        Ok(params)
     }
 
     /// Parse `{ stmt* }` (with optional `;` separators) and return the inner statements.

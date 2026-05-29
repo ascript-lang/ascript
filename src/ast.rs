@@ -34,6 +34,7 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break,
     Continue,
+    Fn { name: String, params: Vec<String>, body: Vec<Stmt> },
 }
 
 #[derive(Clone, Copy, Debug)]

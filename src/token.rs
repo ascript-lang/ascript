@@ -48,6 +48,7 @@ pub enum Tok {
     Return,
     Break,
     Continue,
+    Fn,
     Eof,
 }
 
