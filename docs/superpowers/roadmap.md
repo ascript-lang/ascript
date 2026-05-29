@@ -143,7 +143,17 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
     multipart/form-data, JSON/form helpers, custom headers, proxy.
   - **Deferred/best-effort (justified in §11.5):** HTTP/3 (feature-gated, opt-in),
     response trailers (best-effort; hyper-level for first-class), SOCKS proxy (feature).
-- ⬜ **M15 — Terminal UI.** `std/tui`.
+- ✅ **M15 — Terminal UI.** `std/tui` (feature `tui`, default-on): `crossterm`-backed Terminal
+  handle (`Value::Native`) + a hand-rolled double-buffered screen (Cell/Color/Attrs); raw mode,
+  alt screen, cursor control; drawing primitives (setCell/text/hline/vline/box/fill + `dump()`
+  snapshot) with styling (color names / `[r,g,b]` / 0-255 + bold/underline/italic/reverse); flush
+  (per-cell diff render); key/mouse/resize events (`pollEvent`/`readEvent`, filtered to
+  Press/Repeat — no Windows dup keys); an off-screen `buffer(w,h)` constructor. Pragmatic
+  crossterm-over-ratatui (hand-rolled buffer = "basic widgets & drawing", per the spec's
+  "crossterm/ratatui" license — documented). The testable core (buffer ops, diff, event→object,
+  style parsing) is unit-tested without a tty; coordinate inputs validate-then-cast (huge/negative/
+  fractional → clean Tier-2; in-range OOB clips). 471 lib + 21 cli + 2 frontend + 5 module + 2
+  conformance (501 default; 245 `--no-default`). Merged. Plan: `plans/2026-05-29-ascript-m15-tui.md`.
 
 ## Phase 4 — Tooling completion
 
@@ -453,7 +463,7 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   reviewer per task + holistic) → merge --no-ff; cfg-gated features + dual-config builds; Value::Native
   for handles; Tier-1/Tier-2; `run`/`run_err` + in-process fixtures; capstone example + conformance.
 
-## Roadmap status: M1–M14 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10–M14 done). Remaining: M15 (tui), M16 (lsp).**
+## Roadmap status: M1–M15 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 NEARLY COMPLETE (M10–M15 done). Remaining: M16 (LSP) — the FINAL milestone.**
 The AScript language (spec §§2–9) + tooling (§10: diagnostics, REPL, fmt, test,
 Tree-sitter conformance) + async/await surface (§7) are fully implemented, unit- and
 example-tested, clippy-clean, and merged to `main`. Remaining: Phase 2+ standard
