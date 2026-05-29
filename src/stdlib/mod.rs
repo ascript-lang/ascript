@@ -7,14 +7,24 @@
 pub mod array;
 pub mod bytes;
 pub mod convert;
+#[cfg(feature = "crypto")]
+pub mod crypto;
 #[cfg(feature = "datetime")]
 pub mod date;
+#[cfg(feature = "compress")]
+pub mod compress;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "data")]
 pub mod encoding;
+#[cfg(feature = "sys")]
+pub mod env;
+#[cfg(feature = "sys")]
+pub mod fs;
 #[cfg(feature = "intl")]
 pub mod intl;
+#[cfg(feature = "sys")]
+pub mod process;
 #[cfg(feature = "data")]
 pub mod json;
 pub mod map;
@@ -22,6 +32,8 @@ pub mod math;
 pub mod object;
 #[cfg(feature = "data")]
 pub mod regex;
+#[cfg(feature = "sql")]
+pub mod sqlite;
 pub mod string;
 pub mod time;
 #[cfg(feature = "data")]
@@ -62,8 +74,20 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/json" => json::exports(),
         #[cfg(feature = "data")]
         "std/encoding" => encoding::exports(),
+        #[cfg(feature = "crypto")]
+        "std/crypto" => crypto::exports(),
+        #[cfg(feature = "compress")]
+        "std/compress" => compress::exports(),
+        #[cfg(feature = "sys")]
+        "std/env" => env::exports(),
+        #[cfg(feature = "sys")]
+        "std/fs" => fs::exports(),
+        #[cfg(feature = "sys")]
+        "std/process" => process::exports(),
         #[cfg(feature = "data")]
         "std/regex" => regex::exports(),
+        #[cfg(feature = "sql")]
+        "std/sqlite" => sqlite::exports(),
         #[cfg(feature = "data")]
         "std/uuid" => uuid::exports(),
         #[cfg(feature = "data")]
@@ -103,8 +127,20 @@ impl Interp {
             "json" => json::call(func, args, span),
             #[cfg(feature = "data")]
             "encoding" => encoding::call(func, args, span),
+            #[cfg(feature = "crypto")]
+            "crypto" => crypto::call(func, args, span),
+            #[cfg(feature = "compress")]
+            "compress" => compress::call(func, args, span),
+            #[cfg(feature = "sys")]
+            "env" => env::call(func, args, span),
+            #[cfg(feature = "sys")]
+            "fs" => fs::call(func, args, span),
+            #[cfg(feature = "sys")]
+            "process" => self.call_process(func, args, span).await,
             #[cfg(feature = "data")]
             "regex" => regex::call(func, args, span),
+            #[cfg(feature = "sql")]
+            "sqlite" => self.call_sqlite_open(func, args, span),
             #[cfg(feature = "data")]
             "uuid" => uuid::call(func, args, span),
             #[cfg(feature = "data")]

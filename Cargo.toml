@@ -31,6 +31,18 @@ uuid = { version = "1", features = ["v4", "v7"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 icu = { version = "1", features = ["compiled_data"], optional = true }
 fixed_decimal = { version = "0.5", optional = true }
+dotenvy = { version = "0.15", optional = true }
+walkdir = { version = "2", optional = true }
+ignore = { version = "0.4", optional = true }
+sha2 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
+argon2 = { version = "0.5", optional = true }
+bcrypt = { version = "0.15", optional = true }
+rand = { version = "0.8", optional = true }
+flate2 = { version = "1", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -39,7 +51,13 @@ cc = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
+# Task 2 wires `dotenvy` for std/env; Task 3 (fs) adds walkdir/ignore/regex; Task 7
+# (process, std/process) adds tokio's process + io-util plumbing for subprocesses.
+sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "tokio/process", "tokio/io-util"]
+crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex"]
+compress = ["dep:flate2", "dep:zip"]
+sql = ["dep:rusqlite"]

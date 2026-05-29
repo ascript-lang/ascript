@@ -77,6 +77,37 @@ pub struct ModuleEntry {
     pub exports: Rc<RefCell<HashSet<String>>>,
 }
 
+/// The non-`Clone` OS resource behind a `Value::Native` handle. Real variants are
+/// feature-gated (added by sqlite/process tasks); only `Closed` is always present,
+/// so under `--no-default-features` the enum has just the one variant.
+pub(crate) enum ResourceState {
+    #[cfg(feature = "sql")]
+    SqliteConnection(rusqlite::Connection),
+    // A prepared statement can't be stored directly: rusqlite's `Statement<'conn>`
+    // borrows its `Connection`, which the resource table (owning both) can't model.
+    // Instead we store the SQL text + the owning connection's id, and re-resolve via
+    // `Connection::prepare_cached` on each `run`/`all` (rusqlite caches the parsed
+    // statement internally, so there's no re-parse cost). See std/sqlite.
+    #[cfg(feature = "sql")]
+    SqliteStatement { conn_id: u64, sql: String },
+    // The process child handle requires tokio's `process` feature, which `sys`
+    // enables (M13 Task 7, `std/process`). `spawn` registers the live child plus
+    // its piped stdout/stderr (as `Reader`s) and stdin (as a `Writer`).
+    #[cfg(feature = "sys")]
+    ChildProcess(tokio::process::Child),
+    // A streaming reader over one of a spawned child's pipes. `capture` is the
+    // child's capture mode, which decides whether chunks come back as Str or Bytes.
+    #[cfg(feature = "sys")]
+    Reader { reader: crate::stdlib::process::ProcReader, capture: crate::stdlib::process::Capture },
+    // A streaming writer over a spawned child's stdin. `close()`/EOF takes it.
+    #[cfg(feature = "sys")]
+    Writer(tokio::process::ChildStdin),
+    /// A resource that has been closed/consumed. Also the always-present variant
+    /// so the enum is non-empty under `--no-default-features`.
+    #[allow(dead_code)]
+    Closed,
+}
+
 pub struct Interp {
     /// Captured program output (what `print` writes). Exposed for testing and
     /// flushed to stdout by the CLI.
@@ -87,6 +118,10 @@ pub struct Interp {
     /// Tests registered via the `test(name, fn)` builtin. Only executed by
     /// `ascript test` (via `run_registered_tests`); a normal `run` just collects them.
     tests: Vec<(String, Value)>,
+    /// Live OS resources backing `Value::Native` handles, keyed by handle id.
+    resources: HashMap<u64, ResourceState>,
+    /// Monotonic id source for newly registered resources.
+    next_resource_id: u64,
 }
 
 /// Outcome of running the tests registered on an `Interp`.
@@ -106,6 +141,87 @@ impl Interp {
             module_dir: PathBuf::from("."),
             current_exports: Rc::new(RefCell::new(HashSet::new())),
             tests: Vec::new(),
+            resources: HashMap::new(),
+            next_resource_id: 0,
+        }
+    }
+
+    /// Register an OS `state` behind a fresh `Value::Native` handle of `kind`,
+    /// carrying the plain readable `fields`.
+    #[allow(dead_code)] // Only called by feature-gated modules (sqlite/process) for now.
+    pub(crate) fn register_resource(
+        &mut self,
+        kind: crate::value::NativeKind,
+        fields: indexmap::IndexMap<String, Value>,
+        state: ResourceState,
+    ) -> Value {
+        let id = self.next_resource_id;
+        self.next_resource_id += 1;
+        self.resources.insert(id, state);
+        Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
+    }
+
+    /// Remove and return the resource for `id` (used by `close`/`kill`/EOF).
+    #[allow(dead_code)] // Only used by feature-gated modules (sqlite/process) for now.
+    pub(crate) fn take_resource(&mut self, id: u64) -> Option<ResourceState> {
+        self.resources.remove(&id)
+    }
+
+    /// Borrow the resource for `id` (used by handle methods like `conn.query`).
+    #[allow(dead_code)]
+    pub(crate) fn resource(&self, id: u64) -> Option<&ResourceState> {
+        self.resources.get(&id)
+    }
+
+    /// Number of live OS resources in the table. Tests use this to prove that
+    /// stream/child resources are reclaimed (no fd accumulation across spawns).
+    /// Only exercised by the `sys` process tests, hence dead under other configs.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
+
+    /// Look up the live `rusqlite::Connection` behind a handle id, or `None` if the
+    /// handle was closed (`take_resource`'d) — the caller turns that into the
+    /// "use after close" panic.
+    #[cfg(feature = "sql")]
+    pub(crate) fn sqlite_conn(&self, id: u64) -> Option<&rusqlite::Connection> {
+        match self.resources.get(&id) {
+            Some(ResourceState::SqliteConnection(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the live child process behind a handle id (for `wait`/
+    /// `kill`), or `None` if the handle was already taken (`wait`/EOF removes it).
+    #[cfg(feature = "sys")]
+    pub(crate) fn process_child_mut(&mut self, id: u64) -> Option<&mut tokio::process::Child> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::ChildProcess(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a process reader (stdout/stderr pipe) behind a handle id,
+    /// returning the reader and its capture mode together.
+    #[cfg(feature = "sys")]
+    pub(crate) fn proc_reader_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<(&mut crate::stdlib::process::ProcReader, crate::stdlib::process::Capture)> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::Reader { reader, capture }) => Some((reader, *capture)),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a process writer (stdin pipe) behind a handle id.
+    #[cfg(feature = "sys")]
+    pub(crate) fn proc_writer_mut(&mut self, id: u64) -> Option<&mut tokio::process::ChildStdin> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::Writer(w)) => Some(w),
+            _ => None,
         }
     }
 
@@ -723,6 +839,15 @@ impl Interp {
                 },
                 None => Err(AsError::at(format!("no superclass method '{}' (no superclass)", name), span)),
             },
+            Value::Native(n) => {
+                if let Some(v) = n.fields.get(name) {
+                    return Ok(v.clone());
+                }
+                Ok(Value::NativeMethod(std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: n.clone(),
+                    method: name.to_string(),
+                })))
+            }
             Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
             _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
@@ -736,8 +861,39 @@ impl Interp {
             Value::Function(func) => self.call_function(&func, args, span).await,
             Value::Class(class) => self.construct(class, args, span).await,
             Value::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
+            Value::NativeMethod(m) => self.call_native_method(m, args, span).await,
             _ => Err(AsError::at("value is not callable", span).into()),
         }
+    }
+
+    /// Dispatch a `NativeMethod` (e.g. `conn.query`, `child.wait`) to the handler
+    /// for its receiver's kind. Async + recursive because handlers (added by
+    /// sqlite/process tasks) re-enter the interpreter via `call_value`. For now
+    /// every kind falls through to the "no such method" error — the feature-gated
+    /// arms are added by Tasks 6/7.
+    #[async_recursion(?Send)]
+    pub(crate) async fn call_native_method(
+        &mut self,
+        m: std::rc::Rc<crate::value::NativeMethod>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let _ = &args;
+        #[cfg(feature = "sql")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, SqliteConnection | SqliteStatement) {
+                return self.call_sqlite_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "sys")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, ChildProcess | Reader | Writer) {
+                return self.call_process_method(&m, args, span).await;
+            }
+        }
+        Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
     }
 
     /// Bind params (with contracts), run a body in `call_env`, apply the return
@@ -1062,6 +1218,8 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Bytes(_) => "bytes",
         #[cfg(feature = "data")]
         Value::Regex(_) => "regex",
+        Value::Native(n) => n.kind.type_name(),
+        Value::NativeMethod(_) => "function",
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
@@ -1192,6 +1350,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_handle_fields_and_methods() {
+        let mut interp = Interp::new();
+        let mut fields = indexmap::IndexMap::new();
+        fields.insert("pid".to_string(), Value::Number(42.0));
+        let h = interp.register_resource(crate::value::NativeKind::ChildProcess, fields, ResourceState::Closed);
+        assert_eq!(type_name(&h), "childProcess");
+        assert_eq!(interp.read_member(&h, "pid", Span::new(0, 0)).unwrap(), Value::Number(42.0));
+        let m = interp.read_member(&h, "wait", Span::new(0, 0)).unwrap();
+        assert!(matches!(m, Value::NativeMethod(_)));
+        assert_eq!(h.to_string(), format!("<native childProcess #{}>", 0));
+        // The resource is in the table until taken.
+        assert!(matches!(interp.take_resource(0), Some(ResourceState::Closed)));
+        assert!(interp.take_resource(0).is_none());
+    }
+
+    #[tokio::test]
     async fn string_escapes_and_single_quotes() {
         assert_eq!(run("print('hello')").await, "hello\n");
         assert_eq!(run("print(\"a\\tb\")").await, "a\tb\n");
@@ -1293,6 +1467,17 @@ mod tests {
                    print(doc.a)\n\
                    print(doc.b[1])";
         assert_eq!(run(src).await, "1\ny\n");
+    }
+
+    #[cfg(feature = "sys")]
+    #[tokio::test]
+    async fn std_env_end_to_end() {
+        let src = "import * as env from \"std/env\"\n\
+                   env.set(\"ASCRIPT_E2E_ENV_d4a1\", \"world\")\n\
+                   print(env.get(\"ASCRIPT_E2E_ENV_d4a1\"))\n\
+                   env.unset(\"ASCRIPT_E2E_ENV_d4a1\")\n\
+                   print(env.get(\"ASCRIPT_E2E_ENV_d4a1\"))";
+        assert_eq!(run(src).await, "world\nnil\n");
     }
 
     #[tokio::test]

@@ -100,6 +100,45 @@ pub struct RegexHandle {
     pub source: String,
 }
 
+/// A native resource handle (sqlite connection/statement, process child/reader/writer,
+/// and — in M14 — http bodies/sse/sockets). The non-Clone OS resource lives in the
+/// interp's `resources` table keyed by `id`; this value is a cheap clonable handle.
+pub struct NativeObject {
+    pub id: u64,
+    pub kind: NativeKind,
+    /// Plain readable fields (e.g. a child's `pid`); methods are resolved separately.
+    pub fields: indexmap::IndexMap<String, Value>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // Some variants are only constructed by feature-gated modules (sqlite/process).
+pub enum NativeKind {
+    SqliteConnection,
+    SqliteStatement,
+    ChildProcess,
+    Reader,
+    Writer,
+    // M14 adds: HttpBody, SseStream, TcpStream, ...
+}
+
+impl NativeKind {
+    pub fn type_name(self) -> &'static str {
+        match self {
+            NativeKind::SqliteConnection => "connection",
+            NativeKind::SqliteStatement => "statement",
+            NativeKind::ChildProcess => "childProcess",
+            NativeKind::Reader => "reader",
+            NativeKind::Writer => "writer",
+        }
+    }
+}
+
+/// A method bound to a native handle (e.g. `child.wait`), dispatched async.
+pub struct NativeMethod {
+    pub receiver: std::rc::Rc<NativeObject>,
+    pub method: String,
+}
+
 /// Walk a class chain for a method, returning it plus the class that defined it.
 pub fn find_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Class>)> {
     let mut cur = Some(class.clone());
@@ -142,6 +181,11 @@ pub enum Value {
     /// A compiled regular expression (spec §11.2). Identity equality.
     #[cfg(feature = "data")]
     Regex(Rc<RegexHandle>),
+    /// A native resource handle (spec §11.2/§11.4). Always compiled; only the
+    /// feature-gated modules (sqlite/process) construct one. Identity equality.
+    Native(Rc<NativeObject>),
+    /// A method bound to a native handle, dispatched by the async `call_native_method`.
+    NativeMethod(Rc<NativeMethod>),
     Enum(Rc<EnumDef>),
     EnumVariant(Rc<EnumVariant>),
     Class(Rc<Class>),
@@ -175,6 +219,9 @@ impl PartialEq for Value {
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
             #[cfg(feature = "data")]
             (Value::Regex(a), Value::Regex(b)) => Rc::ptr_eq(a, b),
+            // Native handles and bound native methods compare by identity.
+            (Value::Native(a), Value::Native(b)) => Rc::ptr_eq(a, b),
+            (Value::NativeMethod(a), Value::NativeMethod(b)) => Rc::ptr_eq(a, b),
             // Enums and their (interned) variants compare by identity.
             (Value::Enum(a), Value::Enum(b)) => Rc::ptr_eq(a, b),
             (Value::EnumVariant(a), Value::EnumVariant(b)) => Rc::ptr_eq(a, b),
@@ -205,6 +252,8 @@ impl fmt::Debug for Value {
             Value::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
             #[cfg(feature = "data")]
             Value::Regex(r) => write!(f, "Regex({:?})", r.source),
+            Value::Native(n) => write!(f, "Native({} #{})", n.kind.type_name(), n.id),
+            Value::NativeMethod(m) => write!(f, "NativeMethod({}.{})", m.receiver.kind.type_name(), m.method),
             Value::Enum(e) => write!(f, "Enum({})", e.name),
             Value::EnumVariant(v) => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
             Value::Class(c) => write!(f, "Class({})", c.name),
@@ -291,6 +340,8 @@ impl Value {
             Value::Bytes(b) => write!(f, "<bytes len {}>", b.borrow().len()),
             #[cfg(feature = "data")]
             Value::Regex(r) => write!(f, "<regex {}>", r.source),
+            Value::Native(n) => write!(f, "<native {} #{}>", n.kind.type_name(), n.id),
+            Value::NativeMethod(m) => write!(f, "<native method {}>", m.method),
             Value::Enum(e) => write!(f, "<enum {}>", e.name),
             Value::EnumVariant(v) => write!(f, "{}.{}", v.enum_name, v.name),
             Value::Class(c) => write!(f, "<class {}>", c.name),
