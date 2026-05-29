@@ -113,14 +113,22 @@ impl Interp {
         let prev_dir = std::mem::replace(&mut self.module_dir, dir);
         let prev_exports = std::mem::replace(&mut self.current_exports, exports);
 
-        let tokens = lexer::lex(&src).map_err(Control::Panic)?;
-        let program = parser::parse(&tokens).map_err(Control::Panic)?;
+        let src_info =
+            Rc::new(crate::error::SourceInfo { path: canon.display().to_string(), text: src.clone() });
+
+        let tokens = lexer::lex(&src)
+            .map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
+        let program = parser::parse(&tokens)
+            .map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
         let result = self.exec(&program, &env).await;
 
         self.module_dir = prev_dir;
         self.current_exports = prev_exports;
 
-        result?; // propagate a panic from the module body
+        if let Err(Control::Panic(e)) = result {
+            return Err(Control::Panic(e.with_source(src_info)));
+        }
+        result?; // propagate any other control flow from the module body
         Ok(entry)
     }
 

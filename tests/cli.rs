@@ -102,8 +102,21 @@ fn runs_oop_example() {
 fn reports_usage_without_args() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin).output().unwrap();
+    // clap requires a subcommand; with none it prints usage and exits non-zero.
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("usage"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage"));
+}
+
+#[test]
+fn run_error_shows_source_caret() {
+    let file = std::env::temp_dir().join(format!("ascript_diag_{}.as", std::process::id()));
+    std::fs::write(&file, "let x = 1\nprint(missing)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    // ariadne renders the message and points at the source
+    assert!(err.contains("undefined variable 'missing'"));
 }
 
 #[test]
