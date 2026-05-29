@@ -4,6 +4,7 @@
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, UnOp};
 use crate::env::{AssignError, Environment};
 use crate::error::AsError;
+use crate::span::Span;
 use crate::value::Value;
 use async_recursion::async_recursion;
 
@@ -158,18 +159,18 @@ impl Interp {
             ExprKind::Call { callee, args } => {
                 let name = match &callee.kind {
                     ExprKind::Ident(n) => n.clone(),
-                    _ => return Err(AsError::new("only named builtins are callable in the skeleton")),
+                    _ => return Err(AsError::at("expression is not callable", callee.span)),
                 };
                 let mut values = Vec::new();
                 for a in args {
                     values.push(self.eval_expr(a, env).await?);
                 }
-                self.call_builtin(&name, &values)
+                self.call_builtin(&name, &values, expr.span)
             }
         }
     }
 
-    fn call_builtin(&mut self, name: &str, args: &[Value]) -> Result<Value, AsError> {
+    fn call_builtin(&mut self, name: &str, args: &[Value], span: Span) -> Result<Value, AsError> {
         match name {
             "print" => {
                 let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect();
@@ -177,7 +178,7 @@ impl Interp {
                 self.output.push('\n');
                 Ok(Value::Nil)
             }
-            other => Err(AsError::new(format!("'{}' is not a function", other))),
+            other => Err(AsError::at(format!("'{}' is not a function", other), span)),
         }
     }
 }
@@ -253,6 +254,25 @@ mod tests {
         let env = Environment::global();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("is not a function"));
+    }
+
+    #[tokio::test]
+    async fn call_site_errors_carry_a_span() {
+        // Unknown builtin: "is not a function" error must carry the call span.
+        let stmts = parse(&lex("nope(1)").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("is not a function"));
+        assert!(err.span.is_some());
+
+        // Non-identifier callee: "not callable" error must carry the callee span.
+        let stmts = parse(&lex("(1)(2)").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("not callable"));
+        assert!(err.span.is_some());
     }
 
     #[tokio::test]
