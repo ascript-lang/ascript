@@ -51,6 +51,7 @@ futures-util = { version = "0.3", optional = true }
 http = { version = "1", optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+crossterm = { version = "0.28", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -59,7 +60,7 @@ cc = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
@@ -77,3 +78,6 @@ net = ["dep:reqwest", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:
 # reqwest's http3 is UNSTABLE: building with this feature ALSO requires
 # `RUSTFLAGS="--cfg reqwest_unstable"`. Kept out of `default` for that reason.
 http3 = ["net", "reqwest/http3"]
+# M15 std/tui: terminal control + styling + events via crossterm, plus a hand-rolled
+# double-buffered screen. Default-on; cfg's out cleanly under --no-default-features.
+tui = ["dep:crossterm"]
