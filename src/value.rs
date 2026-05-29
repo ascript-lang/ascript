@@ -11,7 +11,8 @@ use std::rc::Rc;
 /// A user-defined function with its captured (closure) environment.
 pub struct Function {
     pub name: Option<String>,
-    pub params: Vec<String>,
+    pub params: Vec<crate::ast::Param>,
+    pub ret: Option<crate::ast::Type>,
     pub body: Vec<Stmt>,
     pub closure: Environment,
 }

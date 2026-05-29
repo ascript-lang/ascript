@@ -144,7 +144,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     tokens.push(Token { tok: Tok::PipePipe, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {
-                    return Err(AsError::at("unexpected character '|'", Span::new(start, start + 1)));
+                    tokens.push(Token { tok: Tok::Pipe, span: Span::new(start, start + 1) });
+                    i += 1;
                 }
             }
             '?' => {

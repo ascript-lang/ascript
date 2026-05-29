@@ -87,7 +87,7 @@ impl Interp {
                 self.eval_expr(e, env).await?;
                 Ok(Flow::Normal)
             }
-            Stmt::Let { name, value, mutable } => {
+            Stmt::Let { name, ty: _, value, mutable } => {
                 let v = self.eval_expr(value, env).await?;
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -171,10 +171,11 @@ impl Interp {
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
-            Stmt::Fn { name, params, body } => {
+            Stmt::Fn { name, params, ret, body } => {
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
+                    ret: ret.clone(),
                     body: body.clone(),
                     closure: env.clone(),
                 }));
@@ -270,6 +271,7 @@ impl Interp {
                 Ok(Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: None,
                     params: params.clone(),
+                    ret: None,
                     body: body_stmts,
                     closure: env.clone(),
                 })))
@@ -434,7 +436,7 @@ impl Interp {
         // New scope chained to the closure's captured environment.
         let call_env = func.closure.child();
         for (param, arg) in func.params.iter().zip(args.into_iter()) {
-            call_env.define(param, arg, true).map_err(AsError::new)?;
+            call_env.define(&param.name, arg, true).map_err(AsError::new)?;
         }
         match self.exec(&func.body, &call_env).await {
             Ok(Flow::Return(v)) => Ok(v),
@@ -591,6 +593,16 @@ mod tests {
             Control::Panic(e) => e,
             Control::Propagate(_) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn typed_code_runs_without_enforcement_yet() {
+        let src = "let x: number = 5\nfn f(a: number): number { return a + 1 }\nprint(f(x))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "6\n");
     }
 
     #[tokio::test]
