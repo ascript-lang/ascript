@@ -213,7 +213,15 @@ impl Interp {
                 env.define(name, def, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Class { name, superclass: _, methods } => {
+            Stmt::Class { name, superclass, methods } => {
+                let parent = match superclass {
+                    Some(sup_name) => match env.get(sup_name) {
+                        Some(Value::Class(c)) => Some(c),
+                        Some(_) => return Err(AsError::new(format!("'{}' is not a class", sup_name)).into()),
+                        None => return Err(AsError::new(format!("undefined superclass '{}'", sup_name)).into()),
+                    },
+                    None => None,
+                };
                 let mut method_map = indexmap::IndexMap::new();
                 for m in methods {
                     method_map.insert(m.name.clone(), std::rc::Rc::new(crate::value::Method {
@@ -224,7 +232,7 @@ impl Interp {
                 }
                 let class = Value::Class(std::rc::Rc::new(crate::value::Class {
                     name: name.clone(),
-                    superclass: None,
+                    superclass: parent,
                     methods: method_map,
                     def_env: env.clone(),
                 }));
@@ -1633,5 +1641,35 @@ print(r[1])
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "outer inner 2 end\n");
+    }
+
+    #[tokio::test]
+    async fn inheritance_and_super() {
+        let src = "class Animal {\n  fn init(name) { self.name = name }\n  fn speak() { return self.name + \" makes a sound\" }\n}\nclass Dog extends Animal {\n  fn init(name) { super.init(name) }\n  fn speak() { return super.speak() + \" - woof\" }\n}\nlet d = Dog(\"Rex\")\nprint(d.name)\nprint(d.speak())";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "Rex\nRex makes a sound - woof\n");
+    }
+
+    #[tokio::test]
+    async fn inherited_method_without_override() {
+        let src = "class A { fn greet() { return \"hi\" } }\nclass B extends A {}\nlet b = B()\nprint(b.greet())";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "hi\n");
+    }
+
+    #[tokio::test]
+    async fn undefined_superclass_errors() {
+        let src = "class B extends Nope {}";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("undefined superclass"));
     }
 }
