@@ -47,7 +47,9 @@ pub async fn run_source(src: &str) -> Result<String, AsError> {
     let tokens = lexer::lex(src).map_err(|e| e.with_source(src_info.clone()))?;
     let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
     let mut interp = Interp::new();
-    let env = crate::interp::global_env();
+    // Run in a child of the builtins env so the program can shadow builtins
+    // (`let len = 5`) and import names that collide with builtins.
+    let env = crate::interp::global_env().child();
     match interp.exec(&program, &env).await {
         Ok(crate::interp::Flow::Break) => Err(AsError::new("'break' outside of a loop")),
         Ok(crate::interp::Flow::Continue) => Err(AsError::new("'continue' outside of a loop")),

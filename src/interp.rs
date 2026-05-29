@@ -137,7 +137,9 @@ impl Interp {
         }
         let src = std::fs::read_to_string(&canon)
             .map_err(|e| Control::Panic(AsError::new(format!("cannot read module {}: {}", canon.display(), e))))?;
-        let env = global_env();
+        // Child of the global (builtins) env so module-level definitions and
+        // imports can shadow builtins (resolution walks up to find builtins).
+        let env = global_env().child();
         let exports = Rc::new(RefCell::new(HashSet::new()));
         let entry = ModuleEntry { env: env.clone(), exports: exports.clone() };
         // Cache BEFORE executing so circular imports resolve to this entry.
@@ -176,7 +178,9 @@ impl Interp {
         let exports_list = crate::stdlib::std_module_exports(source).ok_or_else(|| {
             Control::Panic(AsError::new(format!("unknown standard library module '{}'", source)))
         })?;
-        let env = global_env();
+        // Child of the global env so an export whose name collides with a global
+        // builtin (e.g. std/regex exports `test`) shadows it rather than erroring.
+        let env = global_env().child();
         let exports = Rc::new(RefCell::new(HashSet::new()));
         for (name, value) in exports_list {
             env.define(&name, value, false).map_err(AsError::new)?;
@@ -214,12 +218,21 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::Let { name, ty, value, mutable } => {
-                let v = self.eval_expr(value, env).await?;
-                if let Some(ty) = ty {
-                    if !check_type(&v, ty) {
-                        return Err(contract_panic(ty, &v, value.span));
+                let v = match value {
+                    Some(value) => {
+                        let v = self.eval_expr(value, env).await?;
+                        if let Some(ty) = ty {
+                            if !check_type(&v, ty) {
+                                return Err(contract_panic(ty, &v, value.span));
+                            }
+                        }
+                        v
                     }
-                }
+                    // `let x` / `let x: T` with no initializer binds nil. The type
+                    // annotation is not enforced here: there is no value to check,
+                    // and the language does not contract-check later assignments.
+                    None => Value::Nil,
+                };
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
@@ -465,6 +478,24 @@ impl Interp {
                     _ => {}
                 }
 
+                // Range `a..b`: eager, half-open `array<number>` with step 1,
+                // matching ForRange and the `range()` builtin. Returns an Array,
+                // so it must be handled before the generic "two numbers → Number"
+                // path below.
+                if let BinOp::Range = op {
+                    let (start, end) = match (&l, &r) {
+                        (Value::Number(a), Value::Number(b)) => (*a, *b),
+                        _ => return Err(AsError::at("range bounds must be numbers", expr.span).into()),
+                    };
+                    let mut items = Vec::new();
+                    let mut i = start;
+                    while i < end {
+                        items.push(Value::Number(i));
+                        i += 1.0;
+                    }
+                    return Ok(Value::Array(Rc::new(RefCell::new(items))));
+                }
+
                 // String concatenation: `+` joins two strings.
                 if let BinOp::Add = op {
                     if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
@@ -487,7 +518,8 @@ impl Interp {
                     BinOp::Le => Value::Bool(a <= b),
                     BinOp::Gt => Value::Bool(a > b),
                     BinOp::Ge => Value::Bool(a >= b),
-                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or | BinOp::Coalesce => {
+                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or | BinOp::Coalesce
+                    | BinOp::Range => {
                         unreachable!("handled above")
                     }
                 };
@@ -878,9 +910,10 @@ impl Interp {
                     Value::Array(a) => a.borrow().len(),
                     Value::Object(o) => o.borrow().len(),
                     Value::Map(m) => m.borrow().len(),
+                    Value::Bytes(b) => b.borrow().len(),
                     _ => {
                         return Err(AsError::at(
-                            format!("len() expects a string, array, object, or map, got {}", type_name(&v)),
+                            format!("len() expects a string, array, object, map, or bytes, got {}", type_name(&v)),
                             span,
                         )
                         .into())
@@ -1026,6 +1059,9 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
         Value::Map(_) => "map",
+        Value::Bytes(_) => "bytes",
+        #[cfg(feature = "data")]
+        Value::Regex(_) => "regex",
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
@@ -1137,7 +1173,7 @@ mod tests {
         let mut interp = Interp::new();
         let tokens = lex(src).expect("lex");
         let stmts = parse(&tokens).expect("parse");
-        let env = global_env();
+        let env = global_env().child();
         interp.exec(&stmts, &env).await.expect("program panicked");
         interp.output
     }
@@ -1147,12 +1183,22 @@ mod tests {
         let mut interp = Interp::new();
         let tokens = lex(src).expect("lex");
         let stmts = parse(&tokens).expect("parse");
-        let env = global_env();
+        let env = global_env().child();
         match interp.exec(&stmts, &env).await {
             Err(Control::Panic(e)) => e,
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn string_escapes_and_single_quotes() {
+        assert_eq!(run("print('hello')").await, "hello\n");
+        assert_eq!(run("print(\"a\\tb\")").await, "a\tb\n");
+        assert_eq!(run("print(\"quote: \\\"x\\\"\")").await, "quote: \"x\"\n");
+        assert_eq!(run("print('it\\'s')").await, "it's\n");
+        // a string with an escaped newline prints across two lines
+        assert_eq!(run("print(\"line1\\nline2\")").await, "line1\nline2\n");
     }
 
     #[tokio::test]
@@ -1166,6 +1212,138 @@ mod tests {
                    print(map.keys(m))\n\
                    print(map.values(m))";
         assert_eq!(run(src).await, "10\n2\n[\"x\", \"y\"]\n[10, 20]\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_json_end_to_end() {
+        // The JSON source is written as a backtick template so the inner double
+        // quotes can be written literally (a `"..."` literal would also work
+        // now that `\"` escapes are supported, but the template reads cleaner).
+        let src = "import * as json from \"std/json\"\n\
+                   let [v, err] = json.parse(`{\"x\": 10, \"ys\": [1, 2]}`)\n\
+                   print(v.x)\n\
+                   print(v.ys[1])\n\
+                   let [s, e2] = json.stringify({ a: 1, b: \"hi\" })\n\
+                   print(s)";
+        assert_eq!(run(src).await, "10\n2\n{\"a\":1,\"b\":\"hi\"}\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_encoding_end_to_end() {
+        let src = "import * as encoding from \"std/encoding\"\n\
+                   print(encoding.base64Encode(\"hi\"))\n\
+                   print(encoding.hexEncode(\"AB\"))\n\
+                   let [raw, e] = encoding.base64Decode(\"aGVsbG8=\")\n\
+                   let [text, e2] = encoding.utf8Decode(raw)\n\
+                   print(text)\n\
+                   print(encoding.urlEncode(\"a b&c\"))";
+        assert_eq!(run(src).await, "aGk=\n4142\nhello\na%20b%26c\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_regex_end_to_end() {
+        let src = "import * as regex from \"std/regex\"\n\
+                   let [re, err] = regex.compile(\"\\\\d+\")\n\
+                   print(regex.test(re, \"abc123\"))\n\
+                   print(regex.findAll(re, \"a1 b22 c333\"))\n\
+                   print(regex.replace(re, \"x9y\", \"#\"))\n\
+                   let m = regex.find(re, \"ab42cd\")\n\
+                   print(m.text)\n\
+                   print(m.index)\n\
+                   print(type(re))";
+        assert_eq!(run(src).await, "true\n[\"1\", \"22\", \"333\"]\nx#y\n42\n2\nregex\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_uuid_end_to_end() {
+        assert_eq!(run("import * as uuid from \"std/uuid\"\nprint(len(uuid.v4()))").await, "36\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_csv_end_to_end() {
+        let src = "import * as csv from \"std/csv\"\n\
+                   let [rows, err] = csv.parse(\"name,age\\nAda,36\\nAlan,41\")\n\
+                   print(rows[1][0])\n\
+                   print(rows[2][1])\n\
+                   let [text, e2] = csv.stringify([[\"a\", \"b\"], [1, 2]])\n\
+                   print(text)";
+        assert_eq!(run(src).await, "Ada\n41\na,b\n1,2\n\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_toml_end_to_end() {
+        let src = "import * as toml from \"std/toml\"\n\
+                   let [cfg, err] = toml.parse(\"name = \\\"ascript\\\"\\nversion = 11\")\n\
+                   print(cfg.name)\n\
+                   print(cfg.version)";
+        assert_eq!(run(src).await, "ascript\n11\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_yaml_end_to_end() {
+        let src = "import * as yaml from \"std/yaml\"\n\
+                   let [doc, err] = yaml.parse(\"a: 1\\nb:\\n  - x\\n  - y\")\n\
+                   print(doc.a)\n\
+                   print(doc.b[1])";
+        assert_eq!(run(src).await, "1\ny\n");
+    }
+
+    #[tokio::test]
+    async fn user_can_shadow_builtins() {
+        assert_eq!(run("let len = 5\nprint(len)").await, "5\n");
+        assert_eq!(run("fn type(x) { return 99 }\nprint(type(1))").await, "99\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn named_import_colliding_with_builtin() {
+        // regex exports `test`; importing it shadows the global test() builtin in this scope
+        let out = run("import { test, compile } from \"std/regex\"\nlet [re, e] = compile(\"\\\\d+\")\nprint(test(re, \"a1\"))").await;
+        assert_eq!(out, "true\n");
+    }
+
+    #[tokio::test]
+    async fn range_as_general_expression() {
+        assert_eq!(run("let r = 0..5\nprint(r)").await, "[0, 1, 2, 3, 4]\n");
+        assert_eq!(run("print(2..2)").await, "[]\n");
+        assert_eq!(run("import * as array from \"std/array\"\nprint(array.contains(1..4, 2))").await, "true\n");
+        // for-in over a non-literal range value (array)
+        assert_eq!(run("let r = 0..3\nlet s = 0\nfor (i in r) { s = s + i }\nprint(s)").await, "3\n");
+        // common literal for-in still works (lazy ForRange path)
+        assert_eq!(run("let s = 0\nfor (i in 0..4) { s = s + i }\nprint(s)").await, "6\n");
+        // precedence: .. tighter than comparison, looser than +
+        assert_eq!(run("print(1+1..5)").await, "[2, 3, 4]\n");
+    }
+
+    #[tokio::test]
+    async fn range_bounds_must_be_numbers() {
+        let err = run_err("print(\"a\"..3)").await;
+        assert!(err.message.contains("range bounds must be numbers"));
+    }
+
+    #[tokio::test]
+    async fn let_without_initializer() {
+        assert_eq!(run("let x\nx = 5\nprint(x)").await, "5\n");
+        assert_eq!(run("let y: number\ny = 3\nprint(y)").await, "3\n");
+        // uninitialized reads as nil
+        assert_eq!(run("let z\nprint(z)").await, "nil\n");
+        // const still requires initializer
+        assert!(parse(&lex("const c").unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn number_literals_hex_binary_scientific_underscore() {
+        assert_eq!(
+            run("print(0xFF)\nprint(0b1010)\nprint(1e3)\nprint(1_000)\nprint(0xFF_FF)").await,
+            "255\n10\n1000\n1000\n65535\n"
+        );
     }
 
     #[tokio::test]
@@ -2118,6 +2296,19 @@ print(r[1])
                    print(string.format(\"{}={}\", \"x\", 9))\n\
                    print(string.padStart(\"5\", 3, \"0\"))";
         assert_eq!(run(src).await, "HI\na+b+c\nx=9\n005\n");
+    }
+
+    #[tokio::test]
+    async fn std_bytes_end_to_end() {
+        let src = "import * as bytes from \"std/bytes\"\n\
+                   let b = bytes.alloc(2)\n\
+                   bytes.set(b, 0, 222)\n\
+                   bytes.set(b, 1, 173)\n\
+                   print(len(b))\n\
+                   print(type(b))\n\
+                   print(bytes.toArray(b))\n\
+                   print(bytes.readUint(b, 0, 2, \"be\"))";
+        assert_eq!(run(src).await, "2\nbytes\n[222, 173]\n57005\n");
     }
 
     #[tokio::test]

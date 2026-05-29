@@ -76,8 +76,11 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
                 out.push_str(": ");
                 out.push_str(&render_type(ty));
             }
-            out.push_str(" = ");
-            write_expr(out, value, 0);
+            // `let x` / `let x: T` may have no initializer.
+            if let Some(value) = value {
+                out.push_str(" = ");
+                write_expr(out, value, 0);
+            }
             out.push('\n');
         }
         Stmt::LetDestructure { names, value, mutable } => {
@@ -271,18 +274,21 @@ fn bin_prec(op: BinOp) -> u8 {
         BinOp::Coalesce => 3,
         BinOp::Eq | BinOp::Ne => 4,
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 5,
-        BinOp::Add | BinOp::Sub => 6,
-        BinOp::Mul | BinOp::Div | BinOp::Mod => 7,
-        BinOp::Pow => 8,
+        // Range binds looser than additive but tighter than comparison
+        // (grammar PREC.range = 7, between compare = 6 and add = 8).
+        BinOp::Range => 6,
+        BinOp::Add | BinOp::Sub => 7,
+        BinOp::Mul | BinOp::Div | BinOp::Mod => 8,
+        BinOp::Pow => 9,
     }
 }
 
 // A precedence floor for a context. An expression whose own precedence is below
 // `min_prec` must be parenthesized.
 const PREC_ASSIGN: u8 = 0;
-const PREC_UNARY: u8 = 9;
-const PREC_POSTFIX: u8 = 10;
-const PREC_ATOM: u8 = 11;
+const PREC_UNARY: u8 = 10;
+const PREC_POSTFIX: u8 = 11;
+const PREC_ATOM: u8 = 12;
 
 /// The natural precedence of an expression (how tightly it binds as a whole).
 fn expr_prec(e: &Expr) -> u8 {
@@ -322,7 +328,7 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
         ExprKind::Number(n) => out.push_str(&format_number(*n)),
         ExprKind::Str(s) => {
             out.push('"');
-            out.push_str(s);
+            out.push_str(&escape_str_lit(s));
             out.push('"');
         }
         ExprKind::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -350,9 +356,15 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                 _ => (p, p + 1),
             };
             write_expr(out, lhs, lp);
-            out.push(' ');
-            out.push_str(&op_str_bin(*op));
-            out.push(' ');
+            // Range uses the no-space idiom `a..b`; all other binary operators
+            // are spaced.
+            if let BinOp::Range = op {
+                out.push_str("..");
+            } else {
+                out.push(' ');
+                out.push_str(&op_str_bin(*op));
+                out.push(' ');
+            }
             write_expr(out, rhs, rp);
         }
         ExprKind::Call { callee, args } => {
@@ -518,6 +530,24 @@ fn format_number(n: f64) -> String {
 
 /// Re-escape template literal text so it round-trips through the lexer (which
 /// unescapes `\` `` ` `` `$` `\n` `\t`).
+/// Re-escape a string value for emission inside a double-quoted literal, so it
+/// round-trips through the lexer's escape handling (see `lexer::escape_char`).
+fn escape_str_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn escape_template_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -571,6 +601,17 @@ mod tests {
     fn formats_canonically() {
         let out = format_source("let x=1").unwrap();
         assert_eq!(out, "let x = 1\n");
+    }
+
+    #[test]
+    fn re_escapes_string_literals() {
+        // A string literal carrying special chars must be emitted with escapes
+        // so the formatted output re-lexes to the same value (round-trips).
+        let out = format_source("print(\"a\\\"b\\tc\\nd\\\\e\")").unwrap();
+        assert_eq!(out, "print(\"a\\\"b\\tc\\nd\\\\e\")\n");
+        // idempotent and re-parses
+        let twice = format_source(&out).unwrap();
+        assert_eq!(out, twice);
     }
 
     #[test]

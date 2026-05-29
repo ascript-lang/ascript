@@ -73,8 +73,20 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   resolve from a static registry (`src/stdlib/mod.rs`) cached under a synthetic `<std>/`
   key. 183 lib + 15 cli + 5 module + 2 conformance tests. Merged.
   Plan: `plans/2026-05-29-ascript-m10-core-collections.md`.
-- ⬜ **M11 — Serialization & encoding.** `std/json`, `std/regex`, `std/encoding`,
-  `std/bytes`, `std/uuid`, `std/csv`, `std/toml`, `std/yaml`.
+- ✅ **M11 — Serialization & encoding.** `std/json`, `std/regex`, `std/encoding`,
+  `std/bytes`, `std/uuid`, `std/csv`, `std/toml`, `std/yaml`. Introduced the
+  **`Value::Bytes`** (always-on) and **`Value::Regex`** (feature-gated) value kinds, a
+  default-on **`data` Cargo feature** (§12.4) gating the crate-backed modules, and one
+  shared `Value`↔`serde_json::Value` converter reused by json/toml/yaml (with
+  `preserve_order` so all three keep source key order). **Also closed three Phase-1
+  front-end conformance gaps** discovered en route: (1) hex/binary/scientific/underscore
+  number literals (`0xFF`/`0b1010`/`1e9`/`1_000`); (2) single-quoted strings + escape
+  sequences (`\n`/`\"`/`\\`/…); (3) range `..` as a general operator + `let` without
+  initializer; plus a builtin-shadowing fix (programs/modules run in a child of the
+  builtins scope, so user code and imports can shadow `len`/`type`/`test`/…). Added
+  `tests/frontend_conformance.rs` (a ~150-snippet differential guardrail). 241 lib + 16
+  cli + 2 frontend + 5 module + 2 conformance tests (266 default; 236 `--no-default`).
+  Merged. Plan: `plans/2026-05-29-ascript-m11-serialization.md`.
 - ⬜ **M12 — Time & locale.** `std/time`, `std/date`, `std/intl` (pragmatic icu4x).
 
 ## Phase 3 — Standard library: system & async
@@ -281,7 +293,35 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 - **`run`/`run_err` async test helpers** now exist in `src/interp.rs` tests (lex+parse+exec a
   string → output / expected-panic `AsError`). Reuse them for stdlib e2e tests.
 
-## Roadmap status: M1–M10 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10 done).**
+### M12 design guidance (from M11 holistic review — read before planning M12)
+
+- **Feature groups:** M11 established the `data` Cargo feature (default-on) gating crate-backed
+  modules, with cfg-gated `pub mod`/`std_module_exports`/`call_stdlib` arms AND cfg-gated value
+  kinds (`Value::Regex`). M12 (time/date/intl) should add a `time` (or `intl`) feature the same
+  way. **Critical:** if a milestone adds a feature-gated `Value` variant, gate EVERY exhaustive
+  match arm and verify BOTH `cargo build` and `cargo build --no-default-features` compile (the
+  `tests/frontend_conformance.rs` + the dual-config test runs are the guardrail).
+- **`std/time.sleep` is the first ASYNC stdlib fn.** The async seam already exists (eval is async
+  on current-thread tokio). Model it on `std/array`'s `call_array`: an `impl Interp { async fn
+  call_time(...) }` that `await`s `tokio::time::sleep`. A real future/awaitable `Value` kind is
+  NOT needed until M14 — `sleep` can await directly inside dispatch. Register the async arm in
+  `call_stdlib` like array's (`"time" => self.call_time(...).await`).
+- **Durations:** likely plain numbers (ms) or a small `{secs, nanos}` object — decide when
+  planning. `now()`→unix ms (number), `monotonic()`→a monotonic number.
+- **`std/date`:** `chrono` or `time` crate; civil dates parse/format/arithmetic/timezones. Map
+  to AScript values (an object `{year, month, day, ...}` or a dedicated kind — prefer object to
+  avoid a new value kind unless arithmetic ergonomics demand it).
+- **`std/intl`:** trimmed `icu4x` (pragmatic subset) — locale-aware number/currency/date
+  formatting, case folding, basic collation. This is the heaviest dep; keep the surface small
+  and the feature optional.
+- **Reuse the M11 patterns:** the shared `want_*` helpers, the `ctx` error closure, Tier-1
+  `make_pair`/`make_error` for fallible parse (date parsing!), Tier-2 panic for arg-type misuse,
+  and the cfg-gated module registration. `run`/`run_err` test helpers + per-module unit tests +
+  an interp e2e + a capstone example + the holistic review remain the process.
+- **Front-end is now solid** (numbers/strings/range/let/shadowing all conform to the grammar;
+  the differential guardrail catches grammar-vs-parser drift). No known remaining Phase-1 gaps.
+
+## Roadmap status: M1–M11 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10, M11 done).**
 The AScript language (spec §§2–9) + tooling (§10: diagnostics, REPL, fmt, test,
 Tree-sitter conformance) + async/await surface (§7) are fully implemented, unit- and
 example-tested, clippy-clean, and merged to `main`. Remaining: Phase 2+ standard

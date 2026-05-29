@@ -434,12 +434,17 @@ impl<'a> Parser<'a> {
         };
         match self.advance() {
             Tok::In => {
-                let start = self.expr()?;
-                self.eat(&Tok::DotDot)?;
-                let end = self.expr()?;
+                // The iterable is a general expression. If it's exactly a `..`
+                // range, keep the allocation-free lazy ForRange path; otherwise
+                // fall back to ForOf (which iterates the resulting array).
+                let iter = self.expr()?;
                 self.eat(&Tok::RParen)?;
                 let body = self.block()?;
-                Ok(Stmt::ForRange { var, start, end, body })
+                if let ExprKind::Binary { op: BinOp::Range, lhs, rhs } = iter.kind {
+                    Ok(Stmt::ForRange { var, start: *lhs, end: *rhs, body })
+                } else {
+                    Ok(Stmt::ForOf { var, iter, body })
+                }
             }
             Tok::Of => {
                 let iter = self.expr()?;
@@ -497,8 +502,17 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.eat(&Tok::Eq)?;
-        let value = self.expr()?;
+        // For `let` (mutable) the initializer is optional (`let x`, `let x: T`);
+        // a later assignment supplies the value. `const` (immutable) must be
+        // initialized at the declaration.
+        let value = if *self.peek() == Tok::Eq {
+            self.advance();
+            Some(self.expr()?)
+        } else if mutable {
+            None
+        } else {
+            return Err(AsError::at("const declarations must be initialized", self.span()));
+        };
         Ok(Stmt::Let { name, ty, value, mutable })
     }
 
@@ -694,7 +708,7 @@ impl<'a> Parser<'a> {
     }
 
     fn comparison(&mut self) -> Result<Expr, AsError> {
-        let mut left = self.additive()?;
+        let mut left = self.range()?;
         loop {
             let op = match self.peek() {
                 Tok::Lt => BinOp::Lt,
@@ -704,8 +718,21 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.advance();
-            let right = self.additive()?;
+            let right = self.range()?;
             left = Self::make_binary(left, op, right);
+        }
+        Ok(left)
+    }
+
+    /// The range operator `..` (grammar PREC.range = 7): binds tighter than
+    /// comparison but looser than additive (`1+1..5` parses as `(1+1)..5`).
+    /// Left-associative, like the other binary levels.
+    fn range(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.additive()?;
+        while *self.peek() == Tok::DotDot {
+            self.advance();
+            let right = self.additive()?;
+            left = Self::make_binary(left, BinOp::Range, right);
         }
         Ok(left)
     }

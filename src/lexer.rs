@@ -9,6 +9,53 @@ enum TemplateChunk {
     Start, // `...${          (more follows)
 }
 
+/// Translate the character following a `\` into its escaped value. Shared by
+/// all three string forms (`"..."`, `'...'`, and `` `...` ``). Unknown escapes
+/// pass through leniently (`\<other>` -> `<other>`), matching the original
+/// template behavior. Template-specific escapes (`` \` `` and `\$`) are
+/// handled by the caller before reaching here (they fall through to the
+/// lenient passthrough anyway, but listing them keeps intent explicit).
+fn escape_char(c: char) -> char {
+    match c {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '0' => '\0',
+        '\\' => '\\',
+        '"' => '"',
+        '\'' => '\'',
+        other => other,
+    }
+}
+
+/// Read a quoted string body starting just after the opening `quote`, scanning
+/// until the matching unescaped `quote`. Advances `i` past the closing quote.
+/// Backslash escapes are translated via `escape_char`.
+fn lex_quoted(
+    chars: &[char],
+    i: &mut usize,
+    start: usize,
+    quote: char,
+) -> Result<String, AsError> {
+    let mut s = String::new();
+    while *i < chars.len() {
+        let c = chars[*i];
+        if c == quote {
+            *i += 1; // consume closing quote
+            return Ok(s);
+        }
+        if c == '\\' && *i + 1 < chars.len() {
+            *i += 1;
+            s.push(escape_char(chars[*i]));
+            *i += 1;
+            continue;
+        }
+        s.push(c);
+        *i += 1;
+    }
+    Err(AsError::at("unterminated string", Span::new(start, *i)))
+}
+
 /// Read template text starting just after a backtick (or after `}` that closes
 /// an interpolation). Advances `i` past the terminating `` ` `` or `${`.
 fn lex_template_chunk(
@@ -28,13 +75,15 @@ fn lex_template_chunk(
             return Ok((text, TemplateChunk::Start));
         }
         if c == '\\' && *i + 1 < chars.len() {
-            // simple escapes inside templates: \` \$ \\ \n \t
+            // Escapes inside templates. `` \` `` and `\$` are template-specific
+            // (they escape the interpolation/terminator syntax); everything
+            // else shares the common escape set via `escape_char`.
             *i += 1;
             let e = chars[*i];
             text.push(match e {
-                'n' => '\n',
-                't' => '\t',
-                other => other,
+                '`' => '`',
+                '$' => '$',
+                other => escape_char(other),
             });
             *i += 1;
             continue;
@@ -242,15 +291,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
             ']' => push(&mut tokens, Tok::RBracket, start, &mut i),
             '"' => {
                 i += 1;
-                let mut s = String::new();
-                while i < chars.len() && chars[i] != '"' {
-                    s.push(chars[i]);
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    return Err(AsError::at("unterminated string", Span::new(start, i)));
-                }
-                i += 1; // consume closing quote
+                let s = lex_quoted(&chars, &mut i, start, '"')?;
+                tokens.push(Token { tok: Tok::Str(s), span: Span::new(start, i) });
+            }
+            '\'' => {
+                i += 1;
+                let s = lex_quoted(&chars, &mut i, start, '\'')?;
                 tokens.push(Token { tok: Tok::Str(s), span: Span::new(start, i) });
             }
             '`' => {
@@ -271,22 +317,84 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 }
             }
             c if c.is_ascii_digit() => {
+                // note: leading-dot floats (e.g. `.5`) are intentionally
+                // unsupported — this arm is only entered on a digit, and a
+                // leading `.` is reserved for member access / the `..` range
+                // operator. Write `0.5` instead.
                 let mut j = i;
-                while j < chars.len() && chars[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j + 1 < chars.len() && chars[j] == '.' && chars[j + 1].is_ascii_digit() {
-                    j += 1;
-                    while j < chars.len() && chars[j].is_ascii_digit() {
+                // Hex / binary prefixes must be checked FIRST: `0x..` / `0b..`.
+                // (A bare `0`, `0.5`, `0e1` fall through to the decimal scan.)
+                if chars[i] == '0'
+                    && i + 1 < chars.len()
+                    && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B')
+                {
+                    let radix_char = chars[i + 1];
+                    let (radix, is_digit): (u32, fn(char) -> bool) = match radix_char {
+                        'x' | 'X' => (16, |d| d.is_ascii_hexdigit()),
+                        _ => (2, |d| d == '0' || d == '1'),
+                    };
+                    j = i + 2;
+                    while j < chars.len() && (is_digit(chars[j]) || chars[j] == '_') {
                         j += 1;
                     }
+                    let span = Span::new(i, j);
+                    let digits: String =
+                        chars[i + 2..j].iter().filter(|&&ch| ch != '_').collect();
+                    let label = if radix == 16 {
+                        "invalid hex number literal"
+                    } else {
+                        "invalid binary number literal"
+                    };
+                    if digits.is_empty() {
+                        return Err(AsError::at(label, span));
+                    }
+                    let n = u64::from_str_radix(&digits, radix)
+                        .map_err(|_| AsError::at(label, span))?
+                        as f64;
+                    tokens.push(Token { tok: Tok::Number(n), span });
+                    i = j;
+                } else {
+                    // Decimal / float / scientific: \d[\d_]* (.\d[\d_]*)? ([eE][+-]?\d+)?
+                    let is_dec = |d: char| d.is_ascii_digit() || d == '_';
+                    while j < chars.len() && is_dec(chars[j]) {
+                        j += 1;
+                    }
+                    // Optional fraction — only when `.` is followed by a digit,
+                    // so `0..5` (range) and `a.0` (member) are preserved.
+                    if j + 1 < chars.len() && chars[j] == '.' && chars[j + 1].is_ascii_digit() {
+                        j += 1;
+                        while j < chars.len() && is_dec(chars[j]) {
+                            j += 1;
+                        }
+                    }
+                    // Optional exponent: e/E, optional sign, then a digit run.
+                    if j < chars.len() && matches!(chars[j], 'e' | 'E') {
+                        let after = j + 1;
+                        let exp_ok = if after < chars.len() && chars[after].is_ascii_digit() {
+                            true
+                        } else {
+                            after + 1 < chars.len()
+                                && matches!(chars[after], '+' | '-')
+                                && chars[after + 1].is_ascii_digit()
+                        };
+                        if exp_ok {
+                            j += 1; // consume e/E
+                            if matches!(chars[j], '+' | '-') {
+                                j += 1;
+                            }
+                            while j < chars.len() && chars[j].is_ascii_digit() {
+                                j += 1;
+                            }
+                        }
+                    }
+                    let span = Span::new(i, j);
+                    let text: String = chars[i..j].iter().filter(|&&ch| ch != '_').collect();
+                    let n: f64 = text
+                        .parse()
+                        .map_err(|_| AsError::at("invalid number", span))?;
+                    tokens.push(Token { tok: Tok::Number(n), span });
+                    i = j;
                 }
-                let text: String = chars[i..j].iter().collect();
-                let n: f64 = text
-                    .parse()
-                    .map_err(|_| AsError::at("invalid number", Span::new(i, j)))?;
-                tokens.push(Token { tok: Tok::Number(n), span: Span::new(i, j) });
-                i = j;
             }
             c if c.is_alphabetic() || c == '_' => {
                 let mut j = i;
@@ -468,6 +576,47 @@ mod tests {
     }
 
     #[test]
+    fn lexes_single_quoted_string() {
+        assert_eq!(kinds("'single'"), vec![Tok::Str("single".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn double_quote_escape_inside_double_string() {
+        // source: "a\"b"
+        assert_eq!(kinds("\"a\\\"b\""), vec![Tok::Str("a\"b".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn newline_escape_in_double_string() {
+        // source: "line\nbreak"
+        assert_eq!(kinds("\"line\\nbreak\""), vec![Tok::Str("line\nbreak".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn single_quote_escape_inside_single_string() {
+        // source: 'it\'s'
+        assert_eq!(kinds("'it\\'s'"), vec![Tok::Str("it's".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn tab_escape_in_double_string() {
+        // source: "tab\there"
+        assert_eq!(kinds("\"tab\\there\""), vec![Tok::Str("tab\there".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn backslash_escape_in_double_string() {
+        // source: "back\\slash"
+        assert_eq!(kinds("\"back\\\\slash\""), vec![Tok::Str("back\\slash".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn rejects_unterminated_single_quoted_string() {
+        let err = lex("'oops").unwrap_err();
+        assert!(err.message.contains("unterminated"));
+    }
+
+    #[test]
     fn skips_line_comments() {
         assert_eq!(kinds("1 // ignored\n+ 2"),
             vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]);
@@ -495,5 +644,62 @@ mod tests {
     fn unterminated_block_comment_errors() {
         let err = lex("/* oops no end").unwrap_err();
         assert!(err.message.contains("unterminated block comment"));
+    }
+
+    #[test]
+    fn lexes_hex_literals() {
+        assert_eq!(kinds("0xFF"), vec![Tok::Number(255.0), Tok::Eof]);
+        assert_eq!(kinds("0xFF_FF"), vec![Tok::Number(65535.0), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_binary_literals() {
+        assert_eq!(kinds("0b1010"), vec![Tok::Number(10.0), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_scientific_literals() {
+        assert_eq!(kinds("1e9"), vec![Tok::Number(1e9), Tok::Eof]);
+        assert_eq!(kinds("1.5e-3"), vec![Tok::Number(0.0015), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_underscore_separators() {
+        assert_eq!(kinds("1_000"), vec![Tok::Number(1000.0), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_plain_decimals_and_floats() {
+        assert_eq!(kinds("255"), vec![Tok::Number(255.0), Tok::Eof]);
+        assert_eq!(kinds("2.5"), vec![Tok::Number(2.5), Tok::Eof]);
+    }
+
+    #[test]
+    fn range_operator_not_consumed_as_float() {
+        // `0..5` must lex as Number(0), DotDot, Number(5) — not `0.` float.
+        assert_eq!(
+            kinds("0..5"),
+            vec![Tok::Number(0.0), Tok::DotDot, Tok::Number(5.0), Tok::Eof]
+        );
+    }
+
+    #[test]
+    fn member_access_after_ident_unaffected() {
+        assert_eq!(
+            kinds("a.b"),
+            vec![Tok::Ident("a".into()), Tok::Dot, Tok::Ident("b".into()), Tok::Eof]
+        );
+    }
+
+    #[test]
+    fn invalid_hex_literal_errors() {
+        let err = lex("0xZZ").unwrap_err();
+        assert!(err.message.contains("invalid hex number literal"));
+    }
+
+    #[test]
+    fn invalid_binary_literal_errors() {
+        let err = lex("0b2").unwrap_err();
+        assert!(err.message.contains("invalid binary number literal"));
     }
 }

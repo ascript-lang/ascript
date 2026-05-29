@@ -5,11 +5,26 @@
 //! are ordinary `function` values; argument-type misuse is a Tier-2 panic.
 
 pub mod array;
+pub mod bytes;
 pub mod convert;
+#[cfg(feature = "data")]
+pub mod csv;
+#[cfg(feature = "data")]
+pub mod encoding;
+#[cfg(feature = "data")]
+pub mod json;
 pub mod map;
 pub mod math;
 pub mod object;
+#[cfg(feature = "data")]
+pub mod regex;
 pub mod string;
+#[cfg(feature = "data")]
+pub mod toml;
+#[cfg(feature = "data")]
+pub mod uuid;
+#[cfg(feature = "data")]
+pub mod yaml;
 
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
@@ -31,7 +46,22 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/array" => array::exports(),
         "std/object" => object::exports(),
         "std/map" => map::exports(),
+        "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
+        #[cfg(feature = "data")]
+        "std/json" => json::exports(),
+        #[cfg(feature = "data")]
+        "std/encoding" => encoding::exports(),
+        #[cfg(feature = "data")]
+        "std/regex" => regex::exports(),
+        #[cfg(feature = "data")]
+        "std/uuid" => uuid::exports(),
+        #[cfg(feature = "data")]
+        "std/csv" => csv::exports(),
+        #[cfg(feature = "data")]
+        "std/toml" => toml::exports(),
+        #[cfg(feature = "data")]
+        "std/yaml" => yaml::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -52,7 +82,22 @@ impl Interp {
             "array" => self.call_array(func, args, span).await,
             "object" => object::call(func, args, span),
             "map" => map::call(func, args, span),
+            "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
+            #[cfg(feature = "data")]
+            "json" => json::call(func, args, span),
+            #[cfg(feature = "data")]
+            "encoding" => encoding::call(func, args, span),
+            #[cfg(feature = "data")]
+            "regex" => regex::call(func, args, span),
+            #[cfg(feature = "data")]
+            "uuid" => uuid::call(func, args, span),
+            #[cfg(feature = "data")]
+            "csv" => csv::call(func, args, span),
+            #[cfg(feature = "data")]
+            "toml" => toml::call(func, args, span),
+            #[cfg(feature = "data")]
+            "yaml" => yaml::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
@@ -91,6 +136,13 @@ pub(crate) fn want_object(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::ce
     match v {
         Value::Object(o) => Ok(o.clone()),
         _ => Err(AsError::at(format!("{} expects an object, got {}", ctx, crate::interp::type_name(v)), span).into()),
+    }
+}
+
+pub(crate) fn want_bytes(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cell::RefCell<Vec<u8>>>, Control> {
+    match v {
+        Value::Bytes(b) => Ok(b.clone()),
+        _ => Err(AsError::at(format!("{} expects bytes, got {}", ctx, crate::interp::type_name(v)), span).into()),
     }
 }
 

@@ -92,6 +92,14 @@ pub struct SuperRef {
     pub start: Option<Rc<Class>>,
 }
 
+/// A compiled regular expression (spec §11.2). Immutable; identity equality.
+/// Gated on the `data` feature because `regex::Regex` only exists with it.
+#[cfg(feature = "data")]
+pub struct RegexHandle {
+    pub re: regex::Regex,
+    pub source: String,
+}
+
 /// Walk a class chain for a method, returning it plus the class that defined it.
 pub fn find_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Class>)> {
     let mut cur = Some(class.clone());
@@ -129,6 +137,11 @@ pub enum Value {
     // IndexMap (not HashMap) is deliberate: insertion order is required for
     // deterministic keys/values/entries/display and to match `Object`.
     Map(Rc<RefCell<IndexMap<MapKey, Value>>>),
+    /// A mutable byte buffer (spec §11.2). Identity equality, like Array/Map.
+    Bytes(Rc<RefCell<Vec<u8>>>),
+    /// A compiled regular expression (spec §11.2). Identity equality.
+    #[cfg(feature = "data")]
+    Regex(Rc<RegexHandle>),
     Enum(Rc<EnumDef>),
     EnumVariant(Rc<EnumVariant>),
     Class(Rc<Class>),
@@ -159,6 +172,9 @@ impl PartialEq for Value {
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             (Value::Map(a), Value::Map(b)) => Rc::ptr_eq(a, b),
+            (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
+            #[cfg(feature = "data")]
+            (Value::Regex(a), Value::Regex(b)) => Rc::ptr_eq(a, b),
             // Enums and their (interned) variants compare by identity.
             (Value::Enum(a), Value::Enum(b)) => Rc::ptr_eq(a, b),
             (Value::EnumVariant(a), Value::EnumVariant(b)) => Rc::ptr_eq(a, b),
@@ -186,6 +202,9 @@ impl fmt::Debug for Value {
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
             Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
             Value::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
+            Value::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
+            #[cfg(feature = "data")]
+            Value::Regex(r) => write!(f, "Regex({:?})", r.source),
             Value::Enum(e) => write!(f, "Enum({})", e.name),
             Value::EnumVariant(v) => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
             Value::Class(c) => write!(f, "Class({})", c.name),
@@ -269,6 +288,9 @@ impl Value {
                 seen.pop();
                 Ok(())
             }
+            Value::Bytes(b) => write!(f, "<bytes len {}>", b.borrow().len()),
+            #[cfg(feature = "data")]
+            Value::Regex(r) => write!(f, "<regex {}>", r.source),
             Value::Enum(e) => write!(f, "<enum {}>", e.name),
             Value::EnumVariant(v) => write!(f, "{}.{}", v.enum_name, v.name),
             Value::Class(c) => write!(f, "<class {}>", c.name),

@@ -158,6 +158,37 @@ fn runs_stdlib_example() {
 }
 
 #[test]
+#[cfg(feature = "data")] // example imports std/json etc.; only valid with the data feature.
+fn runs_serialization_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output =
+        Command::new(bin).arg("run").arg("examples/serialization.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    // json: parsed fields + stringify
+    assert!(out.contains("ascript"));
+    assert!(out.contains("lang"));
+    assert!(out.contains("{\"ok\":true,\"n\":3}"));
+    // toml
+    assert!(out.contains("demo"));
+    assert!(out.contains("8080"));
+    // yaml
+    assert!(out.contains("prod"));
+    // encoding: base64Encode("hi") + decode round-trip
+    assert!(out.contains("aGk="));
+    assert!(out.contains("hello"));
+    // regex: findAll + find.text
+    assert!(out.contains("[\"the\", \"quick\", \"fox\"]"));
+    assert!(out.contains("abc"));
+    // csv: rows[1][0]
+    assert!(out.contains("\n1\n"));
+    // bytes: 513 big-endian = [2, 1]
+    assert!(out.contains("[2, 1]"));
+    // uuid v4 is random; just assert its length (36).
+    assert!(out.contains("36"));
+}
+
+#[test]
 fn repl_evaluates_and_persists_bindings() {
     use std::io::Write;
     use std::process::{Command, Stdio};
