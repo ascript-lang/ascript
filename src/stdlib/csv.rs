@@ -25,6 +25,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "parse" => {
             let text = want_string(&arg(args, 0), span, &ctx("parse"))?;
             let header = matches!(args.get(1), Some(Value::Object(o)) if matches!(o.borrow().get("header"), Some(Value::Bool(true))));
+            // parse is lenient — irregular quoting/ragged rows are coerced rather
+            // than rejected; only genuine reader errors (I/O or UTF-8) reach the
+            // Tier-1 err branch below. This matches the csv crate's permissive
+            // default and real-world CSV.
             let mut rdr = csv::ReaderBuilder::new()
                 .has_headers(false)
                 .flexible(true)
@@ -87,6 +91,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 if wtr.write_record(&header).is_err() {
                     return Ok(make_pair(Value::Nil, make_error(str_v("CSV write error"))));
                 }
+                // Writing to an in-memory Vec is infallible, so data-row write
+                // results are intentionally dropped (`let _ =`); any flush error
+                // surfaces via `into_inner()` below.
                 for row in rows.iter() {
                     let o = match row {
                         Value::Object(o) => o,
@@ -120,6 +127,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         }
                     };
                     let fields: Vec<String> = r.borrow().iter().map(|v| v.to_string()).collect();
+                    // Infallible in-memory write; flush errors surface via into_inner().
                     let _ = wtr.write_record(&fields);
                 }
             }
