@@ -81,10 +81,11 @@
 //!     Tier-1 error ("HTTP/3 requires the 'http3' build feature"). reqwest's http3
 //!     is UNSTABLE, so enabling the feature ALSO needs `RUSTFLAGS=--cfg
 //!     reqwest_unstable` — hence it is intentionally not in `default`.
-//!   - Response trailers: best-effort / not surfaced. reqwest's high-level
-//!     response API does not expose HTTP trailers, so there is no `resp.trailers`
-//!     field; trailing headers from chunked/h2 responses are dropped. Revisit if a
-//!     low-level (hyper) client path is added.
+//!   - Response trailers: best-effort. reqwest's high-level response API does not
+//!     expose HTTP trailing headers, so `resp.trailers` is always an empty object
+//!     (the §11.5 shape, kept so it is not a generic NativeMethod stub); trailing
+//!     headers from chunked/h2 responses are dropped. Revisit if a low-level (hyper)
+//!     client path is added.
 //!   - SOCKS proxy: SUPPORTED. reqwest's `socks` feature is enabled in `[features]
 //!     net`, so `proxy:"socks5://…"` works and compiles cleanly; it is listed under
 //!     §11.5 only because it ships behind that reqwest feature.
@@ -1255,6 +1256,11 @@ impl Interp {
         }
         fields.insert("headers".to_string(), obj(headers));
         fields.insert("cookies".to_string(), obj(cookies));
+        // trailers (§11.5): best-effort, always an empty object. reqwest's high-level
+        // response API does not surface HTTP trailing headers, so we expose the spec
+        // shape as an empty Object rather than letting `resp.trailers` mint a generic
+        // NativeMethod stub. (See the module-doc deferral note.)
+        fields.insert("trailers".to_string(), obj(IndexMap::new()));
         fields
     }
 
@@ -2091,6 +2097,23 @@ print(body)
         );
         let out = run(&src).await;
         assert_eq!(out, "nil\ntrue\n200\nnil\nhello\n");
+    }
+
+    #[tokio::test]
+    async fn trailers_is_an_empty_object() {
+        // §11.5 shape: resp.trailers is best-effort, exposed as an empty object
+        // (not a generic NativeMethod stub).
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/text")
+print(type(resp.trailers))
+print(len(resp.trailers))
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "object\n0\n");
     }
 
     #[tokio::test]
