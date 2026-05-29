@@ -20,8 +20,24 @@ pub enum ExprKind {
     Unary { op: UnOp, expr: Box<Expr> },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Expr> },
-    Assign { name: String, value: Box<Expr> },
+    Assign { target: Box<Expr>, value: Box<Expr> },
     Arrow { params: Vec<String>, body: Box<ArrowBody> },
+    Array(Vec<Expr>),
+    Index { object: Box<Expr>, index: Box<Expr> },
+    Object(Vec<(String, Expr)>),
+    Member { object: Box<Expr>, name: String },
+    OptMember { object: Box<Expr>, name: String },
+    Template { parts: Vec<TemplatePart> },
+    /// A parenthesized expression, kept distinct (not flattened) so parentheses
+    /// break an optional chain: `(a?.b).c` errors on `.c` rather than
+    /// short-circuiting (spec §4, matching JS).
+    Paren(Box<Expr>),
+}
+
+#[derive(Clone, Debug)]
+pub enum TemplatePart {
+    Lit(String),
+    Expr(Box<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +54,7 @@ pub enum Stmt {
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
     ForRange { var: String, start: Expr, end: Expr, body: Vec<Stmt> },
+    ForOf { var: String, iter: Expr, body: Vec<Stmt> },
     Return(Option<Expr>),
     Break,
     Continue,
@@ -112,8 +129,33 @@ impl fmt::Display for ExprKind {
                 }
                 write!(f, ")")
             }
-            ExprKind::Assign { name, value } => write!(f, "(= {} {})", name, value),
+            ExprKind::Assign { target, value } => write!(f, "(= {} {})", target, value),
             ExprKind::Arrow { params, .. } => write!(f, "(arrow [{}])", params.join(" ")),
+            ExprKind::Array(items) => {
+                write!(f, "[")?;
+                for (i, it) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}", it)?;
+                }
+                write!(f, "]")
+            }
+            ExprKind::Index { object, index } => write!(f, "(index {} {})", object, index),
+            ExprKind::Object(entries) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}: {}", k, v)?;
+                }
+                write!(f, "}}")
+            }
+            ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
+            ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
+            ExprKind::Template { .. } => write!(f, "(template)"),
+            ExprKind::Paren(inner) => write!(f, "{}", inner),
         }
     }
 }

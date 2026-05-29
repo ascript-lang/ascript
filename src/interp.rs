@@ -7,6 +7,8 @@ use crate::error::AsError;
 use crate::span::Span;
 use crate::value::Value;
 use async_recursion::async_recursion;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 /// Non-local control-flow signal produced while executing statements.
 #[derive(Debug)]
@@ -105,6 +107,29 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::ForOf { var, iter, body } => {
+                let iterable = self.eval_expr(iter, env).await?;
+                let items: Vec<Value> = match iterable {
+                    Value::Array(arr) => arr.borrow().clone(),
+                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string().into())).collect(),
+                    other => {
+                        return Err(AsError::at(
+                            format!("value of type {} is not iterable", type_name(&other)),
+                            iter.span,
+                        ))
+                    }
+                };
+                for item in items {
+                    let child = env.child();
+                    child.define(var, item, false).map_err(AsError::new)?;
+                    match self.exec(body, &child).await? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Continue | Flow::Normal => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Return(e) => {
                 let v = match e {
                     Some(e) => self.eval_expr(e, env).await?,
@@ -137,19 +162,9 @@ impl Interp {
             ExprKind::Ident(name) => env
                 .get(name)
                 .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span)),
-            ExprKind::Assign { name, value } => {
+            ExprKind::Assign { target, value } => {
                 let v = self.eval_expr(value, env).await?;
-                match env.assign(name, v.clone()) {
-                    Ok(()) => Ok(v),
-                    Err(AssignError::Undefined) => Err(AsError::at(
-                        format!("cannot assign to undefined variable '{}'", name),
-                        expr.span,
-                    )),
-                    Err(AssignError::Immutable) => Err(AsError::at(
-                        format!("cannot assign to immutable binding '{}'", name),
-                        expr.span,
-                    )),
-                }
+                self.assign_to(target, v, env).await
             }
             ExprKind::Unary { op, expr: operand } => {
                 let v = self.eval_expr(operand, env).await?;
@@ -187,6 +202,13 @@ impl Interp {
                     _ => {}
                 }
 
+                // String concatenation: `+` joins two strings.
+                if let BinOp::Add = op {
+                    if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
+                        return Ok(Value::Str(format!("{}{}", a, b).into()));
+                    }
+                }
+
                 let (a, b) = match (&l, &r) {
                     (Value::Number(a), Value::Number(b)) => (*a, *b),
                     _ => return Err(AsError::at("operator requires two numbers", expr.span)),
@@ -208,18 +230,6 @@ impl Interp {
                 };
                 Ok(result)
             }
-            ExprKind::Call { callee, args } => {
-                let callee_v = self.eval_expr(callee, env).await?;
-                let mut values = Vec::new();
-                for a in args {
-                    values.push(self.eval_expr(a, env).await?);
-                }
-                match callee_v {
-                    Value::Builtin(name) => self.call_builtin(&name, &values, expr.span),
-                    Value::Function(func) => self.call_function(&func, values, expr.span).await,
-                    _ => Err(AsError::at("value is not callable", callee.span)),
-                }
-            }
             ExprKind::Arrow { params, body } => {
                 let body_stmts = match body.as_ref() {
                     crate::ast::ArrowBody::Block(stmts) => stmts.clone(),
@@ -232,6 +242,112 @@ impl Interp {
                     closure: env.clone(),
                 })))
             }
+            ExprKind::Array(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_expr(item, env).await?);
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(values))))
+            }
+            ExprKind::Object(entries) => {
+                let mut map = indexmap::IndexMap::with_capacity(entries.len());
+                for (k, v) in entries {
+                    let value = self.eval_expr(v, env).await?;
+                    map.insert(k.clone(), value);
+                }
+                Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(map))))
+            }
+            ExprKind::Template { parts } => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        crate::ast::TemplatePart::Lit(s) => out.push_str(s),
+                        crate::ast::TemplatePart::Expr(e) => {
+                            let v = self.eval_expr(e, env).await?;
+                            out.push_str(&v.to_string());
+                        }
+                    }
+                }
+                Ok(Value::Str(out.into()))
+            }
+            ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
+            ExprKind::OptMember { .. }
+            | ExprKind::Member { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::Call { .. } => {
+                let (v, _) = self.eval_chain(expr, env).await?;
+                Ok(v)
+            }
+        }
+    }
+
+    /// Evaluate a member/index/call chain, returning (value, short_circuited).
+    /// `short_circuited == true` means an earlier `?.` link hit nil and the rest
+    /// of the chain must yield nil without being accessed/called.
+    #[async_recursion(?Send)]
+    async fn eval_chain(&mut self, expr: &Expr, env: &Environment) -> Result<(Value, bool), AsError> {
+        match &expr.kind {
+            ExprKind::OptMember { object, name } => {
+                let (obj, sc) = self.eval_chain(object, env).await?;
+                if sc || obj == Value::Nil {
+                    return Ok((Value::Nil, true));
+                }
+                Ok((self.read_member(&obj, name, object.span)?, false))
+            }
+            ExprKind::Member { object, name } => {
+                let (obj, sc) = self.eval_chain(object, env).await?;
+                if sc {
+                    return Ok((Value::Nil, true));
+                }
+                Ok((self.read_member(&obj, name, object.span)?, false))
+            }
+            ExprKind::Index { object, index } => {
+                let (obj, sc) = self.eval_chain(object, env).await?;
+                if sc {
+                    return Ok((Value::Nil, true));
+                }
+                let idx = self.eval_expr(index, env).await?;
+                let v = match obj {
+                    Value::Array(arr) => {
+                        let i = array_index(&idx, expr.span)?;
+                        let arr = arr.borrow();
+                        arr.get(i)
+                            .cloned()
+                            .ok_or_else(|| AsError::at(format!("index {} out of bounds (len {})", i, arr.len()), expr.span))
+                    }
+                    Value::Object(map) => match idx {
+                        Value::Str(key) => Ok(map.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)),
+                        _ => Err(AsError::at("object index must be a string", expr.span)),
+                    },
+                    _ => Err(AsError::at("cannot index this value", object.span)),
+                };
+                Ok((v?, false))
+            }
+            ExprKind::Call { callee, args } => {
+                let (callee_v, sc) = self.eval_chain(callee, env).await?;
+                if sc {
+                    return Ok((Value::Nil, true));
+                }
+                let mut values = Vec::new();
+                for a in args {
+                    values.push(self.eval_expr(a, env).await?);
+                }
+                let v = match callee_v {
+                    Value::Builtin(name) => self.call_builtin(&name, &values, expr.span),
+                    Value::Function(func) => self.call_function(&func, values, expr.span).await,
+                    _ => Err(AsError::at("value is not callable", callee.span)),
+                };
+                Ok((v?, false))
+            }
+            _ => Ok((self.eval_expr(expr, env).await?, false)),
+        }
+    }
+
+    fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
+        match obj {
+            Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
+            Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
+            _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
     }
 
@@ -276,6 +392,82 @@ impl Interp {
             }
             other => Err(AsError::at(format!("'{}' is not a function", other), span)),
         }
+    }
+
+    #[async_recursion(?Send)]
+    async fn assign_to(&mut self, target: &Expr, value: Value, env: &Environment) -> Result<Value, AsError> {
+        match &target.kind {
+            ExprKind::Ident(name) => match env.assign(name, value.clone()) {
+                Ok(()) => Ok(value),
+                Err(AssignError::Undefined) => Err(AsError::at(
+                    format!("cannot assign to undefined variable '{}'", name),
+                    target.span,
+                )),
+                Err(AssignError::Immutable) => Err(AsError::at(
+                    format!("cannot assign to immutable binding '{}'", name),
+                    target.span,
+                )),
+            },
+            ExprKind::Index { object, index } => {
+                let obj = self.eval_expr(object, env).await?;
+                let idx = self.eval_expr(index, env).await?;
+                match obj {
+                    Value::Array(arr) => {
+                        let i = array_index(&idx, target.span)?;
+                        let mut arr = arr.borrow_mut();
+                        if i >= arr.len() {
+                            return Err(AsError::at(
+                                format!("index {} out of bounds (len {})", i, arr.len()),
+                                target.span,
+                            ));
+                        }
+                        arr[i] = value.clone();
+                        Ok(value)
+                    }
+                    Value::Object(map) => match idx {
+                        Value::Str(key) => {
+                            map.borrow_mut().insert(key.to_string(), value.clone());
+                            Ok(value)
+                        }
+                        _ => Err(AsError::at("object index must be a string", target.span)),
+                    },
+                    _ => Err(AsError::at("cannot index-assign a non-array value", object.span)),
+                }
+            }
+            ExprKind::Member { object, name } => {
+                let obj = self.eval_expr(object, env).await?;
+                match obj {
+                    Value::Object(map) => {
+                        map.borrow_mut().insert(name.clone(), value.clone());
+                        Ok(value)
+                    }
+                    _ => Err(AsError::at(format!("cannot set property '{}' on this value", name), object.span)),
+                }
+            }
+            _ => Err(AsError::at("invalid assignment target", target.span)),
+        }
+    }
+}
+
+/// Validate that a value is a usable array index (a non-negative integer).
+fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
+    match v {
+        Value::Number(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
+        Value::Number(_) => Err(AsError::at("array index must be a non-negative integer", span)),
+        _ => Err(AsError::at("array index must be a number", span)),
+    }
+}
+
+/// Human-readable type name for diagnostics.
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Nil => "nil",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::Str(_) => "string",
+        Value::Builtin(_) | Value::Function(_) => "function",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -326,6 +518,27 @@ mod tests {
         assert_eq!(eval_to_value("2 == 2").await, Value::Bool(true));
         assert_eq!(eval_to_value("1 != 2").await, Value::Bool(true));
         assert_eq!(eval_to_value("\"a\" == \"a\"").await, Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn string_concatenation() {
+        // `Str + Str` concatenates.
+        assert_eq!(
+            eval_to_value("\"a\" + \"b\"").await,
+            Value::Str("ab".into())
+        );
+
+        // `Str + Number` must error (no coercion).
+        let stmts = parse(&lex("\"a\" + 1").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        assert!(interp.exec(&stmts, &env).await.is_err());
+
+        // `Number + Str` must error (no coercion in the other direction).
+        let stmts = parse(&lex("1 + \"a\"").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        assert!(interp.exec(&stmts, &env).await.is_err());
     }
 
     #[tokio::test]
@@ -610,5 +823,169 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "pos\n");
+    }
+
+    #[tokio::test]
+    async fn array_literal_and_indexing() {
+        let src = "let a = [10, 20, 30]\nprint(a[0])\nprint(a[2])";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "10\n30\n");
+    }
+
+    #[tokio::test]
+    async fn index_assignment() {
+        let src = "let a = [1, 2, 3]\na[1] = 99\nprint(a[1])\nprint(a)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "99\n[1, 99, 3]\n");
+    }
+
+    #[tokio::test]
+    async fn out_of_bounds_index_errors() {
+        let src = "let a = [1]\nprint(a[5])";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("out of bounds"));
+    }
+
+    #[tokio::test]
+    async fn object_literal_member_and_computed_access() {
+        let src = "let o = { name: \"Ada\", age: 36 }\nprint(o.name)\nprint(o[\"age\"])\nprint(o.missing)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "Ada\n36\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn member_and_computed_assignment() {
+        let src = "let o = { a: 1 }\no.b = 2\no[\"c\"] = 3\nprint(o.a + o.b + o.c)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "6\n");
+    }
+
+    #[tokio::test]
+    async fn member_of_nil_errors() {
+        let src = "let x = nil\nprint(x.foo)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("cannot read property 'foo' of nil"));
+    }
+
+    #[tokio::test]
+    async fn optional_chaining_short_circuits_on_nil() {
+        let src = "let o = { a: nil }\nprint(o?.a)\nprint(o.a?.deep)\nprint((o.a ?? 42))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        // o?.a -> nil; o.a is nil so o.a?.deep -> nil; nil ?? 42 -> 42
+        assert_eq!(interp.output, "nil\nnil\n42\n");
+    }
+
+    #[tokio::test]
+    async fn optional_chaining_reads_when_present() {
+        let src = "let o = { a: { b: 7 } }\nprint(o?.a?.b)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "7\n");
+    }
+
+    #[tokio::test]
+    async fn optional_chaining_short_circuits_rest_of_chain() {
+        // a is nil: the WHOLE chain a?.b.c yields nil (not an error on .c).
+        let src = "let a = nil\nprint(a?.b.c)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "nil\n");
+    }
+
+    #[tokio::test]
+    async fn optional_chaining_full_chain_with_index_and_present() {
+        // present chain reads through; nil mid-chain short-circuits the rest.
+        let src = "let o = { a: { b: [10, 20] } }\nprint(o?.a.b[1])\nlet z = nil\nprint(z?.a.b[1])";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "20\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn parentheses_break_the_optional_chain() {
+        // (a?.b) evaluates to nil, then .c on nil ERRORS (chain broken by parens).
+        let src = "let a = nil\nprint((a?.b).c)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("cannot read property 'c' of nil"));
+    }
+
+    #[tokio::test]
+    async fn for_of_iterates_array() {
+        let src = "let total = 0\nfor (x of [10, 20, 30]) { total += x }\nprint(total)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "60\n");
+    }
+
+    #[tokio::test]
+    async fn for_of_iterates_string_chars() {
+        let src = "let out = \"\"\nfor (c of \"abc\") { out = out + c + \".\" }\nprint(out)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "a.b.c.\n");
+    }
+
+    #[tokio::test]
+    async fn for_of_non_iterable_errors() {
+        let src = "for (x of 42) { print(x) }";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("not iterable"));
+    }
+
+    #[tokio::test]
+    async fn template_string_interpolates() {
+        let src = "let name = \"Ada\"\nlet n = 3\nprint(`hi ${name}, ${n + 1} times`)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "hi Ada, 4 times\n");
+    }
+
+    #[tokio::test]
+    async fn nested_template_and_plain() {
+        let src = "print(`outer ${ `inner ${1 + 1}` } end`)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "outer inner 2 end\n");
     }
 }

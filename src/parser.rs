@@ -131,6 +131,9 @@ impl<'a> Parser<'a> {
                 }
                 if *self.peek() == Tok::Comma {
                     self.advance();
+                    if *self.peek() == Tok::RParen {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -193,13 +196,26 @@ impl<'a> Parser<'a> {
                 ))
             }
         };
-        self.eat(&Tok::In)?;
-        let start = self.expr()?;
-        self.eat(&Tok::DotDot)?;
-        let end = self.expr()?;
-        self.eat(&Tok::RParen)?;
-        let body = self.block()?;
-        Ok(Stmt::ForRange { var, start, end, body })
+        match self.advance() {
+            Tok::In => {
+                let start = self.expr()?;
+                self.eat(&Tok::DotDot)?;
+                let end = self.expr()?;
+                self.eat(&Tok::RParen)?;
+                let body = self.block()?;
+                Ok(Stmt::ForRange { var, start, end, body })
+            }
+            Tok::Of => {
+                let iter = self.expr()?;
+                self.eat(&Tok::RParen)?;
+                let body = self.block()?;
+                Ok(Stmt::ForOf { var, iter, body })
+            }
+            other => Err(AsError::at(
+                format!("expected 'in' or 'of' in for-loop, found {:?}", other),
+                self.tokens[self.pos - 1].span,
+            )),
+        }
     }
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
@@ -240,30 +256,27 @@ impl<'a> Parser<'a> {
             Tok::SlashEq => Some(BinOp::Div),
             _ => return Ok(target),
         };
-        self.advance(); // consume the assignment operator
+        self.advance(); // assignment operator
         let value = self.assignment()?; // right-associative
 
-        let name = match &target.kind {
-            ExprKind::Ident(name) => name.clone(),
-            _ => return Err(AsError::at("invalid assignment target", target.span)),
-        };
+        // Only assignable expressions are valid targets. (Index/Member added later
+        // in this milestone are also assignable; identifiers always are.)
+        if !is_assignable(&target) {
+            return Err(AsError::at("invalid assignment target", target.span));
+        }
 
-        // For `x += e`, desugar the value to `x + e` (a fresh Binary over the
-        // target identifier and the rhs), preserving spans for diagnostics.
         let span = Span::new(target.span.start, value.span.end);
         let value = match compound {
             None => value,
             Some(op) => {
-                let target_ident = Expr {
-                    kind: ExprKind::Ident(name.clone()),
-                    span: target.span,
-                };
-                Self::make_binary(target_ident, op, value)
+                // x += e  =>  x = (x + e). Re-uses the target expression as the lhs.
+                let lhs = target.clone();
+                Self::make_binary(lhs, op, value)
             }
         };
 
         Ok(Expr {
-            kind: ExprKind::Assign { name, value: Box::new(value) },
+            kind: ExprKind::Assign { target: Box::new(target), value: Box::new(value) },
             span,
         })
     }
@@ -466,25 +479,68 @@ impl<'a> Parser<'a> {
 
     fn postfix(&mut self) -> Result<Expr, AsError> {
         let mut expr = self.primary()?;
-        while *self.peek() == Tok::LParen {
-            self.advance();
-            let mut args = Vec::new();
-            if *self.peek() != Tok::RParen {
-                loop {
-                    args.push(self.expr()?);
-                    if *self.peek() == Tok::Comma {
-                        self.advance();
-                    } else {
-                        break;
+        loop {
+            match self.peek() {
+                Tok::LParen => {
+                    self.advance();
+                    let mut args = Vec::new();
+                    if *self.peek() != Tok::RParen {
+                        loop {
+                            args.push(self.expr()?);
+                            if *self.peek() == Tok::Comma {
+                                self.advance();
+                                if *self.peek() == Tok::RParen {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                     }
+                    self.eat(&Tok::RParen)?;
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Call { callee: Box::new(expr), args }, span };
                 }
+                Tok::LBracket => {
+                    self.advance();
+                    let index = self.expr()?;
+                    self.eat(&Tok::RBracket)?;
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr {
+                        kind: ExprKind::Index { object: Box::new(expr), index: Box::new(index) },
+                        span,
+                    };
+                }
+                Tok::Dot => {
+                    self.advance();
+                    let name = match self.advance() {
+                        Tok::Ident(name) => name,
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected a property name after '.', found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    };
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Member { object: Box::new(expr), name }, span };
+                }
+                Tok::QuestionDot => {
+                    self.advance();
+                    let name = match self.advance() {
+                        Tok::Ident(name) => name,
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected a property name after '?.', found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    };
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::OptMember { object: Box::new(expr), name }, span };
+                }
+                _ => break,
             }
-            self.eat(&Tok::RParen)?;
-            let span = Span::new(expr.span.start, self.prev_end());
-            expr = Expr {
-                kind: ExprKind::Call { callee: Box::new(expr), args },
-                span,
-            };
         }
         Ok(expr)
     }
@@ -501,12 +557,100 @@ impl<'a> Parser<'a> {
             Tok::LParen => {
                 let inner = self.expr()?;
                 self.eat(&Tok::RParen)?;
-                return Ok(inner);
+                // Preserve the parentheses so they break an optional chain
+                // (`(a?.b).c` must not short-circuit). See ExprKind::Paren.
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Paren(Box::new(inner)), span });
+            }
+            Tok::LBracket => {
+                let mut items = Vec::new();
+                if *self.peek() != Tok::RBracket {
+                    loop {
+                        items.push(self.expr()?);
+                        if *self.peek() == Tok::Comma {
+                            self.advance();
+                            if *self.peek() == Tok::RBracket {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat(&Tok::RBracket)?;
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Array(items), span });
+            }
+            Tok::LBrace => {
+                let mut entries = Vec::new();
+                if *self.peek() != Tok::RBrace {
+                    loop {
+                        let key = match self.advance() {
+                            Tok::Ident(name) => name,
+                            Tok::Str(s) => s,
+                            other => {
+                                return Err(AsError::at(
+                                    format!("expected object key, found {:?}", other),
+                                    self.tokens[self.pos - 1].span,
+                                ))
+                            }
+                        };
+                        self.eat(&Tok::Colon)?;
+                        let value = self.expr()?;
+                        entries.push((key, value));
+                        if *self.peek() == Tok::Comma {
+                            self.advance();
+                            if *self.peek() == Tok::RBrace {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat(&Tok::RBrace)?;
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Object(entries), span });
+            }
+            Tok::TemplateStr(s) => {
+                let parts = vec![crate::ast::TemplatePart::Lit(s)];
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Template { parts }, span });
+            }
+            Tok::TemplateStart(s) => {
+                let mut parts = vec![crate::ast::TemplatePart::Lit(s)];
+                loop {
+                    let e = self.expr()?;
+                    parts.push(crate::ast::TemplatePart::Expr(Box::new(e)));
+                    match self.advance() {
+                        Tok::TemplateMiddle(s) => parts.push(crate::ast::TemplatePart::Lit(s)),
+                        Tok::TemplateEnd(s) => {
+                            parts.push(crate::ast::TemplatePart::Lit(s));
+                            break;
+                        }
+                        other => {
+                            return Err(AsError::at(
+                                format!("malformed template, found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    }
+                }
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Template { parts }, span });
             }
             other => return Err(AsError::at(format!("unexpected token {:?}", other), tok_span)),
         };
         Ok(Expr { kind, span: tok_span })
     }
+}
+
+/// Whether an expression can be the target of an assignment.
+fn is_assignable(expr: &Expr) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::Member { .. }
+    )
 }
 
 #[cfg(test)]
@@ -521,6 +665,20 @@ mod tests {
             Stmt::Expr(e) => e.to_string(),
             _ => panic!("expected an expression statement"),
         }
+    }
+
+    #[test]
+    fn trailing_commas_are_allowed() {
+        // arrays, calls, objects, and (separately) param lists
+        assert_eq!(sexpr("[1, 2, 3,]"), "[1 2 3]");
+        assert_eq!(sexpr("f(1, 2,)"), "(call f 1 2)");
+        assert_eq!(sexpr("({a: 1, b: 2,}).a"), "(. {a: 1 b: 2} a)");
+        // param lists with a trailing comma must parse
+        assert!(parse(&lex("fn g(a, b,) { return a }").unwrap()).is_ok());
+        // empty literals and non-trailing forms still work
+        assert_eq!(sexpr("[]"), "[]");
+        assert_eq!(sexpr("f()"), "(call f)");
+        assert_eq!(sexpr("[1, 2, 3]"), "[1 2 3]");
     }
 
     #[test]
@@ -592,6 +750,11 @@ mod tests {
     #[test]
     fn parenthesized_non_arrow_still_works() {
         assert_eq!(sexpr("(1 + 2) * 3"), "(* (+ 1 2) 3)");
+    }
+
+    #[test]
+    fn parses_object_and_member() {
+        assert_eq!(sexpr("({a: 1}).a"), "(. {a: 1} a)");
     }
 
     #[test]

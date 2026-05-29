@@ -50,6 +50,16 @@ pub enum Tok {
     Continue,
     Fn,
     FatArrow,
+    LBracket,
+    RBracket,
+    Dot,
+    Colon,
+    QuestionDot,
+    Of,
+    TemplateStr(String),    // a complete template with no interpolation: `...`
+    TemplateStart(String),  // `...${   — text before the first interpolation
+    TemplateMiddle(String), // }...${    — text between interpolations
+    TemplateEnd(String),    // }...`     — text after the last interpolation
     Eof,
 }
 
