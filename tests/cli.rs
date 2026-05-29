@@ -189,6 +189,25 @@ fn runs_serialization_example() {
 }
 
 #[test]
+#[cfg(all(feature = "datetime", feature = "intl"))] // imports std/date + std/intl
+fn runs_datetime_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/datetime.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    // time: seconds(3) = 3000 (deterministic; elapsed>=5 line varies, not asserted)
+    assert!(out.contains("3000"));
+    // date: parse + strftime format, and June 15 + 7 days = the 22nd
+    assert!(out.contains("2021/06/15"));
+    assert!(out.contains("\n22\n"));
+    // intl: locale-aware grouping differs between en-US and de-DE
+    assert!(out.contains("1,234,567"));
+    assert!(out.contains("1.234.567"));
+    // intl: Turkish dotted-capital-I case folding
+    assert!(out.contains("İSTANBUL"));
+}
+
+#[test]
 fn repl_evaluates_and_persists_bindings() {
     use std::io::Write;
     use std::process::{Command, Stdio};

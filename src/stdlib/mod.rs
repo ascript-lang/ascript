@@ -7,10 +7,14 @@
 pub mod array;
 pub mod bytes;
 pub mod convert;
+#[cfg(feature = "datetime")]
+pub mod date;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "data")]
 pub mod encoding;
+#[cfg(feature = "intl")]
+pub mod intl;
 #[cfg(feature = "data")]
 pub mod json;
 pub mod map;
@@ -19,6 +23,7 @@ pub mod object;
 #[cfg(feature = "data")]
 pub mod regex;
 pub mod string;
+pub mod time;
 #[cfg(feature = "data")]
 pub mod toml;
 #[cfg(feature = "data")]
@@ -48,6 +53,11 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/map" => map::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
+        "std/time" => time::exports(),
+        #[cfg(feature = "datetime")]
+        "std/date" => date::exports(),
+        #[cfg(feature = "intl")]
+        "std/intl" => intl::exports(),
         #[cfg(feature = "data")]
         "std/json" => json::exports(),
         #[cfg(feature = "data")]
@@ -84,6 +94,11 @@ impl Interp {
             "map" => map::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
+            "time" => self.call_time(func, args, span).await,
+            #[cfg(feature = "datetime")]
+            "date" => date::call(func, args, span),
+            #[cfg(feature = "intl")]
+            "intl" => intl::call(func, args, span),
             #[cfg(feature = "data")]
             "json" => json::call(func, args, span),
             #[cfg(feature = "data")]
@@ -100,6 +115,28 @@ impl Interp {
             "yaml" => yaml::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
+    }
+
+    /// `std/time` dispatch. `sleep` is async (the first async stdlib fn) and is
+    /// awaited here on the tokio loop; all other time functions are synchronous
+    /// and delegate to `time::call`.
+    pub(crate) async fn call_time(
+        &mut self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        if func == "sleep" {
+            let ms = want_number(&arg(args, 0), span, "time.sleep")?;
+            if ms < 0.0 {
+                return Err(AsError::at("time.sleep duration must be non-negative", span).into());
+            }
+            // `ms as u64` truncates toward zero: a fractional `sleep(20.7)`
+            // sleeps for 20 whole milliseconds.
+            tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
+            return Ok(Value::Nil);
+        }
+        time::call(func, args, span)
     }
 }
 
