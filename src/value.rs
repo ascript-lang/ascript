@@ -1,5 +1,6 @@
-//! Runtime values. Eight value kinds (nil, bool, number, string, builtin,
-//! function, array, object); the `Map` kind arrives in Milestone 8.
+//! Runtime values. Kinds: nil, bool, number, string, builtin, function, array,
+//! object, enum, enum-variant, class, instance, bound-method, super-ref. The
+//! `Map` kind arrives in Milestone 8.
 
 use crate::ast::Stmt;
 use crate::env::Environment;
@@ -7,6 +8,59 @@ use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
+
+pub struct EnumDef {
+    pub name: String,
+    pub variants: IndexMap<String, Value>, // each is a Value::EnumVariant
+}
+
+pub struct EnumVariant {
+    pub enum_name: String,
+    pub name: String,
+    pub value: Value, // backing value, or Nil
+}
+
+pub struct Method {
+    pub params: Vec<crate::ast::Param>,
+    pub ret: Option<crate::ast::Type>,
+    pub body: Vec<Stmt>,
+}
+
+pub struct Class {
+    pub name: String,
+    pub superclass: Option<Rc<Class>>,
+    pub methods: IndexMap<String, Rc<Method>>,
+    pub def_env: Environment,
+}
+
+pub struct Instance {
+    pub class: Rc<Class>,
+    pub fields: IndexMap<String, Value>,
+}
+
+pub struct BoundMethod {
+    pub receiver: Value,
+    pub method: Rc<Method>,
+    pub defining_class: Rc<Class>,
+    pub name: String,
+}
+
+pub struct SuperRef {
+    pub receiver: Value,
+    pub start: Option<Rc<Class>>,
+}
+
+/// Walk a class chain for a method, returning it plus the class that defined it.
+pub fn find_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Class>)> {
+    let mut cur = Some(class.clone());
+    while let Some(c) = cur {
+        if let Some(m) = c.methods.get(name) {
+            return Some((m.clone(), c.clone()));
+        }
+        cur = c.superclass.clone();
+    }
+    None
+}
 
 /// A user-defined function with its captured (closure) environment.
 pub struct Function {
@@ -29,6 +83,12 @@ pub enum Value {
     Function(Rc<Function>),
     Array(Rc<RefCell<Vec<Value>>>),
     Object(Rc<RefCell<IndexMap<String, Value>>>),
+    Enum(Rc<EnumDef>),
+    EnumVariant(Rc<EnumVariant>),
+    Class(Rc<Class>),
+    Instance(Rc<RefCell<Instance>>),
+    BoundMethod(Rc<BoundMethod>),
+    Super(Rc<SuperRef>),
 }
 
 impl Value {
@@ -52,6 +112,14 @@ impl PartialEq for Value {
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            // Enums and their (interned) variants compare by identity.
+            (Value::Enum(a), Value::Enum(b)) => Rc::ptr_eq(a, b),
+            (Value::EnumVariant(a), Value::EnumVariant(b)) => Rc::ptr_eq(a, b),
+            // Classes/instances/bound-methods/super compare by identity.
+            (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
+            (Value::Instance(a), Value::Instance(b)) => Rc::ptr_eq(a, b),
+            (Value::BoundMethod(a), Value::BoundMethod(b)) => Rc::ptr_eq(a, b),
+            (Value::Super(a), Value::Super(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -70,6 +138,12 @@ impl fmt::Debug for Value {
             }
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
             Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
+            Value::Enum(e) => write!(f, "Enum({})", e.name),
+            Value::EnumVariant(v) => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
+            Value::Class(c) => write!(f, "Class({})", c.name),
+            Value::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
+            Value::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
+            Value::Super(_) => write!(f, "Super"),
         }
     }
 }
@@ -128,6 +202,12 @@ impl Value {
                 seen.pop();
                 Ok(())
             }
+            Value::Enum(e) => write!(f, "<enum {}>", e.name),
+            Value::EnumVariant(v) => write!(f, "{}.{}", v.enum_name, v.name),
+            Value::Class(c) => write!(f, "<class {}>", c.name),
+            Value::Instance(i) => write!(f, "<{} instance>", i.borrow().class.name),
+            Value::BoundMethod(b) => write!(f, "<method {}>", b.name),
+            Value::Super(_) => write!(f, "<super>"),
         }
     }
 

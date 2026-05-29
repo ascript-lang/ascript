@@ -87,6 +87,18 @@ fn runs_typed_example() {
 }
 
 #[test]
+fn runs_oop_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/oop.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("Rex is an animal, specifically a dog"));
+    assert!(out.contains("woof"));
+    assert!(out.contains("square"));
+    assert!(out.contains("other"));
+}
+
+#[test]
 fn reports_usage_without_args() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin).output().unwrap();

@@ -29,6 +29,7 @@ pub enum ExprKind {
     OptMember { object: Box<Expr>, name: String },
     Try(Box<Expr>),
     Template { parts: Vec<TemplatePart> },
+    Match { subject: Box<Expr>, arms: Vec<MatchArm> },
     /// A parenthesized expression, kept distinct (not flattened) so parentheses
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
     /// short-circuiting (spec §4, matching JS).
@@ -50,6 +51,7 @@ pub enum Type {
     Result(Box<Type>),
     Tuple(Vec<Type>),
     Union(Box<Type>, Box<Type>),
+    Named(String),
 }
 
 /// A function parameter: a name with an optional type annotation.
@@ -83,6 +85,7 @@ impl std::fmt::Display for Type {
                 write!(f, "]")
             }
             Type::Union(a, b) => write!(f, "{} | {}", a, b),
+            Type::Named(n) => write!(f, "{}", n),
         }
     }
 }
@@ -112,6 +115,30 @@ pub enum Stmt {
     Break,
     Continue,
     Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt> },
+    Enum { name: String, variants: Vec<EnumVariantDecl> },
+    Class { name: String, superclass: Option<String>, methods: Vec<MethodDecl> },
+}
+
+#[derive(Clone, Debug)]
+pub struct MethodDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Option<Type>,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MatchArm {
+    /// Patterns are value-expressions compared with `==`; `None` patterns list
+    /// means a wildcard `_`. Multiple patterns = an or-pattern.
+    pub patterns: Option<Vec<Expr>>,
+    pub body: Expr,
+}
+
+#[derive(Clone, Debug)]
+pub struct EnumVariantDecl {
+    pub name: String,
+    pub value: Option<Expr>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -212,6 +239,7 @@ impl fmt::Display for ExprKind {
             ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
             ExprKind::Try(e) => write!(f, "(? {})", e),
             ExprKind::Template { .. } => write!(f, "(template)"),
+            ExprKind::Match { .. } => write!(f, "(match)"),
             ExprKind::Paren(inner) => write!(f, "{}", inner),
         }
     }
