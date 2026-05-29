@@ -64,6 +64,7 @@ pub enum Tok {
     Pipe,
     Enum,
     Match,
+    Class,
     Eof,
 }
 

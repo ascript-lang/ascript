@@ -114,6 +114,15 @@ pub enum Stmt {
     Continue,
     Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt> },
     Enum { name: String, variants: Vec<EnumVariantDecl> },
+    Class { name: String, superclass: Option<String>, methods: Vec<MethodDecl> },
+}
+
+#[derive(Clone, Debug)]
+pub struct MethodDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub ret: Option<Type>,
+    pub body: Vec<Stmt>,
 }
 
 #[derive(Clone, Debug)]

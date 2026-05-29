@@ -10,6 +10,14 @@ use async_recursion::async_recursion;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// The callable parts shared by plain functions and methods: parameter list,
+/// optional return contract, and the body to execute.
+struct BodySpec<'a> {
+    params: &'a [crate::ast::Param],
+    ret: &'a Option<crate::ast::Type>,
+    body: &'a [Stmt],
+}
+
 /// Non-local control-flow signal produced while executing statements.
 #[derive(Debug)]
 pub enum Flow {
@@ -203,6 +211,24 @@ impl Interp {
                 }
                 let def = Value::Enum(std::rc::Rc::new(crate::value::EnumDef { name: name.clone(), variants: map }));
                 env.define(name, def, false).map_err(AsError::new)?;
+                Ok(Flow::Normal)
+            }
+            Stmt::Class { name, superclass: _, methods } => {
+                let mut method_map = indexmap::IndexMap::new();
+                for m in methods {
+                    method_map.insert(m.name.clone(), std::rc::Rc::new(crate::value::Method {
+                        params: m.params.clone(),
+                        ret: m.ret.clone(),
+                        body: m.body.clone(),
+                    }));
+                }
+                let class = Value::Class(std::rc::Rc::new(crate::value::Class {
+                    name: name.clone(),
+                    superclass: None,
+                    methods: method_map,
+                    def_env: env.clone(),
+                }));
+                env.define(name, class, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
         }
@@ -455,6 +481,33 @@ impl Interp {
                 "value" => Ok(v.value.clone()),
                 other => Err(AsError::at(format!("enum variant has no property '{}'", other), span)),
             },
+            Value::Instance(inst) => {
+                let b = inst.borrow();
+                if let Some(v) = b.fields.get(name) {
+                    return Ok(v.clone());
+                }
+                match crate::value::find_method(&b.class, name) {
+                    Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(crate::value::BoundMethod {
+                        receiver: obj.clone(),
+                        method,
+                        defining_class: def_class,
+                        name: name.to_string(),
+                    }))),
+                    None => Ok(Value::Nil),
+                }
+            }
+            Value::Super(s) => match &s.start {
+                Some(start) => match crate::value::find_method(start, name) {
+                    Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(crate::value::BoundMethod {
+                        receiver: s.receiver.clone(),
+                        method,
+                        defining_class: def_class,
+                        name: name.to_string(),
+                    }))),
+                    None => Err(AsError::at(format!("no superclass method '{}'", name), span)),
+                },
+                None => Err(AsError::at(format!("no superclass method '{}' (no superclass)", name), span)),
+            },
             Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
             _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
@@ -465,8 +518,53 @@ impl Interp {
         match callee {
             Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
             Value::Function(func) => self.call_function(&func, args, span).await,
+            Value::Class(class) => self.construct(class, args, span).await,
+            Value::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
             _ => Err(AsError::at("value is not callable", span).into()),
         }
+    }
+
+    /// Bind params (with contracts), run a body in `call_env`, apply the return
+    /// contract. Shared by plain functions and methods.
+    #[async_recursion(?Send)]
+    async fn run_body<'s: 'async_recursion>(
+        &mut self,
+        spec: BodySpec<'s>,
+        args: Vec<Value>,
+        call_env: &Environment,
+        span: Span,
+        what: &str,
+    ) -> Result<Value, Control> {
+        let BodySpec { params, ret, body } = spec;
+        if args.len() != params.len() {
+            return Err(AsError::at(
+                format!("{} expected {} argument(s), got {}", what, params.len(), args.len()),
+                span,
+            )
+            .into());
+        }
+        for (p, a) in params.iter().zip(args.into_iter()) {
+            if let Some(ty) = &p.ty {
+                if !check_type(&a, ty) {
+                    return Err(contract_panic(ty, &a, span));
+                }
+            }
+            call_env.define(&p.name, a, true).map_err(AsError::new)?;
+        }
+        let result = match self.exec(body, call_env).await {
+            Ok(Flow::Return(v)) => v,
+            Ok(Flow::Normal) => Value::Nil,
+            Ok(Flow::Break) => return Err(AsError::at("'break' outside of a loop", span).into()),
+            Ok(Flow::Continue) => return Err(AsError::at("'continue' outside of a loop", span).into()),
+            Err(Control::Propagate(v)) => v,
+            Err(Control::Panic(e)) => return Err(Control::Panic(e)),
+        };
+        if let Some(ty) = ret {
+            if !check_type(&result, ty) {
+                return Err(contract_panic(ty, &result, span));
+            }
+        }
+        Ok(result)
     }
 
     #[async_recursion(?Send)]
@@ -476,43 +574,65 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        if args.len() != func.params.len() {
-            return Err(AsError::at(
-                format!(
-                    "{} expected {} argument(s), got {}",
-                    func.name.as_deref().unwrap_or("function"),
-                    func.params.len(),
-                    args.len()
-                ),
-                span,
-            )
-            .into());
-        }
-        // bind + check params
         let call_env = func.closure.child();
-        for (param, arg) in func.params.iter().zip(args.into_iter()) {
-            if let Some(ty) = &param.ty {
-                if !check_type(&arg, ty) {
-                    return Err(contract_panic(ty, &arg, span));
+        let what = func.name.as_deref().unwrap_or("function").to_string();
+        let spec = BodySpec { params: &func.params, ret: &func.ret, body: &func.body };
+        self.run_body(spec, args, &call_env, span, &what).await
+    }
+
+    #[async_recursion(?Send)]
+    async fn construct(
+        &mut self,
+        class: std::rc::Rc<crate::value::Class>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let instance = std::rc::Rc::new(std::cell::RefCell::new(crate::value::Instance {
+            class: class.clone(),
+            fields: indexmap::IndexMap::new(),
+        }));
+        let inst_val = Value::Instance(instance);
+        match crate::value::find_method(&class, "init") {
+            Some((method, def_class)) => {
+                let bm = crate::value::BoundMethod {
+                    receiver: inst_val.clone(),
+                    method,
+                    defining_class: def_class,
+                    name: "init".to_string(),
+                };
+                self.invoke_method(&bm, args, span).await?;
+            }
+            None => {
+                if !args.is_empty() {
+                    return Err(AsError::at(
+                        format!("{} has no init but was given {} argument(s)", class.name, args.len()),
+                        span,
+                    )
+                    .into());
                 }
             }
-            call_env.define(&param.name, arg, true).map_err(AsError::new)?;
         }
-        // execute, then check the return type
-        let result = match self.exec(&func.body, &call_env).await {
-            Ok(Flow::Return(v)) => v,
-            Ok(Flow::Normal) => Value::Nil,
-            Ok(Flow::Break) => return Err(AsError::at("'break' outside of a loop", span).into()),
-            Ok(Flow::Continue) => return Err(AsError::at("'continue' outside of a loop", span).into()),
-            Err(Control::Propagate(v)) => v,
-            Err(Control::Panic(e)) => return Err(Control::Panic(e)),
-        };
-        if let Some(ty) = &func.ret {
-            if !check_type(&result, ty) {
-                return Err(contract_panic(ty, &result, span));
-            }
-        }
-        Ok(result)
+        Ok(inst_val)
+    }
+
+    #[async_recursion(?Send)]
+    async fn invoke_method(
+        &mut self,
+        bm: &crate::value::BoundMethod,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let call_env = bm.defining_class.def_env.child();
+        call_env.define("self", bm.receiver.clone(), false).map_err(AsError::new)?;
+        // `super` lookup begins at the defining class's superclass (always None
+        // until inheritance lands in Task 4).
+        let super_ref = Value::Super(std::rc::Rc::new(crate::value::SuperRef {
+            receiver: bm.receiver.clone(),
+            start: bm.defining_class.superclass.clone(),
+        }));
+        call_env.define("super", super_ref, false).map_err(AsError::new)?;
+        let spec = BodySpec { params: &bm.method.params, ret: &bm.method.ret, body: &bm.method.body };
+        self.run_body(spec, args, &call_env, span, &bm.name).await
     }
 
     #[async_recursion(?Send)]
@@ -611,6 +731,10 @@ impl Interp {
                         map.borrow_mut().insert(name.clone(), value.clone());
                         Ok(value)
                     }
+                    Value::Instance(inst) => {
+                        inst.borrow_mut().fields.insert(name.clone(), value.clone());
+                        Ok(value)
+                    }
                     _ => Err(AsError::at(format!("cannot set property '{}' on this value", name), object.span).into()),
                 }
             }
@@ -640,6 +764,9 @@ fn type_name(v: &Value) -> &'static str {
         Value::Object(_) => "object",
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
+        Value::Class(_) => "class",
+        Value::Instance(_) => "instance",
+        Value::BoundMethod(_) | Value::Super(_) => "function",
     }
 }
 
@@ -757,6 +884,26 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "hit\nmiss\nplus\n");
+    }
+
+    #[tokio::test]
+    async fn class_construction_fields_and_methods() {
+        let src = "class Animal {\n  fn init(name) { self.name = name }\n  fn speak() { return self.name + \" makes a sound\" }\n}\nlet a = Animal(\"Rex\")\nprint(a.name)\nprint(a.speak())";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "Rex\nRex makes a sound\n");
+    }
+
+    #[tokio::test]
+    async fn class_without_init_rejects_args() {
+        let src = "class Empty {}\nEmpty(1)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("no init"));
     }
 
     #[tokio::test]

@@ -75,6 +75,7 @@ impl<'a> Parser<'a> {
             Tok::Return => self.return_stmt(),
             Tok::Fn => self.fn_decl(),
             Tok::Enum => self.enum_decl(),
+            Tok::Class => self.class_decl(),
             Tok::Break => {
                 self.advance();
                 Ok(Stmt::Break)
@@ -149,6 +150,44 @@ impl<'a> Parser<'a> {
         }
         self.eat(&Tok::RBrace)?;
         Ok(Stmt::Enum { name, variants })
+    }
+
+    fn class_decl(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::Class)?;
+        let name = match self.advance() {
+            Tok::Ident(n) => n,
+            other => return Err(AsError::at(format!("expected class name, found {:?}", other), self.tokens[self.pos - 1].span)),
+        };
+        let superclass = if matches!(self.peek(), Tok::Ident(s) if s == "extends") {
+            // `extends` is a soft keyword here (lexes as Ident)
+            self.advance();
+            match self.advance() {
+                Tok::Ident(n) => Some(n),
+                other => return Err(AsError::at(format!("expected superclass name, found {:?}", other), self.tokens[self.pos - 1].span)),
+            }
+        } else {
+            None
+        };
+        self.eat(&Tok::LBrace)?;
+        let mut methods = Vec::new();
+        while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            self.eat(&Tok::Fn)?;
+            let mname = match self.advance() {
+                Tok::Ident(n) => n,
+                other => return Err(AsError::at(format!("expected method name, found {:?}", other), self.tokens[self.pos - 1].span)),
+            };
+            let params = self.param_list()?;
+            let ret = if *self.peek() == Tok::Colon {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let body = self.block()?;
+            methods.push(crate::ast::MethodDecl { name: mname, params, ret, body });
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(Stmt::Class { name, superclass, methods })
     }
 
     fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {
