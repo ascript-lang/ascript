@@ -1170,6 +1170,21 @@ mod tests {
         assert_eq!(run(src).await, "10\n2\n[\"x\", \"y\"]\n[10, 20]\n");
     }
 
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_json_end_to_end() {
+        // AScript double-quoted string literals do not process `\"` escapes
+        // (they read raw to the next quote), so the JSON source is written as a
+        // backtick template, which takes literal double quotes.
+        let src = "import * as json from \"std/json\"\n\
+                   let [v, err] = json.parse(`{\"x\": 10, \"ys\": [1, 2]}`)\n\
+                   print(v.x)\n\
+                   print(v.ys[1])\n\
+                   let [s, e2] = json.stringify({ a: 1, b: \"hi\" })\n\
+                   print(s)";
+        assert_eq!(run(src).await, "10\n2\n{\"a\":1,\"b\":\"hi\"}\n");
+    }
+
     #[tokio::test]
     async fn number_literals_hex_binary_scientific_underscore() {
         assert_eq!(

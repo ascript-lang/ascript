@@ -7,6 +7,8 @@
 pub mod array;
 pub mod bytes;
 pub mod convert;
+#[cfg(feature = "data")]
+pub mod json;
 pub mod map;
 pub mod math;
 pub mod object;
@@ -34,6 +36,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/map" => map::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
+        #[cfg(feature = "data")]
+        "std/json" => json::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -56,6 +60,8 @@ impl Interp {
             "map" => map::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
+            #[cfg(feature = "data")]
+            "json" => json::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

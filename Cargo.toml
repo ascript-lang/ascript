@@ -18,9 +18,23 @@ indexmap = "2"
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.6"
 rustyline = "14"
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.150", optional = true }
+regex = { version = "1.12.3", optional = true }
+base64 = { version = "0.22", optional = true }
+hex = { version = "0.4", optional = true }
+csv = { version = "1", optional = true }
+toml = { version = "0.8", optional = true }
+serde_yaml = { version = "0.9", optional = true }
+percent-encoding = { version = "2", optional = true }
+uuid = { version = "1", features = ["v4", "v7"], optional = true }
 
 [build-dependencies]
 cc = "1"
 
 [dev-dependencies]
 tree-sitter = "0.25"
+
+[features]
+default = ["data"]
+data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
