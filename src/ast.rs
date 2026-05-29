@@ -28,6 +28,10 @@ pub enum ExprKind {
     Member { object: Box<Expr>, name: String },
     OptMember { object: Box<Expr>, name: String },
     Template { parts: Vec<TemplatePart> },
+    /// A parenthesized expression, kept distinct (not flattened) so parentheses
+    /// break an optional chain: `(a?.b).c` errors on `.c` rather than
+    /// short-circuiting (spec §4, matching JS).
+    Paren(Box<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +155,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
             ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
             ExprKind::Template { .. } => write!(f, "(template)"),
+            ExprKind::Paren(inner) => write!(f, "{}", inner),
         }
     }
 }

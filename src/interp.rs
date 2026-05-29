@@ -230,18 +230,6 @@ impl Interp {
                 };
                 Ok(result)
             }
-            ExprKind::Call { callee, args } => {
-                let callee_v = self.eval_expr(callee, env).await?;
-                let mut values = Vec::new();
-                for a in args {
-                    values.push(self.eval_expr(a, env).await?);
-                }
-                match callee_v {
-                    Value::Builtin(name) => self.call_builtin(&name, &values, expr.span),
-                    Value::Function(func) => self.call_function(&func, values, expr.span).await,
-                    _ => Err(AsError::at("value is not callable", callee.span)),
-                }
-            }
             ExprKind::Arrow { params, body } => {
                 let body_stmts = match body.as_ref() {
                     crate::ast::ArrowBody::Block(stmts) => stmts.clone(),
@@ -260,24 +248,6 @@ impl Interp {
                     values.push(self.eval_expr(item, env).await?);
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
-            }
-            ExprKind::Index { object, index } => {
-                let obj = self.eval_expr(object, env).await?;
-                let idx = self.eval_expr(index, env).await?;
-                match obj {
-                    Value::Array(arr) => {
-                        let i = array_index(&idx, expr.span)?;
-                        let arr = arr.borrow();
-                        arr.get(i)
-                            .cloned()
-                            .ok_or_else(|| AsError::at(format!("index {} out of bounds (len {})", i, arr.len()), expr.span))
-                    }
-                    Value::Object(map) => match idx {
-                        Value::Str(key) => Ok(map.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)),
-                        _ => Err(AsError::at("object index must be a string", expr.span)),
-                    },
-                    _ => Err(AsError::at("cannot index this value", object.span)),
-                }
             }
             ExprKind::Object(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
@@ -300,18 +270,76 @@ impl Interp {
                 }
                 Ok(Value::Str(out.into()))
             }
-            ExprKind::Member { object, name } => {
-                let obj = self.eval_expr(object, env).await?;
-                self.read_member(&obj, name, object.span)
+            ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
+            ExprKind::OptMember { .. }
+            | ExprKind::Member { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::Call { .. } => {
+                let (v, _) = self.eval_chain(expr, env).await?;
+                Ok(v)
             }
+        }
+    }
+
+    /// Evaluate a member/index/call chain, returning (value, short_circuited).
+    /// `short_circuited == true` means an earlier `?.` link hit nil and the rest
+    /// of the chain must yield nil without being accessed/called.
+    #[async_recursion(?Send)]
+    async fn eval_chain(&mut self, expr: &Expr, env: &Environment) -> Result<(Value, bool), AsError> {
+        match &expr.kind {
             ExprKind::OptMember { object, name } => {
-                let obj = self.eval_expr(object, env).await?;
-                if obj == Value::Nil {
-                    Ok(Value::Nil)
-                } else {
-                    self.read_member(&obj, name, object.span)
+                let (obj, sc) = self.eval_chain(object, env).await?;
+                if sc || obj == Value::Nil {
+                    return Ok((Value::Nil, true));
                 }
+                Ok((self.read_member(&obj, name, object.span)?, false))
             }
+            ExprKind::Member { object, name } => {
+                let (obj, sc) = self.eval_chain(object, env).await?;
+                if sc {
+                    return Ok((Value::Nil, true));
+                }
+                Ok((self.read_member(&obj, name, object.span)?, false))
+            }
+            ExprKind::Index { object, index } => {
+                let (obj, sc) = self.eval_chain(object, env).await?;
+                if sc {
+                    return Ok((Value::Nil, true));
+                }
+                let idx = self.eval_expr(index, env).await?;
+                let v = match obj {
+                    Value::Array(arr) => {
+                        let i = array_index(&idx, expr.span)?;
+                        let arr = arr.borrow();
+                        arr.get(i)
+                            .cloned()
+                            .ok_or_else(|| AsError::at(format!("index {} out of bounds (len {})", i, arr.len()), expr.span))
+                    }
+                    Value::Object(map) => match idx {
+                        Value::Str(key) => Ok(map.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)),
+                        _ => Err(AsError::at("object index must be a string", expr.span)),
+                    },
+                    _ => Err(AsError::at("cannot index this value", object.span)),
+                };
+                Ok((v?, false))
+            }
+            ExprKind::Call { callee, args } => {
+                let (callee_v, sc) = self.eval_chain(callee, env).await?;
+                if sc {
+                    return Ok((Value::Nil, true));
+                }
+                let mut values = Vec::new();
+                for a in args {
+                    values.push(self.eval_expr(a, env).await?);
+                }
+                let v = match callee_v {
+                    Value::Builtin(name) => self.call_builtin(&name, &values, expr.span),
+                    Value::Function(func) => self.call_function(&func, values, expr.span).await,
+                    _ => Err(AsError::at("value is not callable", callee.span)),
+                };
+                Ok((v?, false))
+            }
+            _ => Ok((self.eval_expr(expr, env).await?, false)),
         }
     }
 
@@ -876,6 +904,39 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "7\n");
+    }
+
+    #[tokio::test]
+    async fn optional_chaining_short_circuits_rest_of_chain() {
+        // a is nil: the WHOLE chain a?.b.c yields nil (not an error on .c).
+        let src = "let a = nil\nprint(a?.b.c)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "nil\n");
+    }
+
+    #[tokio::test]
+    async fn optional_chaining_full_chain_with_index_and_present() {
+        // present chain reads through; nil mid-chain short-circuits the rest.
+        let src = "let o = { a: { b: [10, 20] } }\nprint(o?.a.b[1])\nlet z = nil\nprint(z?.a.b[1])";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "20\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn parentheses_break_the_optional_chain() {
+        // (a?.b) evaluates to nil, then .c on nil ERRORS (chain broken by parens).
+        let src = "let a = nil\nprint((a?.b).c)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("cannot read property 'c' of nil"));
     }
 
     #[tokio::test]

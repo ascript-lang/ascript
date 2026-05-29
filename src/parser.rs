@@ -557,7 +557,10 @@ impl<'a> Parser<'a> {
             Tok::LParen => {
                 let inner = self.expr()?;
                 self.eat(&Tok::RParen)?;
-                return Ok(inner);
+                // Preserve the parentheses so they break an optional chain
+                // (`(a?.b).c` must not short-circuit). See ExprKind::Paren.
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Paren(Box::new(inner)), span });
             }
             Tok::LBracket => {
                 let mut items = Vec::new();
