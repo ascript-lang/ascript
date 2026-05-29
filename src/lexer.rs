@@ -110,7 +110,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     i += 2;
                 } else {
                     return Err(AsError::at(
-                        "unexpected character '?' (the ?. and ? operators arrive in Milestone 3)",
+                        "unexpected character '?' (?. arrives in Milestone 4, the ? operator in Milestone 5)",
                         Span::new(start, start + 1),
                     ));
                 }
@@ -130,7 +130,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     i += 2;
                 } else {
                     return Err(AsError::at(
-                        "unexpected character '.' (member access arrives in Milestone 3)",
+                        "unexpected character '.' (member access arrives in Milestone 4)",
                         Span::new(start, start + 1),
                     ));
                 }

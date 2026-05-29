@@ -1,5 +1,6 @@
-//! Runtime values. The skeleton supports four of the eight value kinds
-//! from spec §4; the rest arrive in later milestones.
+//! Runtime values. Currently six kinds (nil, bool, number, string, builtin,
+//! function); the remaining heap kinds — arrays, objects, maps — arrive in
+//! Milestone 4.
 
 use crate::ast::Stmt;
 use crate::env::Environment;
