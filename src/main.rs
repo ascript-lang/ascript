@@ -18,6 +18,9 @@ enum Command {
     Fmt { files: Vec<String> },
     /// Run .as test files
     Test { files: Vec<String> },
+    /// Run the language server (LSP over stdio)
+    #[cfg(feature = "lsp")]
+    Lsp,
 }
 
 // Single-threaded runtime matches spec §7's single-threaded event loop and the
@@ -86,5 +89,10 @@ async fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        #[cfg(feature = "lsp")]
+        Command::Lsp => {
+            ascript::lsp::run_server().await;
+            ExitCode::SUCCESS
+        }
     }
 }

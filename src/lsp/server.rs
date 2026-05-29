@@ -1,0 +1,107 @@
+//! tower-lsp `LanguageServer` implementation: a thin async adapter over the pure
+//! `analysis` layer plus a document store.
+//!
+//! The backend is `Send + Sync` because it holds only `Send + Sync` types: the
+//! `Client`, and a `tokio::sync::Mutex<HashMap<Url, String>>` of document text. No
+//! interpreter state (`Rc`/`RefCell`/`Value`) is ever held, so this compiles on the
+//! `current_thread` tokio runtime AND satisfies tower-lsp's `Send + Sync` bounds.
+
+use crate::lsp::analysis;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+use tower_lsp::lsp_types::*;
+use tower_lsp::{Client, LanguageServer};
+
+pub struct Backend {
+    client: Client,
+    documents: Mutex<HashMap<Url, String>>,
+}
+
+impl Backend {
+    pub fn new(client: Client) -> Self {
+        Backend { client, documents: Mutex::new(HashMap::new()) }
+    }
+
+    /// Store the document text and publish its diagnostics.
+    async fn analyze_and_publish(&self, uri: Url, text: String, version: Option<i32>) {
+        let diags = analysis::diagnostics(&text);
+        self.documents.lock().await.insert(uri.clone(), text);
+        self.client.publish_diagnostics(uri, diags, version).await;
+    }
+}
+
+/// The set of capabilities the server advertises. Factored out so it can be unit
+/// tested without a live `Client`. Task 1 advertises full-document text sync;
+/// later tasks add completion/hover/definition/documentSymbol providers.
+pub fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        ..ServerCapabilities::default()
+    }
+}
+
+#[tower_lsp::async_trait]
+impl LanguageServer for Backend {
+    async fn initialize(
+        &self,
+        _params: InitializeParams,
+    ) -> tower_lsp::jsonrpc::Result<InitializeResult> {
+        Ok(InitializeResult {
+            capabilities: server_capabilities(),
+            server_info: Some(ServerInfo {
+                name: "ascript".to_string(),
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            }),
+        })
+    }
+
+    async fn initialized(&self, _params: InitializedParams) {
+        self.client
+            .log_message(MessageType::INFO, "ascript language server initialized")
+            .await;
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let doc = params.text_document;
+        self.analyze_and_publish(doc.uri, doc.text, Some(doc.version)).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        // Full-document sync: the last content change holds the entire new text.
+        if let Some(change) = params.content_changes.into_iter().last() {
+            self.analyze_and_publish(
+                params.text_document.uri,
+                change.text,
+                Some(params.text_document.version),
+            )
+            .await;
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let uri = params.text_document.uri;
+        self.documents.lock().await.remove(&uri);
+        // Clear diagnostics for the closed document.
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+    }
+
+    async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_advertise_full_sync() {
+        let caps = server_capabilities();
+        match caps.text_document_sync {
+            Some(TextDocumentSyncCapability::Kind(kind)) => {
+                assert_eq!(kind, TextDocumentSyncKind::FULL);
+            }
+            other => panic!("expected FULL text document sync, got {:?}", other),
+        }
+    }
+}

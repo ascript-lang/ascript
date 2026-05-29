@@ -5,6 +5,8 @@ pub mod error;
 pub mod fmt;
 pub mod interp;
 pub mod lexer;
+#[cfg(feature = "lsp")]
+pub mod lsp;
 pub mod parser;
 pub mod repl;
 pub mod span;
