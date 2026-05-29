@@ -14,6 +14,9 @@
 //! set of changed cells and [`event_to_value`] converts a crossterm `Event` to an
 //! AScript object — both unit-tested directly. The actual stdout write
 //! ([`flush_changes`]) is exercised but its escape output isn't asserted in CI.
+//! `pollEvent`/`readEvent` surface only key Press/Repeat events (never Release) via
+//! the pure [`surfaces`] predicate, so a single keypress yields one key object on
+//! every platform (Windows / kitty-protocol terminals emit a Release otherwise).
 //!
 //! Tier policy (spec §11.3): fallible terminal I/O (enable/disable raw mode, alt
 //! screen, cursor show/hide) → Tier-1 `[nil, err]`; argument-type misuse and
@@ -540,25 +543,49 @@ impl Interp {
                     Value::Nil => 0,
                     other => want_u16(other, span, "terminal.pollEvent timeoutMs")? as u64,
                 };
-                match crossterm::event::poll(std::time::Duration::from_millis(ms)) {
-                    Ok(true) => match crossterm::event::read() {
-                        Ok(ev) => {
-                            self.apply_event_resize(id, &ev);
-                            Ok(make_pair(event_to_value(ev), Value::Nil))
-                        }
-                        Err(e) => Ok(err_pair(format!("terminal.pollEvent read failed: {}", e))),
-                    },
-                    Ok(false) => Ok(make_pair(Value::Nil, Value::Nil)),
-                    Err(e) => Ok(err_pair(format!("terminal.pollEvent failed: {}", e))),
+                // Poll → read → skip non-surfacing events (key Release) → re-poll for
+                // the next one with a small budget. We bound the loop so a flood of
+                // Release events can't make `pollEvent` block past its timeout: each
+                // skipped event consumes one more poll(remaining-or-0ms) cycle, and a
+                // poll(false) (nothing ready) bails to nil.
+                let mut remaining = ms;
+                loop {
+                    match crossterm::event::poll(std::time::Duration::from_millis(remaining)) {
+                        Ok(true) => match crossterm::event::read() {
+                            Ok(ev) => {
+                                if surfaces(&ev) {
+                                    self.apply_event_resize(id, &ev);
+                                    break Ok(make_pair(event_to_value(ev), Value::Nil));
+                                }
+                                // Skipped (e.g. a key Release). Look for the next event
+                                // within the leftover budget; on a timed poll we drop to
+                                // 0ms so we never block waiting after a skip.
+                                remaining = 0;
+                            }
+                            Err(e) => {
+                                break Ok(err_pair(format!("terminal.pollEvent read failed: {}", e)))
+                            }
+                        },
+                        Ok(false) => break Ok(make_pair(Value::Nil, Value::Nil)),
+                        Err(e) => break Ok(err_pair(format!("terminal.pollEvent failed: {}", e))),
+                    }
                 }
             }
-            "readEvent" => match crossterm::event::read() {
-                Ok(ev) => {
-                    self.apply_event_resize(id, &ev);
-                    Ok(make_pair(event_to_value(ev), Value::Nil))
+            "readEvent" => {
+                // Block until a *surfacing* event arrives, skipping key Release events
+                // (so a single keypress yields one key object, not Press+Release).
+                loop {
+                    match crossterm::event::read() {
+                        Ok(ev) => {
+                            if surfaces(&ev) {
+                                self.apply_event_resize(id, &ev);
+                                break Ok(make_pair(event_to_value(ev), Value::Nil));
+                            }
+                        }
+                        Err(e) => break Ok(err_pair(format!("terminal.readEvent failed: {}", e))),
+                    }
                 }
-                Err(e) => Ok(err_pair(format!("terminal.readEvent failed: {}", e))),
-            },
+            }
             "dump" => {
                 let state = self.terminal_mut(id).expect("checked present");
                 Ok(Value::Str(state.back.dump().into()))
@@ -587,6 +614,9 @@ impl Interp {
             if let Some(state) = self.terminal_mut(id) {
                 state.back = Buffer::new(*w, *h);
                 state.flushed = Buffer::new(*w, *h);
+                // Keep the logical cursor inside the new bounds (tidiness).
+                state.cursor.0 = state.cursor.0.min(w.saturating_sub(1));
+                state.cursor.1 = state.cursor.1.min(h.saturating_sub(1));
             }
         }
     }
@@ -836,6 +866,23 @@ fn key_code_name(code: crossterm::event::KeyCode) -> String {
         K::Menu => "Menu".into(),
         K::KeypadBegin => "KeypadBegin".into(),
         K::Media(_) | K::Modifier(_) => format!("{:?}", code),
+    }
+}
+
+/// Whether an event should be surfaced to the AScript program (vs. silently
+/// dropped by `pollEvent`/`readEvent`). PURE + unit-testable.
+///
+/// Key events surface ONLY for `Press` and `Repeat` kinds — a `Release` is dropped.
+/// On Windows and kitty-protocol terminals a single keypress emits both a Press and
+/// a Release; without this filter every keypress would yield two identical key
+/// objects. `Repeat` IS surfaced so that holding a key auto-repeats (the common,
+/// desirable behaviour for e.g. arrow-key navigation). All non-key events (mouse,
+/// resize, focus, paste) always surface.
+pub fn surfaces(ev: &crossterm::event::Event) -> bool {
+    use crossterm::event::{Event, KeyEventKind};
+    match ev {
+        Event::Key(k) => matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat),
+        _ => true,
     }
 }
 
@@ -1383,6 +1430,40 @@ print("[" + term.dumpRow(0) + "]")
         assert_eq!(field_str(&v, "type"), "resize");
         assert_eq!(field_num(&v, "width"), 100.0);
         assert_eq!(field_num(&v, "height"), 40.0);
+    }
+
+    #[test]
+    fn surfaces_filters_key_release_only() {
+        // Press + Repeat surface (so held keys auto-repeat); Release is dropped.
+        let press = Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        let repeat = Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: KeyEventState::NONE,
+        });
+        let release = Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: KeyEventState::NONE,
+        });
+        assert!(surfaces(&press), "Press should surface");
+        assert!(surfaces(&repeat), "Repeat should surface (auto-repeat)");
+        assert!(!surfaces(&release), "Release must be dropped");
+        // Non-key events always surface.
+        assert!(surfaces(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(surfaces(&Event::Resize(10, 5)));
     }
 
     #[test]
