@@ -137,7 +137,9 @@ impl Interp {
         }
         let src = std::fs::read_to_string(&canon)
             .map_err(|e| Control::Panic(AsError::new(format!("cannot read module {}: {}", canon.display(), e))))?;
-        let env = global_env();
+        // Child of the global (builtins) env so module-level definitions and
+        // imports can shadow builtins (resolution walks up to find builtins).
+        let env = global_env().child();
         let exports = Rc::new(RefCell::new(HashSet::new()));
         let entry = ModuleEntry { env: env.clone(), exports: exports.clone() };
         // Cache BEFORE executing so circular imports resolve to this entry.
@@ -1171,7 +1173,7 @@ mod tests {
         let mut interp = Interp::new();
         let tokens = lex(src).expect("lex");
         let stmts = parse(&tokens).expect("parse");
-        let env = global_env();
+        let env = global_env().child();
         interp.exec(&stmts, &env).await.expect("program panicked");
         interp.output
     }
@@ -1181,7 +1183,7 @@ mod tests {
         let mut interp = Interp::new();
         let tokens = lex(src).expect("lex");
         let stmts = parse(&tokens).expect("parse");
-        let env = global_env();
+        let env = global_env().child();
         match interp.exec(&stmts, &env).await {
             Err(Control::Panic(e)) => e,
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
@@ -1248,8 +1250,25 @@ mod tests {
                    print(regex.test(re, \"abc123\"))\n\
                    print(regex.findAll(re, \"a1 b22 c333\"))\n\
                    print(regex.replace(re, \"x9y\", \"#\"))\n\
+                   let m = regex.find(re, \"ab42cd\")\n\
+                   print(m.text)\n\
+                   print(m.index)\n\
                    print(type(re))";
-        assert_eq!(run(src).await, "true\n[\"1\", \"22\", \"333\"]\nx#y\nregex\n");
+        assert_eq!(run(src).await, "true\n[\"1\", \"22\", \"333\"]\nx#y\n42\n2\nregex\n");
+    }
+
+    #[tokio::test]
+    async fn user_can_shadow_builtins() {
+        assert_eq!(run("let len = 5\nprint(len)").await, "5\n");
+        assert_eq!(run("fn type(x) { return 99 }\nprint(type(1))").await, "99\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn named_import_colliding_with_builtin() {
+        // regex exports `test`; importing it shadows the global test() builtin in this scope
+        let out = run("import { test, compile } from \"std/regex\"\nlet [re, e] = compile(\"\\\\d+\")\nprint(test(re, \"a1\"))").await;
+        assert_eq!(out, "true\n");
     }
 
     #[tokio::test]

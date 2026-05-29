@@ -88,7 +88,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         .map(|g| g.map(|m| Value::Str(m.as_str().into())).unwrap_or(Value::Nil))
                         .collect();
                     let mut obj = indexmap::IndexMap::new();
-                    obj.insert("match".to_string(), Value::Str(whole.as_str().into()));
+                    obj.insert("text".to_string(), Value::Str(whole.as_str().into()));
                     obj.insert("index".to_string(), Value::Number(char_index(&s, whole.start())));
                     obj.insert("groups".to_string(), arr(groups));
                     Ok(Value::Object(Rc::new(RefCell::new(obj))))
@@ -132,7 +132,7 @@ mod tests {
     fn test_find_findall_replace_split() {
         assert_eq!(call("test", &[s("\\d+"), s("ab12")], sp()).unwrap(), Value::Bool(true));
         let found = call("find", &[s("(\\d)(\\d)"), s("x42y")], sp()).unwrap();
-        assert_eq!(found.to_string(), "{match: \"42\", index: 1, groups: [\"4\", \"2\"]}");
+        assert_eq!(found.to_string(), "{text: \"42\", index: 1, groups: [\"4\", \"2\"]}");
         assert_eq!(call("findAll", &[s("\\d"), s("a1b2")], sp()).unwrap().to_string(), "[\"1\", \"2\"]");
         assert_eq!(call("replace", &[s("\\d"), s("a1b2"), s("#")], sp()).unwrap(), s("a#b#"));
         assert_eq!(call("split", &[s(",\\s*"), s("a, b,c")], sp()).unwrap().to_string(), "[\"a\", \"b\", \"c\"]");

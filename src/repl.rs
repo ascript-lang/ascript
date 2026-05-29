@@ -22,7 +22,9 @@ use crate::value::Value;
 /// reads lines from stdin directly so non-interactive use still works.
 pub async fn run_repl() -> std::io::Result<()> {
     let mut interp = Interp::new();
-    let env = crate::interp::global_env();
+    // Persistent session scope: a child of the builtins env so REPL definitions
+    // can shadow builtins and persist across lines (builtins resolve upward).
+    let env = crate::interp::global_env().child();
 
     if std::io::stdin().is_terminal() {
         run_tty(&mut interp, &env).await
