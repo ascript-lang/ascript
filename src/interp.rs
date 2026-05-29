@@ -599,7 +599,9 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         Type::Result(inner) => match value {
             Value::Array(a) => {
                 let b = a.borrow();
-                b.len() == 2 && check_type(&b[0], inner) && check_type(&b[1], &Type::Error)
+                b.len() == 2
+                    && (check_type(&b[0], inner) || matches!(b[0], Value::Nil))
+                    && check_type(&b[1], &Type::Error)
             }
             _ => false,
         },
@@ -697,6 +699,26 @@ mod tests {
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "5\n");
+    }
+
+    #[tokio::test]
+    async fn result_contract_accepts_both_ok_and_err() {
+        // Both Ok and Err must satisfy a Result<T> contract (spec §6).
+        let src = "
+fn parseNum(s): Result<number> {
+  if (s == \"bad\") { return Err(\"not a number\") }
+  return Ok(42)
+}
+let good: Result<number> = parseNum(\"ok\")
+let bad: Result<number> = parseNum(\"bad\")
+print(good[0])
+print(bad[1].message)
+";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "42\nnot a number\n");
     }
 
     #[tokio::test]
