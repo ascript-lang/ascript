@@ -777,10 +777,10 @@ impl<'a> Parser<'a> {
                         self.advance();
                         None
                     } else {
-                        let mut pats = vec![self.expr()?];
+                        let mut pats = vec![self.coalesce()?];
                         while *self.peek() == Tok::Pipe {
                             self.advance();
-                            pats.push(self.expr()?);
+                            pats.push(self.coalesce()?);
                         }
                         Some(pats)
                     };
@@ -882,6 +882,11 @@ mod tests {
     #[test]
     fn coalesce_is_loosest() {
         assert_eq!(sexpr("a || b ?? c"), "(?? (|| a b) c)");
+    }
+
+    #[test]
+    fn match_bare_ident_pattern_parses() {
+        assert!(parse(&lex("match x { y => 1, _ => 2 }").unwrap()).is_ok());
     }
 
     #[test]

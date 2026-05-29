@@ -749,6 +749,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn match_with_variable_and_expression_patterns() {
+        // A bare-variable pattern must work (value-equality, not arrow-function).
+        let src = "let k = 2\nprint(match 2 { k => \"hit\", _ => \"miss\" })\nprint(match 3 { k => \"hit\", _ => \"miss\" })\nlet n = 5\nprint(match 6 { n + 1 => \"plus\", _ => \"no\" })";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "hit\nmiss\nplus\n");
+    }
+
+    #[tokio::test]
     async fn typed_code_runs_without_enforcement_yet() {
         let src = "let x: number = 5\nfn f(a: number): number { return a + 1 }\nprint(f(x))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
