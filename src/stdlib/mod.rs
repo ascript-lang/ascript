@@ -62,8 +62,6 @@ pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Contr
     }
 }
 
-// Used by the string/array/object modules landing later in M10; the contract
-// (type-error message shape) is defined here so all modules stay consistent.
 pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, Control> {
     match v {
         Value::Str(s) => Ok(s.clone()),
@@ -78,6 +76,8 @@ pub(crate) fn want_array(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cel
     }
 }
 
+// want_object: used by the object module landing later in M10; the type-error
+// message shape is defined here so all std modules stay consistent.
 #[allow(dead_code)]
 pub(crate) fn want_object(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cell::RefCell<indexmap::IndexMap<String, Value>>>, Control> {
     match v {

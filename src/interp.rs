@@ -2113,6 +2113,15 @@ print(r[1])
     }
 
     #[tokio::test]
+    async fn std_array_sort_is_stable() {
+        // comparator compares only the first element of each pair; equal keys keep input order
+        let src = "import * as array from \"std/array\"\n\
+                   let pairs = [[1, \"a\"], [1, \"b\"], [0, \"c\"], [1, \"d\"]]\n\
+                   print(array.sort(pairs, (x, y) => x[0] - y[0]))";
+        assert_eq!(run(src).await, "[[0, \"c\"], [1, \"a\"], [1, \"b\"], [1, \"d\"]]\n");
+    }
+
+    #[tokio::test]
     async fn named_import_from_std() {
         let out = run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))").await;
         assert_eq!(out, "12\n7\n");

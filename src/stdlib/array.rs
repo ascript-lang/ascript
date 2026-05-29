@@ -111,6 +111,10 @@ impl Interp {
                     Some(f) => {
                         // Insertion sort driven by the async comparator: insert each
                         // item before the first existing element it compares < 0 against.
+                        // O(n^2), acceptable because each comparison is an async user-
+                        // callback call (a standard borrow-free sort is awkward with an
+                        // async comparator). Stable: insertion stops at the first strictly
+                        // negative compare, so equal-key elements keep their input order.
                         let mut sorted: Vec<Value> = Vec::with_capacity(items.len());
                         for item in items.into_iter() {
                             let mut lo = 0usize;
