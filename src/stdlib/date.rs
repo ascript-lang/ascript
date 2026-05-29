@@ -32,6 +32,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 /// Build an instant object snapshot from a UTC epoch-millis value.
+///
+/// Callers validate `epoch_ms` is in chrono's representable range: `fromEpochMs`
+/// guards user input directly, while `now`/`parse`/`add*` only feed epochs that
+/// are already in range. The `unwrap_or_else(1970)` below is a defensive fallback
+/// that should never trigger in practice.
 fn make_instant(epoch_ms: i64) -> Value {
     let dt = Utc
         .timestamp_millis_opt(epoch_ms)
@@ -80,6 +85,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "now" => Ok(make_instant(Utc::now().timestamp_millis())),
         "fromEpochMs" => {
             let ms = want_number(&arg(args, 0), span, &ctx("fromEpochMs"))?;
+            // Reject epochs outside chrono's representable range instead of
+            // silently clamping to 1970 inside make_instant (Tier-2: bad input).
+            if Utc.timestamp_millis_opt(ms as i64).single().is_none() {
+                return Err(AsError::at(
+                    "date.fromEpochMs: epoch milliseconds out of representable range",
+                    span,
+                )
+                .into());
+            }
             Ok(make_instant(ms as i64))
         }
         "parse" => {
@@ -163,6 +177,8 @@ fn add_months(dt: chrono::DateTime<Utc>, months: i64) -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(year, month0 + 1, day, dt.hour(), dt.minute(), dt.second())
         .single()
         .map(|d| d + chrono::Duration::milliseconds(dt.timestamp_subsec_millis() as i64))
+        // Only triggers on year-overflow past chrono's ~±262143-year range; the
+        // day is already clamped to the month, so the constructed date is valid.
         .unwrap_or(dt)
 }
 
@@ -243,5 +259,56 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn tz_offset_shifts_display() {
+        // 2021-01-01T00:00:00Z formatted at +120 min → 02:00; at -300 → prev day 19:00
+        let inst = call("fromEpochMs", &[Value::Number(1609459200000.0)], sp()).unwrap();
+        assert_eq!(
+            call(
+                "format",
+                &[inst.clone(), s("%Y-%m-%d %H:%M"), Value::Number(120.0)],
+                sp()
+            )
+            .unwrap(),
+            s("2021-01-01 02:00")
+        );
+        assert_eq!(
+            call(
+                "format",
+                &[inst, s("%Y-%m-%d %H:%M"), Value::Number(-300.0)],
+                sp()
+            )
+            .unwrap(),
+            s("2020-12-31 19:00")
+        );
+    }
+
+    #[test]
+    fn month_arithmetic_edges() {
+        // Jan 31 2020 (leap) + 1 month → Feb 29; negative; cross-year
+        let leap = call("parse", &[s("2020-01-31T00:00:00Z")], sp()).unwrap();
+        if let Value::Array(a) = &leap {
+            let inst = a.borrow()[0].clone();
+            let feb = call("addMonths", &[inst.clone(), Value::Number(1.0)], sp()).unwrap();
+            assert!(feb.to_string().contains("month: 2") && feb.to_string().contains("day: 29"));
+            let dec = call("addMonths", &[inst, Value::Number(-1.0)], sp()).unwrap(); // Jan 31 2020 - 1mo → Dec 31 2019
+            assert!(
+                dec.to_string().contains("year: 2019")
+                    && dec.to_string().contains("month: 12")
+                    && dec.to_string().contains("day: 31")
+            );
+        } else {
+            panic!();
+        }
+    }
+
+    #[test]
+    fn from_epoch_out_of_range_panics() {
+        assert!(matches!(
+            call("fromEpochMs", &[Value::Number(9.0e18)], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 }
