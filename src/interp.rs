@@ -2077,10 +2077,16 @@ print(r[1])
     async fn std_array_map_filter_reduce() {
         let src = "import * as array from \"std/array\"\n\
                    let xs = [1, 2, 3, 4]\n\
-                   print(array.map(xs, (x, i) => x * 2))\n\
-                   print(array.filter(xs, (x, i) => x % 2 == 0))\n\
-                   print(array.reduce(xs, (a, x, i) => a + x, 0))";
+                   print(array.map(xs, (x) => x * 2))\n\
+                   print(array.filter(xs, (x) => x % 2 == 0))\n\
+                   print(array.reduce(xs, (a, x) => a + x, 0))";
         assert_eq!(run(src).await, "[2, 4, 6, 8]\n[2, 4]\n10\n");
+    }
+
+    #[tokio::test]
+    async fn std_array_map_pointfree() {
+        let src = "import * as array from \"std/array\"\nimport * as math from \"std/math\"\nprint(array.map([-1, -2, 3], math.abs))";
+        assert_eq!(run(src).await, "[1, 2, 3]\n");
     }
 
     #[tokio::test]

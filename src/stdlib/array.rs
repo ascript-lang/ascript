@@ -32,8 +32,8 @@ impl Interp {
                 let f = arg(args, 1);
                 let items = arr.borrow().clone();
                 let mut out = Vec::with_capacity(items.len());
-                for (i, item) in items.into_iter().enumerate() {
-                    let v = self.call_value(f.clone(), vec![item, Value::Number(i as f64)], span).await?;
+                for item in items.into_iter() {
+                    let v = self.call_value(f.clone(), vec![item], span).await?;
                     out.push(v);
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(out))))
@@ -43,8 +43,8 @@ impl Interp {
                 let f = arg(args, 1);
                 let items = arr.borrow().clone();
                 let mut out = Vec::new();
-                for (i, item) in items.into_iter().enumerate() {
-                    let keep = self.call_value(f.clone(), vec![item.clone(), Value::Number(i as f64)], span).await?;
+                for item in items.into_iter() {
+                    let keep = self.call_value(f.clone(), vec![item.clone()], span).await?;
                     if keep.is_truthy() {
                         out.push(item);
                     }
@@ -56,8 +56,8 @@ impl Interp {
                 let f = arg(args, 1);
                 let mut acc = arg(args, 2);
                 let items = arr.borrow().clone();
-                for (i, item) in items.into_iter().enumerate() {
-                    acc = self.call_value(f.clone(), vec![acc, item, Value::Number(i as f64)], span).await?;
+                for item in items.into_iter() {
+                    acc = self.call_value(f.clone(), vec![acc, item], span).await?;
                 }
                 Ok(acc)
             }
