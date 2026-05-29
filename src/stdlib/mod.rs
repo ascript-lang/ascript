@@ -33,6 +33,8 @@ pub mod math;
 pub mod net_tcp;
 #[cfg(feature = "net")]
 pub mod net_http;
+#[cfg(feature = "net")]
+pub mod http_server;
 pub mod object;
 #[cfg(feature = "data")]
 pub mod regex;
@@ -92,6 +94,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/net/tcp" => net_tcp::exports(),
         #[cfg(feature = "net")]
         "std/net/http" => net_http::exports(),
+        #[cfg(feature = "net")]
+        "std/http/server" => http_server::exports(),
         #[cfg(feature = "data")]
         "std/regex" => regex::exports(),
         #[cfg(feature = "sql")]
@@ -149,6 +153,8 @@ impl Interp {
             "net_tcp" => self.call_net_tcp(func, args, span).await,
             #[cfg(feature = "net")]
             "net_http" => self.call_http(func, args, span).await,
+            #[cfg(feature = "net")]
+            "http_server" => self.call_http_server(func, args, span).await,
             #[cfg(feature = "data")]
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "sql")]

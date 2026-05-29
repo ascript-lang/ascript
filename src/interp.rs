@@ -135,6 +135,16 @@ pub(crate) enum ResourceState {
     // keeps the `ResourceState` enum compact (clippy::large_enum_variant).
     #[cfg(feature = "net")]
     SseStream(Box<crate::stdlib::net_http::SseState>),
+    // M14 std/http/server: a server handle's registered routes + middleware and,
+    // after `bind`, the live listener. `serve` runs the sequential accept loop.
+    #[cfg(feature = "net")]
+    HttpServer(crate::stdlib::http_server::HttpServerState),
+    // M14 std/http/server: the continuation state behind a `next` callable handed
+    // to a middleware. Holds the remaining middleware chain, the index to resume
+    // at, the terminal route handler, and the request. Calling `next` re-enters
+    // the chain at this saved point. `Box`ed to keep the enum compact.
+    #[cfg(feature = "net")]
+    HttpNext(Box<crate::stdlib::http_server::NextState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -308,6 +318,28 @@ impl Interp {
             Some(ResourceState::SseStream(s)) => Some(s.as_mut()),
             _ => None,
         }
+    }
+
+    /// Mutable access to an HTTP server's routes/middleware/listener behind a
+    /// handle id (for `route`/`use`/`bind`/`serve`).
+    #[cfg(feature = "net")]
+    pub(crate) fn http_server_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::http_server::HttpServerState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::HttpServer(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Drop any un-consumed `HttpNext` continuations from the resource table. A
+    /// middleware that short-circuits (returns without calling `next`) leaves its
+    /// continuation behind; the server sweeps them after each request so per-request
+    /// handles don't accumulate across a long-running `serve` loop.
+    #[cfg(feature = "net")]
+    pub(crate) fn drop_pending_http_next(&mut self) {
+        self.resources.retain(|_, s| !matches!(s, ResourceState::HttpNext(_)));
     }
 
     /// Mutable access to a bound TCP listener behind a handle id (for `accept`).
@@ -1028,6 +1060,12 @@ impl Interp {
             }
             if matches!(m.receiver.kind, SseStream) {
                 return self.call_sse_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, HttpServer) {
+                return self.call_http_server_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, HttpNext) {
+                return self.call_http_next(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())

@@ -131,6 +131,12 @@ pub enum NativeKind {
     // `next()` yields parsed `{event,data,id,retry}` events; `lastEventId` is a
     // readable property; auto-reconnects on disconnect (see std/net/http).
     SseStream,
+    // M14 std/http/server: a server handle holding registered routes + middleware
+    // and (after `bind`) the live `TcpListener`. Methods: route/use/bind/serve/listen.
+    HttpServer,
+    // M14 std/http/server: the `next` callable handed to a middleware. Calling it
+    // (as a `NativeMethod`) advances the middleware chain → matched route handler.
+    HttpNext,
 }
 
 impl NativeKind {
@@ -147,6 +153,8 @@ impl NativeKind {
             NativeKind::HttpBody => "httpBody",
             NativeKind::CancelHandle => "cancelHandle",
             NativeKind::SseStream => "sseStream",
+            NativeKind::HttpServer => "httpServer",
+            NativeKind::HttpNext => "httpNext",
         }
     }
 }
