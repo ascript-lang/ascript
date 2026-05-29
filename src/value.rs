@@ -122,6 +122,8 @@ pub enum NativeKind {
     TcpListener,
     TcpStream,
     HttpResponse,
+    // A cancellation token for in-flight HTTP requests (`http.cancelToken()`).
+    CancelHandle,
     // M14 adds: HttpBody, SseStream, ...
 }
 
@@ -136,6 +138,7 @@ impl NativeKind {
             NativeKind::TcpListener => "tcpListener",
             NativeKind::TcpStream => "tcpStream",
             NativeKind::HttpResponse => "httpResponse",
+            NativeKind::CancelHandle => "cancelHandle",
         }
     }
 }

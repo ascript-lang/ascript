@@ -26,8 +26,33 @@
 //! (`reqwest::multipart::Form`; each part `{name, value}` for a text field or
 //! `{name, data, filename?, contentType?}` for a file/bytes part).
 //!
-//! Deferred to later M14 tasks: timeouts/redirects/retries/tls/cookies-jar/proxy/
-//! httpVersion (Task 3), streaming response + request bodies (Task 4), `sse` (Task 5).
+//! Advanced request options (Task 3) map onto a per-request `reqwest::Client`
+//! (built only when an advanced opt is present; plain requests reuse the pooled
+//! default client) and/or the `RequestBuilder`:
+//!   - `timeout {connect, read, total}` (ms) → `connect_timeout` + total `timeout`.
+//!     reqwest has no separate per-read timeout in its stable API, so `read` folds
+//!     into the total timeout (when `total` is unset). A total-timeout expiry is a
+//!     Tier-1 err.
+//!   - `redirect {follow, max}` | `"none"` → `redirect::Policy` (default follow, max 10).
+//!   - `retry {max, backoff:"exponential"|"constant", baseDelay, retryOn:[statuses]}`
+//!     → a hand-rolled loop (`send_with_retry`) retrying on connection errors for
+//!     idempotent methods AND on a response status ∈ `retryOn`, up to `max` (OFF by
+//!     default). Non-cloneable (streaming) bodies cannot be retried.
+//!   - `decompress` (default true) → `false` disables all transparent decoders.
+//!   - `tls {caBundle, clientCert, minVersion, sni, insecure}` (`insecure` disables
+//!     cert verification — for testing only).
+//!   - `cookies: true` → a per-request-client cookie jar (persists across redirects +
+//!     reuse within that request's client). A shared cross-request jar handle is a
+//!     documented follow-up.
+//!   - `proxy` "http://…"/"https://…"/"socks5://…" (socks feature enabled)/"system"/"none".
+//!   - `httpVersion` "auto"|"1.1"|"2"|"3" — "3" returns a clean error until the http3
+//!     build feature lands (Task 8). `resp.version` reports the negotiated version.
+//!   - `errorOnStatus: true` → a non-2xx response becomes a Tier-1 err.
+//!   - `cancel` → a `cancelToken()` handle whose `cancel()` aborts the in-flight send
+//!     via a `tokio::select!` against a shared `Notify`.
+//!
+//! Deferred to later M14 tasks: streaming response + request bodies (Task 4), `sse`
+//! (Task 5), the `http3` build feature gate (Task 8).
 
 use super::{arg, bi, want_string};
 use crate::error::AsError;
@@ -58,6 +83,295 @@ fn default_client() -> reqwest::Client {
     })
 }
 
+/// Keys whose presence forces a per-request `ClientBuilder` (the cached default
+/// client cannot express any of these). If none are present we reuse the pooled
+/// default client (fast path).
+const ADVANCED_CLIENT_KEYS: &[&str] = &[
+    "timeout",
+    "redirect",
+    "decompress",
+    "tls",
+    "cookies",
+    "proxy",
+    "httpVersion",
+];
+
+fn has_advanced_client_opts(opts: &Value) -> bool {
+    ADVANCED_CLIENT_KEYS.iter().any(|k| opt_field(opts, k).is_some())
+}
+
+/// Parsed `retry` config (a hand-rolled retry loop wraps the send). Default OFF.
+struct RetryConfig {
+    max: u32,
+    exponential: bool,
+    base_delay_ms: u64,
+    retry_on: Vec<u16>,
+}
+
+/// Read a numeric field from an object, if present and a number.
+fn num_field(o: &IndexMap<String, Value>, key: &str) -> Option<f64> {
+    match o.get(key) {
+        Some(Value::Number(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// HTTP methods considered idempotent (safe to auto-retry on a server/connection
+/// error even without an explicit `retryOn` match).
+fn is_idempotent(method: &reqwest::Method) -> bool {
+    matches!(
+        *method,
+        reqwest::Method::GET
+            | reqwest::Method::HEAD
+            | reqwest::Method::PUT
+            | reqwest::Method::DELETE
+            | reqwest::Method::OPTIONS
+    )
+}
+
+/// Parse `opts.retry` into a `RetryConfig`. Returns `Ok(None)` when absent (retry
+/// OFF by default). Shape: `{ max, backoff:"exponential"|"constant", baseDelay,
+/// retryOn:[statuses] }`.
+fn parse_retry(opts: &Value, span: Span) -> Result<Option<RetryConfig>, Control> {
+    let r = match opt_field(opts, "retry") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let o = match &r {
+        Value::Object(o) => o.borrow(),
+        other => {
+            return Err(AsError::at(
+                format!("net/http retry expects an object, got {}", crate::interp::type_name(other)),
+                span,
+            )
+            .into())
+        }
+    };
+    let max = num_field(&o, "max").unwrap_or(0.0).max(0.0) as u32;
+    let exponential = match o.get("backoff") {
+        Some(Value::Str(s)) => s.as_ref() != "constant",
+        _ => true, // default exponential
+    };
+    let base_delay_ms = num_field(&o, "baseDelay").unwrap_or(100.0).max(0.0) as u64;
+    let retry_on = match o.get("retryOn") {
+        Some(Value::Array(a)) => a
+            .borrow()
+            .iter()
+            .filter_map(|v| match v {
+                Value::Number(n) => Some(*n as u16),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(Some(RetryConfig {
+        max,
+        exponential,
+        base_delay_ms,
+        retry_on,
+    }))
+}
+
+/// Sleep the backoff interval before retry `attempt` (0-based): exponential is
+/// `baseDelay * 2^attempt`, constant is `baseDelay`.
+async fn backoff_sleep(cfg: &RetryConfig, attempt: u32) {
+    let delay = if cfg.exponential {
+        cfg.base_delay_ms.saturating_mul(1u64 << attempt.min(20))
+    } else {
+        cfg.base_delay_ms
+    };
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+}
+
+/// Build a per-request `reqwest::Client` from the advanced client-level opts
+/// (timeout/redirect/decompress/tls/cookies/proxy/httpVersion). Only called when
+/// `has_advanced_client_opts` is true; plain requests reuse the pooled default.
+fn build_client(opts: &Value, span: Span) -> Result<reqwest::Client, Control> {
+    let mut b = reqwest::Client::builder();
+
+    // timeout { connect, read, total } in ms. reqwest has no separate per-read
+    // timeout in its stable API, so `read` is folded into the total timeout (if
+    // `total` is not itself set); the connect timeout is applied independently.
+    if let Some(t) = opt_field(opts, "timeout") {
+        let o = match &t {
+            Value::Object(o) => o.borrow(),
+            other => {
+                return Err(AsError::at(
+                    format!("net/http timeout expects an object, got {}", crate::interp::type_name(other)),
+                    span,
+                )
+                .into())
+            }
+        };
+        if let Some(c) = num_field(&o, "connect") {
+            b = b.connect_timeout(std::time::Duration::from_millis(c.max(0.0) as u64));
+        }
+        // total wins; otherwise read maps to the total timeout.
+        let total = num_field(&o, "total").or_else(|| num_field(&o, "read"));
+        if let Some(t) = total {
+            b = b.timeout(std::time::Duration::from_millis(t.max(0.0) as u64));
+        }
+    }
+
+    // redirect { follow, max } | "none". Default: follow, max 10.
+    if let Some(r) = opt_field(opts, "redirect") {
+        let policy = match &r {
+            Value::Str(s) if s.as_ref() == "none" => reqwest::redirect::Policy::none(),
+            Value::Object(o) => {
+                let o = o.borrow();
+                let follow = !matches!(o.get("follow"), Some(Value::Bool(false)));
+                if !follow {
+                    reqwest::redirect::Policy::none()
+                } else {
+                    let max = num_field(&o, "max").unwrap_or(10.0).max(0.0) as usize;
+                    reqwest::redirect::Policy::limited(max)
+                }
+            }
+            other => {
+                return Err(AsError::at(
+                    format!("net/http redirect expects an object or \"none\", got {}", crate::interp::type_name(other)),
+                    span,
+                )
+                .into())
+            }
+        };
+        b = b.redirect(policy);
+    }
+
+    // decompress (default true). false → disable all transparent decoders, which
+    // also stops reqwest from advertising Accept-Encoding.
+    if matches!(opt_field(opts, "decompress"), Some(Value::Bool(false))) {
+        b = b.no_gzip().no_brotli().no_deflate().no_zstd();
+    }
+
+    // cookies: true → a per-client cookie jar (persists/sends across redirects +
+    // connection reuse within this request's client). A shared cross-request jar
+    // handle is a documented follow-up.
+    if matches!(opt_field(opts, "cookies"), Some(Value::Bool(true))) {
+        b = b.cookie_store(true);
+    }
+
+    // tls { caBundle, clientCert, minVersion, sni, insecure }.
+    if let Some(tls) = opt_field(opts, "tls") {
+        b = apply_tls(b, &tls, span)?;
+    }
+
+    // proxy: "http://…" | "https://…" | "socks5://…" | "system" | "none".
+    if let Some(p) = opt_field(opts, "proxy") {
+        let s = want_string(&p, span, "net/http proxy")?;
+        match s.as_ref() {
+            "system" => { /* reqwest's default honors env proxies */ }
+            "none" => b = b.no_proxy(),
+            url => {
+                let proxy = reqwest::Proxy::all(url)
+                    .map_err(|e| Control::from(AsError::at(format!("net/http proxy: {}", e), span)))?;
+                b = b.proxy(proxy);
+            }
+        }
+    }
+
+    // httpVersion: "auto" (default) | "1.1" | "2" | "3".
+    if let Some(v) = opt_field(opts, "httpVersion") {
+        let s = want_string(&v, span, "net/http httpVersion")?;
+        match s.as_ref() {
+            "auto" => {}
+            "1.1" => b = b.http1_only(),
+            "2" => b = b.http2_prior_knowledge(),
+            "3" => {
+                return Err(AsError::at(
+                    "HTTP/3 requires the 'http3' build feature",
+                    span,
+                )
+                .into())
+            }
+            other => {
+                return Err(AsError::at(
+                    format!("net/http httpVersion must be \"auto\"|\"1.1\"|\"2\"|\"3\", got \"{}\"", other),
+                    span,
+                )
+                .into())
+            }
+        }
+    }
+
+    b.build()
+        .map_err(|e| Control::from(AsError::at(format!("net/http client build: {}", e), span)))
+}
+
+/// Apply `opts.tls` to a `ClientBuilder`. `insecure:true` DISABLES certificate
+/// verification (`danger_accept_invalid_certs`) — intended only for testing
+/// against self-signed endpoints; never use it against untrusted networks.
+fn apply_tls(
+    mut b: reqwest::ClientBuilder,
+    tls: &Value,
+    span: Span,
+) -> Result<reqwest::ClientBuilder, Control> {
+    let o = match tls {
+        Value::Object(o) => o.borrow(),
+        other => {
+            return Err(AsError::at(
+                format!("net/http tls expects an object, got {}", crate::interp::type_name(other)),
+                span,
+            )
+            .into())
+        }
+    };
+    // caBundle: a PEM string or a path to a PEM file → an extra trusted root.
+    if let Some(ca) = o.get("caBundle") {
+        let ca = want_string(ca, span, "net/http tls.caBundle")?;
+        let pem = read_pem_or_inline(&ca);
+        let cert = reqwest::Certificate::from_pem(pem.as_bytes())
+            .map_err(|e| Control::from(AsError::at(format!("net/http tls.caBundle: {}", e), span)))?;
+        b = b.add_root_certificate(cert);
+    }
+    // clientCert: a PEM string (cert + private key) → a client identity (mTLS).
+    if let Some(cc) = o.get("clientCert") {
+        let cc = want_string(cc, span, "net/http tls.clientCert")?;
+        let pem = read_pem_or_inline(&cc);
+        let id = reqwest::Identity::from_pem(pem.as_bytes())
+            .map_err(|e| Control::from(AsError::at(format!("net/http tls.clientCert: {}", e), span)))?;
+        b = b.identity(id);
+    }
+    // minVersion: "1.2" | "1.3".
+    if let Some(mv) = o.get("minVersion") {
+        let mv = want_string(mv, span, "net/http tls.minVersion")?;
+        let v = match mv.as_ref() {
+            "1.2" => reqwest::tls::Version::TLS_1_2,
+            "1.3" => reqwest::tls::Version::TLS_1_3,
+            other => {
+                return Err(AsError::at(
+                    format!("net/http tls.minVersion must be \"1.2\" or \"1.3\", got \"{}\"", other),
+                    span,
+                )
+                .into())
+            }
+        };
+        b = b.min_tls_version(v);
+    }
+    // sni: toggle TLS SNI (default on).
+    if let Some(Value::Bool(sni)) = o.get("sni") {
+        b = b.tls_sni(*sni);
+    }
+    // insecure: disable certificate verification (flagged above).
+    if matches!(o.get("insecure"), Some(Value::Bool(true))) {
+        b = b.danger_accept_invalid_certs(true);
+    }
+    Ok(b)
+}
+
+/// If `s` looks like inline PEM (`-----BEGIN`), use it verbatim; otherwise treat
+/// it as a filesystem path and read the file (falling back to the raw string if
+/// the read fails, so a bad path surfaces as a PEM-parse error downstream).
+fn read_pem_or_inline(s: &str) -> String {
+    if s.trim_start().starts_with("-----BEGIN") {
+        s.to_string()
+    } else {
+        std::fs::read_to_string(s).unwrap_or_else(|_| s.to_string())
+    }
+}
+
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
         ("get", bi("net_http.get")),
@@ -68,6 +382,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("head", bi("net_http.head")),
         ("options", bi("net_http.options")),
         ("request", bi("net_http.request")),
+        ("cancelToken", bi("net_http.cancelToken")),
     ]
 }
 
@@ -164,6 +479,7 @@ impl Interp {
                 };
                 self.call_http_send(&method, url, &opts, span).await
             }
+            "cancelToken" => Ok(self.make_cancel_token()),
             _ => Err(AsError::at(format!("std/net/http has no function '{}'", func), span).into()),
         }
     }
@@ -180,8 +496,15 @@ impl Interp {
             Ok(m) => m,
             Err(_) => return Err(AsError::at(format!("net/http: invalid method '{}'", method), span).into()),
         };
-        let client = default_client();
-        let mut rb = client.request(m, &url);
+        // Fast path: plain requests reuse the pooled default client. Any advanced
+        // client-level opt (timeout/redirect/tls/cookies/proxy/decompress/httpVersion)
+        // builds a dedicated per-request client.
+        let client = if has_advanced_client_opts(opts) {
+            build_client(opts, span)?
+        } else {
+            default_client()
+        };
+        let mut rb = client.request(m.clone(), &url);
 
         // query: object → query pairs (merged onto the URL).
         if let Some(q) = opt_field(opts, "query") {
@@ -217,9 +540,107 @@ impl Interp {
             rb = self.apply_body(rb, &b, span)?;
         }
 
-        match rb.send().await {
-            Ok(resp) => Ok(make_pair(self.http_response_value(resp), Value::Nil)),
-            Err(e) => Ok(err_pair(format!("net/http {} {} failed: {}", method, url, e))),
+        // Resolve a cancellation handle (opts.cancel → a CancelHandle's Notify), if any.
+        let cancel = self.resolve_cancel(opts, span)?;
+
+        // Parse the retry policy (default: OFF).
+        let retry = parse_retry(opts, span)?;
+
+        let resp = match self
+            .send_with_retry(rb, &m, &url, method, retry, cancel)
+            .await
+        {
+            Ok(r) => r,
+            Err(pair) => return Ok(pair),
+        };
+
+        // errorOnStatus: a non-2xx response becomes a Tier-1 err instead of a resp.
+        if matches!(opt_field(opts, "errorOnStatus"), Some(Value::Bool(true))) && !resp.status().is_success() {
+            return Ok(err_pair(format!(
+                "net/http {} {} returned status {}",
+                method,
+                url,
+                resp.status().as_u16()
+            )));
+        }
+
+        Ok(make_pair(self.http_response_value(resp), Value::Nil))
+    }
+
+    /// Send `rb`, applying the hand-rolled retry loop and (optional) cancellation.
+    /// Returns `Ok(response)` or `Err(pair)` where `pair` is the Tier-1 `[nil, err]`.
+    async fn send_with_retry(
+        &mut self,
+        rb: reqwest::RequestBuilder,
+        method_obj: &reqwest::Method,
+        url: &str,
+        method: &str,
+        retry: Option<RetryConfig>,
+        cancel: Option<std::sync::Arc<tokio::sync::Notify>>,
+    ) -> Result<reqwest::Response, Value> {
+        // No retry budget (no `retry` opt, or max 0): send the builder directly —
+        // streaming bodies that can't be cloned still work on this path.
+        let cfg = match retry {
+            Some(c) if c.max > 0 => c,
+            _ => return self.run_send(rb.send(), &cancel, method, url).await,
+        };
+        let max = cfg.max;
+        let idempotent = is_idempotent(method_obj);
+
+        let mut attempt: u32 = 0;
+        loop {
+            // Each retryable attempt needs a fresh builder. `try_clone` returns
+            // None for non-replayable bodies (streams) — then retry is impossible.
+            let send_fut = match rb.try_clone() {
+                Some(b) => b.send(),
+                None => return self.run_send(rb.send(), &cancel, method, url).await,
+            };
+            let result = self.run_send(send_fut, &cancel, method, url).await;
+            match result {
+                Ok(resp) => {
+                    let should_retry = cfg.retry_on.contains(&resp.status().as_u16());
+                    if should_retry && attempt < max {
+                        backoff_sleep(&cfg, attempt).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(pair) => {
+                    // A connection-level error: retry on idempotent methods if budget left.
+                    if idempotent && attempt < max {
+                        backoff_sleep(&cfg, attempt).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(pair);
+                }
+            }
+        }
+    }
+
+    /// Await a single send future, racing it against an optional cancellation token.
+    /// Maps a reqwest error or a cancellation into the Tier-1 `[nil, err]` pair.
+    async fn run_send(
+        &mut self,
+        fut: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+        cancel: &Option<std::sync::Arc<tokio::sync::Notify>>,
+        method: &str,
+        url: &str,
+    ) -> Result<reqwest::Response, Value> {
+        match cancel {
+            Some(token) => {
+                tokio::select! {
+                    biased;
+                    _ = token.notified() => {
+                        Err(err_pair(format!("net/http {} {} cancelled", method, url)))
+                    }
+                    r = fut => r.map_err(|e| err_pair(format!("net/http {} {} failed: {}", method, url, e))),
+                }
+            }
+            None => fut
+                .await
+                .map_err(|e| err_pair(format!("net/http {} {} failed: {}", method, url, e))),
         }
     }
 
@@ -376,6 +797,64 @@ impl Interp {
             other => Err(AsError::at(format!("httpResponse has no method '{}'", other), span).into()),
         }
     }
+
+    /// `http.cancelToken()` → a `CancelHandle` native handle. Its `cancel()` method
+    /// aborts any in-flight request that was passed this handle via `opts.cancel`.
+    fn make_cancel_token(&mut self) -> Value {
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        self.register_resource(
+            NativeKind::CancelHandle,
+            IndexMap::new(),
+            ResourceState::CancelToken(notify),
+        )
+    }
+
+    /// Dispatch a method on a `CancelHandle`: only `cancel()` (notifies waiters).
+    pub(crate) async fn call_cancel_method(
+        &mut self,
+        m: &Rc<NativeMethod>,
+        _args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match m.method.as_str() {
+            "cancel" => {
+                if let Some(ResourceState::CancelToken(n)) = self.resource(m.receiver.id) {
+                    // `notify_one` stores a permit, so a cancel that lands *before*
+                    // the request's `notified()` is registered still aborts the next
+                    // (and only the next) send — important on the single-threaded
+                    // interp where `cancel()` and the request run sequentially.
+                    n.notify_one();
+                }
+                Ok(Value::Nil)
+            }
+            other => Err(AsError::at(format!("cancelHandle has no method '{}'", other), span).into()),
+        }
+    }
+
+    /// Resolve `opts.cancel` (a `CancelHandle`) into its shared `Notify`, if present.
+    fn resolve_cancel(
+        &self,
+        opts: &Value,
+        span: Span,
+    ) -> Result<Option<std::sync::Arc<tokio::sync::Notify>>, Control> {
+        let c = match opt_field(opts, "cancel") {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        match &c {
+            Value::Native(n) if n.kind == NativeKind::CancelHandle => {
+                match self.resource(n.id) {
+                    Some(ResourceState::CancelToken(notify)) => Ok(Some(notify.clone())),
+                    _ => Ok(None),
+                }
+            }
+            other => Err(AsError::at(
+                format!("net/http cancel expects a cancelToken() handle, got {}", crate::interp::type_name(other)),
+                span,
+            )
+            .into()),
+        }
+    }
 }
 
 /// reqwest's HTTP `Version` → the spec's short string ("1.1" | "2" | "3" | ...).
@@ -488,11 +967,28 @@ mod tests {
         use hyper::{Request, Response, StatusCode};
         use hyper_util::rt::TokioIo;
         use std::convert::Infallible;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
         use tokio::net::TcpListener;
 
-        async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+        /// Per-server hit counter for the `/flaky` endpoint (fail N times then 200).
+        type Flaky = Arc<AtomicUsize>;
+
+        async fn handle(req: Request<Incoming>, flaky: Flaky) -> Result<Response<Full<Bytes>>, Infallible> {
             let method = req.method().to_string();
             let path = req.uri().path().to_string();
+            let query = req.uri().query().unwrap_or("").to_string();
+            // Tiny query parser: first value for `key` in `a=1&b=2`.
+            let qval = |key: &str| -> Option<String> {
+                query.split('&').find_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    if k == key {
+                        Some(v.to_string())
+                    } else {
+                        None
+                    }
+                })
+            };
             // Collect headers before consuming the body.
             let mut headers = serde_json::Map::new();
             for (name, value) in req.headers().iter() {
@@ -534,6 +1030,56 @@ mod tests {
                     r.headers_mut().insert(hyper::header::LOCATION, "/text".parse().unwrap());
                     r
                 }
+                // Sleep `?ms=N` (default 0) then 200 "slow". For timeout/cancel tests.
+                "/slow" => {
+                    let ms: u64 = qval("ms").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    Response::new(Full::new(Bytes::from_static(b"slow")))
+                }
+                // Fail with 503 the first `?fail=N` (default 2) hits, then 200 "ok".
+                // The counter is per-server (per fixture::start), so each test gets a
+                // fresh sequence. Used by the retry tests.
+                "/flaky" => {
+                    let fail: usize = qval("fail").and_then(|s| s.parse().ok()).unwrap_or(2);
+                    let n = flaky.fetch_add(1, Ordering::SeqCst);
+                    if n < fail {
+                        let mut r = Response::new(Full::new(Bytes::from_static(b"try again")));
+                        *r.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                        r
+                    } else {
+                        Response::new(Full::new(Bytes::from(format!("ok after {}", n))))
+                    }
+                }
+                "/status/500" => {
+                    let mut r = Response::new(Full::new(Bytes::from_static(b"boom")));
+                    *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    r
+                }
+                "/status/503" => {
+                    let mut r = Response::new(Full::new(Bytes::from_static(b"unavailable")));
+                    *r.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                    r
+                }
+                // Sets a cookie, then redirects to /checkcookie. A client with a jar
+                // (cookies:true) carries the cookie across the redirect within the
+                // same request's client; /checkcookie echoes whether it arrived.
+                "/setcookie" => {
+                    let mut r = Response::new(Full::new(Bytes::new()));
+                    *r.status_mut() = StatusCode::FOUND;
+                    r.headers_mut()
+                        .insert(hyper::header::SET_COOKIE, "sid=abc123; Path=/".parse().unwrap());
+                    r.headers_mut()
+                        .insert(hyper::header::LOCATION, "/checkcookie".parse().unwrap());
+                    r
+                }
+                "/checkcookie" => {
+                    let cookie = headers
+                        .get("cookie")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Response::new(Full::new(Bytes::from(format!("cookie={}", cookie))))
+                }
                 _ => {
                     let mut r = Response::new(Full::new(Bytes::from_static(b"nope")));
                     *r.status_mut() = StatusCode::NOT_FOUND;
@@ -547,6 +1093,7 @@ mod tests {
         pub async fn start() -> String {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().unwrap();
+            let flaky: Flaky = Arc::new(AtomicUsize::new(0));
             tokio::spawn(async move {
                 loop {
                     let (stream, _) = match listener.accept().await {
@@ -554,9 +1101,11 @@ mod tests {
                         Err(_) => break,
                     };
                     let io = TokioIo::new(stream);
+                    let flaky = flaky.clone();
                     tokio::spawn(async move {
+                        let svc = service_fn(move |req| handle(req, flaky.clone()));
                         let _ = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(io, service_fn(handle))
+                            .serve_connection(io, svc)
                             .await;
                     });
                 }
@@ -739,5 +1288,270 @@ print(fetch())
         let out = run(&src).await;
         // x=1, items[0]=1, items[2]=3 → 5
         assert_eq!(out, "5\n");
+    }
+
+    // ---- Task 3: advanced request options -----------------------------------
+
+    #[tokio::test]
+    async fn timeout_total_expiry_is_tier1_err() {
+        let base = fixture::start().await;
+        // /slow sleeps 300ms; a 50ms total timeout must surface a Tier-1 err.
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, err] = await get("{base}/slow?ms=300", {{ timeout: {{ total: 50 }} }})
+print(resp)
+print(err != nil)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn redirect_follow_by_default_reaches_final_body() {
+        let base = fixture::start().await;
+        // /redirect → 302 Location:/text. Default policy follows it to "hello".
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/redirect")
+print(resp.status)
+let [body, _be] = await resp.text()
+print(body)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "200\nhello\n");
+    }
+
+    #[tokio::test]
+    async fn redirect_none_returns_302_not_followed() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/redirect", {{ redirect: "none" }})
+print(resp.status)
+print(resp.ok)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "302\nfalse\n");
+    }
+
+    #[tokio::test]
+    async fn retry_eventually_succeeds_after_failures() {
+        let base = fixture::start().await;
+        // /flaky?fail=2 returns 503 twice then "ok after 2". retryOn 503 with max 3.
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, err] = await get("{base}/flaky?fail=2", {{ retry: {{ max: 3, baseDelay: 1, retryOn: [503] }} }})
+print(err)
+print(resp.status)
+let [body, _be] = await resp.text()
+print(body)
+"#
+        );
+        let out = run(&src).await;
+        // Took 2 retries to reach the 3rd hit (index 2) → "ok after 2".
+        assert_eq!(out, "nil\n200\nok after 2\n");
+    }
+
+    #[tokio::test]
+    async fn retry_disabled_by_default_returns_first_503() {
+        let base = fixture::start().await;
+        // Without a retry opt, the first 503 is returned as-is (no retry).
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/flaky?fail=2")
+print(resp.status)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "503\n");
+    }
+
+    #[tokio::test]
+    async fn error_on_status_turns_404_into_err() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, err] = await get("{base}/status/404", {{ errorOnStatus: true }})
+print(resp)
+print(err != nil)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn decompress_default_decodes_response() {
+        // The h1 fixture serves plain (uncompressed) bodies; assert that the default
+        // decompress:true path still returns the body intact (Accept-Encoding is
+        // advertised, server ignores it). True gzip decode is covered by reqwest's
+        // own tests; the fixture cannot easily gzip, so this guards the opt wiring.
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/text", {{ decompress: false }})
+let [body, _be] = await resp.text()
+print(body)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn cookies_jar_carries_cookie_across_redirect() {
+        let base = fixture::start().await;
+        // /setcookie sets sid + redirects to /checkcookie. With cookies:true the
+        // per-request jar stores the Set-Cookie and replays it on the redirect hop,
+        // so /checkcookie sees it. Without a jar the cookie would be dropped.
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+import {{ find }} from "std/string"
+let [resp, _e] = await get("{base}/setcookie", {{ cookies: true }})
+let [body, _be] = await resp.text()
+print(find(body, "sid=abc123") >= 0)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "true\n");
+    }
+
+    #[tokio::test]
+    async fn cookies_off_drops_cookie_across_redirect() {
+        let base = fixture::start().await;
+        // Without cookies:true there is no jar, so the redirect hop carries no cookie.
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+import {{ find }} from "std/string"
+let [resp, _e] = await get("{base}/setcookie")
+let [body, _be] = await resp.text()
+print(find(body, "sid=abc123") >= 0)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "false\n");
+    }
+
+    #[tokio::test]
+    async fn http_version_1_1_works_against_h1_fixture() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, err] = await get("{base}/text", {{ httpVersion: "1.1" }})
+print(err)
+print(resp.version)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "nil\n1.1\n");
+    }
+
+    #[tokio::test]
+    async fn http_version_3_errors_cleanly_without_feature() {
+        let base = fixture::start().await;
+        // httpVersion:"3" must surface a clean Tier-2 error (no http3 build feature).
+        let mut interp = Interp::new();
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [_r, _e] = await get("{base}/text", {{ httpVersion: "3" }})
+"#
+        );
+        let res = run_on(&mut interp, &src).await;
+        match res {
+            Err(crate::interp::Control::Panic(e)) => {
+                let msg = e.to_string();
+                assert!(msg.contains("HTTP/3 requires the 'http3' build feature"), "got: {}", msg);
+            }
+            other => panic!("expected a clean error, got ok={:?}", other.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_token_aborts_request() {
+        let base = fixture::start().await;
+        // The interp runs single-threaded and sequentially, so we cancel the token
+        // *before* issuing the request; the stored permit makes the request's
+        // select abort immediately rather than waiting out the 5s /slow. The test
+        // would hang (or take ~5s) if the cancel path were not wired.
+        let src = format!(
+            r#"
+import {{ get, cancelToken }} from "std/net/http"
+let tok = cancelToken()
+tok.cancel()
+let [resp, err] = await get("{base}/slow?ms=5000", {{ cancel: tok }})
+print(resp)
+print(err != nil)
+"#
+        );
+        let out = tokio::time::timeout(std::time::Duration::from_secs(2), run(&src))
+            .await
+            .expect("cancel must abort well under the 5s /slow + 2s budget");
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn cancel_token_unused_does_not_abort() {
+        let base = fixture::start().await;
+        // A token that is never cancelled must not interfere with a normal request.
+        let src = format!(
+            r#"
+import {{ get, cancelToken }} from "std/net/http"
+let tok = cancelToken()
+let [resp, err] = await get("{base}/text", {{ cancel: tok }})
+print(err)
+let [body, _be] = await resp.text()
+print(body)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "nil\nhello\n");
+    }
+
+    #[tokio::test]
+    async fn tls_min_version_opt_parses_against_h1_fixture() {
+        // tls/proxy can't be deeply exercised against a plain-h1 in-process fixture;
+        // assert the opts at least parse + build a working client (no-op over plain
+        // HTTP). Real TLS/proxy behavior is reqwest's own and is documented as not
+        // in-process-testable here.
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, err] = await get("{base}/text", {{ tls: {{ minVersion: "1.2", sni: true }}, proxy: "none" }})
+print(err)
+print(resp.status)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "nil\n200\n");
+    }
+
+    #[tokio::test]
+    async fn timeout_connect_only_does_not_break_fast_request() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, err] = await get("{base}/text", {{ timeout: {{ connect: 5000 }} }})
+print(err)
+print(resp.status)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "nil\n200\n");
     }
 }

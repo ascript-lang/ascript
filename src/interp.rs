@@ -114,6 +114,14 @@ pub(crate) enum ResourceState {
     // second body accessor on the same handle is a use-after-consume Tier-2 panic.
     #[cfg(feature = "net")]
     HttpResponse(reqwest::Response),
+    // M14 std/net/http: a cancellation token shared between a `CancelHandle` and any
+    // in-flight requests passed `opts.cancel`. `cancel()` calls `notify_one()` (which
+    // stores a permit); each request `tokio::select!`s its send against `notified()`.
+    // The permit means a cancel issued before the request starts still aborts it,
+    // which matters on the single-threaded interp where `cancel()` and the awaited
+    // request run sequentially.
+    #[cfg(feature = "net")]
+    CancelToken(std::sync::Arc<tokio::sync::Notify>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -949,6 +957,9 @@ impl Interp {
             }
             if matches!(m.receiver.kind, HttpResponse) {
                 return self.call_http_response_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, CancelHandle) {
+                return self.call_cancel_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
