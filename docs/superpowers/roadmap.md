@@ -15,10 +15,11 @@ working, tested software on its own.
 
 - ✅ **M1 — Walking skeleton.** lexer, AST, precedence-climbing parser, async
   tree-walking interpreter, `print`, `ascript run` CLI. Merged.
-- 🟡 **M2 — Variables & control flow.** AST spans; `Environment`; full operator
+- ✅ **M2 — Variables & control flow.** AST spans; `Environment`; full operator
   set (`+ - * / % **`, comparisons, equality, `&& || !`, `??`); `let`/`const`;
   assignment + compound assignment; optional `;`; blocks; `if/else`; `while`;
-  `for (i in a..b)`. Plan: `plans/2026-05-29-ascript-phase1-m2-variables-control-flow.md`.
+  `for (i in a..b)`. 44 lib + 3 integration tests. Merged.
+  Plan: `plans/2026-05-29-ascript-phase1-m2-variables-control-flow.md`.
 - ⬜ **M3 — Functions & data.** `fn` declarations + closures + `return`; arrays
   `[…]`, objects `{…}`, maps; member access `.`, indexing `[]`, optional
   chaining `?.`; `for (x of iterable)`; template strings; the `?` Result operator
@@ -66,3 +67,23 @@ working, tested software on its own.
   current_thread tokio) — M12 async stdlib builds on it.
 - Each milestone: new feature branch off `main`, subagent-driven TDD, merge `--no-ff`.
 - Update this file's status markers as milestones complete.
+
+### M3 design guidance (from M2 holistic review — read before planning M3)
+
+- **Control-flow signal:** before adding `fn`/`return`, give `exec`/`exec_stmt` a
+  flow signal (e.g. return `Result<Flow, AsError>` where `Flow` is
+  `Normal | Return(Value) | Break | Continue`) so `return`/`break`/`continue` work
+  uniformly inside `if`/`while`/`for`. Design this first.
+- **Callable dispatch:** generalize `call_builtin`'s name-`match` into evaluating
+  the callee to a `Value::Function` (closure capturing an `Environment`) or a
+  builtin; dispatch on the value. `Environment` is already `Rc<RefCell<Scope>>` +
+  `Clone`, so closures capture it directly — no structural change needed.
+- **l-values:** `ExprKind::Assign` currently takes `name: String`. Member/index
+  assignment (`obj.x = …`, `arr[i] = …`) needs a structured target
+  (`target: Box<Expr>` resolved to a place); revisit `assignment()` desugaring.
+- **`postfix` is the slot** for `.` member access, `[]` indexing, and `?.` (lexer
+  already reserves bare `.`/`?` with M3-pointing errors).
+- **`for-of`:** add a sibling `Stmt::ForOf { var, iter, body }`; `for_stmt` branches
+  on `in` vs `of` after reading the loop var.
+- Known acceptable edge (not a bug): for-range with non-integer/`inf` bounds follows
+  IEEE semantics (`0.5..3.5` steps by 1.0; `0..(1/0)` loops forever).
