@@ -480,6 +480,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn string_concatenation() {
+        // `Str + Str` concatenates.
+        assert_eq!(
+            eval_to_value("\"a\" + \"b\"").await,
+            Value::Str("ab".into())
+        );
+
+        // `Str + Number` must error (no coercion).
+        let stmts = parse(&lex("\"a\" + 1").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        assert!(interp.exec(&stmts, &env).await.is_err());
+
+        // `Number + Str` must error (no coercion in the other direction).
+        let stmts = parse(&lex("1 + \"a\"").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        assert!(interp.exec(&stmts, &env).await.is_err());
+    }
+
+    #[tokio::test]
     async fn exponent_evaluates() {
         assert_eq!(eval_to_value("2 ** 10").await, Value::Number(1024.0));
     }
