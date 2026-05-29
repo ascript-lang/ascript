@@ -110,25 +110,106 @@ impl<'a> Parser<'a> {
             }
         };
         let params = self.param_list()?;
+        let ret = if *self.peek() == Tok::Colon {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
         let body = self.block()?;
-        Ok(Stmt::Fn { name, params, body })
+        Ok(Stmt::Fn { name, params, ret, body })
     }
 
-    /// Parse `( ident, ident, … )` — a comma-separated list of parameter names.
-    fn param_list(&mut self) -> Result<Vec<String>, AsError> {
+    fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {
+        let mut t = self.parse_type_atom()?;
+        while *self.peek() == Tok::Pipe {
+            self.advance();
+            let rhs = self.parse_type_atom()?;
+            t = crate::ast::Type::Union(Box::new(t), Box::new(rhs));
+        }
+        Ok(t)
+    }
+
+    fn parse_type_atom(&mut self) -> Result<crate::ast::Type, AsError> {
+        use crate::ast::Type;
+        let span = self.span();
+        match self.advance() {
+            Tok::Nil => Ok(Type::Nil),
+            Tok::Fn => Ok(Type::Fn),
+            Tok::LBracket => {
+                // tuple type [T1, T2, ...]
+                let mut parts = Vec::new();
+                if *self.peek() != Tok::RBracket {
+                    loop {
+                        parts.push(self.parse_type()?);
+                        if *self.peek() == Tok::Comma {
+                            self.advance();
+                            if *self.peek() == Tok::RBracket {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat(&Tok::RBracket)?;
+                Ok(Type::Tuple(parts))
+            }
+            Tok::Ident(name) => match name.as_str() {
+                "number" => Ok(Type::Number),
+                "string" => Ok(Type::String),
+                "bool" => Ok(Type::Bool),
+                "any" => Ok(Type::Any),
+                "object" => Ok(Type::Object),
+                "error" => Ok(Type::Error),
+                "array" => {
+                    self.eat(&Tok::Lt)?;
+                    let inner = self.parse_type()?;
+                    self.eat(&Tok::Gt)?;
+                    Ok(Type::Array(Box::new(inner)))
+                }
+                "Result" => {
+                    self.eat(&Tok::Lt)?;
+                    let inner = self.parse_type()?;
+                    self.eat(&Tok::Gt)?;
+                    Ok(Type::Result(Box::new(inner)))
+                }
+                "map" => Err(AsError::at(
+                    "map<K,V> type annotations arrive in Milestone 8",
+                    span,
+                )),
+                other => Err(AsError::at(
+                    format!("unknown type '{}' (class/enum types arrive in Milestone 7)", other),
+                    span,
+                )),
+            },
+            other => Err(AsError::at(format!("expected a type, found {:?}", other), span)),
+        }
+    }
+
+    /// Parse `( ident, ident, … )` — a comma-separated list of parameters, each
+    /// an optionally type-annotated name.
+    fn param_list(&mut self) -> Result<Vec<crate::ast::Param>, AsError> {
         self.eat(&Tok::LParen)?;
         let mut params = Vec::new();
         if *self.peek() != Tok::RParen {
             loop {
-                match self.advance() {
-                    Tok::Ident(name) => params.push(name),
+                let name = match self.advance() {
+                    Tok::Ident(name) => name,
                     other => {
                         return Err(AsError::at(
                             format!("expected a parameter name, found {:?}", other),
                             self.tokens[self.pos - 1].span,
                         ))
                     }
-                }
+                };
+                let ty = if *self.peek() == Tok::Colon {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                params.push(crate::ast::Param { name, ty });
                 if *self.peek() == Tok::Comma {
                     self.advance();
                     if *self.peek() == Tok::RParen {
@@ -229,9 +310,15 @@ impl<'a> Parser<'a> {
                 ))
             }
         };
+        let ty = if *self.peek() == Tok::Colon {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
         self.eat(&Tok::Eq)?;
         let value = self.expr()?;
-        Ok(Stmt::Let { name, value, mutable })
+        Ok(Stmt::Let { name, ty, value, mutable })
     }
 
     fn expr(&mut self) -> Result<Expr, AsError> {
@@ -299,7 +386,10 @@ impl<'a> Parser<'a> {
                 let body = self.arrow_body()?;
                 let end = self.prev_end();
                 return Ok(Some(Expr {
-                    kind: ExprKind::Arrow { params: vec![name], body: Box::new(body) },
+                    kind: ExprKind::Arrow {
+                        params: vec![crate::ast::Param { name, ty: None }],
+                        body: Box::new(body),
+                    },
                     span: Span::new(start, end),
                 }));
             }
@@ -675,6 +765,16 @@ mod tests {
     #[test]
     fn parses_try_operator() {
         assert_eq!(sexpr("readFile(p)?"), "(? (call readFile p))");
+    }
+
+    #[test]
+    fn parses_type_annotations() {
+        assert!(parse(&lex("let x: number = 5").unwrap()).is_ok());
+        assert!(parse(&lex("fn add(a: number, b: number): number { return a + b }").unwrap()).is_ok());
+        assert!(parse(&lex("let xs: array<number> = [1, 2]").unwrap()).is_ok());
+        assert!(parse(&lex("let r: Result<string> = Ok(\"x\")").unwrap()).is_ok());
+        assert!(parse(&lex("let u: number | nil = nil").unwrap()).is_ok());
+        assert!(parse(&lex("let t: [number, string] = [1, \"a\"]").unwrap()).is_ok());
     }
 
     #[test]

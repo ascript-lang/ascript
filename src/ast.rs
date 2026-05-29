@@ -21,7 +21,7 @@ pub enum ExprKind {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Assign { target: Box<Expr>, value: Box<Expr> },
-    Arrow { params: Vec<String>, body: Box<ArrowBody> },
+    Arrow { params: Vec<Param>, body: Box<ArrowBody> },
     Array(Vec<Expr>),
     Index { object: Box<Expr>, index: Box<Expr> },
     Object(Vec<(String, Expr)>),
@@ -33,6 +33,58 @@ pub enum ExprKind {
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
     /// short-circuiting (spec §4, matching JS).
     Paren(Box<Expr>),
+}
+
+/// A type annotation (spec §5). Checked at runtime as a contract.
+#[derive(Clone, Debug)]
+pub enum Type {
+    Number,
+    String,
+    Bool,
+    Nil,
+    Any,
+    Fn,
+    Object,
+    Error, // object | nil
+    Array(Box<Type>),
+    Result(Box<Type>),
+    Tuple(Vec<Type>),
+    Union(Box<Type>, Box<Type>),
+}
+
+/// A function parameter: a name with an optional type annotation.
+#[derive(Clone, Debug)]
+pub struct Param {
+    pub name: String,
+    pub ty: Option<Type>,
+}
+
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Type::Number => write!(f, "number"),
+            Type::String => write!(f, "string"),
+            Type::Bool => write!(f, "bool"),
+            Type::Nil => write!(f, "nil"),
+            Type::Any => write!(f, "any"),
+            Type::Fn => write!(f, "fn"),
+            Type::Object => write!(f, "object"),
+            Type::Error => write!(f, "error"),
+            Type::Array(t) => write!(f, "array<{}>", t),
+            Type::Result(t) => write!(f, "Result<{}>", t),
+            Type::Tuple(ts) => {
+                write!(f, "[")?;
+                for (i, t) in ts.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                write!(f, "]")
+            }
+            Type::Union(a, b) => write!(f, "{} | {}", a, b),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +102,7 @@ pub enum ArrowBody {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Expr(Expr),
-    Let { name: String, value: Expr, mutable: bool },
+    Let { name: String, ty: Option<Type>, value: Expr, mutable: bool },
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
@@ -59,7 +111,7 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break,
     Continue,
-    Fn { name: String, params: Vec<String>, body: Vec<Stmt> },
+    Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt> },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -131,7 +183,10 @@ impl fmt::Display for ExprKind {
                 write!(f, ")")
             }
             ExprKind::Assign { target, value } => write!(f, "(= {} {})", target, value),
-            ExprKind::Arrow { params, .. } => write!(f, "(arrow [{}])", params.join(" ")),
+            ExprKind::Arrow { params, .. } => {
+                let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+                write!(f, "(arrow [{}])", names.join(" "))
+            }
             ExprKind::Array(items) => {
                 write!(f, "[")?;
                 for (i, it) in items.iter().enumerate() {

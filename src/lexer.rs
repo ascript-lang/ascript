@@ -144,7 +144,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     tokens.push(Token { tok: Tok::PipePipe, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {
-                    return Err(AsError::at("unexpected character '|'", Span::new(start, start + 1)));
+                    tokens.push(Token { tok: Tok::Pipe, span: Span::new(start, start + 1) });
+                    i += 1;
                 }
             }
             '?' => {
@@ -160,7 +161,31 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 }
             }
             '/' => {
-                if i + 1 < chars.len() && chars[i + 1] == '=' {
+                if i + 1 < chars.len() && chars[i + 1] == '/' {
+                    // line comment `// ...` to end of line (spec grammar: line_comment)
+                    i += 2;
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                } else if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    // block comment `/* ... */` (spec grammar: block_comment)
+                    i += 2;
+                    let mut closed = false;
+                    while i + 1 < chars.len() {
+                        if chars[i] == '*' && chars[i + 1] == '/' {
+                            closed = true;
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !closed {
+                        return Err(AsError::at(
+                            "unterminated block comment",
+                            Span::new(start, i),
+                        ));
+                    }
+                } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token { tok: Tok::SlashEq, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {
@@ -433,5 +458,35 @@ mod tests {
     fn rejects_unterminated_string() {
         let err = lex("\"oops").unwrap_err();
         assert!(err.message.contains("unterminated"));
+    }
+
+    #[test]
+    fn skips_line_comments() {
+        assert_eq!(kinds("1 // ignored\n+ 2"),
+            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]);
+        // line comment to EOF (no trailing newline) is fine
+        assert_eq!(kinds("42 // trailing"), vec![Tok::Number(42.0), Tok::Eof]);
+    }
+
+    #[test]
+    fn skips_block_comments() {
+        assert_eq!(kinds("1 /* a * b / c */ + 2"),
+            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]);
+        // block comment spanning constructs
+        assert_eq!(kinds("/* x */ 7"), vec![Tok::Number(7.0), Tok::Eof]);
+    }
+
+    #[test]
+    fn division_is_not_a_comment() {
+        assert_eq!(kinds("a / b"),
+            vec![Tok::Ident("a".into()), Tok::Slash, Tok::Ident("b".into()), Tok::Eof]);
+        assert_eq!(kinds("a /= b"),
+            vec![Tok::Ident("a".into()), Tok::SlashEq, Tok::Ident("b".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn unterminated_block_comment_errors() {
+        let err = lex("/* oops no end").unwrap_err();
+        assert!(err.message.contains("unterminated block comment"));
     }
 }

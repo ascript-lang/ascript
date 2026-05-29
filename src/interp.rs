@@ -87,8 +87,13 @@ impl Interp {
                 self.eval_expr(e, env).await?;
                 Ok(Flow::Normal)
             }
-            Stmt::Let { name, value, mutable } => {
+            Stmt::Let { name, ty, value, mutable } => {
                 let v = self.eval_expr(value, env).await?;
+                if let Some(ty) = ty {
+                    if !check_type(&v, ty) {
+                        return Err(contract_panic(ty, &v, value.span));
+                    }
+                }
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
@@ -171,10 +176,11 @@ impl Interp {
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
-            Stmt::Fn { name, params, body } => {
+            Stmt::Fn { name, params, ret, body } => {
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
+                    ret: ret.clone(),
                     body: body.clone(),
                     closure: env.clone(),
                 }));
@@ -270,6 +276,7 @@ impl Interp {
                 Ok(Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: None,
                     params: params.clone(),
+                    ret: None,
                     body: body_stmts,
                     closure: env.clone(),
                 })))
@@ -431,20 +438,31 @@ impl Interp {
             )
             .into());
         }
-        // New scope chained to the closure's captured environment.
+        // bind + check params
         let call_env = func.closure.child();
         for (param, arg) in func.params.iter().zip(args.into_iter()) {
-            call_env.define(param, arg, true).map_err(AsError::new)?;
+            if let Some(ty) = &param.ty {
+                if !check_type(&arg, ty) {
+                    return Err(contract_panic(ty, &arg, span));
+                }
+            }
+            call_env.define(&param.name, arg, true).map_err(AsError::new)?;
         }
-        match self.exec(&func.body, &call_env).await {
-            Ok(Flow::Return(v)) => Ok(v),
-            Ok(Flow::Normal) => Ok(Value::Nil),
-            Ok(Flow::Break) => Err(AsError::at("'break' outside of a loop", span).into()),
-            Ok(Flow::Continue) => Err(AsError::at("'continue' outside of a loop", span).into()),
-            // A `?` inside the body wants THIS function to return the pair.
-            Err(Control::Propagate(v)) => Ok(v),
-            Err(Control::Panic(e)) => Err(Control::Panic(e)),
+        // execute, then check the return type
+        let result = match self.exec(&func.body, &call_env).await {
+            Ok(Flow::Return(v)) => v,
+            Ok(Flow::Normal) => Value::Nil,
+            Ok(Flow::Break) => return Err(AsError::at("'break' outside of a loop", span).into()),
+            Ok(Flow::Continue) => return Err(AsError::at("'continue' outside of a loop", span).into()),
+            Err(Control::Propagate(v)) => v,
+            Err(Control::Panic(e)) => return Err(Control::Panic(e)),
+        };
+        if let Some(ty) = &func.ret {
+            if !check_type(&result, ty) {
+                return Err(contract_panic(ty, &result, span));
+            }
         }
+        Ok(result)
     }
 
     #[async_recursion(?Send)]
@@ -573,6 +591,51 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
+/// Runtime contract check (spec §5). Eagerly checks parametric types to full depth.
+fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
+    use crate::ast::Type;
+    match ty {
+        Type::Any => true,
+        Type::Number => matches!(value, Value::Number(_)),
+        Type::String => matches!(value, Value::Str(_)),
+        Type::Bool => matches!(value, Value::Bool(_)),
+        Type::Nil => matches!(value, Value::Nil),
+        Type::Object => matches!(value, Value::Object(_)),
+        Type::Fn => matches!(value, Value::Function(_) | Value::Builtin(_)),
+        Type::Error => matches!(value, Value::Object(_) | Value::Nil),
+        Type::Array(elem) => match value {
+            Value::Array(a) => a.borrow().iter().all(|v| check_type(v, elem)),
+            _ => false,
+        },
+        Type::Result(inner) => match value {
+            Value::Array(a) => {
+                let b = a.borrow();
+                b.len() == 2
+                    && (check_type(&b[0], inner) || matches!(b[0], Value::Nil))
+                    && check_type(&b[1], &Type::Error)
+            }
+            _ => false,
+        },
+        Type::Tuple(types) => match value {
+            Value::Array(a) => {
+                let b = a.borrow();
+                b.len() == types.len() && b.iter().zip(types.iter()).all(|(v, t)| check_type(v, t))
+            }
+            _ => false,
+        },
+        Type::Union(a, b) => check_type(value, a) || check_type(value, b),
+    }
+}
+
+/// Build a contract-violation panic.
+fn contract_panic(ty: &crate::ast::Type, value: &Value, span: Span) -> Control {
+    AsError::at(
+        format!("type contract violated: expected {}, got {} ({})", ty, type_name(value), value),
+        span,
+    )
+    .into()
+}
+
 impl Default for Interp {
     fn default() -> Self {
         Self::new()
@@ -591,6 +654,126 @@ mod tests {
             Control::Panic(e) => e,
             Control::Propagate(_) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn typed_code_runs_without_enforcement_yet() {
+        let src = "let x: number = 5\nfn f(a: number): number { return a + 1 }\nprint(f(x))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "6\n");
+    }
+
+    #[tokio::test]
+    async fn let_contract_passes_and_fails() {
+        // passes
+        let src = "let x: number = 5\nprint(x)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\n");
+
+        // fails
+        let bad = "let x: number = \"oops\"";
+        let stmts = parse(&lex(bad).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("type contract violated"));
+        assert!(err.message.contains("expected number"));
+    }
+
+    #[tokio::test]
+    async fn parametric_and_union_contracts() {
+        // array<number> with a bad element fails
+        let bad = "let xs: array<number> = [1, \"two\", 3]";
+        let stmts = parse(&lex(bad).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        assert!(interp.exec(&stmts, &env).await.is_err());
+
+        // union passes for either member
+        let ok = "let a: number | nil = nil\nlet b: number | nil = 7\nprint(b)";
+        let stmts = parse(&lex(ok).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "7\n");
+
+        // Result<number>: Ok(5) passes, Ok("x") fails
+        let r = "let r: Result<number> = Ok(5)\nprint(r[0])";
+        let stmts = parse(&lex(r).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\n");
+    }
+
+    #[tokio::test]
+    async fn result_contract_accepts_both_ok_and_err() {
+        // Both Ok and Err must satisfy a Result<T> contract (spec §6).
+        let src = "
+fn parseNum(s): Result<number> {
+  if (s == \"bad\") { return Err(\"not a number\") }
+  return Ok(42)
+}
+let good: Result<number> = parseNum(\"ok\")
+let bad: Result<number> = parseNum(\"bad\")
+print(good[0])
+print(bad[1].message)
+";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "42\nnot a number\n");
+    }
+
+    #[tokio::test]
+    async fn param_contract_enforced() {
+        let src = "fn double(n: number): number { return n * 2 }\nprint(double(\"x\"))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("type contract violated"));
+        assert!(err.message.contains("expected number"));
+    }
+
+    #[tokio::test]
+    async fn return_contract_enforced() {
+        // returns a string but annotated number
+        let src = "fn f(): number { return \"nope\" }\nf()";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("type contract violated"));
+    }
+
+    #[tokio::test]
+    async fn typed_function_happy_path() {
+        let src = "fn add(a: number, b: number): number { return a + b }\nprint(add(2, 3))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\n");
+    }
+
+    #[tokio::test]
+    async fn contract_failure_is_recoverable() {
+        // a contract panic is catchable by recover (it's a Panic, M5)
+        let src = "fn f(n: number) { return n }\nlet r = recover(() => f(\"bad\"))\nprint(r[0])\nprint(r[1].message)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert!(interp.output.starts_with("nil\n"));
+        assert!(interp.output.contains("type contract violated"));
     }
 
     #[tokio::test]
