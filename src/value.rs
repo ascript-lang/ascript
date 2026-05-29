@@ -127,7 +127,10 @@ pub enum NativeKind {
     HttpBody,
     // A cancellation token for in-flight HTTP requests (`http.cancelToken()`).
     CancelHandle,
-    // M14 adds: SseStream, ...
+    // A first-class Server-Sent Events client stream (`http.sse(url, opts?)`).
+    // `next()` yields parsed `{event,data,id,retry}` events; `lastEventId` is a
+    // readable property; auto-reconnects on disconnect (see std/net/http).
+    SseStream,
 }
 
 impl NativeKind {
@@ -143,6 +146,7 @@ impl NativeKind {
             NativeKind::HttpResponse => "httpResponse",
             NativeKind::HttpBody => "httpBody",
             NativeKind::CancelHandle => "cancelHandle",
+            NativeKind::SseStream => "sseStream",
         }
     }
 }

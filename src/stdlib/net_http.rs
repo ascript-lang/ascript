@@ -62,8 +62,18 @@
 //! pulling the next chunk from those sources re-enters the `!Send` single-threaded
 //! interp, which reqwest's body poll cannot do — see `apply_stream_body`.
 //!
-//! Deferred to later M14 tasks: `sse` (Task 5), the `http3` build feature gate
-//! (Task 8).
+//! Server-Sent Events (Task 5): `sse(url, opts?) → [stream, err]` is a first-class
+//! SSE client (NOT a flag on request). It GETs with `Accept: text/event-stream` and
+//! exposes a `Value::Native(SseStream)` whose `await stream.next() → [event, err]`
+//! parses the SSE wire format (`event:`/`data:`/`id:`/`retry:` fields, blank-line
+//! event boundaries, multi-line `data:` joined with `\n`, `:`-comment lines ignored,
+//! one-leading-space strip after the colon). `stream.lastEventId` is a live property
+//! (the most recent `id:`); `stream.close()` ends the stream. Auto-reconnect is ON by
+//! default (`opts.reconnect:false` disables): on disconnect it waits the server
+//! `retry:` interval (or `opts.retryDefault`, default 3000ms), reconnects with
+//! `Last-Event-ID`, and resumes; `opts.maxReconnects` caps attempts. See `SseState`.
+//!
+//! Deferred to later M14 tasks: the `http3` build feature gate (Task 8).
 
 use super::{arg, bi, want_string};
 use crate::error::AsError;
@@ -163,6 +173,163 @@ impl HttpBodyState {
 
     async fn read_to_end_bytes(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
         self.reader.read_to_end(buf).await
+    }
+}
+
+/// A line reader over a streaming HTTP response body — the SSE wire format is
+/// line-oriented, so we only need `read_until('\n')` over the chunked byte stream
+/// (the same `StreamReader` + `BufReader` adaptation `HttpBodyState` uses, minus
+/// the decode-mode/partial-read machinery, which SSE doesn't need).
+type SseReader = tokio::io::BufReader<tokio_util::io::StreamReader<ByteStream, bytes::Bytes>>;
+
+fn sse_reader(resp: reqwest::Response) -> SseReader {
+    use futures_util::StreamExt;
+    let stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+    let boxed: ByteStream = Box::pin(stream);
+    tokio::io::BufReader::new(tokio_util::io::StreamReader::new(boxed))
+}
+
+/// Reconnect configuration captured at `sse()` time so a disconnect can re-issue
+/// the same GET. `headers` are the caller's `opts.headers` (auth, etc.) replayed
+/// verbatim; `Accept: text/event-stream` and `Last-Event-ID` are added per attempt.
+pub struct SseReconnect {
+    url: String,
+    headers: Vec<(String, String)>,
+    auth: Option<SseAuth>,
+    enabled: bool,
+    /// Fallback retry interval (ms) when the server hasn't sent a `retry:` field.
+    retry_default_ms: u64,
+    /// `opts.maxReconnects` cap (None = unbounded).
+    max: Option<u32>,
+    /// Reconnect attempts used so far.
+    count: u32,
+}
+
+/// Captured `opts.auth` for an SSE request, applied via reqwest's `RequestBuilder`
+/// (`bearer_auth`/`basic_auth`) on each connect — avoids hand-rolling base64 (which
+/// isn't a dependency of the `net` feature).
+#[derive(Clone)]
+enum SseAuth {
+    Bearer(String),
+    Basic(String, Option<String>),
+}
+
+/// One parsed SSE event, dispatched on a blank-line boundary.
+#[derive(Default)]
+struct SseEvent {
+    /// `event:` field — defaults to "message" if none was sent.
+    event: Option<String>,
+    /// Accumulated `data:` lines (joined with `\n` on dispatch).
+    data: Vec<String>,
+    /// `id:` field of this event, if any.
+    id: Option<String>,
+    /// `retry:` field of this event (ms), if any.
+    retry: Option<u64>,
+    /// Whether any field at all was seen since the last dispatch (a blank line with
+    /// no preceding fields dispatches nothing).
+    nonempty: bool,
+}
+
+/// The live state behind a `Value::Native(SseStream)`: the current event-stream
+/// body reader, the in-progress event buffer, the running `lastEventId`/`retry`,
+/// and the reconnect template. `next()` reads lines, accumulates fields, and on a
+/// blank line dispatches the buffered event; on EOF it either reconnects (carrying
+/// `Last-Event-ID`) or ends.
+pub struct SseState {
+    reader: SseReader,
+    pending: SseEvent,
+    last_event_id: String,
+    /// The current server-provided retry interval (ms), if any — overrides
+    /// `reconnect.retry_default_ms` for the wait before the next reconnect.
+    retry_ms: Option<u64>,
+    reconnect: SseReconnect,
+}
+
+impl SseState {
+    fn new(reader: SseReader, reconnect: SseReconnect) -> Self {
+        SseState {
+            reader,
+            pending: SseEvent::default(),
+            last_event_id: String::new(),
+            retry_ms: None,
+            reconnect,
+        }
+    }
+
+    pub fn last_event_id(&self) -> &str {
+        &self.last_event_id
+    }
+
+    /// Apply one SSE wire-format line to the in-progress event (no trailing newline).
+    /// Returns the parsed event fields' effect; the dispatch decision (blank line)
+    /// is made by the caller. Comment lines (leading `:`) are ignored.
+    fn apply_line(&mut self, line: &str) {
+        if line.is_empty() {
+            return; // blank line handled by the caller (dispatch boundary)
+        }
+        if line.starts_with(':') {
+            return; // comment
+        }
+        // field[:value]; if there is no colon, the whole line is the field name with
+        // an empty value (per the SSE spec).
+        let (field, value) = match line.split_once(':') {
+            Some((f, v)) => {
+                // Strip a single leading space after the colon.
+                let v = v.strip_prefix(' ').unwrap_or(v);
+                (f, v)
+            }
+            None => (line, ""),
+        };
+        self.pending.nonempty = true;
+        match field {
+            "event" => self.pending.event = Some(value.to_string()),
+            "data" => self.pending.data.push(value.to_string()),
+            "id" => {
+                // The spec ignores an id containing a NUL; the lastEventId is updated
+                // immediately (so it reflects the field even before dispatch).
+                if !value.contains('\0') {
+                    self.pending.id = Some(value.to_string());
+                    self.last_event_id = value.to_string();
+                }
+            }
+            "retry" => {
+                if let Ok(ms) = value.parse::<u64>() {
+                    self.pending.retry = Some(ms);
+                    self.retry_ms = Some(ms);
+                }
+            }
+            _ => {} // unknown field: ignored per spec
+        }
+    }
+
+    /// Take the buffered event (resetting the buffer) as an AScript object value, or
+    /// `None` if nothing was buffered (a stray blank line dispatches nothing).
+    fn take_event(&mut self) -> Option<Value> {
+        if !self.pending.nonempty {
+            return None;
+        }
+        let ev = std::mem::take(&mut self.pending);
+        let mut map = IndexMap::new();
+        map.insert(
+            "event".to_string(),
+            Value::Str(ev.event.unwrap_or_else(|| "message".to_string()).into()),
+        );
+        map.insert("data".to_string(), Value::Str(ev.data.join("\n").into()));
+        map.insert(
+            "id".to_string(),
+            match ev.id {
+                Some(id) => Value::Str(id.into()),
+                None => Value::Nil,
+            },
+        );
+        map.insert(
+            "retry".to_string(),
+            match ev.retry {
+                Some(ms) => Value::Number(ms as f64),
+                None => Value::Nil,
+            },
+        );
+        Some(obj(map))
     }
 }
 
@@ -546,6 +713,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("options", bi("net_http.options")),
         ("request", bi("net_http.request")),
         ("cancelToken", bi("net_http.cancelToken")),
+        ("sse", bi("net_http.sse")),
     ]
 }
 
@@ -643,6 +811,11 @@ impl Interp {
                 self.call_http_send(&method, url, &opts, span).await
             }
             "cancelToken" => Ok(self.make_cancel_token()),
+            "sse" => {
+                let url = want_string(&arg(args, 0), span, "net/http.sse")?;
+                let opts = arg(args, 1);
+                self.call_sse(url.to_string(), &opts, span).await
+            }
             _ => Err(AsError::at(format!("std/net/http has no function '{}'", func), span).into()),
         }
     }
@@ -1303,6 +1476,272 @@ impl Interp {
             .into()),
         }
     }
+
+    /// `http.sse(url, opts?)` → `[stream, err]`. Issues a GET with
+    /// `Accept: text/event-stream`, then registers the response body behind a
+    /// `Value::Native(SseStream)` whose `next()` parses the event stream. A
+    /// connect-time failure is the usual Tier-1 `[nil, err]`.
+    async fn call_sse(&mut self, url: String, opts: &Value, span: Span) -> Result<Value, Control> {
+        // Replayable headers + auth — captured so reconnect re-issues an identical GET.
+        let headers = sse_headers(opts, span)?;
+        let auth = sse_auth(opts, span)?;
+        let reconnect = SseReconnect {
+            url: url.clone(),
+            headers,
+            auth,
+            // Auto-reconnect default ON; `reconnect:false` disables.
+            enabled: !matches!(opt_field(opts, "reconnect"), Some(Value::Bool(false))),
+            retry_default_ms: strict_num_field_v(opts, "retryDefault", "sse.retryDefault", span)?
+                .unwrap_or(3000.0)
+                .max(0.0) as u64,
+            max: strict_num_field_v(opts, "maxReconnects", "sse.maxReconnects", span)?
+                .map(|n| n.max(0.0) as u32),
+            count: 0,
+        };
+        let resp = match self
+            .sse_connect(&reconnect.url, &reconnect.headers, &reconnect.auth, None, span)
+            .await
+        {
+            Ok(r) => r,
+            Err(pair) => return Ok(pair),
+        };
+        let state = SseState::new(sse_reader(resp), reconnect);
+        let handle = self.register_resource(
+            NativeKind::SseStream,
+            IndexMap::new(),
+            ResourceState::SseStream(Box::new(state)),
+        );
+        Ok(make_pair(handle, Value::Nil))
+    }
+
+    /// Issue one SSE GET (initial or reconnect). `last_event_id` (when Some/non-empty)
+    /// is sent as the `Last-Event-ID` header. Returns the response or a Tier-1 pair.
+    async fn sse_connect(
+        &mut self,
+        url: &str,
+        headers: &[(String, String)],
+        auth: &Option<SseAuth>,
+        last_event_id: Option<&str>,
+        _span: Span,
+    ) -> Result<reqwest::Response, Value> {
+        let mut rb = default_client()
+            .get(url)
+            .header(reqwest::header::ACCEPT, "text/event-stream");
+        for (k, v) in headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        match auth {
+            Some(SseAuth::Bearer(tok)) => rb = rb.bearer_auth(tok),
+            Some(SseAuth::Basic(user, pass)) => rb = rb.basic_auth(user, pass.clone()),
+            None => {}
+        }
+        if let Some(id) = last_event_id {
+            if !id.is_empty() {
+                rb = rb.header("last-event-id", id);
+            }
+        }
+        rb.send()
+            .await
+            .map_err(|e| err_pair(format!("net/http sse GET {} failed: {}", url, e)))
+    }
+
+    /// Dispatch a method on an `SseStream` handle: `next()` / `close()`.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn call_sse_method(
+        &mut self,
+        m: &Rc<NativeMethod>,
+        _args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let id = m.receiver.id;
+        match m.method.as_str() {
+            "next" => self.sse_next(id, span).await,
+            "close" => {
+                // Drop the resource (and its underlying connection); subsequent
+                // next() finds no resource and returns nil.
+                self.take_resource(id);
+                Ok(Value::Nil)
+            }
+            other => Err(AsError::at(format!("sseStream has no method '{}'", other), span).into()),
+        }
+    }
+
+    /// `stream.next()` → `[event, nil]` for the next parsed event, or `nil` when the
+    /// stream ends (EOF + no/exhausted reconnect). On a blank-line boundary the
+    /// buffered event is dispatched; on EOF either reconnect (after the retry delay,
+    /// carrying Last-Event-ID) and continue, or end.
+    async fn sse_next(&mut self, id: u64, span: Span) -> Result<Value, Control> {
+        loop {
+            // Read the next line from the current body.
+            let line = {
+                let state = match self.sse_stream_mut(id) {
+                    Some(s) => s,
+                    None => return Ok(Value::Nil), // closed/gone → ended
+                };
+                let mut buf = Vec::new();
+                match state.reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => None, // EOF on the current connection
+                    Ok(_) => {
+                        // Strip the trailing '\n' and an optional preceding '\r'.
+                        if buf.last() == Some(&b'\n') {
+                            buf.pop();
+                            if buf.last() == Some(&b'\r') {
+                                buf.pop();
+                            }
+                        }
+                        Some(String::from_utf8_lossy(&buf).into_owned())
+                    }
+                    Err(e) => {
+                        return Err(AsError::at(format!("net/http sse read failed: {}", e), span).into())
+                    }
+                }
+            };
+
+            match line {
+                Some(line) if line.is_empty() => {
+                    // Blank line: dispatch the buffered event, if any.
+                    let ev = self.sse_stream_mut(id).and_then(|s| s.take_event());
+                    if let Some(ev) = ev {
+                        return Ok(make_pair(ev, Value::Nil));
+                    }
+                    // else: stray blank line, keep reading.
+                }
+                Some(line) => {
+                    if let Some(s) = self.sse_stream_mut(id) {
+                        s.apply_line(&line);
+                    }
+                }
+                None => {
+                    // EOF on the current connection. Dispatch any event buffered
+                    // without a trailing blank line, then attempt reconnect.
+                    if let Some(ev) = self.sse_stream_mut(id).and_then(|s| s.take_event()) {
+                        return Ok(make_pair(ev, Value::Nil));
+                    }
+                    if !self.sse_reconnect(id, span).await? {
+                        // No reconnect (off / cap reached / connect failed) → ended.
+                        self.take_resource(id);
+                        return Ok(Value::Nil);
+                    }
+                    // Reconnected: loop to read from the fresh body.
+                }
+            }
+        }
+    }
+
+    /// Attempt to reconnect a disconnected SSE stream. Returns `Ok(true)` if a fresh
+    /// body is now in place (caller resumes reading), `Ok(false)` if reconnect is
+    /// off, the `maxReconnects` cap is reached, or the reconnect GET itself failed.
+    async fn sse_reconnect(&mut self, id: u64, span: Span) -> Result<bool, Control> {
+        // Pull the reconnect plan (url/headers/delay/last id) without holding the
+        // borrow across the await.
+        let plan = {
+            let state = match self.sse_stream_mut(id) {
+                Some(s) => s,
+                None => return Ok(false),
+            };
+            if !state.reconnect.enabled {
+                return Ok(false);
+            }
+            if let Some(max) = state.reconnect.max {
+                if state.reconnect.count >= max {
+                    return Ok(false);
+                }
+            }
+            state.reconnect.count += 1;
+            let delay = state.retry_ms.unwrap_or(state.reconnect.retry_default_ms);
+            (
+                state.reconnect.url.clone(),
+                state.reconnect.headers.clone(),
+                state.reconnect.auth.clone(),
+                delay,
+                state.last_event_id.clone(),
+            )
+        };
+        let (url, headers, auth, delay, last_id) = plan;
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+        let resp = match self.sse_connect(&url, &headers, &auth, Some(&last_id), span).await {
+            Ok(r) => r,
+            Err(_pair) => return Ok(false), // a failed reconnect ends the stream
+        };
+        if let Some(state) = self.sse_stream_mut(id) {
+            state.reader = sse_reader(resp);
+            Ok(true)
+        } else {
+            Ok(false) // closed during the await
+        }
+    }
+}
+
+/// Build the replayable header list for an SSE request from `opts.headers` (the
+/// same shape as the regular client). `auth:` is also honored via `opts.auth`.
+fn sse_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>, Control> {
+    let mut out = Vec::new();
+    if let Some(h) = opt_field(opts, "headers") {
+        let map = match &h {
+            Value::Object(o) => o,
+            other => {
+                return Err(AsError::at(
+                    format!("net/http sse headers expects an object, got {}", crate::interp::type_name(other)),
+                    span,
+                )
+                .into())
+            }
+        };
+        for (k, v) in map.borrow().iter() {
+            out.push((k.clone(), scalar_to_string(v, span, "net/http sse header")?));
+        }
+    }
+    Ok(out)
+}
+
+/// Capture `opts.auth` ({bearer} | {basic:[user,pass]}) for replay on each connect
+/// via reqwest's `RequestBuilder` (so no base64 dependency is needed here).
+fn sse_auth(opts: &Value, span: Span) -> Result<Option<SseAuth>, Control> {
+    let a = match opt_field(opts, "auth") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let o = match &a {
+        Value::Object(o) => o.borrow(),
+        other => {
+            return Err(AsError::at(
+                format!("net/http sse auth expects an object, got {}", crate::interp::type_name(other)),
+                span,
+            )
+            .into())
+        }
+    };
+    if let Some(tok) = o.get("bearer") {
+        let tok = want_string(tok, span, "net/http sse auth.bearer")?;
+        return Ok(Some(SseAuth::Bearer(tok.to_string())));
+    }
+    if let Some(basic) = o.get("basic") {
+        let arr = super::want_array(basic, span, "net/http sse auth.basic")?;
+        let arr = arr.borrow();
+        let user = want_string(arr.first().unwrap_or(&Value::Nil), span, "net/http sse auth.basic[0]")?;
+        let pass = match arr.get(1) {
+            Some(Value::Nil) | None => None,
+            Some(p) => Some(want_string(p, span, "net/http sse auth.basic[1]")?.to_string()),
+        };
+        return Ok(Some(SseAuth::Basic(user.to_string(), pass)));
+    }
+    Err(AsError::at("net/http sse auth expects {bearer} or {basic:[user,pass]}", span).into())
+}
+
+/// `strict_num_field` over an `opts` value directly (it may not be an object): a
+/// present-but-wrong-type field is a Tier-2 type error; absent/nil → `Ok(None)`.
+fn strict_num_field_v(opts: &Value, key: &str, ctx: &str, span: Span) -> Result<Option<f64>, Control> {
+    match opt_field(opts, key) {
+        None => Ok(None),
+        Some(Value::Number(n)) => Ok(Some(n)),
+        Some(other) => Err(AsError::at(
+            format!("net/http {} expects a number, got {}", ctx, crate::interp::type_name(&other)),
+            span,
+        )
+        .into()),
+    }
 }
 
 /// reqwest's HTTP `Version` → the spec's short string ("1.1" | "2" | "3" | ...).
@@ -1546,6 +1985,35 @@ mod tests {
                     ];
                     let stream = futures_util::stream::iter(frames);
                     return Ok(Response::new(BoxBody::new(StreamBody::new(stream))));
+                }
+                // A canned `text/event-stream` body with three events: an
+                // event+data frame, a multi-line data + id + retry frame, and a
+                // default-event data frame. A leading `:` comment line is ignored.
+                // The body then ends (connection closes) — no reconnect data.
+                "/sse" => {
+                    let mut r = Response::new(Full::new(Bytes::from_static(
+                        b": this is a comment\nevent: greeting\ndata: hello\n\ndata: line1\ndata: line2\nid: 42\nretry: 1000\n\ndata: bye\n\n",
+                    )));
+                    r.headers_mut()
+                        .insert(hyper::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+                    r
+                }
+                // Auto-reconnect endpoint: the FIRST connection (no Last-Event-ID
+                // header) emits one event (id:1) then closes; the SECOND connection
+                // — detected by the presence of a `Last-Event-ID` header — emits a
+                // second event (id:2) then closes. Lets the reconnect test assert
+                // both the resumed event AND that Last-Event-ID was sent.
+                "/sse-reconnect" => {
+                    let has_last_id = headers.contains_key("last-event-id");
+                    let payload: &[u8] = if has_last_id {
+                        b"data: second\nid: 2\n\n"
+                    } else {
+                        b"data: first\nid: 1\n\n"
+                    };
+                    let mut r = Response::new(Full::new(Bytes::from(payload.to_vec())));
+                    r.headers_mut()
+                        .insert(hyper::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+                    r
                 }
                 _ => {
                     let mut r = Response::new(Full::new(Bytes::from_static(b"nope")));
@@ -2259,6 +2727,147 @@ print(data.body)
         );
         let out = run(&src).await;
         assert_eq!(out, "part1-part2\n");
+    }
+
+    // ---- Task 5: Server-Sent Events (http.sse) ------------------------------
+
+    #[tokio::test]
+    async fn sse_parses_events_in_order_then_nil() {
+        let base = fixture::start().await;
+        // The canned /sse body has three events: greeting+data, multi-line data +
+        // id + retry, and a default-event data. The leading `:` comment is ignored.
+        // With reconnect:false the stream ends (nil) after the third event.
+        let src = format!(
+            r#"
+import {{ sse }} from "std/net/http"
+let [s, err] = await sse("{base}/sse", {{ reconnect: false }})
+print(err)
+let e1 = await s.next()
+print(e1[0].event)
+print(e1[0].data)
+let e2 = await s.next()
+print(e2[0].event)
+print(e2[0].data)
+print(e2[0].id)
+print(e2[0].retry)
+let e3 = await s.next()
+print(e3[0].event)
+print(e3[0].data)
+let e4 = await s.next()
+print(e4)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(
+            out,
+            "nil\ngreeting\nhello\nmessage\nline1\nline2\n42\n1000\nmessage\nbye\nnil\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_last_event_id_tracks_latest_id() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ sse }} from "std/net/http"
+let [s, _e] = await sse("{base}/sse", {{ reconnect: false }})
+let _e1 = await s.next()
+print(s.lastEventId)
+let _e2 = await s.next()
+print(s.lastEventId)
+"#
+        );
+        let out = run(&src).await;
+        // No id on the first event, "42" after the second event.
+        assert_eq!(out, "\n42\n");
+    }
+
+    #[tokio::test]
+    async fn sse_close_ends_stream_and_reclaims_resource() {
+        let base = fixture::start().await;
+        let mut interp = Interp::new();
+        let baseline = interp.resource_count();
+        let src = format!(
+            r#"
+import {{ sse }} from "std/net/http"
+let [s, _e] = await sse("{base}/sse", {{ reconnect: false }})
+let _e1 = await s.next()
+s.close()
+print(await s.next())
+print(await s.next())
+"#
+        );
+        run_on(&mut interp, &src).await.expect("exec");
+        assert_eq!(interp.output, "nil\nnil\n");
+        assert_eq!(
+            interp.resource_count(),
+            baseline,
+            "SseStream resource should be reclaimed on close()"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_auto_reconnect_resumes_with_last_event_id() {
+        let base = fixture::start().await;
+        // /sse-reconnect: first connection (no Last-Event-ID) → {data:first,id:1}
+        // then closes; reconnect (carrying Last-Event-ID) → {data:second,id:2} then
+        // closes. With a tiny retryDefault + maxReconnects:1 we get both events then
+        // nil. The second event proves the reconnect carried Last-Event-ID.
+        let src = format!(
+            r#"
+import {{ sse }} from "std/net/http"
+let [s, _e] = await sse("{base}/sse-reconnect", {{ retryDefault: 10, maxReconnects: 1 }})
+let e1 = await s.next()
+print(e1[0].data)
+let e2 = await s.next()
+print(e2[0].data)
+print(e2[0].id)
+print(await s.next())
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "first\nsecond\n2\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn sse_no_reconnect_ends_cleanly_after_first_connection() {
+        let base = fixture::start().await;
+        // reconnect:false against /sse-reconnect → only the first event, then nil.
+        let src = format!(
+            r#"
+import {{ sse }} from "std/net/http"
+let [s, _e] = await sse("{base}/sse-reconnect", {{ reconnect: false }})
+let e1 = await s.next()
+print(e1[0].data)
+print(await s.next())
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "first\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn sse_interp_e2e_event_loop() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ sse }} from "std/net/http"
+fn collect() {{
+  let [s, err] = await sse("{base}/sse", {{ reconnect: false }})
+  if (err != nil) {{ return "ERR" }}
+  let out = ""
+  let ev = await s.next()
+  while (ev != nil) {{
+    out = out + ev[0].event + ":" + ev[0].data + "|"
+    ev = await s.next()
+  }}
+  return out
+}}
+print(collect())
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "greeting:hello|message:line1\nline2|message:bye|\n");
     }
 
     #[tokio::test]

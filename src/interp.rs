@@ -127,6 +127,14 @@ pub(crate) enum ResourceState {
     // request run sequentially.
     #[cfg(feature = "net")]
     CancelToken(std::sync::Arc<tokio::sync::Notify>),
+    // M14 std/net/http: a first-class Server-Sent Events client stream
+    // (`http.sse`). Holds the live event-stream body reader, the in-progress
+    // event parse buffer, the current `lastEventId`/`retry`, and the reconnect
+    // template (url/headers/config) used to re-issue the GET on disconnect.
+    // Boxed: `SseState` carries a sizeable BufReader + reconnect template; boxing it
+    // keeps the `ResourceState` enum compact (clippy::large_enum_variant).
+    #[cfg(feature = "net")]
+    SseStream(Box<crate::stdlib::net_http::SseState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -286,6 +294,18 @@ impl Interp {
     ) -> Option<&mut crate::stdlib::net_http::HttpBodyState> {
         match self.resources.get_mut(&id) {
             Some(ResourceState::HttpBody(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to an SSE stream behind a handle id (for `next`/`close`).
+    #[cfg(feature = "net")]
+    pub(crate) fn sse_stream_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::net_http::SseState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::SseStream(s)) => Some(s.as_mut()),
             _ => None,
         }
     }
@@ -914,6 +934,18 @@ impl Interp {
                 None => Err(AsError::at(format!("no superclass method '{}' (no superclass)", name), span)),
             },
             Value::Native(n) => {
+                // `sse.lastEventId` is a LIVE property: the most recent `id:` seen,
+                // which `next()` keeps current on the resource (the handle's `fields`
+                // are immutable after minting, so it can't be a static field). Read it
+                // straight from the resource state.
+                #[cfg(feature = "net")]
+                if name == "lastEventId" && n.kind == crate::value::NativeKind::SseStream {
+                    let id = match self.resource(n.id) {
+                        Some(ResourceState::SseStream(s)) => s.last_event_id().to_string(),
+                        _ => String::new(),
+                    };
+                    return Ok(Value::Str(id.into()));
+                }
                 if let Some(v) = n.fields.get(name) {
                     return Ok(v.clone());
                 }
@@ -993,6 +1025,9 @@ impl Interp {
             }
             if matches!(m.receiver.kind, CancelHandle) {
                 return self.call_cancel_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, SseStream) {
+                return self.call_sse_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
