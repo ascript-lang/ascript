@@ -15,6 +15,8 @@ pub mod csv;
 pub mod encoding;
 #[cfg(feature = "sys")]
 pub mod env;
+#[cfg(feature = "sys")]
+pub mod fs;
 #[cfg(feature = "intl")]
 pub mod intl;
 #[cfg(feature = "data")]
@@ -66,6 +68,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/encoding" => encoding::exports(),
         #[cfg(feature = "sys")]
         "std/env" => env::exports(),
+        #[cfg(feature = "sys")]
+        "std/fs" => fs::exports(),
         #[cfg(feature = "data")]
         "std/regex" => regex::exports(),
         #[cfg(feature = "data")]
@@ -109,6 +113,8 @@ impl Interp {
             "encoding" => encoding::call(func, args, span),
             #[cfg(feature = "sys")]
             "env" => env::call(func, args, span),
+            #[cfg(feature = "sys")]
+            "fs" => fs::call(func, args, span),
             #[cfg(feature = "data")]
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "data")]
