@@ -17,6 +17,8 @@ pub mod object;
 #[cfg(feature = "data")]
 pub mod regex;
 pub mod string;
+#[cfg(feature = "data")]
+pub mod uuid;
 
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
@@ -46,6 +48,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/encoding" => encoding::exports(),
         #[cfg(feature = "data")]
         "std/regex" => regex::exports(),
+        #[cfg(feature = "data")]
+        "std/uuid" => uuid::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -74,6 +78,8 @@ impl Interp {
             "encoding" => encoding::call(func, args, span),
             #[cfg(feature = "data")]
             "regex" => regex::call(func, args, span),
+            #[cfg(feature = "data")]
+            "uuid" => uuid::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

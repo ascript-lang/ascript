@@ -1257,6 +1257,12 @@ mod tests {
         assert_eq!(run(src).await, "true\n[\"1\", \"22\", \"333\"]\nx#y\n42\n2\nregex\n");
     }
 
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_uuid_end_to_end() {
+        assert_eq!(run("import * as uuid from \"std/uuid\"\nprint(len(uuid.v4()))").await, "36\n");
+    }
+
     #[tokio::test]
     async fn user_can_shadow_builtins() {
         assert_eq!(run("let len = 5\nprint(len)").await, "5\n");
