@@ -251,9 +251,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 
 /// Recursive regex search across a directory tree (spec §11.3). Each match is
 /// `{path, line, column, text}` with 1-based line/column. Walks with the `ignore`
-/// crate (honoring `.gitignore` and hidden files when `respectGitignore`), reads
-/// each file as UTF-8, and applies the regex per line. Non-UTF-8/binary files are
-/// skipped silently so one bad file doesn't fail the whole grep.
+/// crate; `respectGitignore` (default true) honors `.gitignore` (only inside a git
+/// repo). Hidden/dotfiles are ALWAYS searched. Reads each file as UTF-8 and applies
+/// the regex per line. Non-UTF-8/binary files are skipped silently so one bad file
+/// doesn't fail the whole grep. `maxResults` > 0 caps the count; absent/<=0 = no limit.
 fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
     let ctx = "fs.grep";
     let pattern = want_string(&arg(args, 0), span, ctx)?;
@@ -272,8 +273,10 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
         if let Some(v) = o.get("ignoreCase") {
             ignore_case = v.is_truthy();
         }
+        // maxResults semantics: a value > 0 caps the result count at exactly that
+        // many; absent or <= 0 means NO limit (return all matches).
         if let Some(Value::Number(n)) = o.get("maxResults") {
-            if *n >= 0.0 {
+            if *n > 0.0 {
                 max_results = Some(*n as usize);
             }
         }
@@ -289,14 +292,21 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
     };
 
     // ---- build the walker ----
+    // `respectGitignore` controls ONLY gitignore semantics (`.gitignore`,
+    // `.git/info/exclude`, global excludes, parent ignores, and `.ignore` files).
+    // NOTE: the `ignore` crate applies `.gitignore` only within a git repository;
+    // a loose `.gitignore` in a non-repo directory is NOT honored.
+    // Hidden/dotfiles are ALWAYS searched (`.hidden(false)`) — the intuitive grep
+    // default — regardless of `respectGitignore`, so a content search still finds
+    // matches in files like `.env` or `.config`.
     let mut builder = ignore::WalkBuilder::new(dir.as_ref());
     builder
         .git_ignore(respect_gitignore)
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
         .ignore(respect_gitignore)
-        .hidden(respect_gitignore)
-        .parents(respect_gitignore);
+        .parents(respect_gitignore)
+        .hidden(false);
 
     // glob filename filter via `ignore`'s overrides: a single allow-glob means
     // "only files matching this glob are searched".
@@ -335,6 +345,12 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
         let path_str = path.to_string_lossy().into_owned();
         for (line_idx, line) in content.lines().enumerate() {
             if let Some(m) = re.find(line) {
+                // Enforce the cap BEFORE pushing so `maxResults: N` yields at most N.
+                if let Some(max) = max_results {
+                    if matches.len() >= max {
+                        break 'walk;
+                    }
+                }
                 let column = line[..m.start()].chars().count() + 1;
                 let mut entry_obj = IndexMap::new();
                 entry_obj.insert("path".to_string(), Value::Str(path_str.clone().into()));
@@ -342,11 +358,6 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
                 entry_obj.insert("column".to_string(), Value::Number(column as f64));
                 entry_obj.insert("text".to_string(), Value::Str(line.into()));
                 matches.push(obj(entry_obj));
-                if let Some(max) = max_results {
-                    if matches.len() >= max {
-                        break 'walk;
-                    }
-                }
             }
         }
     }
@@ -604,7 +615,8 @@ mod tests {
     }
 
     #[test]
-    fn grep_max_results_caps() {
+    fn grep_max_results_semantics() {
+        // Chosen semantics: maxResults > 0 → at most exactly N; absent or <= 0 → no limit.
         let dir = temp_dir("grep_max");
         call(
             "write",
@@ -612,12 +624,47 @@ mod tests {
             sp(),
         )
         .unwrap();
-        let mut opts = IndexMap::new();
-        opts.insert("maxResults".to_string(), Value::Number(2.0));
-        let g = call("grep", &[s("hit"), s(&path_str(&dir)), obj(opts)], sp()).unwrap();
+        let count = |opts: Option<Value>| -> usize {
+            let mut args = vec![s("hit"), s(&path_str(&dir))];
+            if let Some(o) = opts {
+                args.push(o);
+            }
+            let g = call("grep", &args, sp()).unwrap();
+            match unwrap_pair_ok(&g) {
+                Value::Array(a) => a.borrow().len(),
+                other => panic!("expected array, got {:?}", other),
+            }
+        };
+        // maxResults: 2 → exactly 2
+        let mut o2 = IndexMap::new();
+        o2.insert("maxResults".to_string(), Value::Number(2.0));
+        assert_eq!(count(Some(obj(o2))), 2);
+        // maxResults: 0 → NO limit (all 4)
+        let mut o0 = IndexMap::new();
+        o0.insert("maxResults".to_string(), Value::Number(0.0));
+        assert_eq!(count(Some(obj(o0))), 4);
+        // absent → NO limit (all 4)
+        assert_eq!(count(None), 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn grep_searches_dotfiles_by_default() {
+        // With respectGitignore at its default (true), grep must STILL search
+        // hidden/dotfiles — a content search shouldn't silently skip `.config`.
+        let dir = temp_dir("grep_dotfile");
+        call("write", &[s(&path_str(&dir.join(".config"))), s("secret=findme")], sp()).unwrap();
+        let g = call("grep", &[s("findme"), s(&path_str(&dir))], sp()).unwrap();
         let matches = unwrap_pair_ok(&g);
-        if let Value::Array(a) = &matches {
-            assert_eq!(a.borrow().len(), 2);
+        match &matches {
+            Value::Array(a) => {
+                let a = a.borrow();
+                assert_eq!(a.len(), 1, "dotfile should be searched: {:?}", a);
+                if let Value::Object(o) = &a[0] {
+                    assert!(o.borrow().get("path").unwrap().to_string().contains(".config"));
+                }
+            }
+            other => panic!("expected array, got {:?}", other),
         }
         std::fs::remove_dir_all(&dir).ok();
     }
