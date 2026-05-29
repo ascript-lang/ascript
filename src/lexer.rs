@@ -44,10 +44,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     tokens.push(Token { tok: Tok::EqEq, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {
-                    return Err(AsError::at(
-                        "unexpected character '=' (plain assignment arrives with let/const)",
-                        Span::new(start, start + 1),
-                    ));
+                    tokens.push(Token { tok: Tok::Eq, span: Span::new(start, start + 1) });
+                    i += 1;
                 }
             }
             '<' => {
@@ -100,6 +98,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
             '(' => push(&mut tokens, Tok::LParen, start, &mut i),
             ')' => push(&mut tokens, Tok::RParen, start, &mut i),
             ',' => push(&mut tokens, Tok::Comma, start, &mut i),
+            ';' => push(&mut tokens, Tok::Semicolon, start, &mut i),
             '"' => {
                 i += 1;
                 let mut s = String::new();
@@ -141,6 +140,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "true" => Tok::True,
                     "false" => Tok::False,
                     "nil" => Tok::Nil,
+                    "let" => Tok::Let,
+                    "const" => Tok::Const,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });

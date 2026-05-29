@@ -8,14 +8,16 @@ pub mod span;
 pub mod token;
 pub mod value;
 
+use crate::env::Environment;
 use crate::error::AsError;
 use crate::interp::Interp;
 
-/// Lex → parse → evaluate. Returns the program's captured output.
+/// Lex → parse → evaluate in a fresh global environment. Returns captured output.
 pub async fn run_source(src: &str) -> Result<String, AsError> {
     let tokens = lexer::lex(src)?;
     let program = parser::parse(&tokens)?;
     let mut interp = Interp::new();
-    interp.exec(&program).await?;
+    let env = Environment::global();
+    interp.exec(&program, &env).await?;
     Ok(interp.output)
 }

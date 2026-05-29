@@ -2,6 +2,7 @@
 //! the event-loop seam from spec §7, even though the skeleton never suspends.
 
 use crate::ast::{BinOp, Expr, ExprKind, Stmt, UnOp};
+use crate::env::Environment;
 use crate::error::AsError;
 use crate::value::Value;
 use async_recursion::async_recursion;
@@ -17,30 +18,38 @@ impl Interp {
         Interp { output: String::new() }
     }
 
-    pub async fn exec(&mut self, program: &[Stmt]) -> Result<(), AsError> {
+    pub async fn exec(&mut self, program: &[Stmt], env: &Environment) -> Result<(), AsError> {
         for stmt in program {
-            match stmt {
-                Stmt::Expr(e) => {
-                    self.eval_expr(e).await?;
-                }
+            self.exec_stmt(stmt, env).await?;
+        }
+        Ok(())
+    }
+
+    async fn exec_stmt(&mut self, stmt: &Stmt, env: &Environment) -> Result<(), AsError> {
+        match stmt {
+            Stmt::Expr(e) => {
+                self.eval_expr(e, env).await?;
+            }
+            Stmt::Let { name, value, mutable } => {
+                let v = self.eval_expr(value, env).await?;
+                env.define(name, v, *mutable).map_err(AsError::new)?;
             }
         }
         Ok(())
     }
 
     #[async_recursion(?Send)]
-    pub async fn eval_expr(&mut self, expr: &Expr) -> Result<Value, AsError> {
+    pub async fn eval_expr(&mut self, expr: &Expr, env: &Environment) -> Result<Value, AsError> {
         match &expr.kind {
             ExprKind::Number(n) => Ok(Value::Number(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Nil => Ok(Value::Nil),
-            ExprKind::Ident(name) => Err(AsError::at(
-                format!("undefined variable '{}'", name),
-                expr.span,
-            )),
+            ExprKind::Ident(name) => env
+                .get(name)
+                .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span)),
             ExprKind::Unary { op, expr: operand } => {
-                let v = self.eval_expr(operand).await?;
+                let v = self.eval_expr(operand, env).await?;
                 match op {
                     UnOp::Neg => match v {
                         Value::Number(n) => Ok(Value::Number(-n)),
@@ -52,22 +61,22 @@ impl Interp {
             ExprKind::Binary { op, lhs, rhs } => {
                 match op {
                     BinOp::And => {
-                        let l = self.eval_expr(lhs).await?;
-                        return if l.is_truthy() { self.eval_expr(rhs).await } else { Ok(l) };
+                        let l = self.eval_expr(lhs, env).await?;
+                        return if l.is_truthy() { self.eval_expr(rhs, env).await } else { Ok(l) };
                     }
                     BinOp::Or => {
-                        let l = self.eval_expr(lhs).await?;
-                        return if l.is_truthy() { Ok(l) } else { self.eval_expr(rhs).await };
+                        let l = self.eval_expr(lhs, env).await?;
+                        return if l.is_truthy() { Ok(l) } else { self.eval_expr(rhs, env).await };
                     }
                     BinOp::Coalesce => {
-                        let l = self.eval_expr(lhs).await?;
-                        return if l == Value::Nil { self.eval_expr(rhs).await } else { Ok(l) };
+                        let l = self.eval_expr(lhs, env).await?;
+                        return if l == Value::Nil { self.eval_expr(rhs, env).await } else { Ok(l) };
                     }
                     _ => {}
                 }
 
-                let l = self.eval_expr(lhs).await?;
-                let r = self.eval_expr(rhs).await?;
+                let l = self.eval_expr(lhs, env).await?;
+                let r = self.eval_expr(rhs, env).await?;
 
                 match op {
                     BinOp::Eq => return Ok(Value::Bool(l == r)),
@@ -103,7 +112,7 @@ impl Interp {
                 };
                 let mut values = Vec::new();
                 for a in args {
-                    values.push(self.eval_expr(a).await?);
+                    values.push(self.eval_expr(a, env).await?);
                 }
                 self.call_builtin(&name, &values)
             }
@@ -132,14 +141,20 @@ impl Default for Interp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::Environment;
     use crate::lexer::lex;
     use crate::parser::parse;
 
     async fn eval_to_value(src: &str) -> Value {
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let mut interp = Interp::new();
-        let Stmt::Expr(e) = &stmts[0];
-        interp.eval_expr(e).await.unwrap()
+        let env = Environment::global();
+        let (last, rest) = stmts.split_last().expect("at least one statement");
+        interp.exec(rest, &env).await.unwrap();
+        match last {
+            Stmt::Expr(e) => interp.eval_expr(e, &env).await.unwrap(),
+            _ => panic!("last statement must be an expression"),
+        }
     }
 
     #[tokio::test]
@@ -154,7 +169,8 @@ mod tests {
     async fn print_writes_to_the_output_buffer() {
         let stmts = parse(&lex("print(1 + 2 * 3)").unwrap()).unwrap();
         let mut interp = Interp::new();
-        interp.exec(&stmts).await.unwrap();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "7\n");
     }
 
@@ -184,7 +200,36 @@ mod tests {
     async fn calling_a_non_builtin_is_an_error() {
         let stmts = parse(&lex("nope(1)").unwrap()).unwrap();
         let mut interp = Interp::new();
-        let err = interp.exec(&stmts).await.unwrap_err();
+        let env = Environment::global();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("is not a function"));
+    }
+
+    #[tokio::test]
+    async fn let_binding_resolves() {
+        let stmts = parse(&lex("let x = 5\nprint(x + 1)").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "6\n");
+    }
+
+    #[tokio::test]
+    async fn undefined_variable_errors_with_span() {
+        let stmts = parse(&lex("print(missing)").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("undefined variable 'missing'"));
+        assert!(err.span.is_some());
+    }
+
+    #[tokio::test]
+    async fn optional_semicolons_are_accepted() {
+        let stmts = parse(&lex("let x = 1; print(x);").unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "1\n");
     }
 }

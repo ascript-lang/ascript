@@ -49,10 +49,43 @@ impl<'a> Parser<'a> {
 
     fn program(&mut self) -> Result<Vec<Stmt>, AsError> {
         let mut stmts = Vec::new();
+        self.skip_semicolons();
         while *self.peek() != Tok::Eof {
-            stmts.push(Stmt::Expr(self.expr()?));
+            stmts.push(self.statement()?);
+            self.skip_semicolons();
         }
         Ok(stmts)
+    }
+
+    /// `;` is an optional statement separator; consume any run of them.
+    fn skip_semicolons(&mut self) {
+        while *self.peek() == Tok::Semicolon {
+            self.advance();
+        }
+    }
+
+    fn statement(&mut self) -> Result<Stmt, AsError> {
+        match self.peek() {
+            Tok::Let => self.let_stmt(true),
+            Tok::Const => self.let_stmt(false),
+            _ => Ok(Stmt::Expr(self.expr()?)),
+        }
+    }
+
+    fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
+        self.advance(); // consume `let` / `const`
+        let name = match self.advance() {
+            Tok::Ident(name) => name,
+            other => {
+                return Err(AsError::at(
+                    format!("expected a variable name, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
+        };
+        self.eat(&Tok::Eq)?;
+        let value = self.expr()?;
+        Ok(Stmt::Let { name, value, mutable })
     }
 
     fn expr(&mut self) -> Result<Expr, AsError> {
@@ -244,6 +277,7 @@ mod tests {
         let stmts = parse(&tokens).unwrap();
         match &stmts[0] {
             Stmt::Expr(e) => e.to_string(),
+            _ => panic!("expected an expression statement"),
         }
     }
 
@@ -294,6 +328,7 @@ mod tests {
         let stmts = parse(&tokens).unwrap();
         match &stmts[0] {
             Stmt::Expr(e) => assert_eq!(e.span, Span::new(0, 5)),
+            _ => panic!("expected an expression statement"),
         }
     }
 }

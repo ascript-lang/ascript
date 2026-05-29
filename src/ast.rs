@@ -25,6 +25,7 @@ pub enum ExprKind {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Expr(Expr),
+    Let { name: String, value: Expr, mutable: bool },
 }
 
 #[derive(Clone, Copy, Debug)]

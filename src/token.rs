@@ -29,6 +29,10 @@ pub enum Tok {
     AmpAmp,
     PipePipe,
     QuestionQuestion,
+    Eq,
+    Semicolon,
+    Let,
+    Const,
     Eof,
 }
 
