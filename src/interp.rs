@@ -1177,6 +1177,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn map_self_reference_display_is_cycle_guarded() {
+        // A self-referencing map must print without infinite recursion.
+        let out = run("import * as map from \"std/map\"\nlet m = map.new()\nmap.set(m, \"self\", m)\nprint(len(m))\nprint(m)").await;
+        assert_eq!(out, "1\nmap {\"self\": map {...}}\n");
+    }
+
+    #[tokio::test]
+    async fn map_number_key_contract_and_canonicalization() {
+        // map<number, string> with a string value and number key passes
+        let ok = run("import * as map from \"std/map\"\nlet m: map<number, string> = map.new()\nmap.set(m, 1, \"a\")\nprint(len(m))").await;
+        assert_eq!(ok, "1\n");
+        // -0.0 and 0.0 collide → len stays 1
+        let coll = run("import * as map from \"std/map\"\nlet m = map.new()\nmap.set(m, 0, \"x\")\nmap.set(m, -0.0, \"y\")\nprint(len(m))\nprint(map.get(m, 0))").await;
+        assert_eq!(coll, "1\ny\n");
+    }
+
+    #[tokio::test]
     async fn core_len_type_range() {
         assert_eq!(run("print(len([1,2,3]))").await, "3\n");
         assert_eq!(run("print(len(\"hello\"))").await, "5\n");

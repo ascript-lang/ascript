@@ -126,6 +126,8 @@ pub enum Value {
     Function(Rc<Function>),
     Array(Rc<RefCell<Vec<Value>>>),
     Object(Rc<RefCell<IndexMap<String, Value>>>),
+    // IndexMap (not HashMap) is deliberate: insertion order is required for
+    // deterministic keys/values/entries/display and to match `Object`.
     Map(Rc<RefCell<IndexMap<MapKey, Value>>>),
     Enum(Rc<EnumDef>),
     EnumVariant(Rc<EnumVariant>),

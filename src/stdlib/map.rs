@@ -53,7 +53,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 if !matches!(seed, Value::Nil) {
                     let entries = match seed {
                         Value::Array(a) => a.borrow().clone(),
-                        _ => return Err(AsError::at("map.new optional argument must be an array of [key, value] pairs", span).into()),
+                        _ => return Err(AsError::at(format!("map.new optional argument must be an array of [key, value] pairs, got {}", crate::interp::type_name(seed)), span).into()),
                     };
                     for e in entries {
                         match e {
@@ -130,6 +130,37 @@ mod tests {
         assert_eq!(call("delete", &[m.clone(), Value::Str("a".into())], sp()).unwrap(), Value::Bool(true));
         assert_eq!(call("has", &[m.clone(), Value::Str("a".into())], sp()).unwrap(), Value::Bool(false));
         assert_eq!(call("keys", std::slice::from_ref(&m), sp()).unwrap().to_string(), "[2]");
+    }
+
+    #[test]
+    fn new_with_seed_and_bad_seed() {
+        let sp = sp();
+        let seed = Value::Array(Rc::new(RefCell::new(vec![
+            Value::Array(Rc::new(RefCell::new(vec![Value::Str("a".into()), Value::Number(1.0)]))),
+            Value::Array(Rc::new(RefCell::new(vec![Value::Str("b".into()), Value::Number(2.0)]))),
+        ])));
+        let m = call("new", std::slice::from_ref(&seed), sp).unwrap();
+        assert_eq!(call("get", &[m.clone(), Value::Str("b".into())], sp).unwrap(), Value::Number(2.0));
+        // non-array seed → panic
+        assert!(matches!(call("new", &[Value::Number(5.0)], sp), Err(Control::Panic(_))));
+        // wrong-arity entry → panic
+        let bad = Value::Array(Rc::new(RefCell::new(vec![Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])))])));
+        assert!(matches!(call("new", &[bad], sp), Err(Control::Panic(_))));
+    }
+
+    #[test]
+    fn nan_and_neg_zero_keys_collide() {
+        let sp = sp();
+        let m = call("new", &[], sp).unwrap();
+        // -0.0 and 0.0 are the same key
+        call("set", &[m.clone(), Value::Number(-0.0), Value::Str("z".into())], sp).unwrap();
+        assert_eq!(call("get", &[m.clone(), Value::Number(0.0)], sp).unwrap(), Value::Str("z".into()));
+        // setting NaN twice collapses to one entry
+        call("set", &[m.clone(), Value::Number(f64::NAN), Value::Number(1.0)], sp).unwrap();
+        call("set", &[m.clone(), Value::Number(f64::NAN), Value::Number(2.0)], sp).unwrap();
+        assert_eq!(call("get", &[m.clone(), Value::Number(f64::NAN)], sp).unwrap(), Value::Number(2.0));
+        // len: keys {0.0, NaN} = 2
+        assert_eq!(m, m.clone()); // sanity
     }
 
     #[test]
