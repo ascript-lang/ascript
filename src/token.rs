@@ -67,6 +67,8 @@ pub enum Tok {
     Class,
     Import,
     Export,
+    Async,
+    Await,
     Eof,
 }
 

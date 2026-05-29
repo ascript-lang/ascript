@@ -50,7 +50,7 @@ impl From<AsError> for Control {
 /// A fresh global environment with the built-in functions installed.
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    for name in ["print", "Ok", "Err", "assert", "recover"] {
+    for name in ["print", "Ok", "Err", "assert", "recover", "test"] {
         env.define(name, Value::Builtin(name.into()), false)
             .expect("global env starts empty");
     }
@@ -82,6 +82,18 @@ pub struct Interp {
     modules: HashMap<PathBuf, ModuleEntry>,
     module_dir: PathBuf,
     current_exports: Rc<RefCell<HashSet<String>>>,
+    /// Tests registered via the `test(name, fn)` builtin. Only executed by
+    /// `ascript test` (via `run_registered_tests`); a normal `run` just collects them.
+    tests: Vec<(String, Value)>,
+}
+
+/// Outcome of running the tests registered on an `Interp`.
+#[derive(Debug, Default)]
+pub struct TestSummary {
+    pub passed: usize,
+    pub failed: usize,
+    /// `(test name, failure message)` for each failed test.
+    pub failures: Vec<(String, String)>,
 }
 
 impl Interp {
@@ -91,7 +103,27 @@ impl Interp {
             modules: HashMap::new(),
             module_dir: PathBuf::from("."),
             current_exports: Rc::new(RefCell::new(HashSet::new())),
+            tests: Vec::new(),
         }
+    }
+
+    /// Run every test registered via the `test(name, fn)` builtin. Each test fn
+    /// is invoked with no arguments; a `Control::Panic` (e.g. a failed `assert`)
+    /// is recorded as a failure, while a clean return or a `?` propagation passes.
+    pub async fn run_registered_tests(&mut self) -> TestSummary {
+        let mut summary = TestSummary::default();
+        // Clone out the registrations first: `call_value` borrows `&mut self`.
+        let tests = self.tests.clone();
+        for (name, func) in tests {
+            match self.call_value(func, Vec::new(), Span::new(0, 0)).await {
+                Ok(_) | Err(Control::Propagate(_)) => summary.passed += 1,
+                Err(Control::Panic(e)) => {
+                    summary.failed += 1;
+                    summary.failures.push((name, e.message));
+                }
+            }
+        }
+        summary
     }
 
     /// Load (or fetch from cache) the module at `path`, returning its entry.
@@ -113,14 +145,22 @@ impl Interp {
         let prev_dir = std::mem::replace(&mut self.module_dir, dir);
         let prev_exports = std::mem::replace(&mut self.current_exports, exports);
 
-        let tokens = lexer::lex(&src).map_err(Control::Panic)?;
-        let program = parser::parse(&tokens).map_err(Control::Panic)?;
+        let src_info =
+            Rc::new(crate::error::SourceInfo { path: canon.display().to_string(), text: src.clone() });
+
+        let tokens = lexer::lex(&src)
+            .map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
+        let program = parser::parse(&tokens)
+            .map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
         let result = self.exec(&program, &env).await;
 
         self.module_dir = prev_dir;
         self.current_exports = prev_exports;
 
-        result?; // propagate a panic from the module body
+        if let Err(Control::Panic(e)) = result {
+            return Err(Control::Panic(e.with_source(src_info)));
+        }
+        result?; // propagate any other control flow from the module body
         Ok(entry)
     }
 
@@ -239,13 +279,14 @@ impl Interp {
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
-            Stmt::Fn { name, params, ret, body } => {
+            Stmt::Fn { name, params, ret, body, is_async } => {
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
                     ret: ret.clone(),
                     body: body.clone(),
                     closure: env.clone(),
+                    is_async: *is_async,
                 }));
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -283,6 +324,7 @@ impl Interp {
                         params: m.params.clone(),
                         ret: m.ret.clone(),
                         body: m.body.clone(),
+                        is_async: m.is_async,
                     }));
                 }
                 let class = Value::Class(std::rc::Rc::new(crate::value::Class {
@@ -406,7 +448,7 @@ impl Interp {
                 };
                 Ok(result)
             }
-            ExprKind::Arrow { params, body } => {
+            ExprKind::Arrow { params, body, is_async } => {
                 let body_stmts = match body.as_ref() {
                     crate::ast::ArrowBody::Block(stmts) => stmts.clone(),
                     crate::ast::ArrowBody::Expr(e) => vec![Stmt::Return(Some((**e).clone()))],
@@ -417,6 +459,7 @@ impl Interp {
                     ret: None,
                     body: body_stmts,
                     closure: env.clone(),
+                    is_async: *is_async,
                 })))
             }
             ExprKind::Array(items) => {
@@ -469,6 +512,7 @@ impl Interp {
                 }
                 Err(AsError::at("no matching arm in match expression", expr.span).into())
             }
+            ExprKind::Await(inner) => self.eval_expr(inner, env).await,
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
             ExprKind::Try(inner) => {
                 let v = self.eval_expr(inner, env).await?;
@@ -769,6 +813,17 @@ impl Interp {
                     // value by call_function, so this is unreachable in practice; pass it through.
                     Err(Control::Propagate(v)) => Err(Control::Propagate(v)),
                 }
+            }
+            "test" => {
+                let name = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    Some(v) => v.to_string(),
+                    None => "<unnamed>".to_string(),
+                };
+                let func = args.get(1).cloned().unwrap_or(Value::Nil);
+                // Register only; `ascript test` runs these via run_registered_tests.
+                self.tests.push((name, func));
+                Ok(Value::Nil)
             }
             other => Err(AsError::at(format!("'{}' is not a function", other), span).into()),
         }
@@ -1802,5 +1857,15 @@ print(r[1])
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("type contract violated"));
         assert!(err.message.contains("expected Animal"));
+    }
+
+    #[tokio::test]
+    async fn async_fn_and_await_surface() {
+        let src = "async fn fetch(x) { return x * 2 }\nlet r = await fetch(21)\nprint(r)\nprint(await 5)\nlet g = async (n) => n + 1\nprint(await g(9))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "42\n5\n10\n");
     }
 }

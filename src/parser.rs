@@ -73,7 +73,13 @@ impl<'a> Parser<'a> {
             Tok::While => self.while_stmt(),
             Tok::For => self.for_stmt(),
             Tok::Return => self.return_stmt(),
-            Tok::Fn => self.fn_decl(),
+            Tok::Fn => self.fn_decl(false),
+            // `async fn` is a declaration; `async (…) =>` / `async x =>` are
+            // arrow expressions, handled by the expression path below.
+            Tok::Async if self.tokens[self.pos + 1].tok == Tok::Fn => {
+                self.advance(); // consume `async`
+                self.fn_decl(true)
+            }
             Tok::Enum => self.enum_decl(),
             Tok::Class => self.class_decl(),
             Tok::Import => self.import_decl(),
@@ -142,7 +148,17 @@ impl<'a> Parser<'a> {
         let inner = match self.peek() {
             Tok::Let => self.let_stmt(true)?,
             Tok::Const => self.let_stmt(false)?,
-            Tok::Fn => self.fn_decl()?,
+            Tok::Fn => self.fn_decl(false)?,
+            Tok::Async => {
+                self.advance(); // consume `async`
+                if *self.peek() != Tok::Fn {
+                    return Err(AsError::at(
+                        format!("expected 'fn' after 'async', found {:?}", self.peek()),
+                        self.span(),
+                    ));
+                }
+                self.fn_decl(true)?
+            }
             Tok::Class => self.class_decl()?,
             Tok::Enum => self.enum_decl()?,
             other => return Err(AsError::at(format!("only let/const/fn/class/enum can be exported, found {:?}", other), self.span())),
@@ -162,7 +178,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn fn_decl(&mut self) -> Result<Stmt, AsError> {
+    fn fn_decl(&mut self, is_async: bool) -> Result<Stmt, AsError> {
         self.eat(&Tok::Fn)?;
         let name = match self.advance() {
             Tok::Ident(name) => name,
@@ -181,7 +197,7 @@ impl<'a> Parser<'a> {
             None
         };
         let body = self.block()?;
-        Ok(Stmt::Fn { name, params, ret, body })
+        Ok(Stmt::Fn { name, params, ret, body, is_async })
     }
 
     fn enum_decl(&mut self) -> Result<Stmt, AsError> {
@@ -233,6 +249,12 @@ impl<'a> Parser<'a> {
         self.eat(&Tok::LBrace)?;
         let mut methods = Vec::new();
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            let is_async = if *self.peek() == Tok::Async {
+                self.advance();
+                true
+            } else {
+                false
+            };
             self.eat(&Tok::Fn)?;
             let mname = match self.advance() {
                 Tok::Ident(n) => n,
@@ -246,7 +268,7 @@ impl<'a> Parser<'a> {
                 None
             };
             let body = self.block()?;
-            methods.push(crate::ast::MethodDecl { name: mname, params, ret, body });
+            methods.push(crate::ast::MethodDecl { name: mname, params, ret, body, is_async });
         }
         self.eat(&Tok::RBrace)?;
         Ok(Stmt::Class { name, superclass, methods })
@@ -507,6 +529,29 @@ impl<'a> Parser<'a> {
     /// `Ok(None)` (without consuming) if what follows is not an arrow.
     fn try_arrow(&mut self) -> Result<Option<Expr>, AsError> {
         let start = self.span().start;
+        // Optional leading `async`: `async x => …` / `async (params) => …`. Only
+        // commit to consuming it if an arrow actually follows.
+        let is_async = if *self.peek() == Tok::Async {
+            let next = &self.tokens[self.pos + 1].tok;
+            let looks_like_arrow = match next {
+                Tok::Ident(_) => self.tokens.get(self.pos + 2).map(|t| &t.tok) == Some(&Tok::FatArrow),
+                Tok::LParen => {
+                    let saved = self.pos;
+                    self.pos += 1;
+                    let ok = self.parens_then_arrow();
+                    self.pos = saved;
+                    ok
+                }
+                _ => false,
+            };
+            if !looks_like_arrow {
+                return Ok(None);
+            }
+            self.advance(); // consume `async`
+            true
+        } else {
+            false
+        };
         // Single-parameter form: `ident => …`
         if let Tok::Ident(name) = self.peek().clone() {
             if self.tokens[self.pos + 1].tok == Tok::FatArrow {
@@ -518,6 +563,7 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Arrow {
                         params: vec![crate::ast::Param { name, ty: None }],
                         body: Box::new(body),
+                        is_async,
                     },
                     span: Span::new(start, end),
                 }));
@@ -532,7 +578,7 @@ impl<'a> Parser<'a> {
             let body = self.arrow_body()?;
             let end = self.prev_end();
             return Ok(Some(Expr {
-                kind: ExprKind::Arrow { params, body: Box::new(body) },
+                kind: ExprKind::Arrow { params, body: Box::new(body), is_async },
                 span: Span::new(start, end),
             }));
         }
@@ -679,6 +725,16 @@ impl<'a> Parser<'a> {
 
     fn unary(&mut self) -> Result<Expr, AsError> {
         let start = self.span().start;
+        // `await` is a prefix operator at unary precedence (spec §7).
+        if *self.peek() == Tok::Await {
+            self.advance();
+            let operand = self.unary()?;
+            let span = Span::new(start, operand.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Await(Box::new(operand)),
+                span,
+            });
+        }
         let op = match self.peek() {
             Tok::Minus => Some(UnOp::Neg),
             Tok::Bang => Some(UnOp::Not),
@@ -1041,5 +1097,33 @@ mod tests {
             Stmt::Expr(e) => assert_eq!(e.span, Span::new(0, 5)),
             _ => panic!("expected an expression statement"),
         }
+    }
+
+    #[test]
+    fn parses_async_fn_decl() {
+        let stmts = parse(&lex("async fn fetch(x) { return x }").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Fn { name, is_async, .. } => {
+                assert_eq!(name, "fetch");
+                assert!(is_async);
+            }
+            other => panic!("expected an async fn decl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn await_parses_at_unary_precedence() {
+        // `await f()` => Await(Call(f)); `await a + b` => (await a) + b.
+        assert_eq!(sexpr("await f()"), "(await (call f))");
+        assert_eq!(sexpr("await a + b"), "(+ (await a) b)");
+    }
+
+    #[test]
+    fn parses_async_arrow() {
+        // Both single-param and parenthesized async arrows parse.
+        assert_eq!(sexpr("async x => x + 1"), "(arrow [x])");
+        assert_eq!(sexpr("async (a, b) => a + b"), "(arrow [a b])");
+        let stmts = parse(&lex("let g = async (n) => n + 1").unwrap()).unwrap();
+        assert!(matches!(&stmts[0], Stmt::Let { .. }));
     }
 }

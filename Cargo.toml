@@ -15,3 +15,12 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
 async-recursion = "1"
 indexmap = "2"
+clap = { version = "4", features = ["derive"] }
+ariadne = "0.6"
+rustyline = "14"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tree-sitter = "0.25"

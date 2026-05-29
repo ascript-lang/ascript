@@ -45,6 +45,20 @@ fn runs_functions_example() {
 }
 
 #[test]
+fn runs_async_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/async.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    // fetch(21)=42; await 5=5; async arrow g(9)=10; async arrow h(8)=7.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n5\n10\n7\n");
+}
+
+#[test]
 fn runs_data_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin)
@@ -102,8 +116,21 @@ fn runs_oop_example() {
 fn reports_usage_without_args() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin).output().unwrap();
+    // clap requires a subcommand; with none it prints usage and exits non-zero.
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("usage"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage"));
+}
+
+#[test]
+fn run_error_shows_source_caret() {
+    let file = std::env::temp_dir().join(format!("ascript_diag_{}.as", std::process::id()));
+    std::fs::write(&file, "let x = 1\nprint(missing)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    // ariadne renders the message and points at the source
+    assert!(err.contains("undefined variable 'missing'"));
 }
 
 #[test]
@@ -115,4 +142,64 @@ fn runs_modules_example() {
     assert!(out.contains("12.56636")); // circleArea(2) = 3.14159*4
     assert!(out.contains("12\n"));     // Rect(3,4).area()
     assert!(out.contains("3.14159"));  // geo.PI
+}
+
+#[test]
+fn repl_evaluates_and_persists_bindings() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let mut child = Command::new(bin)
+        .arg("repl")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"let x = 21\nx * 2\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("42"));
+}
+
+#[test]
+fn fmt_subcommand_rewrites_in_place_and_is_idempotent() {
+    let file = std::env::temp_dir().join(format!("ascript_fmt_{}.as", std::process::id()));
+    // A deliberately messy source: cramped spacing, no spaces around `=`/operators.
+    std::fs::write(&file, "let   x=1+2\nfn f(a,b){return a+b}").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    // First format: should succeed and rewrite the file to canonical form.
+    let out = Command::new(bin).arg("fmt").arg(&file).output().unwrap();
+    assert!(out.status.success(), "fmt failed: {:?}", out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("formatted"));
+
+    let after = std::fs::read_to_string(&file).unwrap();
+    // The messy input must have changed to canonical, spaced form.
+    assert_ne!(after, "let   x=1+2\nfn f(a,b){return a+b}");
+    assert!(after.contains("let x = 1 + 2"), "got: {after:?}");
+
+    // Second format: idempotent — running fmt again leaves the file unchanged.
+    let out2 = Command::new(bin).arg("fmt").arg(&file).output().unwrap();
+    assert!(out2.status.success(), "second fmt failed: {:?}", out2);
+    let after2 = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(after, after2, "fmt must be idempotent");
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn test_runner_reports_pass_and_fail() {
+    let file = std::env::temp_dir().join(format!("ascript_tr_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "test(\"adds\", () => { assert(1 + 1 == 2) })\ntest(\"fails\", () => { assert(false, \"boom\") })",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = std::process::Command::new(bin).arg("test").arg(&file).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(s.contains("1 passed") || s.contains("passed"));
+    assert!(s.contains("fails") && s.contains("boom"));
+    assert!(!out.status.success()); // a failing test → non-zero exit
 }

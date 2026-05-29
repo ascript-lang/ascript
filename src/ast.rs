@@ -21,7 +21,7 @@ pub enum ExprKind {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Assign { target: Box<Expr>, value: Box<Expr> },
-    Arrow { params: Vec<Param>, body: Box<ArrowBody> },
+    Arrow { params: Vec<Param>, body: Box<ArrowBody>, is_async: bool },
     Array(Vec<Expr>),
     Index { object: Box<Expr>, index: Box<Expr> },
     Object(Vec<(String, Expr)>),
@@ -30,6 +30,7 @@ pub enum ExprKind {
     Try(Box<Expr>),
     Template { parts: Vec<TemplatePart> },
     Match { subject: Box<Expr>, arms: Vec<MatchArm> },
+    Await(Box<Expr>),
     /// A parenthesized expression, kept distinct (not flattened) so parentheses
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
     /// short-circuiting (spec §4, matching JS).
@@ -114,7 +115,7 @@ pub enum Stmt {
     Return(Option<Expr>),
     Break,
     Continue,
-    Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt> },
+    Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt>, is_async: bool },
     Enum { name: String, variants: Vec<EnumVariantDecl> },
     Class { name: String, superclass: Option<String>, methods: Vec<MethodDecl> },
     Import { names: ImportNames, source: String },
@@ -133,6 +134,7 @@ pub struct MethodDecl {
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Vec<Stmt>,
+    pub is_async: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +250,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Try(e) => write!(f, "(? {})", e),
             ExprKind::Template { .. } => write!(f, "(template)"),
             ExprKind::Match { .. } => write!(f, "(match)"),
+            ExprKind::Await(e) => write!(f, "(await {})", e),
             ExprKind::Paren(inner) => write!(f, "{}", inner),
         }
     }
