@@ -30,6 +30,7 @@ pub enum Stmt {
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
+    ForRange { var: String, start: Expr, end: Expr, body: Vec<Stmt> },
 }
 
 #[derive(Clone, Copy, Debug)]

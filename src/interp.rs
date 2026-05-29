@@ -55,6 +55,21 @@ impl Interp {
                     self.exec(body, &child).await?;
                 }
             }
+            Stmt::ForRange { var, start, end, body } => {
+                let start_v = self.eval_expr(start, env).await?;
+                let end_v = self.eval_expr(end, env).await?;
+                let (lo, hi) = match (start_v, end_v) {
+                    (Value::Number(a), Value::Number(b)) => (a, b),
+                    _ => return Err(AsError::at("for-range bounds must be numbers", start.span)),
+                };
+                let mut i = lo;
+                while i < hi {
+                    let child = env.child();
+                    child.define(var, Value::Number(i), false).map_err(AsError::new)?;
+                    self.exec(body, &child).await?;
+                    i += 1.0;
+                }
+            }
         }
         Ok(())
     }
@@ -336,5 +351,26 @@ mod tests {
         let env = Environment::global();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "15\n");
+    }
+
+    #[tokio::test]
+    async fn for_range_iterates_half_open() {
+        let src = "let sum = 0\nfor (i in 0..5) { sum += i }\nprint(sum)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        // 0 + 1 + 2 + 3 + 4
+        assert_eq!(interp.output, "10\n");
+    }
+
+    #[tokio::test]
+    async fn for_range_loop_var_is_scoped_per_iteration() {
+        let src = "for (i in 0..3) { print(i) }";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "0\n1\n2\n");
     }
 }

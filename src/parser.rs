@@ -71,6 +71,7 @@ impl<'a> Parser<'a> {
             Tok::LBrace => Ok(Stmt::Block(self.block()?)),
             Tok::If => self.if_stmt(),
             Tok::While => self.while_stmt(),
+            Tok::For => self.for_stmt(),
             _ => Ok(Stmt::Expr(self.expr()?)),
         }
     }
@@ -114,6 +115,27 @@ impl<'a> Parser<'a> {
         self.eat(&Tok::RParen)?;
         let body = self.block()?;
         Ok(Stmt::While { cond, body })
+    }
+
+    fn for_stmt(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::For)?;
+        self.eat(&Tok::LParen)?;
+        let var = match self.advance() {
+            Tok::Ident(name) => name,
+            other => {
+                return Err(AsError::at(
+                    format!("expected a loop variable name, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
+        };
+        self.eat(&Tok::In)?;
+        let start = self.expr()?;
+        self.eat(&Tok::DotDot)?;
+        let end = self.expr()?;
+        self.eat(&Tok::RParen)?;
+        let body = self.block()?;
+        Ok(Stmt::ForRange { var, start, end, body })
     }
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {

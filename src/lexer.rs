@@ -121,6 +121,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     i += 1;
                 }
             }
+            '.' => {
+                if i + 1 < chars.len() && chars[i + 1] == '.' {
+                    tokens.push(Token { tok: Tok::DotDot, span: Span::new(start, start + 2) });
+                    i += 2;
+                } else {
+                    return Err(AsError::at(
+                        "unexpected character '.' (member access arrives in Milestone 3)",
+                        Span::new(start, start + 1),
+                    ));
+                }
+            }
             '%' => push(&mut tokens, Tok::Percent, start, &mut i),
             '(' => push(&mut tokens, Tok::LParen, start, &mut i),
             ')' => push(&mut tokens, Tok::RParen, start, &mut i),
@@ -146,7 +157,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 while j < chars.len() && chars[j].is_ascii_digit() {
                     j += 1;
                 }
-                if j < chars.len() && chars[j] == '.' {
+                if j + 1 < chars.len() && chars[j] == '.' && chars[j + 1].is_ascii_digit() {
                     j += 1;
                     while j < chars.len() && chars[j].is_ascii_digit() {
                         j += 1;
@@ -174,6 +185,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "if" => Tok::If,
                     "else" => Tok::Else,
                     "while" => Tok::While,
+                    "for" => Tok::For,
+                    "in" => Tok::In,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });

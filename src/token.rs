@@ -42,6 +42,9 @@ pub enum Tok {
     If,
     Else,
     While,
+    DotDot,
+    For,
+    In,
     Eof,
 }
 
