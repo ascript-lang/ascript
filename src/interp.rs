@@ -176,7 +176,9 @@ impl Interp {
         let exports_list = crate::stdlib::std_module_exports(source).ok_or_else(|| {
             Control::Panic(AsError::new(format!("unknown standard library module '{}'", source)))
         })?;
-        let env = global_env();
+        // Child of the global env so an export whose name collides with a global
+        // builtin (e.g. std/regex exports `test`) shadows it rather than erroring.
+        let env = global_env().child();
         let exports = Rc::new(RefCell::new(HashSet::new()));
         for (name, value) in exports_list {
             env.define(&name, value, false).map_err(AsError::new)?;
@@ -1056,6 +1058,8 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Object(_) => "object",
         Value::Map(_) => "map",
         Value::Bytes(_) => "bytes",
+        #[cfg(feature = "data")]
+        Value::Regex(_) => "regex",
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
@@ -1234,6 +1238,18 @@ mod tests {
                    print(text)\n\
                    print(encoding.urlEncode(\"a b&c\"))";
         assert_eq!(run(src).await, "aGk=\n4142\nhello\na%20b%26c\n");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_regex_end_to_end() {
+        let src = "import * as regex from \"std/regex\"\n\
+                   let [re, err] = regex.compile(\"\\\\d+\")\n\
+                   print(regex.test(re, \"abc123\"))\n\
+                   print(regex.findAll(re, \"a1 b22 c333\"))\n\
+                   print(regex.replace(re, \"x9y\", \"#\"))\n\
+                   print(type(re))";
+        assert_eq!(run(src).await, "true\n[\"1\", \"22\", \"333\"]\nx#y\nregex\n");
     }
 
     #[tokio::test]

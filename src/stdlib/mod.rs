@@ -14,6 +14,8 @@ pub mod json;
 pub mod map;
 pub mod math;
 pub mod object;
+#[cfg(feature = "data")]
+pub mod regex;
 pub mod string;
 
 use crate::error::AsError;
@@ -42,6 +44,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/json" => json::exports(),
         #[cfg(feature = "data")]
         "std/encoding" => encoding::exports(),
+        #[cfg(feature = "data")]
+        "std/regex" => regex::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -68,6 +72,8 @@ impl Interp {
             "json" => json::call(func, args, span),
             #[cfg(feature = "data")]
             "encoding" => encoding::call(func, args, span),
+            #[cfg(feature = "data")]
+            "regex" => regex::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }
