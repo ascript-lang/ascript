@@ -31,8 +31,10 @@ working, tested software on its own.
   arrays/strings, template strings, string `+` concat, trailing commas, `Paren`
   node. 86 lib + 5 integration tests. Merged. (Map kind → M8: no literal syntax.)
   Plan: `plans/2026-05-29-ascript-m4-data-structures.md`.
-- ⬜ **M5 — Result & error model.** `Ok`/`Err`, the `?` propagation operator,
-  Result tier vs panic tier, `recover` boundary (spec §6).
+- ✅ **M5 — Result & error model.** `Control { Panic, Propagate }` error channel;
+  `Ok`/`Err` + error objects; the `?` propagation operator; `assert`; panic tier
+  (unrecoverable abort); `recover` (panic→Result). 94 lib + 6 integration tests.
+  Merged. Plan: `plans/2026-05-29-ascript-m5-result-error-model.md`.
 - ⬜ **M6 — Gradual type contracts.** Annotation grammar; runtime contract checks
   at bindings/params/returns; `error`/`Result<T>` types; `array<T>`/`map<K,V>`
   depth checks; contract failures panic.
@@ -134,3 +136,19 @@ working, tested software on its own.
   returning an `AsError` would close it across the board — future hardening.
 - **`(x) = 5`** (parenthesized assignment target) is rejected as "invalid
   assignment target" (Paren not assignable). Acceptable; revisit only if needed.
+
+### M6 design guidance (from M5 holistic review — read before planning M6)
+
+- **Contracts reuse the Panic tier:** a failed type contract is just
+  `Control::Panic(AsError::at(...))`, exactly like `assert` (`interp.rs` assert arm).
+  No new control mechanism needed; `recover` catches contract failures for free.
+- **Annotation grammar:** the `Colon` token (M4) already exists for `name: Type`.
+  Add type parsing for `let x: T = …`, `fn f(p: T): R { }`. Check contracts at
+  bind/param/return sites; failure → panic.
+- **`Result<T>` / `error` types** reference the pair shape: `Ok`→`[v,nil]`,
+  `Err`→`[nil,{message}]`, `len()==2` invariant. Extract shared predicates
+  (`is_result_pair`, `is_error_object`) — currently the structural check lives
+  inline in the `Try` arm; share it so M6's `Result<T>` validation can't drift.
+  Route construction through `make_pair`/`make_error` (the canonical builders).
+- **Parametric depth (spec §5):** `array<T>`/`map<K,V>` contracts check eagerly to
+  full declared depth at the check site; `any`/unparameterized opt out.
