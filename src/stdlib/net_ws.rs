@@ -4,6 +4,10 @@
 //!
 //! - `connect(url, opts?) -> [conn, err]` — async; opens a client WebSocket to a
 //!   `ws://` or `wss://` URL. (`wss://` rides tokio-tungstenite's rustls support.)
+//!   `opts.headers` (an object of string→string) and `opts.auth` (`{bearer: tok}` →
+//!   `Authorization: Bearer tok`; `{basic: [user, pass]}` → `Authorization: Basic
+//!   <base64(user:pass)>`) are applied to the handshake request — mirroring the
+//!   `std/net/http` client's `headers`/`auth` opts for consistency.
 //! - `listen(host, port) -> [wsListener, err]` — binds a `TcpListener`. The handle's
 //!   `fields` carry the bound `port` (so `listen("127.0.0.1", 0)` is usable: read the
 //!   OS-assigned port off `wsListener.port`).
@@ -48,15 +52,18 @@
 //! `Sink<Message>` (which every `WebSocketStream<T>` is), so `send`/`recv` dispatch is
 //! identical regardless of origin.
 
-use super::{arg, bi, want_string};
+use super::{arg, bi, want_array, want_string};
 use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
 use crate::value::{NativeKind, NativeMethod, Value};
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::client::ClientRequestBuilder;
+use tokio_tungstenite::tungstenite::http::Uri;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -100,6 +107,98 @@ fn bytes_value(b: Vec<u8>) -> Value {
     Value::Bytes(Rc::new(RefCell::new(b)))
 }
 
+/// Parse `connect`'s optional `opts` into a flat list of handshake request headers.
+///
+/// `opts.headers` is an object of string→string; `opts.auth` is `{bearer: tok}` (→
+/// `Authorization: Bearer tok`) or `{basic: [user, pass?]}` (→ `Authorization: Basic
+/// <base64(user:pass)>`). nil/absent opts → no headers. Mirrors the `std/net/http`
+/// client's `headers`/`auth` shape; misuse (non-object opts/headers/auth, bad auth
+/// shape) is a Tier-2 panic.
+fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>, Control> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let obj = match opts {
+        Value::Nil => return Ok(out),
+        Value::Object(o) => o,
+        other => {
+            return Err(AsError::at(
+                format!(
+                    "net/ws.connect opts expects an object, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into());
+        }
+    };
+    let obj = obj.borrow();
+
+    // headers: object of string→string.
+    if let Some(h) = obj.get("headers") {
+        let map = match h {
+            Value::Object(o) => o,
+            other => {
+                return Err(AsError::at(
+                    format!(
+                        "net/ws.connect headers expects an object, got {}",
+                        crate::interp::type_name(other)
+                    ),
+                    span,
+                )
+                .into());
+            }
+        };
+        for (k, v) in map.borrow().iter() {
+            let vs = want_string(v, span, "net/ws.connect header value")?;
+            out.push((k.clone(), vs.to_string()));
+        }
+    }
+
+    // auth: {bearer: tok} or {basic: [user, pass?]}.
+    if let Some(a) = obj.get("auth") {
+        let ao = match a {
+            Value::Object(o) => o,
+            other => {
+                return Err(AsError::at(
+                    format!(
+                        "net/ws.connect auth expects an object, got {}",
+                        crate::interp::type_name(other)
+                    ),
+                    span,
+                )
+                .into());
+            }
+        };
+        let ao = ao.borrow();
+        if let Some(tok) = ao.get("bearer") {
+            let tok = want_string(tok, span, "net/ws.connect auth.bearer")?;
+            out.push(("Authorization".to_string(), format!("Bearer {}", tok)));
+        } else if let Some(basic) = ao.get("basic") {
+            let arr = want_array(basic, span, "net/ws.connect auth.basic")?;
+            let arr = arr.borrow();
+            let user = want_string(
+                arr.first().unwrap_or(&Value::Nil),
+                span,
+                "net/ws.connect auth.basic[0]",
+            )?;
+            let pass = match arr.get(1) {
+                Some(Value::Nil) | None => String::new(),
+                Some(p) => want_string(p, span, "net/ws.connect auth.basic[1]")?.to_string(),
+            };
+            let creds = base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", user, pass));
+            out.push(("Authorization".to_string(), format!("Basic {}", creds)));
+        } else {
+            return Err(AsError::at(
+                "net/ws.connect auth expects {bearer} or {basic:[user,pass]}",
+                span,
+            )
+            .into());
+        }
+    }
+
+    Ok(out)
+}
+
 impl Interp {
     /// Module-level dispatch for `std/net/ws` (`connect`/`listen`).
     pub(crate) async fn call_net_ws(
@@ -117,7 +216,30 @@ impl Interp {
 
     async fn ws_connect(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
         let url = want_string(&arg(args, 0), span, "net/ws.connect url")?;
-        match tokio_tungstenite::connect_async(url.as_ref()).await {
+        // opts.headers / opts.auth → handshake request headers (Tier-2 on misuse,
+        // consistent with the std/net/http client). nil/absent opts → no headers.
+        let headers = ws_connect_headers(&arg(args, 1), span)?;
+
+        let result = if headers.is_empty() {
+            // No custom headers: connect straight from the URL string.
+            tokio_tungstenite::connect_async(url.as_ref()).await
+        } else {
+            // Custom headers require a ClientRequestBuilder, which is built from a
+            // parsed `http::Uri`. A malformed URL surfaces as a Tier-1 connect err.
+            let uri: Uri = match url.parse() {
+                Ok(u) => u,
+                Err(e) => {
+                    return Ok(err_pair(format!("net/ws.connect invalid url {}: {}", url, e)));
+                }
+            };
+            let mut builder = ClientRequestBuilder::new(uri);
+            for (k, v) in headers {
+                builder = builder.with_header(k, v);
+            }
+            tokio_tungstenite::connect_async(builder).await
+        };
+
+        match result {
             Ok((stream, _resp)) => {
                 let handle = self.register_resource(
                     NativeKind::WsConnection,
@@ -341,6 +463,119 @@ mod tests {
             }
         });
         port
+    }
+
+    /// Spawn a one-shot ws server that CAPTURES the handshake request headers (via
+    /// `accept_hdr_async` + a closure `Callback`), echoes one message, and reports the
+    /// captured headers over a oneshot channel. Returns `(port, header_receiver)`.
+    /// Headers come back as lowercased `name: value` lines joined by '\n' for easy
+    /// substring assertions.
+    // The handshake `Callback` returns tungstenite's `Result<Response, ErrorResponse>`;
+    // the large `Err` variant is dictated by that external trait, not our choice.
+    #[allow(clippy::result_large_err)]
+    async fn spawn_header_capturing_server(
+    ) -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            // The `Callback` (an FnOnce) runs synchronously during the handshake; it
+            // owns `tx` and sends the captured headers directly — no shared cell, so
+            // the spawned future stays `Send`.
+            let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                                 resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                let mut s = String::new();
+                for (name, value) in req.headers().iter() {
+                    s.push_str(name.as_str());
+                    s.push_str(": ");
+                    s.push_str(value.to_str().unwrap_or(""));
+                    s.push('\n');
+                }
+                tx.send(s).ok();
+                Ok(resp)
+            };
+            let mut ws = tokio_tungstenite::accept_hdr_async(tcp, callback)
+                .await
+                .expect("handshake");
+            // Echo one message so the client's round-trip completes.
+            if let Some(Ok(msg)) = ws.next().await {
+                ws.send(msg).await.ok();
+            }
+        });
+        (port, rx)
+    }
+
+    #[tokio::test]
+    async fn connect_sends_custom_headers_and_auth_at_handshake() {
+        let (port, rx) = spawn_header_capturing_server().await;
+        let src = format!(
+            r#"
+import {{ connect }} from "std/net/ws"
+let [conn, err] = connect("ws://127.0.0.1:{port}", {{
+  headers: {{ "x-test": "yes" }},
+  auth: {{ bearer: "tok" }}
+}})
+print(err)
+await conn.send("hi")
+let [msg, _r] = await conn.recv()
+print(msg)
+conn.close()
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "nil\nhi\n");
+        let headers = rx.await.expect("server should report captured headers");
+        assert!(headers.contains("x-test: yes"), "missing x-test header in:\n{}", headers);
+        assert!(
+            headers.contains("authorization: Bearer tok"),
+            "missing bearer auth header in:\n{}",
+            headers
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_basic_auth_sends_base64_authorization() {
+        let (port, rx) = spawn_header_capturing_server().await;
+        let src = format!(
+            r#"
+import {{ connect }} from "std/net/ws"
+let [conn, err] = connect("ws://127.0.0.1:{port}", {{
+  auth: {{ basic: ["user", "pass"] }}
+}})
+print(err)
+await conn.send("hi")
+let [_m, _r] = await conn.recv()
+conn.close()
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "nil\n");
+        let headers = rx.await.expect("server should report captured headers");
+        // base64("user:pass") == "dXNlcjpwYXNz"
+        assert!(
+            headers.contains("authorization: Basic dXNlcjpwYXNz"),
+            "missing/incorrect basic auth header in:\n{}",
+            headers
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_with_non_object_opts_is_tier2_panic() {
+        let port = spawn_ws_echo_server().await;
+        let src = format!(
+            r#"
+import {{ connect }} from "std/net/ws"
+let [conn, _e] = connect("ws://127.0.0.1:{port}", 42)
+print(conn)
+"#
+        );
+        let err = crate::run_source(&src).await.expect_err("non-object opts must panic");
+        assert!(
+            err.to_string().contains("opts expects an object"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[tokio::test]
