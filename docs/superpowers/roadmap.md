@@ -35,9 +35,12 @@ working, tested software on its own.
   `Ok`/`Err` + error objects; the `?` propagation operator; `assert`; panic tier
   (unrecoverable abort); `recover` (panic→Result). 94 lib + 6 integration tests.
   Merged. Plan: `plans/2026-05-29-ascript-m5-result-error-model.md`.
-- ⬜ **M6 — Gradual type contracts.** Annotation grammar; runtime contract checks
-  at bindings/params/returns; `error`/`Result<T>` types; `array<T>`/`map<K,V>`
-  depth checks; contract failures panic.
+- ✅ **M6 — Gradual type contracts.** Optional annotations on let/const/params/
+  returns; recursive `check_type` enforced at runtime (failure → recover-able
+  panic); `number/string/bool/nil/any/fn/object/error`, `array<T>`, `Result<T>`
+  (accepts Ok+Err), tuple, union. Also fixed: `//` + `/* */` comments (were
+  missing). 107 lib + 7 integration tests. Merged. (map types → M8; class/enum
+  types → M7.) Plan: `plans/2026-05-29-ascript-m6-type-contracts.md`.
 - ⬜ **M7 — Classes & enums + match.** `class`/`extends`/`super`/`self`/`init`;
   simple enums; `match` expression with patterns.
 - ⬜ **M8 — Modules.** ESM `import`/`export`, namespace import, module graph +
@@ -152,3 +155,25 @@ working, tested software on its own.
   Route construction through `make_pair`/`make_error` (the canonical builders).
 - **Parametric depth (spec §5):** `array<T>`/`map<K,V>` contracts check eagerly to
   full declared depth at the check site; `any`/unparameterized opt out.
+
+### M7 design guidance (from M6 holistic review — read before planning M7)
+
+- **`Type::Named(String)`** is the new type variant for class/enum names. The
+  parser's `parse_type_atom` unknown-ident arm (currently errors "Milestone 7")
+  becomes `Tok::Ident(name) => Type::Named(name)` AFTER the known-primitive
+  matches. The `map` arm stays deferred to M8.
+- **`check_type` gains a `Named` arm:** inspect the value's class/enum tag. Needs
+  class instances + enum values to carry their declared name. Enum types "accept
+  any variant" (name-membership check, not structural — spec §5).
+- **Classes:** `class`/`extends`/`super`/`self`/`init`; instances are tagged
+  objects (reuse `Value::Object` + a class tag, or a dedicated instance value).
+  Method resolution walks the class chain. `Type::Display`/`contract_panic` already
+  handle a `Named` variant with `write!("{}", name)`.
+- **Enums:** simple named variants (spec §8.2), optional backing value; interned
+  tagged values; usable in `match` and as a `Named` contract type.
+- **`match` expression:** patterns over literals, enum variants, `_` wildcard,
+  or-patterns. Reuses the `match` keyword/tokens already lexed (M2 added `match`?
+  check — if not, add the keyword).
+- **Carried-over (not new):** `Ok(nil)` is structurally indistinguishable from an
+  Err's nil success slot under Result checking — inherent to Result-as-[T,error],
+  matches spec; do not try to "fix".
