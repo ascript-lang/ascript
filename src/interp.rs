@@ -438,20 +438,31 @@ impl Interp {
             )
             .into());
         }
-        // New scope chained to the closure's captured environment.
+        // bind + check params
         let call_env = func.closure.child();
         for (param, arg) in func.params.iter().zip(args.into_iter()) {
+            if let Some(ty) = &param.ty {
+                if !check_type(&arg, ty) {
+                    return Err(contract_panic(ty, &arg, span));
+                }
+            }
             call_env.define(&param.name, arg, true).map_err(AsError::new)?;
         }
-        match self.exec(&func.body, &call_env).await {
-            Ok(Flow::Return(v)) => Ok(v),
-            Ok(Flow::Normal) => Ok(Value::Nil),
-            Ok(Flow::Break) => Err(AsError::at("'break' outside of a loop", span).into()),
-            Ok(Flow::Continue) => Err(AsError::at("'continue' outside of a loop", span).into()),
-            // A `?` inside the body wants THIS function to return the pair.
-            Err(Control::Propagate(v)) => Ok(v),
-            Err(Control::Panic(e)) => Err(Control::Panic(e)),
+        // execute, then check the return type
+        let result = match self.exec(&func.body, &call_env).await {
+            Ok(Flow::Return(v)) => v,
+            Ok(Flow::Normal) => Value::Nil,
+            Ok(Flow::Break) => return Err(AsError::at("'break' outside of a loop", span).into()),
+            Ok(Flow::Continue) => return Err(AsError::at("'continue' outside of a loop", span).into()),
+            Err(Control::Propagate(v)) => v,
+            Err(Control::Panic(e)) => return Err(Control::Panic(e)),
+        };
+        if let Some(ty) = &func.ret {
+            if !check_type(&result, ty) {
+                return Err(contract_panic(ty, &result, span));
+            }
         }
+        Ok(result)
     }
 
     #[async_recursion(?Send)]
@@ -719,6 +730,50 @@ print(bad[1].message)
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "42\nnot a number\n");
+    }
+
+    #[tokio::test]
+    async fn param_contract_enforced() {
+        let src = "fn double(n: number): number { return n * 2 }\nprint(double(\"x\"))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("type contract violated"));
+        assert!(err.message.contains("expected number"));
+    }
+
+    #[tokio::test]
+    async fn return_contract_enforced() {
+        // returns a string but annotated number
+        let src = "fn f(): number { return \"nope\" }\nf()";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("type contract violated"));
+    }
+
+    #[tokio::test]
+    async fn typed_function_happy_path() {
+        let src = "fn add(a: number, b: number): number { return a + b }\nprint(add(2, 3))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "5\n");
+    }
+
+    #[tokio::test]
+    async fn contract_failure_is_recoverable() {
+        // a contract panic is catchable by recover (it's a Panic, M5)
+        let src = "fn f(n: number) { return n }\nlet r = recover(() => f(\"bad\"))\nprint(r[0])\nprint(r[1].message)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert!(interp.output.starts_with("nil\n"));
+        assert!(interp.output.contains("type contract violated"));
     }
 
     #[tokio::test]
