@@ -597,6 +597,16 @@ impl Interp {
                         n as usize
                     }
                 };
+                // read(0) is a no-op: return an empty chunk WITHOUT touching the
+                // resource. (An empty read buffer yields Ok(0), which the match below
+                // treats as EOF and would finalize a still-open pipe.)
+                if n == 0 {
+                    let capture = match self.proc_reader_mut(id) {
+                        Some((_, c)) => c,
+                        None => return Ok(Value::Nil), // gone → EOF
+                    };
+                    return Ok(captured_value(Vec::new(), capture));
+                }
                 // A Reader degrades to EOF (nil) once its resource is gone, rather
                 // than panicking: EOF is a reader's natural terminal state.
                 let (reader, capture) = match self.proc_reader_mut(id) {
@@ -640,6 +650,10 @@ impl Interp {
                 }
             }
             "readToEnd" => {
+                // Note: a gone (already-drained) reader returns nil here, whereas
+                // net/tcp's readToEnd returns empty bytes. The divergence is cosmetic;
+                // a process reader has no retained `capture` once finalized, so an
+                // empty value can't be produced in the right Str/Bytes shape.
                 let (reader, capture) = match self.proc_reader_mut(id) {
                     Some(r) => r,
                     None => return Ok(Value::Nil), // gone → EOF
@@ -926,6 +940,22 @@ print(all)
 await child.wait()
 "#).await;
         assert_eq!(out, "abc\n");
+    }
+
+    #[tokio::test]
+    async fn read_zero_returns_empty_without_finalizing() {
+        // read(0) must return an empty chunk WITHOUT finalizing the reader; a later
+        // read must still drain the real output (proves the reader wasn't closed).
+        let out = run(r#"
+import { spawn } from "std/process"
+let [child, _] = spawn("sh", ["-c", "printf 'abc'"])
+let empty = await child.stdout.read(0)
+print(len(empty))
+let rest = await child.stdout.readToEnd()
+print(rest)
+await child.wait()
+"#).await;
+        assert_eq!(out, "0\nabc\n");
     }
 
     #[tokio::test]

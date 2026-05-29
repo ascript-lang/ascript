@@ -177,6 +177,12 @@ impl Interp {
                         n as usize
                     }
                 };
+                // read(0) is a no-op: return empty bytes WITHOUT touching the resource.
+                // (Otherwise an empty read buffer yields Ok(0), which the match below
+                // treats as EOF and would finalize a still-open socket.)
+                if n == 0 {
+                    return Ok(bytes_value(Vec::new()));
+                }
                 // A closed/EOF'd stream degrades to nil rather than panicking.
                 let stream = match self.tcp_stream_mut(id) {
                     Some(s) => s,
@@ -218,9 +224,11 @@ impl Interp {
                 }
             }
             "readToEnd" => {
+                // readToEnd is type-stable: it ALWAYS returns bytes (empty if the
+                // stream was already drained / finalized), matching `readToEnd()→bytes`.
                 let stream = match self.tcp_stream_mut(id) {
                     Some(s) => s,
-                    None => return Ok(bytes_value(Vec::new())), // gone → empty
+                    None => return Ok(bytes_value(Vec::new())), // gone → empty bytes
                 };
                 let mut buf = Vec::new();
                 match stream.read_to_end_bytes(&mut buf).await {
@@ -344,6 +352,28 @@ stream.close()
         );
         let out = run(&src).await;
         assert_eq!(out, "nil\nnil\nhello\n");
+    }
+
+    #[tokio::test]
+    async fn read_zero_returns_empty_bytes_without_finalizing() {
+        // read(0) must return empty bytes WITHOUT closing the socket; a subsequent
+        // read() must still see real echoed data (proves the stream wasn't finalized).
+        let port = spawn_echo_peer().await;
+        let src = format!(
+            r#"
+import {{ connect }} from "std/net/tcp"
+let [stream, _e] = connect("127.0.0.1", {port})
+await stream.write("abc")
+let empty = await stream.read(0)
+print(type(empty))
+print(len(empty))
+let chunk = await stream.read()
+print(len(chunk))
+stream.close()
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "bytes\n0\n3\n");
     }
 
     #[tokio::test]
