@@ -80,7 +80,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "format" => {
             let template = want_string(&arg(args, 0), span, &ctx("format"))?;
-            Ok(str_val(format_template(&template, &args[1.min(args.len())..], span)?))
+            Ok(str_val(format_template(&template, args.get(1..).unwrap_or(&[]), span)?))
         }
         "padStart" | "padEnd" => {
             let s = want_string(&arg(args, 0), span, &ctx(func))?;
@@ -101,6 +101,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "repeat" => {
             let s = want_string(&arg(args, 0), span, &ctx("repeat"))?;
             let n = want_number(&arg(args, 1), span, &ctx("repeat"))?;
+            // `n` truncates toward zero (and NaN → 0), matching `clamp_index`'s convention.
             if n < 0.0 {
                 return Err(AsError::at("string.repeat count must be non-negative", span).into());
             }
@@ -112,6 +113,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 
 /// `format("Hello {}, you are {}", name, age)`. `{}` consumes the next argument
 /// in order; `{{` and `}}` are literal braces. Too few args → panic.
+/// A lone `{` (not followed by `{` or `}`) and a lone `}` fall through to literal
+/// passthrough — deliberate lenient behavior.
 fn format_template(template: &str, args: &[Value], span: Span) -> Result<String, Control> {
     let mut out = String::new();
     let mut chars = template.chars().peekable();
@@ -173,6 +176,23 @@ mod tests {
         assert_eq!(call("padStart", &[s("7"), Value::Number(3.0), s("0")], sp()).unwrap(), s("007"));
         assert_eq!(call("padEnd", &[s("7"), Value::Number(3.0)], sp()).unwrap(), s("7  "));
         assert_eq!(call("repeat", &[s("ab"), Value::Number(3.0)], sp()).unwrap(), s("ababab"));
+    }
+
+    #[test]
+    fn edge_branches() {
+        let sp = sp();
+        // empty separator splits into chars
+        assert_eq!(call("split", &[s("abc"), s("")], sp).unwrap().to_string(), "[\"a\", \"b\", \"c\"]");
+        // padStart when already wide enough returns unchanged
+        assert_eq!(call("padStart", &[s("hello"), Value::Number(3.0), s("0")], sp).unwrap(), s("hello"));
+        // slice start >= end → empty
+        assert_eq!(call("slice", &[s("hello"), Value::Number(4.0), Value::Number(2.0)], sp).unwrap(), s(""));
+        // empty `from` in replace returns input unchanged
+        assert_eq!(call("replace", &[s("abc"), s(""), s("X")], sp).unwrap(), s("abc"));
+        // negative repeat count → panic
+        assert!(matches!(call("repeat", &[s("a"), Value::Number(-1.0)], sp), Err(Control::Panic(_))));
+        // standalone }} escape
+        assert_eq!(call("format", &[s("a}}b")], sp).unwrap(), s("a}b"));
     }
 
     #[test]
