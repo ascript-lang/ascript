@@ -877,6 +877,7 @@ impl Interp {
                     Value::Str(s) => s.chars().count(),
                     Value::Array(a) => a.borrow().len(),
                     Value::Object(o) => o.borrow().len(),
+                    Value::Map(m) => m.borrow().len(),
                     _ => {
                         return Err(AsError::at(
                             format!("len() expects a string, array, object, or map, got {}", type_name(&v)),
@@ -1024,6 +1025,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Builtin(_) | Value::Function(_) => "function",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+        Value::Map(_) => "map",
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
@@ -1090,6 +1092,13 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
             Value::EnumVariant(v) => &v.enum_name == name,
             _ => false,
         },
+        Type::Map(k, v) => match value {
+            Value::Map(m) => m
+                .borrow()
+                .iter()
+                .all(|(mk, val)| check_type(&mk.to_value(), k) && check_type(val, v)),
+            _ => false,
+        },
     }
 }
 
@@ -1144,6 +1153,27 @@ mod tests {
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn std_map_end_to_end() {
+        let src = "import * as map from \"std/map\"\n\
+                   let m = map.new()\n\
+                   map.set(m, \"x\", 10)\n\
+                   map.set(m, \"y\", 20)\n\
+                   print(map.get(m, \"x\"))\n\
+                   print(len(m))\n\
+                   print(map.keys(m))\n\
+                   print(map.values(m))";
+        assert_eq!(run(src).await, "10\n2\n[\"x\", \"y\"]\n[10, 20]\n");
+    }
+
+    #[tokio::test]
+    async fn map_type_contract_enforced() {
+        let ok = run("import * as map from \"std/map\"\nlet m: map<string, number> = map.new()\nmap.set(m, \"a\", 1)\nprint(len(m))").await;
+        assert_eq!(ok, "1\n");
+        let err = run_err("let m: map<string, number> = 5").await;
+        assert!(err.message.contains("type contract violated"));
     }
 
     #[tokio::test]

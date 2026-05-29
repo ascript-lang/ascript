@@ -328,10 +328,14 @@ impl<'a> Parser<'a> {
                     self.eat(&Tok::Gt)?;
                     Ok(Type::Result(Box::new(inner)))
                 }
-                "map" => Err(AsError::at(
-                    "map<K,V> type annotations arrive in Milestone 8",
-                    span,
-                )),
+                "map" => {
+                    self.eat(&Tok::Lt)?;
+                    let k = self.parse_type()?;
+                    self.eat(&Tok::Comma)?;
+                    let v = self.parse_type()?;
+                    self.eat(&Tok::Gt)?;
+                    Ok(Type::Map(Box::new(k), Box::new(v)))
+                }
                 _ => Ok(Type::Named(name)),
             },
             other => Err(AsError::at(format!("expected a type, found {:?}", other), span)),
@@ -1015,6 +1019,16 @@ mod tests {
                 assert!(*mutable);
             }
             other => panic!("expected LetDestructure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_map_type_annotation() {
+        let toks = lex("let m: map<string, number> = empty").unwrap();
+        let prog = parse(&toks).unwrap();
+        match &prog[0] {
+            Stmt::Let { ty: Some(t), .. } => assert_eq!(t.to_string(), "map<string, number>"),
+            other => panic!("expected typed let, got {other:?}"),
         }
     }
 

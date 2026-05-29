@@ -5,6 +5,7 @@
 //! are ordinary `function` values; argument-type misuse is a Tier-2 panic.
 
 pub mod array;
+pub mod map;
 pub mod math;
 pub mod object;
 pub mod string;
@@ -28,6 +29,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/string" => string::exports(),
         "std/array" => array::exports(),
         "std/object" => object::exports(),
+        "std/map" => map::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -47,6 +49,7 @@ impl Interp {
             "string" => string::call(func, args, span),
             "array" => self.call_array(func, args, span).await,
             "object" => object::call(func, args, span),
+            "map" => map::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

@@ -53,6 +53,7 @@ pub enum Type {
     Tuple(Vec<Type>),
     Union(Box<Type>, Box<Type>),
     Named(String),
+    Map(Box<Type>, Box<Type>),
 }
 
 /// A function parameter: a name with an optional type annotation.
@@ -87,6 +88,7 @@ impl std::fmt::Display for Type {
             }
             Type::Union(a, b) => write!(f, "{} | {}", a, b),
             Type::Named(n) => write!(f, "{}", n),
+            Type::Map(k, v) => write!(f, "map<{}, {}>", k, v),
         }
     }
 }
