@@ -313,6 +313,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "enum" => Tok::Enum,
                     "match" => Tok::Match,
                     "class" => Tok::Class,
+                    "import" => Tok::Import,
+                    "export" => Tok::Export,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });

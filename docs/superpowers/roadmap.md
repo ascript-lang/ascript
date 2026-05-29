@@ -47,8 +47,10 @@ working, tested software on its own.
   or-patterns, parsed below arrow precedence), `Type::Named` contracts
   (subclass-aware). 120 lib + 8 integration tests. Merged.
   Plan: `plans/2026-05-29-ascript-m7-classes-enums-match.md`.
-- ⬜ **M8 — Modules.** ESM `import`/`export`, namespace import, module graph +
-  once-only evaluation + cache.
+- ✅ **M8 — Modules.** `export` decls, named + namespace (`* as`) imports, relative
+  `.as` path resolution, once-only cached eval, circular-import partial-init,
+  `run_file` entry point + module loader. 120 lib + 9 cli + 4 module tests. Merged.
+  Plan: `plans/2026-05-29-ascript-m8-modules.md`.
 - ⬜ **M9 — Tooling.** Rich diagnostics (ariadne/miette); REPL; `ascript fmt`;
   `ascript test` runner; Tree-sitter grammar conformance test.
 
@@ -198,3 +200,22 @@ working, tested software on its own.
   numbering shifts; after M8 (modules) + M9 (tooling) come the stdlib milestones.
   The `Map` kind is needed by `std/map`, so it can be introduced either in the
   modules milestone or the first stdlib-collections milestone — decide when planning.
+
+### M9 design guidance (from M8 holistic review — read before planning M9)
+
+- **`std/*` resolution hook:** `resolve_import`/`load_module` (`src/interp.rs`) are the
+  seam — add a `source.starts_with("std/")` check BEFORE `module_dir.join` to dispatch
+  to a registry of built-in modules (native bindings or embedded source), bypassing the
+  filesystem, with a non-path cache key. (Used by the Phase-2 stdlib milestones.)
+- **Multi-file diagnostics:** `AsError` carries only `message` + `span` (offsets relative
+  to each module's own source). For ariadne to point at the right FILE, thread the
+  originating module path/id into `AsError`/`Control::Panic` during M9. This is the main
+  diagnostics-layer change.
+- **Live bindings deferred:** imports snapshot values at import time (named copies the
+  Value; namespace builds a fixed IndexMap object). Spec-adequate. Full ESM live bindings
+  would need the namespace to reference the module env instead of a copied map.
+- **REPL note (from M8):** a module whose body panics still leaves a cached entry; for a
+  long-lived REPL, consider evicting failed modules so re-import re-runs them.
+
+## Roadmap status: M1–M8 ✅ merged. Language core + modules COMPLETE.
+Remaining: M9 (tooling) + Phase 2+ standard library.

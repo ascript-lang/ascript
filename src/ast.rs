@@ -117,6 +117,14 @@ pub enum Stmt {
     Fn { name: String, params: Vec<Param>, ret: Option<Type>, body: Vec<Stmt> },
     Enum { name: String, variants: Vec<EnumVariantDecl> },
     Class { name: String, superclass: Option<String>, methods: Vec<MethodDecl> },
+    Import { names: ImportNames, source: String },
+    Export(Box<Stmt>),
+}
+
+#[derive(Clone, Debug)]
+pub enum ImportNames {
+    Named(Vec<String>),
+    Namespace(String),
 }
 
 #[derive(Clone, Debug)]

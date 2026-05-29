@@ -105,3 +105,14 @@ fn reports_usage_without_args() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("usage"));
 }
+
+#[test]
+fn runs_modules_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/modules/main.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("12.56636")); // circleArea(2) = 3.14159*4
+    assert!(out.contains("12\n"));     // Rect(3,4).area()
+    assert!(out.contains("3.14159"));  // geo.PI
+}

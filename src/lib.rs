@@ -10,6 +10,17 @@ pub mod value;
 
 use crate::error::AsError;
 use crate::interp::Interp;
+use std::path::Path;
+
+/// Run a `.as` file as the entry module (with import resolution relative to it).
+pub async fn run_file(path: &Path) -> Result<String, AsError> {
+    let mut interp = Interp::new();
+    match interp.load_module(path).await {
+        Ok(_) => Ok(interp.output),
+        Err(crate::interp::Control::Panic(e)) => Err(e),
+        Err(crate::interp::Control::Propagate(_)) => Ok(interp.output),
+    }
+}
 
 /// Lex → parse → evaluate in a fresh global environment. Returns captured output.
 pub async fn run_source(src: &str) -> Result<String, AsError> {
