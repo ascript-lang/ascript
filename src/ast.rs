@@ -1,9 +1,17 @@
-//! Abstract syntax tree for the skeleton subset.
+//! Abstract syntax tree.
 
+use crate::span::Span;
 use std::fmt;
 
+/// An expression node plus the source span it was parsed from.
 #[derive(Clone, Debug)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum ExprKind {
     Number(f64),
     Str(String),
     Bool(bool),
@@ -56,15 +64,21 @@ impl fmt::Display for UnOp {
 
 impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind)
+    }
+}
+
+impl fmt::Display for ExprKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Expr::Number(n) => write!(f, "{}", n),
-            Expr::Str(s) => write!(f, "{:?}", s),
-            Expr::Bool(b) => write!(f, "{}", b),
-            Expr::Nil => write!(f, "nil"),
-            Expr::Ident(name) => write!(f, "{}", name),
-            Expr::Unary { op, expr } => write!(f, "({} {})", op, expr),
-            Expr::Binary { op, lhs, rhs } => write!(f, "({} {} {})", op, lhs, rhs),
-            Expr::Call { callee, args } => {
+            ExprKind::Number(n) => write!(f, "{}", n),
+            ExprKind::Str(s) => write!(f, "{:?}", s),
+            ExprKind::Bool(b) => write!(f, "{}", b),
+            ExprKind::Nil => write!(f, "nil"),
+            ExprKind::Ident(name) => write!(f, "{}", name),
+            ExprKind::Unary { op, expr } => write!(f, "({} {})", op, expr),
+            ExprKind::Binary { op, lhs, rhs } => write!(f, "({} {} {})", op, lhs, rhs),
+            ExprKind::Call { callee, args } => {
                 write!(f, "(call {}", callee)?;
                 for a in args {
                     write!(f, " {}", a)?;

@@ -1,7 +1,7 @@
 //! Async tree-walking evaluator. `eval_expr`/`exec` are async to establish
 //! the event-loop seam from spec §7, even though the skeleton never suspends.
 
-use crate::ast::{BinOp, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Stmt, UnOp};
 use crate::error::AsError;
 use crate::value::Value;
 use async_recursion::async_recursion;
@@ -30,22 +30,23 @@ impl Interp {
 
     #[async_recursion(?Send)]
     pub async fn eval_expr(&mut self, expr: &Expr) -> Result<Value, AsError> {
-        match expr {
-            Expr::Number(n) => Ok(Value::Number(*n)),
-            Expr::Str(s) => Ok(Value::Str(s.as_str().into())),
-            Expr::Bool(b) => Ok(Value::Bool(*b)),
-            Expr::Nil => Ok(Value::Nil),
-            Expr::Ident(name) => {
-                Err(AsError::new(format!("undefined variable '{}'", name)))
-            }
-            Expr::Unary { op, expr } => {
-                let v = self.eval_expr(expr).await?;
+        match &expr.kind {
+            ExprKind::Number(n) => Ok(Value::Number(*n)),
+            ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
+            ExprKind::Bool(b) => Ok(Value::Bool(*b)),
+            ExprKind::Nil => Ok(Value::Nil),
+            ExprKind::Ident(name) => Err(AsError::at(
+                format!("undefined variable '{}'", name),
+                expr.span,
+            )),
+            ExprKind::Unary { op, expr: operand } => {
+                let v = self.eval_expr(operand).await?;
                 match (op, v) {
                     (UnOp::Neg, Value::Number(n)) => Ok(Value::Number(-n)),
                     (UnOp::Neg, _) => Err(AsError::new("cannot negate a non-number")),
                 }
             }
-            Expr::Binary { op, lhs, rhs } => {
+            ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.eval_expr(lhs).await?;
                 let r = self.eval_expr(rhs).await?;
                 let (a, b) = match (l, r) {
@@ -61,9 +62,9 @@ impl Interp {
                 };
                 Ok(Value::Number(result))
             }
-            Expr::Call { callee, args } => {
-                let name = match callee.as_ref() {
-                    Expr::Ident(n) => n.clone(),
+            ExprKind::Call { callee, args } => {
+                let name = match &callee.kind {
+                    ExprKind::Ident(n) => n.clone(),
                     _ => return Err(AsError::new("only named builtins are callable in the skeleton")),
                 };
                 let mut values = Vec::new();

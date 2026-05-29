@@ -1,6 +1,6 @@
-//! Recursive-descent / precedence-climbing parser for the skeleton subset.
+//! Recursive-descent / precedence-climbing parser.
 
-use crate::ast::{BinOp, Expr, Stmt, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Stmt, UnOp};
 use crate::error::AsError;
 use crate::span::Span;
 use crate::token::{Tok, Token};
@@ -22,6 +22,11 @@ impl<'a> Parser<'a> {
 
     fn span(&self) -> Span {
         self.tokens[self.pos].span
+    }
+
+    /// End offset of the most recently consumed token.
+    fn prev_end(&self) -> usize {
+        self.tokens[self.pos - 1].span.end
     }
 
     fn advance(&mut self) -> Tok {
@@ -64,7 +69,11 @@ impl<'a> Parser<'a> {
             };
             self.advance();
             let right = self.multiplicative()?;
-            left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right) };
+            let span = Span::new(left.span.start, right.span.end);
+            left = Expr {
+                kind: ExprKind::Binary { op, lhs: Box::new(left), rhs: Box::new(right) },
+                span,
+            };
         }
         Ok(left)
     }
@@ -80,16 +89,25 @@ impl<'a> Parser<'a> {
             };
             self.advance();
             let right = self.unary()?;
-            left = Expr::Binary { op, lhs: Box::new(left), rhs: Box::new(right) };
+            let span = Span::new(left.span.start, right.span.end);
+            left = Expr {
+                kind: ExprKind::Binary { op, lhs: Box::new(left), rhs: Box::new(right) },
+                span,
+            };
         }
         Ok(left)
     }
 
     fn unary(&mut self) -> Result<Expr, AsError> {
+        let start = self.span().start;
         if *self.peek() == Tok::Minus {
             self.advance();
-            let expr = self.unary()?;
-            return Ok(Expr::Unary { op: UnOp::Neg, expr: Box::new(expr) });
+            let operand = self.unary()?;
+            let span = Span::new(start, operand.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Unary { op: UnOp::Neg, expr: Box::new(operand) },
+                span,
+            });
         }
         self.postfix()
     }
@@ -110,27 +128,32 @@ impl<'a> Parser<'a> {
                 }
             }
             self.eat(&Tok::RParen)?;
-            expr = Expr::Call { callee: Box::new(expr), args };
+            let span = Span::new(expr.span.start, self.prev_end());
+            expr = Expr {
+                kind: ExprKind::Call { callee: Box::new(expr), args },
+                span,
+            };
         }
         Ok(expr)
     }
 
     fn primary(&mut self) -> Result<Expr, AsError> {
-        let span = self.span();
-        match self.advance() {
-            Tok::Number(n) => Ok(Expr::Number(n)),
-            Tok::Str(s) => Ok(Expr::Str(s)),
-            Tok::True => Ok(Expr::Bool(true)),
-            Tok::False => Ok(Expr::Bool(false)),
-            Tok::Nil => Ok(Expr::Nil),
-            Tok::Ident(name) => Ok(Expr::Ident(name)),
+        let tok_span = self.span();
+        let kind = match self.advance() {
+            Tok::Number(n) => ExprKind::Number(n),
+            Tok::Str(s) => ExprKind::Str(s),
+            Tok::True => ExprKind::Bool(true),
+            Tok::False => ExprKind::Bool(false),
+            Tok::Nil => ExprKind::Nil,
+            Tok::Ident(name) => ExprKind::Ident(name),
             Tok::LParen => {
                 let inner = self.expr()?;
                 self.eat(&Tok::RParen)?;
-                Ok(inner)
+                return Ok(inner);
             }
-            other => Err(AsError::at(format!("unexpected token {:?}", other), span)),
-        }
+            other => return Err(AsError::at(format!("unexpected token {:?}", other), tok_span)),
+        };
+        Ok(Expr { kind, span: tok_span })
     }
 }
 
@@ -160,5 +183,14 @@ mod tests {
     #[test]
     fn parses_a_call() {
         assert_eq!(sexpr("print(\"hi\")"), "(call print \"hi\")");
+    }
+
+    #[test]
+    fn binary_span_covers_both_operands() {
+        let tokens = lex("1 + 2").unwrap();
+        let stmts = parse(&tokens).unwrap();
+        match &stmts[0] {
+            Stmt::Expr(e) => assert_eq!(e.span, Span::new(0, 5)),
+        }
     }
 }
