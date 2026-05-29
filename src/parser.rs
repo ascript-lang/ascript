@@ -379,13 +379,14 @@ impl<'a> Parser<'a> {
                         ))
                     }
                 };
+                let name_span = self.tokens[self.pos - 1].span;
                 let ty = if *self.peek() == Tok::Colon {
                     self.advance();
                     Some(self.parse_type()?)
                 } else {
                     None
                 };
-                params.push(crate::ast::Param { name, ty });
+                params.push(crate::ast::Param { name, ty, name_span });
                 if *self.peek() == Tok::Comma {
                     self.advance();
                     if *self.peek() == Tok::RParen {
@@ -629,13 +630,14 @@ impl<'a> Parser<'a> {
         // Single-parameter form: `ident => …`
         if let Tok::Ident(name) = self.peek().clone() {
             if self.tokens[self.pos + 1].tok == Tok::FatArrow {
+                let name_span = self.tokens[self.pos].span;
                 self.advance(); // ident
                 self.advance(); // =>
                 let body = self.arrow_body()?;
                 let end = self.prev_end();
                 return Ok(Some(Expr {
                     kind: ExprKind::Arrow {
-                        params: vec![crate::ast::Param { name, ty: None }],
+                        params: vec![crate::ast::Param { name, ty: None, name_span }],
                         body: Box::new(body),
                         is_async,
                     },

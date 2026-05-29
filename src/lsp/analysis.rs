@@ -5,7 +5,7 @@
 //! it holds no `Rc`/`RefCell`/`Value` and is trivially `Send`. This keeps the
 //! tower-lsp `LanguageServer` impl `Send + Sync`-clean.
 
-use crate::ast::Stmt;
+use crate::ast::{Param, Stmt};
 use crate::error::AsError;
 use crate::lexer;
 use crate::lsp::line_index::LineIndex;
@@ -25,7 +25,8 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// The global builtins offered as completions (FUNCTION kind). Mirrors `builtin_doc`.
-const BUILTINS: &[&str] = &["print", "len", "type", "assert", "range", "Ok", "Err", "recover"];
+const BUILTINS: &[&str] =
+    &["print", "len", "type", "assert", "range", "Ok", "Err", "recover", "test"];
 
 /// The known stdlib module paths offered when completing an `import ... from "..."`
 /// string. Hardcoded (rather than derived from `std_module_exports`) so the list is
@@ -52,6 +53,7 @@ const STD_MODULE_PATHS: &[&str] = &[
     "std/intl",
     "std/env",
     "std/fs",
+    "std/process",
     "std/crypto",
     "std/compress",
     "std/sqlite",
@@ -296,6 +298,7 @@ fn builtin_doc(name: &str) -> Option<&'static str> {
         "Ok" => "```\nOk(value): Result\n```\nWrap a value as a successful `Result`.",
         "Err" => "```\nErr(error): Result\n```\nWrap an error as a failed `Result`.",
         "recover" => "```\nrecover(fn): Result\n```\nRun `fn`, capturing any panic as an `Err` instead of unwinding.",
+        "test" => "```\ntest(name, fn)\n```\nRegister a test for `ascript test`.",
         _ => return None,
     };
     Some(s)
@@ -381,22 +384,14 @@ fn in_import_path_string(chars: &[char], offset: usize) -> bool {
     let line_start = chars[..offset].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1);
     let line = &chars[line_start..offset];
 
-    // Find the last unmatched quote: scan for the opening quote of the string the
-    // cursor is in. Walk from the cursor backward to the most recent quote char.
+    // The cursor is inside a string iff the most recent quote on the line has no
+    // matching close before the cursor — i.e. it's the last quote on the line.
     let Some(rel_quote) = line.iter().rposition(|&c| c == '"' || c == '\'') else {
         return false;
     };
-    let quote = line[rel_quote];
-    // The quote must be unclosed before the cursor: count quotes of that kind after
-    // it; an opening quote has an even count of *following* same-quotes (0 here since
-    // it's the last one). If there were a closing quote it'd be the last instead.
-    // Already guaranteed it's the last quote, so it's open.
-
-    // Check the text before the opening quote ends with `from` (allowing whitespace).
+    // Check the text before that opening quote ends with `from` (allowing whitespace).
     let before: String = line[..rel_quote].iter().collect();
-    let before = before.trim_end();
-    let _ = quote;
-    before.ends_with("from")
+    before.trim_end().ends_with("from")
 }
 
 /// If the text immediately before `offset` is `<ident>.`, return `<ident>`.
@@ -469,15 +464,18 @@ fn namespace_import_module(text: &str, alias: &str) -> Option<String> {
 }
 
 /// Go-to-definition at char `offset` in `text`. Pure. Identifies the identifier token
-/// at the offset and resolves it to a top-level declaration's name span, returned as a
-/// `Range`.
+/// at the offset and resolves it to a declaration's name span, returned as a `Range`.
 ///
-/// Scope: top-level declarations only (`fn`/`class`/`enum`/`let`/`const`, including
-/// destructured lets and `export`-wrapped decls). Function params and local lets are
-/// NOT resolved — `Param` carries no `Span` in the AST (`src/ast.rs`), so a param's
-/// name range can't be reported precisely; resolving them is deferred. If the cursor
-/// is on the declaration's own name, that decl's range is returned (self-location).
-/// Unknown identifiers, or any lex/parse failure, yield `None`.
+/// Resolution order (nearest scope first):
+/// 1. If the cursor is inside a function/method body, that function's PARAMS, then its
+///    local `let`/`const` declarations that appear before the cursor.
+/// 2. Otherwise (or if not found in the enclosing fn) the top-level declarations
+///    (`fn`/`class`/`enum`/`let`/`const`, including destructured lets and
+///    `export`-wrapped decls).
+///
+/// Within-file only (cross-file deferred). If the cursor is on a declaration's own
+/// name, that decl's range is returned (self-location). Unknown identifiers, or any
+/// lex/parse failure, yield `None`.
 pub fn definition(text: &str, offset: usize) -> Option<Range> {
     let tokens = lexer::lex(text).ok()?;
     // Identify the identifier token under the cursor (same boundary rule as hover).
@@ -490,11 +488,98 @@ pub fn definition(text: &str, offset: usize) -> Option<Range> {
 
     let stmts = parser::parse(&tokens).ok()?;
     let index = LineIndex::new(text);
+
+    // 1. Try the nearest enclosing function's params + local lets (before the cursor).
+    if let Some(span) = enclosing_fn_local(&stmts, name, offset) {
+        return Some(span_range(span, &index));
+    }
+
+    // 2. Fall back to the top-level declarations.
     let mut name_span = None;
     for stmt in &stmts {
         collect_decl_name_span(stmt, name, &mut name_span);
     }
     name_span.map(|s| span_range(s, &index))
+}
+
+/// The body of a function (top-level `fn` or a class method): its params and the
+/// statements between its name and its closing brace.
+struct FnBody<'a> {
+    params: &'a [Param],
+    body: &'a [Stmt],
+    /// Span covering the whole declaration (used to test containment).
+    span: Span,
+}
+
+/// Walk all top-level fns + class methods and collect their bodies.
+fn collect_fn_bodies<'a>(stmts: &'a [Stmt], out: &mut Vec<FnBody<'a>>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Export(inner) => collect_fn_bodies(std::slice::from_ref(inner), out),
+            Stmt::Fn { params, body, span, .. } => {
+                out.push(FnBody { params, body, span: *span });
+            }
+            Stmt::Class { methods, .. } => {
+                for m in methods {
+                    out.push(FnBody { params: &m.params, body: &m.body, span: m.span });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// If the cursor at `offset` is inside a function/method whose params or local
+/// `let`/`const` (declared before the offset) bind `name`, return that binding's name
+/// span. Picks the NEAREST enclosing fn (smallest containing span) so nested fns win.
+fn enclosing_fn_local(stmts: &[Stmt], name: &str, offset: usize) -> Option<Span> {
+    let mut bodies = Vec::new();
+    collect_fn_bodies(stmts, &mut bodies);
+
+    // Candidate fns whose declaration span contains the cursor, nearest (smallest) first.
+    let mut candidates: Vec<&FnBody> = bodies
+        .iter()
+        .filter(|b| offset >= b.span.start && offset < b.span.end)
+        .collect();
+    candidates.sort_by_key(|b| b.span.end - b.span.start);
+
+    for fnbody in candidates {
+        // Params first.
+        for p in fnbody.params {
+            if p.name == name {
+                return Some(p.name_span);
+            }
+        }
+        // Then local lets/consts declared before the cursor.
+        if let Some(span) = local_let_before(fnbody.body, name, offset) {
+            return Some(span);
+        }
+    }
+    None
+}
+
+/// Find a `let`/`const` (or destructured name) declared in `body` that binds `name`
+/// and whose name span starts at or before `offset`. Last such binding wins (closest
+/// preceding declaration). Direct statements of the body only (pragmatic — no descent
+/// into nested blocks/loops).
+fn local_let_before(body: &[Stmt], name: &str, offset: usize) -> Option<Span> {
+    let mut found = None;
+    for stmt in body {
+        match stmt {
+            Stmt::Let { name: n, name_span, .. } if n == name && name_span.start <= offset => {
+                found = Some(*name_span);
+            }
+            Stmt::LetDestructure { names, name_spans, .. } => {
+                for (n, s) in names.iter().zip(name_spans.iter()) {
+                    if n == name && s.start <= offset {
+                        found = Some(*s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// If a top-level statement declares `name`, record its name span (first match wins).
@@ -803,5 +888,86 @@ export fn bar() {}
         let a_use = src.rfind("(a)").unwrap() + 1;
         let ra = definition(src, a_use).expect("a");
         assert_eq!(ra.start.line, 1);
+    }
+
+    #[test]
+    fn definition_resolves_param_used_in_body() {
+        // `n` is a parameter; its use inside the body should resolve to the param's
+        // name span (the `n` in the parameter list, line 0).
+        let src = "fn f(n) {\n  return n + 1\n}";
+        let use_off = src.rfind('n').unwrap(); // the `n` in `n + 1`
+        let r = definition(src, use_off).expect("should resolve param n");
+        assert_eq!(r.start.line, 0);
+        // `fn f(` is 5 chars, so the param `n` is at character 5.
+        assert_eq!(r.start.character, 5);
+    }
+
+    #[test]
+    fn definition_resolves_local_let_in_body() {
+        let src = "fn f() {\n  let y = 1\n  return y\n}";
+        let use_off = src.rfind('y').unwrap(); // `return y`
+        let r = definition(src, use_off).expect("should resolve local y");
+        assert_eq!(r.start.line, 1); // the `let y` line
+    }
+
+    #[test]
+    fn definition_top_level_fn_called_from_inside_another_fn() {
+        // `helper` is top-level; calling it from inside `main` must resolve to the
+        // top-level decl, not be swallowed by param/local resolution.
+        let src = "fn helper() { return 1 }\nfn main(x) {\n  return helper()\n}";
+        let call = src.rfind("helper").unwrap();
+        let r = definition(src, call).expect("should resolve helper call");
+        assert_eq!(r.start.line, 0);
+        assert_eq!(r.start.character, 3); // after "fn "
+    }
+
+    #[test]
+    fn definition_param_does_not_shadow_when_name_differs() {
+        // The param is `x`; a call to top-level `g` inside the fn still resolves to `g`.
+        let src = "fn g() { return 2 }\nfn h(x) {\n  return g() + x\n}";
+        let g_call = src.rfind("g()").unwrap();
+        let rg = definition(src, g_call).expect("g");
+        assert_eq!(rg.start.line, 0);
+        // And `x` resolves to the param on line 1.
+        let x_use = src.rfind("+ x").unwrap() + 2;
+        let rx = definition(src, x_use).expect("x");
+        assert_eq!(rx.start.line, 1);
+    }
+
+    // ---- module-path / builtin sync guards ----
+
+    #[test]
+    fn std_module_paths_all_resolve_under_default_features() {
+        // Every advertised import path must be a real registered module, so the const
+        // can't silently drift from `std_module_exports`. (cargo test enables all
+        // default features, so every default-gated path resolves.)
+        for path in STD_MODULE_PATHS {
+            assert!(
+                crate::stdlib::std_module_exports(path).is_some(),
+                "STD_MODULE_PATHS entry {path:?} is not a known stdlib module"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_in_import_path_offers_process() {
+        let src = "import { run } from \"std/proc";
+        let items = completions(src, src.chars().count());
+        assert!(labels(&items).contains(&"std/process"));
+    }
+
+    #[test]
+    fn hover_on_builtin_test_mentions_test() {
+        let src = "test(\"x\", fn() {})";
+        let off = 0; // on `test`
+        let h = hover(src, off).expect("expected hover on test builtin");
+        assert!(markup(&h).contains("test"), "got: {}", markup(&h));
+    }
+
+    #[test]
+    fn completions_baseline_includes_test_builtin() {
+        let items = completions("", 0);
+        let t = items.iter().find(|i| i.label == "test").expect("test builtin in baseline");
+        assert_eq!(t.kind, Some(CompletionItemKind::FUNCTION));
     }
 }

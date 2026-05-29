@@ -61,6 +61,8 @@ pub enum Type {
 pub struct Param {
     pub name: String,
     pub ty: Option<Type>,
+    /// Span of just the parameter name (for LSP go-to-definition).
+    pub name_span: Span,
 }
 
 impl std::fmt::Display for Type {
