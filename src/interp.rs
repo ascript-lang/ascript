@@ -388,11 +388,7 @@ impl Interp {
                 for a in args {
                     values.push(self.eval_expr(a, env).await?);
                 }
-                let v = match callee_v {
-                    Value::Builtin(name) => self.call_builtin(&name, &values, expr.span),
-                    Value::Function(func) => self.call_function(&func, values, expr.span).await,
-                    _ => Err(AsError::at("value is not callable", callee.span).into()),
-                };
+                let v = self.call_value(callee_v, values, expr.span).await;
                 Ok((v?, false))
             }
             _ => Ok((self.eval_expr(expr, env).await?, false)),
@@ -404,6 +400,15 @@ impl Interp {
             Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
             Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
             _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
+        }
+    }
+
+    #[async_recursion(?Send)]
+    async fn call_value(&mut self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
+        match callee {
+            Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
+            Value::Function(func) => self.call_function(&func, args, span).await,
+            _ => Err(AsError::at("value is not callable", span).into()),
         }
     }
 
@@ -442,7 +447,8 @@ impl Interp {
         }
     }
 
-    fn call_builtin(&mut self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+    #[async_recursion(?Send)]
+    async fn call_builtin(&mut self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         match name {
             "print" => {
                 let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect();
@@ -469,6 +475,18 @@ impl Interp {
                         None => "assertion failed".to_string(),
                     };
                     Err(AsError::at(msg, span).into())
+                }
+            }
+            "recover" => {
+                let callee = args.first().cloned().unwrap_or(Value::Nil);
+                match self.call_value(callee, Vec::new(), span).await {
+                    Ok(v) => Ok(make_pair(v, Value::Nil)),
+                    Err(Control::Panic(e)) => {
+                        Ok(make_pair(Value::Nil, make_error(Value::Str(e.message.into()))))
+                    }
+                    // A `?` propagation inside `fn` is already converted to fn's return
+                    // value by call_function, so this is unreachable in practice; pass it through.
+                    Err(Control::Propagate(v)) => Err(Control::Propagate(v)),
                 }
             }
             other => Err(AsError::at(format!("'{}' is not a function", other), span).into()),
@@ -640,6 +658,42 @@ print(bad[1].message)
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("requires a Result pair"));
+    }
+
+    #[tokio::test]
+    async fn recover_catches_a_panic() {
+        // A function that panics (index out of bounds) is recovered into [nil, err].
+        let src = "
+fn boom() {
+  let a = [1]
+  return a[10]
+}
+let r = recover(boom)
+print(r[0])
+print(r[1].message)
+";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        // r[0] is nil; r[1].message carries the panic text (index out of bounds).
+        assert!(interp.output.starts_with("nil\n"));
+        assert!(interp.output.contains("out of bounds"));
+    }
+
+    #[tokio::test]
+    async fn recover_passes_through_success() {
+        let src = "
+fn good() { return 42 }
+let r = recover(good)
+print(r[0])
+print(r[1])
+";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "42\nnil\n");
     }
 
     async fn eval_to_value(src: &str) -> Value {
