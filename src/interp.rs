@@ -1134,6 +1134,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn range_error_paths_and_fractional() {
+        // zero step → panic
+        assert!(run_err("range(0, 5, 0)").await.message.contains("step must not be zero"));
+        // too many args → panic
+        assert!(run_err("range(1, 2, 3, 4)").await.message.contains("1 to 3 arguments"));
+        // non-number arg → panic
+        assert!(run_err("range(\"x\")").await.message.contains("number arguments"));
+        // zero args → panic (0 falls into the >3/other arm)
+        assert!(run_err("range()").await.message.contains("1 to 3 arguments"));
+        // fractional step: pin the IEEE-754 accumulation behavior (end-exclusive).
+        // The 4th element is 0.3+0.3+0.3 = 0.8999999999999999 (< 1, so included);
+        // the next accumulation exceeds 1 and is excluded. Accumulation drift is expected.
+        assert_eq!(run("print(range(0, 1, 0.3))").await, "[0, 0.3, 0.6, 0.8999999999999999]\n");
+    }
+
+    #[tokio::test]
     async fn destructures_array_into_bindings() {
         let out = run("let [a, b] = [1, 2]\nprint(a)\nprint(b)\nlet [x, y] = [9]\nprint(x)\nprint(y)").await;
         assert_eq!(out, "1\n2\n9\nnil\n");
