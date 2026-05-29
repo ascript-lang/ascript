@@ -137,6 +137,13 @@ pub enum NativeKind {
     // M14 std/http/server: the `next` callable handed to a middleware. Calling it
     // (as a `NativeMethod`) advances the middleware chain → matched route handler.
     HttpNext,
+    // M14 std/net/ws: a connected WebSocket (client `connect` or server `accept`).
+    // Methods: send/recv/close. Unifies the client/server stream types behind one
+    // boxed Sink+Stream of `Message` (see net_ws::WsConnState).
+    WsConnection,
+    // M14 std/net/ws: an accept-based WebSocket server listener (binds a TcpListener;
+    // `accept()` performs the handshake → WsConnection). Carries a `port` field.
+    WsListener,
 }
 
 impl NativeKind {
@@ -155,6 +162,8 @@ impl NativeKind {
             NativeKind::SseStream => "sseStream",
             NativeKind::HttpServer => "httpServer",
             NativeKind::HttpNext => "httpNext",
+            NativeKind::WsConnection => "wsConnection",
+            NativeKind::WsListener => "wsListener",
         }
     }
 }

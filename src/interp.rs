@@ -145,6 +145,18 @@ pub(crate) enum ResourceState {
     // the chain at this saved point. `Box`ed to keep the enum compact.
     #[cfg(feature = "net")]
     HttpNext(Box<crate::stdlib::http_server::NextState>),
+    // M14 std/net/ws: a connected WebSocket. The client (`connect_async`) and the
+    // server-accepted (`accept_async`) stream types differ — `WebSocketStream<
+    // MaybeTlsStream<TcpStream>>` vs `WebSocketStream<TcpStream>`. We unify them by
+    // boxing as a `dyn Sink<Message> + Stream<Item=…>` (see net_ws::WsConnState), so
+    // send/recv dispatch is identical regardless of origin. `WsConnState` already
+    // holds a single `Box<dyn WsStream>`, so the variant is one pointer wide.
+    #[cfg(feature = "net")]
+    WsConnection(crate::stdlib::net_ws::WsConnState),
+    // M14 std/net/ws: an accept-based WebSocket server listener (a bound TcpListener;
+    // `accept()` does the TCP accept + WebSocket handshake → WsConnection).
+    #[cfg(feature = "net")]
+    WsListener(tokio::net::TcpListener),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -347,6 +359,28 @@ impl Interp {
     pub(crate) fn tcp_listener_mut(&mut self, id: u64) -> Option<&mut tokio::net::TcpListener> {
         match self.resources.get_mut(&id) {
             Some(ResourceState::TcpListener(l)) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a connected WebSocket behind a handle id (send/recv), or
+    /// `None` once the connection was finalized (closed / recv saw a Close frame).
+    #[cfg(feature = "net")]
+    pub(crate) fn ws_conn_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::net_ws::WsConnState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::WsConnection(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a bound WebSocket listener behind a handle id (for `accept`).
+    #[cfg(feature = "net")]
+    pub(crate) fn ws_listener_mut(&mut self, id: u64) -> Option<&mut tokio::net::TcpListener> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::WsListener(l)) => Some(l),
             _ => None,
         }
     }
@@ -1066,6 +1100,9 @@ impl Interp {
             }
             if matches!(m.receiver.kind, HttpNext) {
                 return self.call_http_next(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, WsConnection | WsListener) {
+                return self.call_ws_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
