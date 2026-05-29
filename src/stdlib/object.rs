@@ -62,7 +62,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "merge" => {
             let mut out: IndexMap<String, Value> = IndexMap::new();
             for (i, v) in args.iter().enumerate() {
-                let o = want_object(v, span, &format!("object.merge (argument {})", i + 1))?;
+                let o = want_object(v, span, &format!("{} (argument {})", ctx("merge"), i + 1))?;
                 for (k, val) in o.borrow().iter() {
                     out.insert(k.clone(), val.clone());
                 }
@@ -103,5 +103,22 @@ mod tests {
             obj(&[("b", Value::Number(9.0)), ("c", Value::Number(3.0))]),
         ], sp()).unwrap();
         assert_eq!(merged.to_string(), "{a: 1, b: 9, c: 3}");
+    }
+
+    #[test]
+    fn merge_and_delete_edges() {
+        let sp = sp();
+        // delete of a non-existent key → false
+        let o = obj(&[("a", Value::Number(1.0))]);
+        assert_eq!(call("delete", &[o, Value::Str("nope".into())], sp).unwrap(), Value::Bool(false));
+        // merge with zero args → empty object
+        assert_eq!(call("merge", &[], sp).unwrap().to_string(), "{}");
+        // merge with one arg → a copy (independent of the input)
+        let src = obj(&[("a", Value::Number(1.0))]);
+        let copy = call("merge", std::slice::from_ref(&src), sp).unwrap();
+        assert_eq!(copy.to_string(), "{a: 1}");
+        // mutating the copy via delete does NOT affect the source (independence)
+        call("delete", &[copy, Value::Str("a".into())], sp).unwrap();
+        assert_eq!(call("keys", std::slice::from_ref(&src), sp).unwrap().to_string(), "[\"a\"]");
     }
 }
