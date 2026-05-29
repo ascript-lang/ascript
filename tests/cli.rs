@@ -149,6 +149,32 @@ fn repl_evaluates_and_persists_bindings() {
 }
 
 #[test]
+fn fmt_subcommand_rewrites_in_place_and_is_idempotent() {
+    let file = std::env::temp_dir().join(format!("ascript_fmt_{}.as", std::process::id()));
+    // A deliberately messy source: cramped spacing, no spaces around `=`/operators.
+    std::fs::write(&file, "let   x=1+2\nfn f(a,b){return a+b}").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    // First format: should succeed and rewrite the file to canonical form.
+    let out = Command::new(bin).arg("fmt").arg(&file).output().unwrap();
+    assert!(out.status.success(), "fmt failed: {:?}", out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("formatted"));
+
+    let after = std::fs::read_to_string(&file).unwrap();
+    // The messy input must have changed to canonical, spaced form.
+    assert_ne!(after, "let   x=1+2\nfn f(a,b){return a+b}");
+    assert!(after.contains("let x = 1 + 2"), "got: {after:?}");
+
+    // Second format: idempotent — running fmt again leaves the file unchanged.
+    let out2 = Command::new(bin).arg("fmt").arg(&file).output().unwrap();
+    assert!(out2.status.success(), "second fmt failed: {:?}", out2);
+    let after2 = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(after, after2, "fmt must be idempotent");
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn test_runner_reports_pass_and_fail() {
     let file = std::env::temp_dir().join(format!("ascript_tr_{}.as", std::process::id()));
     std::fs::write(
