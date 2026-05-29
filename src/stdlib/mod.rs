@@ -4,6 +4,7 @@
 //! qualified builtin names (`"math.abs"`) to. Per spec §11.3, native functions
 //! are ordinary `function` values; argument-type misuse is a Tier-2 panic.
 
+pub mod array;
 pub mod math;
 pub mod string;
 
@@ -24,6 +25,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
         "std/math" => math::exports(),
         "std/string" => string::exports(),
+        "std/array" => array::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -41,6 +43,7 @@ impl Interp {
         match module {
             "math" => math::call(func, args, span),
             "string" => string::call(func, args, span),
+            "array" => self.call_array(func, args, span).await,
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

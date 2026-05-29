@@ -2074,6 +2074,39 @@ print(r[1])
     }
 
     #[tokio::test]
+    async fn std_array_map_filter_reduce() {
+        let src = "import * as array from \"std/array\"\n\
+                   let xs = [1, 2, 3, 4]\n\
+                   print(array.map(xs, (x, i) => x * 2))\n\
+                   print(array.filter(xs, (x, i) => x % 2 == 0))\n\
+                   print(array.reduce(xs, (a, x, i) => a + x, 0))";
+        assert_eq!(run(src).await, "[2, 4, 6, 8]\n[2, 4]\n10\n");
+    }
+
+    #[tokio::test]
+    async fn std_array_mutation_and_access() {
+        let src = "import * as array from \"std/array\"\n\
+                   let xs = [1, 2]\n\
+                   print(array.push(xs, 3))\n\
+                   print(xs)\n\
+                   print(array.pop(xs))\n\
+                   print(array.get(xs, 0))\n\
+                   print(array.get(xs, 9))\n\
+                   print(array.contains(xs, 2))\n\
+                   print(array.slice([10,20,30,40], 1, 3))";
+        assert_eq!(run(src).await, "3\n[1, 2, 3]\n3\n1\nnil\ntrue\n[20, 30]\n");
+    }
+
+    #[tokio::test]
+    async fn std_array_sort_default_and_comparator() {
+        let src = "import * as array from \"std/array\"\n\
+                   print(array.sort([3, 1, 2]))\n\
+                   print(array.sort([\"b\", \"a\", \"c\"]))\n\
+                   print(array.sort([3, 1, 2], (a, b) => b - a))";
+        assert_eq!(run(src).await, "[1, 2, 3]\n[\"a\", \"b\", \"c\"]\n[3, 2, 1]\n");
+    }
+
+    #[tokio::test]
     async fn named_import_from_std() {
         let out = run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))").await;
         assert_eq!(out, "12\n7\n");
