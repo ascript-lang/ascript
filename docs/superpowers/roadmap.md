@@ -79,6 +79,22 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   `std/http/server`, `std/net/ws`. **Introduces a real awaitable/future `Value` kind**
   so `await` actually suspends (the surface syntax exists since M9; today `await`
   is identity because nothing suspends).
+  **`std/net/http` client must be modern — full spec in §11.5:**
+  - **SSE:** first-class `http.sse(url, opts)` (dedicated entry, not a request flag) —
+    parses `event:`/`data:`/`id:`/`retry:`, dispatches on blank-line boundaries,
+    multi-line `data:`, `lastEventId`, auto-reconnect honoring the server `retry:`.
+  - **Streaming:** streaming response bodies via the `std/process` reader idiom
+    (`read(n?)`/`readLine()`/`readToEnd()`, string-or-bytes per `bodyMode`, `nil` at EOF)
+    and streamed request bodies (bytes/reader/async generator). Backpressure-aware on
+    the Tokio loop.
+  - **Protocol versions:** HTTP/1.1 + HTTP/2 + HTTP/3(QUIC), ALPN negotiation,
+    `httpVersion` pin + `resp.version` report. Backing: **`reqwest`** (h1/h2 baseline,
+    h3 via `quinn`/`h3` behind a Cargo feature).
+  - **Modern features:** keep-alive/pooling, redirects+policy, gzip/deflate/brotli/zstd,
+    connect/read/total timeouts, retries+backoff, cancellation, TLS config, cookies,
+    multipart/form-data, JSON/form helpers, custom headers, proxy.
+  - **Deferred/best-effort (justified in §11.5):** HTTP/3 (feature-gated, opt-in),
+    response trailers (best-effort; hyper-level for first-class), SOCKS proxy (feature).
 - ⬜ **M15 — Terminal UI.** `std/tui`.
 
 ## Phase 4 — Tooling completion

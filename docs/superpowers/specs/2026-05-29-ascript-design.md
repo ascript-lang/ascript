@@ -503,7 +503,7 @@ Legend: ⚡ = async (returns awaitables); ⬡ = backed by a Rust crate.
 | Module | Contents | Backing |
 |---|---|---|
 | `std/net/tcp` | listener + stream (connect, read, write) | ⬡ `tokio` |
-| `std/net/http` | client: get, post, request, headers, body | ⬡ `hyper`/`reqwest` |
+| `std/net/http` | modern client: methods, headers, query, JSON/form/multipart/streaming bodies, redirects, decompression, timeouts, retries, cookies, TLS, proxy, HTTP/1.1+2+3, **streaming response bodies**, and **Server-Sent Events** (`http.sse`) — full surface in §11.5 | ⬡ `reqwest` (+ `h3`/`quinn`) |
 | `std/http/server` | routes, handlers, middleware, params | ⬡ `hyper` |
 | `std/net/ws` | WebSocket client + server | ⬡ `tokio-tungstenite` |
 
@@ -636,6 +636,133 @@ async fn tailLogs(): Result<nil> {
 The API surface is portable; **portability of the commands themselves is the user's
 responsibility** (e.g. a `bash` script won't run on a stock Windows host). The spec
 documents this boundary rather than hiding it.
+
+### 11.5 HTTP client (`std/net/http`)
+
+A modern async HTTP client riding the §7 event loop. **Backing crate: `reqwest`**
+(async) — chosen because it bundles the entire modern feature set (connection
+pooling, redirects with policy, transparent decompression, cookies, proxy, TLS,
+multipart, HTTP/2) on top of `hyper`/`h2`, and adds HTTP/3 via `quinn`/`h3` behind a
+feature flag. Re-implementing pooling/redirects/decompression/retries/cookies/h2/h3
+by hand on raw `hyper` would be an enormous, error-prone surface; `reqwest` is the
+de-facto modern Rust client and the right batteries-included choice. (`std/http/server`
+uses `hyper` directly; the client uses `reqwest`.)
+
+#### Entry points
+
+```ascript
+import { get, post, request, sse } from "std/net/http"
+
+// Convenience verbs (get/post/put/patch/delete/head/options) and a general `request`.
+async fn fetchUser(id: number): Result<object> {
+  let resp = await get(`https://api.example.com/users/${id}`, { timeout: { total: 5000 } })?
+  if (!resp.ok) { return Err(`HTTP ${resp.status}`) }
+  return Ok(await resp.json()?)
+}
+```
+
+All client calls are async and return a Tier-1 Result `[resp, err]` (a connect/TLS/
+timeout/DNS failure is the `err`; a non-2xx *response* is a normal `resp` with
+`ok == false` — it is NOT an error unless `opts.errorOnStatus` is set).
+
+#### Request options (`request(opts)` / per-verb `opts`)
+
+| Option | Meaning |
+|---|---|
+| `method` | verb (set by the convenience functions) |
+| `url` / `query` | URL; `query` is an object merged as the query string |
+| `headers` | object of custom headers; `auth: { bearer }` / `{ basic: [user, pass] }` helpers |
+| `body` | one of: `string` · `bytes` · `{ json: value }` · `{ form: object }` (urlencoded) · `{ multipart: [...] }` (form-data, incl. file parts) · `{ stream: source }` (streamed request body, see below) |
+| `timeout` | `{ connect, read, total }` in ms (any subset) |
+| `redirect` | `{ follow: bool, max: number }` or `"none"` — redirect policy (default: follow, max 10) |
+| `retry` | `{ max, backoff: "exponential"\|"constant", baseDelay, retryOn: [statuses] }` — retries with backoff on connection errors + idempotent methods (default: off) |
+| `decompress` | gzip/deflate/brotli/zstd auto-decoding (default `true`; sets `Accept-Encoding`, decodes transparently) |
+| `tls` | `{ caBundle, clientCert, minVersion, sni, insecure }` (custom CA, client certs, min TLS version, SNI override; `insecure` disables verification — flagged) |
+| `cookies` | `true` (per-client cookie jar) or a shared jar handle; sends/stores cookies across redirects + reuse |
+| `proxy` | `"http://…"` / `"socks5://…"` / `"system"` (env-based) / `"none"` |
+| `httpVersion` | `"auto"` (default, ALPN-negotiated) · `"1.1"` · `"2"` · `"3"` — pin the protocol |
+| `stream` | `true` → return a streaming response body instead of buffering (see below) |
+| `errorOnStatus` | when `true`, a non-2xx status becomes a Tier-1 `err` instead of a normal `resp` |
+| `cancel` | a cancellation handle (see Cancellation) |
+
+#### Response object
+
+`{ status, ok (200–299), headers, version ("1.1"|"2"|"3"), url (final, post-redirect), cookies }`
+plus body accessors:
+- **Buffered** (default): `await resp.text()` · `await resp.bytes()` · `await resp.json()` — each a Result.
+- **Streaming** (when `opts.stream: true`): `resp.body` is an async reader following the
+  exact `std/process` idiom — `await resp.body.read(n?)` (next chunk, or `nil` at EOF),
+  `await resp.body.readLine()`, `await resp.body.readToEnd()`; chunk type is `string`
+  (UTF-8) or `bytes` per `opts.bodyMode` (`"string"` default · `"bytes"`).
+- `resp.trailers` exposes HTTP/2 response trailers when present (see Deferrals).
+
+#### Streaming bodies (chunked / streamable HTTP)
+
+- **Response streaming:** `opts.stream: true` pulls the body incrementally via the reader
+  above — no full buffering. **Backpressure-aware:** each `read`/`readLine` awaits the
+  next chunk on the Tokio loop; the client does not over-read ahead of the consumer
+  (`reqwest::Response::chunk()` yields as the consumer pulls), so a slow consumer
+  naturally slows the transfer on the single-threaded event loop.
+- **Request streaming:** `body: { stream: source }` where `source` is a `bytes` value, a
+  `std/process`/file reader, or an async generator function `() => Result<bytes>` returning
+  the next chunk (or `nil` to end). Sent as a chunked/streamed request body without
+  buffering; writes await drain, so a slow upstream applies backpressure.
+
+#### Server-Sent Events (`http.sse`)
+
+A **first-class SSE client** as a dedicated entry point (NOT a flag on `request`) — SSE
+has distinct framing/reconnect semantics that warrant their own type:
+
+```ascript
+let events = await sse("https://api.example.com/stream", { headers: { auth: { bearer: tok } } })?
+let ev = await events.next()
+while (ev != nil) {
+  print(`${ev.event}: ${ev.data}`)   // ev = { event, data, id, retry }
+  ev = await events.next()
+}
+```
+
+`sse(url, opts)` returns `[stream, err]`. The stream:
+- requests `Accept: text/event-stream` and consumes the response body as a stream.
+- parses the SSE wire format: `event:` / `data:` / `id:` / `retry:` fields; **dispatches a
+  buffered event on each blank-line boundary**; concatenates **multi-line `data:`** with
+  `\n`; lines beginning `:` are comments (ignored).
+- `await stream.next()` → `[{ event (default "message"), data, id, retry }, err]`, or `nil`
+  when the stream ends and is not reconnecting.
+- `stream.lastEventId` — the most recent `id:` seen; sent as `Last-Event-ID` on reconnect.
+- **Auto-reconnect** (default on; `opts.reconnect: false` to disable): on disconnect, waits
+  the server-provided `retry:` interval (or `opts.retryDefault`, default 3000 ms), reconnects
+  with `Last-Event-ID`, and resumes `next()`. `opts.maxReconnects` caps attempts.
+- `stream.close()` cancels the connection and ends the stream.
+
+#### Protocol versions
+
+HTTP/1.1 and HTTP/2 are always available (ALPN-negotiated over TLS, default `"auto"`).
+**HTTP/3 (QUIC)** is supported via reqwest's `http3` feature (built on `quinn` + `h3`);
+`httpVersion: "3"` pins it. `resp.version` reports the negotiated version (`"1.1"`/`"2"`/
+`"3"`) so callers can assert or log it.
+
+#### Full feature set (enumerated)
+
+Methods (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS) · custom headers · query params ·
+basic/bearer auth helpers · JSON / urlencoded-form / multipart-form-data / raw bytes /
+streamed request bodies · buffered & streaming response bodies · keep-alive +
+connection pooling (default) · redirects with policy · gzip/deflate/brotli/zstd
+decompression · connect/read/total timeouts · retries with backoff · cancellation · TLS
+config (custom CA, client certs, min version, SNI, insecure) · cookie jar · proxy
+(http/https/socks/system) · HTTP/1.1 + HTTP/2 + HTTP/3 with ALPN + version pin/report ·
+SSE client · response trailers.
+
+#### Deferrals (justified, with owning milestone)
+
+| Deferred / best-effort | Why | Owner |
+|---|---|---|
+| **HTTP/3 (QUIC)** | `reqwest`'s `http3` is feature-gated + requires an unstable cfg and `quinn`; it works but is less battle-tested than h1/h2. Ships **behind a Cargo feature** (`http3`), default-off, with `httpVersion: "3"` opt-in. `"auto"`/`"1.1"`/`"2"` are the always-on baseline. | **M14** (feature-gated; promote to default when upstream stabilizes) |
+| **Response trailers** | `reqwest`'s high-level API does not surface HTTP/2 trailers directly; reading them needs a `hyper`-level path. `resp.trailers` is **best-effort** — populated when the backend exposes them, else empty. | **M14** follow-up (drop to `hyper` if first-class trailers are required) |
+| **SOCKS proxy** | Behind reqwest's `socks` feature. | **M14** (Cargo feature `socks`, default-on if it compiles cleanly cross-platform) |
+
+Everything else in the enumerated set is in-scope for **M14 (Async I/O)** and on by
+default.
 
 ---
 
