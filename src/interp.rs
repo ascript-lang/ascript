@@ -878,6 +878,7 @@ impl Interp {
                     Value::Array(a) => a.borrow().len(),
                     Value::Object(o) => o.borrow().len(),
                     Value::Map(m) => m.borrow().len(),
+                    Value::Bytes(b) => b.borrow().len(),
                     _ => {
                         return Err(AsError::at(
                             format!("len() expects a string, array, object, or map, got {}", type_name(&v)),
@@ -1026,6 +1027,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
         Value::Map(_) => "map",
+        Value::Bytes(_) => "bytes",
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
@@ -2118,6 +2120,19 @@ print(r[1])
                    print(string.format(\"{}={}\", \"x\", 9))\n\
                    print(string.padStart(\"5\", 3, \"0\"))";
         assert_eq!(run(src).await, "HI\na+b+c\nx=9\n005\n");
+    }
+
+    #[tokio::test]
+    async fn std_bytes_end_to_end() {
+        let src = "import * as bytes from \"std/bytes\"\n\
+                   let b = bytes.alloc(2)\n\
+                   bytes.set(b, 0, 222)\n\
+                   bytes.set(b, 1, 173)\n\
+                   print(len(b))\n\
+                   print(type(b))\n\
+                   print(bytes.toArray(b))\n\
+                   print(bytes.readUint(b, 0, 2, \"be\"))";
+        assert_eq!(run(src).await, "2\nbytes\n[222, 173]\n57005\n");
     }
 
     #[tokio::test]

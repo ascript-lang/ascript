@@ -5,6 +5,7 @@
 //! are ordinary `function` values; argument-type misuse is a Tier-2 panic.
 
 pub mod array;
+pub mod bytes;
 pub mod convert;
 pub mod map;
 pub mod math;
@@ -31,6 +32,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/array" => array::exports(),
         "std/object" => object::exports(),
         "std/map" => map::exports(),
+        "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
         _ => return None,
     };
@@ -52,6 +54,7 @@ impl Interp {
             "array" => self.call_array(func, args, span).await,
             "object" => object::call(func, args, span),
             "map" => map::call(func, args, span),
+            "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
@@ -91,6 +94,13 @@ pub(crate) fn want_object(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::ce
     match v {
         Value::Object(o) => Ok(o.clone()),
         _ => Err(AsError::at(format!("{} expects an object, got {}", ctx, crate::interp::type_name(v)), span).into()),
+    }
+}
+
+pub(crate) fn want_bytes(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cell::RefCell<Vec<u8>>>, Control> {
+    match v {
+        Value::Bytes(b) => Ok(b.clone()),
+        _ => Err(AsError::at(format!("{} expects bytes, got {}", ctx, crate::interp::type_name(v)), span).into()),
     }
 }
 
