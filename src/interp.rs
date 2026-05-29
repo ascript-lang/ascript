@@ -2404,4 +2404,36 @@ print(r[1])
         let out = run("import * as m1 from \"std/math\"\nimport { abs } from \"std/math\"\nprint(m1.floor(3.7))\nprint(abs(-2))").await;
         assert_eq!(out, "3\n2\n");
     }
+
+    #[tokio::test]
+    async fn std_time_now_and_durations() {
+        let out = run("import * as time from \"std/time\"\nprint(time.seconds(2))\nprint(time.now() > 1700000000000)").await;
+        assert_eq!(out, "2000\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn std_time_sleep_suspends() {
+        // sleep a tiny amount; assert it completes and returns nil
+        let out = run("import * as time from \"std/time\"\nawait time.sleep(5)\nprint(\"done\")").await;
+        assert_eq!(out, "done\n");
+    }
+
+    #[tokio::test]
+    async fn std_time_sleep_without_await_also_works() {
+        // sleep suspends during the call itself; `await` is harmless identity
+        let out = run("import * as time from \"std/time\"\ntime.sleep(5)\nprint(\"done\")").await;
+        assert_eq!(out, "done\n");
+    }
+
+    #[tokio::test]
+    async fn std_time_monotonic_elapsed() {
+        // monotonic measures elapsed; after a sleep it must advance
+        let out = run("import * as time from \"std/time\"\n\
+                       let a = time.monotonic()\n\
+                       await time.sleep(10)\n\
+                       let b = time.monotonic()\n\
+                       print(b > a)")
+        .await;
+        assert_eq!(out, "true\n");
+    }
 }

@@ -12,7 +12,7 @@ name = "ascript"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 async-recursion = "1"
 indexmap = "2"
 clap = { version = "4", features = ["derive"] }
