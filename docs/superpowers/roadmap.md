@@ -41,8 +41,12 @@ working, tested software on its own.
   (accepts Ok+Err), tuple, union. Also fixed: `//` + `/* */` comments (were
   missing). 107 lib + 7 integration tests. Merged. (map types → M8; class/enum
   types → M7.) Plan: `plans/2026-05-29-ascript-m6-type-contracts.md`.
-- ⬜ **M7 — Classes & enums + match.** `class`/`extends`/`super`/`self`/`init`;
-  simple enums; `match` expression with patterns.
+- ✅ **M7 — Classes & enums + match.** Classes (construct/fields/methods/`self`),
+  single inheritance (`extends`/`super`, defining-class-based resolution), simple
+  enums (interned variants, `.name`/`.value`), `match` (literal/enum/wildcard/
+  or-patterns, parsed below arrow precedence), `Type::Named` contracts
+  (subclass-aware). 120 lib + 8 integration tests. Merged.
+  Plan: `plans/2026-05-29-ascript-m7-classes-enums-match.md`.
 - ⬜ **M8 — Modules.** ESM `import`/`export`, namespace import, module graph +
   once-only evaluation + cache.
 - ⬜ **M9 — Tooling.** Rich diagnostics (ariadne/miette); REPL; `ascript fmt`;
@@ -177,3 +181,20 @@ working, tested software on its own.
 - **Carried-over (not new):** `Ok(nil)` is structurally indistinguishable from an
   Err's nil success slot under Result checking — inherent to Result-as-[T,error],
   matches spec; do not try to "fix".
+
+### M8 design guidance (from M7 holistic review — read before planning M8)
+
+- **`run_source` (lib.rs) is the module-loader seam:** grow it into a loader keyed
+  by resolved path with once-only evaluation + a module cache. Each module gets its
+  own top-level scope; `std/*` paths resolve to built-in modules.
+- **Exports are easy:** classes/enums/fns/consts are ordinary `env.define` bindings;
+  `export` captures a module's top-level scope and exposes selected names. The value
+  model needs no change — `Value::Class.def_env` and `Function.closure` already
+  capture the defining scope, so cross-module resolution sees the right lexical env.
+- **`map<K,V>` + `Map` value kind land together in M8** (parser already reserves
+  `map`→error). Adding `Map` needs new arms in `PartialEq`/`Debug`/`Display`/
+  `is_truthy`/`type_name`/`check_type` — same exhaustive-match discipline.
+- **NOTE on ordering:** M8 in this roadmap = "Modules". The original Phase-2 stdlib
+  numbering shifts; after M8 (modules) + M9 (tooling) come the stdlib milestones.
+  The `Map` kind is needed by `std/map`, so it can be introduced either in the
+  modules milestone or the first stdlib-collections milestone — decide when planning.
