@@ -27,6 +27,13 @@ pub enum ExprKind {
     Object(Vec<(String, Expr)>),
     Member { object: Box<Expr>, name: String },
     OptMember { object: Box<Expr>, name: String },
+    Template { parts: Vec<TemplatePart> },
+}
+
+#[derive(Clone, Debug)]
+pub enum TemplatePart {
+    Lit(String),
+    Expr(Box<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +150,7 @@ impl fmt::Display for ExprKind {
             }
             ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
             ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
+            ExprKind::Template { .. } => write!(f, "(template)"),
         }
     }
 }

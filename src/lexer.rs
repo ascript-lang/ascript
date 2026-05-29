@@ -4,10 +4,53 @@ use crate::error::AsError;
 use crate::span::Span;
 use crate::token::{Tok, Token};
 
+enum TemplateChunk {
+    Full,  // `...`           (no interpolation)
+    Start, // `...${          (more follows)
+}
+
+/// Read template text starting just after a backtick (or after `}` that closes
+/// an interpolation). Advances `i` past the terminating `` ` `` or `${`.
+fn lex_template_chunk(
+    chars: &[char],
+    i: &mut usize,
+    start: usize,
+) -> Result<(String, TemplateChunk), AsError> {
+    let mut text = String::new();
+    while *i < chars.len() {
+        let c = chars[*i];
+        if c == '`' {
+            *i += 1;
+            return Ok((text, TemplateChunk::Full));
+        }
+        if c == '$' && *i + 1 < chars.len() && chars[*i + 1] == '{' {
+            *i += 2;
+            return Ok((text, TemplateChunk::Start));
+        }
+        if c == '\\' && *i + 1 < chars.len() {
+            // simple escapes inside templates: \` \$ \\ \n \t
+            *i += 1;
+            let e = chars[*i];
+            text.push(match e {
+                'n' => '\n',
+                't' => '\t',
+                other => other,
+            });
+            *i += 1;
+            continue;
+        }
+        text.push(c);
+        *i += 1;
+    }
+    Err(AsError::at("unterminated template string", Span::new(start, *i)))
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
     let chars: Vec<char> = src.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
+    let mut brace_depth = 0usize;
+    let mut template_stack: Vec<usize> = Vec::new();
 
     while i < chars.len() {
         let c = chars[i];
@@ -142,8 +185,36 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
             ',' => push(&mut tokens, Tok::Comma, start, &mut i),
             ';' => push(&mut tokens, Tok::Semicolon, start, &mut i),
             ':' => push(&mut tokens, Tok::Colon, start, &mut i),
-            '{' => push(&mut tokens, Tok::LBrace, start, &mut i),
-            '}' => push(&mut tokens, Tok::RBrace, start, &mut i),
+            '{' => {
+                brace_depth += 1;
+                push(&mut tokens, Tok::LBrace, start, &mut i);
+            }
+            '}' => {
+                if let Some(&open_depth) = template_stack.last() {
+                    if brace_depth == open_depth {
+                        // This `}` closes a template interpolation.
+                        template_stack.pop();
+                        i += 1;
+                        let (text, kind) = lex_template_chunk(&chars, &mut i, start)?;
+                        match kind {
+                            TemplateChunk::Full => tokens.push(Token {
+                                tok: Tok::TemplateEnd(text),
+                                span: Span::new(start, i),
+                            }),
+                            TemplateChunk::Start => {
+                                tokens.push(Token {
+                                    tok: Tok::TemplateMiddle(text),
+                                    span: Span::new(start, i),
+                                });
+                                template_stack.push(brace_depth);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                brace_depth -= 1;
+                push(&mut tokens, Tok::RBrace, start, &mut i);
+            }
             '[' => push(&mut tokens, Tok::LBracket, start, &mut i),
             ']' => push(&mut tokens, Tok::RBracket, start, &mut i),
             '"' => {
@@ -158,6 +229,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 }
                 i += 1; // consume closing quote
                 tokens.push(Token { tok: Tok::Str(s), span: Span::new(start, i) });
+            }
+            '`' => {
+                i += 1;
+                let (text, kind) = lex_template_chunk(&chars, &mut i, start)?;
+                match kind {
+                    TemplateChunk::Full => tokens.push(Token {
+                        tok: Tok::TemplateStr(text),
+                        span: Span::new(start, i),
+                    }),
+                    TemplateChunk::Start => {
+                        tokens.push(Token {
+                            tok: Tok::TemplateStart(text),
+                            span: Span::new(start, i),
+                        });
+                        template_stack.push(brace_depth);
+                    }
+                }
             }
             c if c.is_ascii_digit() => {
                 let mut j = i;
@@ -303,6 +391,25 @@ mod tests {
         assert_eq!(
             kinds("x => x"),
             vec![Tok::Ident("x".into()), Tok::FatArrow, Tok::Ident("x".into()), Tok::Eof]
+        );
+    }
+
+    #[test]
+    fn lexes_plain_template() {
+        assert_eq!(kinds("`hello`"), vec![Tok::TemplateStr("hello".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_interpolated_template() {
+        // `a${x}b`  ->  Start("a") Ident(x) End("b")
+        assert_eq!(
+            kinds("`a${x}b`"),
+            vec![
+                Tok::TemplateStart("a".into()),
+                Tok::Ident("x".into()),
+                Tok::TemplateEnd("b".into()),
+                Tok::Eof,
+            ]
         );
     }
 

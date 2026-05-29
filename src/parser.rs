@@ -597,6 +597,33 @@ impl<'a> Parser<'a> {
                 let span = Span::new(tok_span.start, self.prev_end());
                 return Ok(Expr { kind: ExprKind::Object(entries), span });
             }
+            Tok::TemplateStr(s) => {
+                let parts = vec![crate::ast::TemplatePart::Lit(s)];
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Template { parts }, span });
+            }
+            Tok::TemplateStart(s) => {
+                let mut parts = vec![crate::ast::TemplatePart::Lit(s)];
+                loop {
+                    let e = self.expr()?;
+                    parts.push(crate::ast::TemplatePart::Expr(Box::new(e)));
+                    match self.advance() {
+                        Tok::TemplateMiddle(s) => parts.push(crate::ast::TemplatePart::Lit(s)),
+                        Tok::TemplateEnd(s) => {
+                            parts.push(crate::ast::TemplatePart::Lit(s));
+                            break;
+                        }
+                        other => {
+                            return Err(AsError::at(
+                                format!("malformed template, found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    }
+                }
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr { kind: ExprKind::Template { parts }, span });
+            }
             other => return Err(AsError::at(format!("unexpected token {:?}", other), tok_span)),
         };
         Ok(Expr { kind, span: tok_span })

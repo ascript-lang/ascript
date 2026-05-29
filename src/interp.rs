@@ -287,6 +287,19 @@ impl Interp {
                 }
                 Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(map))))
             }
+            ExprKind::Template { parts } => {
+                let mut out = String::new();
+                for part in parts {
+                    match part {
+                        crate::ast::TemplatePart::Lit(s) => out.push_str(s),
+                        crate::ast::TemplatePart::Expr(e) => {
+                            let v = self.eval_expr(e, env).await?;
+                            out.push_str(&v.to_string());
+                        }
+                    }
+                }
+                Ok(Value::Str(out.into()))
+            }
             ExprKind::Member { object, name } => {
                 let obj = self.eval_expr(object, env).await?;
                 self.read_member(&obj, name, object.span)
@@ -893,5 +906,25 @@ mod tests {
         let env = global_env();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("not iterable"));
+    }
+
+    #[tokio::test]
+    async fn template_string_interpolates() {
+        let src = "let name = \"Ada\"\nlet n = 3\nprint(`hi ${name}, ${n + 1} times`)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "hi Ada, 4 times\n");
+    }
+
+    #[tokio::test]
+    async fn nested_template_and_plain() {
+        let src = "print(`outer ${ `inner ${1 + 1}` } end`)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "outer inner 2 end\n");
     }
 }
