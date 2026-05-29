@@ -315,6 +315,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "class" => Tok::Class,
                     "import" => Tok::Import,
                     "export" => Tok::Export,
+                    "async" => Tok::Async,
+                    "await" => Tok::Await,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });

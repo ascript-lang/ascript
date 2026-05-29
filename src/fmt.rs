@@ -152,8 +152,11 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("continue\n");
         }
-        Stmt::Fn { name, params, ret, body } => {
+        Stmt::Fn { name, params, ret, body, is_async } => {
             indent(out, level);
+            if *is_async {
+                out.push_str("async ");
+            }
             out.push_str("fn ");
             out.push_str(name);
             write_params(out, params);
@@ -234,6 +237,9 @@ fn write_enum_variant(out: &mut String, v: &EnumVariantDecl, level: usize) {
 
 fn write_method(out: &mut String, m: &MethodDecl, level: usize) {
     indent(out, level);
+    if m.is_async {
+        out.push_str("async ");
+    }
     out.push_str("fn ");
     out.push_str(&m.name);
     write_params(out, &m.params);
@@ -276,6 +282,7 @@ fn expr_prec(e: &Expr) -> u8 {
         ExprKind::Arrow { .. } => PREC_ASSIGN,
         ExprKind::Binary { op, .. } => bin_prec(*op),
         ExprKind::Unary { .. } => PREC_UNARY,
+        ExprKind::Await(_) => PREC_UNARY,
         ExprKind::Call { .. }
         | ExprKind::Index { .. }
         | ExprKind::Member { .. }
@@ -317,6 +324,11 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             // Operand binds at least as tight as a unary operand.
             write_expr(out, expr, PREC_UNARY);
         }
+        ExprKind::Await(expr) => {
+            out.push_str("await ");
+            // Operand binds at least as tight as a unary operand.
+            write_expr(out, expr, PREC_UNARY);
+        }
         ExprKind::Binary { op, lhs, rhs } => {
             let p = bin_prec(*op);
             // Left-associative for all ops except Pow (right-associative): a
@@ -350,7 +362,10 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             out.push_str(" = ");
             write_expr(out, value, PREC_ASSIGN);
         }
-        ExprKind::Arrow { params, body } => {
+        ExprKind::Arrow { params, body, is_async } => {
+            if *is_async {
+                out.push_str("async ");
+            }
             // Single un-annotated param renders without parens (`x => …`);
             // anything else uses the parenthesized form.
             if params.len() == 1 && params[0].ty.is_none() {

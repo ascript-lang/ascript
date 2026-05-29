@@ -24,6 +24,7 @@ pub struct Method {
     pub params: Vec<crate::ast::Param>,
     pub ret: Option<crate::ast::Type>,
     pub body: Vec<Stmt>,
+    pub is_async: bool,
 }
 
 pub struct Class {
@@ -69,6 +70,7 @@ pub struct Function {
     pub ret: Option<crate::ast::Type>,
     pub body: Vec<Stmt>,
     pub closure: Environment,
+    pub is_async: bool,
 }
 
 #[derive(Clone)]

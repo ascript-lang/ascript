@@ -45,6 +45,20 @@ fn runs_functions_example() {
 }
 
 #[test]
+fn runs_async_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/async.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    // fetch(21)=42; await 5=5; async arrow g(9)=10; async arrow h(8)=7.
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n5\n10\n7\n");
+}
+
+#[test]
 fn runs_data_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin)

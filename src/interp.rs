@@ -279,13 +279,14 @@ impl Interp {
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
-            Stmt::Fn { name, params, ret, body } => {
+            Stmt::Fn { name, params, ret, body, is_async } => {
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
                     ret: ret.clone(),
                     body: body.clone(),
                     closure: env.clone(),
+                    is_async: *is_async,
                 }));
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -323,6 +324,7 @@ impl Interp {
                         params: m.params.clone(),
                         ret: m.ret.clone(),
                         body: m.body.clone(),
+                        is_async: m.is_async,
                     }));
                 }
                 let class = Value::Class(std::rc::Rc::new(crate::value::Class {
@@ -446,7 +448,7 @@ impl Interp {
                 };
                 Ok(result)
             }
-            ExprKind::Arrow { params, body } => {
+            ExprKind::Arrow { params, body, is_async } => {
                 let body_stmts = match body.as_ref() {
                     crate::ast::ArrowBody::Block(stmts) => stmts.clone(),
                     crate::ast::ArrowBody::Expr(e) => vec![Stmt::Return(Some((**e).clone()))],
@@ -457,6 +459,7 @@ impl Interp {
                     ret: None,
                     body: body_stmts,
                     closure: env.clone(),
+                    is_async: *is_async,
                 })))
             }
             ExprKind::Array(items) => {
@@ -509,6 +512,7 @@ impl Interp {
                 }
                 Err(AsError::at("no matching arm in match expression", expr.span).into())
             }
+            ExprKind::Await(inner) => self.eval_expr(inner, env).await,
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
             ExprKind::Try(inner) => {
                 let v = self.eval_expr(inner, env).await?;
@@ -1853,5 +1857,15 @@ print(r[1])
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("type contract violated"));
         assert!(err.message.contains("expected Animal"));
+    }
+
+    #[tokio::test]
+    async fn async_fn_and_await_surface() {
+        let src = "async fn fetch(x) { return x * 2 }\nlet r = await fetch(21)\nprint(r)\nprint(await 5)\nlet g = async (n) => n + 1\nprint(await g(9))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "42\n5\n10\n");
     }
 }
