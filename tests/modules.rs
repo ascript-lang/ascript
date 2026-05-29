@@ -61,3 +61,14 @@ fn circular_import_resolves_partial() {
     // a.X=10 is defined before a imports b; b reads X=10, sets Y=15; a.sum()=25.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "25\n");
 }
+
+#[test]
+fn exports_destructured_names() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let d = temp_dir("destructure_export");
+    fs::write(d.join("lib.as"), "export let [a, b] = [1, 2]").unwrap();
+    fs::write(d.join("main.as"), "import { a, b } from \"./lib\"\nprint(a)\nprint(b)").unwrap();
+    let out = std::process::Command::new(bin).arg("run").arg(d.join("main.as")).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n2\n");
+}

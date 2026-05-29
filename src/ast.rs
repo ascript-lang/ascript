@@ -53,6 +53,7 @@ pub enum Type {
     Tuple(Vec<Type>),
     Union(Box<Type>, Box<Type>),
     Named(String),
+    Map(Box<Type>, Box<Type>),
 }
 
 /// A function parameter: a name with an optional type annotation.
@@ -87,6 +88,7 @@ impl std::fmt::Display for Type {
             }
             Type::Union(a, b) => write!(f, "{} | {}", a, b),
             Type::Named(n) => write!(f, "{}", n),
+            Type::Map(k, v) => write!(f, "map<{}, {}>", k, v),
         }
     }
 }
@@ -107,6 +109,7 @@ pub enum ArrowBody {
 pub enum Stmt {
     Expr(Expr),
     Let { name: String, ty: Option<Type>, value: Expr, mutable: bool },
+    LetDestructure { names: Vec<String>, value: Expr, mutable: bool },
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },

@@ -50,7 +50,7 @@ impl From<AsError> for Control {
 /// A fresh global environment with the built-in functions installed.
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    for name in ["print", "Ok", "Err", "assert", "recover", "test"] {
+    for name in ["print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range"] {
         env.define(name, Value::Builtin(name.into()), false)
             .expect("global env starts empty");
     }
@@ -58,12 +58,14 @@ pub fn global_env() -> Environment {
 }
 
 /// Build a `[value, err]` Result pair.
-fn make_pair(value: Value, err: Value) -> Value {
+// pub(crate): used by std/* modules (std/convert) later in M10.
+pub(crate) fn make_pair(value: Value, err: Value) -> Value {
     Value::Array(Rc::new(RefCell::new(vec![value, err])))
 }
 
 /// Build an error object `{ message: <msg> }`.
-fn make_error(msg: Value) -> Value {
+// pub(crate): used by std/* modules (std/convert) later in M10.
+pub(crate) fn make_error(msg: Value) -> Value {
     let mut map = indexmap::IndexMap::new();
     map.insert("message".to_string(), msg);
     Value::Object(Rc::new(RefCell::new(map)))
@@ -164,6 +166,27 @@ impl Interp {
         Ok(entry)
     }
 
+    /// Resolve a `std/*` built-in module to a cached `ModuleEntry`, building it
+    /// from the static export registry. Bypasses the filesystem entirely.
+    fn load_std_module(&mut self, source: &str) -> Result<ModuleEntry, Control> {
+        let key = PathBuf::from(format!("<std>/{}", &source[4..]));
+        if let Some(entry) = self.modules.get(&key) {
+            return Ok(entry.clone());
+        }
+        let exports_list = crate::stdlib::std_module_exports(source).ok_or_else(|| {
+            Control::Panic(AsError::new(format!("unknown standard library module '{}'", source)))
+        })?;
+        let env = global_env();
+        let exports = Rc::new(RefCell::new(HashSet::new()));
+        for (name, value) in exports_list {
+            env.define(&name, value, false).map_err(AsError::new)?;
+            exports.borrow_mut().insert(name);
+        }
+        let entry = ModuleEntry { env, exports };
+        self.modules.insert(key, entry.clone());
+        Ok(entry)
+    }
+
     fn resolve_import(&self, source: &str) -> PathBuf {
         let mut p = self.module_dir.join(source);
         if p.extension().is_none() {
@@ -198,6 +221,24 @@ impl Interp {
                     }
                 }
                 env.define(name, v, *mutable).map_err(AsError::new)?;
+                Ok(Flow::Normal)
+            }
+            Stmt::LetDestructure { names, value, mutable } => {
+                let v = self.eval_expr(value, env).await?;
+                let items = match v {
+                    Value::Array(a) => a.borrow().clone(),
+                    other => {
+                        return Err(AsError::at(
+                            format!("cannot destructure a non-array value of type {}", type_name(&other)),
+                            value.span,
+                        )
+                        .into())
+                    }
+                };
+                for (i, name) in names.iter().enumerate() {
+                    let elem = items.get(i).cloned().unwrap_or(Value::Nil);
+                    env.define(name, elem, *mutable).map_err(AsError::new)?;
+                }
                 Ok(Flow::Normal)
             }
             Stmt::Block(stmts) => {
@@ -338,14 +379,18 @@ impl Interp {
             }
             Stmt::Export(inner) => {
                 let flow = self.exec_stmt(inner, env).await?;
-                if let Some(name) = exported_name(inner) {
+                for name in exported_names(inner) {
                     self.current_exports.borrow_mut().insert(name);
                 }
                 Ok(flow)
             }
             Stmt::Import { names, source } => {
-                let resolved = self.resolve_import(source);
-                let entry = self.load_module(&resolved).await?;
+                let entry = if source.starts_with("std/") {
+                    self.load_std_module(source)?
+                } else {
+                    let resolved = self.resolve_import(source);
+                    self.load_module(&resolved).await?
+                };
                 match names {
                     crate::ast::ImportNames::Named(names) => {
                         for name in names {
@@ -651,8 +696,9 @@ impl Interp {
         }
     }
 
+    // pub(crate): used by std/* modules (std/array callbacks) later in M10.
     #[async_recursion(?Send)]
-    async fn call_value(&mut self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
+    pub(crate) async fn call_value(&mut self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
         match callee {
             Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
             Value::Function(func) => self.call_function(&func, args, span).await,
@@ -825,7 +871,76 @@ impl Interp {
                 self.tests.push((name, func));
                 Ok(Value::Nil)
             }
-            other => Err(AsError::at(format!("'{}' is not a function", other), span).into()),
+            "len" => {
+                let v = args.first().cloned().unwrap_or(Value::Nil);
+                let n = match &v {
+                    Value::Str(s) => s.chars().count(),
+                    Value::Array(a) => a.borrow().len(),
+                    Value::Object(o) => o.borrow().len(),
+                    Value::Map(m) => m.borrow().len(),
+                    _ => {
+                        return Err(AsError::at(
+                            format!("len() expects a string, array, object, or map, got {}", type_name(&v)),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                Ok(Value::Number(n as f64))
+            }
+            "type" => {
+                let v = args.first().cloned().unwrap_or(Value::Nil);
+                Ok(Value::Str(type_name(&v).into()))
+            }
+            "range" => {
+                let want_num = |i: usize| -> Result<f64, Control> {
+                    match args.get(i) {
+                        Some(Value::Number(n)) => Ok(*n),
+                        Some(v) => Err(AsError::at(
+                            format!("range() expects number arguments, got {}", type_name(v)),
+                            span,
+                        )
+                        .into()),
+                        None => Ok(0.0),
+                    }
+                };
+                let (start, end, step) = match args.len() {
+                    1 => (0.0, want_num(0)?, 1.0),
+                    2 => (want_num(0)?, want_num(1)?, 1.0),
+                    3 => (want_num(0)?, want_num(1)?, want_num(2)?),
+                    n => {
+                        return Err(AsError::at(
+                            format!("range() expects 1 to 3 arguments, got {}", n),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                if step == 0.0 {
+                    return Err(AsError::at("range() step must not be zero", span).into());
+                }
+                let mut out = Vec::new();
+                let mut i = start;
+                if step > 0.0 {
+                    while i < end {
+                        out.push(Value::Number(i));
+                        i += step;
+                    }
+                } else {
+                    while i > end {
+                        out.push(Value::Number(i));
+                        i += step;
+                    }
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
+            other => {
+                if let Some((module, func)) = other.split_once('.') {
+                    self.call_stdlib(module, func, args, span).await
+                } else {
+                    Err(AsError::at(format!("'{}' is not a function", other), span).into())
+                }
+            }
         }
     }
 
@@ -901,7 +1016,7 @@ fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
 }
 
 /// Human-readable type name for diagnostics.
-fn type_name(v: &Value) -> &'static str {
+pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Nil => "nil",
         Value::Bool(_) => "bool",
@@ -910,6 +1025,7 @@ fn type_name(v: &Value) -> &'static str {
         Value::Builtin(_) | Value::Function(_) => "function",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+        Value::Map(_) => "map",
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
@@ -918,13 +1034,14 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
-fn exported_name(stmt: &Stmt) -> Option<String> {
+fn exported_names(stmt: &Stmt) -> Vec<String> {
     match stmt {
-        Stmt::Let { name, .. } => Some(name.clone()),
-        Stmt::Fn { name, .. } => Some(name.clone()),
-        Stmt::Class { name, .. } => Some(name.clone()),
-        Stmt::Enum { name, .. } => Some(name.clone()),
-        _ => None,
+        Stmt::Let { name, .. } => vec![name.clone()],
+        Stmt::Fn { name, .. } => vec![name.clone()],
+        Stmt::Class { name, .. } => vec![name.clone()],
+        Stmt::Enum { name, .. } => vec![name.clone()],
+        Stmt::LetDestructure { names, .. } => names.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -975,6 +1092,13 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
             Value::EnumVariant(v) => &v.enum_name == name,
             _ => false,
         },
+        Type::Map(k, v) => match value {
+            Value::Map(m) => m
+                .borrow()
+                .iter()
+                .all(|(mk, val)| check_type(&mk.to_value(), k) && check_type(val, v)),
+            _ => false,
+        },
     }
 }
 
@@ -1005,6 +1129,117 @@ mod tests {
             Control::Panic(e) => e,
             Control::Propagate(_) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    /// Lex+parse+exec a program string, returning its captured `print` output.
+    /// Panics (test failure) on a lex/parse error or a runtime panic.
+    async fn run(src: &str) -> String {
+        let mut interp = Interp::new();
+        let tokens = lex(src).expect("lex");
+        let stmts = parse(&tokens).expect("parse");
+        let env = global_env();
+        interp.exec(&stmts, &env).await.expect("program panicked");
+        interp.output
+    }
+
+    /// Like `run`, but expects a runtime panic and returns its `AsError`.
+    async fn run_err(src: &str) -> AsError {
+        let mut interp = Interp::new();
+        let tokens = lex(src).expect("lex");
+        let stmts = parse(&tokens).expect("parse");
+        let env = global_env();
+        match interp.exec(&stmts, &env).await {
+            Err(Control::Panic(e)) => e,
+            Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
+            Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn std_map_end_to_end() {
+        let src = "import * as map from \"std/map\"\n\
+                   let m = map.new()\n\
+                   map.set(m, \"x\", 10)\n\
+                   map.set(m, \"y\", 20)\n\
+                   print(map.get(m, \"x\"))\n\
+                   print(len(m))\n\
+                   print(map.keys(m))\n\
+                   print(map.values(m))";
+        assert_eq!(run(src).await, "10\n2\n[\"x\", \"y\"]\n[10, 20]\n");
+    }
+
+    #[tokio::test]
+    async fn map_type_contract_enforced() {
+        let ok = run("import * as map from \"std/map\"\nlet m: map<string, number> = map.new()\nmap.set(m, \"a\", 1)\nprint(len(m))").await;
+        assert_eq!(ok, "1\n");
+        let err = run_err("let m: map<string, number> = 5").await;
+        assert!(err.message.contains("type contract violated"));
+    }
+
+    #[tokio::test]
+    async fn map_self_reference_display_is_cycle_guarded() {
+        // A self-referencing map must print without infinite recursion.
+        let out = run("import * as map from \"std/map\"\nlet m = map.new()\nmap.set(m, \"self\", m)\nprint(len(m))\nprint(m)").await;
+        assert_eq!(out, "1\nmap {\"self\": map {...}}\n");
+    }
+
+    #[tokio::test]
+    async fn map_number_key_contract_and_canonicalization() {
+        // map<number, string> with a string value and number key passes
+        let ok = run("import * as map from \"std/map\"\nlet m: map<number, string> = map.new()\nmap.set(m, 1, \"a\")\nprint(len(m))").await;
+        assert_eq!(ok, "1\n");
+        // -0.0 and 0.0 collide → len stays 1
+        let coll = run("import * as map from \"std/map\"\nlet m = map.new()\nmap.set(m, 0, \"x\")\nmap.set(m, -0.0, \"y\")\nprint(len(m))\nprint(map.get(m, 0))").await;
+        assert_eq!(coll, "1\ny\n");
+    }
+
+    #[tokio::test]
+    async fn core_len_type_range() {
+        assert_eq!(run("print(len([1,2,3]))").await, "3\n");
+        assert_eq!(run("print(len(\"hello\"))").await, "5\n");
+        assert_eq!(run("print(len({a:1, b:2}))").await, "2\n");
+        assert_eq!(run("print(type(1))").await, "number\n");
+        assert_eq!(run("print(type(\"x\"))").await, "string\n");
+        assert_eq!(run("print(type([1]))").await, "array\n");
+        assert_eq!(run("print(type(nil))").await, "nil\n");
+        assert_eq!(run("print(range(3))").await, "[0, 1, 2]\n");
+        assert_eq!(run("print(range(2, 5))").await, "[2, 3, 4]\n");
+        assert_eq!(run("print(range(0, 10, 3))").await, "[0, 3, 6, 9]\n");
+        assert_eq!(run("print(range(5, 0, -2))").await, "[5, 3, 1]\n");
+    }
+
+    #[tokio::test]
+    async fn len_of_wrong_type_panics() {
+        let err = run_err("len(5)").await;
+        assert!(err.message.contains("len() expects"));
+    }
+
+    #[tokio::test]
+    async fn range_error_paths_and_fractional() {
+        // zero step → panic
+        assert!(run_err("range(0, 5, 0)").await.message.contains("step must not be zero"));
+        // too many args → panic
+        assert!(run_err("range(1, 2, 3, 4)").await.message.contains("1 to 3 arguments"));
+        // non-number arg → panic
+        assert!(run_err("range(\"x\")").await.message.contains("number arguments"));
+        // zero args → panic (0 falls into the >3/other arm)
+        assert!(run_err("range()").await.message.contains("1 to 3 arguments"));
+        // fractional step: pin the IEEE-754 accumulation behavior (end-exclusive).
+        // The 4th element is 0.3+0.3+0.3 = 0.8999999999999999 (< 1, so included);
+        // the next accumulation exceeds 1 and is excluded. Accumulation drift is expected.
+        assert_eq!(run("print(range(0, 1, 0.3))").await, "[0, 0.3, 0.6, 0.8999999999999999]\n");
+    }
+
+    #[tokio::test]
+    async fn destructures_array_into_bindings() {
+        let out = run("let [a, b] = [1, 2]\nprint(a)\nprint(b)\nlet [x, y] = [9]\nprint(x)\nprint(y)").await;
+        assert_eq!(out, "1\n2\n9\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn destructuring_non_array_panics() {
+        let err = run_err("let [a, b] = 5").await;
+        assert!(err.message.contains("cannot destructure"));
     }
 
     #[tokio::test]
@@ -1867,5 +2102,115 @@ print(r[1])
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "42\n5\n10\n");
+    }
+
+    #[tokio::test]
+    async fn imports_std_math() {
+        let out = run("import * as math from \"std/math\"\nprint(math.abs(-5))\nprint(math.pow(2, 8))\nprint(math.pi > 3.14)").await;
+        assert_eq!(out, "5\n256\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn std_string_end_to_end() {
+        let src = "import * as string from \"std/string\"\n\
+                   print(string.upper(\"hi\"))\n\
+                   print(string.join(string.split(\"a-b-c\", \"-\"), \"+\"))\n\
+                   print(string.format(\"{}={}\", \"x\", 9))\n\
+                   print(string.padStart(\"5\", 3, \"0\"))";
+        assert_eq!(run(src).await, "HI\na+b+c\nx=9\n005\n");
+    }
+
+    #[tokio::test]
+    async fn std_convert_end_to_end() {
+        let src = "import * as convert from \"std/convert\"\n\
+                   let [n, err] = convert.parseNumber(\"42\")\n\
+                   print(n)\n\
+                   print(err)\n\
+                   let [bad, e2] = convert.parseNumber(\"nope\")\n\
+                   print(bad)\n\
+                   print(e2.message)\n\
+                   print(convert.parseInt(\"ff\", 16)[0])\n\
+                   print(convert.toString(123))\n\
+                   print(convert.toBool(0))";
+        assert_eq!(run(src).await, "42\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn std_object_end_to_end() {
+        let src = "import * as object from \"std/object\"\n\
+                   let p = { name: \"Ada\", age: 36 }\n\
+                   print(object.keys(p))\n\
+                   print(object.values(p))\n\
+                   print(object.has(p, \"age\"))\n\
+                   print(object.delete(p, \"age\"))\n\
+                   print(object.keys(p))\n\
+                   print(object.merge({ x: 1 }, { x: 2, y: 3 }))";
+        assert_eq!(run(src).await, "[\"name\", \"age\"]\n[\"Ada\", 36]\ntrue\ntrue\n[\"name\"]\n{x: 2, y: 3}\n");
+    }
+
+    #[tokio::test]
+    async fn std_array_map_filter_reduce() {
+        let src = "import * as array from \"std/array\"\n\
+                   let xs = [1, 2, 3, 4]\n\
+                   print(array.map(xs, (x) => x * 2))\n\
+                   print(array.filter(xs, (x) => x % 2 == 0))\n\
+                   print(array.reduce(xs, (a, x) => a + x, 0))";
+        assert_eq!(run(src).await, "[2, 4, 6, 8]\n[2, 4]\n10\n");
+    }
+
+    #[tokio::test]
+    async fn std_array_map_pointfree() {
+        let src = "import * as array from \"std/array\"\nimport * as math from \"std/math\"\nprint(array.map([-1, -2, 3], math.abs))";
+        assert_eq!(run(src).await, "[1, 2, 3]\n");
+    }
+
+    #[tokio::test]
+    async fn std_array_mutation_and_access() {
+        let src = "import * as array from \"std/array\"\n\
+                   let xs = [1, 2]\n\
+                   print(array.push(xs, 3))\n\
+                   print(xs)\n\
+                   print(array.pop(xs))\n\
+                   print(array.get(xs, 0))\n\
+                   print(array.get(xs, 9))\n\
+                   print(array.contains(xs, 2))\n\
+                   print(array.slice([10,20,30,40], 1, 3))";
+        assert_eq!(run(src).await, "3\n[1, 2, 3]\n3\n1\nnil\ntrue\n[20, 30]\n");
+    }
+
+    #[tokio::test]
+    async fn std_array_sort_default_and_comparator() {
+        let src = "import * as array from \"std/array\"\n\
+                   print(array.sort([3, 1, 2]))\n\
+                   print(array.sort([\"b\", \"a\", \"c\"]))\n\
+                   print(array.sort([3, 1, 2], (a, b) => b - a))";
+        assert_eq!(run(src).await, "[1, 2, 3]\n[\"a\", \"b\", \"c\"]\n[3, 2, 1]\n");
+    }
+
+    #[tokio::test]
+    async fn std_array_sort_is_stable() {
+        // comparator compares only the first element of each pair; equal keys keep input order
+        let src = "import * as array from \"std/array\"\n\
+                   let pairs = [[1, \"a\"], [1, \"b\"], [0, \"c\"], [1, \"d\"]]\n\
+                   print(array.sort(pairs, (x, y) => x[0] - y[0]))";
+        assert_eq!(run(src).await, "[[0, \"c\"], [1, \"a\"], [1, \"b\"], [1, \"d\"]]\n");
+    }
+
+    #[tokio::test]
+    async fn named_import_from_std() {
+        let out = run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))").await;
+        assert_eq!(out, "12\n7\n");
+    }
+
+    #[tokio::test]
+    async fn unknown_std_module_errors() {
+        let err = run_err("import { x } from \"std/nope\"").await;
+        assert!(err.message.contains("unknown standard library module"));
+    }
+
+    #[tokio::test]
+    async fn std_module_import_is_cached() {
+        let out = run("import * as m1 from \"std/math\"\nimport { abs } from \"std/math\"\nprint(m1.floor(3.7))\nprint(abs(-2))").await;
+        assert_eq!(out, "3\n2\n");
     }
 }

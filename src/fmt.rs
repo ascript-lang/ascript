@@ -80,6 +80,15 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_expr(out, value, 0);
             out.push('\n');
         }
+        Stmt::LetDestructure { names, value, mutable } => {
+            indent(out, level);
+            out.push_str(if *mutable { "let " } else { "const " });
+            out.push('[');
+            out.push_str(&names.join(", "));
+            out.push_str("] = ");
+            write_expr(out, value, 0);
+            out.push('\n');
+        }
         Stmt::Block(body) => {
             indent(out, level);
             write_block(out, body, level);
@@ -562,6 +571,12 @@ mod tests {
     fn formats_canonically() {
         let out = format_source("let x=1").unwrap();
         assert_eq!(out, "let x = 1\n");
+    }
+
+    #[test]
+    fn formats_array_destructuring() {
+        let out = format_source("let [a, b] = pair").unwrap();
+        assert_eq!(out, "let [a, b] = pair\n");
     }
 
     /// Every committed example must format idempotently and the formatted

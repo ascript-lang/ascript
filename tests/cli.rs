@@ -145,6 +145,19 @@ fn runs_modules_example() {
 }
 
 #[test]
+fn runs_stdlib_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/stdlib.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(out.contains("brown, fox, quick, the"));
+    assert!(out.contains("[1, 4, 9, 16]"));
+    assert!(out.contains("\"name\", \"age\"")); // object.keys
+    assert!(out.contains("cannot parse 'xyz' as a number")); // Result destructuring
+    assert!(out.contains("\n50\n")); // 42 + 8 after parseNumber + destructure
+}
+
+#[test]
 fn repl_evaluates_and_persists_bindings() {
     use std::io::Write;
     use std::process::{Command, Stdio};

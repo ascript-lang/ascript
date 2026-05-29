@@ -328,10 +328,14 @@ impl<'a> Parser<'a> {
                     self.eat(&Tok::Gt)?;
                     Ok(Type::Result(Box::new(inner)))
                 }
-                "map" => Err(AsError::at(
-                    "map<K,V> type annotations arrive in Milestone 8",
-                    span,
-                )),
+                "map" => {
+                    self.eat(&Tok::Lt)?;
+                    let k = self.parse_type()?;
+                    self.eat(&Tok::Comma)?;
+                    let v = self.parse_type()?;
+                    self.eat(&Tok::Gt)?;
+                    Ok(Type::Map(Box::new(k), Box::new(v)))
+                }
                 _ => Ok(Type::Named(name)),
             },
             other => Err(AsError::at(format!("expected a type, found {:?}", other), span)),
@@ -452,6 +456,32 @@ impl<'a> Parser<'a> {
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
         self.advance(); // consume `let` / `const`
+        // `let [a, b] = expr` — array destructuring binding (spec §6).
+        if *self.peek() == Tok::LBracket {
+            self.advance(); // consume '['
+            let mut names = Vec::new();
+            if *self.peek() != Tok::RBracket {
+                loop {
+                    match self.advance() {
+                        Tok::Ident(n) => names.push(n),
+                        other => return Err(AsError::at(
+                            format!("expected an identifier in destructuring pattern, found {:?}", other),
+                            self.tokens[self.pos - 1].span,
+                        )),
+                    }
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                        if *self.peek() == Tok::RBracket { break; }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.eat(&Tok::RBracket)?;
+            self.eat(&Tok::Eq)?;
+            let value = self.expr()?;
+            return Ok(Stmt::LetDestructure { names, value, mutable });
+        }
         let name = match self.advance() {
             Tok::Ident(name) => name,
             other => {
@@ -976,6 +1006,29 @@ mod tests {
         match &stmts[0] {
             Stmt::Expr(e) => e.to_string(),
             _ => panic!("expected an expression statement"),
+        }
+    }
+
+    #[test]
+    fn parses_array_destructuring_let() {
+        let toks = lex("let [a, b] = pair").unwrap();
+        let prog = parse(&toks).unwrap();
+        match &prog[0] {
+            Stmt::LetDestructure { names, mutable, .. } => {
+                assert_eq!(names, &["a".to_string(), "b".to_string()]);
+                assert!(*mutable);
+            }
+            other => panic!("expected LetDestructure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_map_type_annotation() {
+        let toks = lex("let m: map<string, number> = empty").unwrap();
+        let prog = parse(&toks).unwrap();
+        match &prog[0] {
+            Stmt::Let { ty: Some(t), .. } => assert_eq!(t.to_string(), "map<string, number>"),
+            other => panic!("expected typed let, got {other:?}"),
         }
     }
 

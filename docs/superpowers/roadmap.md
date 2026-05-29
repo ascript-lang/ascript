@@ -64,9 +64,15 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 
 ## Phase 2 — Standard library: data & text
 
-- ⬜ **M10 — Core collections.** `core` globals, `std/string`, `std/array`,
-  `std/object`, `std/map`, `std/math`, `std/convert`. **Introduces the `Map` value
-  kind + `map<K,V>` contract type** (the one §4/§5 item deferred from the language).
+- ✅ **M10 — Core collections.** `core` globals (`len`/`type`/`range`), `std/string`,
+  `std/array`, `std/object`, `std/map`, `std/math`, `std/convert`; the **`Map` value
+  kind + `MapKey` + `map<K,V>` contract type** (the one §4/§5 item deferred from the
+  language); and **array destructuring `let [a, b] = expr`** (spec §6 — a Phase-1 gap
+  closed here, since the whole stdlib returns `[value, err]` pairs). Native dispatch via
+  qualified `Value::Builtin("module.fn")` routed through `call_stdlib`; `std/*` imports
+  resolve from a static registry (`src/stdlib/mod.rs`) cached under a synthetic `<std>/`
+  key. 183 lib + 15 cli + 5 module + 2 conformance tests. Merged.
+  Plan: `plans/2026-05-29-ascript-m10-core-collections.md`.
 - ⬜ **M11 — Serialization & encoding.** `std/json`, `std/regex`, `std/encoding`,
   `std/bytes`, `std/uuid`, `std/csv`, `std/toml`, `std/yaml`.
 - ⬜ **M12 — Time & locale.** `std/time`, `std/date`, `std/intl` (pragmatic icu4x).
@@ -244,7 +250,38 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 - **REPL note (from M8):** a module whose body panics still leaves a cached entry; for a
   long-lived REPL, consider evicting failed modules so re-import re-runs them.
 
-## Roadmap status: M1–M9 ✅ merged. **PHASE 1 COMPLETE.**
+### M11 design guidance (from M10 holistic review — read before planning M11)
+
+- **The stdlib seam is proven and replicable.** Each module is `src/stdlib/<name>.rs` with
+  `exports() -> Vec<(&'static str, Value)>` (binding name → `bi("name.fn")` or a constant
+  `Value`) + a dispatcher. Pure modules use a free `pub fn call(func, args, span)`;
+  callback/`self`-needing modules use `impl Interp { async fn call_<name>(...) }` (see
+  `std/array`). Register in `std_module_exports` (the `import` registry) AND `call_stdlib`
+  (the runtime router), both in `src/stdlib/mod.rs`. New modules: add `pub mod <name>;` there.
+- **Shared helpers** in `mod.rs`: `bi`, `arg`, `want_number/string/array/object`, `clamp_index`.
+  Add `want_*` helpers as new value kinds need them (keep the `"{ctx} expects a {type}, got
+  {actual}"` message shape). `ctx = |f| format!("module.{}", f)` per module.
+- **Tier-1 vs Tier-2 (spec §11.3):** fallible-on-data ops return `[value, err]` via
+  `make_pair`/`make_error` (`pub(crate)` in interp.rs); wrong-arg-type is a Tier-2 panic via
+  the `want_*` helpers. `std/convert` is the worked example (parseNumber = Tier-1, toNumber =
+  Tier-2 coercion).
+- **M11 introduces `Value::Bytes`** (recommended): a dedicated `Rc<RefCell<Vec<u8>>>` kind is
+  cleaner than an array-of-byte-numbers and is also needed by `std/process` (M13) and
+  `std/net/http` (M14). Adding it repeats the M10 `Map` discipline: new arms in `value.rs`
+  (PartialEq/Debug/Display/`is_truthy` is automatic via the catch-all/`type_name`) and
+  `interp.rs` (`type_name`, `check_type` if a `bytes` contract type is added, `len`). The
+  compiler's exhaustiveness checker lists every match to update — add explicit arms, no `_`.
+- **`std/json`** round-trips `Value` (object/array/number/string/bool/nil → JSON); `Map` has no
+  JSON form, so JSON objects parse to `Value::Object`. New crates (`serde_json`, `regex`,
+  `base64`, `hex`, `uuid`, `csv`, `toml`, `serde_yaml`) land here; gate under a `data` Cargo
+  feature per spec §12.4.
+- **Conformance/fmt:** any NEW surface syntax needs a Tree-sitter grammar update + an example
+  exercising it (the conformance test parses every `examples/*.as` under both parsers). M10
+  added no new syntax beyond what the grammar already had (`array_pattern`, `map_type`).
+- **`run`/`run_err` async test helpers** now exist in `src/interp.rs` tests (lex+parse+exec a
+  string → output / expected-panic `AsError`). Reuse them for stdlib e2e tests.
+
+## Roadmap status: M1–M10 ✅ merged. **PHASE 1 COMPLETE; PHASE 2 IN PROGRESS (M10 done).**
 The AScript language (spec §§2–9) + tooling (§10: diagnostics, REPL, fmt, test,
 Tree-sitter conformance) + async/await surface (§7) are fully implemented, unit- and
 example-tested, clippy-clean, and merged to `main`. Remaining: Phase 2+ standard

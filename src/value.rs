@@ -1,6 +1,5 @@
 //! Runtime values. Kinds: nil, bool, number, string, builtin, function, array,
-//! object, enum, enum-variant, class, instance, bound-method, super-ref. The
-//! `Map` kind arrives in Milestone 8.
+//! object, map, enum, enum-variant, class, instance, bound-method, super-ref.
 
 use crate::ast::Stmt;
 use crate::env::Environment;
@@ -8,6 +7,48 @@ use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
+
+/// A hashable map key. Maps key on `nil`/`bool`/`number`/`string` (spec §11.2);
+/// other value kinds are not hashable and panic at insertion time.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub enum MapKey {
+    Nil,
+    Bool(bool),
+    Num(u64), // canonicalized f64 bits (−0.0→+0.0, all NaNs→one canonical NaN)
+    Str(Rc<str>),
+}
+
+impl MapKey {
+    /// Convert a value to a key, or `None` if its kind is not hashable.
+    pub fn from_value(v: &Value) -> Option<MapKey> {
+        match v {
+            Value::Nil => Some(MapKey::Nil),
+            Value::Bool(b) => Some(MapKey::Bool(*b)),
+            Value::Number(n) => {
+                let canon = if *n == 0.0 {
+                    0.0f64.to_bits()
+                } else if n.is_nan() {
+                    f64::NAN.to_bits()
+                } else {
+                    n.to_bits()
+                };
+                Some(MapKey::Num(canon))
+            }
+            Value::Str(s) => Some(MapKey::Str(s.clone())),
+            _ => None,
+        }
+    }
+
+    /// Recover the value form of a key (for `keys`/`entries`/display/contracts).
+    pub fn to_value(&self) -> Value {
+        match self {
+            MapKey::Nil => Value::Nil,
+            MapKey::Bool(b) => Value::Bool(*b),
+            MapKey::Num(bits) => Value::Number(f64::from_bits(*bits)),
+            MapKey::Str(s) => Value::Str(s.clone()),
+        }
+    }
+}
 
 pub struct EnumDef {
     pub name: String,
@@ -85,6 +126,9 @@ pub enum Value {
     Function(Rc<Function>),
     Array(Rc<RefCell<Vec<Value>>>),
     Object(Rc<RefCell<IndexMap<String, Value>>>),
+    // IndexMap (not HashMap) is deliberate: insertion order is required for
+    // deterministic keys/values/entries/display and to match `Object`.
+    Map(Rc<RefCell<IndexMap<MapKey, Value>>>),
     Enum(Rc<EnumDef>),
     EnumVariant(Rc<EnumVariant>),
     Class(Rc<Class>),
@@ -114,6 +158,7 @@ impl PartialEq for Value {
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
+            (Value::Map(a), Value::Map(b)) => Rc::ptr_eq(a, b),
             // Enums and their (interned) variants compare by identity.
             (Value::Enum(a), Value::Enum(b)) => Rc::ptr_eq(a, b),
             (Value::EnumVariant(a), Value::EnumVariant(b)) => Rc::ptr_eq(a, b),
@@ -140,6 +185,7 @@ impl fmt::Debug for Value {
             }
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
             Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
+            Value::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
             Value::Enum(e) => write!(f, "Enum({})", e.name),
             Value::EnumVariant(v) => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
             Value::Class(c) => write!(f, "Class({})", c.name),
@@ -198,6 +244,25 @@ impl Value {
                         write!(f, ", ")?;
                     }
                     write!(f, "{}: ", k)?;
+                    v.write_element(f, seen)?;
+                }
+                write!(f, "}}")?;
+                seen.pop();
+                Ok(())
+            }
+            Value::Map(m) => {
+                let ptr = Rc::as_ptr(m) as usize;
+                if seen.contains(&ptr) {
+                    return write!(f, "map {{...}}");
+                }
+                seen.push(ptr);
+                write!(f, "map {{")?;
+                for (i, (k, v)) in m.borrow().iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    k.to_value().write_element(f, seen)?;
+                    write!(f, ": ")?;
                     v.write_element(f, seen)?;
                 }
                 write!(f, "}}")?;
@@ -272,6 +337,20 @@ mod tests {
         let b = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])));
         assert_ne!(a, b);
         assert!(a.is_truthy());
+    }
+
+    #[test]
+    fn maps_display_and_compare_by_identity() {
+        use indexmap::IndexMap;
+        let mut m = IndexMap::new();
+        m.insert(MapKey::Str("a".into()), Value::Number(1.0));
+        m.insert(MapKey::Num(0.0f64.to_bits()), Value::Str("zero".into()));
+        let map = Value::Map(Rc::new(RefCell::new(m)));
+        assert_eq!(map.to_string(), "map {\"a\": 1, 0: \"zero\"}");
+        assert_eq!(map.clone(), map);
+        assert!(map.is_truthy());
+        assert!(MapKey::from_value(&Value::Number(0.0)).is_some());
+        assert!(MapKey::from_value(&Value::Array(Rc::new(RefCell::new(vec![])))).is_none());
     }
 
     #[test]
