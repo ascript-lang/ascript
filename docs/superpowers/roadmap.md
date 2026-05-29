@@ -20,19 +20,26 @@ working, tested software on its own.
   assignment + compound assignment; optional `;`; blocks; `if/else`; `while`;
   `for (i in a..b)`. 44 lib + 3 integration tests. Merged.
   Plan: `plans/2026-05-29-ascript-phase1-m2-variables-control-flow.md`.
-- ⬜ **M3 — Functions & data.** `fn` declarations + closures + `return`; arrays
-  `[…]`, objects `{…}`, maps; member access `.`, indexing `[]`, optional
-  chaining `?.`; `for (x of iterable)`; template strings; the `?` Result operator
-  + Result/panic tiers; generalize builtin dispatch to callable `Value`.
-- ⬜ **M4 — Gradual type contracts.** Annotation grammar; runtime contract checks
+- ⬜ **M3 — Functions & control-flow completion.** Flow signal
+  (`Normal/Return/Break/Continue`) threaded through `exec`; `fn` declarations +
+  closures (capturing `Environment`) + `return`; `break`/`continue`; generalize
+  call dispatch to a callable `Value::Function`/builtin.
+- ⬜ **M4 — Data structures.** Arrays `[…]`, objects `{…}`, maps; member access
+  `.`, indexing `[]`, optional chaining `?.`; l-value (member/index) assignment;
+  `for (x of iterable)`; template strings.
+- ⬜ **M5 — Result & error model.** `Ok`/`Err`, the `?` propagation operator,
+  Result tier vs panic tier, `recover` boundary (spec §6).
+- ⬜ **M6 — Gradual type contracts.** Annotation grammar; runtime contract checks
   at bindings/params/returns; `error`/`Result<T>` types; `array<T>`/`map<K,V>`
   depth checks; contract failures panic.
-- ⬜ **M5 — Classes & enums + match.** `class`/`extends`/`super`/`self`/`init`;
+- ⬜ **M7 — Classes & enums + match.** `class`/`extends`/`super`/`self`/`init`;
   simple enums; `match` expression with patterns.
-- ⬜ **M6 — Modules.** ESM `import`/`export`, namespace import, module graph +
+- ⬜ **M8 — Modules.** ESM `import`/`export`, namespace import, module graph +
   once-only evaluation + cache.
-- ⬜ **M7 — Tooling.** Rich diagnostics (ariadne/miette); REPL; `ascript fmt`;
+- ⬜ **M9 — Tooling.** Rich diagnostics (ariadne/miette); REPL; `ascript fmt`;
   `ascript test` runner; Tree-sitter grammar conformance test.
+
+(Phase 2+ stdlib milestones below shift accordingly; renumber when reached.)
 
 ## Phase 2 — Standard library: data & text
 
