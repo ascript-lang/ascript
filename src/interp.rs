@@ -77,6 +77,20 @@ pub struct ModuleEntry {
     pub exports: Rc<RefCell<HashSet<String>>>,
 }
 
+/// The non-`Clone` OS resource behind a `Value::Native` handle. Real variants are
+/// feature-gated (added by sqlite/process tasks); only `Closed` is always present,
+/// so under `--no-default-features` the enum has just the one variant.
+pub(crate) enum ResourceState {
+    #[cfg(feature = "sql")]
+    SqliteConnection(rusqlite::Connection),
+    #[cfg(feature = "sys")]
+    ChildProcess(tokio::process::Child),
+    /// A resource that has been closed/consumed. Also the always-present variant
+    /// so the enum is non-empty under `--no-default-features`.
+    #[allow(dead_code)]
+    Closed,
+}
+
 pub struct Interp {
     /// Captured program output (what `print` writes). Exposed for testing and
     /// flushed to stdout by the CLI.
@@ -87,6 +101,10 @@ pub struct Interp {
     /// Tests registered via the `test(name, fn)` builtin. Only executed by
     /// `ascript test` (via `run_registered_tests`); a normal `run` just collects them.
     tests: Vec<(String, Value)>,
+    /// Live OS resources backing `Value::Native` handles, keyed by handle id.
+    resources: HashMap<u64, ResourceState>,
+    /// Monotonic id source for newly registered resources.
+    next_resource_id: u64,
 }
 
 /// Outcome of running the tests registered on an `Interp`.
@@ -106,7 +124,30 @@ impl Interp {
             module_dir: PathBuf::from("."),
             current_exports: Rc::new(RefCell::new(HashSet::new())),
             tests: Vec::new(),
+            resources: HashMap::new(),
+            next_resource_id: 0,
         }
+    }
+
+    /// Register an OS `state` behind a fresh `Value::Native` handle of `kind`,
+    /// carrying the plain readable `fields`.
+    #[allow(dead_code)] // Only called by feature-gated modules (sqlite/process) for now.
+    pub(crate) fn register_resource(
+        &mut self,
+        kind: crate::value::NativeKind,
+        fields: indexmap::IndexMap<String, Value>,
+        state: ResourceState,
+    ) -> Value {
+        let id = self.next_resource_id;
+        self.next_resource_id += 1;
+        self.resources.insert(id, state);
+        Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
+    }
+
+    /// Remove and return the resource for `id` (used by `close`/`kill`/EOF).
+    #[allow(dead_code)] // Only used by feature-gated modules (sqlite/process) for now.
+    pub(crate) fn take_resource(&mut self, id: u64) -> Option<ResourceState> {
+        self.resources.remove(&id)
     }
 
     /// Run every test registered via the `test(name, fn)` builtin. Each test fn
@@ -723,6 +764,15 @@ impl Interp {
                 },
                 None => Err(AsError::at(format!("no superclass method '{}' (no superclass)", name), span)),
             },
+            Value::Native(n) => {
+                if let Some(v) = n.fields.get(name) {
+                    return Ok(v.clone());
+                }
+                Ok(Value::NativeMethod(std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: n.clone(),
+                    method: name.to_string(),
+                })))
+            }
             Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
             _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
@@ -736,8 +786,28 @@ impl Interp {
             Value::Function(func) => self.call_function(&func, args, span).await,
             Value::Class(class) => self.construct(class, args, span).await,
             Value::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
+            Value::NativeMethod(m) => self.call_native_method(m, args, span).await,
             _ => Err(AsError::at("value is not callable", span).into()),
         }
+    }
+
+    /// Dispatch a `NativeMethod` (e.g. `conn.query`, `child.wait`) to the handler
+    /// for its receiver's kind. Async + recursive because handlers (added by
+    /// sqlite/process tasks) re-enter the interpreter via `call_value`. For now
+    /// every kind falls through to the "no such method" error — the feature-gated
+    /// arms are added by Tasks 6/7.
+    #[async_recursion(?Send)]
+    pub(crate) async fn call_native_method(
+        &mut self,
+        m: std::rc::Rc<crate::value::NativeMethod>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let _ = args;
+        // Tasks 6/7 add feature-gated `match m.receiver.kind { ... }` arms here
+        // (SqliteConnection/Statement → call_sqlite_method, Child/Reader/Writer →
+        // call_process_method). Until then, no native kind has any method.
+        Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
     }
 
     /// Bind params (with contracts), run a body in `call_env`, apply the return
@@ -1062,6 +1132,8 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Bytes(_) => "bytes",
         #[cfg(feature = "data")]
         Value::Regex(_) => "regex",
+        Value::Native(n) => n.kind.type_name(),
+        Value::NativeMethod(_) => "function",
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
@@ -1189,6 +1261,22 @@ mod tests {
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn native_handle_fields_and_methods() {
+        let mut interp = Interp::new();
+        let mut fields = indexmap::IndexMap::new();
+        fields.insert("pid".to_string(), Value::Number(42.0));
+        let h = interp.register_resource(crate::value::NativeKind::ChildProcess, fields, ResourceState::Closed);
+        assert_eq!(type_name(&h), "childProcess");
+        assert_eq!(interp.read_member(&h, "pid", Span::new(0, 0)).unwrap(), Value::Number(42.0));
+        let m = interp.read_member(&h, "wait", Span::new(0, 0)).unwrap();
+        assert!(matches!(m, Value::NativeMethod(_)));
+        assert_eq!(h.to_string(), format!("<native childProcess #{}>", 0));
+        // The resource is in the table until taken.
+        assert!(matches!(interp.take_resource(0), Some(ResourceState::Closed)));
+        assert!(interp.take_resource(0).is_none());
     }
 
     #[tokio::test]

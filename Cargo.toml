@@ -43,3 +43,7 @@ default = ["data", "datetime", "intl"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
+# Declared now (deps wired up by M13 Tasks 2-7) so the cfg-gated `ResourceState`
+# variants in src/interp.rs don't trigger `unexpected_cfgs`. Empty until then.
+sys = []
+sql = []
