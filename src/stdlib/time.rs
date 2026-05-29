@@ -19,10 +19,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     ]
 }
 
-// A process-start instant for monotonic(): lazily initialized.
-thread_local! {
-    static START: std::time::Instant = std::time::Instant::now();
-}
+// A process-global start instant for monotonic(), lazily initialized. Global
+// (not thread_local) so readings are comparable across threads under a
+// multi-thread runtime.
+use std::sync::LazyLock;
+static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
 /// Synchronous time functions. `sleep` is handled async in `call_time` (mod.rs)
 /// and must NOT be dispatched here.
@@ -37,7 +38,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             Ok(Value::Number(ms))
         }
         "monotonic" => {
-            let ms = START.with(|s| s.elapsed().as_secs_f64() * 1000.0);
+            let ms = START.elapsed().as_secs_f64() * 1000.0;
             Ok(Value::Number(ms))
         }
         "millis" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("millis"))?)),

@@ -119,6 +119,8 @@ impl Interp {
             if ms < 0.0 {
                 return Err(AsError::at("time.sleep duration must be non-negative", span).into());
             }
+            // `ms as u64` truncates toward zero: a fractional `sleep(20.7)`
+            // sleeps for 20 whole milliseconds.
             tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
             return Ok(Value::Nil);
         }
