@@ -452,6 +452,31 @@ impl<'a> Parser<'a> {
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
         self.advance(); // consume `let` / `const`
+        if *self.peek() == Tok::LBracket {
+            self.advance(); // consume '['
+            let mut names = Vec::new();
+            if *self.peek() != Tok::RBracket {
+                loop {
+                    match self.advance() {
+                        Tok::Ident(n) => names.push(n),
+                        other => return Err(AsError::at(
+                            format!("expected an identifier in destructuring pattern, found {:?}", other),
+                            self.tokens[self.pos - 1].span,
+                        )),
+                    }
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                        if *self.peek() == Tok::RBracket { break; }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.eat(&Tok::RBracket)?;
+            self.eat(&Tok::Eq)?;
+            let value = self.expr()?;
+            return Ok(Stmt::LetDestructure { names, value, mutable });
+        }
         let name = match self.advance() {
             Tok::Ident(name) => name,
             other => {
@@ -976,6 +1001,19 @@ mod tests {
         match &stmts[0] {
             Stmt::Expr(e) => e.to_string(),
             _ => panic!("expected an expression statement"),
+        }
+    }
+
+    #[test]
+    fn parses_array_destructuring_let() {
+        let toks = lex("let [a, b] = pair").unwrap();
+        let prog = parse(&toks).unwrap();
+        match &prog[0] {
+            Stmt::LetDestructure { names, mutable, .. } => {
+                assert_eq!(names, &["a".to_string(), "b".to_string()]);
+                assert!(*mutable);
+            }
+            other => panic!("expected LetDestructure, got {other:?}"),
         }
     }
 

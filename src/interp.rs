@@ -200,6 +200,24 @@ impl Interp {
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
+            Stmt::LetDestructure { names, value, mutable } => {
+                let v = self.eval_expr(value, env).await?;
+                let items = match v {
+                    Value::Array(a) => a.borrow().clone(),
+                    other => {
+                        return Err(AsError::at(
+                            format!("cannot destructure a non-array value of type {}", type_name(&other)),
+                            value.span,
+                        )
+                        .into())
+                    }
+                };
+                for (i, name) in names.iter().enumerate() {
+                    let elem = items.get(i).cloned().unwrap_or(Value::Nil);
+                    env.define(name, elem, *mutable).map_err(AsError::new)?;
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Block(stmts) => {
                 let child = env.child();
                 self.exec(stmts, &child).await
@@ -1005,6 +1023,42 @@ mod tests {
             Control::Panic(e) => e,
             Control::Propagate(_) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    /// Lex+parse+exec a program string, returning its captured `print` output.
+    /// Panics (test failure) on a lex/parse error or a runtime panic.
+    async fn run(src: &str) -> String {
+        let mut interp = Interp::new();
+        let tokens = lex(src).expect("lex");
+        let stmts = parse(&tokens).expect("parse");
+        let env = global_env();
+        interp.exec(&stmts, &env).await.expect("program panicked");
+        interp.output
+    }
+
+    /// Like `run`, but expects a runtime panic and returns its `AsError`.
+    async fn run_err(src: &str) -> AsError {
+        let mut interp = Interp::new();
+        let tokens = lex(src).expect("lex");
+        let stmts = parse(&tokens).expect("parse");
+        let env = global_env();
+        match interp.exec(&stmts, &env).await {
+            Err(Control::Panic(e)) => e,
+            Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
+            Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn destructures_array_into_bindings() {
+        let out = run("let [a, b] = [1, 2]\nprint(a)\nprint(b)\nlet [x, y] = [9]\nprint(x)\nprint(y)").await;
+        assert_eq!(out, "1\n2\n9\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn destructuring_non_array_panics() {
+        let err = run_err("let [a, b] = 5").await;
+        assert!(err.message.contains("cannot destructure"));
     }
 
     #[tokio::test]

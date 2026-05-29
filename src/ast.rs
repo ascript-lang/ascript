@@ -107,6 +107,7 @@ pub enum ArrowBody {
 pub enum Stmt {
     Expr(Expr),
     Let { name: String, ty: Option<Type>, value: Expr, mutable: bool },
+    LetDestructure { names: Vec<String>, value: Expr, mutable: bool },
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
