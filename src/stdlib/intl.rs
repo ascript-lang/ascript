@@ -88,10 +88,13 @@ fn currency_info(code: &str) -> (String, u8) {
 
 /// Region-aware date pattern for the pragmatic formatDate fallback.
 fn date_pattern(loc: &Locale, style: &str) -> &'static str {
-    let region = loc.id.region.map(|r| r.as_str().to_string());
-    let lang = loc.id.language.as_str().to_string();
+    let lang = loc.id.language;
+    let lang = lang.as_str();
     let order_ymd = lang == "ja" || lang == "zh" || lang == "ko";
-    let order_mdy = region.as_deref() == Some("US");
+    let order_mdy = match loc.id.region {
+        Some(r) => r.as_str() == "US",
+        None => false,
+    };
     match style {
         "short" => {
             if order_ymd {
@@ -129,6 +132,13 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         "formatNumber" => {
             let n = want_number(&arg(args, 0), span, &ctx("formatNumber"))?;
+            if !n.is_finite() {
+                return Err(AsError::at(
+                    format!("intl.formatNumber: cannot format a non-finite number ({})", n),
+                    span,
+                )
+                .into());
+            }
             let loc = parse_locale(
                 &want_string(&arg(args, 1), span, &ctx("formatNumber"))?,
                 span,
@@ -142,6 +152,13 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "formatCurrency" => {
             let n = want_number(&arg(args, 0), span, &ctx("formatCurrency"))?;
+            if !n.is_finite() {
+                return Err(AsError::at(
+                    format!("intl.formatCurrency: cannot format a non-finite number ({})", n),
+                    span,
+                )
+                .into());
+            }
             let code = want_string(&arg(args, 1), span, &ctx("formatCurrency"))?;
             let loc = parse_locale(
                 &want_string(&arg(args, 2), span, &ctx("formatCurrency"))?,
@@ -315,6 +332,20 @@ mod tests {
         assert_eq!(us, "Jun 15, 2021");
         assert_eq!(de, "15 Jun 2021");
         assert_eq!(ja, "2021/06/15");
+    }
+
+    #[test]
+    fn non_finite_number_panics() {
+        let inf = Value::Number(f64::INFINITY);
+        assert!(matches!(
+            call("formatNumber", &[inf, s("en-US")], sp()),
+            Err(Control::Panic(_))
+        ));
+        let nan = Value::Number(f64::NAN);
+        assert!(matches!(
+            call("formatCurrency", &[nan, s("USD"), s("en-US")], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 
     #[test]
