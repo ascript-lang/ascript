@@ -20,6 +20,8 @@ pub mod object;
 pub mod regex;
 pub mod string;
 #[cfg(feature = "data")]
+pub mod toml;
+#[cfg(feature = "data")]
 pub mod uuid;
 
 use crate::error::AsError;
@@ -54,6 +56,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/uuid" => uuid::exports(),
         #[cfg(feature = "data")]
         "std/csv" => csv::exports(),
+        #[cfg(feature = "data")]
+        "std/toml" => toml::exports(),
         _ => return None,
     };
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
@@ -86,6 +90,8 @@ impl Interp {
             "uuid" => uuid::call(func, args, span),
             #[cfg(feature = "data")]
             "csv" => csv::call(func, args, span),
+            #[cfg(feature = "data")]
+            "toml" => toml::call(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
     }

@@ -1275,6 +1275,16 @@ mod tests {
         assert_eq!(run(src).await, "Ada\n41\na,b\n1,2\n\n");
     }
 
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_toml_end_to_end() {
+        let src = "import * as toml from \"std/toml\"\n\
+                   let [cfg, err] = toml.parse(\"name = \\\"ascript\\\"\\nversion = 11\")\n\
+                   print(cfg.name)\n\
+                   print(cfg.version)";
+        assert_eq!(run(src).await, "ascript\n11\n");
+    }
+
     #[tokio::test]
     async fn user_can_shadow_builtins() {
         assert_eq!(run("let len = 5\nprint(len)").await, "5\n");
