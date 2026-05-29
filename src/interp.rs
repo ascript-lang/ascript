@@ -1285,6 +1285,16 @@ mod tests {
         assert_eq!(run(src).await, "ascript\n11\n");
     }
 
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn std_yaml_end_to_end() {
+        let src = "import * as yaml from \"std/yaml\"\n\
+                   let [doc, err] = yaml.parse(\"a: 1\\nb:\\n  - x\\n  - y\")\n\
+                   print(doc.a)\n\
+                   print(doc.b[1])";
+        assert_eq!(run(src).await, "1\ny\n");
+    }
+
     #[tokio::test]
     async fn user_can_shadow_builtins() {
         assert_eq!(run("let len = 5\nprint(len)").await, "5\n");
