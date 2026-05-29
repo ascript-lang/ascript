@@ -212,7 +212,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         continue;
                     }
                 }
-                brace_depth -= 1;
+                brace_depth = brace_depth.saturating_sub(1);
                 push(&mut tokens, Tok::RBrace, start, &mut i);
             }
             '[' => push(&mut tokens, Tok::LBracket, start, &mut i),
@@ -316,6 +316,13 @@ mod tests {
 
     fn kinds(src: &str) -> Vec<Tok> {
         lex(src).unwrap().into_iter().map(|t| t.tok).collect()
+    }
+
+    #[test]
+    fn stray_close_brace_does_not_panic() {
+        // A stray `}` must lex cleanly (no usize underflow panic); the parser
+        // rejects it later as an unexpected token.
+        assert_eq!(kinds("}"), vec![Tok::RBrace, Tok::Eof]);
     }
 
     #[test]
