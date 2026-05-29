@@ -290,3 +290,29 @@ fn runs_crypto_sha256_and_password_roundtrip() {
     );
     let _ = std::fs::remove_file(&file);
 }
+
+// The system capstone imports std/fs, std/crypto, std/compress, std/sqlite,
+// std/process, std/env and std/encoding, so it only loads with all those
+// features. It runs `echo`, so it is additionally gated to unix (mirroring the
+// existing process integration tests).
+#[test]
+#[cfg(all(feature = "sys", feature = "crypto", feature = "compress", feature = "sql", unix))]
+fn runs_system_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg("examples/system.as").output().unwrap();
+    assert!(output.status.success(), "process failed: {:?}", output);
+    let out = String::from_utf8_lossy(&output.stdout);
+    // crypto: sha256("abc")
+    assert!(out.contains("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    // fs.grep: 2 matches, first on line 2 ("beta TODO").
+    assert_eq!(out.lines().nth(1), Some("2")); // match count
+    assert_eq!(out.lines().nth(2), Some("2")); // first match line number
+    // compress: gzip -> gunzip round-trip is lossless.
+    assert!(out.contains("true"));
+    // sqlite: queried row value.
+    assert!(out.contains("ada"));
+    // process: echo's captured stdout.
+    assert!(out.contains("hello-from-subprocess"));
+    // env: round-tripped variable.
+    assert!(out.contains("demo-value"));
+}
