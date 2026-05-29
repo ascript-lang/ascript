@@ -87,9 +87,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "randomBytes" => {
             let n = want_number(&arg(args, 0), span, &ctx("randomBytes"))?;
-            if n < 0.0 {
+            // Bound the length: a huge/fractional `n as usize` would saturate
+            // into an alloc-abort rather than a clean Tier-2 panic. 16 MiB cap.
+            const MAX_RANDOM_BYTES: f64 = 16_777_216.0;
+            if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > MAX_RANDOM_BYTES {
                 return Err(AsError::at(
-                    "crypto.randomBytes length must be non-negative",
+                    "crypto.randomBytes: length must be a non-negative integer <= 16777216",
                     span,
                 )
                 .into());
@@ -125,6 +128,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 None | Some(Value::Nil) => bcrypt::DEFAULT_COST,
                 Some(v) => {
                     let c = want_number(v, span, &ctx("bcryptHash"))?;
+                    // bcrypt's valid cost range is 4..=31; reject anything else
+                    // (incl. non-integers) as a Tier-2 panic.
+                    if !c.is_finite() || c.fract() != 0.0 || !(4.0..=31.0).contains(&c) {
+                        return Err(AsError::at(
+                            "crypto.bcryptHash: cost must be an integer in 4..=31",
+                            span,
+                        )
+                        .into());
+                    }
                     c as u32
                 }
             };
@@ -215,6 +227,28 @@ mod tests {
             }
             _ => panic!("randomBytes should return bytes"),
         }
+    }
+
+    #[test]
+    fn random_bytes_bounds_are_tier2() {
+        // Negative length is rejected.
+        assert!(call("randomBytes", &[Value::Number(-1.0)], sp()).is_err());
+        // A huge length would saturate `as usize` into an alloc-abort; reject it.
+        assert!(call("randomBytes", &[Value::Number(1e30)], sp()).is_err());
+        // Fractional (non-integer) lengths are rejected.
+        assert!(call("randomBytes", &[Value::Number(1.5)], sp()).is_err());
+        // Non-finite lengths are rejected.
+        assert!(call("randomBytes", &[Value::Number(f64::NAN)], sp()).is_err());
+        // The cap itself is allowed; one past it is not.
+        assert!(call("randomBytes", &[Value::Number(16_777_217.0)], sp()).is_err());
+    }
+
+    #[test]
+    fn bcrypt_cost_bounds_are_tier2() {
+        // bcrypt's valid cost range is 4..=31; out-of-range is a Tier-2 panic.
+        assert!(call("bcryptHash", &[s("pw"), Value::Number(99.0)], sp()).is_err());
+        assert!(call("bcryptHash", &[s("pw"), Value::Number(3.0)], sp()).is_err());
+        assert!(call("bcryptHash", &[s("pw"), Value::Number(4.5)], sp()).is_err());
     }
 
     #[test]
