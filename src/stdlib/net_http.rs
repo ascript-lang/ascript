@@ -51,8 +51,19 @@
 //!   - `cancel` → a `cancelToken()` handle whose `cancel()` aborts the in-flight send
 //!     via a `tokio::select!` against a shared `Notify`.
 //!
-//! Deferred to later M14 tasks: streaming response + request bodies (Task 4), `sse`
-//! (Task 5), the `http3` build feature gate (Task 8).
+//! Streaming bodies (Task 4): with `opts.stream:true` the body is NOT buffered;
+//! `resp.body` is a `Value::Native(HttpBody)` reader following the §11.4 idiom
+//! (`await resp.body.read(n?)`→chunk|nil, `readLine()`, `readToEnd()`; chunk type
+//! string|bytes per `opts.bodyMode`). The buffered accessors (text/bytes/json) are
+//! then unavailable; conversely `resp.body` is only present in streaming mode.
+//! Request streaming (`body:{stream:source}`): a `bytes` source is sent as a true
+//! streamed body; a reader-handle (Reader/TcpStream/HttpBody) or async-generator-fn
+//! source is DRAINED into a buffer and then sent (buffered-then-sent), because
+//! pulling the next chunk from those sources re-enters the `!Send` single-threaded
+//! interp, which reqwest's body poll cannot do — see `apply_stream_body`.
+//!
+//! Deferred to later M14 tasks: `sse` (Task 5), the `http3` build feature gate
+//! (Task 8).
 
 use super::{arg, bi, want_string};
 use crate::error::AsError;
@@ -62,6 +73,93 @@ use crate::value::{NativeKind, NativeMethod, Value};
 use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::rc::Rc;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+// `bytes::Bytes` is the chunk type of reqwest's byte stream; tokio-util re-exports
+// the `bytes` crate, so we alias it rather than add a separate direct dependency.
+use tokio_util::bytes;
+
+/// Default chunk size for `resp.body.read()` with no `n` argument (mirrors
+/// net/tcp + std/process readers).
+const DEFAULT_CHUNK: usize = 64 * 1024;
+
+/// How a streaming body's chunks are decoded (`opts.bodyMode`): UTF-8-lossy
+/// strings (default) or raw bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BodyMode {
+    Str,
+    Bytes,
+}
+
+impl BodyMode {
+    /// Parse `opts.bodyMode` ("string" default | "bytes").
+    fn parse(opts: &Value, span: Span) -> Result<BodyMode, Control> {
+        match opt_field(opts, "bodyMode") {
+            None => Ok(BodyMode::Str),
+            Some(Value::Str(s)) if s.as_ref() == "string" => Ok(BodyMode::Str),
+            Some(Value::Str(s)) if s.as_ref() == "bytes" => Ok(BodyMode::Bytes),
+            Some(other) => Err(AsError::at(
+                format!(
+                    "net/http bodyMode must be \"string\" or \"bytes\", got {}",
+                    crate::interp::type_name(&other)
+                ),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// Wrap a finalized chunk as Str (lossy) or Bytes per the mode.
+    fn wrap(self, bytes: Vec<u8>) -> Value {
+        match self {
+            BodyMode::Bytes => Value::Bytes(Rc::new(RefCell::new(bytes))),
+            BodyMode::Str => Value::Str(String::from_utf8_lossy(&bytes).into_owned().into()),
+        }
+    }
+}
+
+/// The `AsyncRead` we get by adapting a `reqwest` byte stream: `bytes_stream()`
+/// yields `Result<Bytes, reqwest::Error>`; `StreamReader` needs `io::Error` items,
+/// so the stream's errors are mapped to `io::Error` first. The reader is then a
+/// `BufReader` over that, which lets the §11.4 idiom (`read`/`read_until`/
+/// `read_to_end`) apply VERBATIM over the chunked stream — the leftover buffering
+/// for partial `read(n)` and `readLine()` line-splitting is the BufReader's own.
+type ByteStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>>>>;
+
+/// A streaming HTTP response body: a `BufReader` over the response's chunked byte
+/// stream, plus the decode mode. Reads are pull-driven (each awaits only the next
+/// chunk), so a slow consumer applies backpressure to the transfer.
+pub struct HttpBodyState {
+    reader: tokio::io::BufReader<tokio_util::io::StreamReader<ByteStream, bytes::Bytes>>,
+    mode: BodyMode,
+}
+
+impl HttpBodyState {
+    fn new(resp: reqwest::Response, mode: BodyMode) -> Self {
+        use futures_util::StreamExt;
+        // bytes_stream(): Stream<Item = reqwest::Result<Bytes>>. Map the error type
+        // to io::Error so StreamReader (which yields io::Result chunks) accepts it.
+        let stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+        let boxed: ByteStream = Box::pin(stream);
+        let reader = tokio::io::BufReader::new(tokio_util::io::StreamReader::new(boxed));
+        HttpBodyState { reader, mode }
+    }
+
+    async fn read_upto(&mut self, n: usize, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        buf.resize(n, 0);
+        let got = self.reader.read(buf).await?;
+        buf.truncate(got);
+        Ok(got)
+    }
+
+    async fn read_line_bytes(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.reader.read_until(b'\n', buf).await
+    }
+
+    async fn read_to_end_bytes(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.reader.read_to_end(buf).await
+    }
+}
 
 thread_local! {
     /// A process-wide default `reqwest::Client` (connection pool + cookie store off
@@ -595,9 +693,9 @@ impl Interp {
             rb = self.apply_auth(rb, &a, span)?;
         }
 
-        // body: string · bytes · {json} · {form} · {multipart}.
+        // body: string · bytes · {json} · {form} · {multipart} · {stream}.
         if let Some(b) = opt_field(opts, "body") {
-            rb = self.apply_body(rb, &b, span)?;
+            rb = self.apply_body(rb, &b, span).await?;
         }
 
         // Resolve a cancellation handle (opts.cancel → a CancelHandle's Notify), if any.
@@ -624,7 +722,15 @@ impl Interp {
             )));
         }
 
-        Ok(make_pair(self.http_response_value(resp), Value::Nil))
+        // stream:true → don't buffer; expose `resp.body` as an HttpBody reader and
+        // do NOT store the response for the buffered text/bytes/json accessors.
+        let stream = matches!(opt_field(opts, "stream"), Some(Value::Bool(true)));
+        if stream {
+            let mode = BodyMode::parse(opts, span)?;
+            Ok(make_pair(self.http_streaming_response_value(resp, mode), Value::Nil))
+        } else {
+            Ok(make_pair(self.http_response_value(resp), Value::Nil))
+        }
     }
 
     /// Send `rb`, applying the hand-rolled retry loop and (optional) cancellation.
@@ -739,8 +845,9 @@ impl Interp {
         Err(AsError::at("net/http auth expects {bearer} or {basic:[user,pass]}", span).into())
     }
 
-    fn apply_body(
-        &self,
+    #[async_recursion::async_recursion(?Send)]
+    async fn apply_body(
+        &mut self,
         rb: reqwest::RequestBuilder,
         body: &Value,
         span: Span,
@@ -749,9 +856,19 @@ impl Interp {
             Value::Str(s) => Ok(rb.body(s.to_string())),
             Value::Bytes(b) => Ok(rb.body(b.borrow().clone())),
             Value::Object(o) => {
-                let o = o.borrow();
-                if let Some(jv) = o.get("json") {
-                    let json = crate::stdlib::json::from_ascript(jv, &mut Vec::new())
+                // Pull out the single recognized shape WITHOUT holding the borrow
+                // across an await (the {stream} path can call back into the interp).
+                let (jv, form, mp, stream) = {
+                    let o = o.borrow();
+                    (
+                        o.get("json").cloned(),
+                        o.get("form").cloned(),
+                        o.get("multipart").cloned(),
+                        o.get("stream").cloned(),
+                    )
+                };
+                if let Some(jv) = jv {
+                    let json = crate::stdlib::json::from_ascript(&jv, &mut Vec::new())
                         .map_err(|m| Control::from(AsError::at(format!("net/http body.json: {}", m), span)))?;
                     let bytes = serde_json::to_vec(&json)
                         .map_err(|e| Control::from(AsError::at(format!("net/http body.json: {}", e), span)))?;
@@ -759,17 +876,20 @@ impl Interp {
                         .header(reqwest::header::CONTENT_TYPE, "application/json")
                         .body(bytes));
                 }
-                if let Some(form) = o.get("form") {
-                    let pairs = value_to_query_pairs(form, span, "net/http body.form")?;
+                if let Some(form) = form {
+                    let pairs = value_to_query_pairs(&form, span, "net/http body.form")?;
                     // `.form(&pairs)` urlencodes + sets application/x-www-form-urlencoded.
                     return Ok(rb.form(&pairs));
                 }
-                if let Some(mp) = o.get("multipart") {
-                    let form = build_multipart(mp, span)?;
+                if let Some(mp) = mp {
+                    let form = build_multipart(&mp, span)?;
                     return Ok(rb.multipart(form));
                 }
+                if let Some(source) = stream {
+                    return self.apply_stream_body(rb, &source, span).await;
+                }
                 Err(AsError::at(
-                    "net/http body object must be {json}, {form}, or {multipart}",
+                    "net/http body object must be {json}, {form}, {multipart}, or {stream}",
                     span,
                 )
                 .into())
@@ -785,9 +905,133 @@ impl Interp {
         }
     }
 
-    /// Read the response metadata into `fields` and register the live response (for
-    /// the body accessors) behind a `Value::Native(HttpResponse)` handle.
-    fn http_response_value(&mut self, resp: reqwest::Response) -> Value {
+    /// Apply a `body: {stream: source}` request body.
+    ///
+    /// `source` is one of:
+    ///   (a) a `bytes` value — sent as a true streamed body (`Body::wrap_stream`
+    ///       over a one-chunk stream); trivially incremental.
+    ///   (b) a reader native handle (std/process Reader, net/tcp TcpStream, or an
+    ///       http `HttpBody`) — DRAINED fully into a buffer here, then sent.
+    ///   (c) an async-generator AScript fn `() => [bytes, err]` — called repeatedly
+    ///       (each `[chunk, err]`; `[nil, *]` or `nil` ends) and DRAINED into a
+    ///       buffer here, then sent.
+    ///
+    /// WHY buffered for (b)/(c): on the single-threaded interp, reqwest polls the
+    /// request body on its executor, but pulling the next chunk for these sources
+    /// means re-entering the interpreter (calling a user fn / reading a resource),
+    /// which needs `&mut Interp` — not available inside reqwest's body poll, and the
+    /// interp is `!Send`. Draining-then-sending sidesteps that reentrancy/!Send
+    /// problem. It is correct but loses true incremental upload for (b)/(c); the
+    /// bytes source (a) keeps the true streamed path.
+    async fn apply_stream_body(
+        &mut self,
+        rb: reqwest::RequestBuilder,
+        source: &Value,
+        span: Span,
+    ) -> Result<reqwest::RequestBuilder, Control> {
+        match source {
+            // (a) bytes → a true streamed body (single chunk).
+            Value::Bytes(b) => {
+                let data = b.borrow().clone();
+                let chunk =
+                    Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(data));
+                let stream = futures_util::stream::once(async move { chunk });
+                Ok(rb.body(reqwest::Body::wrap_stream(stream)))
+            }
+            // (b) a reader native handle → drain fully (buffered-then-sent).
+            Value::Native(n)
+                if matches!(
+                    n.kind,
+                    NativeKind::Reader | NativeKind::TcpStream | NativeKind::HttpBody
+                ) =>
+            {
+                let bytes = self.drain_reader_handle(n.clone(), span).await?;
+                Ok(rb.body(bytes))
+            }
+            // (c) an async-generator fn → call to exhaustion (buffered-then-sent).
+            Value::Function(_) | Value::Builtin(_) | Value::BoundMethod(_) => {
+                let bytes = self.drain_generator(source.clone(), span).await?;
+                Ok(rb.body(bytes))
+            }
+            other => Err(AsError::at(
+                format!(
+                    "net/http body.stream expects bytes, a reader handle, or a generator fn, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// Drain a reader native handle (Reader/TcpStream/HttpBody) fully into bytes by
+    /// calling its `readToEnd()` method. Buffered-then-sent (see `apply_stream_body`).
+    async fn drain_reader_handle(
+        &mut self,
+        n: Rc<crate::value::NativeObject>,
+        span: Span,
+    ) -> Result<Vec<u8>, Control> {
+        let m = Rc::new(NativeMethod { receiver: n, method: "readToEnd".to_string() });
+        let v = self.call_native_method(m, Vec::new(), span).await?;
+        match v {
+            Value::Bytes(b) => Ok(b.borrow().clone()),
+            Value::Str(s) => Ok(s.as_bytes().to_vec()),
+            Value::Nil => Ok(Vec::new()),
+            other => Err(AsError::at(
+                format!("net/http body.stream reader yielded a non-bytes value: {}", crate::interp::type_name(&other)),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// Drain an async-generator fn fully: call it repeatedly, concatenating each
+    /// chunk, until it returns `[nil, _]`/`nil` (end) or an `[_, err]` (error →
+    /// Tier-1 propagated as a Tier-2 here is avoided — a generator error aborts the
+    /// drain with a Tier-2, matching how a malformed body fails the request build).
+    async fn drain_generator(
+        &mut self,
+        gen: Value,
+        span: Span,
+    ) -> Result<Vec<u8>, Control> {
+        let mut out = Vec::new();
+        loop {
+            let r = self.call_value(gen.clone(), Vec::new(), span).await?;
+            // A generator yields `[chunk, err]` (or a bare chunk / nil to end).
+            let (chunk, err) = match &r {
+                Value::Nil => (Value::Nil, Value::Nil),
+                Value::Array(a) => {
+                    let a = a.borrow();
+                    (a.first().cloned().unwrap_or(Value::Nil), a.get(1).cloned().unwrap_or(Value::Nil))
+                }
+                other => (other.clone(), Value::Nil),
+            };
+            if !matches!(err, Value::Nil) {
+                return Err(AsError::at(
+                    format!("net/http body.stream generator returned an error: {}", err),
+                    span,
+                )
+                .into());
+            }
+            match chunk {
+                Value::Nil => return Ok(out), // end of stream
+                Value::Bytes(b) => out.extend_from_slice(&b.borrow()),
+                Value::Str(s) => out.extend_from_slice(s.as_bytes()),
+                other => {
+                    return Err(AsError::at(
+                        format!("net/http body.stream generator chunk must be bytes/string, got {}", crate::interp::type_name(&other)),
+                        span,
+                    )
+                    .into())
+                }
+            }
+        }
+    }
+
+    /// Build the response metadata `fields` (status/ok/version/url/headers/cookies)
+    /// read off the response before its body is consumed. Shared by the buffered
+    /// and streaming response constructors.
+    fn http_response_fields(resp: &reqwest::Response) -> IndexMap<String, Value> {
         let status = resp.status();
         let mut fields = IndexMap::new();
         fields.insert("status".to_string(), Value::Number(status.as_u16() as f64));
@@ -811,8 +1055,40 @@ impl Interp {
         }
         fields.insert("headers".to_string(), obj(headers));
         fields.insert("cookies".to_string(), obj(cookies));
+        fields
+    }
 
+    /// Read the response metadata into `fields` and register the live response (for
+    /// the buffered body accessors) behind a `Value::Native(HttpResponse)` handle.
+    fn http_response_value(&mut self, resp: reqwest::Response) -> Value {
+        let fields = Self::http_response_fields(&resp);
         self.register_resource(NativeKind::HttpResponse, fields, ResourceState::HttpResponse(resp))
+    }
+
+    /// Build a streaming response: the body is NOT buffered. The response's chunked
+    /// byte stream is registered behind a `Value::Native(HttpBody)` reader handle,
+    /// which is exposed as the response's `body` field. The buffered accessors
+    /// (text/bytes/json) are intentionally absent — see `call_http_response_method`.
+    fn http_streaming_response_value(&mut self, resp: reqwest::Response, mode: BodyMode) -> Value {
+        let mut fields = Self::http_response_fields(&resp);
+        let body = self.register_resource(
+            NativeKind::HttpBody,
+            IndexMap::new(),
+            ResourceState::HttpBody(HttpBodyState::new(resp, mode)),
+        );
+        fields.insert("body".to_string(), body);
+        // The streaming response handle carries only metadata + the `body` reader —
+        // there is NO live `reqwest::Response` behind it (the body owns the stream).
+        // Register to mint the handle, then immediately drop its table entry so it
+        // doesn't linger as a phantom resource: the only live resource for a
+        // streaming response is the HttpBody, which finalizes itself on EOF. A later
+        // `resp.text()/bytes()/json()` finds no entry and (because `body` is present
+        // in fields) reports the clear "not available on a streaming response" error.
+        let handle = self.register_resource(NativeKind::HttpResponse, fields, ResourceState::Closed);
+        if let Value::Native(n) = &handle {
+            self.take_resource(n.id);
+        }
+        handle
     }
 
     /// Dispatch a body accessor on an HTTP response handle: `text`/`bytes`/`json`.
@@ -832,7 +1108,17 @@ impl Interp {
                 let resp = match self.take_http_response(id) {
                     Some(r) => r,
                     None => {
-                        return Err(AsError::at("response body already consumed", span).into())
+                        // A streaming response (stream:true) carries a `body` reader
+                        // and never stored a buffered Response — the buffered accessors
+                        // don't apply. Distinguish that from a second consume.
+                        if m.receiver.fields.contains_key("body") {
+                            return Err(AsError::at(
+                                format!("resp.{}() is not available on a streaming response (request opts.stream:true); read resp.body instead", method),
+                                span,
+                            )
+                            .into());
+                        }
+                        return Err(AsError::at("response body already consumed", span).into());
                     }
                 };
                 match method {
@@ -855,6 +1141,103 @@ impl Interp {
                 }
             }
             other => Err(AsError::at(format!("httpResponse has no method '{}'", other), span).into()),
+        }
+    }
+
+    /// Dispatch a read method on a streaming HTTP body handle (`resp.body`):
+    /// `read(n?)` / `readLine()` / `readToEnd()` — the §11.4 reader idiom, reused
+    /// verbatim from net/tcp + std/process over the chunked byte stream. The body
+    /// finalizes itself on EOF (`take_resource`), so a read after EOF returns nil
+    /// (or empty bytes for `readToEnd`) rather than panicking, and the stream's
+    /// connection drops promptly.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn call_http_body_method(
+        &mut self,
+        m: &Rc<NativeMethod>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let id = m.receiver.id;
+        match m.method.as_str() {
+            "read" => {
+                let n = match args.first() {
+                    None | Some(Value::Nil) => DEFAULT_CHUNK,
+                    Some(v) => {
+                        let n = super::want_number(v, span, "body.read")?;
+                        if n < 0.0 {
+                            return Err(AsError::at("body.read n must be non-negative", span).into());
+                        }
+                        n as usize
+                    }
+                };
+                // read(0) is a no-op: return an empty chunk WITHOUT touching the
+                // resource (an empty buffer yields Ok(0), which would otherwise be
+                // treated as EOF and finalize a still-open body).
+                if n == 0 {
+                    let mode = match self.http_body_mut(id) {
+                        Some(b) => b.mode,
+                        None => return Ok(Value::Nil), // gone → EOF
+                    };
+                    return Ok(mode.wrap(Vec::new()));
+                }
+                let body = match self.http_body_mut(id) {
+                    Some(b) => b,
+                    None => return Ok(Value::Nil), // gone → EOF
+                };
+                let mode = body.mode;
+                let mut buf = Vec::new();
+                match body.read_upto(n, &mut buf).await {
+                    Ok(0) => {
+                        self.take_resource(id);
+                        Ok(Value::Nil)
+                    }
+                    Ok(_) => Ok(mode.wrap(buf)),
+                    Err(e) => Err(AsError::at(format!("body.read failed: {}", e), span).into()),
+                }
+            }
+            "readLine" => {
+                let body = match self.http_body_mut(id) {
+                    Some(b) => b,
+                    None => return Ok(Value::Nil), // gone → EOF
+                };
+                let mode = body.mode;
+                let mut buf = Vec::new();
+                match body.read_line_bytes(&mut buf).await {
+                    Ok(0) => {
+                        self.take_resource(id);
+                        Ok(Value::Nil)
+                    }
+                    Ok(_) => {
+                        // Strip a single trailing '\n' and an optional preceding '\r'.
+                        if buf.last() == Some(&b'\n') {
+                            buf.pop();
+                            if buf.last() == Some(&b'\r') {
+                                buf.pop();
+                            }
+                        }
+                        Ok(mode.wrap(buf))
+                    }
+                    Err(e) => Err(AsError::at(format!("body.readLine failed: {}", e), span).into()),
+                }
+            }
+            "readToEnd" => {
+                // readToEnd is type-stable: it ALWAYS returns a value in the body's
+                // mode (empty if already drained / finalized).
+                let body = match self.http_body_mut(id) {
+                    Some(b) => b,
+                    None => return Ok(BodyMode::Str.wrap(Vec::new())),
+                };
+                let mode = body.mode;
+                let mut buf = Vec::new();
+                match body.read_to_end_bytes(&mut buf).await {
+                    Ok(_) => {
+                        self.take_resource(id);
+                        Ok(mode.wrap(buf))
+                    }
+                    Err(e) => Err(AsError::at(format!("body.readToEnd failed: {}", e), span).into()),
+                }
+            }
+            other => Err(AsError::at(format!("httpBody has no method '{}'", other), span).into()),
         }
     }
 
@@ -1021,6 +1404,7 @@ mod tests {
     //   /redirect      → 302 Location: /text
     // Reused by Tasks 3-5.
     mod fixture {
+        use http_body_util::combinators::BoxBody;
         use http_body_util::{BodyExt, Full};
         use hyper::body::{Bytes, Incoming};
         use hyper::service::service_fn;
@@ -1034,7 +1418,10 @@ mod tests {
         /// Per-server hit counter for the `/flaky` endpoint (fail N times then 200).
         type Flaky = Arc<AtomicUsize>;
 
-        async fn handle(req: Request<Incoming>, flaky: Flaky) -> Result<Response<Full<Bytes>>, Infallible> {
+        async fn handle(
+            req: Request<Incoming>,
+            flaky: Flaky,
+        ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
             let method = req.method().to_string();
             let path = req.uri().path().to_string();
             let query = req.uri().query().unwrap_or("").to_string();
@@ -1140,13 +1527,31 @@ mod tests {
                         .to_string();
                     Response::new(Full::new(Bytes::from(format!("cookie={}", cookie))))
                 }
+                // A chunked/multi-frame body for streaming-response tests: emits
+                // "chunk1\nchunk2\nchunk3\n" across SEPARATE body frames (via a
+                // `StreamBody` of `Frame`s) so the client must pull multiple chunks.
+                // Uses a boxed body, hence the `BoxBody` return type below.
+                "/stream" => {
+                    use http_body_util::StreamBody;
+                    use hyper::body::Frame;
+                    let frames = vec![
+                        Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"chunk1\n"))),
+                        Ok(Frame::data(Bytes::from_static(b"chunk2\n"))),
+                        Ok(Frame::data(Bytes::from_static(b"chunk3\n"))),
+                    ];
+                    let stream = futures_util::stream::iter(frames);
+                    return Ok(Response::new(BoxBody::new(StreamBody::new(stream))));
+                }
                 _ => {
                     let mut r = Response::new(Full::new(Bytes::from_static(b"nope")));
                     *r.status_mut() = StatusCode::NOT_FOUND;
                     r
                 }
             };
-            Ok(resp)
+            // The non-stream arms build a `Full`-bodied response; box it so this
+            // handler's return type is uniform with the `/stream` arm's `BoxBody`.
+            let (parts, body) = resp.into_parts();
+            Ok(Response::from_parts(parts, BoxBody::new(body)))
         }
 
         /// Start the fixture; returns `http://127.0.0.1:{port}`.
@@ -1662,5 +2067,192 @@ print(resp.status)
         );
         let out = run(&src).await;
         assert_eq!(out, "nil\n200\n");
+    }
+
+    // ---- Task 4: streaming response + request bodies ------------------------
+
+    #[tokio::test]
+    async fn stream_read_to_end_yields_full_body() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/stream", {{ stream: true }})
+let body = await resp.body.readToEnd()
+print(type(body))
+print(body)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "string\nchunk1\nchunk2\nchunk3\n\n");
+    }
+
+    #[tokio::test]
+    async fn stream_read_line_yields_lines_then_nil() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/stream", {{ stream: true }})
+print(await resp.body.readLine())
+print(await resp.body.readLine())
+print(await resp.body.readLine())
+print(await resp.body.readLine())
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "chunk1\nchunk2\nchunk3\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn stream_bytes_mode_read_returns_bytes() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/stream", {{ stream: true, bodyMode: "bytes" }})
+let chunk = await resp.body.read()
+print(type(chunk))
+print(len(chunk) > 0)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "bytes\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn stream_partial_read_bounds_chunk_and_concatenates() {
+        let base = fixture::start().await;
+        // read(4) returns at most 4 bytes; successive reads concatenate to the
+        // full 21-byte body ("chunk1\nchunk2\nchunk3\n").
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/stream", {{ stream: true }})
+let acc = ""
+let first = await resp.body.read(4)
+print(len(first) <= 4)
+acc = acc + first
+let part = await resp.body.read(4)
+while (part != nil) {{
+  acc = acc + part
+  part = await resp.body.read(4)
+}}
+print(acc)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "true\nchunk1\nchunk2\nchunk3\n\n");
+    }
+
+    #[tokio::test]
+    async fn stream_read_after_eof_is_nil_repeatedly_and_reclaims_resource() {
+        let base = fixture::start().await;
+        let mut interp = Interp::new();
+        let baseline = interp.resource_count();
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/stream", {{ stream: true }})
+let _all = await resp.body.readToEnd()
+print(await resp.body.read())
+print(await resp.body.read())
+print(await resp.body.readLine())
+"#
+        );
+        run_on(&mut interp, &src).await.expect("exec");
+        assert_eq!(interp.output, "nil\nnil\nnil\n");
+        assert_eq!(
+            interp.resource_count(),
+            baseline,
+            "HttpBody resource should be reclaimed on EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_response_text_accessor_is_clear_error() {
+        let base = fixture::start().await;
+        let mut interp = Interp::new();
+        // With stream:true the response is NOT stored as a buffered Response, so
+        // text()/json()/bytes() must surface a clear Tier-2 error.
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/stream", {{ stream: true }})
+let [_t, _te] = await resp.text()
+"#
+        );
+        let res = run_on(&mut interp, &src).await;
+        match res {
+            Err(crate::interp::Control::Panic(e)) => {
+                let msg = e.to_string();
+                assert!(msg.contains("streaming"), "got: {}", msg);
+            }
+            other => panic!("expected a Tier-2 error, got ok={:?}", other.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_stream_response_body_accessor_is_clear_error() {
+        let base = fixture::start().await;
+        let mut interp = Interp::new();
+        // Without stream:true there is no `body` reader; `resp.body` must be a clear
+        // error directing the caller to text()/bytes()/json().
+        let src = format!(
+            r#"
+import {{ get }} from "std/net/http"
+let [resp, _e] = await get("{base}/text")
+let x = resp.body
+"#
+        );
+        let res = run_on(&mut interp, &src).await;
+        match res {
+            Err(crate::interp::Control::Panic(e)) => {
+                let msg = e.to_string();
+                assert!(msg.contains("body") && msg.contains("stream"), "got: {}", msg);
+            }
+            other => panic!("expected a Tier-2 error, got ok={:?}", other.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_stream_bytes_is_reflected() {
+        let base = fixture::start().await;
+        let src = format!(
+            r#"
+import {{ post }} from "std/net/http"
+import {{ utf8Encode }} from "std/encoding"
+let [resp, _e] = await post("{base}/echo", {{ body: {{ stream: utf8Encode("streamed-bytes") }} }})
+let [data, _je] = await resp.json()
+print(data.body)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "streamed-bytes\n");
+    }
+
+    #[tokio::test]
+    async fn request_body_stream_generator_is_buffered_and_reflected() {
+        let base = fixture::start().await;
+        // An async-generator source: a fn returning [bytes, err] each call, then nil
+        // to end. The two chunks are buffered-then-sent; /echo reflects their concat.
+        let src = format!(
+            r#"
+import {{ post }} from "std/net/http"
+import {{ utf8Encode }} from "std/encoding"
+let calls = 0
+fn gen() {{
+  calls = calls + 1
+  if (calls == 1) {{ return [utf8Encode("part1-"), nil] }}
+  if (calls == 2) {{ return [utf8Encode("part2"), nil] }}
+  return [nil, nil]
+}}
+let [resp, _e] = await post("{base}/echo", {{ body: {{ stream: gen }} }})
+let [data, _je] = await resp.json()
+print(data.body)
+"#
+        );
+        let out = run(&src).await;
+        assert_eq!(out, "part1-part2\n");
     }
 }

@@ -122,9 +122,12 @@ pub enum NativeKind {
     TcpListener,
     TcpStream,
     HttpResponse,
+    // A streaming HTTP response body reader (`resp.body` when `opts.stream:true`).
+    // Follows the §11.4 reader idiom over a chunked byte stream.
+    HttpBody,
     // A cancellation token for in-flight HTTP requests (`http.cancelToken()`).
     CancelHandle,
-    // M14 adds: HttpBody, SseStream, ...
+    // M14 adds: SseStream, ...
 }
 
 impl NativeKind {
@@ -138,6 +141,7 @@ impl NativeKind {
             NativeKind::TcpListener => "tcpListener",
             NativeKind::TcpStream => "tcpStream",
             NativeKind::HttpResponse => "httpResponse",
+            NativeKind::HttpBody => "httpBody",
             NativeKind::CancelHandle => "cancelHandle",
         }
     }

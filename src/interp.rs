@@ -114,6 +114,11 @@ pub(crate) enum ResourceState {
     // second body accessor on the same handle is a use-after-consume Tier-2 panic.
     #[cfg(feature = "net")]
     HttpResponse(reqwest::Response),
+    // M14 std/net/http: a streaming response body (`opts.stream:true`). Wraps the
+    // response's chunked byte stream in a `BufReader` so the §11.4 reader idiom
+    // (`read(n?)`/`readLine()`/`readToEnd()`) applies verbatim. Finalized on EOF.
+    #[cfg(feature = "net")]
+    HttpBody(crate::stdlib::net_http::HttpBodyState),
     // M14 std/net/http: a cancellation token shared between a `CancelHandle` and any
     // in-flight requests passed `opts.cancel`. `cancel()` calls `notify_one()` (which
     // stores a permit); each request `tokio::select!`s its send against `notified()`.
@@ -268,6 +273,19 @@ impl Interp {
             // Not an HttpResponse (or already gone): nothing to return. If it was a
             // different live resource, put it back is unnecessary — ids are unique
             // per kind by construction, so this branch means "already consumed".
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a streaming HTTP body behind a handle id, or `None` once
+    /// the body was finalized (EOF / drained) — read methods turn `None` into nil.
+    #[cfg(feature = "net")]
+    pub(crate) fn http_body_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::net_http::HttpBodyState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::HttpBody(s)) => Some(s),
             _ => None,
         }
     }
@@ -899,6 +917,18 @@ impl Interp {
                 if let Some(v) = n.fields.get(name) {
                     return Ok(v.clone());
                 }
+                // `resp.body` is only a reader when the request used `stream:true`
+                // (then `body` is a field set above). On a buffered response it is
+                // absent — a bare `resp.body` is a mistake, so surface a clear error
+                // directing the caller to text()/bytes()/json() instead of silently
+                // returning a `body` NativeMethod that would fail confusingly later.
+                #[cfg(feature = "net")]
+                if name == "body" && n.kind == crate::value::NativeKind::HttpResponse {
+                    return Err(AsError::at(
+                        "resp.body is only available on a streaming response (request opts.stream:true); use resp.text()/bytes()/json() for a buffered body",
+                        span,
+                    ));
+                }
                 Ok(Value::NativeMethod(std::rc::Rc::new(crate::value::NativeMethod {
                     receiver: n.clone(),
                     method: name.to_string(),
@@ -957,6 +987,9 @@ impl Interp {
             }
             if matches!(m.receiver.kind, HttpResponse) {
                 return self.call_http_response_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, HttpBody) {
+                return self.call_http_body_method(&m, args, span).await;
             }
             if matches!(m.receiver.kind, CancelHandle) {
                 return self.call_cancel_method(&m, args, span).await;
