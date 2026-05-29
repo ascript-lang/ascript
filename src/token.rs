@@ -37,6 +37,10 @@ pub enum Tok {
     MinusEq,
     StarEq,
     SlashEq,
+    LBrace,
+    RBrace,
+    If,
+    Else,
     Eof,
 }
 

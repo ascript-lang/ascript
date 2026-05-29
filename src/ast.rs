@@ -27,6 +27,8 @@ pub enum ExprKind {
 pub enum Stmt {
     Expr(Expr),
     Let { name: String, value: Expr, mutable: bool },
+    Block(Vec<Stmt>),
+    If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
 }
 
 #[derive(Clone, Copy, Debug)]

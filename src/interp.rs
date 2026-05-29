@@ -18,6 +18,7 @@ impl Interp {
         Interp { output: String::new() }
     }
 
+    #[async_recursion(?Send)]
     pub async fn exec(&mut self, program: &[Stmt], env: &Environment) -> Result<(), AsError> {
         for stmt in program {
             self.exec_stmt(stmt, env).await?;
@@ -25,6 +26,7 @@ impl Interp {
         Ok(())
     }
 
+    #[async_recursion(?Send)]
     async fn exec_stmt(&mut self, stmt: &Stmt, env: &Environment) -> Result<(), AsError> {
         match stmt {
             Stmt::Expr(e) => {
@@ -33,6 +35,19 @@ impl Interp {
             Stmt::Let { name, value, mutable } => {
                 let v = self.eval_expr(value, env).await?;
                 env.define(name, v, *mutable).map_err(AsError::new)?;
+            }
+            Stmt::Block(stmts) => {
+                let child = env.child();
+                self.exec(stmts, &child).await?;
+            }
+            Stmt::If { cond, then_branch, else_branch } => {
+                if self.eval_expr(cond, env).await?.is_truthy() {
+                    let child = env.child();
+                    self.exec(then_branch, &child).await?;
+                } else if let Some(else_stmts) = else_branch {
+                    let child = env.child();
+                    self.exec(else_stmts, &child).await?;
+                }
             }
         }
         Ok(())
@@ -275,5 +290,35 @@ mod tests {
         let env = Environment::global();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("immutable"));
+    }
+
+    #[tokio::test]
+    async fn if_else_chooses_branch() {
+        let src = "let x = 3\nif (x < 5) { print(\"small\") } else { print(\"big\") }";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "small\n");
+    }
+
+    #[tokio::test]
+    async fn else_if_chain() {
+        let src = "let x = 7\nif (x < 5) { print(\"a\") } else if (x < 10) { print(\"b\") } else { print(\"c\") }";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "b\n");
+    }
+
+    #[tokio::test]
+    async fn block_scope_does_not_leak() {
+        let src = "{ let y = 1 }\nprint(y)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        let err = interp.exec(&stmts, &env).await.unwrap_err();
+        assert!(err.message.contains("undefined variable 'y'"));
     }
 }

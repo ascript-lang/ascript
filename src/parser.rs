@@ -68,8 +68,42 @@ impl<'a> Parser<'a> {
         match self.peek() {
             Tok::Let => self.let_stmt(true),
             Tok::Const => self.let_stmt(false),
+            Tok::LBrace => Ok(Stmt::Block(self.block()?)),
+            Tok::If => self.if_stmt(),
             _ => Ok(Stmt::Expr(self.expr()?)),
         }
+    }
+
+    /// Parse `{ stmt* }` (with optional `;` separators) and return the inner statements.
+    fn block(&mut self) -> Result<Vec<Stmt>, AsError> {
+        self.eat(&Tok::LBrace)?;
+        let mut stmts = Vec::new();
+        self.skip_semicolons();
+        while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            stmts.push(self.statement()?);
+            self.skip_semicolons();
+        }
+        self.eat(&Tok::RBrace)?;
+        Ok(stmts)
+    }
+
+    fn if_stmt(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::If)?;
+        self.eat(&Tok::LParen)?;
+        let cond = self.expr()?;
+        self.eat(&Tok::RParen)?;
+        let then_branch = self.block()?;
+        let else_branch = if *self.peek() == Tok::Else {
+            self.advance();
+            if *self.peek() == Tok::If {
+                Some(vec![self.if_stmt()?]) // `else if`
+            } else {
+                Some(self.block()?)
+            }
+        } else {
+            None
+        };
+        Ok(Stmt::If { cond, then_branch, else_branch })
     }
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
