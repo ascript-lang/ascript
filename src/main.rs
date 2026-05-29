@@ -69,9 +69,22 @@ async fn main() -> ExitCode {
             }
             code
         }
-        Command::Test { .. } => {
-            eprintln!("test: implemented in a later step");
-            ExitCode::from(1)
-        }
+        Command::Test { files } => match ascript::run_tests(&files).await {
+            Ok(summary) => {
+                for (name, message) in &summary.failures {
+                    println!("FAIL {}: {}", name, message);
+                }
+                println!("ok. {} passed; {} failed", summary.passed, summary.failed);
+                if summary.failed > 0 {
+                    ExitCode::from(1)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(e) => {
+                ascript::diagnostics::report(&e);
+                ExitCode::from(1)
+            }
+        },
     }
 }

@@ -147,3 +147,19 @@ fn repl_evaluates_and_persists_bindings() {
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("42"));
 }
+
+#[test]
+fn test_runner_reports_pass_and_fail() {
+    let file = std::env::temp_dir().join(format!("ascript_tr_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "test(\"adds\", () => { assert(1 + 1 == 2) })\ntest(\"fails\", () => { assert(false, \"boom\") })",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = std::process::Command::new(bin).arg("test").arg(&file).output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(s.contains("1 passed") || s.contains("passed"));
+    assert!(s.contains("fails") && s.contains("boom"));
+    assert!(!out.status.success()); // a failing test → non-zero exit
+}

@@ -50,7 +50,7 @@ impl From<AsError> for Control {
 /// A fresh global environment with the built-in functions installed.
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    for name in ["print", "Ok", "Err", "assert", "recover"] {
+    for name in ["print", "Ok", "Err", "assert", "recover", "test"] {
         env.define(name, Value::Builtin(name.into()), false)
             .expect("global env starts empty");
     }
@@ -82,6 +82,18 @@ pub struct Interp {
     modules: HashMap<PathBuf, ModuleEntry>,
     module_dir: PathBuf,
     current_exports: Rc<RefCell<HashSet<String>>>,
+    /// Tests registered via the `test(name, fn)` builtin. Only executed by
+    /// `ascript test` (via `run_registered_tests`); a normal `run` just collects them.
+    tests: Vec<(String, Value)>,
+}
+
+/// Outcome of running the tests registered on an `Interp`.
+#[derive(Debug, Default)]
+pub struct TestSummary {
+    pub passed: usize,
+    pub failed: usize,
+    /// `(test name, failure message)` for each failed test.
+    pub failures: Vec<(String, String)>,
 }
 
 impl Interp {
@@ -91,7 +103,27 @@ impl Interp {
             modules: HashMap::new(),
             module_dir: PathBuf::from("."),
             current_exports: Rc::new(RefCell::new(HashSet::new())),
+            tests: Vec::new(),
         }
+    }
+
+    /// Run every test registered via the `test(name, fn)` builtin. Each test fn
+    /// is invoked with no arguments; a `Control::Panic` (e.g. a failed `assert`)
+    /// is recorded as a failure, while a clean return or a `?` propagation passes.
+    pub async fn run_registered_tests(&mut self) -> TestSummary {
+        let mut summary = TestSummary::default();
+        // Clone out the registrations first: `call_value` borrows `&mut self`.
+        let tests = self.tests.clone();
+        for (name, func) in tests {
+            match self.call_value(func, Vec::new(), Span::new(0, 0)).await {
+                Ok(_) | Err(Control::Propagate(_)) => summary.passed += 1,
+                Err(Control::Panic(e)) => {
+                    summary.failed += 1;
+                    summary.failures.push((name, e.message));
+                }
+            }
+        }
+        summary
     }
 
     /// Load (or fetch from cache) the module at `path`, returning its entry.
@@ -777,6 +809,17 @@ impl Interp {
                     // value by call_function, so this is unreachable in practice; pass it through.
                     Err(Control::Propagate(v)) => Err(Control::Propagate(v)),
                 }
+            }
+            "test" => {
+                let name = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    Some(v) => v.to_string(),
+                    None => "<unnamed>".to_string(),
+                };
+                let func = args.get(1).cloned().unwrap_or(Value::Nil);
+                // Register only; `ascript test` runs these via run_registered_tests.
+                self.tests.push((name, func));
+                Ok(Value::Nil)
             }
             other => Err(AsError::at(format!("'{}' is not a function", other), span).into()),
         }

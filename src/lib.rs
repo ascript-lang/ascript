@@ -13,6 +13,7 @@ pub mod value;
 
 use crate::error::{AsError, SourceInfo};
 use crate::interp::Interp;
+pub use crate::interp::TestSummary;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -24,6 +25,19 @@ pub async fn run_file(path: &Path) -> Result<String, AsError> {
         Err(crate::interp::Control::Panic(e)) => Err(e),
         Err(crate::interp::Control::Propagate(_)) => Ok(interp.output),
     }
+}
+
+/// Load each file as a module (running its `test(...)` registrations) on a
+/// single `Interp`, then run all registered tests and return a summary.
+pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
+    let mut interp = Interp::new();
+    for file in files {
+        match interp.load_module(Path::new(file)).await {
+            Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
+            Err(crate::interp::Control::Panic(e)) => return Err(e),
+        }
+    }
+    Ok(interp.run_registered_tests().await)
 }
 
 /// Lex → parse → evaluate in a fresh global environment. Returns captured output.
