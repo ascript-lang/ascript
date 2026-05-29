@@ -43,6 +43,12 @@ rand = { version = "0.8", optional = true }
 flate2 = { version = "1", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "cookies", "gzip", "brotli", "deflate", "zstd"], optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true }
+http = { version = "1", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -63,4 +69,4 @@ compress = ["dep:flate2", "dep:zip"]
 sql = ["dep:rusqlite"]
 # M14 networking. Task 1 (std/net/tcp) needs only tokio's net + io-util; later
 # tasks (http/ws) ADD dep:reqwest/dep:hyper/etc. to this feature.
-net = ["tokio/net", "tokio/io-util"]
+net = ["dep:reqwest", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "dep:http", "tokio/net", "tokio/io-util"]

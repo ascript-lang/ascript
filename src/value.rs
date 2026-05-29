@@ -121,6 +121,7 @@ pub enum NativeKind {
     // M14 networking handles (registered only under feature `net`).
     TcpListener,
     TcpStream,
+    HttpResponse,
     // M14 adds: HttpBody, SseStream, ...
 }
 
@@ -134,6 +135,7 @@ impl NativeKind {
             NativeKind::Writer => "writer",
             NativeKind::TcpListener => "tcpListener",
             NativeKind::TcpStream => "tcpStream",
+            NativeKind::HttpResponse => "httpResponse",
         }
     }
 }

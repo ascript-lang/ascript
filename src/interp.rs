@@ -108,6 +108,12 @@ pub(crate) enum ResourceState {
     TcpListener(tokio::net::TcpListener),
     #[cfg(feature = "net")]
     TcpStream(crate::stdlib::net_tcp::TcpStreamState),
+    // M14 std/net/http: a received HTTP response whose body has not yet been read.
+    // `reqwest::Response::text()/bytes()/json()` consume `self` by value, so the
+    // response is stored here and `take_resource`'d by the first body accessor; a
+    // second body accessor on the same handle is a use-after-consume Tier-2 panic.
+    #[cfg(feature = "net")]
+    HttpResponse(reqwest::Response),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -240,6 +246,20 @@ impl Interp {
     ) -> Option<&mut crate::stdlib::net_tcp::TcpStreamState> {
         match self.resources.get_mut(&id) {
             Some(ResourceState::TcpStream(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Take the live `reqwest::Response` behind a handle id, removing it from the
+    /// table. `None` if it was already consumed (a body accessor took it). The
+    /// caller turns `None` into the "response body already consumed" Tier-2 panic.
+    #[cfg(feature = "net")]
+    pub(crate) fn take_http_response(&mut self, id: u64) -> Option<reqwest::Response> {
+        match self.resources.remove(&id) {
+            Some(ResourceState::HttpResponse(r)) => Some(r),
+            // Not an HttpResponse (or already gone): nothing to return. If it was a
+            // different live resource, put it back is unnecessary — ids are unique
+            // per kind by construction, so this branch means "already consumed".
             _ => None,
         }
     }
@@ -926,6 +946,9 @@ impl Interp {
             use crate::value::NativeKind::*;
             if matches!(m.receiver.kind, TcpListener | TcpStream) {
                 return self.call_tcp_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, HttpResponse) {
+                return self.call_http_response_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
