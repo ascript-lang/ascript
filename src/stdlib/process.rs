@@ -79,12 +79,17 @@ pub enum ProcReader {
 
 impl ProcReader {
     async fn read_upto(&mut self, n: usize, buf: &mut Vec<u8>) -> std::io::Result<usize> {
-        buf.resize(n, 0);
+        // `read_buf` over a `take(n)` adapter appends only the bytes actually
+        // available, capped at `n` — bounding the read at `n` with NO 64KB zero-fill
+        // on every small read (the old `resize(n, 0)` + `truncate` did). `reserve`
+        // alone is insufficient: it can over-allocate, and `read_buf` fills to the
+        // vec's full spare capacity, so a hard `take(n)` cap is required.
+        buf.clear();
+        buf.reserve(n);
         let got = match self {
-            ProcReader::Out(r) => r.read(buf).await?,
-            ProcReader::Err(r) => r.read(buf).await?,
+            ProcReader::Out(r) => (&mut *r).take(n as u64).read_buf(buf).await?,
+            ProcReader::Err(r) => (&mut *r).take(n as u64).read_buf(buf).await?,
         };
-        buf.truncate(got);
         Ok(got)
     }
 
@@ -597,6 +602,16 @@ impl Interp {
                         n as usize
                     }
                 };
+                // read(0) is a no-op: return an empty chunk WITHOUT touching the
+                // resource. (An empty read buffer yields Ok(0), which the match below
+                // treats as EOF and would finalize a still-open pipe.)
+                if n == 0 {
+                    let capture = match self.proc_reader_mut(id) {
+                        Some((_, c)) => c,
+                        None => return Ok(Value::Nil), // gone → EOF
+                    };
+                    return Ok(captured_value(Vec::new(), capture));
+                }
                 // A Reader degrades to EOF (nil) once its resource is gone, rather
                 // than panicking: EOF is a reader's natural terminal state.
                 let (reader, capture) = match self.proc_reader_mut(id) {
@@ -640,6 +655,10 @@ impl Interp {
                 }
             }
             "readToEnd" => {
+                // Note: a gone (already-drained) reader returns nil here, whereas
+                // net/tcp's readToEnd returns empty bytes. The divergence is cosmetic;
+                // a process reader has no retained `capture` once finalized, so an
+                // empty value can't be produced in the right Str/Bytes shape.
                 let (reader, capture) = match self.proc_reader_mut(id) {
                     Some(r) => r,
                     None => return Ok(Value::Nil), // gone → EOF
@@ -926,6 +945,22 @@ print(all)
 await child.wait()
 "#).await;
         assert_eq!(out, "abc\n");
+    }
+
+    #[tokio::test]
+    async fn read_zero_returns_empty_without_finalizing() {
+        // read(0) must return an empty chunk WITHOUT finalizing the reader; a later
+        // read must still drain the real output (proves the reader wasn't closed).
+        let out = run(r#"
+import { spawn } from "std/process"
+let [child, _] = spawn("sh", ["-c", "printf 'abc'"])
+let empty = await child.stdout.read(0)
+print(len(empty))
+let rest = await child.stdout.readToEnd()
+print(rest)
+await child.wait()
+"#).await;
+        assert_eq!(out, "0\nabc\n");
     }
 
     #[tokio::test]

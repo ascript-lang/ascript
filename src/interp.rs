@@ -102,6 +102,61 @@ pub(crate) enum ResourceState {
     // A streaming writer over a spawned child's stdin. `close()`/EOF takes it.
     #[cfg(feature = "sys")]
     Writer(tokio::process::ChildStdin),
+    // M14 std/net/tcp: a bound listener and a buffered client/accepted stream. The
+    // stream carries a `BufReader` so `readLine` works (mirrors the process Reader).
+    #[cfg(feature = "net")]
+    TcpListener(tokio::net::TcpListener),
+    #[cfg(feature = "net")]
+    TcpStream(crate::stdlib::net_tcp::TcpStreamState),
+    // M14 std/net/http: a received HTTP response whose body has not yet been read.
+    // `reqwest::Response::text()/bytes()/json()` consume `self` by value, so the
+    // response is stored here and `take_resource`'d by the first body accessor; a
+    // second body accessor on the same handle is a use-after-consume Tier-2 panic.
+    #[cfg(feature = "net")]
+    HttpResponse(reqwest::Response),
+    // M14 std/net/http: a streaming response body (`opts.stream:true`). Wraps the
+    // response's chunked byte stream in a `BufReader` so the §11.4 reader idiom
+    // (`read(n?)`/`readLine()`/`readToEnd()`) applies verbatim. Finalized on EOF.
+    #[cfg(feature = "net")]
+    HttpBody(crate::stdlib::net_http::HttpBodyState),
+    // M14 std/net/http: a cancellation token shared between a `CancelHandle` and any
+    // in-flight requests passed `opts.cancel`. `cancel()` calls `notify_one()` (which
+    // stores a permit); each request `tokio::select!`s its send against `notified()`.
+    // The permit means a cancel issued before the request starts still aborts it,
+    // which matters on the single-threaded interp where `cancel()` and the awaited
+    // request run sequentially.
+    #[cfg(feature = "net")]
+    CancelToken(std::sync::Arc<tokio::sync::Notify>),
+    // M14 std/net/http: a first-class Server-Sent Events client stream
+    // (`http.sse`). Holds the live event-stream body reader, the in-progress
+    // event parse buffer, the current `lastEventId`/`retry`, and the reconnect
+    // template (url/headers/config) used to re-issue the GET on disconnect.
+    // Boxed: `SseState` carries a sizeable BufReader + reconnect template; boxing it
+    // keeps the `ResourceState` enum compact (clippy::large_enum_variant).
+    #[cfg(feature = "net")]
+    SseStream(Box<crate::stdlib::net_http::SseState>),
+    // M14 std/http/server: a server handle's registered routes + middleware and,
+    // after `bind`, the live listener. `serve` runs the sequential accept loop.
+    #[cfg(feature = "net")]
+    HttpServer(crate::stdlib::http_server::HttpServerState),
+    // M14 std/http/server: the continuation state behind a `next` callable handed
+    // to a middleware. Holds the remaining middleware chain, the index to resume
+    // at, the terminal route handler, and the request. Calling `next` re-enters
+    // the chain at this saved point. `Box`ed to keep the enum compact.
+    #[cfg(feature = "net")]
+    HttpNext(Box<crate::stdlib::http_server::NextState>),
+    // M14 std/net/ws: a connected WebSocket. The client (`connect_async`) and the
+    // server-accepted (`accept_async`) stream types differ — `WebSocketStream<
+    // MaybeTlsStream<TcpStream>>` vs `WebSocketStream<TcpStream>`. We unify them by
+    // boxing as a `dyn Sink<Message> + Stream<Item=…>` (see net_ws::WsConnState), so
+    // send/recv dispatch is identical regardless of origin. `WsConnState` already
+    // holds a single `Box<dyn WsStream>`, so the variant is one pointer wide.
+    #[cfg(feature = "net")]
+    WsConnection(crate::stdlib::net_ws::WsConnState),
+    // M14 std/net/ws: an accept-based WebSocket server listener (a bound TcpListener;
+    // `accept()` does the TCP accept + WebSocket handshake → WsConnection).
+    #[cfg(feature = "net")]
+    WsListener(tokio::net::TcpListener),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -221,6 +276,111 @@ impl Interp {
     pub(crate) fn proc_writer_mut(&mut self, id: u64) -> Option<&mut tokio::process::ChildStdin> {
         match self.resources.get_mut(&id) {
             Some(ResourceState::Writer(w)) => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a buffered TCP stream behind a handle id, or `None` once
+    /// the handle was finalized (closed / EOF) — read methods turn `None` into nil.
+    #[cfg(feature = "net")]
+    pub(crate) fn tcp_stream_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::net_tcp::TcpStreamState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::TcpStream(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Take the live `reqwest::Response` behind a handle id, removing it from the
+    /// table. `None` if it was already consumed (a body accessor took it). The
+    /// caller turns `None` into the "response body already consumed" Tier-2 panic.
+    #[cfg(feature = "net")]
+    pub(crate) fn take_http_response(&mut self, id: u64) -> Option<reqwest::Response> {
+        match self.resources.remove(&id) {
+            Some(ResourceState::HttpResponse(r)) => Some(r),
+            // Not an HttpResponse (or already gone): nothing to return. If it was a
+            // different live resource, put it back is unnecessary — ids are unique
+            // per kind by construction, so this branch means "already consumed".
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a streaming HTTP body behind a handle id, or `None` once
+    /// the body was finalized (EOF / drained) — read methods turn `None` into nil.
+    #[cfg(feature = "net")]
+    pub(crate) fn http_body_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::net_http::HttpBodyState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::HttpBody(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to an SSE stream behind a handle id (for `next`/`close`).
+    #[cfg(feature = "net")]
+    pub(crate) fn sse_stream_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::net_http::SseState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::SseStream(s)) => Some(s.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to an HTTP server's routes/middleware/listener behind a
+    /// handle id (for `route`/`use`/`bind`/`serve`).
+    #[cfg(feature = "net")]
+    pub(crate) fn http_server_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::http_server::HttpServerState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::HttpServer(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Drop any un-consumed `HttpNext` continuations from the resource table. A
+    /// middleware that short-circuits (returns without calling `next`) leaves its
+    /// continuation behind; the server sweeps them after each request so per-request
+    /// handles don't accumulate across a long-running `serve` loop.
+    #[cfg(feature = "net")]
+    pub(crate) fn drop_pending_http_next(&mut self) {
+        self.resources.retain(|_, s| !matches!(s, ResourceState::HttpNext(_)));
+    }
+
+    /// Mutable access to a bound TCP listener behind a handle id (for `accept`).
+    #[cfg(feature = "net")]
+    pub(crate) fn tcp_listener_mut(&mut self, id: u64) -> Option<&mut tokio::net::TcpListener> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::TcpListener(l)) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a connected WebSocket behind a handle id (send/recv), or
+    /// `None` once the connection was finalized (closed / recv saw a Close frame).
+    #[cfg(feature = "net")]
+    pub(crate) fn ws_conn_mut(
+        &mut self,
+        id: u64,
+    ) -> Option<&mut crate::stdlib::net_ws::WsConnState> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::WsConnection(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to a bound WebSocket listener behind a handle id (for `accept`).
+    #[cfg(feature = "net")]
+    pub(crate) fn ws_listener_mut(&mut self, id: u64) -> Option<&mut tokio::net::TcpListener> {
+        match self.resources.get_mut(&id) {
+            Some(ResourceState::WsListener(l)) => Some(l),
             _ => None,
         }
     }
@@ -840,8 +1000,32 @@ impl Interp {
                 None => Err(AsError::at(format!("no superclass method '{}' (no superclass)", name), span)),
             },
             Value::Native(n) => {
+                // `sse.lastEventId` is a LIVE property: the most recent `id:` seen,
+                // which `next()` keeps current on the resource (the handle's `fields`
+                // are immutable after minting, so it can't be a static field). Read it
+                // straight from the resource state.
+                #[cfg(feature = "net")]
+                if name == "lastEventId" && n.kind == crate::value::NativeKind::SseStream {
+                    let id = match self.resource(n.id) {
+                        Some(ResourceState::SseStream(s)) => s.last_event_id().to_string(),
+                        _ => String::new(),
+                    };
+                    return Ok(Value::Str(id.into()));
+                }
                 if let Some(v) = n.fields.get(name) {
                     return Ok(v.clone());
+                }
+                // `resp.body` is only a reader when the request used `stream:true`
+                // (then `body` is a field set above). On a buffered response it is
+                // absent — a bare `resp.body` is a mistake, so surface a clear error
+                // directing the caller to text()/bytes()/json() instead of silently
+                // returning a `body` NativeMethod that would fail confusingly later.
+                #[cfg(feature = "net")]
+                if name == "body" && n.kind == crate::value::NativeKind::HttpResponse {
+                    return Err(AsError::at(
+                        "resp.body is only available on a streaming response (request opts.stream:true); use resp.text()/bytes()/json() for a buffered body",
+                        span,
+                    ));
                 }
                 Ok(Value::NativeMethod(std::rc::Rc::new(crate::value::NativeMethod {
                     receiver: n.clone(),
@@ -891,6 +1075,34 @@ impl Interp {
             use crate::value::NativeKind::*;
             if matches!(m.receiver.kind, ChildProcess | Reader | Writer) {
                 return self.call_process_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "net")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, TcpListener | TcpStream) {
+                return self.call_tcp_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, HttpResponse) {
+                return self.call_http_response_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, HttpBody) {
+                return self.call_http_body_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, CancelHandle) {
+                return self.call_cancel_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, SseStream) {
+                return self.call_sse_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, HttpServer) {
+                return self.call_http_server_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, HttpNext) {
+                return self.call_http_next(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, WsConnection | WsListener) {
+                return self.call_ws_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())

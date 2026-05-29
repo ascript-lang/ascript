@@ -12,7 +12,7 @@ name = "ascript"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 async-recursion = "1"
 indexmap = "2"
 clap = { version = "4", features = ["derive"] }
@@ -43,6 +43,14 @@ rand = { version = "0.8", optional = true }
 flate2 = { version = "1", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "cookies", "gzip", "brotli", "deflate", "zstd", "socks", "http2"], optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true }
+http = { version = "1", optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -51,7 +59,7 @@ cc = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
@@ -61,3 +69,11 @@ sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "tokio/process",
 crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex"]
 compress = ["dep:flate2", "dep:zip"]
 sql = ["dep:rusqlite"]
+# M14 networking. Task 1 (std/net/tcp) needs only tokio's net + io-util; later
+# tasks (http/ws) ADD dep:reqwest/dep:hyper/etc. to this feature.
+net = ["dep:reqwest", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "dep:http", "dep:tokio-util", "dep:tokio-tungstenite", "dep:base64", "tokio/net", "tokio/io-util"]
+# §11.5 deferral: HTTP/3 (default-OFF, opt-in). Enables reqwest's http3 backend so
+# `httpVersion:"3"` pins http3; without it that path returns a clean Tier-1 error.
+# reqwest's http3 is UNSTABLE: building with this feature ALSO requires
+# `RUSTFLAGS="--cfg reqwest_unstable"`. Kept out of `default` for that reason.
+http3 = ["net", "reqwest/http3"]

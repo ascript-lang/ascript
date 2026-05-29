@@ -118,7 +118,32 @@ pub enum NativeKind {
     ChildProcess,
     Reader,
     Writer,
-    // M14 adds: HttpBody, SseStream, TcpStream, ...
+    // M14 networking handles (registered only under feature `net`).
+    TcpListener,
+    TcpStream,
+    HttpResponse,
+    // A streaming HTTP response body reader (`resp.body` when `opts.stream:true`).
+    // Follows the §11.4 reader idiom over a chunked byte stream.
+    HttpBody,
+    // A cancellation token for in-flight HTTP requests (`http.cancelToken()`).
+    CancelHandle,
+    // A first-class Server-Sent Events client stream (`http.sse(url, opts?)`).
+    // `next()` yields parsed `{event,data,id,retry}` events; `lastEventId` is a
+    // readable property; auto-reconnects on disconnect (see std/net/http).
+    SseStream,
+    // M14 std/http/server: a server handle holding registered routes + middleware
+    // and (after `bind`) the live `TcpListener`. Methods: route/use/bind/serve/listen.
+    HttpServer,
+    // M14 std/http/server: the `next` callable handed to a middleware. Calling it
+    // (as a `NativeMethod`) advances the middleware chain → matched route handler.
+    HttpNext,
+    // M14 std/net/ws: a connected WebSocket (client `connect` or server `accept`).
+    // Methods: send/recv/close. Unifies the client/server stream types behind one
+    // boxed Sink+Stream of `Message` (see net_ws::WsConnState).
+    WsConnection,
+    // M14 std/net/ws: an accept-based WebSocket server listener (binds a TcpListener;
+    // `accept()` performs the handshake → WsConnection). Carries a `port` field.
+    WsListener,
 }
 
 impl NativeKind {
@@ -129,6 +154,16 @@ impl NativeKind {
             NativeKind::ChildProcess => "childProcess",
             NativeKind::Reader => "reader",
             NativeKind::Writer => "writer",
+            NativeKind::TcpListener => "tcpListener",
+            NativeKind::TcpStream => "tcpStream",
+            NativeKind::HttpResponse => "httpResponse",
+            NativeKind::HttpBody => "httpBody",
+            NativeKind::CancelHandle => "cancelHandle",
+            NativeKind::SseStream => "sseStream",
+            NativeKind::HttpServer => "httpServer",
+            NativeKind::HttpNext => "httpNext",
+            NativeKind::WsConnection => "wsConnection",
+            NativeKind::WsListener => "wsListener",
         }
     }
 }
