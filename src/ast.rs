@@ -29,6 +29,7 @@ pub enum Stmt {
     Let { name: String, value: Expr, mutable: bool },
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
+    While { cond: Expr, body: Vec<Stmt> },
 }
 
 #[derive(Clone, Copy, Debug)]

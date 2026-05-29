@@ -70,6 +70,7 @@ impl<'a> Parser<'a> {
             Tok::Const => self.let_stmt(false),
             Tok::LBrace => Ok(Stmt::Block(self.block()?)),
             Tok::If => self.if_stmt(),
+            Tok::While => self.while_stmt(),
             _ => Ok(Stmt::Expr(self.expr()?)),
         }
     }
@@ -104,6 +105,15 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(Stmt::If { cond, then_branch, else_branch })
+    }
+
+    fn while_stmt(&mut self) -> Result<Stmt, AsError> {
+        self.eat(&Tok::While)?;
+        self.eat(&Tok::LParen)?;
+        let cond = self.expr()?;
+        self.eat(&Tok::RParen)?;
+        let body = self.block()?;
+        Ok(Stmt::While { cond, body })
     }
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {

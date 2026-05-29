@@ -41,6 +41,7 @@ pub enum Tok {
     RBrace,
     If,
     Else,
+    While,
     Eof,
 }
 

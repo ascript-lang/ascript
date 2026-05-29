@@ -173,6 +173,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "const" => Tok::Const,
                     "if" => Tok::If,
                     "else" => Tok::Else,
+                    "while" => Tok::While,
                     _ => Tok::Ident(text),
                 };
                 tokens.push(Token { tok, span: Span::new(i, j) });

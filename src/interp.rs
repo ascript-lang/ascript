@@ -49,6 +49,12 @@ impl Interp {
                     self.exec(else_stmts, &child).await?;
                 }
             }
+            Stmt::While { cond, body } => {
+                while self.eval_expr(cond, env).await?.is_truthy() {
+                    let child = env.child();
+                    self.exec(body, &child).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -320,5 +326,15 @@ mod tests {
         let env = Environment::global();
         let err = interp.exec(&stmts, &env).await.unwrap_err();
         assert!(err.message.contains("undefined variable 'y'"));
+    }
+
+    #[tokio::test]
+    async fn while_loop_accumulates() {
+        let src = "let i = 1\nlet sum = 0\nwhile (i <= 5) { sum += i\ni += 1 }\nprint(sum)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = Environment::global();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "15\n");
     }
 }
