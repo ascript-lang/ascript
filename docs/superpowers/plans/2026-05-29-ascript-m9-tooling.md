@@ -346,6 +346,46 @@ fn tree_sitter_accepts_all_examples() {
 
 ---
 
+## Task 7: `async`/`await` surface syntax (spec §7)
+
+Close the only genuine §§2–10 language gap and fix the grammar↔interpreter lockstep (the Tree-sitter grammar already parses `async`/`await`; the interpreter must too). The async *runtime seam* already exists (`eval_expr` is `#[async_recursion(?Send)]` on a current-thread tokio runtime). This task adds the SURFACE: `async fn`/`async (…) =>`/`async fn` methods, and the `await` prefix operator. Semantics per spec §7: synchronous code never suspends, so with no awaitable/future value kind yet (those arrive with the async I/O stdlib in Phase 3), `await expr` evaluates `expr` and returns it (identity for non-futures), and an `async fn` simply runs to completion. The syntax is fully accepted and composes, ready for the async stdlib to introduce real suspension points.
+
+**Files:** `src/token.rs`, `src/lexer.rs`, `src/ast.rs`, `src/parser.rs`, `src/value.rs`, `src/interp.rs`, `src/fmt.rs`, plus tests + an example.
+
+- [ ] **Step 1: `src/token.rs`** — add `Async,` and `Await,` before `Eof`. **Lexer:** keywords `"async" => Tok::Async, "await" => Tok::Await,`.
+
+- [ ] **Step 2: `src/ast.rs`** — add `is_async: bool` to `Stmt::Fn`, `MethodDecl`, and `ExprKind::Arrow`; add `ExprKind::Await(Box<Expr>)`. Display: `ExprKind::Await(e) => write!(f, "(await {})", e)`. (Function/method Display, if any, may show `async`.)
+
+- [ ] **Step 3: `src/value.rs`** — add `is_async: bool` to `Function` and `Method` (carried for fidelity/fmt; does not change execution since nothing suspends without futures).
+
+- [ ] **Step 4: `src/parser.rs`** —
+  - `statement`: if `peek == Tok::Async`, expect `fn` next → parse an async `fn_decl` (set `is_async: true`). `fn_decl` takes/derives `is_async`.
+  - `class_decl` method parsing: optional `async` before `fn`.
+  - `try_arrow`/arrow parsing: optional leading `async` (`async (a) => …`, `async x => …`) → `is_async: true`. Non-async fn/arrow set `is_async: false`.
+  - `await`: a prefix operator at unary precedence — in `unary()` (alongside `-`/`!`), if `peek == Tok::Await`, consume and parse a `unary()` operand, wrap in `ExprKind::Await`. So `await f()` parses as `Await(Call(f))` and `await a + b` as `(await a) + b`.
+
+- [ ] **Step 5: `src/interp.rs`** — `ExprKind::Await(e) => self.eval_expr(e, env).await` (identity passthrough — no futures to suspend on yet; correct per §7 for synchronous code). `is_async` flags require no behavioral change (the evaluator is already async; functions run to completion). Update the `Stmt::Fn`/`Arrow`/method construction sites to pass `is_async` into the `Function`/`Method`.
+
+- [ ] **Step 6: `src/fmt.rs`** — prefix `async ` for async fn declarations/methods/arrows; render `await expr` as `await ` + the operand. Keep idempotent.
+
+- [ ] **Step 7: Tests** (interp):
+```rust
+    #[tokio::test]
+    async fn async_fn_and_await_surface() {
+        let src = "async fn fetch(x) { return x * 2 }\nlet r = await fetch(21)\nprint(r)\nprint(await 5)\nlet g = async (n) => n + 1\nprint(await g(9))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let mut interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output, "42\n5\n10\n");
+    }
+```
+Add a parser test that `async fn`/`await`/`async () =>` parse. Add `examples/async.as` exercising `async fn` + `await` and an integration test, AND ensure the Tree-sitter conformance corpus includes it (so both parsers are exercised on async — fixing the §10.1 lockstep). Confirm `tree-sitter parse examples/async.as` has 0 ERROR nodes (the grammar already supports async); if the grammar needs a tweak, regenerate + recommit parser.c.
+
+- [ ] **Step 8: Run** `cargo test` (incl. the new tests + conformance over the async example) + `cargo clippy --all-targets`. **Commit:** `feat: add async/await surface syntax (spec §7)`
+
+---
+
 ## Definition of Done
 
 - `cargo test` passes (unit + integration + module + conformance); `cargo clippy --all-targets` clean.
