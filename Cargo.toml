@@ -42,6 +42,7 @@ bcrypt = { version = "0.15", optional = true }
 rand = { version = "0.8", optional = true }
 flate2 = { version = "1", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -50,7 +51,7 @@ cc = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
@@ -62,4 +63,4 @@ sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex"]
 process = ["tokio/process", "tokio/io-util"]
 crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex"]
 compress = ["dep:flate2", "dep:zip"]
-sql = []
+sql = ["dep:rusqlite"]

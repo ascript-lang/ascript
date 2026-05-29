@@ -83,6 +83,13 @@ pub struct ModuleEntry {
 pub(crate) enum ResourceState {
     #[cfg(feature = "sql")]
     SqliteConnection(rusqlite::Connection),
+    // A prepared statement can't be stored directly: rusqlite's `Statement<'conn>`
+    // borrows its `Connection`, which the resource table (owning both) can't model.
+    // Instead we store the SQL text + the owning connection's id, and re-resolve via
+    // `Connection::prepare_cached` on each `run`/`all` (rusqlite caches the parsed
+    // statement internally, so there's no re-parse cost). See std/sqlite.
+    #[cfg(feature = "sql")]
+    SqliteStatement { conn_id: u64, sql: String },
     // The process child handle requires tokio's `process` feature, wired up by
     // M13 Task 7 (`std/process`). Gated on `process` so `sys` can ship `std/env`
     // (Task 2) without pulling tokio/process yet.
@@ -151,6 +158,23 @@ impl Interp {
     #[allow(dead_code)] // Only used by feature-gated modules (sqlite/process) for now.
     pub(crate) fn take_resource(&mut self, id: u64) -> Option<ResourceState> {
         self.resources.remove(&id)
+    }
+
+    /// Borrow the resource for `id` (used by handle methods like `conn.query`).
+    #[allow(dead_code)]
+    pub(crate) fn resource(&self, id: u64) -> Option<&ResourceState> {
+        self.resources.get(&id)
+    }
+
+    /// Look up the live `rusqlite::Connection` behind a handle id, or `None` if the
+    /// handle was closed (`take_resource`'d) — the caller turns that into the
+    /// "use after close" panic.
+    #[cfg(feature = "sql")]
+    pub(crate) fn sqlite_conn(&self, id: u64) -> Option<&rusqlite::Connection> {
+        match self.resources.get(&id) {
+            Some(ResourceState::SqliteConnection(c)) => Some(c),
+            _ => None,
+        }
     }
 
     /// Run every test registered via the `test(name, fn)` builtin. Each test fn
@@ -806,10 +830,16 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        let _ = args;
-        // Tasks 6/7 add feature-gated `match m.receiver.kind { ... }` arms here
-        // (SqliteConnection/Statement → call_sqlite_method, Child/Reader/Writer →
-        // call_process_method). Until then, no native kind has any method.
+        let _ = &args;
+        #[cfg(feature = "sql")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, SqliteConnection | SqliteStatement) {
+                return self.call_sqlite_method(&m, args, span).await;
+            }
+        }
+        // Task 7 adds the `#[cfg(feature = "sys")]` arm routing Child/Reader/Writer
+        // to `call_process_method`. Any other kind has no method.
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
     }
 

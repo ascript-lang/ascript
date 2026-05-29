@@ -30,6 +30,8 @@ pub mod math;
 pub mod object;
 #[cfg(feature = "data")]
 pub mod regex;
+#[cfg(feature = "sql")]
+pub mod sqlite;
 pub mod string;
 pub mod time;
 #[cfg(feature = "data")]
@@ -80,6 +82,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/fs" => fs::exports(),
         #[cfg(feature = "data")]
         "std/regex" => regex::exports(),
+        #[cfg(feature = "sql")]
+        "std/sqlite" => sqlite::exports(),
         #[cfg(feature = "data")]
         "std/uuid" => uuid::exports(),
         #[cfg(feature = "data")]
@@ -129,6 +133,8 @@ impl Interp {
             "fs" => fs::call(func, args, span),
             #[cfg(feature = "data")]
             "regex" => regex::call(func, args, span),
+            #[cfg(feature = "sql")]
+            "sqlite" => self.call_sqlite_open(func, args, span),
             #[cfg(feature = "data")]
             "uuid" => uuid::call(func, args, span),
             #[cfg(feature = "data")]
