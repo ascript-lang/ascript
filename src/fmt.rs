@@ -281,7 +281,11 @@ fn expr_prec(e: &Expr) -> u8 {
         | ExprKind::Member { .. }
         | ExprKind::OptMember { .. }
         | ExprKind::Try(_) => PREC_POSTFIX,
-        ExprKind::Paren(inner) => expr_prec(inner),
+        // A `Paren` node already emits exactly one set of parens in
+        // `write_expr_inner`, so it must be treated as an atom here to prevent
+        // `write_expr` from wrapping it in a second, redundant set (which would
+        // accumulate `Paren(Paren(...))` layers on every `fmt` pass).
+        ExprKind::Paren(_) => PREC_ATOM,
         _ => PREC_ATOM,
     }
 }
@@ -517,6 +521,26 @@ mod tests {
         assert_eq!(once, twice, "fmt must be idempotent");
         // re-parses to an equivalent program (no parse error)
         assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn paren_in_operand_is_idempotent() {
+        for src in [
+            "(a + b) * c",
+            "a * (b + c)",
+            "-(a + b)",
+            "((1 + 2)) * 3",
+            "(a?.b).c",
+            "f((a + b))",
+        ] {
+            let once = format_source(src).unwrap();
+            let twice = format_source(&once).unwrap();
+            assert_eq!(once, twice, "not idempotent for: {src}");
+            // and it still re-parses
+            assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+        }
+        // a single explicit paren group renders as exactly one set
+        assert_eq!(format_source("(a + b) * c").unwrap(), "(a + b) * c\n");
     }
 
     #[test]
