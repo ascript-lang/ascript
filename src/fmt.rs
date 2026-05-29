@@ -573,6 +573,12 @@ mod tests {
         assert_eq!(out, "let x = 1\n");
     }
 
+    #[test]
+    fn formats_array_destructuring() {
+        let out = format_source("let [a, b] = pair").unwrap();
+        assert_eq!(out, "let [a, b] = pair\n");
+    }
+
     /// Every committed example must format idempotently and the formatted
     /// output must re-parse — proving all AST variants are handled.
     #[test]

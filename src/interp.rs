@@ -356,7 +356,7 @@ impl Interp {
             }
             Stmt::Export(inner) => {
                 let flow = self.exec_stmt(inner, env).await?;
-                if let Some(name) = exported_name(inner) {
+                for name in exported_names(inner) {
                     self.current_exports.borrow_mut().insert(name);
                 }
                 Ok(flow)
@@ -936,13 +936,14 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
-fn exported_name(stmt: &Stmt) -> Option<String> {
+fn exported_names(stmt: &Stmt) -> Vec<String> {
     match stmt {
-        Stmt::Let { name, .. } => Some(name.clone()),
-        Stmt::Fn { name, .. } => Some(name.clone()),
-        Stmt::Class { name, .. } => Some(name.clone()),
-        Stmt::Enum { name, .. } => Some(name.clone()),
-        _ => None,
+        Stmt::Let { name, .. } => vec![name.clone()],
+        Stmt::Fn { name, .. } => vec![name.clone()],
+        Stmt::Class { name, .. } => vec![name.clone()],
+        Stmt::Enum { name, .. } => vec![name.clone()],
+        Stmt::LetDestructure { names, .. } => names.clone(),
+        _ => Vec::new(),
     }
 }
 

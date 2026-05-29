@@ -452,6 +452,7 @@ impl<'a> Parser<'a> {
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
         self.advance(); // consume `let` / `const`
+        // `let [a, b] = expr` — array destructuring binding (spec §6).
         if *self.peek() == Tok::LBracket {
             self.advance(); // consume '['
             let mut names = Vec::new();
