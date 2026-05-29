@@ -9,6 +9,53 @@ enum TemplateChunk {
     Start, // `...${          (more follows)
 }
 
+/// Translate the character following a `\` into its escaped value. Shared by
+/// all three string forms (`"..."`, `'...'`, and `` `...` ``). Unknown escapes
+/// pass through leniently (`\<other>` -> `<other>`), matching the original
+/// template behavior. Template-specific escapes (`` \` `` and `\$`) are
+/// handled by the caller before reaching here (they fall through to the
+/// lenient passthrough anyway, but listing them keeps intent explicit).
+fn escape_char(c: char) -> char {
+    match c {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '0' => '\0',
+        '\\' => '\\',
+        '"' => '"',
+        '\'' => '\'',
+        other => other,
+    }
+}
+
+/// Read a quoted string body starting just after the opening `quote`, scanning
+/// until the matching unescaped `quote`. Advances `i` past the closing quote.
+/// Backslash escapes are translated via `escape_char`.
+fn lex_quoted(
+    chars: &[char],
+    i: &mut usize,
+    start: usize,
+    quote: char,
+) -> Result<String, AsError> {
+    let mut s = String::new();
+    while *i < chars.len() {
+        let c = chars[*i];
+        if c == quote {
+            *i += 1; // consume closing quote
+            return Ok(s);
+        }
+        if c == '\\' && *i + 1 < chars.len() {
+            *i += 1;
+            s.push(escape_char(chars[*i]));
+            *i += 1;
+            continue;
+        }
+        s.push(c);
+        *i += 1;
+    }
+    Err(AsError::at("unterminated string", Span::new(start, *i)))
+}
+
 /// Read template text starting just after a backtick (or after `}` that closes
 /// an interpolation). Advances `i` past the terminating `` ` `` or `${`.
 fn lex_template_chunk(
@@ -28,13 +75,15 @@ fn lex_template_chunk(
             return Ok((text, TemplateChunk::Start));
         }
         if c == '\\' && *i + 1 < chars.len() {
-            // simple escapes inside templates: \` \$ \\ \n \t
+            // Escapes inside templates. `` \` `` and `\$` are template-specific
+            // (they escape the interpolation/terminator syntax); everything
+            // else shares the common escape set via `escape_char`.
             *i += 1;
             let e = chars[*i];
             text.push(match e {
-                'n' => '\n',
-                't' => '\t',
-                other => other,
+                '`' => '`',
+                '$' => '$',
+                other => escape_char(other),
             });
             *i += 1;
             continue;
@@ -242,15 +291,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
             ']' => push(&mut tokens, Tok::RBracket, start, &mut i),
             '"' => {
                 i += 1;
-                let mut s = String::new();
-                while i < chars.len() && chars[i] != '"' {
-                    s.push(chars[i]);
-                    i += 1;
-                }
-                if i >= chars.len() {
-                    return Err(AsError::at("unterminated string", Span::new(start, i)));
-                }
-                i += 1; // consume closing quote
+                let s = lex_quoted(&chars, &mut i, start, '"')?;
+                tokens.push(Token { tok: Tok::Str(s), span: Span::new(start, i) });
+            }
+            '\'' => {
+                i += 1;
+                let s = lex_quoted(&chars, &mut i, start, '\'')?;
                 tokens.push(Token { tok: Tok::Str(s), span: Span::new(start, i) });
             }
             '`' => {
@@ -526,6 +572,47 @@ mod tests {
     #[test]
     fn rejects_unterminated_string() {
         let err = lex("\"oops").unwrap_err();
+        assert!(err.message.contains("unterminated"));
+    }
+
+    #[test]
+    fn lexes_single_quoted_string() {
+        assert_eq!(kinds("'single'"), vec![Tok::Str("single".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn double_quote_escape_inside_double_string() {
+        // source: "a\"b"
+        assert_eq!(kinds("\"a\\\"b\""), vec![Tok::Str("a\"b".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn newline_escape_in_double_string() {
+        // source: "line\nbreak"
+        assert_eq!(kinds("\"line\\nbreak\""), vec![Tok::Str("line\nbreak".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn single_quote_escape_inside_single_string() {
+        // source: 'it\'s'
+        assert_eq!(kinds("'it\\'s'"), vec![Tok::Str("it's".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn tab_escape_in_double_string() {
+        // source: "tab\there"
+        assert_eq!(kinds("\"tab\\there\""), vec![Tok::Str("tab\there".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn backslash_escape_in_double_string() {
+        // source: "back\\slash"
+        assert_eq!(kinds("\"back\\\\slash\""), vec![Tok::Str("back\\slash".into()), Tok::Eof]);
+    }
+
+    #[test]
+    fn rejects_unterminated_single_quoted_string() {
+        let err = lex("'oops").unwrap_err();
         assert!(err.message.contains("unterminated"));
     }
 

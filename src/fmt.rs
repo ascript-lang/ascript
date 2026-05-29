@@ -322,7 +322,7 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
         ExprKind::Number(n) => out.push_str(&format_number(*n)),
         ExprKind::Str(s) => {
             out.push('"');
-            out.push_str(s);
+            out.push_str(&escape_str_lit(s));
             out.push('"');
         }
         ExprKind::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -518,6 +518,24 @@ fn format_number(n: f64) -> String {
 
 /// Re-escape template literal text so it round-trips through the lexer (which
 /// unescapes `\` `` ` `` `$` `\n` `\t`).
+/// Re-escape a string value for emission inside a double-quoted literal, so it
+/// round-trips through the lexer's escape handling (see `lexer::escape_char`).
+fn escape_str_lit(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn escape_template_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -571,6 +589,17 @@ mod tests {
     fn formats_canonically() {
         let out = format_source("let x=1").unwrap();
         assert_eq!(out, "let x = 1\n");
+    }
+
+    #[test]
+    fn re_escapes_string_literals() {
+        // A string literal carrying special chars must be emitted with escapes
+        // so the formatted output re-lexes to the same value (round-trips).
+        let out = format_source("print(\"a\\\"b\\tc\\nd\\\\e\")").unwrap();
+        assert_eq!(out, "print(\"a\\\"b\\tc\\nd\\\\e\")\n");
+        // idempotent and re-parses
+        let twice = format_source(&out).unwrap();
+        assert_eq!(out, twice);
     }
 
     #[test]

@@ -1158,6 +1158,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn string_escapes_and_single_quotes() {
+        assert_eq!(run("print('hello')").await, "hello\n");
+        assert_eq!(run("print(\"a\\tb\")").await, "a\tb\n");
+        assert_eq!(run("print(\"quote: \\\"x\\\"\")").await, "quote: \"x\"\n");
+        assert_eq!(run("print('it\\'s')").await, "it's\n");
+        // a string with an escaped newline prints across two lines
+        assert_eq!(run("print(\"line1\\nline2\")").await, "line1\nline2\n");
+    }
+
+    #[tokio::test]
     async fn std_map_end_to_end() {
         let src = "import * as map from \"std/map\"\n\
                    let m = map.new()\n\
@@ -1173,9 +1183,9 @@ mod tests {
     #[cfg(feature = "data")]
     #[tokio::test]
     async fn std_json_end_to_end() {
-        // AScript double-quoted string literals do not process `\"` escapes
-        // (they read raw to the next quote), so the JSON source is written as a
-        // backtick template, which takes literal double quotes.
+        // The JSON source is written as a backtick template so the inner double
+        // quotes can be written literally (a `"..."` literal would also work
+        // now that `\"` escapes are supported, but the template reads cleaner).
         let src = "import * as json from \"std/json\"\n\
                    let [v, err] = json.parse(`{\"x\": 10, \"ys\": [1, 2]}`)\n\
                    print(v.x)\n\
