@@ -36,6 +36,8 @@ impl Backend {
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
         ..ServerCapabilities::default()
     }
 }
@@ -85,6 +87,30 @@ impl LanguageServer for Backend {
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let docs = self.documents.lock().await;
+        let Some(text) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let symbols = analysis::document_symbols(text);
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn hover(&self, params: HoverParams) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let docs = self.documents.lock().await;
+        let Some(text) = docs.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
+        Ok(analysis::hover(text, offset))
+    }
+
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
         Ok(())
     }
@@ -103,5 +129,23 @@ mod tests {
             }
             other => panic!("expected FULL text document sync, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn capabilities_advertise_document_symbol_and_hover() {
+        let caps = server_capabilities();
+        assert!(
+            matches!(
+                caps.document_symbol_provider,
+                Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+            ),
+            "expected a document symbol provider, got {:?}",
+            caps.document_symbol_provider
+        );
+        assert!(
+            caps.hover_provider.is_some(),
+            "expected a hover provider, got {:?}",
+            caps.hover_provider
+        );
     }
 }

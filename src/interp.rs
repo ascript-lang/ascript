@@ -508,7 +508,7 @@ impl Interp {
                 self.eval_expr(e, env).await?;
                 Ok(Flow::Normal)
             }
-            Stmt::Let { name, ty, value, mutable } => {
+            Stmt::Let { name, ty, value, mutable, .. } => {
                 let v = match value {
                     Some(value) => {
                         let v = self.eval_expr(value, env).await?;
@@ -527,7 +527,7 @@ impl Interp {
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::LetDestructure { names, value, mutable } => {
+            Stmt::LetDestructure { names, value, mutable, .. } => {
                 let v = self.eval_expr(value, env).await?;
                 let items = match v {
                     Value::Array(a) => a.borrow().clone(),
@@ -624,7 +624,7 @@ impl Interp {
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
-            Stmt::Fn { name, params, ret, body, is_async } => {
+            Stmt::Fn { name, params, ret, body, is_async, .. } => {
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
@@ -636,7 +636,7 @@ impl Interp {
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Enum { name, variants } => {
+            Stmt::Enum { name, variants, .. } => {
                 let mut map = indexmap::IndexMap::new();
                 for v in variants {
                     let backing = match &v.value {
@@ -654,7 +654,7 @@ impl Interp {
                 env.define(name, def, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Class { name, superclass, methods } => {
+            Stmt::Class { name, superclass, methods, .. } => {
                 let parent = match superclass {
                     Some(sup_name) => match env.get(sup_name) {
                         Some(Value::Class(c)) => Some(c),

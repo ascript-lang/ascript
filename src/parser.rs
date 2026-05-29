@@ -179,7 +179,9 @@ impl<'a> Parser<'a> {
     }
 
     fn fn_decl(&mut self, is_async: bool) -> Result<Stmt, AsError> {
+        let start = self.span().start; // at the `fn` keyword
         self.eat(&Tok::Fn)?;
+        let name_span = self.span();
         let name = match self.advance() {
             Tok::Ident(name) => name,
             other => {
@@ -197,11 +199,14 @@ impl<'a> Parser<'a> {
             None
         };
         let body = self.block()?;
-        Ok(Stmt::Fn { name, params, ret, body, is_async })
+        let span = Span::new(start, self.prev_end());
+        Ok(Stmt::Fn { name, params, ret, body, is_async, span, name_span })
     }
 
     fn enum_decl(&mut self) -> Result<Stmt, AsError> {
+        let start = self.span().start;
         self.eat(&Tok::Enum)?;
+        let name_span = self.span();
         let name = match self.advance() {
             Tok::Ident(n) => n,
             other => return Err(AsError::at(format!("expected enum name, found {:?}", other), self.tokens[self.pos - 1].span)),
@@ -209,6 +214,7 @@ impl<'a> Parser<'a> {
         self.eat(&Tok::LBrace)?;
         let mut variants = Vec::new();
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            let vname_span = self.span();
             let vname = match self.advance() {
                 Tok::Ident(n) => n,
                 other => return Err(AsError::at(format!("expected variant name, found {:?}", other), self.tokens[self.pos - 1].span)),
@@ -219,7 +225,7 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            variants.push(crate::ast::EnumVariantDecl { name: vname, value });
+            variants.push(crate::ast::EnumVariantDecl { name: vname, value, name_span: vname_span });
             if *self.peek() == Tok::Comma {
                 self.advance();
             } else {
@@ -227,11 +233,14 @@ impl<'a> Parser<'a> {
             }
         }
         self.eat(&Tok::RBrace)?;
-        Ok(Stmt::Enum { name, variants })
+        let span = Span::new(start, self.prev_end());
+        Ok(Stmt::Enum { name, variants, span, name_span })
     }
 
     fn class_decl(&mut self) -> Result<Stmt, AsError> {
+        let start = self.span().start;
         self.eat(&Tok::Class)?;
+        let name_span = self.span();
         let name = match self.advance() {
             Tok::Ident(n) => n,
             other => return Err(AsError::at(format!("expected class name, found {:?}", other), self.tokens[self.pos - 1].span)),
@@ -249,6 +258,7 @@ impl<'a> Parser<'a> {
         self.eat(&Tok::LBrace)?;
         let mut methods = Vec::new();
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            let mstart = self.span().start;
             let is_async = if *self.peek() == Tok::Async {
                 self.advance();
                 true
@@ -256,6 +266,7 @@ impl<'a> Parser<'a> {
                 false
             };
             self.eat(&Tok::Fn)?;
+            let mname_span = self.span();
             let mname = match self.advance() {
                 Tok::Ident(n) => n,
                 other => return Err(AsError::at(format!("expected method name, found {:?}", other), self.tokens[self.pos - 1].span)),
@@ -268,10 +279,20 @@ impl<'a> Parser<'a> {
                 None
             };
             let body = self.block()?;
-            methods.push(crate::ast::MethodDecl { name: mname, params, ret, body, is_async });
+            let mspan = Span::new(mstart, self.prev_end());
+            methods.push(crate::ast::MethodDecl {
+                name: mname,
+                params,
+                ret,
+                body,
+                is_async,
+                span: mspan,
+                name_span: mname_span,
+            });
         }
         self.eat(&Tok::RBrace)?;
-        Ok(Stmt::Class { name, superclass, methods })
+        let span = Span::new(start, self.prev_end());
+        Ok(Stmt::Class { name, superclass, methods, span, name_span })
     }
 
     fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {
@@ -460,15 +481,21 @@ impl<'a> Parser<'a> {
     }
 
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
+        let start = self.span().start;
         self.advance(); // consume `let` / `const`
         // `let [a, b] = expr` — array destructuring binding (spec §6).
         if *self.peek() == Tok::LBracket {
             self.advance(); // consume '['
             let mut names = Vec::new();
+            let mut name_spans = Vec::new();
             if *self.peek() != Tok::RBracket {
                 loop {
+                    let span = self.span();
                     match self.advance() {
-                        Tok::Ident(n) => names.push(n),
+                        Tok::Ident(n) => {
+                            names.push(n);
+                            name_spans.push(span);
+                        }
                         other => return Err(AsError::at(
                             format!("expected an identifier in destructuring pattern, found {:?}", other),
                             self.tokens[self.pos - 1].span,
@@ -485,8 +512,10 @@ impl<'a> Parser<'a> {
             self.eat(&Tok::RBracket)?;
             self.eat(&Tok::Eq)?;
             let value = self.expr()?;
-            return Ok(Stmt::LetDestructure { names, value, mutable });
+            let span = Span::new(start, self.prev_end());
+            return Ok(Stmt::LetDestructure { names, value, mutable, span, name_spans });
         }
+        let name_span = self.span();
         let name = match self.advance() {
             Tok::Ident(name) => name,
             other => {
@@ -513,7 +542,8 @@ impl<'a> Parser<'a> {
         } else {
             return Err(AsError::at("const declarations must be initialized", self.span()));
         };
-        Ok(Stmt::Let { name, ty, value, mutable })
+        let span = Span::new(start, self.prev_end());
+        Ok(Stmt::Let { name, ty, value, mutable, span, name_span })
     }
 
     fn expr(&mut self) -> Result<Expr, AsError> {
