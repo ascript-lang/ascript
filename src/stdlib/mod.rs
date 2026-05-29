@@ -7,6 +7,8 @@
 pub mod array;
 pub mod bytes;
 pub mod convert;
+#[cfg(feature = "crypto")]
+pub mod crypto;
 #[cfg(feature = "datetime")]
 pub mod date;
 #[cfg(feature = "data")]
@@ -66,6 +68,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/json" => json::exports(),
         #[cfg(feature = "data")]
         "std/encoding" => encoding::exports(),
+        #[cfg(feature = "crypto")]
+        "std/crypto" => crypto::exports(),
         #[cfg(feature = "sys")]
         "std/env" => env::exports(),
         #[cfg(feature = "sys")]
@@ -111,6 +115,8 @@ impl Interp {
             "json" => json::call(func, args, span),
             #[cfg(feature = "data")]
             "encoding" => encoding::call(func, args, span),
+            #[cfg(feature = "crypto")]
+            "crypto" => crypto::call(func, args, span),
             #[cfg(feature = "sys")]
             "env" => env::call(func, args, span),
             #[cfg(feature = "sys")]

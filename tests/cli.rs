@@ -266,3 +266,27 @@ fn test_runner_reports_pass_and_fail() {
     assert!(s.contains("fails") && s.contains("boom"));
     assert!(!out.status.success()); // a failing test → non-zero exit
 }
+
+#[test]
+#[cfg(feature = "crypto")] // program imports std/crypto; only valid with the crypto feature.
+fn runs_crypto_sha256_and_password_roundtrip() {
+    let file = std::env::temp_dir().join(format!("ascript_crypto_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "import { sha256, hashPassword, verifyPassword } from \"std/crypto\"\n\
+         print(sha256(\"abc\"))\n\
+         const [phc, err] = hashPassword(\"hunter2\")\n\
+         print(err == nil)\n\
+         print(verifyPassword(\"hunter2\", phc))\n\
+         print(verifyPassword(\"nope\", phc))",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = std::process::Command::new(bin).arg("run").arg(&file).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\ntrue\ntrue\nfalse\n"
+    );
+    let _ = std::fs::remove_file(&file);
+}
