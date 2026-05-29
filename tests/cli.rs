@@ -30,6 +30,21 @@ fn runs_factorial_example() {
 }
 
 #[test]
+fn runs_functions_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/functions.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    // fib(10) = 55; triple(7) = 21; count of odd fib(0..10) = fib values
+    // [0,1,1,2,3,5,8,13,21,34] -> odd ones: 1,1,3,5,13,21 -> 6
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "55\n21\n6\n");
+}
+
+#[test]
 fn reports_usage_without_args() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let output = Command::new(bin).output().unwrap();
