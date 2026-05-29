@@ -58,12 +58,12 @@ pub fn global_env() -> Environment {
 }
 
 /// Build a `[value, err]` Result pair.
-fn make_pair(value: Value, err: Value) -> Value {
+pub(crate) fn make_pair(value: Value, err: Value) -> Value {
     Value::Array(Rc::new(RefCell::new(vec![value, err])))
 }
 
 /// Build an error object `{ message: <msg> }`.
-fn make_error(msg: Value) -> Value {
+pub(crate) fn make_error(msg: Value) -> Value {
     let mut map = indexmap::IndexMap::new();
     map.insert("message".to_string(), msg);
     Value::Object(Rc::new(RefCell::new(map)))
@@ -161,6 +161,27 @@ impl Interp {
             return Err(Control::Panic(e.with_source(src_info)));
         }
         result?; // propagate any other control flow from the module body
+        Ok(entry)
+    }
+
+    /// Resolve a `std/*` built-in module to a cached `ModuleEntry`, building it
+    /// from the static export registry. Bypasses the filesystem entirely.
+    fn load_std_module(&mut self, source: &str) -> Result<ModuleEntry, Control> {
+        let key = PathBuf::from(format!("<std>/{}", &source[4..]));
+        if let Some(entry) = self.modules.get(&key) {
+            return Ok(entry.clone());
+        }
+        let exports_list = crate::stdlib::std_module_exports(source).ok_or_else(|| {
+            Control::Panic(AsError::new(format!("unknown standard library module '{}'", source)))
+        })?;
+        let env = global_env();
+        let exports = Rc::new(RefCell::new(HashSet::new()));
+        for (name, value) in exports_list {
+            env.define(&name, value, false).map_err(AsError::new)?;
+            exports.borrow_mut().insert(name);
+        }
+        let entry = ModuleEntry { env, exports };
+        self.modules.insert(key, entry.clone());
         Ok(entry)
     }
 
@@ -362,8 +383,12 @@ impl Interp {
                 Ok(flow)
             }
             Stmt::Import { names, source } => {
-                let resolved = self.resolve_import(source);
-                let entry = self.load_module(&resolved).await?;
+                let entry = if source.starts_with("std/") {
+                    self.load_std_module(source)?
+                } else {
+                    let resolved = self.resolve_import(source);
+                    self.load_module(&resolved).await?
+                };
                 match names {
                     crate::ast::ImportNames::Named(names) => {
                         for name in names {
@@ -670,7 +695,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    async fn call_value(&mut self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
+    pub(crate) async fn call_value(&mut self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
         match callee {
             Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
             Value::Function(func) => self.call_function(&func, args, span).await,
@@ -905,7 +930,13 @@ impl Interp {
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(out))))
             }
-            other => Err(AsError::at(format!("'{}' is not a function", other), span).into()),
+            other => {
+                if let Some((module, func)) = other.split_once('.') {
+                    self.call_stdlib(module, func, args, span).await
+                } else {
+                    Err(AsError::at(format!("'{}' is not a function", other), span).into())
+                }
+            }
         }
     }
 
@@ -981,7 +1012,7 @@ fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
 }
 
 /// Human-readable type name for diagnostics.
-fn type_name(v: &Value) -> &'static str {
+pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Nil => "nil",
         Value::Bool(_) => "bool",
@@ -2021,5 +2052,23 @@ print(r[1])
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output, "42\n5\n10\n");
+    }
+
+    #[tokio::test]
+    async fn imports_std_math() {
+        let out = run("import * as math from \"std/math\"\nprint(math.abs(-5))\nprint(math.pow(2, 8))\nprint(math.pi > 3.14)").await;
+        assert_eq!(out, "5\n256\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn named_import_from_std() {
+        let out = run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))").await;
+        assert_eq!(out, "12\n7\n");
+    }
+
+    #[tokio::test]
+    async fn unknown_std_module_errors() {
+        let err = run_err("import { x } from \"std/nope\"").await;
+        assert!(err.message.contains("unknown standard library module"));
     }
 }
