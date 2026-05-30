@@ -1,0 +1,76 @@
+//! M17 carry-in regression tests: abandoned/un-iterated generators must never
+//! hang program exit, and operating on a generator handle without driving it
+//! must be graceful. These run the real binary end-to-end, so the program's
+//! top-level `LocalSet` drain is exercised — a regression to the old
+//! spawned-task generator model would HANG these tests (cargo's timeout fails
+//! them), rather than silently passing.
+
+use assert_cmd::Command;
+
+fn run_ok(name: &str, src: &str) -> String {
+    let dir = std::env::temp_dir().join("ascript_m17_regressions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.as"));
+    std::fs::write(&path, src).unwrap();
+    let out = Command::cargo_bin("ascript")
+        .unwrap()
+        .arg("run")
+        .arg(&path)
+        .assert()
+        .success();
+    String::from_utf8(out.get_output().stdout.clone()).unwrap()
+}
+
+#[test]
+fn equality_on_uniterated_generator_terminates() {
+    // A generator handle is identity-comparable without driving its body. The
+    // program must terminate (the top-level drain must not wait on the
+    // never-polled generator future).
+    let out = run_ok(
+        "eq",
+        "fn* count() { yield 1\n yield 2 }\nlet g = count()\nprint(g == g)\nprint(\"end\")\n",
+    );
+    assert!(out.contains("true"), "got: {out:?}");
+    assert!(out.contains("end"), "got: {out:?}");
+}
+
+#[test]
+fn stringify_of_uniterated_generator_is_graceful_and_terminates() {
+    // json.stringify of a generator returns the graceful [nil, err] Result
+    // (never a panic, never a hang), and the program terminates.
+    let out = run_ok(
+        "stringify",
+        "import * as json from \"std/json\"\n\
+         fn* count() { yield 1 }\n\
+         let g = count()\n\
+         let [s, err] = json.stringify(g)\n\
+         print(s)\n\
+         print(err != nil)\n\
+         print(\"end\")\n",
+    );
+    assert!(out.contains("nil"), "expected nil value, got: {out:?}");
+    assert!(out.contains("true"), "expected non-nil error, got: {out:?}");
+    assert!(out.contains("end"), "got: {out:?}");
+}
+
+#[test]
+fn never_iterated_generator_terminates() {
+    // Creating a generator and never iterating it must not hang exit.
+    let out = run_ok("never", "fn* g() { yield 1\n yield 2 }\ng()\nprint(\"ok\")\n");
+    assert!(out.contains("ok"), "got: {out:?}");
+}
+
+#[test]
+fn infinite_generator_with_break_terminates_and_prints() {
+    // A lazy infinite generator consumed with an early break must print exactly
+    // the pulled values and then exit — the canonical "abandoned generator" case.
+    let out = run_ok(
+        "infbreak",
+        "fn* nats() { let i = 0\n while (true) { yield i\n i = i + 1 } }\n\
+         for await (x in nats()) { print(x)\n if (x >= 2) { break } }\n\
+         print(\"done\")\n",
+    );
+    assert!(out.contains("0"), "got: {out:?}");
+    assert!(out.contains("2"), "got: {out:?}");
+    assert!(out.contains("done"), "got: {out:?}");
+}
