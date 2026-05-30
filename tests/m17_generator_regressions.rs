@@ -2,23 +2,18 @@
 //! hang program exit, and operating on a generator handle without driving it
 //! must be graceful. These run the real binary end-to-end, so the program's
 //! top-level `LocalSet` drain is exercised — a regression to the old
-//! spawned-task generator model would HANG these tests (cargo's timeout fails
-//! them), rather than silently passing.
+//! spawned-task generator model would HANG these tests (cargo's harness timeout
+//! fails them), rather than silently passing.
 
-use assert_cmd::Command;
+use std::process::Command;
 
 fn run_ok(name: &str, src: &str) -> String {
-    let dir = std::env::temp_dir().join("ascript_m17_regressions");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("{name}.as"));
-    std::fs::write(&path, src).unwrap();
-    let out = Command::cargo_bin("ascript")
-        .unwrap()
-        .arg("run")
-        .arg(&path)
-        .assert()
-        .success();
-    String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    let file = std::env::temp_dir().join(format!("ascript_m17_{name}.as"));
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    assert!(output.status.success(), "process failed: {output:?}");
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
@@ -70,7 +65,7 @@ fn infinite_generator_with_break_terminates_and_prints() {
          for await (x in nats()) { print(x)\n if (x >= 2) { break } }\n\
          print(\"done\")\n",
     );
-    assert!(out.contains("0"), "got: {out:?}");
-    assert!(out.contains("2"), "got: {out:?}");
+    assert!(out.contains('0'), "got: {out:?}");
+    assert!(out.contains('2'), "got: {out:?}");
     assert!(out.contains("done"), "got: {out:?}");
 }
