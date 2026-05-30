@@ -3201,7 +3201,7 @@ print(r[1])
             "import * as time from \"std/time\"\n\
              async fn job(n) { await time.sleep(2) return n }\n\
              let total = 0\n\
-             for i in [1, 2, 3] { total = total + (await job(i)) }\n\
+             for (i in [1, 2, 3]) { total = total + (await job(i)) }\n\
              print(total)",
         )
         .await;
