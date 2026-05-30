@@ -345,13 +345,26 @@ impl Interp {
         }
     }
 
-    /// Drop any un-consumed `HttpNext` continuations from the resource table. A
-    /// middleware that short-circuits (returns without calling `next`) leaves its
-    /// continuation behind; the server sweeps them after each request so per-request
-    /// handles don't accumulate across a long-running `serve` loop.
+    /// Drop the un-consumed `HttpNext` continuations belonging to ONE dispatch
+    /// (identified by `dispatch_id`). A middleware that short-circuits (returns
+    /// without calling `next`) leaves its continuation behind; the server sweeps it
+    /// after each request so per-request handles don't accumulate. The sweep is
+    /// scoped to the dispatch so concurrent connections (each handled on its own
+    /// task) never drop one another's still-pending continuations.
     #[cfg(feature = "net")]
-    pub(crate) fn drop_pending_http_next(&self) {
-        self.resources.borrow_mut().retain(|_, s| !matches!(s, ResourceState::HttpNext(_)));
+    pub(crate) fn drop_pending_http_next(&self, dispatch_id: u64) {
+        self.resources.borrow_mut().retain(|_, s| match s {
+            ResourceState::HttpNext(state) => state.dispatch_id != dispatch_id,
+            _ => true,
+        });
+    }
+
+    /// Allocate a fresh monotonic id identifying one `dispatch_request` so its
+    /// `HttpNext` continuations can be swept without touching other concurrent
+    /// dispatches. Reuses the resource-id counter (ids are unique either way).
+    #[cfg(feature = "net")]
+    pub(crate) fn next_http_dispatch_id(&self) -> u64 {
+        self.next_id()
     }
 
     /// A mutable borrow of an HTTP server's routes/middleware/listener (as a `RefMut`
