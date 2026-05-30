@@ -43,6 +43,7 @@ pub mod regex;
 #[cfg(feature = "sql")]
 pub mod sqlite;
 pub mod string;
+pub mod task_mod;
 pub mod time;
 #[cfg(feature = "tui")]
 pub mod tui;
@@ -75,6 +76,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/map" => map::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
+        "std/task" => task_mod::exports(),
         "std/time" => time::exports(),
         #[cfg(feature = "datetime")]
         "std/date" => date::exports(),
@@ -138,6 +140,7 @@ impl Interp {
             "map" => map::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
+            "task" => self.call_task(func, args, span).await,
             "time" => self.call_time(func, args, span).await,
             #[cfg(feature = "datetime")]
             "date" => date::call(func, args, span),
