@@ -80,6 +80,12 @@ point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_sourc
   loop. The whole runtime is `Rc`/`RefCell`-based and therefore **`!Send`** — the binary uses
   `#[tokio::main(flavor = "current_thread")]`. Do not introduce `Send` bounds or spawn onto a
   multi-thread runtime; async I/O is dispatched inline rather than via a new future kind.
+  - **M17 in progress** (real async concurrency + generators/coroutines, Architecture A — see
+    `docs/superpowers/plans/2026-05-30-async-generators-coroutines.md` and spec §7): `await`
+    becomes real, calling an `async fn` returns an eagerly-scheduled `Value::Future` on a
+    `tokio::task::LocalSet`, and `yield`/`fn*` ride an internal rendezvous. New interpreter
+    invariant: **never hold a `RefCell` borrow across an `.await`** (enforced by clippy
+    `await_holding_refcell_ref`) — bind/drop borrows before any suspension point.
 - **Control flow uses two enums, not `Result<_, io::Error>`:**
   - `Flow { Normal, Return(Value), Break, Continue }` — normal statement-level control flow.
   - `Control { Panic(AsError), Propagate(Value) }` — the error channel. `Panic` is an unrecoverable
