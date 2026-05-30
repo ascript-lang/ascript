@@ -30,8 +30,22 @@ let ua = await a         // total wait ≈ max(a, b), not a + b
 let ub = await b
 ```
 
-Side effects of an un-awaited future still complete: the top-level program drains all
-spawned tasks before it exits (structured shutdown).
+## Structured concurrency: cancel-on-drop
+
+A task's lifetime is **bound to its future handle**. When the last reference to a future is
+dropped, the task is **cancelled** — work without an owner does not linger.
+
+```ascript
+async fn log(msg) { await db.write(msg) }
+
+log("hello")             // future created then immediately dropped -> CANCELLED, never runs
+let f = log("kept")      // held -> runs; `await f` would also keep it alive
+```
+
+If you want fire-and-forget work that *must* run even though you do not keep the handle, use
+`task.spawn` (below) — it is the explicit opt-out of cancel-on-drop. This makes memory
+bounded by construction: a server loop that fires un-awaited async calls cannot pile up
+orphaned tasks.
 
 ## The `future<T>` type
 
@@ -52,16 +66,18 @@ import * as task from "std/task"
 
 | Function | Behavior |
 |---|---|
-| `spawn(futureOr0ArgFn) -> future` | Schedule a task and get its `future`. Accepts a future or a 0-arg function. |
+| `spawn(futureOr0ArgFn) -> future` | **Detach** a task (opt out of cancel-on-drop) so it runs to completion even if the handle is dropped. Accepts a future or a 0-arg function. |
 | `gather([futures]) -> [values]` | Run all concurrently; return results **in input order**. The first error short-circuits. |
-| `race([futures]) -> value` | Resolve to the first to finish; the losers are dropped. |
-| `timeout(ms, future) -> [value, err]` | Result pair: `[value, nil]` if it finishes in time, else `[nil, err]`. |
+| `race([futures]) -> value` | Resolve to the first to finish; **the losers are cancelled**. |
+| `timeout(ms, future) -> [value, err]` | Result pair: `[value, nil]` if it finishes in time, else `[nil, err]`. On timeout the **timed-out work is cancelled**. |
 
 ```ascript
 let [x, y, z] = await task.gather([compute(), compute(), compute()])
-let first      = await task.race([slow(), fast()])
-let [val, err] = await task.timeout(500, slow())
+let first      = await task.race([slow(), fast()])    // slow() is cancelled when fast() wins
+let [val, err] = await task.timeout(500, slow())      // slow() is cancelled if it overruns
 if (err != nil) { print("timed out") }
+
+task.spawn(log("audit"))   // fire-and-forget: runs to completion despite the dropped handle
 ```
 
 ## Generators (`fn*`) and coroutines
@@ -123,6 +139,9 @@ This is the shape used to re-stream LLM/SSE tokens through transformations to a 
 
 - **Single-threaded:** no data races; shared mutable state needs no locks. CPU-bound work in a
   handler blocks the loop — offload heavy work, keep handlers I/O-bound.
+- **Cancel-on-drop:** an un-awaited, un-held async call is cancelled; use `task.spawn` for
+  fire-and-forget. `race` cancels losers; `timeout` cancels the timed-out work. Memory is
+  bounded by construction.
 - **HTTP server** handles each connection on its own task with a bounded concurrency cap, so a
   slow handler does not block other clients.
 - **Not provided** (deliberate architectural non-goals — see the design spec §7): durable /
