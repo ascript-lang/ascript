@@ -592,10 +592,15 @@ impl<'a> Parser<'a> {
         if *self.peek() == Tok::Yield {
             let start = self.span().start;
             self.advance(); // consume `yield`
-            let operand = match self.peek() {
-                Tok::RParen | Tok::RBrace | Tok::RBracket | Tok::Comma | Tok::Semicolon
-                | Tok::Eof | Tok::Colon => None,
-                _ => Some(Box::new(self.assignment()?)),
+            // An operand is present iff the next token can begin an expression.
+            // AScript has no newline tokens (ASI is parser-driven), so a bare
+            // `yield` is recognized by what follows: a terminator (`)`, `}`, `,`,
+            // `;`, `:`, EOF) or a statement keyword (`let`, `return`, `if`, …)
+            // that cannot start an expression ends the `yield`.
+            let operand = if starts_expression(self.peek()) {
+                Some(Box::new(self.assignment()?))
+            } else {
+                None
             };
             let end = self.prev_end();
             return Ok(Expr {
@@ -1152,6 +1157,33 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Whether `tok` can begin an expression. Used to decide if a `yield` carries an
+/// operand: since AScript has no newline tokens, a bare `yield` is only
+/// distinguishable from `yield <expr>` by whether what follows can start an
+/// expression (a terminator or a statement keyword cannot).
+fn starts_expression(tok: &Tok) -> bool {
+    matches!(
+        tok,
+        Tok::Number(_)
+            | Tok::Str(_)
+            | Tok::Ident(_)
+            | Tok::True
+            | Tok::False
+            | Tok::Nil
+            | Tok::LParen
+            | Tok::LBracket
+            | Tok::LBrace
+            | Tok::Minus
+            | Tok::Bang
+            | Tok::Await
+            | Tok::Yield
+            | Tok::Async
+            | Tok::Match
+            | Tok::TemplateStr(_)
+            | Tok::TemplateStart(_)
+    )
+}
+
 /// Whether an expression can be the target of an assignment.
 fn is_assignable(expr: &Expr) -> bool {
     matches!(
@@ -1371,16 +1403,20 @@ mod tests {
     fn parses_yield_with_and_without_operand() {
         assert_eq!(sexpr("yield 1"), "(yield 1)");
         assert_eq!(sexpr("yield x + 1"), "(yield (+ x 1))");
-        // A bare `yield` terminated by `)` / newline.
+        // A bare `yield` terminated by `)`.
         assert_eq!(sexpr("(yield)"), "(yield)");
-        let stmts = parse(&lex("fn* g() { yield\nyield 2 }").unwrap()).unwrap();
+        // A bare `yield` followed by a statement keyword (`let` cannot start an
+        // expression, so the `yield` does not consume it).
+        let stmts = parse(&lex("fn* g() { yield\nlet x = 1 }").unwrap()).unwrap();
         match &stmts[0] {
             Stmt::Fn { body, .. } => {
                 assert!(matches!(&body[0], Stmt::Expr(e) if matches!(e.kind, ExprKind::Yield(None))));
-                assert!(matches!(&body[1], Stmt::Expr(e) if matches!(e.kind, ExprKind::Yield(Some(_)))));
+                assert!(matches!(&body[1], Stmt::Let { .. }));
             }
             other => panic!("expected fn body, got {other:?}"),
         }
+        // `yield` IS an expression start, so `yield yield 2` nests (right-assoc).
+        assert_eq!(sexpr("yield yield 2"), "(yield (yield 2))");
     }
 
     #[test]

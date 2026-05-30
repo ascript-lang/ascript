@@ -1710,11 +1710,11 @@ fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> 
     #[cfg(feature = "net")]
     {
         use crate::value::NativeKind::*;
-        return match kind {
+        match kind {
             WsConnection => Some("recv"),
             SseStream => Some("next"),
             _ => None,
-        };
+        }
     }
     #[cfg(not(feature = "net"))]
     {
