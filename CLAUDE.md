@@ -76,16 +76,31 @@ token and AST node carries a `Span` (byte offsets + line/col) so `diagnostics` (
 point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_source`, `run_tests`.
 
 ### The interpreter (`src/interp.rs`)
-- `eval_expr`/`exec` are `async` (`#[async_recursion]`) to establish spec §7's single-threaded event
-  loop. The whole runtime is `Rc`/`RefCell`-based and therefore **`!Send`** — the binary uses
-  `#[tokio::main(flavor = "current_thread")]`. Do not introduce `Send` bounds or spawn onto a
-  multi-thread runtime; async I/O is dispatched inline rather than via a new future kind.
-  - **M17 in progress** (real async concurrency + generators/coroutines, Architecture A — see
-    `docs/superpowers/plans/2026-05-30-async-generators-coroutines.md` and spec §7): `await`
-    becomes real, calling an `async fn` returns an eagerly-scheduled `Value::Future` on a
-    `tokio::task::LocalSet`, and `yield`/`fn*` ride an internal rendezvous. New interpreter
-    invariant: **never hold a `RefCell` borrow across an `.await`** (enforced by clippy
-    `await_holding_refcell_ref`) — bind/drop borrows before any suspension point.
+- `eval_expr`/`exec` are `async` (`#[async_recursion]`) and take **`&self`** (not `&mut self`) —
+  `Interp` state lives behind interior-mutability cells (`RefCell`/`Cell`) so multiple eval futures can
+  be live at once (M17). The whole runtime is `Rc`/`RefCell`-based and therefore **`!Send`** — the
+  binary uses `#[tokio::main(flavor = "current_thread")]` and runs each program inside a
+  `tokio::task::LocalSet`. Do not introduce `Send` bounds or a multi-thread runtime.
+- **M17 async model (spec §7):** calling a script `async fn` returns a `Value::Future` and **eagerly
+  schedules** the body via `tokio::task::spawn_local` (`self.rc()` yields an owned `Rc<Interp>` via a
+  self-`Weak` installed by `install_self`); `await` drives a future to completion (`await` on a
+  non-future is identity). Entry points (`run_file`/`run_source`/`run_tests` in `src/lib.rs`, repl) do
+  `local.run_until(root).await; local.await;` — the trailing drain runs spawned tasks to completion
+  (structured shutdown). **Invariant: never hold a `RefCell` borrow across an `.await`** (enforced by
+  clippy `await_holding_refcell_ref = "deny"` in `Cargo.toml`); for native resources use the
+  take-out-across-await pattern (`take_resource` → await on the owned value → `return_resource`).
+- **Concurrency primitives:** `src/task.rs` has `SharedFuture` (the completion cell backing
+  `Value::Future`, carrying `Result<Value, Control>` so panics cross the task boundary). `std/task`
+  (`src/stdlib/task_mod.rs`) provides `spawn`/`gather`/`race`/`timeout` as pure library functions over
+  `future<T>`.
+- **Generators & coroutines** (`src/coro.rs`): `fn*`/`async fn*` return a `Value::Generator` that is
+  **consumer-driven** — the body is a lazily-polled `Pin<Box<dyn Future>>` (NOT a spawned task), driven
+  one step per `resume`/`gen.next(v)`/`for await`. `yield` parks via `poll_fn`; a thread-local stack
+  tracks the current generator for nested composition; `gen.close()` drops the body. Abandoning a
+  generator just drops the future (no task → no exit hang). Surface syntax (`yield`, `fn*`, `async fn*`,
+  `for await`, `future<T>`) touches the lexer, parser, tree-sitter grammar (regen `parser.c` with
+  `tree-sitter generate --abi 14`), `fmt.rs`, and the LSP keyword list — and `ExprKind::Yield` needs
+  arms in interp (eval), `fmt.rs` (`write_expr_inner`), and `ast.rs` (`Display`).
 - **Control flow uses two enums, not `Result<_, io::Error>`:**
   - `Flow { Normal, Return(Value), Break, Continue }` — normal statement-level control flow.
   - `Control { Panic(AsError), Propagate(Value) }` (`derive(Clone)` so it can ride cross-task futures)
@@ -150,4 +165,7 @@ guardrail. If you change syntax, update both parsers and keep the examples passi
   merge `--no-ff`. Plans live in `docs/superpowers/plans/`.
 - Any spec deferral must be a documented, owner-noted Cargo feature or Tier-1 error — never a silent
   drop. Current deferrals: `http3` (feature), HTTP trailers (best-effort), `icu`/crossterm subsets,
-  cross-file LSP features.
+  cross-file LSP features. M17 has three **architectural** non-goals (impossible under the approach-A
+  async engine — documented in spec §7 and `docs/superpowers/specs/adr/2026-05-30-async-generators.md`,
+  not code TODOs): durable/serializable continuations (needs an explicit-stack VM), robust unbounded
+  deep recursion (needs stackful coroutines), and deterministic/replayable task scheduling.
