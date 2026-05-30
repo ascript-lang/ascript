@@ -28,6 +28,10 @@ pub enum ExprKind {
     Member { object: Box<Expr>, name: String },
     OptMember { object: Box<Expr>, name: String },
     Try(Box<Expr>),
+    /// The conditional operator `cond ? then : els` (spec §3). Right-associative,
+    /// binds just above assignment. `then`/`els` are evaluated lazily — only the
+    /// selected branch runs.
+    Ternary { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
     Template { parts: Vec<TemplatePart> },
     Match { subject: Box<Expr>, arms: Vec<MatchArm> },
     Await(Box<Expr>),
@@ -292,6 +296,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
             ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
             ExprKind::Try(e) => write!(f, "(? {})", e),
+            ExprKind::Ternary { cond, then, els } => write!(f, "(?: {} {} {})", cond, then, els),
             ExprKind::Template { .. } => write!(f, "(template)"),
             ExprKind::Match { .. } => write!(f, "(match)"),
             ExprKind::Await(e) => write!(f, "(await {})", e),

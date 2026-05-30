@@ -158,11 +158,7 @@ async fn loadUser(id: number): Result<object> {
 }
 
 let [user, err] = await loadUser(42)
-if (err == nil) {
-  print(\`hi \${user.name}\`)
-} else {
-  print("lookup failed")
-}`);
+print(err == nil ? \`hi \${user.name}\` : "lookup failed")`);
 </script>
 </body>
 </html>

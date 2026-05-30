@@ -22,11 +22,7 @@ async fn weather(city: string): Result<object> {
 }
 
 let [report, err] = await weather("Lisbon")
-if (err == nil) {
-  print(`${report.tempC}°C in Lisbon`)
-} else {
-  print("could not load weather")
-}
+print(err == nil ? `${report.tempC}°C in Lisbon` : "could not load weather")
 ```
 
 ## Design priorities

@@ -881,6 +881,15 @@ impl Interp {
                 Err(AsError::at("no matching arm in match expression", expr.span).into())
             }
             ExprKind::Await(inner) => self.eval_expr(inner, env).await,
+            ExprKind::Ternary { cond, then, els } => {
+                // Only the selected branch is evaluated (lazy, like `&&`/`||`).
+                let c = self.eval_expr(cond, env).await?;
+                if c.is_truthy() {
+                    self.eval_expr(then, env).await
+                } else {
+                    self.eval_expr(els, env).await
+                }
+            }
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
             ExprKind::Try(inner) => {
                 let v = self.eval_expr(inner, env).await?;
@@ -1606,6 +1615,31 @@ mod tests {
         assert_eq!(run("print('it\\'s')").await, "it's\n");
         // a string with an escaped newline prints across two lines
         assert_eq!(run("print(\"line1\\nline2\")").await, "line1\nline2\n");
+    }
+
+    #[tokio::test]
+    async fn ternary_operator() {
+        assert_eq!(run("print(true ? 1 : 2)").await, "1\n");
+        assert_eq!(run("print(1 > 2 ? \"a\" : \"b\")").await, "b\n");
+        // Right-associative chain.
+        assert_eq!(
+            run("let x = 0\nprint(x < 0 ? \"neg\" : x == 0 ? \"zero\" : \"pos\")").await,
+            "zero\n"
+        );
+        // Only the selected branch runs — the untaken branch would panic.
+        assert_eq!(run("let a = [1]\nprint(len(a) > 5 ? a[99] : \"safe\")").await, "safe\n");
+        // Only nil/false are falsy: 0 and "" are truthy conditions.
+        assert_eq!(run("print(0 ? \"t\" : \"f\")").await, "t\n");
+        assert_eq!(run("print(nil ? \"t\" : \"f\")").await, "f\n");
+    }
+
+    #[tokio::test]
+    async fn ternary_does_not_break_postfix_try() {
+        // The `?` propagation operator still works in the presence of ternary.
+        let src = "fn half(n) { if (n % 2 != 0) { return Err(\"odd\") }\nreturn Ok(n / 2) }\n\
+                   fn run() { let x = half(10)?\nreturn Ok(x) }\n\
+                   let [v, e] = run()\nprint(v)";
+        assert_eq!(run(src).await, "5\n");
     }
 
     #[tokio::test]

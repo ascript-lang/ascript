@@ -19,18 +19,19 @@
 // Precedence ladder, low (loosest) to high (tightest binding).
 const PREC = {
   assign: 1,
-  coalesce: 2,
-  or: 3,
-  and: 4,
-  equality: 5,
-  compare: 6,
-  range: 7,
-  add: 8,
-  mul: 9,
-  exp: 10,    // right-associative
-  unary: 11,
-  postfix: 12, // call, member, index, optional-member, ? propagation
-  primary: 13,
+  ternary: 2,  // cond ? then : else (right-associative)
+  coalesce: 3,
+  or: 4,
+  and: 5,
+  equality: 6,
+  compare: 7,
+  range: 8,
+  add: 9,
+  mul: 10,
+  exp: 11,    // right-associative
+  unary: 12,
+  postfix: 13, // call, member, index, optional-member, ? propagation
+  primary: 14,
 };
 
 module.exports = grammar({
@@ -48,6 +49,12 @@ module.exports = grammar({
     // `(x)` could be a one-arg parameter list (arrow fn) or a parenthesized
     // identifier — needs a GLR split until the `=>` (or lack of it) is seen.
     [$.parameter, $._primary_expression],
+    // At `<postfix-expr> ?` the parser cannot yet tell a propagation (`expr?`)
+    // from a ternary condition (`expr ? then : else`): the postfix expression
+    // could reduce to `_expression` (the ternary's condition) or extend into
+    // `propagate_expression`. GLR keeps both alive until a following `:` (ternary)
+    // or end-of-expression (propagation) decides.
+    [$._expression, $.propagate_expression],
   ],
 
   rules: {
@@ -210,6 +217,7 @@ module.exports = grammar({
     // ----- Expressions (§3 precedence) ------------------------------------
     _expression: $ => choice(
       $.assignment_expression,
+      $.ternary_expression,
       $.binary_expression,
       $.unary_expression,
       $.await_expression,
@@ -324,10 +332,27 @@ module.exports = grammar({
       '[', field('index', $._expression), ']',
     )),
 
-    // expr?  — Result early-return propagation (§6)
-    propagate_expression: $ => prec(PREC.postfix, seq(
+    // expr?  — Result early-return propagation (§6). Intentionally left WITHOUT a
+    // precedence: its `?` shares a prefix with the ternary `cond ? then : else`, so
+    // the `shift ? (propagation)` vs `reduce postfix→expression (ternary condition)`
+    // decision must stay an unresolved GLR conflict (declared above) rather than be
+    // settled by precedence — only a following `:` (ternary) vs end-of-expression
+    // (propagation) can decide it. The operand is already a `_postfix_expression`,
+    // so propagation still binds tighter than any binary/ternary operator.
+    propagate_expression: $ => seq(
       field('operand', $._postfix_expression),
       '?',
+    ),
+
+    // cond ? then : else — the conditional operator (§3). Right-associative,
+    // binds just above assignment. Shares the `expr ?` prefix with
+    // propagate_expression (resolved by the conflicts entry above).
+    ternary_expression: $ => prec.right(PREC.ternary, seq(
+      field('condition', $._expression),
+      '?',
+      field('consequence', $._expression),
+      ':',
+      field('alternative', $._expression),
     )),
 
     _primary_expression: $ => choice(
