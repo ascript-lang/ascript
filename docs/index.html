@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AScript — a Lua-simple language with a Go-class standard library</title>
+<meta name="description" content="AScript is a small, dynamically-typed scripting language with JavaScript-flavored syntax, optional runtime-checked type contracts, and a batteries-included standard library, in a single Rust binary.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314110d'/%3E%3Ctext x='15' y='23' font-family='monospace' font-size='20' fill='%23f0a92b' text-anchor='middle' font-weight='700'%3Ea%3C/text%3E%3Ccircle cx='24' cy='23' r='2.6' fill='%23e7674a'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <a class="brand" href="index.html"><span><b>ascript</b><span class="dot">.</span></span><span class="ext">as</span></a>
+  <nav class="topnav">
+    <a href="reader.html#/introduction">Docs</a>
+    <a href="reader.html#/stdlib/overview">Standard library</a>
+    <a href="reader.html#/examples">Examples</a>
+  </nav>
+  <span class="spacer"></span>
+  <button class="searchbtn" data-action="search"><span>Search docs</span><kbd>⌘K</kbd></button>
+  <a class="ghlink" href="reader.html#/getting-started">Get started →</a>
+</header>
+
+<main class="wrap">
+
+  <!-- HERO -->
+  <section class="hero">
+    <div>
+      <span class="hero-eyebrow">Dynamically typed · Rust-powered</span>
+      <h1>A <em>small</em> language with<br>serious batteries.</h1>
+      <p class="lead">AScript reads like JavaScript, stays as simple as Lua, and ships a
+        Go/Deno-class standard library — HTTP, WebSockets, SQLite, crypto, a terminal UI —
+        in a single Rust binary.</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="reader.html#/getting-started">Read the guide →</a>
+        <a class="btn btn-ghost" href="reader.html#/stdlib/overview">Explore the stdlib</a>
+      </div>
+      <div class="hero-stats">
+        <div><span class="n">8</span><span class="l">core value kinds</span></div>
+        <div><span class="n">28</span><span class="l">std modules</span></div>
+        <div><span class="n">540</span><span class="l">tests passing</span></div>
+      </div>
+    </div>
+
+    <div class="codecard">
+      <div class="codecard-bar">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="name">fetch_users.as</span>
+      </div>
+      <pre><code id="hero-code"></code></pre>
+    </div>
+  </section>
+
+  <!-- DESIGN PRINCIPLES -->
+  <section class="section">
+    <div class="section-head">
+      <div class="kicker">Why AScript</div>
+      <h2>Simple to hold in your head. Hard to outgrow.</h2>
+      <p>Four priorities, in strict order: simplicity, safety, familiarity, performance.
+         The core stays tiny; the library does the heavy lifting.</p>
+    </div>
+    <div class="feature-grid">
+      <div class="feature">
+        <div class="ic">{ }</div>
+        <h3>Familiar syntax</h3>
+        <p>Braces, <code>fn</code>, arrows, template strings, <code>for…of</code>. If you read JavaScript, you already read AScript.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">≡</div>
+        <h3>Gradual contracts</h3>
+        <p>Add type annotations where they pay off. They're checked at runtime as contracts — not erased, not in your way.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">⤷</div>
+        <h3>Errors as values</h3>
+        <p>No exceptions. Fallible calls return <code>[value, err]</code>; the <code>?</code> operator propagates. Bugs panic — loudly.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">⚡</div>
+        <h3>Async without colors fights</h3>
+        <p>A single-threaded event loop. <code>await</code> any I/O; synchronous code pays nothing. No data races, ever.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">⌗</div>
+        <h3>Batteries included</h3>
+        <p>JSON, regex, SQLite, crypto, compression, a modern HTTP client, WebSockets, a TUI — all in the box.</p>
+      </div>
+      <div class="feature">
+        <div class="ic">⌥</div>
+        <h3>Real tooling</h3>
+        <p>A runner, REPL, formatter, test runner, and a language server — one <code>ascript</code> binary, no toolchain to assemble.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- STDLIB SHOWCASE -->
+  <section class="section">
+    <div class="section-head">
+      <div class="kicker">The standard library</div>
+      <h2>Twenty-eight modules, one import away.</h2>
+      <p>Rust's crate ecosystem makes high-quality batteries cheap. Each <code>std/*</code> module is
+         native Rust over AScript's value model.</p>
+    </div>
+    <div class="modgrid">
+      <a class="modchip" href="reader.html#/stdlib/collections#stdstring"><span class="m">std/string</span><span class="d">slice, split, format, pad</span></a>
+      <a class="modchip" href="reader.html#/stdlib/collections#stdarray"><span class="m">std/array</span><span class="d">map, filter, reduce, sort</span></a>
+      <a class="modchip" href="reader.html#/stdlib/data#stdjson"><span class="m">std/json</span><span class="d">parse & stringify</span></a>
+      <a class="modchip" href="reader.html#/stdlib/data#stdregex"><span class="m">std/regex</span><span class="d">compiled patterns</span></a>
+      <a class="modchip" href="reader.html#/stdlib/system#stdfs"><span class="m">std/fs</span><span class="d">files, walk, grep</span></a>
+      <a class="modchip" href="reader.html#/stdlib/system#stdsqlite"><span class="m">std/sqlite</span><span class="d">bundled SQLite</span></a>
+      <a class="modchip" href="reader.html#/stdlib/system#stdcrypto"><span class="m">std/crypto</span><span class="d">hashes, argon2, HMAC</span></a>
+      <a class="modchip" href="reader.html#/stdlib/system#stdprocess"><span class="m">std/process</span><span class="d">subprocesses, streams</span></a>
+      <a class="modchip" href="reader.html#/stdlib/net#stdnethttp"><span class="m">std/net/http</span><span class="d">modern HTTP client</span></a>
+      <a class="modchip" href="reader.html#/stdlib/net#stdhttpserver"><span class="m">std/http/server</span><span class="d">routes & middleware</span></a>
+      <a class="modchip" href="reader.html#/stdlib/net#stdnetws"><span class="m">std/net/ws</span><span class="d">WebSocket client/server</span></a>
+      <a class="modchip" href="reader.html#/stdlib/tui#stdtui"><span class="m">std/tui</span><span class="d">double-buffered terminal</span></a>
+    </div>
+  </section>
+
+  <!-- QUOTE -->
+  <section class="bigquote">
+    <blockquote>“Lua-simple language, <b>Go/Deno-class</b> standard library.”</blockquote>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>AScript — language &amp; runtime. Built in Rust.</div>
+    <div>
+      <a href="reader.html#/introduction">Documentation</a> ·
+      <a href="reader.html#/cli">CLI</a> ·
+      <a href="reader.html#/examples">Examples</a>
+    </div>
+  </div>
+</footer>
+
+<!-- search overlay -->
+<div class="search-overlay" id="search-overlay">
+  <div class="search-box">
+    <input id="search-input" type="text" placeholder="Search the documentation…" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results"></div>
+  </div>
+</div>
+
+<script src="assets/app.js"></script>
+<script>
+  // render the hero snippet with the real highlighter
+  document.getElementById('hero-code').innerHTML = highlightAScript(
+`import { get } from "std/net/http"
+
+// Fetch a user — errors are plain values, no exceptions.
+async fn loadUser(id: number): Result<object> {
+  let [resp, err] = await get(\`https://api.example.com/users/\${id}\`)
+  if (err != nil) { return Err(err.message) }
+  return await resp.json()
+}
+
+let [user, err] = await loadUser(42)
+if (err == nil) {
+  print(\`hi \${user.name}\`)
+} else {
+  print("lookup failed")
+}`);
+</script>
+</body>
+</html>
