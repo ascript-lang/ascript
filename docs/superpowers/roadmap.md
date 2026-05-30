@@ -174,7 +174,7 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 
 ## Phase 5 — Concurrency & coroutines (post-spec extension)
 
-- ⏳ **M17 — Async Concurrency + Generators/Coroutines (Architecture A).** Turn the async
+- ✅ **M17 — Async Concurrency + Generators/Coroutines (Architecture A).** Turn the async
   model from "sequential inline, `await` is identity" into real cooperative concurrency on the
   single-threaded tokio runtime, then expose the interpreter's *existing* stackless-coroutine
   nature as script-level generators/coroutines — one engine, no `unsafe`, no CPS rewrite.
