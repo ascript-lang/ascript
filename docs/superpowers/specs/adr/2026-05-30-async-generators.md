@@ -92,6 +92,24 @@ would be required.
    not bit-for-bit reproducible or deterministically replayable. **Requires a custom
    scheduler over an explicit-stack VM (B2).**
 
+## Refinement (post-implementation): structured concurrency / cancel-on-drop
+
+The first implementation spawned each `async fn` body as a detached `spawn_local` task and
+reaped them only at the top-level drain. A memory scan found un-awaited async calls in a loop
+grew RSS without bound (one live task per call: ~39/69/130 MB at 50k/100k/200k iterations),
+and `race`/`timeout` left losing/timed-out work running to program exit. Both are the same
+defect: a task could outlive every handle to it.
+
+Fix: a task's lifetime is **bound to its `Value::Future` handle** (cancel-on-drop). The
+handle owns the task's `AbortHandle` and aborts on `Drop`; the spawned task holds only the
+result cell, never the handle, so there is no `Rc` cycle and last-handle-drop genuinely
+cancels. `task.spawn` is the explicit detach (fire-and-forget); `race` cancels losers;
+`timeout` cancels the timed-out work. A cooperative yield above an in-flight cap reaps
+finished/cancelled tasks so a tight un-awaited loop stays bounded (RSS now flat ~8 MB). This
+mirrors the consumer-driven generator decision (work without an owner does not linger) and
+matches where single-threaded async runtimes converge (smol `Task` cancel-on-drop, Swift
+task groups, Trio nurseries). See spec §7.2.
+
 ## References
 
 - **genawaiter** — bidirectional generators/coroutines built on stable Rust async

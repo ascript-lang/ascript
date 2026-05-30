@@ -35,7 +35,7 @@ Design priorities, in strict order: **simplicity → safety → familiarity → 
 - **Familiar syntax** — braces, `fn`, arrows, template strings, `for…of`. If you read JavaScript, you read AScript.
 - **Gradual type contracts** — optional annotations, checked at runtime as contracts, never erased.
 - **Errors as values** — no exceptions; fallible calls return `[value, err]` and the `?` operator propagates. Bugs panic, loudly.
-- **Single-threaded async & concurrency** — `await` any I/O on a cooperative event loop; `future<T>` and `std/task` (`spawn`/`gather`/`race`/`timeout`); the HTTP server serves connections concurrently. No data races.
+- **Single-threaded async & concurrency** — `await` any I/O on a cooperative event loop; `future<T>` and `std/task` (`spawn`/`gather`/`race`/`timeout`); structured concurrency with cancel-on-drop (un-awaited work is cancelled, `task.spawn` detaches); the HTTP server serves connections concurrently. No data races.
 - **Generators & coroutines** — `fn*`/`async fn*` with `yield`, bidirectional `gen.next(v)`, `gen.close()`, and `for await` over generators and native streams (composable async pipelines).
 - **Batteries included** — JSON, regex, SQLite, crypto, compression, a modern HTTP client, WebSockets, and a TUI.
 - **Real tooling** — a runner, REPL, formatter, test runner, and language server, all in one binary.
