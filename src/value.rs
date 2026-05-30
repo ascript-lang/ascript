@@ -202,6 +202,7 @@ pub struct Function {
     pub body: Vec<Stmt>,
     pub closure: Environment,
     pub is_async: bool,
+    pub is_generator: bool,
 }
 
 #[derive(Clone)]
@@ -238,6 +239,14 @@ pub enum Value {
     /// A pending or completed async computation (spec §7, M17 Phase 2). Produced
     /// by calling a script `async fn` and driven by `await`. Identity equality.
     Future(crate::task::SharedFuture),
+    /// A running script generator (spec §7, M17 Phase 4). Produced by calling a
+    /// `fn*` / `async fn*`; consumed by `for await` or `gen.next(v)`. Holds the
+    /// rendezvous channel to the spawned body task. Identity equality.
+    Generator(Rc<crate::coro::GeneratorHandle>),
+    /// A method bound to a generator handle (e.g. `gen.next`), dispatched by the
+    /// async `call_generator_method`. Generators have no `NativeObject`, so they
+    /// can't reuse `NativeMethod`; this is the parallel binding for them.
+    GeneratorMethod(Rc<crate::coro::GeneratorHandle>, &'static str),
 }
 
 impl Value {
@@ -278,6 +287,11 @@ impl PartialEq for Value {
             (Value::Super(a), Value::Super(b)) => Rc::ptr_eq(a, b),
             // Futures compare by identity (same completion cell).
             (Value::Future(a), Value::Future(b)) => a.ptr_eq(b),
+            // Generators compare by identity (same body channel).
+            (Value::Generator(a), Value::Generator(b)) => Rc::ptr_eq(a, b),
+            (Value::GeneratorMethod(a, an), Value::GeneratorMethod(b, bn)) => {
+                Rc::ptr_eq(a, b) && an == bn
+            }
             _ => false,
         }
     }
@@ -309,6 +323,8 @@ impl fmt::Debug for Value {
             Value::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
             Value::Super(_) => write!(f, "Super"),
             Value::Future(_) => write!(f, "Future"),
+            Value::Generator(_) => write!(f, "Generator"),
+            Value::GeneratorMethod(_, m) => write!(f, "GeneratorMethod({})", m),
         }
     }
 }
@@ -398,6 +414,8 @@ impl Value {
             Value::BoundMethod(b) => write!(f, "<method {}>", b.name),
             Value::Super(_) => write!(f, "<super>"),
             Value::Future(_) => write!(f, "<future>"),
+            Value::Generator(_) => write!(f, "<generator>"),
+            Value::GeneratorMethod(_, m) => write!(f, "<generator method {}>", m),
         }
     }
 

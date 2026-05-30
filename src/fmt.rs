@@ -137,11 +137,20 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_block(out, body, level);
             out.push('\n');
         }
-        Stmt::ForOf { var, iter, body } => {
+        Stmt::ForOf { var, iter, body, for_await } => {
             indent(out, level);
-            out.push_str("for (");
-            out.push_str(var);
-            out.push_str(" of ");
+            // `for await (x in e)` for async iteration; plain `for (x of e)`
+            // otherwise. The async form uses `in` (matching the parser, which
+            // accepts both `in`/`of` and only distinguishes by the `await`).
+            if *for_await {
+                out.push_str("for await (");
+                out.push_str(var);
+                out.push_str(" in ");
+            } else {
+                out.push_str("for (");
+                out.push_str(var);
+                out.push_str(" of ");
+            }
             write_expr(out, iter, 0);
             out.push_str(") ");
             write_block(out, body, level);
@@ -164,12 +173,12 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("continue\n");
         }
-        Stmt::Fn { name, params, ret, body, is_async, .. } => {
+        Stmt::Fn { name, params, ret, body, is_async, is_generator, .. } => {
             indent(out, level);
             if *is_async {
                 out.push_str("async ");
             }
-            out.push_str("fn ");
+            out.push_str(if *is_generator { "fn* " } else { "fn " });
             out.push_str(name);
             write_params(out, params);
             if let Some(ret) = ret {
@@ -252,7 +261,7 @@ fn write_method(out: &mut String, m: &MethodDecl, level: usize) {
     if m.is_async {
         out.push_str("async ");
     }
-    out.push_str("fn ");
+    out.push_str(if m.is_generator { "fn* " } else { "fn " });
     out.push_str(&m.name);
     write_params(out, &m.params);
     if let Some(ret) = &m.ret {
@@ -301,6 +310,8 @@ fn expr_prec(e: &Expr) -> u8 {
         ExprKind::Binary { op, .. } => bin_prec(*op),
         ExprKind::Unary { .. } => PREC_UNARY,
         ExprKind::Await(_) => PREC_UNARY,
+        // `yield` binds as loosely as assignment (it captures a full expression).
+        ExprKind::Yield(_) => PREC_ASSIGN,
         ExprKind::Call { .. }
         | ExprKind::Index { .. }
         | ExprKind::Member { .. }
@@ -347,6 +358,13 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             // Operand binds at least as tight as a unary operand.
             write_expr(out, expr, PREC_UNARY);
         }
+        ExprKind::Yield(operand) => match operand {
+            Some(e) => {
+                out.push_str("yield ");
+                write_expr(out, e, PREC_ASSIGN);
+            }
+            None => out.push_str("yield"),
+        },
         ExprKind::Binary { op, lhs, rhs } => {
             let p = bin_prec(*op);
             // Left-associative for all ops except Pow (right-associative): a
@@ -386,7 +404,7 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             out.push_str(" = ");
             write_expr(out, value, PREC_ASSIGN);
         }
-        ExprKind::Arrow { params, body, is_async } => {
+        ExprKind::Arrow { params, body, is_async, .. } => {
             if *is_async {
                 out.push_str("async ");
             }
@@ -674,6 +692,45 @@ mod tests {
         let once = format_source("let y: future<array<number>> = g()").unwrap();
         assert_eq!(once, "let y: future<array<number>> = g()\n");
         assert_eq!(format_source(&once).unwrap(), once);
+    }
+
+    #[test]
+    fn formats_generators_yield_and_for_await() {
+        // fn* / async fn* / yield / yield <expr> / for await all render canonically.
+        assert_eq!(
+            format_source("fn*count(){yield 1\nyield 2}").unwrap(),
+            "fn* count() {\n  yield 1\n  yield 2\n}\n"
+        );
+        assert_eq!(
+            format_source("async fn* g(){yield x}").unwrap(),
+            "async fn* g() {\n  yield x\n}\n"
+        );
+        assert_eq!(
+            format_source("fn* e(){let a=yield\nlet b=yield 5}").unwrap(),
+            "fn* e() {\n  let a = yield\n  let b = yield 5\n}\n"
+        );
+        assert_eq!(
+            format_source("for await(x in gen()){print(x)}").unwrap(),
+            "for await (x in gen()) {\n  print(x)\n}\n"
+        );
+        // Generator method.
+        assert_eq!(
+            format_source("class C{fn* g(){yield 1}}").unwrap(),
+            "class C {\n  fn* g() {\n    yield 1\n  }\n}\n"
+        );
+        // Idempotence + re-parse for every shape.
+        for src in [
+            "fn* count() { yield 1 }",
+            "async fn* g() { yield x * 2 }",
+            "for await (x in g) { yield x }",
+            "fn* e() { let a = yield 1 }",
+            "class C { fn* g() { yield 1 } }",
+        ] {
+            let once = format_source(src).unwrap();
+            let twice = format_source(&once).unwrap();
+            assert_eq!(once, twice, "fmt not idempotent for: {src}");
+            assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+        }
     }
 
     /// Every committed example must format idempotently and the formatted

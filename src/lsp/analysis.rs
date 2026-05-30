@@ -21,7 +21,8 @@ use tower_lsp::lsp_types::{
 /// keyword table (`src/lexer.rs`) plus `match` (which the lexer maps to `Tok::Match`).
 const KEYWORDS: &[&str] = &[
     "let", "const", "fn", "return", "if", "else", "while", "for", "of", "in", "match", "async",
-    "await", "class", "enum", "import", "export", "nil", "true", "false", "break", "continue",
+    "await", "yield", "class", "enum", "import", "export", "nil", "true", "false", "break",
+    "continue",
 ];
 
 /// The global builtins offered as completions (FUNCTION kind). Mirrors `builtin_doc`.
@@ -264,6 +265,7 @@ fn keyword_doc(tok: &Tok) -> Option<&'static str> {
         Tok::Match => "`match` — pattern-match a value against arms.",
         Tok::Async => "`async` — declare an asynchronous function returning a future.",
         Tok::Await => "`await` — suspend until an async value resolves.",
+        Tok::Yield => "`yield` — produce a value from a generator (`fn*`); evaluates to the resume value.",
         Tok::Class => "`class` — declare a class with methods.",
         Tok::Enum => "`enum` — declare an enumeration of named variants.",
         Tok::Import => "`import` — import names from another module.",
@@ -962,6 +964,30 @@ export fn bar() {}
         let off = 0; // on `test`
         let h = hover(src, off).expect("expected hover on test builtin");
         assert!(markup(&h).contains("test"), "got: {}", markup(&h));
+    }
+
+    #[test]
+    fn hover_on_yield_keyword_describes_it() {
+        let src = "fn* g() { yield 1 }";
+        let off = src.find("yield").unwrap();
+        let h = hover(src, off).expect("expected hover on yield keyword");
+        assert!(markup(&h).to_lowercase().contains("generator"), "got: {}", markup(&h));
+    }
+
+    #[test]
+    fn completions_baseline_includes_yield_keyword() {
+        let items = completions("", 0);
+        let y = items.iter().find(|i| i.label == "yield").expect("yield keyword in baseline");
+        assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn document_symbols_lists_generator_fn() {
+        // A `fn*` declaration still produces a FUNCTION symbol (the parser flows
+        // through the shared AST that the LSP walks).
+        let syms = document_symbols("fn* count() { yield 1 }");
+        let f = syms.iter().find(|s| s.name == "count").expect("count symbol");
+        assert_eq!(f.kind, SymbolKind::FUNCTION);
     }
 
     #[test]

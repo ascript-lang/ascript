@@ -181,6 +181,14 @@ impl<'a> Parser<'a> {
     fn fn_decl(&mut self, is_async: bool) -> Result<Stmt, AsError> {
         let start = self.span().start; // at the `fn` keyword
         self.eat(&Tok::Fn)?;
+        // `fn*` / `async fn*` — a generator declaration. The `*` immediately
+        // follows the `fn` keyword.
+        let is_generator = if *self.peek() == Tok::Star {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let name_span = self.span();
         let name = match self.advance() {
             Tok::Ident(name) => name,
@@ -200,7 +208,7 @@ impl<'a> Parser<'a> {
         };
         let body = self.block()?;
         let span = Span::new(start, self.prev_end());
-        Ok(Stmt::Fn { name, params, ret, body, is_async, span, name_span })
+        Ok(Stmt::Fn { name, params, ret, body, is_async, is_generator, span, name_span })
     }
 
     fn enum_decl(&mut self) -> Result<Stmt, AsError> {
@@ -266,6 +274,12 @@ impl<'a> Parser<'a> {
                 false
             };
             self.eat(&Tok::Fn)?;
+            let is_generator = if *self.peek() == Tok::Star {
+                self.advance();
+                true
+            } else {
+                false
+            };
             let mname_span = self.span();
             let mname = match self.advance() {
                 Tok::Ident(n) => n,
@@ -286,6 +300,7 @@ impl<'a> Parser<'a> {
                 ret,
                 body,
                 is_async,
+                is_generator,
                 span: mspan,
                 name_span: mname_span,
             });
@@ -450,6 +465,14 @@ impl<'a> Parser<'a> {
 
     fn for_stmt(&mut self) -> Result<Stmt, AsError> {
         self.eat(&Tok::For)?;
+        // `for await (x in e)` — async iteration over a generator or a native
+        // stream handle. The `await` sits between `for` and `(`.
+        let for_await = if *self.peek() == Tok::Await {
+            self.advance();
+            true
+        } else {
+            false
+        };
         self.eat(&Tok::LParen)?;
         let var = match self.advance() {
             Tok::Ident(name) => name,
@@ -468,17 +491,21 @@ impl<'a> Parser<'a> {
                 let iter = self.expr()?;
                 self.eat(&Tok::RParen)?;
                 let body = self.block()?;
-                if let ExprKind::Binary { op: BinOp::Range, lhs, rhs } = iter.kind {
-                    Ok(Stmt::ForRange { var, start: *lhs, end: *rhs, body })
-                } else {
-                    Ok(Stmt::ForOf { var, iter, body })
+                // `for await` always uses the async-iteration ForOf path (even
+                // over a `..` range it would be a non-iterable Tier-2 error, but
+                // a range is never async-iterable so keep it ForOf for the error).
+                if !for_await {
+                    if let ExprKind::Binary { op: BinOp::Range, lhs, rhs } = iter.kind {
+                        return Ok(Stmt::ForRange { var, start: *lhs, end: *rhs, body });
+                    }
                 }
+                Ok(Stmt::ForOf { var, iter, body, for_await })
             }
             Tok::Of => {
                 let iter = self.expr()?;
                 self.eat(&Tok::RParen)?;
                 let body = self.block()?;
-                Ok(Stmt::ForOf { var, iter, body })
+                Ok(Stmt::ForOf { var, iter, body, for_await })
             }
             other => Err(AsError::at(
                 format!("expected 'in' or 'of' in for-loop, found {:?}", other),
@@ -558,6 +585,24 @@ impl<'a> Parser<'a> {
     }
 
     fn assignment(&mut self) -> Result<Expr, AsError> {
+        // `yield` / `yield <expr>` — a prefix expression at the lowest (assignment)
+        // precedence (spec §7, like JS `yield`). An operand is present unless the
+        // next token is a terminator (`)`, `}`, `]`, `,`, `;`, EOF) — those forms
+        // are a bare `yield`.
+        if *self.peek() == Tok::Yield {
+            let start = self.span().start;
+            self.advance(); // consume `yield`
+            let operand = match self.peek() {
+                Tok::RParen | Tok::RBrace | Tok::RBracket | Tok::Comma | Tok::Semicolon
+                | Tok::Eof | Tok::Colon => None,
+                _ => Some(Box::new(self.assignment()?)),
+            };
+            let end = self.prev_end();
+            return Ok(Expr {
+                kind: ExprKind::Yield(operand),
+                span: Span::new(start, end),
+            });
+        }
         // Arrow functions: `x => …` or `(a, b) => …`. Detect without breaking
         // ordinary parenthesized expressions by checking ahead for `=>`.
         if let Some(arrow) = self.try_arrow()? {
@@ -646,6 +691,7 @@ impl<'a> Parser<'a> {
                         params: vec![crate::ast::Param { name, ty: None, name_span }],
                         body: Box::new(body),
                         is_async,
+                        is_generator: false,
                     },
                     span: Span::new(start, end),
                 }));
@@ -660,7 +706,7 @@ impl<'a> Parser<'a> {
             let body = self.arrow_body()?;
             let end = self.prev_end();
             return Ok(Some(Expr {
-                kind: ExprKind::Arrow { params, body: Box::new(body), is_async },
+                kind: ExprKind::Arrow { params, body: Box::new(body), is_async, is_generator: false },
                 span: Span::new(start, end),
             }));
         }
@@ -1275,11 +1321,90 @@ mod tests {
     fn parses_async_fn_decl() {
         let stmts = parse(&lex("async fn fetch(x) { return x }").unwrap()).unwrap();
         match &stmts[0] {
-            Stmt::Fn { name, is_async, .. } => {
+            Stmt::Fn { name, is_async, is_generator, .. } => {
                 assert_eq!(name, "fetch");
                 assert!(is_async);
+                assert!(!is_generator);
             }
             other => panic!("expected an async fn decl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_generator_fn_decl() {
+        let stmts = parse(&lex("fn* count() { yield 1 }").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Fn { name, is_async, is_generator, .. } => {
+                assert_eq!(name, "count");
+                assert!(!is_async);
+                assert!(is_generator);
+            }
+            other => panic!("expected a generator fn decl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_async_generator_fn_decl() {
+        let stmts = parse(&lex("async fn* g() { yield 1 }").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Fn { is_async, is_generator, .. } => {
+                assert!(is_async);
+                assert!(is_generator);
+            }
+            other => panic!("expected an async generator fn decl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_generator_method() {
+        let stmts = parse(&lex("class C { fn* gen() { yield 1 } }").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Class { methods, .. } => {
+                assert_eq!(methods[0].name, "gen");
+                assert!(methods[0].is_generator);
+            }
+            other => panic!("expected a class with a generator method, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_yield_with_and_without_operand() {
+        assert_eq!(sexpr("yield 1"), "(yield 1)");
+        assert_eq!(sexpr("yield x + 1"), "(yield (+ x 1))");
+        // A bare `yield` terminated by `)` / newline.
+        assert_eq!(sexpr("(yield)"), "(yield)");
+        let stmts = parse(&lex("fn* g() { yield\nyield 2 }").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Fn { body, .. } => {
+                assert!(matches!(&body[0], Stmt::Expr(e) if matches!(e.kind, ExprKind::Yield(None))));
+                assert!(matches!(&body[1], Stmt::Expr(e) if matches!(e.kind, ExprKind::Yield(Some(_)))));
+            }
+            other => panic!("expected fn body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn yield_resume_value_is_usable() {
+        // `let a = yield "q"` — yield's value (the resume value) binds to `a`.
+        let stmts = parse(&lex("fn* echo() { let a = yield \"q\" }").unwrap()).unwrap();
+        assert!(matches!(&stmts[0], Stmt::Fn { .. }));
+    }
+
+    #[test]
+    fn parses_for_await() {
+        let stmts = parse(&lex("for await (x in gen()) { print(x) }").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::ForOf { var, for_await, .. } => {
+                assert_eq!(var, "x");
+                assert!(for_await);
+            }
+            other => panic!("expected a for-await loop, got {other:?}"),
+        }
+        // A plain `for (x in xs)` is NOT for_await.
+        let plain = parse(&lex("for (x in xs) { print(x) }").unwrap()).unwrap();
+        match &plain[0] {
+            Stmt::ForOf { for_await, .. } => assert!(!for_await),
+            other => panic!("expected a plain for-of, got {other:?}"),
         }
     }
 

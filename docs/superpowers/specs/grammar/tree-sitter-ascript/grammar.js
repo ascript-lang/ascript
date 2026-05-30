@@ -139,6 +139,7 @@ module.exports = grammar({
     function_declaration: $ => seq(
       optional('async'),
       'fn',
+      optional('*'),  // `fn*` / `async fn*` — a generator (§7, M17)
       field('name', $.identifier),
       field('parameters', $.parameter_list),
       optional(seq(':', field('return_type', $._type))),
@@ -162,6 +163,7 @@ module.exports = grammar({
     method_definition: $ => seq(
       optional('async'),
       'fn',
+      optional('*'),  // `fn*` generator method (§7, M17)
       field('name', $.identifier),
       field('parameters', $.parameter_list),
       optional(seq(':', field('return_type', $._type))),
@@ -193,9 +195,11 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
-    // for (x of iterable)  and  for (i in start..end)
+    // for (x of iterable), for (i in start..end), and for await (x in stream)
     for_statement: $ => seq(
-      'for', '(',
+      'for',
+      optional('await'),  // `for await` — async iteration (§7, M17)
+      '(',
       field('binding', $.identifier),
       field('kind', choice('of', 'in')),
       field('iterable', $._expression),
@@ -221,6 +225,7 @@ module.exports = grammar({
       $.binary_expression,
       $.unary_expression,
       $.await_expression,
+      $.yield_expression,
       $.match_expression,
       $.arrow_function,
       $._postfix_expression,
@@ -263,6 +268,14 @@ module.exports = grammar({
     )),
 
     await_expression: $ => prec.right(PREC.unary, seq('await', $._expression)),
+
+    // `yield` / `yield <expr>` inside a generator body (`fn*`). Binds at the
+    // assignment tier (lowest), like the hand-written parser. The operand is
+    // optional (a bare `yield`).
+    yield_expression: $ => prec.right(PREC.assign, seq(
+      'yield',
+      optional($._expression),
+    )),
 
     // match subj { Pattern => expr, _ => expr, }  (§3, §8.2)
     // The subject is parsed at coalesce precedence so the trailing `{` opens
