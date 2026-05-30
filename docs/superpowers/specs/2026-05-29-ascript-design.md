@@ -294,7 +294,8 @@ coroutine crate, and no continuation-passing rewrite.
 - Calling an `async fn` returns a **`future<T>`** value (§7.6) that is **eagerly
   scheduled**: it begins executing immediately as a task on the `LocalSet` and makes
   progress whenever the current task is parked at an `await`. Calling a non-`async` fn is
-  unchanged — it runs inline to its `return`.
+  unchanged — it runs inline to its `return`. The task's lifetime is **bound to its
+  `future<T>` handle** — see §7.2 (cancel-on-drop).
 - `await expr` drives `expr`'s future to completion and evaluates to its result. As a
   deliberate back-compat rule, **`await` on a non-future is the identity** (`await 5` is
   `5`, `await xs` is `xs`) — so older code and gradual typing keep working.
@@ -318,14 +319,30 @@ async fn fetchUser(id: number): Result<object> {
 }
 ```
 
-### 7.2 Structured concurrency — the top-level drain
+### 7.2 Structured concurrency — cancel-on-drop
 
-The top-level program runs as the **root task**. The runtime joins **all** tasks the
-program spawned before the process exits: no detached task outlives `main`, and a panic in
-a spawned task surfaces (it is not silently swallowed). This gives structured concurrency
-without a separate scope construct — the program *is* the scope. The top-level program may
-itself be `async`; the runtime drives it, then drains the rest of the `LocalSet`, to
-completion.
+A task's lifetime is **bound to its `future<T>` handle**. When the last handle referring to
+a task is dropped, the task is **cancelled** — the dual of the consumer-driven generator
+design (§7.4): work without an owner does not linger. Concretely:
+
+- Calling an `async fn` and **discarding** the result cancels it: the handle drops at the
+  end of the expression statement, aborting the task before its body runs further. An
+  un-awaited-and-dropped call therefore does **not** run to completion, and its side effects
+  do not happen.
+- **`await`** holds the handle across the work, so an awaited call always completes.
+- **`task.spawn(...)`** is the explicit opt-out: it *detaches* the task so it runs to
+  completion (fire-and-forget) regardless of whether the returned handle is awaited or
+  dropped.
+
+This bounds memory by construction: a long-running loop that fires un-awaited async calls
+cannot accumulate orphaned tasks (each is cancelled as its handle drops; finished/cancelled
+tasks are reaped cooperatively). It also removes a footgun — there is no "work happens at
+some surprising later point."
+
+At program exit the runtime drives the `LocalSet` to completion so every task still alive
+(awaited, held, or detached via `spawn`) finishes before the process exits; a panic in such
+a task surfaces (it is not silently swallowed). The top-level program may itself be `async`;
+the runtime drives it, then drains the rest of the `LocalSet`, to completion.
 
 ### 7.3 The `std/task` module
 
@@ -337,21 +354,24 @@ import { spawn, gather, race, timeout } from "std/task"
 let a = spawn(fetchUser(1))               // schedule a task, get its future<T> handle
 let b = spawn(fetchUser(2))
 let [ua, ub]  = await gather([a, b])      // run an array of futures concurrently, results in order
-let first     = await race([a, b])        // first to finish wins; the rest are dropped
+let first     = await race([a, b])        // first to finish wins; the losers are cancelled
 let [v, err]  = await timeout(500, slow()) // Result pair: [value, nil] or [nil, err] on deadline
 ```
 
-- `spawn(futureOr0ArgFn)` schedules/tracks a task on the `LocalSet` and returns its
-  `future<T>`. Given a `future` it returns it (already eagerly scheduled); given a 0-arg
-  function it calls it — which schedules it — and returns the resulting future.
+- `spawn(futureOr0ArgFn)` **detaches** a task (the explicit opt-out of cancel-on-drop, §7.2)
+  and returns its `future<T>`, so the work runs to completion even if the handle is dropped.
+  Given a `future` it detaches and returns it; given a 0-arg function it calls it — which
+  schedules it — detaches the result, and returns the future.
 - `gather([futures])` takes an **array** of futures, awaits them all concurrently, and
   returns an **array** of their results in order (the structured "join all" combinator). The
-  first error short-circuits and propagates via the panic / `?` channel.
+  first error short-circuits and propagates via the panic / `?` channel. (Inputs run
+  concurrently because each `async fn` call was already scheduled eagerly.)
 - `race([futures])` takes an **array** of futures and resolves to the value of the first to
-  complete; the losers are cancelled/dropped.
+  complete; the **losers are cancelled** (their handles drop as `race` returns).
 - `timeout(ms, future)` returns a Result pair (§6) — `[value, nil]` if `future` resolves
   before `ms`, else `[nil, err]` (a Tier-1 timeout error) when `ms` elapses first — and
-  never panics on a missed deadline.
+  never panics on a missed deadline. On timeout the future handle drops, so the **timed-out
+  work is cancelled** rather than left running.
 
 ### 7.4 Generators & coroutines
 
