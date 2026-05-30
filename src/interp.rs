@@ -1596,6 +1596,10 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
                 .all(|(mk, val)| check_type(&mk.to_value(), k) && check_type(val, v)),
             _ => false,
         },
+        // A value satisfies `future<T>` iff it is a future. The inner `T` is the
+        // type the future *resolves to*, which cannot be inspected until it is
+        // awaited, so it is advisory/erased at the binding site.
+        Type::Future(_) => matches!(value, Value::Future(_)),
     }
 }
 
@@ -1893,6 +1897,44 @@ mod tests {
         assert_eq!(ok, "1\n");
         let err = run_err("let m: map<string, number> = 5").await;
         assert!(err.message.contains("type contract violated"));
+    }
+
+    #[tokio::test]
+    async fn future_type_annotation_checks() {
+        // Calling an async fn yields a future; the binding annotated `future<T>`
+        // accepts it, and awaiting it produces the resolved value.
+        let ok = run(
+            "async fn f(): number { return 1 }\nlet x: future<number> = f()\nprint(await x)",
+        )
+        .await;
+        assert_eq!(ok, "1\n");
+        // A non-future violates the contract; the message names `future`.
+        let err = run_err("let y: future<number> = 5").await;
+        assert!(err.message.contains("future"), "message was {:?}", err.message);
+        assert_eq!(
+            err.message,
+            "type contract violated: expected future<number>, got number (5)"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_type_display_round_trips() {
+        use crate::ast::Type;
+        assert_eq!(Type::Future(Box::new(Type::Number)).to_string(), "future<number>");
+        // Nested generic types Display correctly.
+        let ty = Type::Future(Box::new(Type::Array(Box::new(Type::Number))));
+        assert_eq!(ty.to_string(), "future<array<number>>");
+    }
+
+    #[tokio::test]
+    async fn future_type_annotations_parse_in_positions() {
+        // A function return-type annotation `: future<string>` parses (the body
+        // would itself have to return a future to satisfy it at runtime).
+        assert!(parse(&lex("fn g(): future<string> { return wrap() }").unwrap()).is_ok());
+        // Nested `future<array<number>>` parses as a binding annotation.
+        assert!(parse(&lex("let z: future<array<number>> = w").unwrap()).is_ok());
+        // As a parameter type.
+        assert!(parse(&lex("fn h(p: future<number>) { return p }").unwrap()).is_ok());
     }
 
     #[tokio::test]

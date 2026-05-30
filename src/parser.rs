@@ -349,6 +349,12 @@ impl<'a> Parser<'a> {
                     self.eat(&Tok::Gt)?;
                     Ok(Type::Result(Box::new(inner)))
                 }
+                "future" => {
+                    self.eat(&Tok::Lt)?;
+                    let inner = self.parse_type()?;
+                    self.eat(&Tok::Gt)?;
+                    Ok(Type::Future(Box::new(inner)))
+                }
                 "map" => {
                     self.eat(&Tok::Lt)?;
                     let k = self.parse_type()?;

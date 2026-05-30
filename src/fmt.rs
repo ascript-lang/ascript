@@ -662,6 +662,20 @@ mod tests {
         assert_eq!(out, "let [a, b] = pair\n");
     }
 
+    #[test]
+    fn formats_future_type_annotation() {
+        // A `future<T>` binding annotation round-trips through the formatter.
+        // (Space before `=` so the lexer does not read `>=` as a single token.)
+        assert_eq!(
+            format_source("let x:future<number> = f()").unwrap(),
+            "let x: future<number> = f()\n"
+        );
+        // Nested generic and idempotence.
+        let once = format_source("let y: future<array<number>> = g()").unwrap();
+        assert_eq!(once, "let y: future<array<number>> = g()\n");
+        assert_eq!(format_source(&once).unwrap(), once);
+    }
+
     /// Every committed example must format idempotently and the formatted
     /// output must re-parse — proving all AST variants are handled.
     #[test]
