@@ -88,21 +88,26 @@ point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_sourc
     `await_holding_refcell_ref`) — bind/drop borrows before any suspension point.
 - **Control flow uses two enums, not `Result<_, io::Error>`:**
   - `Flow { Normal, Return(Value), Break, Continue }` — normal statement-level control flow.
-  - `Control { Panic(AsError), Propagate(Value) }` — the error channel. `Panic` is an unrecoverable
-    Tier-2 programmer error (aborts unless caught by `recover`); `Propagate` is the `?`-operator
-    early return carrying a `[nil, err]` Result pair. `AsError` converts into `Control::Panic`.
+  - `Control { Panic(AsError), Propagate(Value) }` (`derive(Clone)` so it can ride cross-task futures)
+    — the error channel. `Panic` is an unrecoverable Tier-2 programmer error (aborts unless caught by
+    `recover`); `Propagate` is the `?`-operator early return carrying a `[nil, err]` Result pair.
+    `AsError` converts into `Control::Panic`.
 - `global_env()` builds a fresh environment with builtins installed; programs run in a `.child()` of
   it so they can shadow builtins (`let len = 5`).
 - **Native resource handles:** OS resources (TCP streams, child processes, HTTP bodies/servers, SSE,
   WebSocket connections, terminals) are NOT embedded in `Value`. They live in `Interp.resources`
-  (a `HashMap<u64, ResourceState>`) and are referenced from script by a `Value::Native` handle id.
-  This keeps `Value` cheap/cloneable and lets the interpreter reclaim fds deterministically. When
-  adding a stateful native API, add a `ResourceState` variant + accessor methods on `Interp`.
+  (a `RefCell<HashMap<u64, ResourceState>>`) and are referenced from script by a `Value::Native` handle
+  id. This keeps `Value` cheap/cloneable and lets the interpreter reclaim fds deterministically. When
+  adding a stateful native API, add a `ResourceState` variant + accessor methods on `Interp`, and never
+  hold a `resources` borrow across an `.await` (take the state out first). The HTTP server handles each
+  connection on its own `spawn_local` task with a `Semaphore` concurrency cap (M17).
 
 ### Values (`src/value.rs`)
 `Value` is the ~14-variant runtime tagged union: `Bool`, `Number(f64)`, `Str(Rc<str>)`, `Builtin`,
 `Function`, `Array`, `Object` (insertion-ordered `IndexMap`), `Map`, `Bytes`, `Regex`, `Native`,
-`Enum`, `Class`, `Instance`, `Super`. Mutable containers are `Rc<RefCell<...>>`. There is a separate
+`Enum`, `Class`, `Instance`, `Super`, plus M17's `Future` (identity-equal, backed by `SharedFuture`)
+and `Generator` (identity-equal, a consumer-driven `GeneratorHandle`). Mutable containers are
+`Rc<RefCell<...>>`. There is a separate
 hashable `MapKey` (numbers canonicalized: −0.0→+0.0, NaN unified) for `Map` keys.
 
 ### Standard library (`src/stdlib/`)
