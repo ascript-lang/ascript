@@ -8,7 +8,7 @@ use crate::span::Span;
 use crate::value::Value;
 use crate::{lexer, parser};
 use async_recursion::async_recursion;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -167,20 +167,26 @@ pub(crate) enum ResourceState {
     Closed,
 }
 
+/// All mutable interpreter state lives behind interior mutability (`RefCell`/
+/// `Cell`) so the `eval`/`exec`/`call_*` methods take `&self`, not `&mut self`.
+/// This lets multiple concurrent eval futures (M17 Phase 2+) share one
+/// `Rc<Interp>` while mutating through short-lived borrows. Borrow rule: never
+/// hold a `RefCell` guard across an `.await` — take the resource OUT of the table
+/// first (`take_resource`) and put it back after (`return_resource`).
 pub struct Interp {
-    /// Captured program output (what `print` writes). Exposed for testing and
+    /// Captured program output (what `print` writes). Read via `output()` and
     /// flushed to stdout by the CLI.
-    pub output: String,
-    modules: HashMap<PathBuf, ModuleEntry>,
-    module_dir: PathBuf,
-    current_exports: Rc<RefCell<HashSet<String>>>,
+    output: RefCell<String>,
+    modules: RefCell<HashMap<PathBuf, ModuleEntry>>,
+    module_dir: RefCell<PathBuf>,
+    current_exports: RefCell<Rc<RefCell<HashSet<String>>>>,
     /// Tests registered via the `test(name, fn)` builtin. Only executed by
     /// `ascript test` (via `run_registered_tests`); a normal `run` just collects them.
-    tests: Vec<(String, Value)>,
+    tests: RefCell<Vec<(String, Value)>>,
     /// Live OS resources backing `Value::Native` handles, keyed by handle id.
-    resources: HashMap<u64, ResourceState>,
+    resources: RefCell<HashMap<u64, ResourceState>>,
     /// Monotonic id source for newly registered resources.
-    next_resource_id: u64,
+    next_resource_id: Cell<u64>,
 }
 
 /// Outcome of running the tests registered on an `Interp`.
@@ -195,41 +201,94 @@ pub struct TestSummary {
 impl Interp {
     pub fn new() -> Self {
         Interp {
-            output: String::new(),
-            modules: HashMap::new(),
-            module_dir: PathBuf::from("."),
-            current_exports: Rc::new(RefCell::new(HashSet::new())),
-            tests: Vec::new(),
-            resources: HashMap::new(),
-            next_resource_id: 0,
+            output: RefCell::new(String::new()),
+            modules: RefCell::new(HashMap::new()),
+            module_dir: RefCell::new(PathBuf::from(".")),
+            current_exports: RefCell::new(Rc::new(RefCell::new(HashSet::new()))),
+            tests: RefCell::new(Vec::new()),
+            resources: RefCell::new(HashMap::new()),
+            next_resource_id: Cell::new(0),
         }
+    }
+
+    /// Snapshot of all captured program output so far.
+    pub fn output(&self) -> String {
+        self.output.borrow().clone()
+    }
+
+    /// Append to the captured program output (`print`).
+    pub(crate) fn push_output(&self, s: &str) {
+        self.output.borrow_mut().push_str(s);
+    }
+
+    /// Is the captured output buffer empty? (REPL flush check.)
+    pub(crate) fn output_is_empty(&self) -> bool {
+        self.output.borrow().is_empty()
+    }
+
+    /// Clear the captured output buffer (REPL flushes after each line).
+    pub(crate) fn clear_output(&self) {
+        self.output.borrow_mut().clear();
+    }
+
+    /// Allocate the next monotonic resource id.
+    fn next_id(&self) -> u64 {
+        let id = self.next_resource_id.get();
+        self.next_resource_id.set(id + 1);
+        id
+    }
+
+    /// Return a resource to the table after a take-out across an `.await`. Pairs
+    /// with `take_resource`.
+    #[allow(dead_code)] // Only used by feature-gated I/O modules.
+    pub(crate) fn return_resource(&self, id: u64, state: ResourceState) {
+        self.resources.borrow_mut().insert(id, state);
     }
 
     /// Register an OS `state` behind a fresh `Value::Native` handle of `kind`,
     /// carrying the plain readable `fields`.
     #[allow(dead_code)] // Only called by feature-gated modules (sqlite/process) for now.
     pub(crate) fn register_resource(
-        &mut self,
+        &self,
         kind: crate::value::NativeKind,
         fields: indexmap::IndexMap<String, Value>,
         state: ResourceState,
     ) -> Value {
-        let id = self.next_resource_id;
-        self.next_resource_id += 1;
-        self.resources.insert(id, state);
+        let id = self.next_id();
+        self.resources.borrow_mut().insert(id, state);
         Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
     }
 
-    /// Remove and return the resource for `id` (used by `close`/`kill`/EOF).
+    /// Remove and return the resource for `id` (used by `close`/`kill`/EOF, and to
+    /// own a resource across an `.await` without holding the table borrow — pair
+    /// with `return_resource`).
     #[allow(dead_code)] // Only used by feature-gated modules (sqlite/process) for now.
-    pub(crate) fn take_resource(&mut self, id: u64) -> Option<ResourceState> {
-        self.resources.remove(&id)
+    pub(crate) fn take_resource(&self, id: u64) -> Option<ResourceState> {
+        self.resources.borrow_mut().remove(&id)
     }
 
-    /// Borrow the resource for `id` (used by handle methods like `conn.query`).
+    /// Run `f` with a shared borrow of the resource for `id` (handle methods that
+    /// only inspect state, e.g. `conn.query` re-resolving a statement). The closure
+    /// must NOT `.await` — the borrow is held for its duration.
     #[allow(dead_code)]
-    pub(crate) fn resource(&self, id: u64) -> Option<&ResourceState> {
-        self.resources.get(&id)
+    pub(crate) fn with_resource<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(Option<&ResourceState>) -> R,
+    ) -> R {
+        f(self.resources.borrow().get(&id))
+    }
+
+    /// Like [`with_resource`], but with a mutable borrow. The closure must NOT
+    /// `.await` (the borrow is held for its duration); used by synchronous handle
+    /// mutations such as feeding bytes to an SSE parser between async chunk reads.
+    #[allow(dead_code)]
+    pub(crate) fn with_resource_mut<R>(
+        &self,
+        id: u64,
+        f: impl FnOnce(Option<&mut ResourceState>) -> R,
+    ) -> R {
+        f(self.resources.borrow_mut().get_mut(&id))
     }
 
     /// Number of live OS resources in the table. Tests use this to prove that
@@ -238,113 +297,31 @@ impl Interp {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn resource_count(&self) -> usize {
-        self.resources.len()
+        self.resources.borrow().len()
     }
 
-    /// Look up the live `rusqlite::Connection` behind a handle id, or `None` if the
-    /// handle was closed (`take_resource`'d) — the caller turns that into the
-    /// "use after close" panic.
+    /// A shared borrow of the live `rusqlite::Connection` behind a handle id (as a
+    /// `Ref` guard), or `None` if the handle was closed (`take_resource`'d). Sqlite
+    /// work is synchronous, so the guard never lives across an `.await`.
     #[cfg(feature = "sql")]
-    pub(crate) fn sqlite_conn(&self, id: u64) -> Option<&rusqlite::Connection> {
-        match self.resources.get(&id) {
+    pub(crate) fn sqlite_conn(&self, id: u64) -> Option<std::cell::Ref<'_, rusqlite::Connection>> {
+        std::cell::Ref::filter_map(self.resources.borrow(), |m| match m.get(&id) {
             Some(ResourceState::SqliteConnection(c)) => Some(c),
             _ => None,
-        }
-    }
-
-    /// Mutable access to the live child process behind a handle id (for `wait`/
-    /// `kill`), or `None` if the handle was already taken (`wait`/EOF removes it).
-    #[cfg(feature = "sys")]
-    pub(crate) fn process_child_mut(&mut self, id: u64) -> Option<&mut tokio::process::Child> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::ChildProcess(c)) => Some(c),
-            _ => None,
-        }
-    }
-
-    /// Mutable access to a process reader (stdout/stderr pipe) behind a handle id,
-    /// returning the reader and its capture mode together.
-    #[cfg(feature = "sys")]
-    pub(crate) fn proc_reader_mut(
-        &mut self,
-        id: u64,
-    ) -> Option<(&mut crate::stdlib::process::ProcReader, crate::stdlib::process::Capture)> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::Reader { reader, capture }) => Some((reader, *capture)),
-            _ => None,
-        }
-    }
-
-    /// Mutable access to a process writer (stdin pipe) behind a handle id.
-    #[cfg(feature = "sys")]
-    pub(crate) fn proc_writer_mut(&mut self, id: u64) -> Option<&mut tokio::process::ChildStdin> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::Writer(w)) => Some(w),
-            _ => None,
-        }
-    }
-
-    /// Mutable access to a buffered TCP stream behind a handle id, or `None` once
-    /// the handle was finalized (closed / EOF) — read methods turn `None` into nil.
-    #[cfg(feature = "net")]
-    pub(crate) fn tcp_stream_mut(
-        &mut self,
-        id: u64,
-    ) -> Option<&mut crate::stdlib::net_tcp::TcpStreamState> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::TcpStream(s)) => Some(s),
-            _ => None,
-        }
+        })
+        .ok()
     }
 
     /// Take the live `reqwest::Response` behind a handle id, removing it from the
     /// table. `None` if it was already consumed (a body accessor took it). The
     /// caller turns `None` into the "response body already consumed" Tier-2 panic.
     #[cfg(feature = "net")]
-    pub(crate) fn take_http_response(&mut self, id: u64) -> Option<reqwest::Response> {
-        match self.resources.remove(&id) {
+    pub(crate) fn take_http_response(&self, id: u64) -> Option<reqwest::Response> {
+        match self.resources.borrow_mut().remove(&id) {
             Some(ResourceState::HttpResponse(r)) => Some(r),
             // Not an HttpResponse (or already gone): nothing to return. If it was a
             // different live resource, put it back is unnecessary — ids are unique
             // per kind by construction, so this branch means "already consumed".
-            _ => None,
-        }
-    }
-
-    /// Mutable access to a streaming HTTP body behind a handle id, or `None` once
-    /// the body was finalized (EOF / drained) — read methods turn `None` into nil.
-    #[cfg(feature = "net")]
-    pub(crate) fn http_body_mut(
-        &mut self,
-        id: u64,
-    ) -> Option<&mut crate::stdlib::net_http::HttpBodyState> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::HttpBody(s)) => Some(s),
-            _ => None,
-        }
-    }
-
-    /// Mutable access to an SSE stream behind a handle id (for `next`/`close`).
-    #[cfg(feature = "net")]
-    pub(crate) fn sse_stream_mut(
-        &mut self,
-        id: u64,
-    ) -> Option<&mut crate::stdlib::net_http::SseState> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::SseStream(s)) => Some(s.as_mut()),
-            _ => None,
-        }
-    }
-
-    /// Mutable access to an HTTP server's routes/middleware/listener behind a
-    /// handle id (for `route`/`use`/`bind`/`serve`).
-    #[cfg(feature = "net")]
-    pub(crate) fn http_server_mut(
-        &mut self,
-        id: u64,
-    ) -> Option<&mut crate::stdlib::http_server::HttpServerState> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::HttpServer(s)) => Some(s),
             _ => None,
         }
     }
@@ -354,59 +331,49 @@ impl Interp {
     /// continuation behind; the server sweeps them after each request so per-request
     /// handles don't accumulate across a long-running `serve` loop.
     #[cfg(feature = "net")]
-    pub(crate) fn drop_pending_http_next(&mut self) {
-        self.resources.retain(|_, s| !matches!(s, ResourceState::HttpNext(_)));
+    pub(crate) fn drop_pending_http_next(&self) {
+        self.resources.borrow_mut().retain(|_, s| !matches!(s, ResourceState::HttpNext(_)));
     }
 
-    /// Mutable access to a bound TCP listener behind a handle id (for `accept`).
+    /// A mutable borrow of an HTTP server's routes/middleware/listener (as a `RefMut`
+    /// guard), or `None` if the handle is gone. Used by the synchronous `route`/`use`
+    /// builders; `bind`/`serve` take the listener out (`take_resource`) before
+    /// awaiting so no guard is held across an `.await`.
     #[cfg(feature = "net")]
-    pub(crate) fn tcp_listener_mut(&mut self, id: u64) -> Option<&mut tokio::net::TcpListener> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::TcpListener(l)) => Some(l),
-            _ => None,
-        }
-    }
-
-    /// Mutable access to a connected WebSocket behind a handle id (send/recv), or
-    /// `None` once the connection was finalized (closed / recv saw a Close frame).
-    #[cfg(feature = "net")]
-    pub(crate) fn ws_conn_mut(
-        &mut self,
+    pub(crate) fn http_server_mut(
+        &self,
         id: u64,
-    ) -> Option<&mut crate::stdlib::net_ws::WsConnState> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::WsConnection(s)) => Some(s),
+    ) -> Option<std::cell::RefMut<'_, crate::stdlib::http_server::HttpServerState>> {
+        std::cell::RefMut::filter_map(self.resources.borrow_mut(), |m| match m.get_mut(&id) {
+            Some(ResourceState::HttpServer(s)) => Some(s),
             _ => None,
-        }
+        })
+        .ok()
     }
 
-    /// Mutable access to a bound WebSocket listener behind a handle id (for `accept`).
-    #[cfg(feature = "net")]
-    pub(crate) fn ws_listener_mut(&mut self, id: u64) -> Option<&mut tokio::net::TcpListener> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::WsListener(l)) => Some(l),
-            _ => None,
-        }
-    }
-
-    /// Mutable access to a `Terminal` handle's screen state behind a handle id,
-    /// or `None` once the handle was closed (`restore`/`close` removes it) — the
-    /// caller turns `None` into the "use after close" Tier-2 panic.
+    /// A mutable borrow of a `Terminal` handle's screen state (as a `RefMut` guard),
+    /// or `None` once the handle was closed. Crossterm I/O is synchronous, so the
+    /// guard never lives across an `.await`.
     #[cfg(feature = "tui")]
-    pub(crate) fn terminal_mut(&mut self, id: u64) -> Option<&mut crate::stdlib::tui::TerminalState> {
-        match self.resources.get_mut(&id) {
-            Some(ResourceState::Terminal(s)) => Some(s.as_mut()),
+    pub(crate) fn terminal_mut(
+        &self,
+        id: u64,
+    ) -> Option<std::cell::RefMut<'_, crate::stdlib::tui::TerminalState>> {
+        std::cell::RefMut::filter_map(self.resources.borrow_mut(), |m| match m.get_mut(&id) {
+            Some(ResourceState::Terminal(s)) => Some(&mut **s),
             _ => None,
-        }
+        })
+        .ok()
     }
 
     /// Run every test registered via the `test(name, fn)` builtin. Each test fn
     /// is invoked with no arguments; a `Control::Panic` (e.g. a failed `assert`)
     /// is recorded as a failure, while a clean return or a `?` propagation passes.
-    pub async fn run_registered_tests(&mut self) -> TestSummary {
+    pub async fn run_registered_tests(&self) -> TestSummary {
         let mut summary = TestSummary::default();
-        // Clone out the registrations first: `call_value` borrows `&mut self`.
-        let tests = self.tests.clone();
+        // Clone out the registrations first so the table borrow is not held across
+        // each `call_value` await.
+        let tests = self.tests.borrow().clone();
         for (name, func) in tests {
             match self.call_value(func, Vec::new(), Span::new(0, 0)).await {
                 Ok(_) | Err(Control::Propagate(_)) => summary.passed += 1,
@@ -421,9 +388,9 @@ impl Interp {
 
     /// Load (or fetch from cache) the module at `path`, returning its entry.
     #[async_recursion(?Send)]
-    pub async fn load_module(&mut self, path: &Path) -> Result<ModuleEntry, Control> {
+    pub async fn load_module(&self, path: &Path) -> Result<ModuleEntry, Control> {
         let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if let Some(entry) = self.modules.get(&canon) {
+        if let Some(entry) = self.modules.borrow().get(&canon) {
             return Ok(entry.clone()); // cached, or in-progress (circular)
         }
         let src = std::fs::read_to_string(&canon)
@@ -434,11 +401,11 @@ impl Interp {
         let exports = Rc::new(RefCell::new(HashSet::new()));
         let entry = ModuleEntry { env: env.clone(), exports: exports.clone() };
         // Cache BEFORE executing so circular imports resolve to this entry.
-        self.modules.insert(canon.clone(), entry.clone());
+        self.modules.borrow_mut().insert(canon.clone(), entry.clone());
 
         let dir = canon.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-        let prev_dir = std::mem::replace(&mut self.module_dir, dir);
-        let prev_exports = std::mem::replace(&mut self.current_exports, exports);
+        let prev_dir = self.module_dir.replace(dir);
+        let prev_exports = self.current_exports.replace(exports);
 
         let src_info =
             Rc::new(crate::error::SourceInfo { path: canon.display().to_string(), text: src.clone() });
@@ -449,8 +416,8 @@ impl Interp {
             .map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
         let result = self.exec(&program, &env).await;
 
-        self.module_dir = prev_dir;
-        self.current_exports = prev_exports;
+        *self.module_dir.borrow_mut() = prev_dir;
+        *self.current_exports.borrow_mut() = prev_exports;
 
         if let Err(Control::Panic(e)) = result {
             return Err(Control::Panic(e.with_source(src_info)));
@@ -461,9 +428,9 @@ impl Interp {
 
     /// Resolve a `std/*` built-in module to a cached `ModuleEntry`, building it
     /// from the static export registry. Bypasses the filesystem entirely.
-    fn load_std_module(&mut self, source: &str) -> Result<ModuleEntry, Control> {
+    fn load_std_module(&self, source: &str) -> Result<ModuleEntry, Control> {
         let key = PathBuf::from(format!("<std>/{}", &source[4..]));
-        if let Some(entry) = self.modules.get(&key) {
+        if let Some(entry) = self.modules.borrow().get(&key) {
             return Ok(entry.clone());
         }
         let exports_list = crate::stdlib::std_module_exports(source).ok_or_else(|| {
@@ -478,12 +445,12 @@ impl Interp {
             exports.borrow_mut().insert(name);
         }
         let entry = ModuleEntry { env, exports };
-        self.modules.insert(key, entry.clone());
+        self.modules.borrow_mut().insert(key, entry.clone());
         Ok(entry)
     }
 
     fn resolve_import(&self, source: &str) -> PathBuf {
-        let mut p = self.module_dir.join(source);
+        let mut p = self.module_dir.borrow().join(source);
         if p.extension().is_none() {
             p.set_extension("as");
         }
@@ -491,7 +458,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    pub async fn exec(&mut self, program: &[Stmt], env: &Environment) -> Result<Flow, Control> {
+    pub async fn exec(&self, program: &[Stmt], env: &Environment) -> Result<Flow, Control> {
         for stmt in program {
             match self.exec_stmt(stmt, env).await? {
                 Flow::Normal => {}
@@ -502,7 +469,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    async fn exec_stmt(&mut self, stmt: &Stmt, env: &Environment) -> Result<Flow, Control> {
+    async fn exec_stmt(&self, stmt: &Stmt, env: &Environment) -> Result<Flow, Control> {
         match stmt {
             Stmt::Expr(e) => {
                 self.eval_expr(e, env).await?;
@@ -684,7 +651,7 @@ impl Interp {
             Stmt::Export(inner) => {
                 let flow = self.exec_stmt(inner, env).await?;
                 for name in exported_names(inner) {
-                    self.current_exports.borrow_mut().insert(name);
+                    self.current_exports.borrow().borrow_mut().insert(name);
                 }
                 Ok(flow)
             }
@@ -720,7 +687,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    pub async fn eval_expr(&mut self, expr: &Expr, env: &Environment) -> Result<Value, Control> {
+    pub async fn eval_expr(&self, expr: &Expr, env: &Environment) -> Result<Value, Control> {
         match &expr.kind {
             ExprKind::Number(n) => Ok(Value::Number(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
@@ -929,7 +896,7 @@ impl Interp {
     /// `short_circuited == true` means an earlier `?.` link hit nil and the rest
     /// of the chain must yield nil without being accessed/called.
     #[async_recursion(?Send)]
-    async fn eval_chain(&mut self, expr: &Expr, env: &Environment) -> Result<(Value, bool), Control> {
+    async fn eval_chain(&self, expr: &Expr, env: &Environment) -> Result<(Value, bool), Control> {
         match &expr.kind {
             ExprKind::OptMember { object, name } => {
                 let (obj, sc) = self.eval_chain(object, env).await?;
@@ -1030,10 +997,10 @@ impl Interp {
                 // straight from the resource state.
                 #[cfg(feature = "net")]
                 if name == "lastEventId" && n.kind == crate::value::NativeKind::SseStream {
-                    let id = match self.resource(n.id) {
+                    let id = self.with_resource(n.id, |r| match r {
                         Some(ResourceState::SseStream(s)) => s.last_event_id().to_string(),
                         _ => String::new(),
-                    };
+                    });
                     return Ok(Value::Str(id.into()));
                 }
                 if let Some(v) = n.fields.get(name) {
@@ -1063,7 +1030,7 @@ impl Interp {
 
     // pub(crate): used by std/* modules (std/array callbacks) later in M10.
     #[async_recursion(?Send)]
-    pub(crate) async fn call_value(&mut self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
+    pub(crate) async fn call_value(&self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
         match callee {
             Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
             Value::Function(func) => self.call_function(&func, args, span).await,
@@ -1081,7 +1048,7 @@ impl Interp {
     /// arms are added by Tasks 6/7.
     #[async_recursion(?Send)]
     pub(crate) async fn call_native_method(
-        &mut self,
+        &self,
         m: std::rc::Rc<crate::value::NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -1142,7 +1109,7 @@ impl Interp {
     /// contract. Shared by plain functions and methods.
     #[async_recursion(?Send)]
     async fn run_body<'s: 'async_recursion>(
-        &mut self,
+        &self,
         spec: BodySpec<'s>,
         args: Vec<Value>,
         call_env: &Environment,
@@ -1183,7 +1150,7 @@ impl Interp {
 
     #[async_recursion(?Send)]
     async fn call_function(
-        &mut self,
+        &self,
         func: &crate::value::Function,
         args: Vec<Value>,
         span: Span,
@@ -1196,7 +1163,7 @@ impl Interp {
 
     #[async_recursion(?Send)]
     async fn construct(
-        &mut self,
+        &self,
         class: std::rc::Rc<crate::value::Class>,
         args: Vec<Value>,
         span: Span,
@@ -1231,7 +1198,7 @@ impl Interp {
 
     #[async_recursion(?Send)]
     async fn invoke_method(
-        &mut self,
+        &self,
         bm: &crate::value::BoundMethod,
         args: Vec<Value>,
         span: Span,
@@ -1249,12 +1216,12 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    async fn call_builtin(&mut self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+    async fn call_builtin(&self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         match name {
             "print" => {
                 let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect();
-                self.output.push_str(&parts.join(" "));
-                self.output.push('\n');
+                self.push_output(&parts.join(" "));
+                self.push_output("\n");
                 Ok(Value::Nil)
             }
             "Ok" => {
@@ -1298,7 +1265,7 @@ impl Interp {
                 };
                 let func = args.get(1).cloned().unwrap_or(Value::Nil);
                 // Register only; `ascript test` runs these via run_registered_tests.
-                self.tests.push((name, func));
+                self.tests.borrow_mut().push((name, func));
                 Ok(Value::Nil)
             }
             "len" => {
@@ -1376,7 +1343,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    async fn assign_to(&mut self, target: &Expr, value: Value, env: &Environment) -> Result<Value, Control> {
+    async fn assign_to(&self, target: &Expr, value: Value, env: &Environment) -> Result<Value, Control> {
         match &target.kind {
             ExprKind::Ident(name) => match env.assign(name, value.clone()) {
                 Ok(()) => Ok(value),
@@ -1570,17 +1537,17 @@ mod tests {
     /// Lex+parse+exec a program string, returning its captured `print` output.
     /// Panics (test failure) on a lex/parse error or a runtime panic.
     async fn run(src: &str) -> String {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let tokens = lex(src).expect("lex");
         let stmts = parse(&tokens).expect("parse");
         let env = global_env().child();
         interp.exec(&stmts, &env).await.expect("program panicked");
-        interp.output
+        interp.output()
     }
 
     /// Like `run`, but expects a runtime panic and returns its `AsError`.
     async fn run_err(src: &str) -> AsError {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let tokens = lex(src).expect("lex");
         let stmts = parse(&tokens).expect("parse");
         let env = global_env().child();
@@ -1593,7 +1560,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_handle_fields_and_methods() {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let mut fields = indexmap::IndexMap::new();
         fields.insert("pid".to_string(), Value::Number(42.0));
         let h = interp.register_resource(crate::value::NativeKind::ChildProcess, fields, ResourceState::Closed);
@@ -1896,37 +1863,37 @@ mod tests {
     async fn enum_variants_access_and_equality() {
         let src = "enum Color { Red, Green, Blue }\nenum Status { Ok = 200, NotFound = 404 }\nprint(Color.Red)\nprint(Color.Red == Color.Red)\nprint(Color.Red == Color.Green)\nprint(Status.NotFound.value)\nprint(Status.Ok.name)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "Color.Red\ntrue\nfalse\n404\nOk\n");
+        assert_eq!(interp.output(), "Color.Red\ntrue\nfalse\n404\nOk\n");
     }
 
     #[tokio::test]
     async fn match_on_literals_and_wildcard() {
         let src = "fn label(n) { return match n { 0 => \"zero\", 1 | 2 => \"small\", _ => \"many\" } }\nprint(label(0))\nprint(label(2))\nprint(label(9))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "zero\nsmall\nmany\n");
+        assert_eq!(interp.output(), "zero\nsmall\nmany\n");
     }
 
     #[tokio::test]
     async fn match_on_enum_variants() {
         let src = "enum Color { Red, Green, Blue }\nfn warm(c) { return match c { Color.Red => true, _ => false } }\nprint(warm(Color.Red))\nprint(warm(Color.Blue))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "true\nfalse\n");
+        assert_eq!(interp.output(), "true\nfalse\n");
     }
 
     #[tokio::test]
     async fn match_no_arm_panics() {
         let src = "match 5 { 1 => \"a\" }";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("no matching arm"));
@@ -1937,27 +1904,27 @@ mod tests {
         // A bare-variable pattern must work (value-equality, not arrow-function).
         let src = "let k = 2\nprint(match 2 { k => \"hit\", _ => \"miss\" })\nprint(match 3 { k => \"hit\", _ => \"miss\" })\nlet n = 5\nprint(match 6 { n + 1 => \"plus\", _ => \"no\" })";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "hit\nmiss\nplus\n");
+        assert_eq!(interp.output(), "hit\nmiss\nplus\n");
     }
 
     #[tokio::test]
     async fn class_construction_fields_and_methods() {
         let src = "class Animal {\n  fn init(name) { self.name = name }\n  fn speak() { return self.name + \" makes a sound\" }\n}\nlet a = Animal(\"Rex\")\nprint(a.name)\nprint(a.speak())";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "Rex\nRex makes a sound\n");
+        assert_eq!(interp.output(), "Rex\nRex makes a sound\n");
     }
 
     #[tokio::test]
     async fn class_without_init_rejects_args() {
         let src = "class Empty {}\nEmpty(1)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("no init"));
@@ -1967,10 +1934,10 @@ mod tests {
     async fn typed_code_runs_without_enforcement_yet() {
         let src = "let x: number = 5\nfn f(a: number): number { return a + 1 }\nprint(f(x))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "6\n");
+        assert_eq!(interp.output(), "6\n");
     }
 
     #[tokio::test]
@@ -1978,15 +1945,15 @@ mod tests {
         // passes
         let src = "let x: number = 5\nprint(x)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "5\n");
+        assert_eq!(interp.output(), "5\n");
 
         // fails
         let bad = "let x: number = \"oops\"";
         let stmts = parse(&lex(bad).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("type contract violated"));
@@ -1998,25 +1965,25 @@ mod tests {
         // array<number> with a bad element fails
         let bad = "let xs: array<number> = [1, \"two\", 3]";
         let stmts = parse(&lex(bad).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         assert!(interp.exec(&stmts, &env).await.is_err());
 
         // union passes for either member
         let ok = "let a: number | nil = nil\nlet b: number | nil = 7\nprint(b)";
         let stmts = parse(&lex(ok).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "7\n");
+        assert_eq!(interp.output(), "7\n");
 
         // Result<number>: Ok(5) passes, Ok("x") fails
         let r = "let r: Result<number> = Ok(5)\nprint(r[0])";
         let stmts = parse(&lex(r).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "5\n");
+        assert_eq!(interp.output(), "5\n");
     }
 
     #[tokio::test]
@@ -2033,17 +2000,17 @@ print(good[0])
 print(bad[1].message)
 ";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "42\nnot a number\n");
+        assert_eq!(interp.output(), "42\nnot a number\n");
     }
 
     #[tokio::test]
     async fn param_contract_enforced() {
         let src = "fn double(n: number): number { return n * 2 }\nprint(double(\"x\"))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("type contract violated"));
@@ -2055,7 +2022,7 @@ print(bad[1].message)
         // returns a string but annotated number
         let src = "fn f(): number { return \"nope\" }\nf()";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("type contract violated"));
@@ -2065,10 +2032,10 @@ print(bad[1].message)
     async fn typed_function_happy_path() {
         let src = "fn add(a: number, b: number): number { return a + b }\nprint(add(2, 3))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "5\n");
+        assert_eq!(interp.output(), "5\n");
     }
 
     #[tokio::test]
@@ -2076,21 +2043,21 @@ print(bad[1].message)
         // a contract panic is catchable by recover (it's a Panic, M5)
         let src = "fn f(n: number) { return n }\nlet r = recover(() => f(\"bad\"))\nprint(r[0])\nprint(r[1].message)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert!(interp.output.starts_with("nil\n"));
-        assert!(interp.output.contains("type contract violated"));
+        assert!(interp.output().starts_with("nil\n"));
+        assert!(interp.output().contains("type contract violated"));
     }
 
     #[tokio::test]
     async fn ok_and_err_construct_result_pairs() {
         let src = "let r = Ok(5)\nprint(r[0])\nprint(r[1])\nlet e = Err(\"boom\")\nprint(e[0])\nprint(e[1].message)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "5\nnil\nnil\nboom\n");
+        assert_eq!(interp.output(), "5\nnil\nnil\nboom\n");
     }
 
     #[tokio::test]
@@ -2098,15 +2065,15 @@ print(bad[1].message)
         // passing assert returns nil
         let ok = "assert(1 < 2)\nprint(\"ok\")";
         let stmts = parse(&lex(ok).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "ok\n");
+        assert_eq!(interp.output(), "ok\n");
 
         // failing assert panics with the message
         let bad = "assert(false, \"nope\")";
         let stmts = parse(&lex(bad).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("nope"));
@@ -2132,19 +2099,19 @@ print(bad[0])
 print(bad[1].message)
 ";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         // run(5): parse->Ok(10), v=10, returns Ok(11) -> [11, nil]
         // run(-1): parse->Err, ? propagates [nil, {message:"negative"}]
-        assert_eq!(interp.output, "11\nnil\nnil\nnegative\n");
+        assert_eq!(interp.output(), "11\nnil\nnil\nnegative\n");
     }
 
     #[tokio::test]
     async fn question_on_non_result_panics() {
         let src = "let x = 5\nlet y = x?";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("requires a Result pair"));
@@ -2163,12 +2130,12 @@ print(r[0])
 print(r[1].message)
 ";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         // r[0] is nil; r[1].message carries the panic text (index out of bounds).
-        assert!(interp.output.starts_with("nil\n"));
-        assert!(interp.output.contains("out of bounds"));
+        assert!(interp.output().starts_with("nil\n"));
+        assert!(interp.output().contains("out of bounds"));
     }
 
     #[tokio::test]
@@ -2180,15 +2147,15 @@ print(r[0])
 print(r[1])
 ";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "42\nnil\n");
+        assert_eq!(interp.output(), "42\nnil\n");
     }
 
     async fn eval_to_value(src: &str) -> Value {
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let (last, rest) = stmts.split_last().expect("at least one statement");
         interp.exec(rest, &env).await.unwrap();
@@ -2209,10 +2176,10 @@ print(r[1])
     #[tokio::test]
     async fn print_writes_to_the_output_buffer() {
         let stmts = parse(&lex("print(1 + 2 * 3)").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "7\n");
+        assert_eq!(interp.output(), "7\n");
     }
 
     #[tokio::test]
@@ -2233,13 +2200,13 @@ print(r[1])
 
         // `Str + Number` must error (no coercion).
         let stmts = parse(&lex("\"a\" + 1").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         assert!(interp.exec(&stmts, &env).await.is_err());
 
         // `Number + Str` must error (no coercion in the other direction).
         let stmts = parse(&lex("1 + \"a\"").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         assert!(interp.exec(&stmts, &env).await.is_err());
     }
@@ -2262,7 +2229,7 @@ print(r[1])
     async fn calling_an_undefined_name_is_an_error() {
         // `nope` is not a binding, so resolving the callee fails before the call.
         let stmts = parse(&lex("nope(1)").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined variable"));
@@ -2272,7 +2239,7 @@ print(r[1])
     async fn call_site_errors_carry_a_span() {
         // Undefined callee name: the resolution error must carry a span.
         let stmts = parse(&lex("nope(1)").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined variable"));
@@ -2280,7 +2247,7 @@ print(r[1])
 
         // Non-callable callee value: "not callable" error must carry the callee span.
         let stmts = parse(&lex("(1)(2)").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("not callable"));
@@ -2290,16 +2257,16 @@ print(r[1])
     #[tokio::test]
     async fn let_binding_resolves() {
         let stmts = parse(&lex("let x = 5\nprint(x + 1)").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "6\n");
+        assert_eq!(interp.output(), "6\n");
     }
 
     #[tokio::test]
     async fn undefined_variable_errors_with_span() {
         let stmts = parse(&lex("print(missing)").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined variable 'missing'"));
@@ -2309,37 +2276,37 @@ print(r[1])
     #[tokio::test]
     async fn optional_semicolons_are_accepted() {
         let stmts = parse(&lex("let x = 1; print(x);").unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "1\n");
+        assert_eq!(interp.output(), "1\n");
     }
 
     #[tokio::test]
     async fn assignment_updates_a_mutable_binding() {
         let src = "let x = 1\nx = x + 4\nprint(x)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "5\n");
+        assert_eq!(interp.output(), "5\n");
     }
 
     #[tokio::test]
     async fn compound_assignment_runs() {
         let src = "let x = 10\nx *= 3\nprint(x)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "30\n");
+        assert_eq!(interp.output(), "30\n");
     }
 
     #[tokio::test]
     async fn assigning_to_const_errors() {
         let src = "const x = 1\nx = 2";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("immutable"));
@@ -2349,27 +2316,27 @@ print(r[1])
     async fn if_else_chooses_branch() {
         let src = "let x = 3\nif (x < 5) { print(\"small\") } else { print(\"big\") }";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "small\n");
+        assert_eq!(interp.output(), "small\n");
     }
 
     #[tokio::test]
     async fn else_if_chain() {
         let src = "let x = 7\nif (x < 5) { print(\"a\") } else if (x < 10) { print(\"b\") } else { print(\"c\") }";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "b\n");
+        assert_eq!(interp.output(), "b\n");
     }
 
     #[tokio::test]
     async fn block_scope_does_not_leak() {
         let src = "{ let y = 1 }\nprint(y)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined variable 'y'"));
@@ -2379,61 +2346,61 @@ print(r[1])
     async fn while_loop_accumulates() {
         let src = "let i = 1\nlet sum = 0\nwhile (i <= 5) { sum += i\ni += 1 }\nprint(sum)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "15\n");
+        assert_eq!(interp.output(), "15\n");
     }
 
     #[tokio::test]
     async fn for_range_iterates_half_open() {
         let src = "let sum = 0\nfor (i in 0..5) { sum += i }\nprint(sum)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         // 0 + 1 + 2 + 3 + 4
-        assert_eq!(interp.output, "10\n");
+        assert_eq!(interp.output(), "10\n");
     }
 
     #[tokio::test]
     async fn for_range_loop_var_is_scoped_per_iteration() {
         let src = "for (i in 0..3) { print(i) }";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "0\n1\n2\n");
+        assert_eq!(interp.output(), "0\n1\n2\n");
     }
 
     #[tokio::test]
     async fn break_exits_loop_early() {
         let src = "let sum = 0\nfor (i in 0..10) { if (i == 5) { break }\nsum += i }\nprint(sum)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "10\n"); // 0+1+2+3+4
+        assert_eq!(interp.output(), "10\n"); // 0+1+2+3+4
     }
 
     #[tokio::test]
     async fn continue_skips_iteration() {
         let src = "let sum = 0\nfor (i in 0..5) { if (i == 2) { continue }\nsum += i }\nprint(sum)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "8\n"); // 0+1+3+4
+        assert_eq!(interp.output(), "8\n"); // 0+1+3+4
     }
 
     #[tokio::test]
     async fn break_in_while() {
         let src = "let i = 0\nwhile (true) { if (i >= 3) { break }\ni += 1 }\nprint(i)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "3\n");
+        assert_eq!(interp.output(), "3\n");
     }
 
     #[tokio::test]
@@ -2451,20 +2418,20 @@ print(r[1])
     async fn calls_a_user_function() {
         let src = "fn add(a, b) { return a + b }\nprint(add(2, 3))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "5\n");
+        assert_eq!(interp.output(), "5\n");
     }
 
     #[tokio::test]
     async fn recursion_works() {
         let src = "fn fact(n) { if (n <= 1) { return 1 }\nreturn n * fact(n - 1) }\nprint(fact(5))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "120\n");
+        assert_eq!(interp.output(), "120\n");
     }
 
     #[tokio::test]
@@ -2472,17 +2439,17 @@ print(r[1])
         // makeAdder returns a function that closes over `x`.
         let src = "fn makeAdder(x) { fn adder(y) { return x + y }\nreturn adder }\nlet add10 = makeAdder(10)\nprint(add10(5))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "15\n");
+        assert_eq!(interp.output(), "15\n");
     }
 
     #[tokio::test]
     async fn arity_mismatch_errors() {
         let src = "fn f(a, b) { return a }\nf(1)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("expected 2 argument"));
@@ -2492,67 +2459,67 @@ print(r[1])
     async fn function_without_return_yields_nil() {
         let src = "fn noop() { let x = 1 }\nprint(noop())";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "nil\n");
+        assert_eq!(interp.output(), "nil\n");
     }
 
     #[tokio::test]
     async fn arrow_expression_body() {
         let src = "let double = x => x * 2\nprint(double(21))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "42\n");
+        assert_eq!(interp.output(), "42\n");
     }
 
     #[tokio::test]
     async fn arrow_multi_param_and_closure() {
         let src = "let base = 100\nlet f = (a, b) => a + b + base\nprint(f(1, 2))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "103\n");
+        assert_eq!(interp.output(), "103\n");
     }
 
     #[tokio::test]
     async fn arrow_block_body_with_return() {
         let src = "let f = (n) => { if (n > 0) { return \"pos\" }\nreturn \"nonpos\" }\nprint(f(5))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "pos\n");
+        assert_eq!(interp.output(), "pos\n");
     }
 
     #[tokio::test]
     async fn array_literal_and_indexing() {
         let src = "let a = [10, 20, 30]\nprint(a[0])\nprint(a[2])";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "10\n30\n");
+        assert_eq!(interp.output(), "10\n30\n");
     }
 
     #[tokio::test]
     async fn index_assignment() {
         let src = "let a = [1, 2, 3]\na[1] = 99\nprint(a[1])\nprint(a)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "99\n[1, 99, 3]\n");
+        assert_eq!(interp.output(), "99\n[1, 99, 3]\n");
     }
 
     #[tokio::test]
     async fn out_of_bounds_index_errors() {
         let src = "let a = [1]\nprint(a[5])";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("out of bounds"));
@@ -2562,27 +2529,27 @@ print(r[1])
     async fn object_literal_member_and_computed_access() {
         let src = "let o = { name: \"Ada\", age: 36 }\nprint(o.name)\nprint(o[\"age\"])\nprint(o.missing)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "Ada\n36\nnil\n");
+        assert_eq!(interp.output(), "Ada\n36\nnil\n");
     }
 
     #[tokio::test]
     async fn member_and_computed_assignment() {
         let src = "let o = { a: 1 }\no.b = 2\no[\"c\"] = 3\nprint(o.a + o.b + o.c)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "6\n");
+        assert_eq!(interp.output(), "6\n");
     }
 
     #[tokio::test]
     async fn member_of_nil_errors() {
         let src = "let x = nil\nprint(x.foo)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("cannot read property 'foo' of nil"));
@@ -2592,21 +2559,21 @@ print(r[1])
     async fn optional_chaining_short_circuits_on_nil() {
         let src = "let o = { a: nil }\nprint(o?.a)\nprint(o.a?.deep)\nprint((o.a ?? 42))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         // o?.a -> nil; o.a is nil so o.a?.deep -> nil; nil ?? 42 -> 42
-        assert_eq!(interp.output, "nil\nnil\n42\n");
+        assert_eq!(interp.output(), "nil\nnil\n42\n");
     }
 
     #[tokio::test]
     async fn optional_chaining_reads_when_present() {
         let src = "let o = { a: { b: 7 } }\nprint(o?.a?.b)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "7\n");
+        assert_eq!(interp.output(), "7\n");
     }
 
     #[tokio::test]
@@ -2614,10 +2581,10 @@ print(r[1])
         // a is nil: the WHOLE chain a?.b.c yields nil (not an error on .c).
         let src = "let a = nil\nprint(a?.b.c)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "nil\n");
+        assert_eq!(interp.output(), "nil\n");
     }
 
     #[tokio::test]
@@ -2625,10 +2592,10 @@ print(r[1])
         // present chain reads through; nil mid-chain short-circuits the rest.
         let src = "let o = { a: { b: [10, 20] } }\nprint(o?.a.b[1])\nlet z = nil\nprint(z?.a.b[1])";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "20\nnil\n");
+        assert_eq!(interp.output(), "20\nnil\n");
     }
 
     #[tokio::test]
@@ -2636,7 +2603,7 @@ print(r[1])
         // (a?.b) evaluates to nil, then .c on nil ERRORS (chain broken by parens).
         let src = "let a = nil\nprint((a?.b).c)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("cannot read property 'c' of nil"));
@@ -2646,27 +2613,27 @@ print(r[1])
     async fn for_of_iterates_array() {
         let src = "let total = 0\nfor (x of [10, 20, 30]) { total += x }\nprint(total)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "60\n");
+        assert_eq!(interp.output(), "60\n");
     }
 
     #[tokio::test]
     async fn for_of_iterates_string_chars() {
         let src = "let out = \"\"\nfor (c of \"abc\") { out = out + c + \".\" }\nprint(out)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "a.b.c.\n");
+        assert_eq!(interp.output(), "a.b.c.\n");
     }
 
     #[tokio::test]
     async fn for_of_non_iterable_errors() {
         let src = "for (x of 42) { print(x) }";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("not iterable"));
@@ -2676,47 +2643,47 @@ print(r[1])
     async fn template_string_interpolates() {
         let src = "let name = \"Ada\"\nlet n = 3\nprint(`hi ${name}, ${n + 1} times`)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "hi Ada, 4 times\n");
+        assert_eq!(interp.output(), "hi Ada, 4 times\n");
     }
 
     #[tokio::test]
     async fn nested_template_and_plain() {
         let src = "print(`outer ${ `inner ${1 + 1}` } end`)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "outer inner 2 end\n");
+        assert_eq!(interp.output(), "outer inner 2 end\n");
     }
 
     #[tokio::test]
     async fn inheritance_and_super() {
         let src = "class Animal {\n  fn init(name) { self.name = name }\n  fn speak() { return self.name + \" makes a sound\" }\n}\nclass Dog extends Animal {\n  fn init(name) { super.init(name) }\n  fn speak() { return super.speak() + \" - woof\" }\n}\nlet d = Dog(\"Rex\")\nprint(d.name)\nprint(d.speak())";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "Rex\nRex makes a sound - woof\n");
+        assert_eq!(interp.output(), "Rex\nRex makes a sound - woof\n");
     }
 
     #[tokio::test]
     async fn inherited_method_without_override() {
         let src = "class A { fn greet() { return \"hi\" } }\nclass B extends A {}\nlet b = B()\nprint(b.greet())";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "hi\n");
+        assert_eq!(interp.output(), "hi\n");
     }
 
     #[tokio::test]
     async fn undefined_superclass_errors() {
         let src = "class B extends Nope {}";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("undefined superclass"));
@@ -2726,18 +2693,18 @@ print(r[1])
     async fn named_type_contracts() {
         let src = "class Animal { fn init() { self.ok = true } }\nclass Dog extends Animal {}\nenum Color { Red, Green }\nfn pet(a: Animal): bool { return a.ok }\nlet d: Dog = Dog()\nprint(pet(d))\nlet c: Color = Color.Red\nprint(c.name)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         // Dog is-an Animal (subclass), so pet(d) passes; c: Color accepts a Color variant.
-        assert_eq!(interp.output, "true\nRed\n");
+        assert_eq!(interp.output(), "true\nRed\n");
     }
 
     #[tokio::test]
     async fn named_contract_rejects_wrong_type() {
         let src = "class Animal { fn init() {} }\nclass Plant { fn init() {} }\nfn pet(a: Animal) { return a }\npet(Plant())";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
         assert!(err.message.contains("type contract violated"));
@@ -2748,10 +2715,10 @@ print(r[1])
     async fn async_fn_and_await_surface() {
         let src = "async fn fetch(x) { return x * 2 }\nlet r = await fetch(21)\nprint(r)\nprint(await 5)\nlet g = async (n) => n + 1\nprint(await g(9))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output, "42\n5\n10\n");
+        assert_eq!(interp.output(), "42\n5\n10\n");
     }
 
     #[tokio::test]

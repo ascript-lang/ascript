@@ -342,7 +342,7 @@ fn captured_value(bytes: Vec<u8>, capture: Capture) -> Value {
 impl Interp {
     /// Module-level dispatch for `std/process` (`run`/`spawn`).
     pub(crate) async fn call_process(
-        &mut self,
+        &self,
         func: &str,
         args: &[Value],
         span: Span,
@@ -354,7 +354,7 @@ impl Interp {
         }
     }
 
-    async fn process_run(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
+    async fn process_run(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let cmd = want_string(&arg(args, 0), span, "process.run")?;
         let arg_list = match arg(args, 1) {
             Value::Nil => Vec::new(),
@@ -444,7 +444,7 @@ impl Interp {
         Ok(make_pair(obj(result), Value::Nil))
     }
 
-    async fn process_spawn(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
+    async fn process_spawn(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let cmd = want_string(&arg(args, 0), span, "process.spawn")?;
         let arg_list = match arg(args, 1) {
             Value::Nil => Vec::new(),
@@ -513,7 +513,7 @@ impl Interp {
     /// Dispatch a method on a process child / reader / writer handle.
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_process_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -528,7 +528,7 @@ impl Interp {
     }
 
     async fn child_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: &[Value],
         span: Span,
@@ -572,11 +572,15 @@ impl Interp {
                     None | Some(Value::Nil) => "KILL".to_string(),
                     Some(v) => want_string(v, span, "child.kill")?.to_string(),
                 };
-                let child = match self.process_child_mut(id) {
-                    Some(c) => c,
-                    None => return Err(use_after_close(span)),
+                // `kill_child` is synchronous; take the child out, signal it, and put
+                // it back so a later `wait()` can still reap the (now-dying) process.
+                let mut child = match self.take_resource(id) {
+                    Some(ResourceState::ChildProcess(c)) => c,
+                    _ => return Err(use_after_close(span)),
                 };
-                kill_child(child, &sig, span)?;
+                let res = kill_child(&mut child, &sig, span);
+                self.return_resource(id, ResourceState::ChildProcess(child));
+                res?;
                 Ok(Value::Nil)
             }
             other => Err(AsError::at(format!("childProcess has no method '{}'", other), span).into()),
@@ -584,7 +588,7 @@ impl Interp {
     }
 
     async fn reader_method(
-        &mut self,
+        &self,
         id: u64,
         method: &str,
         args: &[Value],
@@ -606,41 +610,46 @@ impl Interp {
                 // resource. (An empty read buffer yields Ok(0), which the match below
                 // treats as EOF and would finalize a still-open pipe.)
                 if n == 0 {
-                    let capture = match self.proc_reader_mut(id) {
-                        Some((_, c)) => c,
-                        None => return Ok(Value::Nil), // gone → EOF
+                    let capture = self.with_resource(id, |r| match r {
+                        Some(ResourceState::Reader { capture, .. }) => Some(*capture),
+                        _ => None,
+                    });
+                    return match capture {
+                        Some(capture) => Ok(captured_value(Vec::new(), capture)),
+                        None => Ok(Value::Nil), // gone → EOF
                     };
-                    return Ok(captured_value(Vec::new(), capture));
                 }
                 // A Reader degrades to EOF (nil) once its resource is gone, rather
-                // than panicking: EOF is a reader's natural terminal state.
-                let (reader, capture) = match self.proc_reader_mut(id) {
-                    Some(r) => r,
-                    None => return Ok(Value::Nil),
+                // than panicking: EOF is a reader's natural terminal state. Take it
+                // OUT so no table borrow is held across the await.
+                let (mut reader, capture) = match self.take_resource(id) {
+                    Some(ResourceState::Reader { reader, capture }) => (reader, capture),
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(Value::Nil);
+                    }
                 };
                 let mut buf = Vec::new();
                 match reader.read_upto(n, &mut buf).await {
-                    Ok(0) => {
-                        // EOF: finalize the reader so its pipe fd is dropped now.
-                        self.take_resource(id);
-                        Ok(Value::Nil)
+                    Ok(0) => Ok(Value::Nil), // EOF: drop the reader
+                    Ok(_) => {
+                        self.return_resource(id, ResourceState::Reader { reader, capture });
+                        Ok(captured_value(buf, capture))
                     }
-                    Ok(_) => Ok(captured_value(buf, capture)),
                     Err(e) => Err(AsError::at(format!("reader.read failed: {}", e), span).into()),
                 }
             }
             "readLine" => {
-                let (reader, capture) = match self.proc_reader_mut(id) {
-                    Some(r) => r,
-                    None => return Ok(Value::Nil), // gone → EOF
+                let (mut reader, capture) = match self.take_resource(id) {
+                    Some(ResourceState::Reader { reader, capture }) => (reader, capture),
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(Value::Nil); // gone → EOF
+                    }
                 };
                 let mut buf = Vec::new();
                 match reader.read_line_bytes(&mut buf).await {
-                    Ok(0) => {
-                        // EOF: finalize the reader so its pipe fd is dropped now.
-                        self.take_resource(id);
-                        Ok(Value::Nil)
-                    }
+                    Ok(0) => Ok(Value::Nil), // EOF: drop the reader
                     Ok(_) => {
                         // Strip a single trailing '\n' and an optional preceding '\r'.
                         if buf.last() == Some(&b'\n') {
@@ -649,6 +658,7 @@ impl Interp {
                                 buf.pop();
                             }
                         }
+                        self.return_resource(id, ResourceState::Reader { reader, capture });
                         Ok(captured_value(buf, capture))
                     }
                     Err(e) => Err(AsError::at(format!("reader.readLine failed: {}", e), span).into()),
@@ -659,18 +669,17 @@ impl Interp {
                 // net/tcp's readToEnd returns empty bytes. The divergence is cosmetic;
                 // a process reader has no retained `capture` once finalized, so an
                 // empty value can't be produced in the right Str/Bytes shape.
-                let (reader, capture) = match self.proc_reader_mut(id) {
-                    Some(r) => r,
-                    None => return Ok(Value::Nil), // gone → EOF
+                let (mut reader, capture) = match self.take_resource(id) {
+                    Some(ResourceState::Reader { reader, capture }) => (reader, capture),
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(Value::Nil); // gone → EOF
+                    }
                 };
                 let mut buf = Vec::new();
+                // readToEnd consumes the whole stream; we drop the reader either way.
                 match reader.read_to_end_bytes(&mut buf).await {
-                    Ok(_) => {
-                        // readToEnd consumes the whole stream: finalize the reader so
-                        // its pipe fd is dropped now.
-                        self.take_resource(id);
-                        Ok(captured_value(buf, capture))
-                    }
+                    Ok(_) => Ok(captured_value(buf, capture)),
                     Err(e) => Err(AsError::at(format!("reader.readToEnd failed: {}", e), span).into()),
                 }
             }
@@ -679,7 +688,7 @@ impl Interp {
     }
 
     async fn writer_method(
-        &mut self,
+        &self,
         id: u64,
         method: &str,
         args: &[Value],
@@ -688,11 +697,16 @@ impl Interp {
         match method {
             "write" => {
                 let data = data_to_bytes(&arg(args, 0), span, "writer.write")?;
-                let writer = match self.proc_writer_mut(id) {
-                    Some(w) => w,
-                    None => return Err(use_after_close(span)),
+                let mut writer = match self.take_resource(id) {
+                    Some(ResourceState::Writer(w)) => w,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Err(use_after_close(span));
+                    }
                 };
-                match writer.write_all(&data).await {
+                let res = writer.write_all(&data).await;
+                self.return_resource(id, ResourceState::Writer(writer));
+                match res {
                     Ok(_) => Ok(Value::Nil),
                     Err(e) => Err(AsError::at(format!("writer.write failed: {}", e), span).into()),
                 }
@@ -764,7 +778,7 @@ mod tests {
 
     /// Lex/parse/exec `src` against a caller-held `Interp` (so the resource table
     /// can be inspected afterward). Returns the interp for `resource_count()` checks.
-    async fn run_on(interp: &mut Interp, src: &str) {
+    async fn run_on(interp: &Interp, src: &str) {
         let tokens = crate::lexer::lex(src).expect("lex");
         let program = crate::parser::parse(&tokens).expect("parse");
         let env = crate::interp::global_env().child();
@@ -983,10 +997,10 @@ print(after)
         // Spawn + fully drain (readToEnd) + wait K children in a loop; afterward the
         // resource table must return to its baseline (every child + its stdin/stdout/
         // stderr stream resource reclaimed). Proves no fd accumulation.
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let baseline = interp.resource_count();
         run_on(
-            &mut interp,
+            &interp,
             r#"
 import { spawn } from "std/process"
 let i = 0

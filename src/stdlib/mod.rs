@@ -124,7 +124,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
 impl Interp {
     /// Dispatch a qualified stdlib builtin (`module` = "math", `func` = "abs").
     pub(crate) async fn call_stdlib(
-        &mut self,
+        &self,
         module: &str,
         func: &str,
         args: &[Value],
@@ -187,7 +187,7 @@ impl Interp {
     /// awaited here on the tokio loop; all other time functions are synchronous
     /// and delegate to `time::call`.
     pub(crate) async fn call_time(
-        &mut self,
+        &self,
         func: &str,
         args: &[Value],
         span: Span,

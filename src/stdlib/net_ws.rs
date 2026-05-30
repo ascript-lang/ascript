@@ -202,7 +202,7 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
 impl Interp {
     /// Module-level dispatch for `std/net/ws` (`connect`/`listen`).
     pub(crate) async fn call_net_ws(
-        &mut self,
+        &self,
         func: &str,
         args: &[Value],
         span: Span,
@@ -214,7 +214,7 @@ impl Interp {
         }
     }
 
-    async fn ws_connect(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
+    async fn ws_connect(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let url = want_string(&arg(args, 0), span, "net/ws.connect url")?;
         // opts.headers / opts.auth → handshake request headers (Tier-2 on misuse,
         // consistent with the std/net/http client). nil/absent opts → no headers.
@@ -252,7 +252,7 @@ impl Interp {
         }
     }
 
-    async fn ws_listen(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
+    async fn ws_listen(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let host = want_string(&arg(args, 0), span, "net/ws.listen host")?;
         let port = super::want_number(&arg(args, 1), span, "net/ws.listen port")?;
         if !(0.0..=65535.0).contains(&port) || port.fract() != 0.0 {
@@ -280,7 +280,7 @@ impl Interp {
     /// Dispatch a method on a WebSocket connection / listener handle.
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_ws_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -294,7 +294,7 @@ impl Interp {
     }
 
     async fn ws_conn_method(
-        &mut self,
+        &self,
         id: u64,
         method: &str,
         args: &[Value],
@@ -316,30 +316,39 @@ impl Interp {
                         .into());
                     }
                 };
-                let conn = match self.ws_conn_mut(id) {
-                    Some(c) => c,
-                    None => return Ok(err_pair("ws.send: connection is closed".to_string())),
+                // Take the connection OUT so no table borrow is held across the await.
+                let mut conn = match self.take_resource(id) {
+                    Some(ResourceState::WsConnection(c)) => c,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(err_pair("ws.send: connection is closed".to_string()));
+                    }
                 };
-                match conn.inner.send(msg).await {
+                let r = conn.inner.send(msg).await;
+                self.return_resource(id, ResourceState::WsConnection(conn));
+                match r {
                     Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
                     Err(e) => Ok(err_pair(format!("ws.send failed: {}", e))),
                 }
             }
             "recv" => {
+                // Take the connection OUT so no table borrow is held across the await.
                 // A closed/finalized connection degrades to nil rather than panicking.
-                if self.ws_conn_mut(id).is_none() {
-                    return Ok(make_pair(Value::Nil, Value::Nil));
-                }
+                let mut conn = match self.take_resource(id) {
+                    Some(ResourceState::WsConnection(c)) => c,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(make_pair(Value::Nil, Value::Nil));
+                    }
+                };
                 loop {
-                    let conn = match self.ws_conn_mut(id) {
-                        Some(c) => c,
-                        None => return Ok(make_pair(Value::Nil, Value::Nil)),
-                    };
                     match conn.inner.next().await {
                         Some(Ok(Message::Text(s))) => {
+                            self.return_resource(id, ResourceState::WsConnection(conn));
                             return Ok(make_pair(Value::Str(s.into()), Value::Nil));
                         }
                         Some(Ok(Message::Binary(b))) => {
+                            self.return_resource(id, ResourceState::WsConnection(conn));
                             return Ok(make_pair(bytes_value(b), Value::Nil));
                         }
                         // Control frames are handled by tungstenite (it auto-replies to
@@ -347,17 +356,15 @@ impl Interp {
                         Some(Ok(Message::Ping(_)))
                         | Some(Ok(Message::Pong(_)))
                         | Some(Ok(Message::Frame(_))) => continue,
-                        // Peer sent a Close frame, or the stream ended: finalize and
-                        // report end-of-connection as nil.
+                        // Peer sent a Close frame, or the stream ended: drop the conn
+                        // and report end-of-connection as nil.
                         Some(Ok(Message::Close(_))) | None => {
-                            self.take_resource(id);
                             return Ok(make_pair(Value::Nil, Value::Nil));
                         }
                         Some(Err(e)) => {
                             // A transport-level reset after the peer is gone is an EOF
-                            // for our purposes: finalize and surface nil, not a Tier-1
-                            // err (matches the tcp reader's EOF-as-nil contract).
-                            self.take_resource(id);
+                            // for our purposes: drop the conn and surface nil, not a
+                            // Tier-1 err (matches the tcp reader's EOF-as-nil contract).
                             if matches!(
                                 e,
                                 WsError::ConnectionClosed | WsError::AlreadyClosed
@@ -370,11 +377,10 @@ impl Interp {
                 }
             }
             "close" => {
-                // Send a Close frame (best-effort), then finalize the handle.
-                if let Some(conn) = self.ws_conn_mut(id) {
+                // Send a Close frame (best-effort), then drop the handle.
+                if let Some(ResourceState::WsConnection(mut conn)) = self.take_resource(id) {
                     let _ = conn.inner.close().await;
                 }
-                self.take_resource(id);
                 Ok(make_pair(Value::Nil, Value::Nil))
             }
             other => Err(AsError::at(format!("wsConnection has no method '{}'", other), span).into()),
@@ -382,7 +388,7 @@ impl Interp {
     }
 
     async fn ws_listener_method(
-        &mut self,
+        &self,
         id: u64,
         method: &str,
         _args: &[Value],
@@ -390,11 +396,17 @@ impl Interp {
     ) -> Result<Value, Control> {
         match method {
             "accept" => {
-                let listener = match self.ws_listener_mut(id) {
-                    Some(l) => l,
-                    None => return Ok(err_pair("ws listener.accept: listener is closed".to_string())),
+                let listener = match self.take_resource(id) {
+                    Some(ResourceState::WsListener(l)) => l,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(err_pair("ws listener.accept: listener is closed".to_string()));
+                    }
                 };
-                let (tcp, _peer) = match listener.accept().await {
+                let accepted = listener.accept().await;
+                // The listener keeps accepting: put it back before the handshake.
+                self.return_resource(id, ResourceState::WsListener(listener));
+                let (tcp, _peer) = match accepted {
                     Ok(pair) => pair,
                     Err(e) => return Ok(err_pair(format!("ws listener.accept failed: {}", e))),
                 };
@@ -428,7 +440,7 @@ mod tests {
 
     /// Lex/parse/exec `src` against a caller-held `Interp` (so the resource table
     /// can be inspected afterward).
-    async fn run_on(interp: &mut Interp, src: &str) {
+    async fn run_on(interp: &Interp, src: &str) {
         let tokens = crate::lexer::lex(src).expect("lex");
         let program = crate::parser::parse(&tokens).expect("parse");
         let env = crate::interp::global_env().child();
@@ -695,7 +707,7 @@ print(err != nil)
     #[tokio::test]
     async fn connection_resource_reclaimed_after_close() {
         let port = spawn_ws_echo_server().await;
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let baseline = interp.resource_count();
         let src = format!(
             r#"
@@ -706,7 +718,7 @@ let [_m, _r] = await conn.recv()
 conn.close()
 "#
         );
-        run_on(&mut interp, &src).await;
+        run_on(&interp, &src).await;
         assert_eq!(interp.resource_count(), baseline, "connection should be reclaimed on close");
     }
 
@@ -715,7 +727,7 @@ conn.close()
         // AScript binds + accepts + echoes; a raw tungstenite CLIENT connects to
         // wsListener.port, sends a message, and verifies the echo. Uses the
         // reserve-port pattern from net_tcp so the client can retry-connect.
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = reserve.local_addr().unwrap().port();
         drop(reserve);
@@ -752,10 +764,10 @@ conn.close()
 server.close()
 "#
         );
-        run_on(&mut interp, &src).await;
+        run_on(&interp, &src).await;
         let reply = client.await.unwrap();
         assert_eq!(reply, "ping");
-        assert_eq!(interp.output, "nil\ntrue\nnil\nping\n");
+        assert_eq!(interp.output(), "nil\ntrue\nnil\nping\n");
     }
 
     #[tokio::test]

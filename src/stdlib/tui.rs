@@ -310,7 +310,7 @@ fn use_after_close(span: Span) -> Control {
 impl Interp {
     /// Module-level dispatch for `std/tui` (`init`).
     pub(crate) fn call_tui(
-        &mut self,
+        &self,
         func: &str,
         args: &[Value],
         span: Span,
@@ -324,7 +324,7 @@ impl Interp {
 
     /// `init() -> [term, err]`. Query the terminal size (80×24 fallback on a
     /// non-tty), build a `TerminalState` sized to it, register the handle.
-    fn tui_init(&mut self) -> Result<Value, Control> {
+    fn tui_init(&self) -> Result<Value, Control> {
         let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
         let state = TerminalState::new(w, h);
         let handle = self.register_resource(
@@ -347,7 +347,7 @@ impl Interp {
     /// `buffer` returns the handle DIRECTLY: the only failure is arg/size misuse,
     /// which is a Tier-2 panic (per `want_dim`: non-number / non-integer / negative /
     /// zero / > u16::MAX). A `[term, err]` pair here would be pure noise.
-    fn tui_buffer(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
+    fn tui_buffer(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let w = want_dim(&super::arg(args, 0), span, "tui.buffer width")?;
         let h = want_dim(&super::arg(args, 1), span, "tui.buffer height")?;
         let state = TerminalState::new(w, h);
@@ -362,7 +362,7 @@ impl Interp {
     /// Dispatch a method on a `Terminal` handle. Async-signature for dispatch
     /// uniformity though every Task-1 op is synchronous.
     pub(crate) async fn call_terminal_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -414,14 +414,14 @@ impl Interp {
                 Ok(Value::Object(Rc::new(std::cell::RefCell::new(map))))
             }
             "clear" => {
-                let state = self.terminal_mut(id).expect("checked present");
+                let mut state = self.terminal_mut(id).expect("checked present");
                 state.back.clear();
                 Ok(Value::Nil)
             }
             "moveCursor" => {
                 let x = want_u16(&super::arg(&args, 0), span, "terminal.moveCursor x")?;
                 let y = want_u16(&super::arg(&args, 1), span, "terminal.moveCursor y")?;
-                let state = self.terminal_mut(id).expect("checked present");
+                let mut state = self.terminal_mut(id).expect("checked present");
                 state.cursor = (x, y);
                 Ok(Value::Nil)
             }
@@ -549,15 +549,20 @@ impl Interp {
                 Ok(Value::Nil)
             }
             "flush" => {
-                let state = self.terminal_mut(id).expect("checked present");
-                // Pure diff first (unit-tested separately), then the crossterm write.
-                let changes = state.back.diff(&state.flushed);
-                let cursor = state.cursor;
+                // Scope each `terminal_mut` (a RefMut guard) so it drops before the
+                // next borrow — a RefMut can't be live twice on the same cell.
+                let (changes, cursor) = {
+                    let state = self.terminal_mut(id).expect("checked present");
+                    // Pure diff first (unit-tested separately), then the crossterm write.
+                    (state.back.diff(&state.flushed), state.cursor)
+                };
                 let res = flush_changes(&changes, cursor);
                 // Sync flushed←back regardless of write outcome (the back buffer is
                 // the source of truth; a failed write just means the screen may lag).
-                let state = self.terminal_mut(id).expect("checked present");
-                state.flushed = state.back.clone();
+                {
+                    let mut state = self.terminal_mut(id).expect("checked present");
+                    state.flushed = state.back.clone();
+                }
                 match res {
                     Ok(()) => Ok(make_pair(Value::Nil, Value::Nil)),
                     Err(e) => Ok(err_pair(format!("terminal.flush failed: {}", e))),
@@ -634,9 +639,9 @@ impl Interp {
     /// a resize anyway); `flushed` is also cleared so the next flush fully repaints
     /// the resized screen. Non-resize events are ignored. The handle is assumed
     /// live (every event caller has already passed the presence check).
-    fn apply_event_resize(&mut self, id: u64, ev: &crossterm::event::Event) {
+    fn apply_event_resize(&self, id: u64, ev: &crossterm::event::Event) {
         if let crossterm::event::Event::Resize(w, h) = ev {
-            if let Some(state) = self.terminal_mut(id) {
+            if let Some(mut state) = self.terminal_mut(id) {
                 state.back = Buffer::new(*w, *h);
                 state.flushed = Buffer::new(*w, *h);
                 // Keep the logical cursor inside the new bounds (tidiness).

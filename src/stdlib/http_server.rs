@@ -433,7 +433,7 @@ fn serialize_response(resp: &HttpResponse) -> Vec<u8> {
 impl Interp {
     /// Module-level dispatch for `std/http/server` (`create`).
     pub(crate) async fn call_http_server(
-        &mut self,
+        &self,
         func: &str,
         _args: &[Value],
         span: Span,
@@ -462,7 +462,7 @@ impl Interp {
     /// Dispatch a method on an HTTP server handle (`route`/`use`/`bind`/`serve`/`listen`).
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_http_server_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -478,7 +478,7 @@ impl Interp {
                     return Err(AsError::at("server.route handler must be a function", span).into());
                 }
                 match self.http_server_mut(id) {
-                    Some(s) => s.routes.push((method, path, handler)),
+                    Some(mut s) => s.routes.push((method, path, handler)),
                     None => return Err(AsError::at("server.route: server is closed", span).into()),
                 }
                 Ok(server)
@@ -489,7 +489,7 @@ impl Interp {
                     return Err(AsError::at("server.use middleware must be a function", span).into());
                 }
                 match self.http_server_mut(id) {
-                    Some(s) => s.middleware.push(mw),
+                    Some(mut s) => s.middleware.push(mw),
                     None => return Err(AsError::at("server.use: server is closed", span).into()),
                 }
                 Ok(server)
@@ -505,7 +505,7 @@ impl Interp {
                     Ok(listener) => {
                         let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                         match self.http_server_mut(id) {
-                            Some(s) => s.listener = Some(listener),
+                            Some(mut s) => s.listener = Some(listener),
                             None => return Ok(err_pair("server.bind: server is closed".into())),
                         }
                         Ok(make_pair(Value::Number(bound as f64), Value::Nil))
@@ -542,7 +542,7 @@ impl Interp {
 
     /// Run the accept loop on the bound listener, handling requests sequentially.
     async fn http_server_serve(
-        &mut self,
+        &self,
         id: u64,
         args: &[Value],
         span: Span,
@@ -574,7 +574,7 @@ impl Interp {
         // Take the listener out of the resource so we own it across awaits (the
         // resource table can't lend `&mut TcpListener` across a `call_value`).
         let listener = match self.http_server_mut(id) {
-            Some(s) => match s.listener.take() {
+            Some(mut s) => match s.listener.take() {
                 Some(l) => l,
                 None => {
                     return Ok(err_pair("server.serve: not bound (call bind/listen first)".into()))
@@ -636,7 +636,7 @@ impl Interp {
     /// Build the request object, run the middleware chain → matched handler, and
     /// convert the result into an `HttpResponse`.
     async fn dispatch_request(
-        &mut self,
+        &self,
         id: u64,
         req: RawRequest,
         span: Span,
@@ -721,7 +721,7 @@ impl Interp {
     /// Returns the response value.
     #[async_recursion::async_recursion(?Send)]
     async fn run_chain(
-        &mut self,
+        &self,
         middleware: Vec<Value>,
         index: usize,
         handler: Value,
@@ -760,7 +760,7 @@ impl Interp {
     /// pass a (possibly replaced) request object onward (`next(req)`); with no
     /// argument the original request is forwarded.
     pub(crate) async fn call_http_next(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -802,7 +802,7 @@ mod tests {
 
     /// Run an AScript program on a caller-held interp (so we can drive `serve` and
     /// inspect output). Returns the captured output.
-    async fn run_on(interp: &mut Interp, src: &str) -> Result<(), String> {
+    async fn run_on(interp: &Interp, src: &str) -> Result<(), String> {
         let tokens = crate::lexer::lex(src).map_err(|e| e.message)?;
         let program = crate::parser::parse(&tokens).map_err(|e| e.message)?;
         let env = crate::interp::global_env().child();
@@ -827,8 +827,8 @@ mod tests {
         T: Send + 'static,
     {
         let client_task = tokio::spawn(client());
-        let mut interp = Interp::new();
-        run_on(&mut interp, src).await.unwrap_or_else(|e| panic!("server: {e}"));
+        let interp = Interp::new();
+        run_on(&interp, src).await.unwrap_or_else(|e| panic!("server: {e}"));
         client_task.await.unwrap()
     }
 
@@ -1061,13 +1061,13 @@ print(out)
         let client = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async move {
-                let mut interp = Interp::new();
-                run_on(&mut interp, &client_src).await.expect("client ran");
-                interp.output.clone()
+                let interp = Interp::new();
+                run_on(&interp, &client_src).await.expect("client ran");
+                interp.output()
             })
         });
-        let mut interp = Interp::new();
-        run_on(&mut interp, &server_src).await.expect("server ran");
+        let interp = Interp::new();
+        run_on(&interp, &server_src).await.expect("server ran");
         let client_out = client.join().unwrap();
         assert_eq!(client_out, "from-server\n");
     }
@@ -1089,9 +1089,9 @@ await s.serve({{ maxRequests: 1 }})
         );
         let url = format!("http://127.0.0.1:{port}/x");
         let client = tokio::spawn(async move { client_request("GET", &url, None).await });
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let baseline = interp.resource_count();
-        run_on(&mut interp, &src).await.expect("server ran");
+        run_on(&interp, &src).await.expect("server ran");
         client.await.unwrap();
         // The server handle itself was closed implicitly? No — `create()`'s handle
         // outlives the program, but the transient next-continuation must be gone.
