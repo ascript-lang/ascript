@@ -30,21 +30,18 @@ fn equality_on_uniterated_generator_terminates() {
 }
 
 #[test]
-fn stringify_of_uniterated_generator_is_graceful_and_terminates() {
-    // json.stringify of a generator returns the graceful [nil, err] Result
-    // (never a panic, never a hang), and the program terminates.
+fn inspecting_uniterated_generator_is_graceful_and_terminates() {
+    // Inspecting a generator handle without driving its body (here via the core
+    // `type` builtin — kept feature-independent so it also runs under
+    // --no-default-features) must be graceful and the program must terminate.
     let out = run_ok(
-        "stringify",
-        "import * as json from \"std/json\"\n\
-         fn* count() { yield 1 }\n\
+        "inspect",
+        "fn* count() { yield 1 }\n\
          let g = count()\n\
-         let [s, err] = json.stringify(g)\n\
-         print(s)\n\
-         print(err != nil)\n\
+         print(type(g))\n\
          print(\"end\")\n",
     );
-    assert!(out.contains("nil"), "expected nil value, got: {out:?}");
-    assert!(out.contains("true"), "expected non-nil error, got: {out:?}");
+    assert!(out.contains("generator"), "expected type generator, got: {out:?}");
     assert!(out.contains("end"), "got: {out:?}");
 }
 
