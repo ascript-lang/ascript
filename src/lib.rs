@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod coro;
 pub mod diagnostics;
 pub mod env;
 pub mod error;
