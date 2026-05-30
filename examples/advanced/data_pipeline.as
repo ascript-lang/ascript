@@ -60,7 +60,8 @@ fn main() {
   // Keep only records that actually sold something.
   let sold = array.filter(cleaned, (x) => x.units > 0)
 
-  // Derive a unit price per record (map).
+  // Derive a unit price and a volume tier per record. The tier uses a
+  // (right-associative) ternary chain as a compact if/else-if ladder.
   let priced = array.map(sold, (x) => {
     return {
       name: x.name,
@@ -68,6 +69,7 @@ fn main() {
       units: x.units,
       revenue: x.revenue,
       unitPrice: x.revenue / x.units,
+      tier: x.units >= 100 ? "high" : x.units >= 25 ? "mid" : "low",
     }
   })
 

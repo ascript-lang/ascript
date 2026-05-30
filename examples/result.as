@@ -16,6 +16,11 @@ let bad = compute(100, 0, 2)
 print(bad[0])
 print(bad[1].message)
 
+// The ternary `cond ? then : else` reuses `?` (the line above uses `?` for
+// propagation): a `:` after the `?` makes it a conditional, not propagation.
+let status = bad[1] == nil ? "ok" : "failed"
+print(status)
+
 fn willPanic() {
   let arr = [1, 2]
   return arr[99]

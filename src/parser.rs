@@ -558,7 +558,7 @@ impl<'a> Parser<'a> {
             return Ok(arrow);
         }
 
-        let target = self.coalesce()?;
+        let target = self.ternary()?;
 
         // Map a compound-assignment token to the binary op it desugars to.
         let compound = match self.peek() {
@@ -692,6 +692,55 @@ impl<'a> Parser<'a> {
         } else {
             Ok(ArrowBody::Expr(Box::new(self.assignment()?)))
         }
+    }
+
+    /// The conditional operator `cond ? then : els` (grammar PREC.ternary, just
+    /// above assignment). Right-associative: `a ? b : c ? d : e` parses as
+    /// `a ? b : (c ? d : e)`.
+    ///
+    /// `?` is overloaded — it is also the postfix Result-propagation operator
+    /// (`expr?`, parsed in `postfix`). They are disambiguated by
+    /// `question_begins_ternary`, which `postfix` consults so it never swallows a
+    /// ternary `?` as a `Try`. By the time control reaches here, any `?` left
+    /// unconsumed by `postfix` is therefore a ternary, so a bare token check suffices.
+    fn ternary(&mut self) -> Result<Expr, AsError> {
+        let cond = self.coalesce()?;
+        if *self.peek() == Tok::Question {
+            self.advance(); // `?`
+            let then = self.assignment()?;
+            self.eat(&Tok::Colon)?;
+            // Right-associative: the `else` branch may itself be a ternary.
+            let els = self.assignment()?;
+            let span = Span::new(cond.span.start, els.span.end);
+            return Ok(Expr {
+                kind: ExprKind::Ternary {
+                    cond: Box::new(cond),
+                    then: Box::new(then),
+                    els: Box::new(els),
+                },
+                span,
+            });
+        }
+        Ok(cond)
+    }
+
+    /// Decide whether the `?` at the current position begins a ternary
+    /// (vs. a postfix `Try`) by **speculatively parsing**: it is a ternary iff a
+    /// consequent expression parses and is immediately followed by `:`. The trial
+    /// parse is always rolled back via `self.pos`.
+    ///
+    /// Using the real expression grammar (rather than a raw token scan) makes this
+    /// respect statement boundaries automatically — `a?` followed by an adjacent
+    /// `b ? c : d` statement does not fuse, and a `Try` result used as a ternary
+    /// condition (`g()? ? a : b`) resolves correctly — matching the tree-sitter
+    /// grammar's GLR resolution.
+    fn question_begins_ternary(&mut self) -> bool {
+        debug_assert_eq!(*self.peek(), Tok::Question);
+        let saved = self.pos;
+        self.advance(); // consume `?`
+        let begins = self.assignment().is_ok() && *self.peek() == Tok::Colon;
+        self.pos = saved; // roll back the trial parse unconditionally
+        begins
     }
 
     fn coalesce(&mut self) -> Result<Expr, AsError> {
@@ -904,6 +953,11 @@ impl<'a> Parser<'a> {
                     expr = Expr { kind: ExprKind::OptMember { object: Box::new(expr), name }, span };
                 }
                 Tok::Question => {
+                    // `?` is overloaded: postfix `Try` here, or the start of a
+                    // ternary. Defer the latter to `ternary()` by leaving it.
+                    if self.question_begins_ternary() {
+                        break;
+                    }
                     self.advance();
                     let span = Span::new(expr.span.start, self.prev_end());
                     expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
@@ -1237,5 +1291,45 @@ mod tests {
         assert_eq!(sexpr("async (a, b) => a + b"), "(arrow [a b])");
         let stmts = parse(&lex("let g = async (n) => n + 1").unwrap()).unwrap();
         assert!(matches!(&stmts[0], Stmt::Let { .. }));
+    }
+
+    #[test]
+    fn parses_ternary() {
+        assert_eq!(sexpr("a ? b : c"), "(?: a b c)");
+        // Right-associative: a ? b : (c ? d : e)
+        assert_eq!(sexpr("a ? b : c ? d : e"), "(?: a b (?: c d e))");
+        // Binds looser than every binary op: (a + 1) ? (b * 2) : c
+        assert_eq!(sexpr("a + 1 ? b * 2 : c"), "(?: (+ a 1) (* b 2) c)");
+        // Looser than `??`.
+        assert_eq!(sexpr("a ?? b ? c : d"), "(?: (?? a b) c d)");
+        // A parenthesized ternary as the condition stays grouped.
+        assert_eq!(sexpr("(a ? b : c) ? d : e"), "(?: (?: a b c) d e)");
+    }
+
+    #[test]
+    fn ternary_vs_postfix_try_disambiguation() {
+        // No following `:` → the `?` is a postfix Try, not a ternary.
+        assert_eq!(sexpr("f()?"), "(? (call f))");
+        // Try as a call argument (closing `)` before any `:`).
+        assert_eq!(sexpr("g(f()?)"), "(call g (? (call f)))");
+        // Try followed by subtraction — the `-` does NOT make it a ternary.
+        assert_eq!(sexpr("a? - b"), "(- (? a) b)");
+        // But a real ternary with a negative consequent is a ternary.
+        assert_eq!(sexpr("a ? -b : c"), "(?: a (- b) c)");
+        // A `:` belonging to a *later* statement must not be captured: here the
+        // `?` is a Try and the `let y: T` colon is in the next statement.
+        let stmts = parse(&lex("let x = f()?\nlet y: number = 9").unwrap()).unwrap();
+        assert!(matches!(&stmts[0], Stmt::Let { .. }));
+        assert!(matches!(&stmts[1], Stmt::Let { .. }));
+
+        // A `Try` result used directly as a ternary condition: `g()? ? a : b`.
+        assert_eq!(sexpr("g()? ? a : b"), "(?: (? (call g)) a b)");
+
+        // A bare `expr?` statement followed by an adjacent ternary statement (no
+        // separator) must NOT fuse — the scan respects statement boundaries.
+        let stmts = parse(&lex("a?\nb ? c : d").unwrap()).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(matches!(&stmts[0], Stmt::Expr(e) if matches!(e.kind, ExprKind::Try(_))));
+        assert!(matches!(&stmts[1], Stmt::Expr(e) if matches!(e.kind, ExprKind::Ternary { .. })));
     }
 }

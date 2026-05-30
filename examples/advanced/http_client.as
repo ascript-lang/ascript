@@ -29,10 +29,8 @@ async fn showJson(label, path, opts) {
     print(`${label}: ${resp.status} but body was not JSON`)
     return
   }
-  let okLabel = "not-ok"
-  if (resp.ok) { okLabel = "OK" }
   let [s, _] = json.stringify(data)
-  print(`${label}: ${resp.status} ${okLabel} -> ${s}`)
+  print(`${label}: ${resp.status} ${resp.ok ? "OK" : "not-ok"} -> ${s}`)
 }
 
 async fn main() {

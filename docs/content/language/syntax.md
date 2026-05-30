@@ -40,6 +40,7 @@ elements pushed).
 == != <  <= >  >=        comparison
 && || !                  logical (short-circuit)
 ?? ?.                    nil-coalescing / optional chaining
+?  :                     conditional (ternary)  — cond ? then : else
 =  += -= *= /=           assignment (and compound)
 ?                        postfix Result propagation (see Errors)
 ..                       range
@@ -148,3 +149,31 @@ cfg?.cache?.ttl ?? 60   // 60 — fall back to a default
 > [!NOTE] Reading a *missing* key of an existing object returns `nil` (not a panic) — e.g.
 > `({a: 1}).b` is `nil`. Only a `nil` *receiver* and an out-of-bounds `arr[i]` index panic. Use
 > `?.` when the receiver itself might be `nil`.
+
+## Conditional expressions (the ternary)
+
+`cond ? then : else` is an **expression** that evaluates `cond` and yields one of the two branches —
+only the selected branch runs (like `&&`/`||`, it short-circuits).
+
+```ascript
+let label = score >= 90 ? "A" : "B"
+let access = user == nil ? "guest" : user.role
+
+// Use it inline, e.g. inside a template:
+print(`status: ${ok ? "up" : "down"}`)
+```
+
+It binds looser than every other operator except assignment, and is **right-associative**, so it
+chains cleanly as an `if`/`else if`/`else` ladder:
+
+```ascript
+let sign = n < 0 ? "negative"
+         : n == 0 ? "zero"
+         : "positive"
+```
+
+> [!NOTE] `?` is overloaded: as a ternary here, and as the postfix
+> [Result-propagation](errors#the-propagation-operator) operator (`expr?`). They never collide —
+> a `?` is a ternary only when a `:` follows it; otherwise it propagates. So `a ? -b : c` is a
+> ternary, while `f()? - 1` propagates the result of `f()` and then subtracts. For the verbose case
+> with many branches, [`match`](classes-enums#match) is often clearer.

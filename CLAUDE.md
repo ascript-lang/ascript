@@ -28,13 +28,21 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
   fs, process, datetime, tui, plus HTTP/WebSocket/SSE client+server pairs). Verify with
   `target/release/ascript run <file>`.
 
-> Language gotchas worth knowing when writing `.as` code or docs: there is **no ternary** (`?` is
-> postfix Result-propagation only — use `if/else`); `print` output is **buffered and flushed at
-> program exit** (a forever-looping server won't stream logs live — use `serve({maxRequests:N})`).
-> Note: template `${…}` interpolation *does* fully support nested string literals (incl. strings
-> containing `}`/`{`/`${` and nested templates) — see the `template_interpolation_*` lexer/interp
-> tests. (An earlier draft of this file wrongly listed that as a limitation; the real cause of that
-> failure was the missing ternary.)
+> Language notes worth knowing when writing `.as` code or docs: `print` output is **buffered and
+> flushed at program exit** (a forever-looping server won't stream logs live — use
+> `serve({maxRequests:N})`). Template `${…}` interpolation fully supports nested string literals
+> (incl. strings containing `}`/`{`/`${` and nested templates) — see the `template_interpolation_*`
+> tests.
+>
+> **`?` is overloaded** and parsed in two places: postfix Result-propagation (`expr?`, in
+> `postfix()`) and the ternary `cond ? then : els` (in `ternary()`, just above assignment). They're
+> disambiguated by `is_ternary_question()` — a `?` is a ternary only when a `:` follows at
+> bracket-depth 0 before the statement ends; otherwise it's a `Try`. So `a ? -b : c` is a ternary
+> but `f()? - 1` is propagate-then-subtract. The tree-sitter grammar mirrors this via a declared GLR
+> conflict (`[$._expression, $.propagate_expression]`); **regenerate `parser.c` with
+> `tree-sitter generate --abi 14`** after any grammar change. When touching `ExprKind`, the
+> exhaustive matches in `interp.rs` (eval), `fmt.rs` (`write_expr_inner`), and `ast.rs` (`Display`)
+> must each get an arm.
 
 ## Commands
 

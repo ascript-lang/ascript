@@ -294,6 +294,9 @@ const PREC_ATOM: u8 = 12;
 fn expr_prec(e: &Expr) -> u8 {
     match &e.kind {
         ExprKind::Assign { .. } => PREC_ASSIGN,
+        // The ternary binds just above assignment (looser than every binary op),
+        // so it shares the lowest tier here.
+        ExprKind::Ternary { .. } => PREC_ASSIGN,
         ExprKind::Arrow { .. } => PREC_ASSIGN,
         ExprKind::Binary { op, .. } => bin_prec(*op),
         ExprKind::Unary { .. } => PREC_UNARY,
@@ -445,6 +448,16 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
         ExprKind::Try(inner) => {
             write_expr(out, inner, PREC_POSTFIX);
             out.push('?');
+        }
+        ExprKind::Ternary { cond, then, els } => {
+            // `cond` and `then` bind one tier above the ternary so a nested
+            // ternary there is parenthesized; the right-associative `els` does
+            // not need parentheses for a chained ternary.
+            write_expr(out, cond, PREC_ASSIGN + 1);
+            out.push_str(" ? ");
+            write_expr(out, then, PREC_ASSIGN + 1);
+            out.push_str(" : ");
+            write_expr(out, els, PREC_ASSIGN);
         }
         ExprKind::Template { parts } => {
             out.push('`');
@@ -601,6 +614,35 @@ mod tests {
     fn formats_canonically() {
         let out = format_source("let x=1").unwrap();
         assert_eq!(out, "let x = 1\n");
+    }
+
+    #[test]
+    fn formats_ternary() {
+        // Canonical spacing.
+        assert_eq!(format_source("let x=a?b:c").unwrap(), "let x = a ? b : c\n");
+        // Right-associative chain renders without redundant parentheses…
+        assert_eq!(
+            format_source("let x = a ? b : c ? d : e").unwrap(),
+            "let x = a ? b : c ? d : e\n"
+        );
+        // …but a ternary used as the condition keeps its parentheses.
+        assert_eq!(
+            format_source("let x = (a ? b : c) ? d : e").unwrap(),
+            "let x = (a ? b : c) ? d : e\n"
+        );
+        // Idempotent + still parses for several shapes (incl. a postfix Try nearby).
+        for src in [
+            "a ? b : c",
+            "cond ? -1 : 1",
+            "a ? b : c ? d : e",
+            "f(x > 0 ? \"pos\" : \"neg\")",
+            "let v = ok ? data : fallback",
+        ] {
+            let once = format_source(src).unwrap();
+            let twice = format_source(&once).unwrap();
+            assert_eq!(once, twice, "fmt not idempotent for: {src}");
+            assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+        }
     }
 
     #[test]

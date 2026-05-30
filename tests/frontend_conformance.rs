@@ -98,6 +98,11 @@ fn interpreter_parses_each_grammar_construct() {
         "let mem = o.a.b",
         "let ch = o?.a?.b",
         "let tryp = readFile(p)?",
+        // --- ternary conditional (and its disambiguation from postfix `?`) ---
+        "let tern = a ? b : c",
+        "let chain = a ? b : c ? d : e",
+        "let neg = cond ? -1 : 1",
+        "let mix = (x > 0 ? \"pos\" : \"neg\")",
         "o.method(1)",
         "fn m() { return self.x }",
         // --- arrow functions: single / multi / async ---
