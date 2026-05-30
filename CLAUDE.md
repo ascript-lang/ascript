@@ -85,13 +85,20 @@ point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_sourc
   schedules** the body via `tokio::task::spawn_local` (`self.rc()` yields an owned `Rc<Interp>` via a
   self-`Weak` installed by `install_self`); `await` drives a future to completion (`await` on a
   non-future is identity). Entry points (`run_file`/`run_source`/`run_tests` in `src/lib.rs`, repl) do
-  `local.run_until(root).await; local.await;` — the trailing drain runs spawned tasks to completion
-  (structured shutdown). **Invariant: never hold a `RefCell` borrow across an `.await`** (enforced by
-  clippy `await_holding_refcell_ref = "deny"` in `Cargo.toml`); for native resources use the
-  take-out-across-await pattern (`take_resource` → await on the owned value → `return_resource`).
-- **Concurrency primitives:** `src/task.rs` has `SharedFuture` (the completion cell backing
-  `Value::Future`, carrying `Result<Value, Control>` so panics cross the task boundary). `std/task`
-  (`src/stdlib/task_mod.rs`) provides `spawn`/`gather`/`race`/`timeout` as pure library functions over
+  `local.run_until(root).await; local.await;`. **Invariant: never hold a `RefCell` borrow across an
+  `.await`** (enforced by clippy `await_holding_refcell_ref = "deny"` in `Cargo.toml`); for native
+  resources use the take-out-across-await pattern (`take_resource` → await on the owned value →
+  `return_resource`).
+- **Structured concurrency / cancel-on-drop:** an async task's lifetime is bound to its
+  `Value::Future` handle — dropping the last handle aborts the task (so an un-awaited, un-held async
+  call is cancelled, not orphaned). `task.spawn` is the explicit detach (fire-and-forget); `race`
+  cancels losers; `timeout` cancels the timed-out work. A cooperative yield above `INFLIGHT_YIELD_CAP`
+  reaps finished/cancelled tasks so a tight un-awaited loop stays bounded (no memory growth).
+- **Concurrency primitives:** `src/task.rs` has `SharedFuture` — split into a `ResultCell` (held by the
+  spawned task, which resolves it) and a handle (behind `Value::Future`) that owns the task's
+  `AbortHandle` and aborts on `Drop`; the task never holds the handle, so there is no reference cycle
+  and the handle's last-drop genuinely cancels. It carries `Result<Value, Control>` so panics cross the
+  task boundary. `std/task` (`src/stdlib/task_mod.rs`) provides `spawn`/`gather`/`race`/`timeout` over
   `future<T>`.
 - **Generators & coroutines** (`src/coro.rs`): `fn*`/`async fn*` return a `Value::Generator` that is
   **consumer-driven** — the body is a lazily-polled `Pin<Box<dyn Future>>` (NOT a spawned task), driven
