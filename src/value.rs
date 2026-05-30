@@ -1,5 +1,6 @@
 //! Runtime values. Kinds: nil, bool, number, string, builtin, function, array,
-//! object, map, enum, enum-variant, class, instance, bound-method, super-ref.
+//! object, map, enum, enum-variant, class, instance, bound-method, super-ref,
+//! future.
 
 use crate::ast::Stmt;
 use crate::env::Environment;
@@ -234,6 +235,9 @@ pub enum Value {
     Instance(Rc<RefCell<Instance>>),
     BoundMethod(Rc<BoundMethod>),
     Super(Rc<SuperRef>),
+    /// A pending or completed async computation (spec §7, M17 Phase 2). Produced
+    /// by calling a script `async fn` and driven by `await`. Identity equality.
+    Future(crate::task::SharedFuture),
 }
 
 impl Value {
@@ -272,6 +276,8 @@ impl PartialEq for Value {
             (Value::Instance(a), Value::Instance(b)) => Rc::ptr_eq(a, b),
             (Value::BoundMethod(a), Value::BoundMethod(b)) => Rc::ptr_eq(a, b),
             (Value::Super(a), Value::Super(b)) => Rc::ptr_eq(a, b),
+            // Futures compare by identity (same completion cell).
+            (Value::Future(a), Value::Future(b)) => a.ptr_eq(b),
             _ => false,
         }
     }
@@ -302,6 +308,7 @@ impl fmt::Debug for Value {
             Value::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
             Value::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
             Value::Super(_) => write!(f, "Super"),
+            Value::Future(_) => write!(f, "Future"),
         }
     }
 }
@@ -390,6 +397,7 @@ impl Value {
             Value::Instance(i) => write!(f, "<{} instance>", i.borrow().class.name),
             Value::BoundMethod(b) => write!(f, "<method {}>", b.name),
             Value::Super(_) => write!(f, "<super>"),
+            Value::Future(_) => write!(f, "<future>"),
         }
     }
 

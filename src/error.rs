@@ -12,7 +12,7 @@ pub struct SourceInfo {
     pub text: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AsError {
     pub message: String,
     pub span: Option<Span>,
