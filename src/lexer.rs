@@ -570,6 +570,53 @@ mod tests {
     }
 
     #[test]
+    fn template_interpolation_contains_string_literal() {
+        // A string literal inside `${...}` lexes as an ordinary Str token; the
+        // closing `}` of the interpolation is still found correctly.
+        assert_eq!(
+            kinds("`x${\"hi\"}y`"),
+            vec![
+                Tok::TemplateStart("x".into()),
+                Tok::Str("hi".into()),
+                Tok::TemplateEnd("y".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn template_interpolation_string_with_braces_and_dollar() {
+        // Braces and `${` *inside* the nested string are part of the string and
+        // must NOT be treated as interpolation delimiters — string-lexing wins.
+        assert_eq!(
+            kinds("`${\"a}b{c ${d}\"}`"),
+            vec![
+                Tok::TemplateStart("".into()),
+                Tok::Str("a}b{c ${d}".into()),
+                Tok::TemplateEnd("".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn template_interpolation_nested_template() {
+        // A template nested inside another template's interpolation:
+        // `${`hi ${n}`}`
+        assert_eq!(
+            kinds("`${`hi ${n}`}`"),
+            vec![
+                Tok::TemplateStart("".into()),
+                Tok::TemplateStart("hi ".into()),
+                Tok::Ident("n".into()),
+                Tok::TemplateEnd("".into()),
+                Tok::TemplateEnd("".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_unterminated_string() {
         let err = lex("\"oops").unwrap_err();
         assert!(err.message.contains("unterminated"));

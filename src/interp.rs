@@ -1609,6 +1609,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn template_interpolation_nested_string_literals() {
+        // A bare string literal inside `${...}`.
+        assert_eq!(run("print(`x=${\"hi\"}`)").await, "x=hi\n");
+        // A nullish-coalescing default that is a string literal.
+        assert_eq!(run("let a = nil\nprint(`v=${a ?? \"-\"}`)").await, "v=-\n");
+        // A function call passing a string literal argument.
+        assert_eq!(
+            run("fn f(s) { return s }\nprint(`r=${f(\"yo\")}`)").await,
+            "r=yo\n"
+        );
+        // Braces and `${` inside the nested string stay literal.
+        assert_eq!(run("print(`${\"a}b{c ${d}\"}`)").await, "a}b{c ${d}\n");
+        // A template nested inside another template's interpolation.
+        assert_eq!(
+            run("let n = \"Ada\"\nprint(`outer ${`inner ${n}`}`)").await,
+            "outer inner Ada\n"
+        );
+    }
+
+    #[tokio::test]
     async fn std_map_end_to_end() {
         let src = "import * as map from \"std/map\"\n\
                    let m = map.new()\n\
