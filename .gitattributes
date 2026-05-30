@@ -1,0 +1,19 @@
+# Ensure source and doc files get line-based (text) diffs rather than being
+# treated as binary. Some assets contain Unicode that git's content heuristic
+# could otherwise misdetect, hiding real diffs in review.
+*.rs    text diff=rust
+*.js    text
+*.css   text
+*.html  text
+*.md    text
+*.as    text
+*.toml  text
+*.json  text
+*.c     text
+*.h     text
+
+# The tree-sitter parser is generated from grammar.js (`tree-sitter generate
+# --abi 14`). Keep it diffable, but mark it generated for language stats.
+docs/superpowers/specs/grammar/tree-sitter-ascript/src/parser.c   linguist-generated
+docs/superpowers/specs/grammar/tree-sitter-ascript/src/grammar.json    linguist-generated
+docs/superpowers/specs/grammar/tree-sitter-ascript/src/node-types.json linguist-generated
