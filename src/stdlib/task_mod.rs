@@ -17,6 +17,16 @@ use crate::span::Span;
 use crate::task::SharedFuture;
 use crate::value::Value;
 
+/// Aborts a `spawn_local` task when dropped. Used by `race` to cancel the resolver
+/// tasks (and thereby the losing futures) once a winner is decided.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// `import * as task from "std/task"` bindings.
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -61,14 +71,23 @@ impl Interp {
     async fn task_spawn(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let v = arg(args, 0);
         match v {
-            Value::Future(_) => Ok(v),
+            // `spawn` is the explicit opt-out of cancel-on-drop: detach the backing
+            // task so it runs to completion (fire-and-forget) regardless of whether
+            // the returned handle is awaited or dropped.
+            Value::Future(f) => {
+                f.detach();
+                Ok(Value::Future(f))
+            }
             callable @ (Value::Function(_)
             | Value::Builtin(_)
             | Value::BoundMethod(_)
             | Value::NativeMethod(_)) => {
                 let r = self.call_value(callable, Vec::new(), span).await?;
                 match r {
-                    Value::Future(_) => Ok(r),
+                    Value::Future(f) => {
+                        f.detach();
+                        Ok(Value::Future(f))
+                    }
                     other => Ok(Value::Future(SharedFuture::resolved(Ok(other)))),
                 }
             }
@@ -100,7 +119,11 @@ impl Interp {
     }
 
     /// `race([futures]) -> value`. Resolves to the first input future to complete
-    /// (value or error). Non-future elements resolve immediately.
+    /// (value or error). Non-future elements resolve immediately. The losers are
+    /// **cancelled**: each is awaited inside a resolver task whose `AbortHandle` is
+    /// held by an `AbortOnDrop` guard; when `race` returns, the guards drop, the
+    /// resolver tasks abort, their loser-future clones drop, and (once the caller
+    /// no longer holds them) the losers' own tasks are cancelled via cancel-on-drop.
     async fn task_race(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let array = want_array(&arg(args, 0), span, "task.race")?;
         let items: Vec<Value> = array.borrow().clone();
@@ -108,25 +131,33 @@ impl Interp {
             return Err(AsError::at("task.race requires a non-empty array", span).into());
         }
         let winner = SharedFuture::new();
+        let mut resolver_guards: Vec<AbortOnDrop> = Vec::new();
         for item in items {
             match item {
                 Value::Future(f) => {
                     let w = winner.clone();
-                    tokio::task::spawn_local(async move {
+                    let jh = tokio::task::spawn_local(async move {
                         let r = f.get().await;
                         w.resolve(r);
                     });
+                    resolver_guards.push(AbortOnDrop(jh.abort_handle()));
                 }
                 // A non-future element is already "done": it wins instantly.
                 other => winner.resolve(Ok(other)),
             }
         }
-        winner.get().await
+        let result = winner.get().await;
+        // Dropping the guards aborts the still-pending resolver tasks, releasing
+        // their hold on the loser futures so the losers can be cancelled.
+        drop(resolver_guards);
+        result
     }
 
-    /// `timeout(ms, future) -> [value, err]`. Races the future against a sleep;
-    /// on timeout returns an error pair (the future keeps running but is dropped
-    /// from this await). A panic inside the future propagates (not an err pair).
+    /// `timeout(ms, future) -> [value, err]`. Races the future against a sleep; on
+    /// timeout returns an error pair and the future handle is dropped as `timeout`
+    /// returns, so (once the caller no longer holds it) the timed-out work is
+    /// **cancelled** via cancel-on-drop rather than left running. A panic inside the
+    /// future propagates (not an err pair).
     async fn task_timeout(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let ms = want_number(&arg(args, 0), span, "task.timeout")?;
         if ms < 0.0 {

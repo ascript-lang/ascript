@@ -1,74 +1,158 @@
-//! Futures for M17 Phase 2 — real async.
+//! M17 async runtime: `SharedFuture`, the handle behind `Value::Future`, with
+//! **structured concurrency / cancel-on-drop**.
 //!
-//! A [`SharedFuture`] is a shared, single-assignment completion cell with an
-//! async `get()`. It backs `Value::Future`: calling a script `async fn` spawns
-//! the body onto the current-thread `LocalSet` and hands back a `SharedFuture`
-//! that `await` drives. The cell stores a `Result<Value, Control>` so a panic (or
-//! a `?`-propagation) raised inside the spawned task crosses the task boundary and
-//! re-surfaces at the awaiting site.
+//! A script `async fn` call schedules its body on the current-thread `LocalSet`
+//! and hands back a `Value::Future`. Structured-concurrency rule: the spawned
+//! task's lifetime is bound to its handle(s). When the **last** `Value::Future`
+//! clone referring to a task is dropped, the task is **aborted** — so an
+//! un-awaited result is cancelled rather than orphaned (the dual of the
+//! consumer-driven generator design). `task.spawn(...)` is the one explicit way
+//! to opt out (detach / fire-and-forget).
 //!
-//! Borrow rule (clippy `await_holding_refcell_ref = deny`): never hold the slot's
-//! `RefCell` borrow across the `.await` — `get()` clones the completed result out
-//! before awaiting on the next notification.
+//! To make cancel-on-drop possible WITHOUT a reference cycle, the result slot and
+//! the lifetime owner are split into two `Rc`s:
+//! - [`ResultCell`] — the completion slot. The spawned task holds a clone of THIS
+//!   (only) to deposit its result. It deliberately does NOT hold the handle.
+//! - [`SharedFuture`] (`Rc<HandleInner>`) — the handle behind `Value::Future`. It
+//!   owns the task's [`AbortHandle`] and aborts the task in its `Drop`. Because
+//!   the task never holds the handle, the handle's refcount can fall to zero while
+//!   the task is still running — which is exactly what triggers cancellation.
+//!
+//! The stored value is a `Result<Value, Control>` so a panic/propagation raised in
+//! the spawned body crosses the task boundary and re-surfaces at the `await` site.
 
 use crate::interp::Control;
 use crate::value::Value;
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::sync::Notify;
+use tokio::task::AbortHandle;
 
-/// A shared completion cell carrying either the produced value or the `Control`
-/// error that aborted the producing task. Cheap to `clone` (just an `Rc` bump);
-/// equality is by identity (`ptr_eq`), like the other mutable `Value` containers.
-#[derive(Clone)]
-pub struct SharedFuture(Rc<Inner>);
-
-struct Inner {
+/// The completion slot shared between the spawned task (writer) and the handle
+/// (reader). Holds NO task lifetime — dropping it never cancels anything.
+struct CellInner {
+    /// `None` until resolved; then `Some(result)`. First writer wins (e.g. `race`).
     slot: RefCell<Option<Result<Value, Control>>>,
+    /// Notifies all `get()` waiters when the slot is filled.
     ready: Notify,
 }
 
-impl SharedFuture {
-    /// A new, unresolved future.
-    pub fn new() -> Self {
-        SharedFuture(Rc::new(Inner { slot: RefCell::new(None), ready: Notify::new() }))
+/// Cloneable handle to a completion slot. Given to a spawned task so it can
+/// `resolve` the result without holding the cancel-owning [`SharedFuture`].
+#[derive(Clone)]
+pub struct ResultCell(Rc<CellInner>);
+
+impl ResultCell {
+    fn new() -> Self {
+        ResultCell(Rc::new(CellInner { slot: RefCell::new(None), ready: Notify::new() }))
     }
 
-    /// An already-resolved future carrying `r`. Used by `task.spawn` when the
-    /// supplied function returns a plain value rather than a future.
-    pub fn resolved(r: Result<Value, Control>) -> Self {
+    /// Resolve the cell (first writer wins) and wake all waiters.
+    pub fn resolve(&self, result: Result<Value, Control>) {
+        let mut slot = self.0.slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(result);
+            self.0.ready.notify_waiters();
+        }
+    }
+
+    /// Await the cell's value, parking until it is resolved.
+    async fn get(&self) -> Result<Value, Control> {
+        loop {
+            // Fast path: already resolved. Clone out so we don't hold the borrow
+            // across the await below.
+            {
+                let slot = self.0.slot.borrow();
+                if let Some(r) = slot.as_ref() {
+                    return r.clone();
+                }
+            }
+            // Park until the next resolve, then re-check.
+            let fut = self.0.ready.notified();
+            // Re-check after creating the wait future to avoid lost wakeups.
+            if self.0.slot.borrow().is_some() {
+                continue;
+            }
+            fut.await;
+        }
+    }
+}
+
+/// The lifetime owner behind `Value::Future`. Owns the task's abort handle and
+/// cancels the task when the last handle clone is dropped (unless detached).
+struct HandleInner {
+    cell: ResultCell,
+    /// The backing task's abort handle, if any. `None` for a taskless future
+    /// (`new`/`resolved`, e.g. `race`'s winner) or after `detach()`.
+    abort: RefCell<Option<AbortHandle>>,
+}
+
+impl Drop for HandleInner {
+    fn drop(&mut self) {
+        // Cancel-on-drop: when the last handle goes away, abort the backing task.
+        // A taskless or detached future has no abort handle, so this is a no-op.
+        if let Some(h) = self.abort.borrow_mut().take() {
+            h.abort();
+        }
+    }
+}
+
+/// Shared async handle behind `Value::Future`. `Rc`-shared, `!Send`. Cloning
+/// shares the same task/slot; dropping the last clone cancels the task.
+#[derive(Clone)]
+pub struct SharedFuture(Rc<HandleInner>);
+
+impl SharedFuture {
+    /// A fresh, unresolved, **taskless** future (no cancel-on-drop). Used as a
+    /// plain rendezvous cell, e.g. `race`'s `winner`.
+    pub fn new() -> Self {
+        SharedFuture(Rc::new(HandleInner {
+            cell: ResultCell::new(),
+            abort: RefCell::new(None),
+        }))
+    }
+
+    /// An already-resolved future (used when a value is ready synchronously).
+    pub fn resolved(result: Result<Value, Control>) -> Self {
         let f = SharedFuture::new();
-        f.resolve(r);
+        f.resolve(result);
         f
     }
 
-    /// Complete the future. The first resolution wins (later ones are ignored, so
-    /// `race` can let several producers call `resolve` and keep only the winner).
-    /// Always notifies waiters so a `get()` parked on `notified()` wakes up.
-    pub fn resolve(&self, r: Result<Value, Control>) {
-        if self.0.slot.borrow().is_none() {
-            *self.0.slot.borrow_mut() = Some(r);
-        }
-        self.0.ready.notify_waiters();
+    /// Resolve the cell (first writer wins) and wake all waiters.
+    pub fn resolve(&self, result: Result<Value, Control>) {
+        self.0.cell.resolve(result);
     }
 
-    /// Await the result. Returns a clone of the stored result; repeated `get()`s
-    /// return the same cached result. Never holds the slot borrow across `.await`.
+    /// Await the cell's value, parking until it is resolved. Cloneable waiters all
+    /// observe the same result.
     pub async fn get(&self) -> Result<Value, Control> {
-        loop {
-            // Register interest BEFORE checking the slot so a `resolve()` that
-            // races between the check and the await can't be missed.
-            let notified = self.0.ready.notified();
-            if let Some(r) = self.0.slot.borrow().clone() {
-                return r;
-            }
-            notified.await;
-        }
+        self.0.cell.get().await
     }
 
-    /// Identity equality (two handles to the same cell).
+    /// Identity equality (`Value::Future` is identity-equal, like other handles).
     pub fn ptr_eq(&self, other: &SharedFuture) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// The result cell to hand to the backing task. The task resolves THIS rather
+    /// than a `SharedFuture` clone, so it never keeps the handle alive — letting
+    /// the handle's `Drop` cancel the task once the last handle goes away.
+    pub fn cell(&self) -> ResultCell {
+        self.0.cell.clone()
+    }
+
+    /// Attach the backing task's abort handle so dropping the last handle cancels
+    /// the task (structured concurrency / cancel-on-drop).
+    pub fn set_abort(&self, abort: AbortHandle) {
+        *self.0.abort.borrow_mut() = Some(abort);
+    }
+
+    /// Detach the backing task: it runs to completion regardless of handle drops
+    /// (explicit fire-and-forget, used by `task.spawn`). Removes the abort handle
+    /// from the shared state, so no clone will cancel it.
+    pub fn detach(&self) {
+        let _ = self.0.abort.borrow_mut().take();
     }
 }
 
@@ -85,13 +169,6 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_once_and_get_returns_value() {
-        let f = SharedFuture::new();
-        f.resolve(Ok(Value::Number(7.0)));
-        assert_eq!(f.get().await.unwrap(), Value::Number(7.0));
-    }
-
-    #[tokio::test]
-    async fn second_get_returns_cached_value() {
         let f = SharedFuture::new();
         f.resolve(Ok(Value::Number(1.0)));
         assert_eq!(f.get().await.unwrap(), Value::Number(1.0));
@@ -119,13 +196,13 @@ mod tests {
     #[tokio::test]
     async fn get_parks_until_resolved() {
         let f = SharedFuture::new();
-        let f2 = f.clone();
+        let cell = f.cell();
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async move {
                 tokio::task::spawn_local(async move {
                     tokio::task::yield_now().await;
-                    f2.resolve(Ok(Value::Number(99.0)));
+                    cell.resolve(Ok(Value::Number(99.0)));
                 });
                 assert_eq!(f.get().await.unwrap(), Value::Number(99.0));
             })
@@ -142,8 +219,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_constructor_is_ready() {
-        let f = SharedFuture::resolved(Ok(Value::Bool(true)));
-        assert_eq!(f.get().await.unwrap(), Value::Bool(true));
+    async fn dropping_last_handle_aborts_the_task() {
+        // Dropping the last handle aborts the backing task: its body never finishes
+        // (the post-suspension side effect does not run). Flag-based + timer-free
+        // for determinism.
+        use std::cell::Cell as StdCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let ran = Rc::new(StdCell::new(false));
+                let ran2 = ran.clone();
+                let f = SharedFuture::new();
+                let cell = f.cell();
+                let jh = tokio::task::spawn_local(async move {
+                    // Two suspension points: the abort (issued before any poll)
+                    // cancels the task before it can set the flag.
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                    ran2.set(true);
+                    cell.resolve(Ok(Value::Number(1.0)));
+                });
+                f.set_abort(jh.abort_handle());
+                drop(f); // last handle -> abort, before the task's first poll
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(!ran.get(), "aborted task body must not run to completion");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn detached_future_is_not_aborted_on_drop() {
+        // After `detach()`, dropping all handles does NOT cancel the task: it runs
+        // to completion (fire-and-forget).
+        use std::cell::Cell as StdCell;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let ran = Rc::new(StdCell::new(false));
+                let ran2 = ran.clone();
+                let f = SharedFuture::new();
+                let cell = f.cell();
+                let jh = tokio::task::spawn_local(async move {
+                    tokio::task::yield_now().await;
+                    ran2.set(true);
+                    cell.resolve(Ok(Value::Number(7.0)));
+                });
+                f.set_abort(jh.abort_handle());
+                f.detach(); // opt out of cancel-on-drop
+                drop(f);
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(ran.get(), "detached task should run to completion");
+                assert!(jh.is_finished());
+            })
+            .await;
     }
 }

@@ -192,6 +192,32 @@ pub struct Interp {
     /// `Rc<Interp>` (`rc()`) so they can `spawn_local` a `'static` task that
     /// re-enters the interpreter — required for M17 Phase 2 async-fn scheduling.
     self_weak: RefCell<std::rc::Weak<Interp>>,
+    /// Number of eagerly-spawned `async fn`/method body tasks currently alive
+    /// (incremented at spawn, decremented when the task future drops — completion
+    /// OR cancel-on-drop). Used for cooperative backpressure so a tight un-awaited
+    /// loop can't accumulate cancelled-but-unreaped tasks without bound.
+    inflight: Cell<u64>,
+    /// High-water mark of `inflight` over the program's life. Exposed for tests
+    /// that assert async-task memory stays bounded (does not scale with N).
+    max_inflight: Cell<u64>,
+}
+
+/// Above this many in-flight async tasks, an async-fn call cooperatively yields
+/// after spawning so the executor can reap finished/cancelled tasks. Keeps a
+/// no-await loop of un-awaited async calls bounded instead of growing to N.
+const INFLIGHT_YIELD_CAP: u64 = 256;
+
+/// Decrements `Interp::inflight` when dropped. Created at spawn time and moved
+/// into the spawned task so the count tracks the task's real lifetime — it
+/// decrements whether the task completes, errors, or is aborted (cancel-on-drop).
+pub(crate) struct InflightGuard {
+    vm: Rc<Interp>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.vm.inflight.set(self.vm.inflight.get().saturating_sub(1));
+    }
 }
 
 /// Outcome of running the tests registered on an `Interp`.
@@ -214,7 +240,41 @@ impl Interp {
             resources: RefCell::new(HashMap::new()),
             next_resource_id: Cell::new(0),
             self_weak: RefCell::new(std::rc::Weak::new()),
+            inflight: Cell::new(0),
+            max_inflight: Cell::new(0),
         }
+    }
+
+    /// Register one newly-spawned async task: bump `inflight` (and the high-water
+    /// mark) and return a guard that decrements when the task future is dropped.
+    pub(crate) fn inflight_guard(&self) -> InflightGuard {
+        let n = self.inflight.get() + 1;
+        self.inflight.set(n);
+        if n > self.max_inflight.get() {
+            self.max_inflight.set(n);
+        }
+        InflightGuard { vm: self.rc() }
+    }
+
+    /// Cooperative backpressure: if many async tasks are in flight, yield once so
+    /// the executor can drive/reap them. Called by async-fn/method call sites
+    /// after spawning. A normal awaiting program reaps continuously and rarely
+    /// trips this; a tight un-awaited loop trips it and stays bounded.
+    pub(crate) async fn maybe_yield_for_inflight(&self) {
+        if self.inflight.get() >= INFLIGHT_YIELD_CAP {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Current number of in-flight async tasks (test/diagnostic hook).
+    pub fn inflight_count(&self) -> u64 {
+        self.inflight.get()
+    }
+
+    /// High-water mark of in-flight async tasks since program start (test hook:
+    /// asserts async-task memory stays bounded and does not scale with workload).
+    pub fn max_inflight(&self) -> u64 {
+        self.max_inflight.get()
     }
 
     /// Install the self-reference so `&self` methods can obtain an owned
@@ -1391,13 +1451,25 @@ impl Interp {
             let vm = self.rc();
             let func = func.clone();
             let fut = crate::task::SharedFuture::new();
-            let fut2 = fut.clone();
-            tokio::task::spawn_local(async move {
+            // The task resolves the *cell* (not a `SharedFuture` clone) so it never
+            // keeps the handle alive — letting the handle's `Drop` cancel the task
+            // once the last `Value::Future` is dropped (structured concurrency).
+            let cell = fut.cell();
+            // Track this task's lifetime for backpressure; the guard moves into the
+            // task and decrements on completion OR cancel-on-drop.
+            let guard = self.inflight_guard();
+            let handle = tokio::task::spawn_local(async move {
+                let _g = guard;
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
                 let r = vm.run_function_body(func, args, call_env, span, what).await;
-                fut2.resolve(r);
+                cell.resolve(r);
             });
+            // Cancel-on-drop: dropping the last handle aborts this task.
+            fut.set_abort(handle.abort_handle());
+            // Cooperatively yield if many tasks are in flight, so cancelled/finished
+            // ones get reaped (bounds memory in a tight un-awaited loop).
+            self.maybe_yield_for_inflight().await;
             return Ok(Value::Future(fut));
         }
         self.run_function_body(func, args, call_env, span, what).await
@@ -1478,13 +1550,18 @@ impl Interp {
             let method = bm.method.clone();
             let name = bm.name.clone();
             let fut = crate::task::SharedFuture::new();
-            let fut2 = fut.clone();
-            tokio::task::spawn_local(async move {
+            // Resolve the cell, not a handle clone, so cancel-on-drop works.
+            let cell = fut.cell();
+            let guard = self.inflight_guard();
+            let handle = tokio::task::spawn_local(async move {
+                let _g = guard;
                 // Owned `method`/`call_env`/`name` keep the `BodySpec` borrow inside
                 // `run_method_body`'s frame, so nothing escapes the `'static` task.
                 let r = vm.run_method_body(method, args, call_env, span, name).await;
-                fut2.resolve(r);
+                cell.resolve(r);
             });
+            fut.set_abort(handle.abort_handle());
+            self.maybe_yield_for_inflight().await;
             return Ok(Value::Future(fut));
         }
         let spec = BodySpec { params: &bm.method.params, ret: &bm.method.ret, body: &bm.method.body };
@@ -3221,21 +3298,33 @@ print(r[1])
     }
 
     #[tokio::test]
-    async fn unawaited_async_call_is_drained_at_exit() {
-        // A script `async fn` returns a future the moment it's called. Even when the
-        // result is never `await`ed, the top-level LocalSet drain runs the spawned
-        // task to completion before the program returns, so its side effects (the
-        // `print` after a short `await time.sleep`) still appear in the output.
-        let out = run(
+    async fn unawaited_async_call_is_cancelled_but_spawn_detaches() {
+        // Structured concurrency / cancel-on-drop (M17): calling an `async fn` and
+        // immediately discarding the future cancels it — the future's last handle
+        // drops at the end of the expression statement, aborting the task before it
+        // runs, so its side effect does NOT appear. `task.spawn(...)` is the
+        // explicit opt-out: it detaches the task, which runs to completion (its
+        // side effect appears, produced during the top-level drain).
+        let cancelled = run(
             "import * as time from \"std/time\"\n\
              async fn work() { await time.sleep(5) print(\"worked\") }\n\
              work()\n\
              print(\"main\")",
         )
         .await;
-        // `main` prints synchronously; `worked` is produced by the drained task.
-        assert!(out.contains("main\n"), "got: {out:?}");
-        assert!(out.contains("worked\n"), "got: {out:?}");
+        assert!(cancelled.contains("main\n"), "got: {cancelled:?}");
+        assert!(!cancelled.contains("worked"), "unawaited call must be cancelled: {cancelled:?}");
+
+        let detached = run(
+            "import * as time from \"std/time\"\n\
+             import * as task from \"std/task\"\n\
+             async fn work() { await time.sleep(5) print(\"worked\") }\n\
+             task.spawn(work())\n\
+             print(\"main\")",
+        )
+        .await;
+        assert!(detached.contains("main\n"), "got: {detached:?}");
+        assert!(detached.contains("worked\n"), "spawned task must run: {detached:?}");
     }
 
     // ---- M17 Phase 2: futures & real async ----
