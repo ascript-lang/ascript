@@ -400,6 +400,7 @@ module.exports = grammar({
       $.array_type,
       $.map_type,
       $.result_type,
+      $.future_type,
       $.tuple_type,
       $.identifier, // class / enum name
     ),
@@ -409,6 +410,7 @@ module.exports = grammar({
     array_type: $ => seq('array', '<', $._type, '>'),
     map_type: $ => seq('map', '<', $._type, ',', $._type, '>'),
     result_type: $ => seq('Result', '<', $._type, '>'),
+    future_type: $ => seq('future', '<', $._type, '>'),
     tuple_type: $ => seq('[', commaSep1($._type), optional(','), ']'),
 
     // ----- Literals (§2) ---------------------------------------------------
