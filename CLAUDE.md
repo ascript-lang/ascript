@@ -29,10 +29,12 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
   `target/release/ascript run <file>`.
 
 > Language gotchas worth knowing when writing `.as` code or docs: there is **no ternary** (`?` is
-> postfix Result-propagation only — use `if/else`); template `${…}` interpolation does not accept
-> nested string literals well, so compute such values into a variable first; `print` output is
-> **buffered and flushed at program exit** (a forever-looping server won't stream logs live — use
-> `serve({maxRequests:N})`).
+> postfix Result-propagation only — use `if/else`); `print` output is **buffered and flushed at
+> program exit** (a forever-looping server won't stream logs live — use `serve({maxRequests:N})`).
+> Note: template `${…}` interpolation *does* fully support nested string literals (incl. strings
+> containing `}`/`{`/`${` and nested templates) — see the `template_interpolation_*` lexer/interp
+> tests. (An earlier draft of this file wrongly listed that as a limitation; the real cause of that
+> failure was the missing ternary.)
 
 ## Commands
 
