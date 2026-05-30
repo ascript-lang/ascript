@@ -24,7 +24,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 impl Interp {
-    pub(crate) async fn call_array(&mut self, func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+    pub(crate) async fn call_array(&self, func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         let ctx = |f: &str| format!("array.{}", f);
         match func {
             "map" => {
@@ -179,7 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn push_mutates_and_returns_len() {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let a = arr(vec![n(1.0), n(2.0)]);
         let len = interp.call_array("push", &[a.clone(), n(3.0)], sp()).await.unwrap();
         assert_eq!(len, n(3.0));
@@ -188,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn pop_returns_last_then_nil() {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let a = arr(vec![n(1.0)]);
         assert_eq!(interp.call_array("pop", std::slice::from_ref(&a), sp()).await.unwrap(), n(1.0));
         assert_eq!(interp.call_array("pop", std::slice::from_ref(&a), sp()).await.unwrap(), Value::Nil);
@@ -196,7 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_handles_oob_negative_and_fractional() {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let a = arr(vec![n(10.0), n(20.0)]);
         assert_eq!(interp.call_array("get", &[a.clone(), n(0.0)], sp()).await.unwrap(), n(10.0));
         assert_eq!(interp.call_array("get", &[a.clone(), n(9.0)], sp()).await.unwrap(), Value::Nil);
@@ -206,7 +206,7 @@ mod tests {
 
     #[tokio::test]
     async fn contains_uses_structural_eq() {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let a = arr(vec![n(1.0), n(2.0)]);
         assert_eq!(interp.call_array("contains", &[a.clone(), n(2.0)], sp()).await.unwrap(), Value::Bool(true));
         assert_eq!(interp.call_array("contains", &[a.clone(), n(5.0)], sp()).await.unwrap(), Value::Bool(false));
@@ -214,7 +214,7 @@ mod tests {
 
     #[tokio::test]
     async fn slice_supports_negatives_and_default_end() {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let a = arr(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
         assert_eq!(interp.call_array("slice", &[a.clone(), n(1.0), n(3.0)], sp()).await.unwrap().to_string(), "[20, 30]");
         assert_eq!(interp.call_array("slice", &[a.clone(), n(-2.0)], sp()).await.unwrap().to_string(), "[30, 40]");
@@ -224,14 +224,14 @@ mod tests {
 
     #[tokio::test]
     async fn sort_default_rejects_mixed() {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let a = arr(vec![n(1.0), Value::Str("x".into())]);
         assert!(matches!(interp.call_array("sort", &[a], sp()).await, Err(Control::Panic(_))));
     }
 
     #[tokio::test]
     async fn misuse_panics() {
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         assert!(matches!(interp.call_array("push", &[n(1.0), n(2.0)], sp()).await, Err(Control::Panic(_))));
         assert!(matches!(interp.call_array("nope", &[arr(vec![])], sp()).await, Err(Control::Panic(_))));
     }

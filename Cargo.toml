@@ -86,3 +86,6 @@ tui = ["dep:crossterm"]
 # completion/hover/goto-def); never runs the interpreter, so it avoids the !Send
 # Rc/RefCell runtime. tower-lsp bundles lsp-types + tower + JSON-RPC over stdio.
 lsp = ["dep:tower-lsp", "tokio/io-std"]
+
+[lints.clippy]
+await_holding_refcell_ref = "deny"

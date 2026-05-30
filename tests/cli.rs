@@ -357,3 +357,38 @@ fn runs_tui_example() {
         out
     );
 }
+
+#[test]
+fn runs_generators_example_terminates_and_prints() {
+    // End-to-end: the binary runs the generators example to completion. This goes
+    // through the real entry-point exit drain (`local.await`), so a regressed
+    // task-based generator (zombie task parked in `yield`) would HANG here. The
+    // test reaching its asserts is the proof that consumer-driven generators exit.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg("examples/generators.as").output().unwrap();
+    assert!(out.status.success(), "generators.as did not exit cleanly");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("6"), "got: {stdout}");
+}
+
+#[test]
+fn abandoned_infinite_generator_with_break_terminates() {
+    // An infinite generator broken after 3 values: the classic abandoned-generator
+    // case that hung before generators became consumer-driven. The binary must
+    // print 0 1 2 done and EXIT (the test process would hang if it regressed).
+    let dir = std::env::temp_dir();
+    let path = dir.join("ascript_gen_break_cli.as");
+    std::fs::write(
+        &path,
+        "fn* g() { let i = 0\nwhile (true) { yield i\ni = i + 1 } }\n\
+         for await (x in g()) { print(x)\nif (x >= 2) { break } }\n\
+         print(\"done\")\n",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(path.to_str().unwrap()).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(out.status.success(), "abandoned generator program did not exit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, "0\n1\n2\ndone\n", "got: {stdout}");
+}

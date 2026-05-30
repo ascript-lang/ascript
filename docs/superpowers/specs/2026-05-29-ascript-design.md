@@ -277,16 +277,36 @@ not for routine control flow.
 
 ## 7. Concurrency — async/await on a Single-Threaded Event Loop
 
-AScript supports `async fn` and `await`. The implementation (**approach A**) makes
-the interpreter's core `eval` an `async fn` in Rust running on a single-threaded
-Tokio executor, which *is* the event loop:
+AScript supports `async fn`, `await`, generators (`fn*` / `async fn*`), `yield`, and
+`for await`. The implementation (**approach A**) makes the interpreter's core `eval` an
+`async fn` in Rust running on a single-threaded Tokio executor, which *is* the event
+loop. Concurrent tasks ride a `tokio::task::LocalSet` with `spawn_local`, which accepts
+`!Send` futures — so the `Rc<RefCell<…>>` value model (§9) is preserved unchanged and
+there is still **no user-visible multithreading**.
 
-- A script-level `await expr` maps to a Rust `.await`.
-- Async stdlib functions (I/O, timers, sockets, HTTP, WebSockets) return awaitables
-  that the Tokio runtime drives.
-- Synchronous programs never touch the executor and pay no async cost.
-- User code is **single-threaded** — no data races, so heap values use
-  `Rc<RefCell<…>>` rather than `Arc<Mutex<…>>` (§9).
+The key realization driving the whole design: Rust `async`/`.await` *is* a stackless
+coroutine transform, and `eval` is *already* an `async fn`. So both real concurrency and
+script-level generators fall out of the engine we already have — no `unsafe` stackful
+coroutine crate, and no continuation-passing rewrite.
+
+### 7.1 Tasks, eager scheduling, and real `await`
+
+- Calling an `async fn` returns a **`future<T>`** value (§7.6) that is **eagerly
+  scheduled**: it begins executing immediately as a task on the `LocalSet` and makes
+  progress whenever the current task is parked at an `await`. Calling a non-`async` fn is
+  unchanged — it runs inline to its `return`.
+- `await expr` drives `expr`'s future to completion and evaluates to its result. As a
+  deliberate back-compat rule, **`await` on a non-future is the identity** (`await 5` is
+  `5`, `await xs` is `xs`) — so older code and gradual typing keep working.
+- Async stdlib functions (I/O, timers, sockets, HTTP, WebSockets) return awaitables that
+  the Tokio runtime drives; `await`-ing them suspends only the current task, letting other
+  ready tasks run.
+- Synchronous programs never spawn a task and pay no async cost.
+- User code is **single-threaded** — no data races, so heap values use `Rc<RefCell<…>>`
+  rather than `Arc<Mutex<…>>` (§9). The single interpreter-internal rule the concurrency
+  model adds is: *never hold a `RefCell` borrow across an `.await`* (a held borrow that
+  outlives a suspension point could alias another task's mutation); the build enforces this
+  with clippy's `await_holding_refcell_ref`.
 
 Async composes with the Result model:
 
@@ -298,7 +318,115 @@ async fn fetchUser(id: number): Result<object> {
 }
 ```
 
-The top-level program may be `async`; the runtime blocks on it to completion.
+### 7.2 Structured concurrency — the top-level drain
+
+The top-level program runs as the **root task**. The runtime joins **all** tasks the
+program spawned before the process exits: no detached task outlives `main`, and a panic in
+a spawned task surfaces (it is not silently swallowed). This gives structured concurrency
+without a separate scope construct — the program *is* the scope. The top-level program may
+itself be `async`; the runtime drives it, then drains the rest of the `LocalSet`, to
+completion.
+
+### 7.3 The `std/task` module
+
+`std/task` exposes the concurrency primitives over `future<T>`:
+
+```ascript
+import { spawn, gather, race, timeout } from "std/task"
+
+let a = spawn(fetchUser(1))               // schedule a task, get its future<T> handle
+let b = spawn(fetchUser(2))
+let [ua, ub]  = await gather([a, b])      // run an array of futures concurrently, results in order
+let first     = await race([a, b])        // first to finish wins; the rest are dropped
+let [v, err]  = await timeout(500, slow()) // Result pair: [value, nil] or [nil, err] on deadline
+```
+
+- `spawn(futureOr0ArgFn)` schedules/tracks a task on the `LocalSet` and returns its
+  `future<T>`. Given a `future` it returns it (already eagerly scheduled); given a 0-arg
+  function it calls it — which schedules it — and returns the resulting future.
+- `gather([futures])` takes an **array** of futures, awaits them all concurrently, and
+  returns an **array** of their results in order (the structured "join all" combinator). The
+  first error short-circuits and propagates via the panic / `?` channel.
+- `race([futures])` takes an **array** of futures and resolves to the value of the first to
+  complete; the losers are cancelled/dropped.
+- `timeout(ms, future)` returns a Result pair (§6) — `[value, nil]` if `future` resolves
+  before `ms`, else `[nil, err]` (a Tier-1 timeout error) when `ms` elapses first — and
+  never panics on a missed deadline.
+
+### 7.4 Generators & coroutines
+
+A generator function is written `fn*` (or `async fn*`); inside it, `yield e` produces a
+value to the consumer and **suspends** at that point. A suspension point is, mechanically,
+an internal `.await` on a single-consumer **rendezvous** between the generator's eval
+future and its driver — the same technique `genawaiter`/`async-stream` use to build
+coroutines on stable async. Calling a generator function does not run its body; it returns
+a **`Value::Generator`** handle.
+
+Generators are **bidirectional coroutines**: `gen.next(v)` resumes the paused `yield` and
+makes that `yield` expression evaluate to `v` inside the generator, then runs until the
+next `yield` or `return`. `next()` reports completion (the final `return` value vs. a
+yielded value) so a consumer can tell "another value" from "done".
+
+```ascript
+fn* counter(start) {
+  let n = start
+  while true {
+    let step = yield n        // value passed in via next(step)
+    n = n + (step ?? 1)
+  }
+}
+
+let g = counter(10)
+g.next()        // -> 10
+g.next(5)       // -> 15   (the paused `yield n` received 5)
+```
+
+`async fn*` generators may `await` between yields, so a generator can stream values pulled
+from real I/O.
+
+### 7.5 `for await`
+
+`for await (x in e)` consumes any **async-iterable** and binds each produced value to `x`:
+
+- a script generator (`fn*` / `async fn*`), driven via its internal rendezvous, or
+- a native stream handle (e.g. a channel/SSE/WebSocket source exposing a `recv()`-style
+  pull), driven by `await`-ing the next item.
+
+```ascript
+for await (chunk in sseStream) {
+  print(chunk)
+}
+```
+
+The loop suspends the current task between items (cooperative), and terminates when the
+source signals end-of-stream / the generator `return`s.
+
+### 7.6 The `future<T>` type
+
+`future<T>` is a first-class **type** for contracts (§5): the eventual result of an async
+computation, with element type `T`. `async fn fetchUser(...): Result<object>` has call type
+`future<Result<object>>`; `await`-ing it yields the `Result<object>`. A bare `future`
+(unparameterized) accepts any future. `future<T>` values are produced by calling an
+`async fn`, by `spawn`, and by the `std/task` combinators.
+
+### 7.7 Non-goals / deferred to a future engine
+
+The following are **deliberate architectural boundaries** of approach A, not unfinished
+work. Each is impossible under a stackless-async tree-walker and would require a different
+execution engine; they are recorded here so the boundary is explicit. (See the ADR
+`specs/adr/2026-05-30-async-generators.md`.)
+
+- **Durable / serialize-to-disk continuations** — checkpointing a paused workflow to disk
+  and resuming it in a later process. Async suspension state lives in the Rust stackframes
+  the compiler generates; it is not a reified, serializable object. *Needs an
+  explicit-stack VM with reified continuations (option **B2**, §below).*
+- **Robust unbounded recursion over very deep data** — deep *non-yielding* script recursion
+  still consumes the native call stack and can overflow it, because stackless async does not
+  move recursion off the host stack. *Needs stackful coroutines (**B1**) or an explicit-stack
+  VM (**B2**).*
+- **Deterministic / replayable task scheduling** — Tokio owns task interleaving, so runs are
+  not bit-for-bit reproducible and cannot be deterministically replayed. *Needs a custom
+  scheduler over an explicit-stack VM (**B2**).*
 
 ---
 

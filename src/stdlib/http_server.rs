@@ -12,13 +12,35 @@
 //! the response bytes back. This keeps `&mut self` available across the whole
 //! accept→dispatch→respond cycle.
 //!
-//! ## Sequential request handling (v1 limitation)
+//! ## Concurrent request handling (M17)
 //!
-//! Requests are handled **strictly sequentially**: the loop accepts a connection,
-//! serves exactly one request on it, awaits the handler fully, writes the
-//! response, then loops. Concurrent connection handling is a documented v1
-//! limitation (deferred per the M14 plan) — it is the correct behaviour under a
-//! single `&mut Interp`.
+//! Each accepted connection is handled on its **own `spawn_local` task** (built on
+//! M17's interior-mutable interpreter: the accept loop captures `self.rc()` and the
+//! handler task re-enters the interpreter via that owned `Rc<Interp>`). The accept
+//! loop continues to `accept()` the next connection immediately, so a slow handler
+//! does NOT block other clients (no head-of-line blocking) — total wall time for a
+//! mix of fast/slow requests is ≈ max, not the sum.
+//!
+//! - **Bounded concurrency.** A `tokio::sync::Semaphore` caps the number of
+//!   connections handled at once (default `DEFAULT_MAX_CONCURRENT` = 256,
+//!   configurable via the serve opt `maxConcurrent`). The loop acquires an
+//!   `OwnedSemaphorePermit` BEFORE spawning each handler task and the task holds it
+//!   for its whole lifetime; this applies backpressure and bounds memory/fd usage
+//!   under a flood of slow clients.
+//! - **Deterministic shutdown.** `maxRequests:N` counts accepted connections; after
+//!   N the loop stops accepting and **drains** the in-flight handler tasks (awaits
+//!   them) before returning, so an `await serve(...)` (and tests) complete only once
+//!   every accepted request's response has been written.
+//! - **Per-connection limits preserved.** `requestTimeout` (408), `maxBodySize`
+//!   (413), the header limit (431), and handler-panic→500 isolation all apply inside
+//!   each spawned task, so one stuck/oversized/panicking connection can't affect the
+//!   others or the accept loop. A task panic can't abort the process (handler
+//!   panics are converted to 500 before they can escape the task).
+//! - **Borrow discipline.** The handler task never holds a `RefCell` borrow across
+//!   an `.await`: routes/middleware are cloned out under a short borrow, the listener
+//!   is taken out of the resource table up front, and the per-request `HttpNext`
+//!   continuations are swept per-dispatch (each dispatch is tagged with a unique id)
+//!   so concurrent connections never clobber one another's pending `next` handles.
 //!
 //! ## Testable lifecycle
 //!
@@ -26,8 +48,10 @@
 //! - `server.bind(host, port) → [boundPort, err]` binds a listener WITHOUT looping
 //!   (so tests bind port 0, read the OS-assigned `boundPort`, then drive `serve`).
 //! - `server.serve(opts?) → [nil, err]` runs the accept loop. `opts.maxRequests:N`
-//!   makes it return after serving N requests (so an `await serve(...)` completes
-//!   in tests). With no `maxRequests` it loops until the listener errors.
+//!   makes it return after accepting N requests (draining in-flight handlers first,
+//!   so an `await serve(...)` completes in tests). `opts.maxConcurrent:N` caps the
+//!   number of connections handled at once. With no `maxRequests` it loops until the
+//!   listener errors.
 //! - `server.listen(host, port, opts?)` is `bind` + `serve` for the common case.
 //!
 //! ## Request / response shape
@@ -56,10 +80,11 @@
 //!   the body is NOT read.
 //! - **Per-request read timeout** (default 30s, configurable via `{requestTimeout}`
 //!   in milliseconds) wraps the whole request read. On expiry the server responds
-//!   **408** and continues — so a slowloris client can't hang the (sequential) loop.
+//!   **408** and continues — so a slowloris client can't hang its connection's task.
 //!
-//! Because handling is sequential, these limits matter doubly: one stuck/oversized
-//! request would otherwise stall the entire server.
+//! With concurrent handling these limits bound each connection's task independently
+//! (and the `maxConcurrent` semaphore bounds how many run at once), so a hostile
+//! client can stall only its own task, never the accept loop or other clients.
 
 use super::{arg, bi, want_string};
 use crate::error::AsError;
@@ -81,6 +106,11 @@ const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default per-request read timeout in milliseconds (overridable via
 /// `requestTimeout`). On expiry the server responds 408 and continues serving.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+/// Default cap on the number of connections handled concurrently (overridable via
+/// the serve opt `maxConcurrent`). The accept loop acquires a permit from a
+/// semaphore before spawning each per-connection handler task, bounding memory/fd
+/// usage so a flood of slow clients can't spawn unbounded tasks.
+const DEFAULT_MAX_CONCURRENT: usize = 256;
 
 /// Why reading a request failed, so the loop can pick the right status code.
 enum ReadError {
@@ -433,7 +463,7 @@ fn serialize_response(resp: &HttpResponse) -> Vec<u8> {
 impl Interp {
     /// Module-level dispatch for `std/http/server` (`create`).
     pub(crate) async fn call_http_server(
-        &mut self,
+        &self,
         func: &str,
         _args: &[Value],
         span: Span,
@@ -462,7 +492,7 @@ impl Interp {
     /// Dispatch a method on an HTTP server handle (`route`/`use`/`bind`/`serve`/`listen`).
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_http_server_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -478,7 +508,7 @@ impl Interp {
                     return Err(AsError::at("server.route handler must be a function", span).into());
                 }
                 match self.http_server_mut(id) {
-                    Some(s) => s.routes.push((method, path, handler)),
+                    Some(mut s) => s.routes.push((method, path, handler)),
                     None => return Err(AsError::at("server.route: server is closed", span).into()),
                 }
                 Ok(server)
@@ -489,7 +519,7 @@ impl Interp {
                     return Err(AsError::at("server.use middleware must be a function", span).into());
                 }
                 match self.http_server_mut(id) {
-                    Some(s) => s.middleware.push(mw),
+                    Some(mut s) => s.middleware.push(mw),
                     None => return Err(AsError::at("server.use: server is closed", span).into()),
                 }
                 Ok(server)
@@ -505,7 +535,7 @@ impl Interp {
                     Ok(listener) => {
                         let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                         match self.http_server_mut(id) {
-                            Some(s) => s.listener = Some(listener),
+                            Some(mut s) => s.listener = Some(listener),
                             None => return Ok(err_pair("server.bind: server is closed".into())),
                         }
                         Ok(make_pair(Value::Number(bound as f64), Value::Nil))
@@ -540,18 +570,26 @@ impl Interp {
         }
     }
 
-    /// Run the accept loop on the bound listener, handling requests sequentially.
+    /// Run the accept loop on the bound listener, handling each connection on its
+    /// own `spawn_local` task so a slow handler can't block other clients (no
+    /// head-of-line blocking). A bounded semaphore (`maxConcurrent`) caps in-flight
+    /// tasks; per-request `requestTimeout`/`maxBodySize`/4xx behavior is preserved
+    /// inside each task. With `maxRequests:N` the loop stops after accepting N
+    /// connections and DRAINS the in-flight handler tasks before returning, so an
+    /// `await serve(...)` (and tests) complete deterministically.
     async fn http_server_serve(
-        &mut self,
+        &self,
         id: u64,
         args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
         // Optional serve opts: `maxRequests` (test/shutdown stop), `maxBodySize`
-        // (413 limit), `requestTimeout` (ms, 408 on expiry).
+        // (413 limit), `requestTimeout` (ms, 408 on expiry), `maxConcurrent` (cap on
+        // concurrently-handled connections).
         let mut max_requests: Option<usize> = None;
         let mut max_body = DEFAULT_MAX_BODY_BYTES;
         let mut timeout_ms = DEFAULT_REQUEST_TIMEOUT_MS;
+        let mut max_concurrent = DEFAULT_MAX_CONCURRENT;
         if let Value::Object(o) = arg(args, 0) {
             let o = o.borrow();
             if let Some(Value::Number(n)) = o.get("maxRequests") {
@@ -569,12 +607,17 @@ impl Interp {
                     timeout_ms = *n as u64;
                 }
             }
+            if let Some(Value::Number(n)) = o.get("maxConcurrent") {
+                if *n >= 1.0 {
+                    max_concurrent = *n as usize;
+                }
+            }
         }
 
         // Take the listener out of the resource so we own it across awaits (the
         // resource table can't lend `&mut TcpListener` across a `call_value`).
         let listener = match self.http_server_mut(id) {
-            Some(s) => match s.listener.take() {
+            Some(mut s) => match s.listener.take() {
                 Some(l) => l,
                 None => {
                     return Ok(err_pair("server.serve: not bound (call bind/listen first)".into()))
@@ -583,6 +626,22 @@ impl Interp {
             None => return Ok(err_pair("server.serve: server is closed".into())),
         };
 
+        // Bounds the number of connections handled at once. Each spawned handler
+        // task holds an `OwnedSemaphorePermit` for its lifetime; the permit is
+        // released (returned to the semaphore) when the task finishes. This caps
+        // memory/fd usage even under a flood of slow clients.
+        // `Arc` (not `Rc`): `Semaphore::acquire_owned` requires `Arc<Semaphore>` so
+        // the resulting `OwnedSemaphorePermit` is `'static` and can move into the
+        // spawned handler task. Arc is fine in this `!Send` single-threaded runtime —
+        // the permit never crosses a thread (every task stays on the LocalSet).
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        // In-flight handler tasks, retained ONLY when `maxRequests` is set so the
+        // shutdown path can DRAIN them (await completion) before returning —
+        // otherwise an accepted-but-not-yet-finished slow handler's response could be
+        // lost. Without `maxRequests` (an unbounded `serve`) tasks are detached; the
+        // semaphore alone bounds concurrency and finished tasks free themselves, so
+        // we don't accumulate join handles forever.
+        let mut inflight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut served = 0usize;
         loop {
             if let Some(max) = max_requests {
@@ -590,53 +649,103 @@ impl Interp {
                     break;
                 }
             }
-            let (mut stream, _peer) = match listener.accept().await {
+            let (stream, _peer) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(e) => return Ok(err_pair(format!("server.serve accept failed: {}", e))),
             };
-            // Serve one request per connection (sequential v1 model). The whole
-            // request read is bounded by `requestTimeout` so a slow/stalled client
-            // can't hang the (sequential) server — on expiry we answer 408 + move on.
-            let read = tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                read_request(&mut stream, max_body),
-            )
-            .await;
-            // Pick the response (if any) for this connection.
-            let resp: Option<HttpResponse> = match read {
-                Ok(Ok(Some(req))) => {
-                    // `dispatch_request` is infallible w.r.t. handler errors (it
-                    // converts panics/propagation to 500), so a bad handler can't
-                    // take down the loop. A genuine internal `Control` still bubbles.
-                    Some(self.dispatch_request(id, req, span).await?)
-                }
-                // Clean EOF before any bytes: client closed; don't count it.
-                Ok(Ok(None)) => None,
-                Ok(Err(ReadError::HeadersTooLarge)) => Some(simple_response(431, "request header fields too large")),
-                Ok(Err(ReadError::BodyTooLarge)) => Some(simple_response(413, "payload too large")),
-                Ok(Err(ReadError::BadRequest)) => Some(simple_response(400, "bad request")),
-                // Timer elapsed: the read didn't complete in time.
-                Err(_) => Some(simple_response(408, "request timeout")),
+            // Acquire a permit BEFORE spawning so we never spawn more than
+            // `max_concurrent` handler tasks at once. (Bounded by the semaphore; the
+            // accept loop parks here when the cap is reached, applying backpressure.)
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                // The semaphore is never closed while we own it, so this is
+                // unreachable in practice; bail cleanly if it ever happens.
+                Err(_) => break,
             };
-            if let Some(resp) = resp {
-                // v1 serves ONE request per connection then closes it, so the
-                // response always advertises `connection: close`.
-                let bytes = serialize_response(&resp);
-                let _ = stream.write_all(&bytes).await;
-                let _ = stream.flush().await;
-                // Half-close our side so the client's read terminates promptly.
-                let _ = stream.shutdown().await;
-                served += 1;
+            let vm = self.rc();
+            // Each connection is handled on its own `'static` task. A panicking
+            // handler is already converted to a 500 inside `handle_connection` (and a
+            // genuine internal `Control` is swallowed there too) so a task can't
+            // abort the process or the accept loop. The permit is moved in and held
+            // for the task's whole lifetime, then dropped (released) on completion.
+            let handle = tokio::task::spawn_local(async move {
+                let _permit = permit;
+                vm.handle_connection(id, stream, max_body, timeout_ms, span).await;
+            });
+            served += 1;
+            if max_requests.is_some() {
+                inflight.push(handle);
             }
+            // (Unbounded serve: the handle is dropped — the task is detached and runs
+            // to completion on the LocalSet; the semaphore bounds concurrency.)
+        }
+
+        // Deterministic shutdown: drain every in-flight handler task so all accepted
+        // connections have had their responses written before `serve` returns.
+        for handle in inflight {
+            let _ = handle.await;
         }
 
         Ok(make_pair(Value::Nil, Value::Nil))
     }
 
+    /// Handle one accepted connection end-to-end on a spawned task: read the request
+    /// (bounded by `timeout_ms`/`max_body`), dispatch it through the interpreter
+    /// (handler panics/propagation → 500), then write + close. Never panics out of
+    /// the task: a genuine internal `Control` escaping dispatch is swallowed (logged
+    /// as a 500) so one connection can't take down the accept loop or the process.
+    async fn handle_connection(
+        &self,
+        id: u64,
+        mut stream: TcpStream,
+        max_body: usize,
+        timeout_ms: u64,
+        span: Span,
+    ) {
+        // The whole request read is bounded by `requestTimeout` so a slow/stalled
+        // client can't hang this connection's task — on expiry we answer 408.
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            read_request(&mut stream, max_body),
+        )
+        .await;
+        let resp: Option<HttpResponse> = match read {
+            Ok(Ok(Some(req))) => {
+                // `dispatch_request` is infallible w.r.t. handler errors (it converts
+                // panics/propagation to 500). A genuine internal `Control` should not
+                // occur here, but if it does, convert it to a 500 rather than letting
+                // the task panic (which would otherwise be silently dropped).
+                match self.dispatch_request(id, req, span).await {
+                    Ok(r) => Some(r),
+                    Err(Control::Panic(e)) => Some(simple_response(500, &e.message)),
+                    Err(Control::Propagate(v)) => {
+                        Some(simple_response(500, &error_message(&propagated_error(&v))))
+                    }
+                }
+            }
+            // Clean EOF before any bytes: client closed; nothing to write.
+            Ok(Ok(None)) => None,
+            Ok(Err(ReadError::HeadersTooLarge)) => Some(simple_response(431, "request header fields too large")),
+            Ok(Err(ReadError::BodyTooLarge)) => Some(simple_response(413, "payload too large")),
+            Ok(Err(ReadError::BadRequest)) => Some(simple_response(400, "bad request")),
+            // Timer elapsed: the read didn't complete in time.
+            Err(_) => Some(simple_response(408, "request timeout")),
+        };
+        if let Some(resp) = resp {
+            // One request per connection then close, so the response always
+            // advertises `connection: close`.
+            let bytes = serialize_response(&resp);
+            let _ = stream.write_all(&bytes).await;
+            let _ = stream.flush().await;
+            // Half-close our side so the client's read terminates promptly.
+            let _ = stream.shutdown().await;
+        }
+    }
+
     /// Build the request object, run the middleware chain → matched handler, and
     /// convert the result into an `HttpResponse`.
     async fn dispatch_request(
-        &mut self,
+        &self,
         id: u64,
         req: RawRequest,
         span: Span,
@@ -695,11 +804,25 @@ impl Interp {
             None => Vec::new(),
         };
 
-        let result = self.run_chain(middleware, 0, handler, request, span).await;
+        // A fresh id tags every `HttpNext` continuation created for this dispatch so
+        // the post-chain sweep only drops THIS request's leftovers — concurrent
+        // connections (each on its own task) must not clobber one another's pending
+        // continuations.
+        let dispatch_id = self.next_http_dispatch_id();
+        // An `async` handler/middleware returns a `Value::Future` (eagerly spawned on
+        // the LocalSet); settle it before converting to a response so the client sees
+        // the resolved body, not the future itself. A plain (sync) handler returns a
+        // non-future, so this is the identity for sequential handlers (mirrors how the
+        // `await` expression drives a future, spec: `await 5 == 5`). Errors inside the
+        // future surface as `Control` and become a 500 below.
+        let result = match self.run_chain(middleware, 0, handler, request, dispatch_id, span).await {
+            Ok(Value::Future(f)) => f.get().await,
+            other => other,
+        };
         // A short-circuiting middleware (one that returns without calling `next`)
         // leaves its un-consumed `HttpNext` continuation in the resource table;
-        // sweep any leftovers so per-request handles don't accumulate.
-        self.drop_pending_http_next();
+        // sweep this dispatch's leftovers so per-request handles don't accumulate.
+        self.drop_pending_http_next(dispatch_id);
         // A handler/middleware panic (`Control::Panic`) or `?`-propagation
         // (`Control::Propagate`) must NOT kill the server: convert it to a 500 so
         // the accept loop keeps serving. The message is included for dev-friendliness.
@@ -721,11 +844,12 @@ impl Interp {
     /// Returns the response value.
     #[async_recursion::async_recursion(?Send)]
     async fn run_chain(
-        &mut self,
+        &self,
         middleware: Vec<Value>,
         index: usize,
         handler: Value,
         request: Value,
+        dispatch_id: u64,
         span: Span,
     ) -> Result<Value, Control> {
         if index >= middleware.len() {
@@ -740,6 +864,7 @@ impl Interp {
             index: index + 1,
             handler,
             request: request.clone(),
+            dispatch_id,
         };
         let next_handle = self.register_resource(
             NativeKind::HttpNext,
@@ -760,7 +885,7 @@ impl Interp {
     /// pass a (possibly replaced) request object onward (`next(req)`); with no
     /// argument the original request is forwarded.
     pub(crate) async fn call_http_next(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -775,7 +900,8 @@ impl Interp {
             Some(v) if !matches!(v, Value::Nil) => v.clone(),
             _ => state.request,
         };
-        self.run_chain(state.middleware, state.index, state.handler, request, span).await
+        self.run_chain(state.middleware, state.index, state.handler, request, state.dispatch_id, span)
+            .await
     }
 }
 
@@ -786,6 +912,10 @@ pub struct NextState {
     index: usize,
     handler: Value,
     request: Value,
+    /// Identifies the owning `dispatch_request` so a short-circuit sweep only
+    /// drops THIS dispatch's leftover continuations (concurrent connections each
+    /// have their own dispatch id — see `drop_pending_http_next`).
+    pub dispatch_id: u64,
 }
 
 /// Is `v` something `call_value` can invoke?
@@ -799,14 +929,34 @@ fn is_callable(v: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::interp::Interp;
+    use std::rc::Rc;
+
+    /// Build a fresh interpreter as an `Rc` with its self-reference installed (so
+    /// `serve`'s per-connection `self.rc()` / `spawn_local` works — see M17).
+    fn new_interp() -> Rc<Interp> {
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        interp
+    }
 
     /// Run an AScript program on a caller-held interp (so we can drive `serve` and
-    /// inspect output). Returns the captured output.
-    async fn run_on(interp: &mut Interp, src: &str) -> Result<(), String> {
+    /// inspect output) INSIDE a `LocalSet`, the shape `run_file`/`run_source` use:
+    /// the server's per-connection handler tasks are `spawn_local`'d, which requires
+    /// an active `LocalSet`; we `run_until` the program then drain remaining tasks.
+    async fn run_on(interp: &Rc<Interp>, src: &str) -> Result<(), String> {
         let tokens = crate::lexer::lex(src).map_err(|e| e.message)?;
         let program = crate::parser::parse(&tokens).map_err(|e| e.message)?;
         let env = crate::interp::global_env().child();
-        interp.exec(&program, &env).await.map_err(|c| format!("{:?}", c)).map(|_| ())
+        let local = tokio::task::LocalSet::new();
+        let r = local
+            .run_until(async { interp.exec(&program, &env).await })
+            .await
+            .map_err(|c| format!("{:?}", c))
+            .map(|_| ());
+        // Drain any still-running spawned tasks (handler tasks for unbounded serve;
+        // for tests `serve` already drained its in-flight tasks before returning).
+        local.await;
+        r
     }
 
     /// Reserve an ephemeral port (bind+drop) so the AScript server can bind it and
@@ -827,8 +977,8 @@ mod tests {
         T: Send + 'static,
     {
         let client_task = tokio::spawn(client());
-        let mut interp = Interp::new();
-        run_on(&mut interp, src).await.unwrap_or_else(|e| panic!("server: {e}"));
+        let interp = new_interp();
+        run_on(&interp, src).await.unwrap_or_else(|e| panic!("server: {e}"));
         client_task.await.unwrap()
     }
 
@@ -1061,13 +1211,13 @@ print(out)
         let client = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             rt.block_on(async move {
-                let mut interp = Interp::new();
-                run_on(&mut interp, &client_src).await.expect("client ran");
-                interp.output.clone()
+                let interp = new_interp();
+                run_on(&interp, &client_src).await.expect("client ran");
+                interp.output()
             })
         });
-        let mut interp = Interp::new();
-        run_on(&mut interp, &server_src).await.expect("server ran");
+        let interp = new_interp();
+        run_on(&interp, &server_src).await.expect("server ran");
         let client_out = client.join().unwrap();
         assert_eq!(client_out, "from-server\n");
     }
@@ -1089,9 +1239,9 @@ await s.serve({{ maxRequests: 1 }})
         );
         let url = format!("http://127.0.0.1:{port}/x");
         let client = tokio::spawn(async move { client_request("GET", &url, None).await });
-        let mut interp = Interp::new();
+        let interp = new_interp();
         let baseline = interp.resource_count();
-        run_on(&mut interp, &src).await.expect("server ran");
+        run_on(&interp, &src).await.expect("server ran");
         client.await.unwrap();
         // The server handle itself was closed implicitly? No — `create()`'s handle
         // outlives the program, but the transient next-continuation must be gone.
@@ -1158,6 +1308,131 @@ await s.serve({{ maxRequests: 2, maxBodySize: 10 }})
         assert_eq!(up_status, "HTTP/1.1 413 Payload Too Large", "oversized body must be 413");
         assert_eq!(ping_status, "HTTP/1.1 200 OK", "server must survive the rejected body");
         assert_eq!(ping_body, "pong");
+    }
+
+    #[tokio::test]
+    async fn slow_handler_does_not_block_fast_handler() {
+        // THE concurrency proof: a SLOW route (sleeps 400ms) and a FAST route. Two
+        // clients hit them *at the same time*. If handling is concurrent, the fast
+        // response returns long before the slow one (their handling overlaps), so
+        // total wall time ≈ max(slow, fast) ≈ 400ms, NOT the sum (~800ms). Under the
+        // old sequential server, the slow handler (accepted first) would block the
+        // fast one and this would take ~800ms / the fast one would stall.
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import {{ sleep }} from "std/time"
+let s = create()
+s.route("GET", "/slow", async (req) => {{ await sleep(400); return "slow" }})
+s.route("GET", "/fast", (req) => "fast")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 2 }})
+"#
+        );
+        let slow_url = format!("http://127.0.0.1:{port}/slow");
+        let fast_url = format!("http://127.0.0.1:{port}/fast");
+        let (slow_elapsed_ms, fast_elapsed_ms, slow_body, fast_body) = with_server(&src, move || async move {
+            let start = std::time::Instant::now();
+            // Fire the slow request first so it is (likely) accepted first; then the
+            // fast one. Concurrency means the fast one still returns quickly.
+            let slow = tokio::spawn({
+                let url = slow_url.clone();
+                async move {
+                    let (_s, b) = client_request("GET", &url, None).await;
+                    (start.elapsed().as_millis(), b)
+                }
+            });
+            // Tiny stagger so /slow is accepted first, exposing head-of-line blocking
+            // if the server were sequential.
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let fast = tokio::spawn({
+                let url = fast_url.clone();
+                async move {
+                    let (_s, b) = client_request("GET", &url, None).await;
+                    (start.elapsed().as_millis(), b)
+                }
+            });
+            let (slow_ms, slow_b) = slow.await.unwrap();
+            let (fast_ms, fast_b) = fast.await.unwrap();
+            (slow_ms, fast_ms, slow_b, fast_b)
+        })
+        .await;
+        assert_eq!(slow_body, "slow");
+        assert_eq!(fast_body, "fast");
+        // The fast response must come back well before the slow handler finishes
+        // (which can't be earlier than ~400ms). Lenient bound to avoid CI flakiness:
+        // if handling were sequential the fast one would wait behind the slow one
+        // (~400ms+); concurrent handling returns it in tens of ms.
+        assert!(
+            fast_elapsed_ms < 300,
+            "fast response should overlap the slow handler (got {fast_elapsed_ms}ms; slow took {slow_elapsed_ms}ms)"
+        );
+        // Sanity: the slow handler really did take ~400ms (it slept).
+        assert!(slow_elapsed_ms >= 350, "slow handler should have slept ~400ms (got {slow_elapsed_ms}ms)");
+    }
+
+    #[tokio::test]
+    async fn max_requests_drains_inflight_slow_handler() {
+        // maxRequests-based shutdown must DRAIN in-flight handler tasks: a slow
+        // handler accepted as the Nth request must still complete and deliver its
+        // response before `serve` returns. Here maxRequests:1 with a single slow
+        // request — `serve` must not return until the slow handler's response is
+        // written, or the client would see a truncated/empty body.
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import {{ sleep }} from "std/time"
+let s = create()
+s.route("GET", "/slow", async (req) => {{ await sleep(200); return "drained-ok" }})
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/slow");
+        let (status, body) =
+            with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
+        assert_eq!(status, "HTTP/1.1 200 OK", "in-flight slow handler must be drained before serve returns");
+        assert_eq!(body, "drained-ok");
+    }
+
+    #[tokio::test]
+    async fn many_concurrent_requests_all_succeed_under_cap() {
+        // Stress: more concurrent clients than a small `maxConcurrent` cap. The
+        // bounded semaphore must serialize admission WITHOUT dropping anyone — every
+        // request still gets a correct response (the cap throttles, never fails).
+        let port = reserve_port().await;
+        let n = 8usize;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import {{ sleep }} from "std/time"
+let s = create()
+s.route("GET", "/work", async (req) => {{ await sleep(20); return "done" }})
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: {n}, maxConcurrent: 2 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/work");
+        let bodies = with_server(&src, move || async move {
+            let mut tasks = Vec::new();
+            for _ in 0..n {
+                let u = url.clone();
+                tasks.push(tokio::spawn(async move { client_request("GET", &u, None).await }));
+            }
+            let mut out = Vec::new();
+            for t in tasks {
+                out.push(t.await.unwrap());
+            }
+            out
+        })
+        .await;
+        assert_eq!(bodies.len(), n);
+        for (status, body) in &bodies {
+            assert_eq!(status, "HTTP/1.1 200 OK", "every request must succeed under the cap");
+            assert_eq!(body, "done");
+        }
     }
 
     /// Like `client_request` but returns the FULL raw response text (head + body)

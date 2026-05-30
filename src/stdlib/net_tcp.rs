@@ -100,7 +100,7 @@ fn want_addr(args: &[Value], span: Span, ctx: &str) -> Result<String, Control> {
 impl Interp {
     /// Module-level dispatch for `std/net/tcp` (`connect`/`listen`).
     pub(crate) async fn call_net_tcp(
-        &mut self,
+        &self,
         func: &str,
         args: &[Value],
         span: Span,
@@ -112,7 +112,7 @@ impl Interp {
         }
     }
 
-    async fn tcp_connect(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
+    async fn tcp_connect(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let addr = want_addr(args, span, "net/tcp.connect")?;
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
@@ -127,7 +127,7 @@ impl Interp {
         }
     }
 
-    async fn tcp_listen(&mut self, args: &[Value], span: Span) -> Result<Value, Control> {
+    async fn tcp_listen(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let addr = want_addr(args, span, "net/tcp.listen")?;
         match TcpListener::bind(&addr).await {
             Ok(listener) => {
@@ -150,7 +150,7 @@ impl Interp {
     /// Dispatch a method on a TCP stream / listener handle.
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_tcp_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -164,7 +164,7 @@ impl Interp {
     }
 
     async fn tcp_stream_method(
-        &mut self,
+        &self,
         id: u64,
         method: &str,
         args: &[Value],
@@ -189,33 +189,43 @@ impl Interp {
                     return Ok(bytes_value(Vec::new()));
                 }
                 // A closed/EOF'd stream degrades to nil rather than panicking.
-                let stream = match self.tcp_stream_mut(id) {
-                    Some(s) => s,
-                    None => return Ok(Value::Nil),
+                // Take the stream OUT so no table borrow is held across the await.
+                let mut stream = match self.take_resource(id) {
+                    Some(ResourceState::TcpStream(s)) => s,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(Value::Nil);
+                    }
                 };
                 let mut buf = Vec::new();
                 match stream.read_upto(n, &mut buf).await {
                     Ok(0) => {
-                        // EOF: finalize the stream so its socket fd drops now.
-                        self.take_resource(id);
+                        // EOF: drop the stream so its socket fd is reclaimed now.
                         Ok(Value::Nil)
                     }
-                    Ok(_) => Ok(bytes_value(buf)),
+                    Ok(_) => {
+                        self.return_resource(id, ResourceState::TcpStream(stream));
+                        Ok(bytes_value(buf))
+                    }
                     Err(e) => Err(AsError::at(format!("stream.read failed: {}", e), span).into()),
                 }
             }
             "readLine" => {
-                let stream = match self.tcp_stream_mut(id) {
-                    Some(s) => s,
-                    None => return Ok(Value::Nil), // gone → EOF
+                let mut stream = match self.take_resource(id) {
+                    Some(ResourceState::TcpStream(s)) => s,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(Value::Nil); // gone → EOF
+                    }
                 };
                 let mut buf = Vec::new();
                 match stream.read_line_bytes(&mut buf).await {
                     Ok(0) => {
-                        self.take_resource(id);
+                        // EOF: drop the stream.
                         Ok(Value::Nil)
                     }
                     Ok(_) => {
+                        self.return_resource(id, ResourceState::TcpStream(stream));
                         // Strip a single trailing '\n' and an optional preceding '\r'.
                         if buf.last() == Some(&b'\n') {
                             buf.pop();
@@ -231,27 +241,32 @@ impl Interp {
             "readToEnd" => {
                 // readToEnd is type-stable: it ALWAYS returns bytes (empty if the
                 // stream was already drained / finalized), matching `readToEnd()→bytes`.
-                let stream = match self.tcp_stream_mut(id) {
-                    Some(s) => s,
-                    None => return Ok(bytes_value(Vec::new())), // gone → empty bytes
+                let mut stream = match self.take_resource(id) {
+                    Some(ResourceState::TcpStream(s)) => s,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(bytes_value(Vec::new())); // gone → empty bytes
+                    }
                 };
                 let mut buf = Vec::new();
+                // readToEnd consumes the whole stream; we drop it either way.
                 match stream.read_to_end_bytes(&mut buf).await {
-                    Ok(_) => {
-                        // readToEnd consumes the whole stream: finalize it now.
-                        self.take_resource(id);
-                        Ok(bytes_value(buf))
-                    }
+                    Ok(_) => Ok(bytes_value(buf)),
                     Err(e) => Err(AsError::at(format!("stream.readToEnd failed: {}", e), span).into()),
                 }
             }
             "write" => {
                 let data = data_to_bytes(&arg(args, 0), span, "stream.write")?;
-                let stream = match self.tcp_stream_mut(id) {
-                    Some(s) => s,
-                    None => return Ok(err_pair("stream.write: stream is closed".to_string())),
+                let mut stream = match self.take_resource(id) {
+                    Some(ResourceState::TcpStream(s)) => s,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(err_pair("stream.write: stream is closed".to_string()));
+                    }
                 };
-                match stream.write_all(&data).await {
+                let r = stream.write_all(&data).await;
+                self.return_resource(id, ResourceState::TcpStream(stream));
+                match r {
                     Ok(_) => Ok(make_pair(Value::Nil, Value::Nil)),
                     Err(e) => Ok(err_pair(format!("stream.write failed: {}", e))),
                 }
@@ -266,7 +281,7 @@ impl Interp {
     }
 
     async fn tcp_listener_method(
-        &mut self,
+        &self,
         id: u64,
         method: &str,
         _args: &[Value],
@@ -274,11 +289,17 @@ impl Interp {
     ) -> Result<Value, Control> {
         match method {
             "accept" => {
-                let listener = match self.tcp_listener_mut(id) {
-                    Some(l) => l,
-                    None => return Ok(err_pair("listener.accept: listener is closed".to_string())),
+                let listener = match self.take_resource(id) {
+                    Some(ResourceState::TcpListener(l)) => l,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(err_pair("listener.accept: listener is closed".to_string()));
+                    }
                 };
-                match listener.accept().await {
+                let accepted = listener.accept().await;
+                // The listener keeps accepting: put it back.
+                self.return_resource(id, ResourceState::TcpListener(listener));
+                match accepted {
                     Ok((stream, _peer)) => {
                         let handle = self.register_resource(
                             NativeKind::TcpStream,
@@ -308,7 +329,7 @@ mod tests {
 
     /// Lex/parse/exec `src` against a caller-held `Interp` (so the resource table
     /// can be inspected afterward).
-    async fn run_on(interp: &mut Interp, src: &str) {
+    async fn run_on(interp: &Interp, src: &str) {
         let tokens = crate::lexer::lex(src).expect("lex");
         let program = crate::parser::parse(&tokens).expect("parse");
         let env = crate::interp::global_env().child();
@@ -445,7 +466,7 @@ print(b)
     async fn listen_accept_reads_from_raw_client() {
         // AScript binds + accepts; a raw tokio client connects to listener.port and
         // sends a line. Verifies the AScript listen/accept side end-to-end.
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         // Reserve a free port (bind+drop), hand it to the AScript `listen`, and have
         // the raw client retry-connect until AScript's listener is up — deterministic
         // without needing to interleave reading `listener.port` across executions.
@@ -481,9 +502,9 @@ conn.close()
 server.close()
 "#
         );
-        run_on(&mut interp, &src).await;
+        run_on(&interp, &src).await;
         client.await.unwrap();
-        assert_eq!(interp.output, "nil\ntrue\nnil\nping\n");
+        assert_eq!(interp.output(), "nil\ntrue\nnil\nping\n");
     }
 
     #[tokio::test]
@@ -520,7 +541,7 @@ print(werr != nil)
     #[tokio::test]
     async fn stream_resources_reclaimed_after_close() {
         let port = spawn_echo_peer().await;
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let baseline = interp.resource_count();
         let src = format!(
             r#"
@@ -531,7 +552,7 @@ let line = await stream.readLine()
 stream.close()
 "#
         );
-        run_on(&mut interp, &src).await;
+        run_on(&interp, &src).await;
         assert_eq!(interp.resource_count(), baseline, "stream should be reclaimed on close");
     }
 }

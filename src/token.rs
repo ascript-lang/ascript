@@ -69,6 +69,7 @@ pub enum Tok {
     Export,
     Async,
     Await,
+    Yield,
     Eof,
 }
 

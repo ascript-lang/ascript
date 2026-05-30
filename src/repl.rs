@@ -6,6 +6,9 @@
 //! that trailing expression is printed (unless it is `nil`). A `Control::Panic`
 //! is reported but does NOT exit the loop — the environment stays intact and the
 //! loop continues.
+//!
+//! Each line is evaluated inside a `tokio::task::LocalSet` so spawned tasks (from
+//! M17 Phase 2 on) join before the prompt returns; today the drain is a no-op.
 
 use std::io::{BufRead, IsTerminal};
 use std::rc::Rc;
@@ -21,20 +24,21 @@ use crate::value::Value;
 /// Uses `rustyline` line editing when stdin is a TTY; otherwise (piped input)
 /// reads lines from stdin directly so non-interactive use still works.
 pub async fn run_repl() -> std::io::Result<()> {
-    let mut interp = Interp::new();
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
     // Persistent session scope: a child of the builtins env so REPL definitions
     // can shadow builtins and persist across lines (builtins resolve upward).
     let env = crate::interp::global_env().child();
 
     if std::io::stdin().is_terminal() {
-        run_tty(&mut interp, &env).await
+        run_tty(&interp, &env).await
     } else {
-        run_piped(&mut interp, &env).await
+        run_piped(&interp, &env).await
     }
 }
 
 /// Interactive path: rustyline editor with history.
-async fn run_tty(interp: &mut Interp, env: &Environment) -> std::io::Result<()> {
+async fn run_tty(interp: &Interp, env: &Environment) -> std::io::Result<()> {
     use rustyline::error::ReadlineError;
     use rustyline::DefaultEditor;
 
@@ -57,7 +61,7 @@ async fn run_tty(interp: &mut Interp, env: &Environment) -> std::io::Result<()> 
 }
 
 /// Non-TTY path: read lines straight from stdin (used by the piped test).
-async fn run_piped(interp: &mut Interp, env: &Environment) -> std::io::Result<()> {
+async fn run_piped(interp: &Interp, env: &Environment) -> std::io::Result<()> {
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
@@ -69,7 +73,7 @@ async fn run_piped(interp: &mut Interp, env: &Environment) -> std::io::Result<()
 /// Lex+parse one input line and evaluate it against the shared interpreter and
 /// environment. Errors (lex/parse/panic) are reported and swallowed so the loop
 /// continues with the environment intact.
-async fn eval_line(interp: &mut Interp, env: &Environment, line: &str) {
+async fn eval_line(interp: &Interp, env: &Environment, line: &str) {
     if line.trim().is_empty() {
         return;
     }
@@ -97,35 +101,43 @@ async fn eval_line(interp: &mut Interp, env: &Environment, line: &str) {
         _ => None,
     };
 
-    if let Err(Control::Panic(e)) = interp.exec(&program, env).await {
-        flush_output(interp);
-        crate::diagnostics::report(&e.with_source(src_info.clone()));
-        return;
-    }
+    // Drive each input under a LocalSet so spawned tasks join before the prompt
+    // returns (no-op until Phase 2).
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            if let Err(Control::Panic(e)) = interp.exec(&program, env).await {
+                flush_output(interp);
+                crate::diagnostics::report(&e.with_source(src_info.clone()));
+                return;
+            }
 
-    if let Some(Stmt::Expr(expr)) = trailing {
-        match interp.eval_expr(&expr, env).await {
-            Ok(value) => {
-                flush_output(interp);
-                if !matches!(value, Value::Nil) {
-                    println!("{}", value);
+            if let Some(Stmt::Expr(expr)) = trailing {
+                match interp.eval_expr(&expr, env).await {
+                    Ok(value) => {
+                        flush_output(interp);
+                        if !matches!(value, Value::Nil) {
+                            println!("{}", value);
+                        }
+                    }
+                    Err(Control::Panic(e)) => {
+                        flush_output(interp);
+                        crate::diagnostics::report(&e.with_source(src_info));
+                    }
+                    Err(Control::Propagate(_)) => flush_output(interp),
                 }
-            }
-            Err(Control::Panic(e)) => {
+            } else {
                 flush_output(interp);
-                crate::diagnostics::report(&e.with_source(src_info));
             }
-            Err(Control::Propagate(_)) => flush_output(interp),
-        }
-    } else {
-        flush_output(interp);
-    }
+        })
+        .await;
+    local.await;
 }
 
 /// Print and clear any output captured by `print` during this input.
-fn flush_output(interp: &mut Interp) {
-    if !interp.output.is_empty() {
-        print!("{}", interp.output);
-        interp.output.clear();
+fn flush_output(interp: &Interp) {
+    if !interp.output_is_empty() {
+        print!("{}", interp.output());
+        interp.clear_output();
     }
 }

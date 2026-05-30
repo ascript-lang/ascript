@@ -531,6 +531,18 @@
           "value": "fn"
         },
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "*"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "FIELD",
           "name": "name",
           "content": {
@@ -765,6 +777,18 @@
         {
           "type": "STRING",
           "value": "fn"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "*"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "FIELD",
@@ -1037,6 +1061,18 @@
           "value": "for"
         },
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "await"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "STRING",
           "value": "("
         },
@@ -1209,6 +1245,10 @@
         {
           "type": "SYMBOL",
           "name": "await_expression"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "yield_expression"
         },
         {
           "type": "SYMBOL",
@@ -1858,6 +1898,31 @@
           {
             "type": "SYMBOL",
             "name": "_expression"
+          }
+        ]
+      }
+    },
+    "yield_expression": {
+      "type": "PREC_RIGHT",
+      "value": 1,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "yield"
+          },
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "_expression"
+              },
+              {
+                "type": "BLANK"
+              }
+            ]
           }
         ]
       }
@@ -2623,6 +2688,10 @@
         },
         {
           "type": "SYMBOL",
+          "name": "future_type"
+        },
+        {
+          "type": "SYMBOL",
           "name": "tuple_type"
         },
         {
@@ -2724,6 +2793,27 @@
         {
           "type": "STRING",
           "value": "Result"
+        },
+        {
+          "type": "STRING",
+          "value": "<"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "_type"
+        },
+        {
+          "type": "STRING",
+          "value": ">"
+        }
+      ]
+    },
+    "future_type": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "future"
         },
         {
           "type": "STRING",

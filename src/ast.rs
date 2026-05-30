@@ -21,7 +21,7 @@ pub enum ExprKind {
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Call { callee: Box<Expr>, args: Vec<Expr> },
     Assign { target: Box<Expr>, value: Box<Expr> },
-    Arrow { params: Vec<Param>, body: Box<ArrowBody>, is_async: bool },
+    Arrow { params: Vec<Param>, body: Box<ArrowBody>, is_async: bool, is_generator: bool },
     Array(Vec<Expr>),
     Index { object: Box<Expr>, index: Box<Expr> },
     Object(Vec<(String, Expr)>),
@@ -35,6 +35,10 @@ pub enum ExprKind {
     Template { parts: Vec<TemplatePart> },
     Match { subject: Box<Expr>, arms: Vec<MatchArm> },
     Await(Box<Expr>),
+    /// `yield` / `yield <expr>` inside a generator body (`fn*` / `async fn*`).
+    /// Hands a value to the consumer and evaluates to the resume value the
+    /// consumer passed via `gen.next(v)` (`nil` for `next()` / `for await`).
+    Yield(Option<Box<Expr>>),
     /// A parenthesized expression, kept distinct (not flattened) so parentheses
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
     /// short-circuiting (spec §4, matching JS).
@@ -58,6 +62,7 @@ pub enum Type {
     Union(Box<Type>, Box<Type>),
     Named(String),
     Map(Box<Type>, Box<Type>),
+    Future(Box<Type>),
 }
 
 /// A function parameter: a name with an optional type annotation.
@@ -95,6 +100,7 @@ impl std::fmt::Display for Type {
             Type::Union(a, b) => write!(f, "{} | {}", a, b),
             Type::Named(n) => write!(f, "{}", n),
             Type::Map(k, v) => write!(f, "map<{}, {}>", k, v),
+            Type::Future(t) => write!(f, "future<{}>", t),
         }
     }
 }
@@ -137,7 +143,7 @@ pub enum Stmt {
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
     While { cond: Expr, body: Vec<Stmt> },
     ForRange { var: String, start: Expr, end: Expr, body: Vec<Stmt> },
-    ForOf { var: String, iter: Expr, body: Vec<Stmt> },
+    ForOf { var: String, iter: Expr, body: Vec<Stmt>, for_await: bool },
     Return(Option<Expr>),
     Break,
     Continue,
@@ -147,6 +153,7 @@ pub enum Stmt {
         ret: Option<Type>,
         body: Vec<Stmt>,
         is_async: bool,
+        is_generator: bool,
         span: Span,
         name_span: Span,
     },
@@ -175,6 +182,7 @@ pub struct MethodDecl {
     pub ret: Option<Type>,
     pub body: Vec<Stmt>,
     pub is_async: bool,
+    pub is_generator: bool,
     /// Span of the method (for LSP symbol range).
     pub span: Span,
     /// Span of just the method name (for LSP selection range).
@@ -300,6 +308,8 @@ impl fmt::Display for ExprKind {
             ExprKind::Template { .. } => write!(f, "(template)"),
             ExprKind::Match { .. } => write!(f, "(match)"),
             ExprKind::Await(e) => write!(f, "(await {})", e),
+            ExprKind::Yield(Some(e)) => write!(f, "(yield {})", e),
+            ExprKind::Yield(None) => write!(f, "(yield)"),
             ExprKind::Paren(inner) => write!(f, "{}", inner),
         }
     }

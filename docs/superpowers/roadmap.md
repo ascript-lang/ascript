@@ -172,6 +172,28 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 
 ---
 
+## Phase 5 — Concurrency & coroutines (post-spec extension)
+
+- ✅ **M17 — Async Concurrency + Generators/Coroutines (Architecture A).** Turn the async
+  model from "sequential inline, `await` is identity" into real cooperative concurrency on the
+  single-threaded tokio runtime, then expose the interpreter's *existing* stackless-coroutine
+  nature as script-level generators/coroutines — one engine, no `unsafe`, no CPS rewrite.
+  Calling an `async fn` returns an eagerly-scheduled `Value::Future`; `await` actually drives it
+  (identity on non-futures, for back-compat); `std/task` adds `spawn`/`gather`/`race`/`timeout`
+  over `tokio::task::LocalSet` + `spawn_local` (accepts `!Send`, so `Rc`/`RefCell` is preserved).
+  `yield` is a real `.await` on an internal single-consumer rendezvous → generators (`fn*` /
+  `async fn*`), bidirectional resume (`gen.next(v)`), and `for await`. Runtime joins all spawned
+  tasks before exit (structured drain). New interpreter invariant: **never hold a `RefCell` borrow
+  across an `.await`** (clippy `await_holding_refcell_ref = deny`). New value kinds `Value::Future`
+  + `Value::Generator`; new `future<T>` contract type. **Documented deferrals** (deliberate
+  Architecture-A boundaries, each needs a different engine): durable/serializable continuations
+  (needs explicit-stack VM "B2"); robust unbounded deep script recursion (needs stackful "B1" or
+  "B2"); deterministic/replayable scheduling (needs "B2"). Spec §7 rewritten; ADR at
+  `specs/adr/2026-05-30-async-generators.md`. Plan:
+  `plans/2026-05-30-async-generators-coroutines.md`.
+
+---
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

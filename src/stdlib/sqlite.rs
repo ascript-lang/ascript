@@ -59,7 +59,7 @@ impl Interp {
     /// Module-level dispatch for `std/sqlite` (only `open`). Method calls on a
     /// connection/statement handle go through `call_sqlite_method` instead.
     pub(crate) fn call_sqlite_open(
-        &mut self,
+        &self,
         func: &str,
         args: &[Value],
         span: Span,
@@ -86,7 +86,7 @@ impl Interp {
     /// Dispatch a method on a sqlite connection or statement handle. Sync work, but
     /// async-signed for uniformity with `call_native_method`.
     pub(crate) async fn call_sqlite_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -105,7 +105,7 @@ impl Interp {
     }
 
     fn sqlite_conn_method(
-        &mut self,
+        &self,
         id: u64,
         method: &str,
         args: &[Value],
@@ -130,7 +130,7 @@ impl Interp {
                 let sql = want_string(&arg(args, 0), span, "connection.exec")?;
                 let params = parse_params(args.get(1), span, "connection.exec")?;
                 let conn = self.sqlite_conn(id).expect("checked present");
-                match exec_sql(conn, &sql, &params) {
+                match exec_sql(&conn, &sql, &params) {
                     Ok(changes) => Ok(make_pair(Value::Number(changes as f64), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("connection.exec failed: {}", e))),
                 }
@@ -139,17 +139,20 @@ impl Interp {
                 let sql = want_string(&arg(args, 0), span, "connection.query")?;
                 let params = parse_params(args.get(1), span, "connection.query")?;
                 let conn = self.sqlite_conn(id).expect("checked present");
-                match query_sql(conn, &sql, &params) {
+                match query_sql(&conn, &sql, &params) {
                     Ok(rows) => Ok(make_pair(Value::Array(Rc::new(RefCell::new(rows))), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("connection.query failed: {}", e))),
                 }
             }
             "prepare" => {
                 let sql = want_string(&arg(args, 0), span, "connection.prepare")?;
-                let conn = self.sqlite_conn(id).expect("checked present");
                 // Validate the SQL up front so a bad statement is a Tier-1 err here
-                // rather than surfacing only on the first run/all.
-                if let Err(e) = conn.prepare(&sql) {
+                // rather than surfacing only on the first run/all. Scope the conn
+                // borrow so it drops before `register_resource` re-borrows the table.
+                if let Some(e) = {
+                    let conn = self.sqlite_conn(id).expect("checked present");
+                    conn.prepare(&sql).err().map(|e| e.to_string())
+                } {
                     return Ok(err_pair(format!("connection.prepare failed: {}", e)));
                 }
                 let handle = self.register_resource(
@@ -170,7 +173,7 @@ impl Interp {
         }
     }
 
-    fn conn_exec_simple(&mut self, id: u64, sql: &str, ctx: &str) -> Result<Value, Control> {
+    fn conn_exec_simple(&self, id: u64, sql: &str, ctx: &str) -> Result<Value, Control> {
         let conn = self.sqlite_conn(id).expect("checked present");
         match conn.execute(sql, []) {
             Ok(_) => Ok(make_pair(Value::Nil, Value::Nil)),
@@ -179,16 +182,19 @@ impl Interp {
     }
 
     fn sqlite_stmt_method(
-        &mut self,
+        &self,
         id: u64,
         method: &str,
         args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
         // Pull the stored SQL + owning connection id out of the statement resource.
-        let (conn_id, sql) = match self.resource(id) {
-            Some(ResourceState::SqliteStatement { conn_id, sql }) => (*conn_id, sql.clone()),
-            _ => return Err(use_after_close(span)),
+        let (conn_id, sql) = match self.with_resource(id, |r| match r {
+            Some(ResourceState::SqliteStatement { conn_id, sql }) => Some((*conn_id, sql.clone())),
+            _ => None,
+        }) {
+            Some(pair) => pair,
+            None => return Err(use_after_close(span)),
         };
         // The statement is dead once its connection is closed.
         if self.sqlite_conn(conn_id).is_none() {
@@ -199,7 +205,7 @@ impl Interp {
             "run" => {
                 let params = parse_params(args.first(), span, "statement.run")?;
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
-                match exec_cached(conn, &sql, &params) {
+                match exec_cached(&conn, &sql, &params) {
                     Ok(changes) => Ok(make_pair(Value::Number(changes as f64), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("statement.run failed: {}", e))),
                 }
@@ -207,7 +213,7 @@ impl Interp {
             "all" => {
                 let params = parse_params(args.first(), span, "statement.all")?;
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
-                match query_cached(conn, &sql, &params) {
+                match query_cached(&conn, &sql, &params) {
                     Ok(rows) => Ok(make_pair(Value::Array(Rc::new(RefCell::new(rows))), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("statement.all failed: {}", e))),
                 }
@@ -578,7 +584,7 @@ print(conn)
     #[tokio::test]
     async fn open_registers_resource_state() {
         use crate::interp::{Interp, ResourceState};
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let pair = interp
             .call_sqlite_open("open", &[Value::Str(":memory:".into())], crate::span::Span::new(0, 0))
             .unwrap();
@@ -590,9 +596,9 @@ print(conn)
             Value::Native(n) => n.id,
             _ => panic!("expected native handle"),
         };
-        assert!(matches!(
-            interp.resource(id),
+        assert!(interp.with_resource(id, |r| matches!(
+            r,
             Some(ResourceState::SqliteConnection(_))
-        ));
+        )));
     }
 }

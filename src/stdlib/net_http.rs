@@ -807,7 +807,7 @@ fn scalar_to_string(v: &Value, span: Span, ctx: &str) -> Result<String, Control>
 impl Interp {
     /// Module-level dispatch for `std/net/http` (the verbs + `request`).
     pub(crate) async fn call_http(
-        &mut self,
+        &self,
         func: &str,
         args: &[Value],
         span: Span,
@@ -845,7 +845,7 @@ impl Interp {
 
     /// Build + send one request, returning the Tier-1 `[resp, err]` pair.
     async fn call_http_send(
-        &mut self,
+        &self,
         method: &str,
         url: String,
         opts: &Value,
@@ -937,7 +937,7 @@ impl Interp {
     /// Send `rb`, applying the hand-rolled retry loop and (optional) cancellation.
     /// Returns `Ok(response)` or `Err(pair)` where `pair` is the Tier-1 `[nil, err]`.
     async fn send_with_retry(
-        &mut self,
+        &self,
         rb: reqwest::RequestBuilder,
         method_obj: &reqwest::Method,
         url: &str,
@@ -989,7 +989,7 @@ impl Interp {
     /// Await a single send future, racing it against an optional cancellation token.
     /// Maps a reqwest error or a cancellation into the Tier-1 `[nil, err]` pair.
     async fn run_send(
-        &mut self,
+        &self,
         fut: impl std::future::Future<Output = reqwest::Result<reqwest::Response>>,
         cancel: &Option<std::sync::Arc<tokio::sync::Notify>>,
         method: &str,
@@ -1048,7 +1048,7 @@ impl Interp {
 
     #[async_recursion::async_recursion(?Send)]
     async fn apply_body(
-        &mut self,
+        &self,
         rb: reqwest::RequestBuilder,
         body: &Value,
         span: Span,
@@ -1125,7 +1125,7 @@ impl Interp {
     /// problem. It is correct but loses true incremental upload for (b)/(c); the
     /// bytes source (a) keeps the true streamed path.
     async fn apply_stream_body(
-        &mut self,
+        &self,
         rb: reqwest::RequestBuilder,
         source: &Value,
         span: Span,
@@ -1168,7 +1168,7 @@ impl Interp {
     /// Drain a reader native handle (Reader/TcpStream/HttpBody) fully into bytes by
     /// calling its `readToEnd()` method. Buffered-then-sent (see `apply_stream_body`).
     async fn drain_reader_handle(
-        &mut self,
+        &self,
         n: Rc<crate::value::NativeObject>,
         span: Span,
     ) -> Result<Vec<u8>, Control> {
@@ -1191,7 +1191,7 @@ impl Interp {
     /// Tier-1 propagated as a Tier-2 here is avoided — a generator error aborts the
     /// drain with a Tier-2, matching how a malformed body fails the request build).
     async fn drain_generator(
-        &mut self,
+        &self,
         gen: Value,
         span: Span,
     ) -> Result<Vec<u8>, Control> {
@@ -1266,7 +1266,7 @@ impl Interp {
 
     /// Read the response metadata into `fields` and register the live response (for
     /// the buffered body accessors) behind a `Value::Native(HttpResponse)` handle.
-    fn http_response_value(&mut self, resp: reqwest::Response) -> Value {
+    fn http_response_value(&self, resp: reqwest::Response) -> Value {
         let fields = Self::http_response_fields(&resp);
         self.register_resource(NativeKind::HttpResponse, fields, ResourceState::HttpResponse(resp))
     }
@@ -1275,7 +1275,7 @@ impl Interp {
     /// byte stream is registered behind a `Value::Native(HttpBody)` reader handle,
     /// which is exposed as the response's `body` field. The buffered accessors
     /// (text/bytes/json) are intentionally absent — see `call_http_response_method`.
-    fn http_streaming_response_value(&mut self, resp: reqwest::Response, mode: BodyMode) -> Value {
+    fn http_streaming_response_value(&self, resp: reqwest::Response, mode: BodyMode) -> Value {
         let mut fields = Self::http_response_fields(&resp);
         let body = self.register_resource(
             NativeKind::HttpBody,
@@ -1302,7 +1302,7 @@ impl Interp {
     /// the same handle is a Tier-2 panic.
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_http_response_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         _args: Vec<Value>,
         span: Span,
@@ -1358,7 +1358,7 @@ impl Interp {
     /// connection drops promptly.
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_http_body_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         args: Vec<Value>,
         span: Span,
@@ -1380,39 +1380,47 @@ impl Interp {
                 // resource (an empty buffer yields Ok(0), which would otherwise be
                 // treated as EOF and finalize a still-open body).
                 if n == 0 {
-                    let mode = match self.http_body_mut(id) {
-                        Some(b) => b.mode,
-                        None => return Ok(Value::Nil), // gone → EOF
+                    // read(0) must not touch the resource. Inspect mode under a borrow.
+                    let mode = self.with_resource(id, |r| match r {
+                        Some(ResourceState::HttpBody(b)) => Some(b.mode),
+                        _ => None,
+                    });
+                    return match mode {
+                        Some(mode) => Ok(mode.wrap(Vec::new())),
+                        None => Ok(Value::Nil), // gone → EOF
                     };
-                    return Ok(mode.wrap(Vec::new()));
                 }
-                let body = match self.http_body_mut(id) {
-                    Some(b) => b,
-                    None => return Ok(Value::Nil), // gone → EOF
+                // Take the body OUT so no table borrow is held across the await.
+                let mut body = match self.take_resource(id) {
+                    Some(ResourceState::HttpBody(b)) => b,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(Value::Nil); // gone → EOF
+                    }
                 };
                 let mode = body.mode;
                 let mut buf = Vec::new();
                 match body.read_upto(n, &mut buf).await {
-                    Ok(0) => {
-                        self.take_resource(id);
-                        Ok(Value::Nil)
+                    Ok(0) => Ok(Value::Nil), // EOF: drop the body
+                    Ok(_) => {
+                        self.return_resource(id, ResourceState::HttpBody(body));
+                        Ok(mode.wrap(buf))
                     }
-                    Ok(_) => Ok(mode.wrap(buf)),
                     Err(e) => Err(AsError::at(format!("body.read failed: {}", e), span).into()),
                 }
             }
             "readLine" => {
-                let body = match self.http_body_mut(id) {
-                    Some(b) => b,
-                    None => return Ok(Value::Nil), // gone → EOF
+                let mut body = match self.take_resource(id) {
+                    Some(ResourceState::HttpBody(b)) => b,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(Value::Nil); // gone → EOF
+                    }
                 };
                 let mode = body.mode;
                 let mut buf = Vec::new();
                 match body.read_line_bytes(&mut buf).await {
-                    Ok(0) => {
-                        self.take_resource(id);
-                        Ok(Value::Nil)
-                    }
+                    Ok(0) => Ok(Value::Nil), // EOF: drop the body
                     Ok(_) => {
                         // Strip a single trailing '\n' and an optional preceding '\r'.
                         if buf.last() == Some(&b'\n') {
@@ -1421,6 +1429,7 @@ impl Interp {
                                 buf.pop();
                             }
                         }
+                        self.return_resource(id, ResourceState::HttpBody(body));
                         Ok(mode.wrap(buf))
                     }
                     Err(e) => Err(AsError::at(format!("body.readLine failed: {}", e), span).into()),
@@ -1429,17 +1438,18 @@ impl Interp {
             "readToEnd" => {
                 // readToEnd is type-stable: it ALWAYS returns a value in the body's
                 // mode (empty if already drained / finalized).
-                let body = match self.http_body_mut(id) {
-                    Some(b) => b,
-                    None => return Ok(BodyMode::Str.wrap(Vec::new())),
+                let mut body = match self.take_resource(id) {
+                    Some(ResourceState::HttpBody(b)) => b,
+                    other => {
+                        if let Some(o) = other { self.return_resource(id, o); }
+                        return Ok(BodyMode::Str.wrap(Vec::new()));
+                    }
                 };
                 let mode = body.mode;
                 let mut buf = Vec::new();
+                // readToEnd consumes the whole body; we drop it either way.
                 match body.read_to_end_bytes(&mut buf).await {
-                    Ok(_) => {
-                        self.take_resource(id);
-                        Ok(mode.wrap(buf))
-                    }
+                    Ok(_) => Ok(mode.wrap(buf)),
                     Err(e) => Err(AsError::at(format!("body.readToEnd failed: {}", e), span).into()),
                 }
             }
@@ -1449,7 +1459,7 @@ impl Interp {
 
     /// `http.cancelToken()` → a `CancelHandle` native handle. Its `cancel()` method
     /// aborts any in-flight request that was passed this handle via `opts.cancel`.
-    fn make_cancel_token(&mut self) -> Value {
+    fn make_cancel_token(&self) -> Value {
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
         self.register_resource(
             NativeKind::CancelHandle,
@@ -1460,20 +1470,22 @@ impl Interp {
 
     /// Dispatch a method on a `CancelHandle`: only `cancel()` (notifies waiters).
     pub(crate) async fn call_cancel_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         _args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
         match m.method.as_str() {
             "cancel" => {
-                if let Some(ResourceState::CancelToken(n)) = self.resource(m.receiver.id) {
-                    // `notify_one` stores a permit, so a cancel that lands *before*
-                    // the request's `notified()` is registered still aborts the next
-                    // (and only the next) send — important on the single-threaded
-                    // interp where `cancel()` and the request run sequentially.
-                    n.notify_one();
-                }
+                self.with_resource(m.receiver.id, |r| {
+                    if let Some(ResourceState::CancelToken(n)) = r {
+                        // `notify_one` stores a permit, so a cancel that lands *before*
+                        // the request's `notified()` is registered still aborts the next
+                        // (and only the next) send — important on the single-threaded
+                        // interp where `cancel()` and the request run sequentially.
+                        n.notify_one();
+                    }
+                });
                 Ok(Value::Nil)
             }
             other => Err(AsError::at(format!("cancelHandle has no method '{}'", other), span).into()),
@@ -1492,10 +1504,10 @@ impl Interp {
         };
         match &c {
             Value::Native(n) if n.kind == NativeKind::CancelHandle => {
-                match self.resource(n.id) {
-                    Some(ResourceState::CancelToken(notify)) => Ok(Some(notify.clone())),
-                    _ => Ok(None),
-                }
+                Ok(self.with_resource(n.id, |r| match r {
+                    Some(ResourceState::CancelToken(notify)) => Some(notify.clone()),
+                    _ => None,
+                }))
             }
             other => Err(AsError::at(
                 format!("net/http cancel expects a cancelToken() handle, got {}", crate::interp::type_name(other)),
@@ -1509,7 +1521,7 @@ impl Interp {
     /// `Accept: text/event-stream`, then registers the response body behind a
     /// `Value::Native(SseStream)` whose `next()` parses the event stream. A
     /// connect-time failure is the usual Tier-1 `[nil, err]`.
-    async fn call_sse(&mut self, url: String, opts: &Value, span: Span) -> Result<Value, Control> {
+    async fn call_sse(&self, url: String, opts: &Value, span: Span) -> Result<Value, Control> {
         // Replayable headers + auth — captured so reconnect re-issues an identical GET.
         let headers = sse_headers(opts, span)?;
         let auth = sse_auth(opts, span)?;
@@ -1545,7 +1557,7 @@ impl Interp {
     /// Issue one SSE GET (initial or reconnect). `last_event_id` (when Some/non-empty)
     /// is sent as the `Last-Event-ID` header. Returns the response or a Tier-1 pair.
     async fn sse_connect(
-        &mut self,
+        &self,
         url: &str,
         headers: &[(String, String)],
         auth: &Option<SseAuth>,
@@ -1576,7 +1588,7 @@ impl Interp {
     /// Dispatch a method on an `SseStream` handle: `next()` / `close()`.
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_sse_method(
-        &mut self,
+        &self,
         m: &Rc<NativeMethod>,
         _args: Vec<Value>,
         span: Span,
@@ -1598,14 +1610,18 @@ impl Interp {
     /// stream ends (EOF + no/exhausted reconnect). On a blank-line boundary the
     /// buffered event is dispatched; on EOF either reconnect (after the retry delay,
     /// carrying Last-Event-ID) and continue, or end.
-    async fn sse_next(&mut self, id: u64, span: Span) -> Result<Value, Control> {
+    async fn sse_next(&self, id: u64, span: Span) -> Result<Value, Control> {
         loop {
-            // Read the next line from the current body.
+            // Read the next line from the current body. Take the state OUT so no
+            // table borrow is held across the `read_until` await, then put it back.
+            let mut state = match self.take_resource(id) {
+                Some(ResourceState::SseStream(s)) => s,
+                other => {
+                    if let Some(o) = other { self.return_resource(id, o); }
+                    return Ok(Value::Nil); // closed/gone → ended
+                }
+            };
             let line = {
-                let state = match self.sse_stream_mut(id) {
-                    Some(s) => s,
-                    None => return Ok(Value::Nil), // closed/gone → ended
-                };
                 let mut buf = Vec::new();
                 match state.reader.read_until(b'\n', &mut buf).await {
                     Ok(0) => None, // EOF on the current connection
@@ -1628,21 +1644,24 @@ impl Interp {
             match line {
                 Some(line) if line.is_empty() => {
                     // Blank line: dispatch the buffered event, if any.
-                    let ev = self.sse_stream_mut(id).and_then(|s| s.take_event());
+                    let ev = state.take_event();
+                    self.return_resource(id, ResourceState::SseStream(state));
                     if let Some(ev) = ev {
                         return Ok(make_pair(ev, Value::Nil));
                     }
                     // else: stray blank line, keep reading.
                 }
                 Some(line) => {
-                    if let Some(s) = self.sse_stream_mut(id) {
-                        s.apply_line(&line);
-                    }
+                    state.apply_line(&line);
+                    self.return_resource(id, ResourceState::SseStream(state));
                 }
                 None => {
                     // EOF on the current connection. Dispatch any event buffered
                     // without a trailing blank line, then attempt reconnect.
-                    if let Some(ev) = self.sse_stream_mut(id).and_then(|s| s.take_event()) {
+                    let ev = state.take_event();
+                    // Put the state back so `sse_reconnect` can read its plan.
+                    self.return_resource(id, ResourceState::SseStream(state));
+                    if let Some(ev) = ev {
                         return Ok(make_pair(ev, Value::Nil));
                     }
                     if !self.sse_reconnect(id, span).await? {
@@ -1659,33 +1678,36 @@ impl Interp {
     /// Attempt to reconnect a disconnected SSE stream. Returns `Ok(true)` if a fresh
     /// body is now in place (caller resumes reading), `Ok(false)` if reconnect is
     /// off, the `maxReconnects` cap is reached, or the reconnect GET itself failed.
-    async fn sse_reconnect(&mut self, id: u64, span: Span) -> Result<bool, Control> {
+    async fn sse_reconnect(&self, id: u64, span: Span) -> Result<bool, Control> {
         // Pull the reconnect plan (url/headers/delay/last id) without holding the
         // borrow across the await.
-        let plan = {
-            let state = match self.sse_stream_mut(id) {
-                Some(s) => s,
-                None => return Ok(false),
+        let plan = self.with_resource_mut(id, |r| {
+            let state = match r {
+                Some(ResourceState::SseStream(s)) => s,
+                _ => return None,
             };
             if !state.reconnect.enabled {
-                return Ok(false);
+                return None;
             }
             if let Some(max) = state.reconnect.max {
                 if state.reconnect.count >= max {
-                    return Ok(false);
+                    return None;
                 }
             }
             state.reconnect.count += 1;
             let delay = state.retry_ms.unwrap_or(state.reconnect.retry_default_ms);
-            (
+            Some((
                 state.reconnect.url.clone(),
                 state.reconnect.headers.clone(),
                 state.reconnect.auth.clone(),
                 delay,
                 state.last_event_id.clone(),
-            )
+            ))
+        });
+        let (url, headers, auth, delay, last_id) = match plan {
+            Some(p) => p,
+            None => return Ok(false),
         };
-        let (url, headers, auth, delay, last_id) = plan;
         if delay > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         }
@@ -1693,12 +1715,14 @@ impl Interp {
             Ok(r) => r,
             Err(_pair) => return Ok(false), // a failed reconnect ends the stream
         };
-        if let Some(state) = self.sse_stream_mut(id) {
-            state.reader = sse_reader(resp);
-            Ok(true)
-        } else {
-            Ok(false) // closed during the await
-        }
+        self.with_resource_mut(id, |r| {
+            if let Some(ResourceState::SseStream(state)) = r {
+                state.reader = sse_reader(resp);
+                Ok(true)
+            } else {
+                Ok(false) // closed during the await
+            }
+        })
     }
 }
 
@@ -1858,7 +1882,7 @@ mod tests {
     }
 
     /// Run on a caller-held interp (so resource state can be inspected after).
-    async fn run_on(interp: &mut Interp, src: &str) -> Result<(), crate::interp::Control> {
+    async fn run_on(interp: &Interp, src: &str) -> Result<(), crate::interp::Control> {
         let tokens = crate::lexer::lex(src).expect("lex");
         let program = crate::parser::parse(&tokens).expect("parse");
         let env = crate::interp::global_env().child();
@@ -2233,7 +2257,7 @@ print(err != nil)
     #[tokio::test]
     async fn double_body_consume_is_tier2_panic() {
         let base = fixture::start().await;
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let src = format!(
             r#"
 import {{ get }} from "std/net/http"
@@ -2242,7 +2266,7 @@ let [_t, _te] = await resp.text()
 let [_b, _be] = await resp.bytes()
 "#
         );
-        let res = run_on(&mut interp, &src).await;
+        let res = run_on(&interp, &src).await;
         match res {
             Err(crate::interp::Control::Panic(e)) => {
                 let msg = e.to_string();
@@ -2347,14 +2371,14 @@ print(body)
         let base = fixture::start().await;
         // A non-number retry.max is a type error (parity with timeout/redirect),
         // not a silent "retries off" — it must Tier-2 panic with a clear message.
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let src = format!(
             r#"
 import {{ get }} from "std/net/http"
 let [_r, _e] = await get("{base}/text", {{ retry: {{ max: "y" }} }})
 "#
         );
-        let res = run_on(&mut interp, &src).await;
+        let res = run_on(&interp, &src).await;
         match res {
             Err(crate::interp::Control::Panic(e)) => {
                 let msg = e.to_string();
@@ -2469,14 +2493,14 @@ print(resp.version)
     async fn http_version_3_errors_cleanly_without_feature() {
         let base = fixture::start().await;
         // httpVersion:"3" must surface a clean Tier-1 error (no http3 build feature).
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let src = format!(
             r#"
 import {{ get }} from "std/net/http"
 let [_r, _e] = await get("{base}/text", {{ httpVersion: "3" }})
 "#
         );
-        let res = run_on(&mut interp, &src).await;
+        let res = run_on(&interp, &src).await;
         match res {
             Err(crate::interp::Control::Panic(e)) => {
                 let msg = e.to_string();
@@ -2552,14 +2576,14 @@ print(resp.status)
         // A non-PEM string with no -----BEGIN header is treated as a file path; a
         // missing file must yield a clear "could not read PEM file" error naming the
         // path — not a confusing downstream PEM-parse error.
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let src = format!(
             r#"
 import {{ get }} from "std/net/http"
 let [_r, _e] = await get("{base}/text", {{ tls: {{ caBundle: "/no/such/ca.pem" }} }})
 "#
         );
-        let res = run_on(&mut interp, &src).await;
+        let res = run_on(&interp, &src).await;
         match res {
             Err(crate::interp::Control::Panic(e)) => {
                 let msg = e.to_string();
@@ -2667,7 +2691,7 @@ print(acc)
     #[tokio::test]
     async fn stream_read_after_eof_is_nil_repeatedly_and_reclaims_resource() {
         let base = fixture::start().await;
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let baseline = interp.resource_count();
         let src = format!(
             r#"
@@ -2679,8 +2703,8 @@ print(await resp.body.read())
 print(await resp.body.readLine())
 "#
         );
-        run_on(&mut interp, &src).await.expect("exec");
-        assert_eq!(interp.output, "nil\nnil\nnil\n");
+        run_on(&interp, &src).await.expect("exec");
+        assert_eq!(interp.output(), "nil\nnil\nnil\n");
         assert_eq!(
             interp.resource_count(),
             baseline,
@@ -2691,7 +2715,7 @@ print(await resp.body.readLine())
     #[tokio::test]
     async fn stream_response_text_accessor_is_clear_error() {
         let base = fixture::start().await;
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         // With stream:true the response is NOT stored as a buffered Response, so
         // text()/json()/bytes() must surface a clear Tier-2 error.
         let src = format!(
@@ -2701,7 +2725,7 @@ let [resp, _e] = await get("{base}/stream", {{ stream: true }})
 let [_t, _te] = await resp.text()
 "#
         );
-        let res = run_on(&mut interp, &src).await;
+        let res = run_on(&interp, &src).await;
         match res {
             Err(crate::interp::Control::Panic(e)) => {
                 let msg = e.to_string();
@@ -2714,7 +2738,7 @@ let [_t, _te] = await resp.text()
     #[tokio::test]
     async fn non_stream_response_body_accessor_is_clear_error() {
         let base = fixture::start().await;
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         // Without stream:true there is no `body` reader; `resp.body` must be a clear
         // error directing the caller to text()/bytes()/json().
         let src = format!(
@@ -2724,7 +2748,7 @@ let [resp, _e] = await get("{base}/text")
 let x = resp.body
 "#
         );
-        let res = run_on(&mut interp, &src).await;
+        let res = run_on(&interp, &src).await;
         match res {
             Err(crate::interp::Control::Panic(e)) => {
                 let msg = e.to_string();
@@ -2831,7 +2855,7 @@ print(s.lastEventId)
     #[tokio::test]
     async fn sse_close_ends_stream_and_reclaims_resource() {
         let base = fixture::start().await;
-        let mut interp = Interp::new();
+        let interp = Interp::new();
         let baseline = interp.resource_count();
         let src = format!(
             r#"
@@ -2843,8 +2867,8 @@ print(await s.next())
 print(await s.next())
 "#
         );
-        run_on(&mut interp, &src).await.expect("exec");
-        assert_eq!(interp.output, "nil\nnil\n");
+        run_on(&interp, &src).await.expect("exec");
+        assert_eq!(interp.output(), "nil\nnil\n");
         assert_eq!(
             interp.resource_count(),
             baseline,

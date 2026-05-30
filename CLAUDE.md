@@ -76,27 +76,53 @@ token and AST node carries a `Span` (byte offsets + line/col) so `diagnostics` (
 point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_source`, `run_tests`.
 
 ### The interpreter (`src/interp.rs`)
-- `eval_expr`/`exec` are `async` (`#[async_recursion]`) to establish spec §7's single-threaded event
-  loop. The whole runtime is `Rc`/`RefCell`-based and therefore **`!Send`** — the binary uses
-  `#[tokio::main(flavor = "current_thread")]`. Do not introduce `Send` bounds or spawn onto a
-  multi-thread runtime; async I/O is dispatched inline rather than via a new future kind.
+- `eval_expr`/`exec` are `async` (`#[async_recursion]`) and take **`&self`** (not `&mut self`) —
+  `Interp` state lives behind interior-mutability cells (`RefCell`/`Cell`) so multiple eval futures can
+  be live at once (M17). The whole runtime is `Rc`/`RefCell`-based and therefore **`!Send`** — the
+  binary uses `#[tokio::main(flavor = "current_thread")]` and runs each program inside a
+  `tokio::task::LocalSet`. Do not introduce `Send` bounds or a multi-thread runtime.
+- **M17 async model (spec §7):** calling a script `async fn` returns a `Value::Future` and **eagerly
+  schedules** the body via `tokio::task::spawn_local` (`self.rc()` yields an owned `Rc<Interp>` via a
+  self-`Weak` installed by `install_self`); `await` drives a future to completion (`await` on a
+  non-future is identity). Entry points (`run_file`/`run_source`/`run_tests` in `src/lib.rs`, repl) do
+  `local.run_until(root).await; local.await;` — the trailing drain runs spawned tasks to completion
+  (structured shutdown). **Invariant: never hold a `RefCell` borrow across an `.await`** (enforced by
+  clippy `await_holding_refcell_ref = "deny"` in `Cargo.toml`); for native resources use the
+  take-out-across-await pattern (`take_resource` → await on the owned value → `return_resource`).
+- **Concurrency primitives:** `src/task.rs` has `SharedFuture` (the completion cell backing
+  `Value::Future`, carrying `Result<Value, Control>` so panics cross the task boundary). `std/task`
+  (`src/stdlib/task_mod.rs`) provides `spawn`/`gather`/`race`/`timeout` as pure library functions over
+  `future<T>`.
+- **Generators & coroutines** (`src/coro.rs`): `fn*`/`async fn*` return a `Value::Generator` that is
+  **consumer-driven** — the body is a lazily-polled `Pin<Box<dyn Future>>` (NOT a spawned task), driven
+  one step per `resume`/`gen.next(v)`/`for await`. `yield` parks via `poll_fn`; a thread-local stack
+  tracks the current generator for nested composition; `gen.close()` drops the body. Abandoning a
+  generator just drops the future (no task → no exit hang). Surface syntax (`yield`, `fn*`, `async fn*`,
+  `for await`, `future<T>`) touches the lexer, parser, tree-sitter grammar (regen `parser.c` with
+  `tree-sitter generate --abi 14`), `fmt.rs`, and the LSP keyword list — and `ExprKind::Yield` needs
+  arms in interp (eval), `fmt.rs` (`write_expr_inner`), and `ast.rs` (`Display`).
 - **Control flow uses two enums, not `Result<_, io::Error>`:**
   - `Flow { Normal, Return(Value), Break, Continue }` — normal statement-level control flow.
-  - `Control { Panic(AsError), Propagate(Value) }` — the error channel. `Panic` is an unrecoverable
-    Tier-2 programmer error (aborts unless caught by `recover`); `Propagate` is the `?`-operator
-    early return carrying a `[nil, err]` Result pair. `AsError` converts into `Control::Panic`.
+  - `Control { Panic(AsError), Propagate(Value) }` (`derive(Clone)` so it can ride cross-task futures)
+    — the error channel. `Panic` is an unrecoverable Tier-2 programmer error (aborts unless caught by
+    `recover`); `Propagate` is the `?`-operator early return carrying a `[nil, err]` Result pair.
+    `AsError` converts into `Control::Panic`.
 - `global_env()` builds a fresh environment with builtins installed; programs run in a `.child()` of
   it so they can shadow builtins (`let len = 5`).
 - **Native resource handles:** OS resources (TCP streams, child processes, HTTP bodies/servers, SSE,
   WebSocket connections, terminals) are NOT embedded in `Value`. They live in `Interp.resources`
-  (a `HashMap<u64, ResourceState>`) and are referenced from script by a `Value::Native` handle id.
-  This keeps `Value` cheap/cloneable and lets the interpreter reclaim fds deterministically. When
-  adding a stateful native API, add a `ResourceState` variant + accessor methods on `Interp`.
+  (a `RefCell<HashMap<u64, ResourceState>>`) and are referenced from script by a `Value::Native` handle
+  id. This keeps `Value` cheap/cloneable and lets the interpreter reclaim fds deterministically. When
+  adding a stateful native API, add a `ResourceState` variant + accessor methods on `Interp`, and never
+  hold a `resources` borrow across an `.await` (take the state out first). The HTTP server handles each
+  connection on its own `spawn_local` task with a `Semaphore` concurrency cap (M17).
 
 ### Values (`src/value.rs`)
 `Value` is the ~14-variant runtime tagged union: `Bool`, `Number(f64)`, `Str(Rc<str>)`, `Builtin`,
 `Function`, `Array`, `Object` (insertion-ordered `IndexMap`), `Map`, `Bytes`, `Regex`, `Native`,
-`Enum`, `Class`, `Instance`, `Super`. Mutable containers are `Rc<RefCell<...>>`. There is a separate
+`Enum`, `Class`, `Instance`, `Super`, plus M17's `Future` (identity-equal, backed by `SharedFuture`)
+and `Generator` (identity-equal, a consumer-driven `GeneratorHandle`). Mutable containers are
+`Rc<RefCell<...>>`. There is a separate
 hashable `MapKey` (numbers canonicalized: −0.0→+0.0, NaN unified) for `Map` keys.
 
 ### Standard library (`src/stdlib/`)
@@ -139,4 +165,7 @@ guardrail. If you change syntax, update both parsers and keep the examples passi
   merge `--no-ff`. Plans live in `docs/superpowers/plans/`.
 - Any spec deferral must be a documented, owner-noted Cargo feature or Tier-1 error — never a silent
   drop. Current deferrals: `http3` (feature), HTTP trailers (best-effort), `icu`/crossterm subsets,
-  cross-file LSP features.
+  cross-file LSP features. M17 has three **architectural** non-goals (impossible under the approach-A
+  async engine — documented in spec §7 and `docs/superpowers/specs/adr/2026-05-30-async-generators.md`,
+  not code TODOs): durable/serializable continuations (needs an explicit-stack VM), robust unbounded
+  deep recursion (needs stackful coroutines), and deterministic/replayable task scheduling.
