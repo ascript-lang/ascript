@@ -886,14 +886,13 @@ impl Interp {
                     Some(e) => self.eval_expr(e, env).await?,
                     None => Value::Nil,
                 };
-                // The channel of the generator body currently executing on THIS
-                // task. Absent => `yield` was used outside a generator body.
-                let chan = crate::coro::GEN_CHANNEL
-                    .try_with(|c| c.clone())
-                    .map_err(|_| AsError::at("'yield' outside of a generator", expr.span))?;
-                // Hand the value to the consumer and park; the resume value the
+                // The generator currently being polled (top of the current-gen
+                // stack). Absent => `yield` was used outside any generator body.
+                let g = crate::coro::current_generator()
+                    .ok_or_else(|| AsError::at("'yield' outside of a generator", expr.span))?;
+                // Hand the value to the consumer and suspend; the resume value the
                 // consumer passes to `gen.next(v)` becomes this expression's value.
-                Ok(chan.yield_(v).await)
+                Ok(g.yield_(v).await)
             }
             ExprKind::Ternary { cond, then, els } => {
                 // Only the selected branch is evaluated (lazy, like `&&`/`||`).
@@ -1071,9 +1070,9 @@ impl Interp {
                 })))
             }
             Value::Generator(g) => match name {
-                // `gen.next` / `gen.return` are bound generator methods.
+                // `gen.next` / `gen.close` are bound generator methods.
                 "next" => Ok(Value::GeneratorMethod(g.clone(), "next")),
-                "return" => Ok(Value::GeneratorMethod(g.clone(), "return")),
+                "close" => Ok(Value::GeneratorMethod(g.clone(), "close")),
                 other => Err(AsError::at(
                     format!("generator has no property '{}' (try 'next')", other),
                     span,
@@ -1102,8 +1101,8 @@ impl Interp {
 
     /// Dispatch a bound generator method. `next(v?)` resumes the body with `v`
     /// (`nil` if omitted) and returns the next yielded value, or `nil` when the
-    /// generator is done — after which a stored body error (if any) re-surfaces.
-    /// `return()` finishes the generator (no further values) and returns `nil`.
+    /// generator is done; a body panic/propagation surfaces here as `Err`.
+    /// `close()` drops the body future (subsequent `next` returns `nil`).
     #[async_recursion(?Send)]
     pub(crate) async fn call_generator_method(
         &self,
@@ -1115,21 +1114,16 @@ impl Interp {
         match method {
             "next" => {
                 let input = args.into_iter().next().unwrap_or(Value::Nil);
-                match g.chan.resume(input).await {
+                // resume drives the body to its next yield; Err surfaces a body
+                // panic to the consumer, None is the done sentinel (→ nil).
+                match g.resume(input).await? {
                     Some(v) => Ok(v),
-                    None => {
-                        // Done: re-raise a stored body error, else `nil` sentinel.
-                        if let Some(c) = g.chan.take_error() {
-                            return Err(c);
-                        }
-                        Ok(Value::Nil)
-                    }
+                    None => Ok(Value::Nil),
                 }
             }
-            "return" => {
-                // Abandon the generator: mark it finished. The parked body task is
-                // dropped when its `yield_` never resumes (reclaimed by the LocalSet).
-                g.chan.finish();
+            "close" => {
+                // Drop the body future: no further values; `next` now returns nil.
+                g.close();
                 Ok(Value::Nil)
             }
             other => {
@@ -1219,28 +1213,25 @@ impl Interp {
         match iterable {
             Value::Generator(g) => {
                 loop {
-                    let next = g.chan.resume(Value::Nil).await;
-                    let item = match next {
+                    // resume drives the body to its next yield; Err surfaces a body
+                    // panic, None ends iteration.
+                    let item = match g.resume(Value::Nil).await? {
                         Some(v) => v,
-                        None => {
-                            // End of generator: re-raise a stored body error if any.
-                            if let Some(c) = g.chan.take_error() {
-                                return Err(c);
-                            }
-                            break;
-                        }
+                        None => break,
                     };
                     let child = env.child();
                     child.define(var, item, false).map_err(AsError::new)?;
                     match self.exec(body, &child).await? {
-                        // `break` abandons the generator: finish it so the parked
-                        // body task is reclaimed cleanly (no hang/leak).
+                        // `break` / early return abandon the generator: `close` it
+                        // (drops the body future). There is no task to reclaim — a
+                        // consumer-driven generator just stops being polled — but
+                        // closing frees the body promptly rather than at scope end.
                         Flow::Break => {
-                            g.chan.finish();
+                            g.close();
                             break;
                         }
                         Flow::Return(v) => {
-                            g.chan.finish();
+                            g.close();
                             return Ok(Flow::Return(v));
                         }
                         Flow::Continue | Flow::Normal => {}
@@ -1358,28 +1349,26 @@ impl Interp {
     ) -> Result<Value, Control> {
         let call_env = func.closure.child();
         let what = func.name.as_deref().unwrap_or("function").to_string();
-        // A generator (`fn*` / `async fn*`) does NOT run inline. Spawn its body as
-        // its own `spawn_local` task scoped under a fresh `GEN_CHANNEL`, parked on
-        // `await_first_resume` so nothing runs until the first `next`/`for await`.
-        // The body's `yield`s rendezvous through the channel; the consumer drives
-        // it via `gen.next(v)` or `for await`. A body error is stored on the
-        // channel (via `fail`) so it re-surfaces at the consumer. Both sync and
-        // async generators take this path (the body may itself `await`).
+        // A generator (`fn*` / `async fn*`) is NOT run inline and is NOT spawned as
+        // a task. Its body is built into a boxed future stored on a
+        // `GeneratorHandle` and driven *synchronously by the consumer* via
+        // `gen.next(v)` / `for await` (see `src/coro.rs`). Making it consumer-driven
+        // (rather than a `spawn_local` task) is what prevents an abandoned
+        // generator from parking a zombie task that would hang the exit drain: an
+        // un-driven generator is just an unpolled future that drops cleanly.
+        //
+        // The body uses `run_function_body`, which already owns all its captures, so
+        // the future is `'static`. The body's `yield` finds this generator via the
+        // current-generator stack that `resume` maintains while polling. Both sync
+        // and async generators take this path (the body may itself `await`).
         if func.is_generator {
             let vm = self.rc();
             let func = func.clone();
-            let chan = crate::coro::YieldChannel::new();
-            let chan_body = chan.clone();
-            tokio::task::spawn_local(crate::coro::GEN_CHANNEL.scope(chan_body.clone(), async move {
-                chan_body.await_first_resume().await;
-                match vm.run_function_body(func, args, call_env, span, what).await {
-                    // A generator `return v` ends iteration; v is discarded (v1).
-                    Ok(_) => chan_body.finish(),
-                    // A panic/propagation in the body surfaces at the consumer.
-                    Err(c) => chan_body.fail(c),
-                }
-            }));
-            return Ok(Value::Generator(Rc::new(crate::coro::GeneratorHandle { chan })));
+            let body: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Control>>>> =
+                Box::pin(async move {
+                    vm.run_function_body(func, args, call_env, span, what).await
+                });
+            return Ok(Value::Generator(Rc::new(crate::coro::GeneratorHandle::new(body))));
         }
         // A script `async fn` is scheduled eagerly: build the body future, spawn it
         // onto the current-thread LocalSet, and hand back a `Value::Future`
