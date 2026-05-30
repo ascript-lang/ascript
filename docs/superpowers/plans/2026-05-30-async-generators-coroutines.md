@@ -448,15 +448,25 @@ async fn race_first_wins() {
                    print(await task.race([d(50,\"slow\"), d(5,\"fast\")]))").await;
     assert_eq!(out, "fast\n");
 }
+#[tokio::test]
+async fn timeout_fires() {
+    // slow future misses the 5ms deadline -> [nil, err] Result pair
+    let out = run("import * as task from \"std/task\"\n\
+                   import * as time from \"std/time\"\n\
+                   async fn slow(ms,v){ await time.sleep(ms); return v }\n\
+                   let [v, err] = await task.timeout(5, slow(50, \"x\"))\n\
+                   print(v == nil)\n print(err != nil)").await;
+    assert_eq!(out, "true\ntrue\n");
+}
 ```
 
 - [ ] **Step 2: Run** → FAIL (module missing).
 
 - [ ] **Step 3: Implement** `std/task`:
-  - `spawn(fut_or_fn)` → if given a `Value::Future`, return it as a tracked handle; if given a 0-arg function, call it (which schedules) and return the future. (Calling an async fn already schedules; `spawn` is the explicit detach/track entry point.)
+  - `spawn(futureOr0ArgFn)` → if given a `Value::Future`, return it as a tracked handle; if given a 0-arg function, call it (which schedules it) and return the resulting future. (Calling an async fn already schedules; `spawn` is the explicit detach/track entry point.)
   - `gather(array_of_futures)` → `await` each `SharedFuture::get()` in order, collect into an array; first `Control` short-circuits.
   - `race(array)` → poll all via `futures`-free manual select: park on each `Notify`; return the first resolved. (Implement with `tokio::select!` over the `get()` futures, or a small loop.)
-  - `timeout(ms)` → returns a `Value::Future` that resolves to `nil` after `ms` (via `tokio::time::sleep` in a `spawn_local`), for composing with `race`.
+  - `timeout(ms, future)` → returns a **Result pair**: `[value, nil]` if `future` resolves before `ms`, else `[nil, err]` (a Tier-1 timeout error) when `ms` elapses first. Implement by racing `future`'s `SharedFuture::get()` against a `tokio::time::sleep(ms)` (e.g. `tokio::select!`); the sleeper branch yields the timeout `err`. Never panics on a missed deadline.
 
 - [ ] **Step 4:** Register `"std/task"` in both match arms of `src/stdlib/mod.rs`. (No feature gate — core async.)
 

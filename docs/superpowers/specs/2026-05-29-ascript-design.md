@@ -336,17 +336,22 @@ import { spawn, gather, race, timeout } from "std/task"
 
 let a = spawn(fetchUser(1))               // schedule a task, get its future<T> handle
 let b = spawn(fetchUser(2))
-let [ua, ub] = await gather(a, b)         // run concurrently, collect all results in order
-let first    = await race(a, b)           // first to finish wins; the rest are dropped
-let r        = await timeout(500, slow())  // Result: Ok(value) or Err on deadline
+let [ua, ub]  = await gather([a, b])      // run an array of futures concurrently, results in order
+let first     = await race([a, b])        // first to finish wins; the rest are dropped
+let [v, err]  = await timeout(500, slow()) // Result pair: [value, nil] or [nil, err] on deadline
 ```
 
-- `spawn(future)` schedules a task on the `LocalSet` and returns its `future<T>`.
-- `gather(...futures)` awaits all of them concurrently and returns their results in
-  argument order (the structured "join all" combinator).
-- `race(...futures)` resolves to the first to complete; losers are cancelled/dropped.
-- `timeout(ms, future)` returns a Result — `Ok(value)` if it finishes in time, else an
-  `Err` (Tier-1, §6) — and never panics on a missed deadline.
+- `spawn(futureOr0ArgFn)` schedules/tracks a task on the `LocalSet` and returns its
+  `future<T>`. Given a `future` it returns it (already eagerly scheduled); given a 0-arg
+  function it calls it — which schedules it — and returns the resulting future.
+- `gather([futures])` takes an **array** of futures, awaits them all concurrently, and
+  returns an **array** of their results in order (the structured "join all" combinator). The
+  first error short-circuits and propagates via the panic / `?` channel.
+- `race([futures])` takes an **array** of futures and resolves to the value of the first to
+  complete; the losers are cancelled/dropped.
+- `timeout(ms, future)` returns a Result pair (§6) — `[value, nil]` if `future` resolves
+  before `ms`, else `[nil, err]` (a Tier-1 timeout error) when `ms` elapses first — and
+  never panics on a missed deadline.
 
 ### 7.4 Generators & coroutines
 
