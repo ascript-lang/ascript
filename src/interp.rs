@@ -577,8 +577,11 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::ForOf { var, iter, body } => {
+            Stmt::ForOf { var, iter, body, for_await } => {
                 let iterable = self.eval_expr(iter, env).await?;
+                if *for_await {
+                    return self.exec_for_await(var, iterable, body, env, iter.span).await;
+                }
                 let items: Vec<Value> = match iterable {
                     Value::Array(arr) => arr.borrow().clone(),
                     Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string().into())).collect(),
@@ -610,7 +613,7 @@ impl Interp {
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
-            Stmt::Fn { name, params, ret, body, is_async, .. } => {
+            Stmt::Fn { name, params, ret, body, is_async, is_generator, .. } => {
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
@@ -618,6 +621,7 @@ impl Interp {
                     body: body.clone(),
                     closure: env.clone(),
                     is_async: *is_async,
+                    is_generator: *is_generator,
                 }));
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -802,7 +806,7 @@ impl Interp {
                 };
                 Ok(result)
             }
-            ExprKind::Arrow { params, body, is_async } => {
+            ExprKind::Arrow { params, body, is_async, is_generator } => {
                 let body_stmts = match body.as_ref() {
                     crate::ast::ArrowBody::Block(stmts) => stmts.clone(),
                     crate::ast::ArrowBody::Expr(e) => vec![Stmt::Return(Some((**e).clone()))],
@@ -814,6 +818,7 @@ impl Interp {
                     body: body_stmts,
                     closure: env.clone(),
                     is_async: *is_async,
+                    is_generator: *is_generator,
                 })))
             }
             ExprKind::Array(items) => {
@@ -875,6 +880,20 @@ impl Interp {
                     // `await` on a non-future is identity (back-compat: `await 5` == 5).
                     other => Ok(other),
                 }
+            }
+            ExprKind::Yield(operand) => {
+                let v = match operand {
+                    Some(e) => self.eval_expr(e, env).await?,
+                    None => Value::Nil,
+                };
+                // The channel of the generator body currently executing on THIS
+                // task. Absent => `yield` was used outside a generator body.
+                let chan = crate::coro::GEN_CHANNEL
+                    .try_with(|c| c.clone())
+                    .map_err(|_| AsError::at("'yield' outside of a generator", expr.span))?;
+                // Hand the value to the consumer and park; the resume value the
+                // consumer passes to `gen.next(v)` becomes this expression's value.
+                Ok(chan.yield_(v).await)
             }
             ExprKind::Ternary { cond, then, els } => {
                 // Only the selected branch is evaluated (lazy, like `&&`/`||`).
@@ -1051,6 +1070,15 @@ impl Interp {
                     method: name.to_string(),
                 })))
             }
+            Value::Generator(g) => match name {
+                // `gen.next` / `gen.return` are bound generator methods.
+                "next" => Ok(Value::GeneratorMethod(g.clone(), "next")),
+                "return" => Ok(Value::GeneratorMethod(g.clone(), "return")),
+                other => Err(AsError::at(
+                    format!("generator has no property '{}' (try 'next')", other),
+                    span,
+                )),
+            },
             Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
             _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
@@ -1065,7 +1093,48 @@ impl Interp {
             Value::Class(class) => self.construct(class, args, span).await,
             Value::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
             Value::NativeMethod(m) => self.call_native_method(m, args, span).await,
+            Value::GeneratorMethod(g, method) => {
+                self.call_generator_method(&g, method, args, span).await
+            }
             _ => Err(AsError::at("value is not callable", span).into()),
+        }
+    }
+
+    /// Dispatch a bound generator method. `next(v?)` resumes the body with `v`
+    /// (`nil` if omitted) and returns the next yielded value, or `nil` when the
+    /// generator is done — after which a stored body error (if any) re-surfaces.
+    /// `return()` finishes the generator (no further values) and returns `nil`.
+    #[async_recursion(?Send)]
+    pub(crate) async fn call_generator_method(
+        &self,
+        g: &std::rc::Rc<crate::coro::GeneratorHandle>,
+        method: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match method {
+            "next" => {
+                let input = args.into_iter().next().unwrap_or(Value::Nil);
+                match g.chan.resume(input).await {
+                    Some(v) => Ok(v),
+                    None => {
+                        // Done: re-raise a stored body error, else `nil` sentinel.
+                        if let Some(c) = g.chan.take_error() {
+                            return Err(c);
+                        }
+                        Ok(Value::Nil)
+                    }
+                }
+            }
+            "return" => {
+                // Abandon the generator: mark it finished. The parked body task is
+                // dropped when its `yield_` never resumes (reclaimed by the LocalSet).
+                g.chan.finish();
+                Ok(Value::Nil)
+            }
+            other => {
+                Err(AsError::at(format!("generator has no method '{}'", other), span).into())
+            }
         }
     }
 
@@ -1133,6 +1202,110 @@ impl Interp {
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
     }
 
+    /// Drive a `for await (x in e)` loop. `e` must be async-iterable: a script
+    /// generator (driven via its channel) or a native stream handle whose recv/
+    /// next method yields a `[value, err]` pair ending in a `nil` value (WebSocket
+    /// `recv`, SSE `next`). Each item binds `var` in a fresh child scope; the body
+    /// honours `break`/`continue`/`return`. A generator body error re-surfaces here.
+    #[async_recursion(?Send)]
+    async fn exec_for_await(
+        &self,
+        var: &str,
+        iterable: Value,
+        body: &[Stmt],
+        env: &Environment,
+        span: Span,
+    ) -> Result<Flow, Control> {
+        match iterable {
+            Value::Generator(g) => {
+                loop {
+                    let next = g.chan.resume(Value::Nil).await;
+                    let item = match next {
+                        Some(v) => v,
+                        None => {
+                            // End of generator: re-raise a stored body error if any.
+                            if let Some(c) = g.chan.take_error() {
+                                return Err(c);
+                            }
+                            break;
+                        }
+                    };
+                    let child = env.child();
+                    child.define(var, item, false).map_err(AsError::new)?;
+                    match self.exec(body, &child).await? {
+                        // `break` abandons the generator: finish it so the parked
+                        // body task is reclaimed cleanly (no hang/leak).
+                        Flow::Break => {
+                            g.chan.finish();
+                            break;
+                        }
+                        Flow::Return(v) => {
+                            g.chan.finish();
+                            return Ok(Flow::Return(v));
+                        }
+                        Flow::Continue | Flow::Normal => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            // A native stream handle: iterate its recv/next method until the value
+            // is nil (end-of-stream). Both WS (`recv`) and SSE (`next`) follow the
+            // `[value, err]` contract where a nil value marks end-of-stream.
+            Value::Native(ref n) => {
+                let method = native_stream_method(n.kind).ok_or_else(|| {
+                    AsError::at(
+                        format!("value of type {} is not async-iterable", type_name(&iterable)),
+                        span,
+                    )
+                })?;
+                loop {
+                    let bound = Value::NativeMethod(std::rc::Rc::new(crate::value::NativeMethod {
+                        receiver: n.clone(),
+                        method: method.to_string(),
+                    }));
+                    let pair = self.call_value(bound, Vec::new(), span).await?;
+                    // The recv/next contract returns a `[value, err]` pair.
+                    let (value, err) = match &pair {
+                        Value::Array(a) if a.borrow().len() == 2 => {
+                            let b = a.borrow();
+                            (b[0].clone(), b[1].clone())
+                        }
+                        // Defensive: a non-pair return ends iteration.
+                        _ => break,
+                    };
+                    if err != Value::Nil {
+                        // Surface a stream error as a Tier-2 panic at the loop site.
+                        let msg = match &err {
+                            Value::Object(o) => o
+                                .borrow()
+                                .get("message")
+                                .map(|m| m.to_string())
+                                .unwrap_or_else(|| err.to_string()),
+                            other => other.to_string(),
+                        };
+                        return Err(AsError::at(format!("for await stream error: {}", msg), span).into());
+                    }
+                    if value == Value::Nil {
+                        break; // end-of-stream
+                    }
+                    let child = env.child();
+                    child.define(var, value, false).map_err(AsError::new)?;
+                    match self.exec(body, &child).await? {
+                        Flow::Break => break,
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Continue | Flow::Normal => {}
+                    }
+                }
+                Ok(Flow::Normal)
+            }
+            other => Err(AsError::at(
+                format!("value of type {} is not async-iterable", type_name(&other)),
+                span,
+            )
+            .into()),
+        }
+    }
+
     /// Bind params (with contracts), run a body in `call_env`, apply the return
     /// contract. Shared by plain functions and methods.
     #[async_recursion(?Send)]
@@ -1185,6 +1358,29 @@ impl Interp {
     ) -> Result<Value, Control> {
         let call_env = func.closure.child();
         let what = func.name.as_deref().unwrap_or("function").to_string();
+        // A generator (`fn*` / `async fn*`) does NOT run inline. Spawn its body as
+        // its own `spawn_local` task scoped under a fresh `GEN_CHANNEL`, parked on
+        // `await_first_resume` so nothing runs until the first `next`/`for await`.
+        // The body's `yield`s rendezvous through the channel; the consumer drives
+        // it via `gen.next(v)` or `for await`. A body error is stored on the
+        // channel (via `fail`) so it re-surfaces at the consumer. Both sync and
+        // async generators take this path (the body may itself `await`).
+        if func.is_generator {
+            let vm = self.rc();
+            let func = func.clone();
+            let chan = crate::coro::YieldChannel::new();
+            let chan_body = chan.clone();
+            tokio::task::spawn_local(crate::coro::GEN_CHANNEL.scope(chan_body.clone(), async move {
+                chan_body.await_first_resume().await;
+                match vm.run_function_body(func, args, call_env, span, what).await {
+                    // A generator `return v` ends iteration; v is discarded (v1).
+                    Ok(_) => chan_body.finish(),
+                    // A panic/propagation in the body surfaces at the consumer.
+                    Err(c) => chan_body.fail(c),
+                }
+            }));
+            return Ok(Value::Generator(Rc::new(crate::coro::GeneratorHandle { chan })));
+        }
         // A script `async fn` is scheduled eagerly: build the body future, spawn it
         // onto the current-thread LocalSet, and hand back a `Value::Future`
         // immediately. `await` later drives it; the top-level drain ensures even an
@@ -1506,6 +1702,26 @@ fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
     }
 }
 
+/// The recv/next method name a native handle exposes for `for await` async
+/// iteration, or `None` if the handle kind is not an async-iterable stream.
+/// Both methods follow the `[value, err]` contract ending in a `nil` value.
+#[allow(unused_variables)]
+fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> {
+    #[cfg(feature = "net")]
+    {
+        use crate::value::NativeKind::*;
+        return match kind {
+            WsConnection => Some("recv"),
+            SseStream => Some("next"),
+            _ => None,
+        };
+    }
+    #[cfg(not(feature = "net"))]
+    {
+        None
+    }
+}
+
 /// Human-readable type name for diagnostics.
 pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
@@ -1528,6 +1744,8 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Instance(_) => "instance",
         Value::BoundMethod(_) | Value::Super(_) => "function",
         Value::Future(_) => "future",
+        Value::Generator(_) => "generator",
+        Value::GeneratorMethod(..) => "function",
     }
 }
 
