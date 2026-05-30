@@ -11,6 +11,7 @@ pub mod parser;
 pub mod repl;
 pub mod span;
 pub mod stdlib;
+pub mod task;
 pub mod token;
 pub mod value;
 
@@ -27,6 +28,7 @@ use std::rc::Rc;
 /// future completes we drive the LocalSet to drain spawned tasks — a no-op today.
 pub async fn run_file(path: &Path) -> Result<String, AsError> {
     let interp = Rc::new(Interp::new());
+    interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(interp.load_module(path)).await;
     local.await; // drain spawned tasks (structured join) — no-op until Phase 2
@@ -41,6 +43,7 @@ pub async fn run_file(path: &Path) -> Result<String, AsError> {
 /// single `Interp`, then run all registered tests and return a summary.
 pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
     let interp = Rc::new(Interp::new());
+    interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result: Result<TestSummary, AsError> = local
         .run_until(async {
@@ -63,6 +66,7 @@ pub async fn run_source(src: &str) -> Result<String, AsError> {
     let tokens = lexer::lex(src).map_err(|e| e.with_source(src_info.clone()))?;
     let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
     let interp = Rc::new(Interp::new());
+    interp.install_self();
     // Run in a child of the builtins env so the program can shadow builtins
     // (`let len = 5`) and import names that collide with builtins.
     let env = crate::interp::global_env().child();

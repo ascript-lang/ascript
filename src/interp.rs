@@ -31,7 +31,7 @@ pub enum Flow {
 }
 
 /// Non-local exit from expression/statement evaluation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Control {
     /// An unrecoverable programmer error (spec §6 Tier 2). Aborts unless caught
     /// by `recover`. Carries the diagnostic.
@@ -187,6 +187,11 @@ pub struct Interp {
     resources: RefCell<HashMap<u64, ResourceState>>,
     /// Monotonic id source for newly registered resources.
     next_resource_id: Cell<u64>,
+    /// A `Weak` back to the owning `Rc<Interp>`, installed by `install_self`
+    /// right after construction. Lets `&self` methods recover an owned
+    /// `Rc<Interp>` (`rc()`) so they can `spawn_local` a `'static` task that
+    /// re-enters the interpreter — required for M17 Phase 2 async-fn scheduling.
+    self_weak: RefCell<std::rc::Weak<Interp>>,
 }
 
 /// Outcome of running the tests registered on an `Interp`.
@@ -208,7 +213,21 @@ impl Interp {
             tests: RefCell::new(Vec::new()),
             resources: RefCell::new(HashMap::new()),
             next_resource_id: Cell::new(0),
+            self_weak: RefCell::new(std::rc::Weak::new()),
         }
+    }
+
+    /// Install the self-reference so `&self` methods can obtain an owned
+    /// `Rc<Interp>` via `rc()`. MUST be called immediately after `Rc::new(Interp::new())`
+    /// at every entry point, before running any program.
+    pub(crate) fn install_self(self: &Rc<Interp>) {
+        *self.self_weak.borrow_mut() = Rc::downgrade(self);
+    }
+
+    /// Recover an owned `Rc<Interp>` from `&self`. Panics if `install_self` was
+    /// never called (an entry-point bug).
+    pub(crate) fn rc(&self) -> Rc<Interp> {
+        self.self_weak.borrow().upgrade().expect("Interp self-ref not installed")
     }
 
     /// Snapshot of all captured program output so far.
@@ -847,7 +866,16 @@ impl Interp {
                 }
                 Err(AsError::at("no matching arm in match expression", expr.span).into())
             }
-            ExprKind::Await(inner) => self.eval_expr(inner, env).await,
+            ExprKind::Await(inner) => {
+                let v = self.eval_expr(inner, env).await?;
+                match v {
+                    // Drive the future to completion; a panic/propagation raised in
+                    // the spawned task re-surfaces here (cross-task propagation).
+                    Value::Future(f) => f.get().await,
+                    // `await` on a non-future is identity (back-compat: `await 5` == 5).
+                    other => Ok(other),
+                }
+            }
             ExprKind::Ternary { cond, then, els } => {
                 // Only the selected branch is evaluated (lazy, like `&&`/`||`).
                 let c = self.eval_expr(cond, env).await?;
@@ -1033,7 +1061,7 @@ impl Interp {
     pub(crate) async fn call_value(&self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
         match callee {
             Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
-            Value::Function(func) => self.call_function(&func, args, span).await,
+            Value::Function(func) => self.call_function(func, args, span).await,
             Value::Class(class) => self.construct(class, args, span).await,
             Value::BoundMethod(bm) => self.invoke_method(&bm, args, span).await,
             Value::NativeMethod(m) => self.call_native_method(m, args, span).await,
@@ -1151,12 +1179,44 @@ impl Interp {
     #[async_recursion(?Send)]
     async fn call_function(
         &self,
-        func: &crate::value::Function,
+        func: Rc<crate::value::Function>,
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
         let call_env = func.closure.child();
         let what = func.name.as_deref().unwrap_or("function").to_string();
+        // A script `async fn` is scheduled eagerly: build the body future, spawn it
+        // onto the current-thread LocalSet, and hand back a `Value::Future`
+        // immediately. `await` later drives it; the top-level drain ensures even an
+        // unawaited call runs to completion. Non-async functions run inline.
+        if func.is_async {
+            let vm = self.rc();
+            let func = func.clone();
+            let fut = crate::task::SharedFuture::new();
+            let fut2 = fut.clone();
+            tokio::task::spawn_local(async move {
+                // The owned `func`/`call_env`/`what` live in `run_function_body`'s
+                // frame, so the `BodySpec` borrow never escapes this `'static` task.
+                let r = vm.run_function_body(func, args, call_env, span, what).await;
+                fut2.resolve(r);
+            });
+            return Ok(Value::Future(fut));
+        }
+        self.run_function_body(func, args, call_env, span, what).await
+    }
+
+    /// Run a (already-prepared) function body, owning the `Rc<Function>` for the
+    /// whole frame so the `BodySpec` borrow stays local. Used both inline (sync
+    /// functions) and from a spawned `'static` task (async functions).
+    #[async_recursion(?Send)]
+    async fn run_function_body(
+        &self,
+        func: Rc<crate::value::Function>,
+        args: Vec<Value>,
+        call_env: Environment,
+        span: Span,
+        what: String,
+    ) -> Result<Value, Control> {
         let spec = BodySpec { params: &func.params, ret: &func.ret, body: &func.body };
         self.run_body(spec, args, &call_env, span, &what).await
     }
@@ -1211,8 +1271,41 @@ impl Interp {
             start: bm.defining_class.superclass.clone(),
         }));
         call_env.define("super", super_ref, false).map_err(AsError::new)?;
+        // An async method, like an async free function, is scheduled eagerly and
+        // returns a `Value::Future`. We move owned copies (the `Rc<Method>`, name,
+        // and prepared `call_env`) into the spawned task so the body can outlive
+        // this `&self` call.
+        if bm.method.is_async {
+            let vm = self.rc();
+            let method = bm.method.clone();
+            let name = bm.name.clone();
+            let fut = crate::task::SharedFuture::new();
+            let fut2 = fut.clone();
+            tokio::task::spawn_local(async move {
+                // Owned `method`/`call_env`/`name` keep the `BodySpec` borrow inside
+                // `run_method_body`'s frame, so nothing escapes the `'static` task.
+                let r = vm.run_method_body(method, args, call_env, span, name).await;
+                fut2.resolve(r);
+            });
+            return Ok(Value::Future(fut));
+        }
         let spec = BodySpec { params: &bm.method.params, ret: &bm.method.ret, body: &bm.method.body };
         self.run_body(spec, args, &call_env, span, &bm.name).await
+    }
+
+    /// Run a method body owning the `Rc<Method>` for the whole frame (so the
+    /// `BodySpec` borrow stays local). Used by the async-method spawn path.
+    #[async_recursion(?Send)]
+    async fn run_method_body(
+        &self,
+        method: Rc<crate::value::Method>,
+        args: Vec<Value>,
+        call_env: Environment,
+        span: Span,
+        what: String,
+    ) -> Result<Value, Control> {
+        let spec = BodySpec { params: &method.params, ret: &method.ret, body: &method.body };
+        self.run_body(spec, args, &call_env, span, &what).await
     }
 
     #[async_recursion(?Send)]
@@ -1434,6 +1527,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Class(_) => "class",
         Value::Instance(_) => "instance",
         Value::BoundMethod(_) | Value::Super(_) => "function",
+        Value::Future(_) => "future",
     }
 }
 
@@ -1535,23 +1629,31 @@ mod tests {
     }
 
     /// Lex+parse+exec a program string, returning its captured `print` output.
-    /// Panics (test failure) on a lex/parse error or a runtime panic.
+    /// Panics (test failure) on a lex/parse error or a runtime panic. Runs under a
+    /// `LocalSet` (and drains it) so M17 async-fn tasks behave like a real program.
     async fn run(src: &str) -> String {
-        let interp = Interp::new();
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
         let tokens = lex(src).expect("lex");
         let stmts = parse(&tokens).expect("parse");
         let env = global_env().child();
-        interp.exec(&stmts, &env).await.expect("program panicked");
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") }).await;
+        local.await; // drain spawned async-fn tasks
         interp.output()
     }
 
     /// Like `run`, but expects a runtime panic and returns its `AsError`.
     async fn run_err(src: &str) -> AsError {
-        let interp = Interp::new();
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
         let tokens = lex(src).expect("lex");
         let stmts = parse(&tokens).expect("parse");
         let env = global_env().child();
-        match interp.exec(&stmts, &env).await {
+        let local = tokio::task::LocalSet::new();
+        let r = local.run_until(async { interp.exec(&stmts, &env).await }).await;
+        local.await;
+        match r {
             Err(Control::Panic(e)) => e,
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
@@ -2858,10 +2960,265 @@ print(r[1])
     }
 
     #[tokio::test]
-    async fn std_time_sleep_without_await_also_works() {
-        // sleep suspends during the call itself; `await` is harmless identity
-        let out = run("import * as time from \"std/time\"\ntime.sleep(5)\nprint(\"done\")").await;
+    async fn unawaited_async_call_is_drained_at_exit() {
+        // A script `async fn` returns a future the moment it's called. Even when the
+        // result is never `await`ed, the top-level LocalSet drain runs the spawned
+        // task to completion before the program returns, so its side effects (the
+        // `print` after a short `await time.sleep`) still appear in the output.
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             async fn work() { await time.sleep(5) print(\"worked\") }\n\
+             work()\n\
+             print(\"main\")",
+        )
+        .await;
+        // `main` prints synchronously; `worked` is produced by the drained task.
+        assert!(out.contains("main\n"), "got: {out:?}");
+        assert!(out.contains("worked\n"), "got: {out:?}");
+    }
+
+    // ---- M17 Phase 2: futures & real async ----
+
+    #[tokio::test]
+    async fn async_call_returns_future_awaited_for_value() {
+        let out = run(
+            "async fn answer() { return 42 }\n\
+             let f = answer()\n\
+             print(type(f))\n\
+             print(await f)",
+        )
+        .await;
+        assert_eq!(out, "future\n42\n");
+    }
+
+    #[tokio::test]
+    async fn await_on_non_future_is_identity() {
+        assert_eq!(run("print(await 5)").await, "5\n");
+        assert_eq!(run("print(await \"hi\")").await, "hi\n");
+    }
+
+    #[tokio::test]
+    async fn nested_await_of_already_resolved_value() {
+        // `await await f`: the first await yields 7 (a number), the second is identity.
+        let out = run("async fn f() { return 7 }\nprint(await await f())").await;
+        assert_eq!(out, "7\n");
+    }
+
+    #[tokio::test]
+    async fn two_async_calls_run_concurrently() {
+        // Both tasks sleep 30ms then return; started before either is awaited, so
+        // total wall-time is ~max(30,30), not ~60. Assert results plus a lenient
+        // upper bound on elapsed time.
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             import * as t from \"std/task\"\n\
+             async fn job(n) { await time.sleep(30) return n }\n\
+             let a = job(1)\n\
+             let b = job(2)\n\
+             let start = time.monotonic()\n\
+             print(await a)\n\
+             print(await b)\n\
+             let elapsed = time.monotonic() - start\n\
+             print(elapsed < 200)",
+        )
+        .await;
+        assert_eq!(out, "1\n2\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn gather_preserves_input_order() {
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             import * as task from \"std/task\"\n\
+             async fn job(ms, n) { await time.sleep(ms) return n }\n\
+             let r = await task.gather([job(40, \"a\"), job(5, \"b\"), job(20, \"c\")])\n\
+             print(r)",
+        )
+        .await;
+        // Despite different completion times, results are in INPUT order.
+        assert_eq!(out, "[\"a\", \"b\", \"c\"]\n");
+    }
+
+    #[tokio::test]
+    async fn gather_of_empty_array_is_empty() {
+        let out = run("import * as task from \"std/task\"\nprint(await task.gather([]))").await;
+        assert_eq!(out, "[]\n");
+    }
+
+    #[tokio::test]
+    async fn gather_mixes_futures_and_plain_values() {
+        let out = run(
+            "import * as task from \"std/task\"\n\
+             async fn f() { return 1 }\n\
+             print(await task.gather([f(), 2, f()]))",
+        )
+        .await;
+        assert_eq!(out, "[1, 2, 1]\n");
+    }
+
+    #[tokio::test]
+    async fn race_returns_first_to_resolve() {
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             import * as task from \"std/task\"\n\
+             async fn job(ms, n) { await time.sleep(ms) return n }\n\
+             print(await task.race([job(50, \"slow\"), job(5, \"fast\")]))",
+        )
+        .await;
+        assert_eq!(out, "fast\n");
+    }
+
+    #[tokio::test]
+    async fn timeout_fast_future_yields_ok_pair() {
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             import * as task from \"std/task\"\n\
+             async fn quick() { await time.sleep(5) return \"v\" }\n\
+             let r = await task.timeout(500, quick())\n\
+             print(r[0])\n\
+             print(r[1])",
+        )
+        .await;
+        assert_eq!(out, "v\nnil\n");
+    }
+
+    #[tokio::test]
+    async fn timeout_slow_future_yields_err_pair() {
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             import * as task from \"std/task\"\n\
+             async fn slow() { await time.sleep(200) return \"v\" }\n\
+             let r = await task.timeout(20, slow())\n\
+             print(r[0])\n\
+             print(r[1].message)",
+        )
+        .await;
+        assert!(out.starts_with("nil\n"), "got: {out:?}");
+        assert!(out.contains("timed out"), "got: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn panic_propagates_across_task_boundary() {
+        // A panic raised inside a spawned async-fn task re-surfaces at the await site.
+        // `assert(false, msg)` is the spec's Tier-2 panic primitive.
+        let err = run_err(
+            "async fn boom() { assert(false, \"kaboom\") }\n\
+             await boom()",
+        )
+        .await;
+        assert!(err.message.contains("kaboom"), "got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn question_propagation_across_await() {
+        // An async fn returning a [nil, err] Result, awaited then `?`-propagated.
+        let out = run(
+            "async fn fails() { return Err(\"nope\") }\n\
+             fn caller() {\n\
+               let v = (await fails())?\n\
+               return Ok(v)\n\
+             }\n\
+             let r = caller()\n\
+             print(r[0])\n\
+             print(r[1].message)",
+        )
+        .await;
+        assert_eq!(out, "nil\nnope\n");
+    }
+
+    #[tokio::test]
+    async fn question_propagation_across_await_ok_path() {
+        let out = run(
+            "async fn ok() { return Ok(99) }\n\
+             fn caller() {\n\
+               let v = (await ok())?\n\
+               return Ok(v)\n\
+             }\n\
+             let r = caller()\n\
+             print(r[0])",
+        )
+        .await;
+        assert_eq!(out, "99\n");
+    }
+
+    #[tokio::test]
+    async fn spawn_wraps_sync_function_value() {
+        let out = run(
+            "import * as task from \"std/task\"\n\
+             let f = task.spawn(() => 7)\n\
+             print(type(f))\n\
+             print(await f)",
+        )
+        .await;
+        assert_eq!(out, "future\n7\n");
+    }
+
+    #[tokio::test]
+    async fn spawn_of_async_call_returns_its_future() {
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             import * as task from \"std/task\"\n\
+             async fn job() { await time.sleep(5) return \"done\" }\n\
+             let h = task.spawn(job)\n\
+             print(await h)",
+        )
+        .await;
         assert_eq!(out, "done\n");
+    }
+
+    #[tokio::test]
+    async fn spawn_of_existing_future_passes_through() {
+        let out = run(
+            "import * as task from \"std/task\"\n\
+             async fn f() { return 3 }\n\
+             let fut = f()\n\
+             let same = task.spawn(fut)\n\
+             print(await same)",
+        )
+        .await;
+        assert_eq!(out, "3\n");
+    }
+
+    #[tokio::test]
+    async fn class_async_method_returns_future() {
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             class Worker {\n\
+               async fn work(n) { await time.sleep(5) return n * 2 }\n\
+             }\n\
+             let w = Worker()\n\
+             let f = w.work(21)\n\
+             print(type(f))\n\
+             print(await f)",
+        )
+        .await;
+        assert_eq!(out, "future\n42\n");
+    }
+
+    #[tokio::test]
+    async fn await_inside_a_loop() {
+        let out = run(
+            "import * as time from \"std/time\"\n\
+             async fn job(n) { await time.sleep(2) return n }\n\
+             let total = 0\n\
+             for i in [1, 2, 3] { total = total + (await job(i)) }\n\
+             print(total)",
+        )
+        .await;
+        // 1 + 2 + 3 = 6
+        assert_eq!(out, "6\n");
+    }
+
+    #[tokio::test]
+    async fn spawn_type_misuse_panics() {
+        let err = run_err("import * as task from \"std/task\"\ntask.spawn(5)").await;
+        assert!(err.message.contains("future or a 0-argument function"), "got: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn gather_type_misuse_panics() {
+        let err = run_err("import * as task from \"std/task\"\ntask.gather(5)").await;
+        assert!(err.message.contains("expects an array"), "got: {}", err.message);
     }
 
     #[tokio::test]
