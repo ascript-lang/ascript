@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AScript Documentation</title>
+<meta name="description" content="The AScript language and standard library reference.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314110d'/%3E%3Ctext x='15' y='23' font-family='monospace' font-size='20' fill='%23f0a92b' text-anchor='middle' font-weight='700'%3Ea%3C/text%3E%3Ccircle cx='24' cy='23' r='2.6' fill='%23e7674a'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <button class="menu-toggle" id="menu-toggle" aria-label="Toggle navigation">☰</button>
+  <a class="brand" href="index.html"><span><b>ascript</b><span class="dot">.</span></span><span class="ext">as</span></a>
+  <nav class="topnav">
+    <a href="#/introduction" class="active">Docs</a>
+    <a href="#/stdlib/overview">Standard library</a>
+    <a href="#/examples">Examples</a>
+  </nav>
+  <span class="spacer"></span>
+  <button class="searchbtn" data-action="search"><span>Search docs</span><kbd>⌘K</kbd></button>
+  <a class="ghlink" href="index.html">Home</a>
+</header>
+
+<div class="docs-shell">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="content" id="content"></main>
+  <nav class="toc" id="toc"></nav>
+</div>
+
+<!-- search overlay -->
+<div class="search-overlay" id="search-overlay">
+  <div class="search-box">
+    <input id="search-input" type="text" placeholder="Search the documentation…" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results"></div>
+  </div>
+</div>
+
+<script src="assets/app.js"></script>
+</body>
+</html>

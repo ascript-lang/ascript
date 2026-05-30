@@ -13,6 +13,27 @@ The design goal is **"Lua-simple language, Go/Deno-class standard library"**: th
 The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md` — the entire spec
 (§§2–16) is implemented. `docs/superpowers/roadmap.md` is the milestone-by-milestone record.
 
+## Documentation & examples
+
+- **User-facing docs** live in `docs/` as a small static site: `docs/index.html` (landing),
+  `docs/reader.html` (the reader app), `docs/assets/{styles.css,app.js}`, and the actual content as
+  Markdown under `docs/content/` (language guide + per-domain stdlib reference). `app.js` `fetch`es
+  the Markdown, so the site must be **served**, not opened from `file://` (`cd docs && python3 -m
+  http.server`). The content Markdown is also readable straight from the repo.
+- The stdlib reference pages are generated from the source modules; if you change a `std/*` API,
+  update the matching `docs/content/stdlib/*.md` page.
+- **`README.md`** is the repo front door (install, CLI, stdlib table, links into `docs/`).
+- **Runnable examples:** `examples/*.as` (introductory; exercised by the conformance tests) and
+  `examples/advanced/*.as` (production-shaped, fully error-handled — data pipeline, sqlite, crypto,
+  fs, process, datetime, tui, plus HTTP/WebSocket/SSE client+server pairs). Verify with
+  `target/release/ascript run <file>`.
+
+> Language gotchas worth knowing when writing `.as` code or docs: there is **no ternary** (`?` is
+> postfix Result-propagation only — use `if/else`); template `${…}` interpolation does not accept
+> nested string literals well, so compute such values into a variable first; `print` output is
+> **buffered and flushed at program exit** (a forever-looping server won't stream logs live — use
+> `serve({maxRequests:N})`).
+
 ## Commands
 
 ```bash
