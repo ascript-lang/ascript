@@ -2815,12 +2815,11 @@ print(r[1])
 
     #[tokio::test]
     async fn async_fn_and_await_surface() {
+        // M16-era surface test. M17: async fn schedules eagerly, so this runs via the
+        // LocalSet-aware `run` helper rather than a bare `exec`. NB: `async (n) => ...`
+        // arrow is also async, so `g(9)` returns a future that `await` drives.
         let src = "async fn fetch(x) { return x * 2 }\nlet r = await fetch(21)\nprint(r)\nprint(await 5)\nlet g = async (n) => n + 1\nprint(await g(9))";
-        let stmts = parse(&lex(src).unwrap()).unwrap();
-        let interp = Interp::new();
-        let env = global_env();
-        interp.exec(&stmts, &env).await.unwrap();
-        assert_eq!(interp.output(), "42\n5\n10\n");
+        assert_eq!(run(src).await, "42\n5\n10\n");
     }
 
     #[tokio::test]
