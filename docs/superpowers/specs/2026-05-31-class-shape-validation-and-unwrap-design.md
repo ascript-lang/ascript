@@ -44,8 +44,11 @@ The target one-liner this design makes real (no parens around `await` needed —
 the precedence rule in §5.2):
 
 ```javascript
-let user = recover(() => User.from(await resp.json()!))?
+let user = recover(() => User.from(await resp.json()!))?   // general primitives (§4–§5)
+let user = await resp.json(User)?                          // typed-parse shortcut (§4.5)
 ```
+
+Both are valid; the second is sugar built from the first, for the common HTTP-JSON case.
 
 ### Non-goals (and why)
 
@@ -55,11 +58,11 @@ let user = recover(() => User.from(await resp.json()!))?
   environment, not on the value). This rebuilds the validator's benefit at much higher
   conceptual + architectural cost. Rejected. The validating boundary (§4) delivers the
   same capability inside the existing nominal model.
-- **User-facing generics / `resp.json<User>()`.** AScript has no user-definable type
-  parameters and this design adds none. The force-unwrap operator (§5) plus `.from`
-  already produce the one-liner; a class is a first-class value, so any future
-  "typed parse" sugar can pass the class *as a value argument* (`resp.json(User)`)
-  rather than as a type parameter. Deferred; not required.
+- **User-facing generics / type parameters (`resp.json<User>()`).** AScript has no
+  user-definable type parameters and this design adds none. The typed-parse shortcut
+  in §4.5 (`resp.json(User)`) passes the class *as an ordinary value argument*, not as a
+  type parameter — that is precisely what lets us deliver the ergonomics without
+  generics. Generic *syntax* (`<User>`) remains rejected.
 
 ---
 
@@ -68,8 +71,9 @@ let user = recover(() => User.from(await resp.json()!))?
 - **Tiny core / gradual contracts.** Declared fields are checked; undeclared fields stay
   dynamic and unchecked. Existing classes are unaffected.
 - **Value-introspective typing stays intact.** `check_type` remains a pure function over
-  `(Value, Type)`. The only structural operation is the explicit `.from` crossing, which
-  *produces* a self-describing instance; type checks downstream remain nominal.
+  `(Value, Type)`. The only structural operation is the explicit validation crossing —
+  `.from` and the typed-parse shortcut (§4.5), which share one `validate_into` core — and
+  it *produces* a self-describing instance; type checks downstream remain nominal.
 - **Two-tier error model stays intact.** `!` lifts Tier-1 → Tier-2 (pair → panic);
   `recover` lowers Tier-2 → Tier-1 (panic → pair); `?` moves a Tier-1 error outward.
   Each arrow has one direction and one meaning.
@@ -172,6 +176,11 @@ signature or side effects `init` has.
   `Address.from(value, strict)`. An already-`Address` instance passes through unchanged.
 - **Array of class** (`tags: array<Tag>`): each element that is a raw `Object` is
   validated via `Tag.from(element, strict)`; the contract `array<Tag>` then holds.
+- **Map of class** (`byId: map<string, Tag>`): each *value* that is a raw `Object` is
+  validated via `Tag.from(value, strict)`; the contract `map<string, Tag>` then holds.
+  (Keys are not recursed — map keys are scalars.) This completes recursion symmetry
+  across all three container shapes (nested class, `array<Class>`, `map<K, Class>`); the
+  three are handled by the same `match` on the field's declared type.
 - **Cycles:** JSON cannot express cycles, and `.from` consumes plain data, so unbounded
   recursion is not a concern in practice. (No cycle guard in v1; revisit only if `.from`
   is ever pointed at script-constructed graphs.)
@@ -181,6 +190,39 @@ signature or side effects `init` has.
 Validation panics carry a **field path** so a deep mismatch is diagnosable:
 `type contract violated at user.address.zip: expected number, got string ("90210")`.
 Because panics are recoverable, the whole `.from` call composes with `recover` (§6).
+
+### 4.5 Non-panicking core + typed-parse shortcut
+
+The validation logic is implemented **once** as a non-panicking core that returns a
+`Result`-style outcome rather than raising:
+
+```
+fn validate_into(class, obj, strict) -> Result<Instance, ValidationError>
+```
+
+Two thin adapters wrap it, placing the result on the correct error tier:
+
+- **`ClassName.from(obj, strict = false)`** (§4.1) → on `Err`, **panics** (Tier-2). This
+  is the boundary used inside `recover`/`!`.
+- **Typed parse on decode functions** → on `Err`, returns a **Tier-1 `[nil, err]` pair**,
+  fusing validation failure into the *same* channel as a parse failure:
+  - **`resp.json(Class)`** (`std/net/http`): decode the body, then validate against
+    `Class`. A malformed body and a shape mismatch both surface as the single `err`.
+  - **`json.parse(text, Class)`** (`std/json`): parse, then validate. Same fusion.
+
+  In both, the class argument is **optional**: `resp.json()` / `json.parse(text)` keep
+  their current behavior (return the raw decoded value); passing a class adds validation.
+  The class rides in as an ordinary value argument — **no generics, no type parameters**.
+
+This is why the §1 shortcut works and reads so cleanly:
+
+```javascript
+let user = await resp.json(User)?     // ≡ (await resp.json(User))?  — see §5.2
+let [user, err] = await resp.json(User)   // or handle the pair explicitly
+```
+
+The shortcut uses default lenient (`strict = false`) matching. A caller needing strict
+matching parses raw and then validates explicitly: `Class.from(raw, true)` (§4.2).
 
 ---
 
@@ -251,12 +293,18 @@ class User {
   address: Address           // nested — User.from recurses
 }
 
+// Using the general primitives (§4–§5):
 async fn loadUser(resp): Result<User> {
   // `!` promotes a JSON parse failure to a panic AND unwraps the pair;
   // `User.from` panics on a shape mismatch; `recover` catches either;
   // `?` propagates the unified error.
   // No parens around `await` — `!` binds looser than `await` (§5.2).
   return recover(() => User.from(await resp.json()!))?
+}
+
+// Equivalent, using the typed-parse shortcut (§4.5):
+async fn loadUser2(resp): Result<User> {
+  return await resp.json(User)?   // parse + recursive validation, fused into one error
 }
 ```
 
@@ -276,8 +324,14 @@ Failure modes, all surfaced as one Tier-1 error out of `loadUser`:
   `nil`; default applied when absent; undeclared field stays dynamic/unchecked;
   back-compat (existing field-free classes unchanged). Unit tests in `interp.rs`.
 - **`.from`:** happy path; missing required → panic; optional/defaulted handling;
-  `strict` rejects/ignores extras; nested object recursion; `array<Class>` recursion;
-  field-path in error message; recoverable via `recover`.
+  `strict` rejects/ignores extras; nested object recursion; `array<Class>` and
+  `map<K, Class>` recursion; field-path in error message; recoverable via `recover`.
+- **Non-panicking core:** `validate_into` returns `Err` (not a panic) on mismatch;
+  `.from` adapter panics on that `Err`; the decode adapter returns `[nil, err]`.
+- **Typed parse:** `resp.json(User)` and `json.parse(text, User)` return `[instance, nil]`
+  on a valid payload, `[nil, err]` on either a parse failure *or* a shape mismatch (one
+  fused channel); `resp.json()` / `json.parse(text)` with no class argument behave exactly
+  as before (raw decoded value); `await resp.json(User)?` unwraps to the instance.
 - **Postfix `!`:** unwraps `[v, nil]` → `v`; `[nil, e]!` panics carrying `e`; misuse on
   non-pair; precedence (`await f()!` ⇒ `(await f())!`); chaining; `recover` round-trips
   the original error object losslessly.
@@ -293,6 +347,9 @@ Failure modes, all surfaced as one Tier-1 error out of `loadUser`:
 
 - Update the language guide: class fields (`docs/content/language/…`), the error-tier
   page (add `!` next to `?` and `recover`), and the types/contracts section.
+- Update the stdlib reference pages for the typed-parse arguments:
+  `docs/content/stdlib/net.md` (`resp.json(Class)`) and `docs/content/stdlib/data.md`
+  (`json.parse(text, Class)`).
 - Update `README.md` feature list and `CLAUDE.md` (note the new `ExprKind::Unwrap` match
   obligations and the `?`/`!` precedence relationship to `await`).
 - Add the end-to-end example under `examples/` (introductory) and/or
@@ -302,11 +359,11 @@ Failure modes, all surfaced as one Tier-1 error out of `loadUser`:
 
 ## 9. Open Questions / Deferrals
 
-- **`map<K, V>` recursion in `.from`:** v1 recurses into nested *class*-typed fields and
-  arrays thereof. Recursing into `map<string, SomeClass>` values is a natural extension;
-  deferred unless needed.
-- **`resp.json(User)` convenience:** deferred (see §1 non-goals); revisit if the
-  `recover(… .from(await …!))?` shape proves common enough to warrant sugar.
-- **Field declarations as constructor surface:** this design keeps `init` and field
-  declarations independent. A future "auto-`init` from declared fields" is possible but
-  out of scope.
+- **Field declarations as constructor surface (auto-`init`):** this design keeps `init`
+  and field declarations independent. Deriving a constructor from declared fields is a
+  separable records/dataclasses feature with its own design questions (positional vs.
+  named construction, interaction with an explicit `init`, default/optional mapping) and
+  is orthogonal to JSON validation. Deferred to its own spec.
+- **Typed parse for other decoders:** `resp.json(Class)` and `json.parse(text, Class)`
+  cover the common cases. Extending the class-as-value pattern to other decoders (e.g. a
+  future typed CSV/TOML/YAML row mapping) is a natural follow-up; deferred unless needed.
