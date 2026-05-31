@@ -48,7 +48,12 @@ Design priorities, in strict order:
 - **Encoding:** source files are UTF-8.
 - **Comments:** `// line` and `/* block */`.
 - **Statement termination:** newline-terminated with lightweight automatic
-  semicolon insertion (ASI-lite). Explicit `;` is allowed but never required.
+  semicolon insertion (ASI-lite). Explicit `;` is allowed but never required. `;`
+  is honored as an optional separator wherever newlines separate self-delimiting
+  members — top-level/block statement lists **and class bodies** (so a one-line
+  `class P { x: number; y: number }` parses). It never substitutes for `,`: enums,
+  match arms, params, and array/object literals stay comma-delimited. The formatter
+  always canonicalizes `;` back to newlines.
 - **Identifiers:** `[A-Za-z_][A-Za-z0-9_]*`.
 - **Keywords:** `let const fn return if else while for of in match async await
   class extends super self enum import export nil true false`.
@@ -1068,6 +1073,14 @@ source(.as)
 
 `std/log` records follow the same split: under `Live` they go to **stderr** (keeping
 `print` on stdout clean); under `Capture` they buffer separately for tests.
+
+**REPL session & multi-line input.** The REPL holds one `Interp` + one session
+`Environment` for the whole session, so definitions (`let`/`fn`/`import`/classes)
+**persist across lines**. Input that is *incomplete* — unclosed `{`/`(`/`[` (counted as
+delimiter *tokens*, so `${…}` template braces never skew the count) or an unterminated
+string/template at EOF — is buffered on a `..` continuation prompt until it parses, then
+executed as one statement; a genuine balanced-but-wrong line is reported immediately.
+Ctrl-C cancels a partial buffer; Ctrl-D ends the session.
 
 ### 12.2 Crate/module layout (workspace)
 
