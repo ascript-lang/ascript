@@ -17,16 +17,43 @@ pub enum ExprKind {
     Bool(bool),
     Nil,
     Ident(String),
-    Unary { op: UnOp, expr: Box<Expr> },
-    Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<CallArg> },
-    Assign { target: Box<Expr>, value: Box<Expr> },
-    Arrow { params: Vec<Param>, body: Box<ArrowBody>, is_async: bool, is_generator: bool },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<CallArg>,
+    },
+    Assign {
+        target: Box<Expr>,
+        value: Box<Expr>,
+    },
+    Arrow {
+        params: Vec<Param>,
+        body: Box<ArrowBody>,
+        is_async: bool,
+        is_generator: bool,
+    },
     Array(Vec<ArrayElem>),
-    Index { object: Box<Expr>, index: Box<Expr> },
+    Index {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    },
     Object(Vec<ObjEntry>),
-    Member { object: Box<Expr>, name: String },
-    OptMember { object: Box<Expr>, name: String },
+    Member {
+        object: Box<Expr>,
+        name: String,
+    },
+    OptMember {
+        object: Box<Expr>,
+        name: String,
+    },
     Try(Box<Expr>),
     /// `expr!` — force-unwrap a Tier-1 `[value, err]` pair: evaluates to `value`
     /// when `err == nil`, otherwise panics (carrying the original error's
@@ -35,9 +62,18 @@ pub enum ExprKind {
     /// The conditional operator `cond ? then : els` (spec §3). Right-associative,
     /// binds just above assignment. `then`/`els` are evaluated lazily — only the
     /// selected branch runs.
-    Ternary { cond: Box<Expr>, then: Box<Expr>, els: Box<Expr> },
-    Template { parts: Vec<TemplatePart> },
-    Match { subject: Box<Expr>, arms: Vec<MatchArm> },
+    Ternary {
+        cond: Box<Expr>,
+        then: Box<Expr>,
+        els: Box<Expr>,
+    },
+    Template {
+        parts: Vec<TemplatePart>,
+    },
+    Match {
+        subject: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
     Await(Box<Expr>),
     /// `yield` / `yield <expr>` inside a generator body (`fn*` / `async fn*`).
     /// Hands a value to the consumer and evaluates to the resume value the
@@ -200,10 +236,27 @@ pub enum Stmt {
         span: Span,
     },
     Block(Vec<Stmt>),
-    If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
-    While { cond: Expr, body: Vec<Stmt> },
-    ForRange { var: String, start: Expr, end: Expr, body: Vec<Stmt> },
-    ForOf { var: String, iter: Expr, body: Vec<Stmt>, for_await: bool },
+    If {
+        cond: Expr,
+        then_branch: Vec<Stmt>,
+        else_branch: Option<Vec<Stmt>>,
+    },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
+    ForRange {
+        var: String,
+        start: Expr,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
+    ForOf {
+        var: String,
+        iter: Expr,
+        body: Vec<Stmt>,
+        for_await: bool,
+    },
     Return(Option<Expr>),
     Break,
     Continue,
@@ -217,7 +270,12 @@ pub enum Stmt {
         span: Span,
         name_span: Span,
     },
-    Enum { name: String, variants: Vec<EnumVariantDecl>, span: Span, name_span: Span },
+    Enum {
+        name: String,
+        variants: Vec<EnumVariantDecl>,
+        span: Span,
+        name_span: Span,
+    },
     Class {
         name: String,
         superclass: Option<String>,
@@ -226,7 +284,10 @@ pub enum Stmt {
         span: Span,
         name_span: Span,
     },
-    Import { names: ImportNames, source: String },
+    Import {
+        names: ImportNames,
+        source: String,
+    },
     Export(Box<Stmt>),
 }
 
@@ -278,9 +339,21 @@ pub struct EnumVariantDecl {
 
 #[derive(Clone, Copy, Debug)]
 pub enum BinOp {
-    Add, Sub, Mul, Div, Mod, Pow,
-    Lt, Le, Gt, Ge, Eq, Ne,
-    And, Or, Coalesce,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    And,
+    Or,
+    Coalesce,
     Range,
 }
 

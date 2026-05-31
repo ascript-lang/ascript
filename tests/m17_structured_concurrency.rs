@@ -36,7 +36,10 @@ fn unawaited_async_call_is_cancelled() {
          print(\"main\")\n",
     );
     assert!(out.contains("main"), "got: {out:?}");
-    assert!(!out.contains("worked"), "unawaited call must be cancelled: {out:?}");
+    assert!(
+        !out.contains("worked"),
+        "unawaited call must be cancelled: {out:?}"
+    );
 }
 
 #[test]
@@ -52,7 +55,10 @@ fn spawn_detaches_so_the_task_runs() {
          print(\"main\")\n",
     );
     assert!(out.contains("main"), "got: {out:?}");
-    assert!(out.contains("worked"), "spawned task must run to completion: {out:?}");
+    assert!(
+        out.contains("worked"),
+        "spawned task must run to completion: {out:?}"
+    );
 }
 
 #[test]
@@ -83,7 +89,10 @@ fn race_cancels_the_loser() {
          print(len(ran))\n",
     );
     assert!(out.contains("fast"), "fast should win: {out:?}");
-    assert!(out.trim_end().ends_with('0'), "race loser must be cancelled (len(ran)==0): {out:?}");
+    assert!(
+        out.trim_end().ends_with('0'),
+        "race loser must be cancelled (len(ran)==0): {out:?}"
+    );
 }
 
 #[test]
@@ -101,7 +110,10 @@ fn timeout_cancels_the_timed_out_work() {
          print(len(ran))\n",
     );
     assert!(out.contains("true"), "timeout should fire: {out:?}");
-    assert!(out.trim_end().ends_with('0'), "timed-out work must be cancelled (len(ran)==0): {out:?}");
+    assert!(
+        out.trim_end().ends_with('0'),
+        "timed-out work must be cancelled (len(ran)==0): {out:?}"
+    );
 }
 
 #[test]

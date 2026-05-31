@@ -180,7 +180,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     let mut names = Vec::new();
                     for entry in entries {
                         match entry {
-                            Ok(e) => names.push(Value::Str(e.file_name().to_string_lossy().into_owned().into())),
+                            Ok(e) => names.push(Value::Str(
+                                e.file_name().to_string_lossy().into_owned().into(),
+                            )),
                             Err(e) => return Ok(io_err(e)),
                         }
                     }
@@ -286,7 +288,10 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
     }
 
     // ---- compile regex (reuse the `regex` crate; Tier-1 err on a bad pattern) ----
-    let re = match regex::RegexBuilder::new(&pattern).case_insensitive(ignore_case).build() {
+    let re = match regex::RegexBuilder::new(&pattern)
+        .case_insensitive(ignore_case)
+        .build()
+    {
         Ok(re) => re,
         Err(e) => return Ok(io_err(format!("invalid regex: {}", e))),
     };
@@ -444,7 +449,10 @@ mod tests {
         call("write", &[s(&f), s("x")], sp()).unwrap();
         assert_eq!(call("exists", &[s(&f)], sp()).unwrap(), Value::Bool(true));
         let missing = path_str(&dir.join("absent.txt"));
-        assert_eq!(call("exists", &[s(&missing)], sp()).unwrap(), Value::Bool(false));
+        assert_eq!(
+            call("exists", &[s(&missing)], sp()).unwrap(),
+            Value::Bool(false)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -500,12 +508,18 @@ mod tests {
         // recursive succeeds
         let ok = call("mkdir", &[s(&nested), Value::Bool(true)], sp()).unwrap();
         assert_eq!(unwrap_pair_ok(&ok), Value::Nil);
-        assert_eq!(call("exists", &[s(&nested)], sp()).unwrap(), Value::Bool(true));
+        assert_eq!(
+            call("exists", &[s(&nested)], sp()).unwrap(),
+            Value::Bool(true)
+        );
         // recursive remove of the top dir clears the tree
         let top = path_str(&dir.join("a"));
         let rm = call("remove", &[s(&top), Value::Bool(true)], sp()).unwrap();
         assert_eq!(unwrap_pair_ok(&rm), Value::Nil);
-        assert_eq!(call("exists", &[s(&top)], sp()).unwrap(), Value::Bool(false));
+        assert_eq!(
+            call("exists", &[s(&top)], sp()).unwrap(),
+            Value::Bool(false)
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -542,27 +556,58 @@ mod tests {
         let sub = dir.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         call("write", &[s(&path_str(&dir.join("top.txt"))), s("t")], sp()).unwrap();
-        call("write", &[s(&path_str(&sub.join("deep.txt"))), s("d")], sp()).unwrap();
+        call(
+            "write",
+            &[s(&path_str(&sub.join("deep.txt"))), s("d")],
+            sp(),
+        )
+        .unwrap();
         let w = call("walk", &[s(&path_str(&dir))], sp()).unwrap();
         let paths = unwrap_pair_ok(&w);
         let joined = paths.to_string();
-        assert!(joined.contains("top.txt"), "walk missing top.txt: {}", joined);
-        assert!(joined.contains("deep.txt"), "walk missing deep.txt: {}", joined);
+        assert!(
+            joined.contains("top.txt"),
+            "walk missing top.txt: {}",
+            joined
+        );
+        assert!(
+            joined.contains("deep.txt"),
+            "walk missing deep.txt: {}",
+            joined
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn path_helpers() {
         // join
-        assert_eq!(call("join", &[s("a"), s("b"), s("c")], sp()).unwrap(), s("a/b/c"));
+        assert_eq!(
+            call("join", &[s("a"), s("b"), s("c")], sp()).unwrap(),
+            s("a/b/c")
+        );
         // dirname / basename / extname
-        assert_eq!(call("dirname", &[s("/x/y/z.txt")], sp()).unwrap(), s("/x/y"));
-        assert_eq!(call("basename", &[s("/x/y/z.txt")], sp()).unwrap(), s("z.txt"));
-        assert_eq!(call("extname", &[s("/x/y/z.txt")], sp()).unwrap(), s(".txt"));
+        assert_eq!(
+            call("dirname", &[s("/x/y/z.txt")], sp()).unwrap(),
+            s("/x/y")
+        );
+        assert_eq!(
+            call("basename", &[s("/x/y/z.txt")], sp()).unwrap(),
+            s("z.txt")
+        );
+        assert_eq!(
+            call("extname", &[s("/x/y/z.txt")], sp()).unwrap(),
+            s(".txt")
+        );
         assert_eq!(call("extname", &[s("/x/y/noext")], sp()).unwrap(), s(""));
         // isAbsolute
-        assert_eq!(call("isAbsolute", &[s("/abs/path")], sp()).unwrap(), Value::Bool(true));
-        assert_eq!(call("isAbsolute", &[s("rel/path")], sp()).unwrap(), Value::Bool(false));
+        assert_eq!(
+            call("isAbsolute", &[s("/abs/path")], sp()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call("isAbsolute", &[s("rel/path")], sp()).unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
@@ -570,13 +615,19 @@ mod tests {
         let dir = temp_dir("grep_basic");
         call(
             "write",
-            &[s(&path_str(&dir.join("a.txt"))), s("alpha\nTODO: fix\nbeta")],
+            &[
+                s(&path_str(&dir.join("a.txt"))),
+                s("alpha\nTODO: fix\nbeta"),
+            ],
             sp(),
         )
         .unwrap();
         call(
             "write",
-            &[s(&path_str(&dir.join("b.txt"))), s("nothing here\nanother TODO line")],
+            &[
+                s(&path_str(&dir.join("b.txt"))),
+                s("nothing here\nanother TODO line"),
+            ],
             sp(),
         )
         .unwrap();
@@ -593,8 +644,16 @@ mod tests {
             .map(|m| match m {
                 Value::Object(o) => {
                     let o = o.borrow();
-                    let line = if let Some(Value::Number(n)) = o.get("line") { *n } else { -1.0 };
-                    let col = if let Some(Value::Number(n)) = o.get("column") { *n } else { -1.0 };
+                    let line = if let Some(Value::Number(n)) = o.get("line") {
+                        *n
+                    } else {
+                        -1.0
+                    };
+                    let col = if let Some(Value::Number(n)) = o.get("column") {
+                        *n
+                    } else {
+                        -1.0
+                    };
                     let text = o.get("text").map(|t| t.to_string()).unwrap_or_default();
                     let path = o.get("path").map(|t| t.to_string()).unwrap_or_default();
                     (path, line, col, text)
@@ -653,7 +712,12 @@ mod tests {
         // With respectGitignore at its default (true), grep must STILL search
         // hidden/dotfiles — a content search shouldn't silently skip `.config`.
         let dir = temp_dir("grep_dotfile");
-        call("write", &[s(&path_str(&dir.join(".config"))), s("secret=findme")], sp()).unwrap();
+        call(
+            "write",
+            &[s(&path_str(&dir.join(".config"))), s("secret=findme")],
+            sp(),
+        )
+        .unwrap();
         let g = call("grep", &[s("findme"), s(&path_str(&dir))], sp()).unwrap();
         let matches = unwrap_pair_ok(&g);
         match &matches {
@@ -661,7 +725,12 @@ mod tests {
                 let a = a.borrow();
                 assert_eq!(a.len(), 1, "dotfile should be searched: {:?}", a);
                 if let Value::Object(o) = &a[0] {
-                    assert!(o.borrow().get("path").unwrap().to_string().contains(".config"));
+                    assert!(o
+                        .borrow()
+                        .get("path")
+                        .unwrap()
+                        .to_string()
+                        .contains(".config"));
                 }
             }
             other => panic!("expected array, got {:?}", other),
@@ -672,7 +741,12 @@ mod tests {
     #[test]
     fn grep_ignore_case() {
         let dir = temp_dir("grep_case");
-        call("write", &[s(&path_str(&dir.join("c.txt"))), s("Hello WORLD")], sp()).unwrap();
+        call(
+            "write",
+            &[s(&path_str(&dir.join("c.txt"))), s("Hello WORLD")],
+            sp(),
+        )
+        .unwrap();
         // case-sensitive: no match for "world"
         let g1 = call("grep", &[s("world"), s(&path_str(&dir))], sp()).unwrap();
         if let Value::Array(a) = &unwrap_pair_ok(&g1) {
@@ -691,8 +765,18 @@ mod tests {
     #[test]
     fn grep_glob_filter_restricts_files() {
         let dir = temp_dir("grep_glob");
-        call("write", &[s(&path_str(&dir.join("keep.rs"))), s("needle here")], sp()).unwrap();
-        call("write", &[s(&path_str(&dir.join("skip.txt"))), s("needle here too")], sp()).unwrap();
+        call(
+            "write",
+            &[s(&path_str(&dir.join("keep.rs"))), s("needle here")],
+            sp(),
+        )
+        .unwrap();
+        call(
+            "write",
+            &[s(&path_str(&dir.join("skip.txt"))), s("needle here too")],
+            sp(),
+        )
+        .unwrap();
         let mut opts = IndexMap::new();
         opts.insert("glob".to_string(), s("*.rs"));
         let g = call("grep", &[s("needle"), s(&path_str(&dir)), obj(opts)], sp()).unwrap();
@@ -703,7 +787,12 @@ mod tests {
         };
         assert_eq!(v.len(), 1, "glob should restrict to .rs only: {:?}", v);
         if let Value::Object(o) = &v[0] {
-            assert!(o.borrow().get("path").unwrap().to_string().contains("keep.rs"));
+            assert!(o
+                .borrow()
+                .get("path")
+                .unwrap()
+                .to_string()
+                .contains("keep.rs"));
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -713,7 +802,12 @@ mod tests {
         let dir = temp_dir("grep_binary");
         // a binary file with invalid UTF-8 bytes
         std::fs::write(dir.join("bin.dat"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
-        call("write", &[s(&path_str(&dir.join("text.txt"))), s("findme")], sp()).unwrap();
+        call(
+            "write",
+            &[s(&path_str(&dir.join("text.txt"))), s("findme")],
+            sp(),
+        )
+        .unwrap();
         let g = call("grep", &[s("findme"), s(&path_str(&dir))], sp()).unwrap();
         // should not error, and finds the one text match
         let matches = unwrap_pair_ok(&g);
@@ -740,7 +834,10 @@ mod tests {
 
     #[test]
     fn read_non_string_path_is_tier2_panic() {
-        assert!(matches!(call("read", &[Value::Number(1.0)], sp()), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("read", &[Value::Number(1.0)], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 
     #[test]
@@ -784,7 +881,10 @@ print(matches[0].text)
         );
 
         let out = crate::run_source(&src).await.expect("program should run");
-        assert_eq!(out, "nil\nfirst line\nTODO: ship it\nlast line\n1\n2\nTODO: ship it\n");
+        assert_eq!(
+            out,
+            "nil\nfirst line\nTODO: ship it\nlast line\n1\n2\nTODO: ship it\n"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -134,7 +134,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let n = want_number(&arg(args, 0), span, &ctx("formatNumber"))?;
             if !n.is_finite() {
                 return Err(AsError::at(
-                    format!("intl.formatNumber: cannot format a non-finite number ({})", n),
+                    format!(
+                        "intl.formatNumber: cannot format a non-finite number ({})",
+                        n
+                    ),
                     span,
                 )
                 .into());
@@ -154,7 +157,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let n = want_number(&arg(args, 0), span, &ctx("formatCurrency"))?;
             if !n.is_finite() {
                 return Err(AsError::at(
-                    format!("intl.formatCurrency: cannot format a non-finite number ({})", n),
+                    format!(
+                        "intl.formatCurrency: cannot format a non-finite number ({})",
+                        n
+                    ),
                     span,
                 )
                 .into());
@@ -231,9 +237,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 span,
                 &ctx("compare"),
             )?;
-            let collator = Collator::try_new(&loc.into(), Default::default()).map_err(
-                |e| -> Control { AsError::at(format!("intl.compare: {}", e), span).into() },
-            )?;
+            let collator =
+                Collator::try_new(&loc.into(), Default::default()).map_err(|e| -> Control {
+                    AsError::at(format!("intl.compare: {}", e), span).into()
+                })?;
             let ord = collator.compare(&a, &b);
             Ok(Value::Number(match ord {
                 std::cmp::Ordering::Less => -1.0,
@@ -326,8 +333,10 @@ mod tests {
         let mut o: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         o.insert("epochMs".into(), Value::Number(1623760200000.0));
         let inst = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(o)));
-        let us = str_of(call("formatDate", &[inst.clone(), s("en-US"), s("medium")], sp()).unwrap());
-        let de = str_of(call("formatDate", &[inst.clone(), s("de-DE"), s("medium")], sp()).unwrap());
+        let us =
+            str_of(call("formatDate", &[inst.clone(), s("en-US"), s("medium")], sp()).unwrap());
+        let de =
+            str_of(call("formatDate", &[inst.clone(), s("de-DE"), s("medium")], sp()).unwrap());
         let ja = str_of(call("formatDate", &[inst, s("ja-JP"), s("short")], sp()).unwrap());
         assert_eq!(us, "Jun 15, 2021");
         assert_eq!(de, "15 Jun 2021");

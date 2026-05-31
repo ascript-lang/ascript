@@ -50,7 +50,9 @@ impl From<AsError> for Control {
 /// A fresh global environment with the built-in functions installed.
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    for name in ["print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range"] {
+    for name in [
+        "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range",
+    ] {
         env.define(name, Value::Builtin(name.into()), false)
             .expect("global env starts empty");
     }
@@ -98,7 +100,10 @@ pub(crate) enum ResourceState {
     // A streaming reader over one of a spawned child's pipes. `capture` is the
     // child's capture mode, which decides whether chunks come back as Str or Bytes.
     #[cfg(feature = "sys")]
-    Reader { reader: crate::stdlib::process::ProcReader, capture: crate::stdlib::process::Capture },
+    Reader {
+        reader: crate::stdlib::process::ProcReader,
+        capture: crate::stdlib::process::Capture,
+    },
     // A streaming writer over a spawned child's stdin. `close()`/EOF takes it.
     #[cfg(feature = "sys")]
     Writer(tokio::process::ChildStdin),
@@ -179,7 +184,12 @@ pub enum OutputSink {
 /// std/log severity, ordered debug<info<warn<error for level filtering.
 #[cfg(feature = "log")]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum LogLevel { Debug = 0, Info = 1, Warn = 2, Error = 3 }
+pub enum LogLevel {
+    Debug = 0,
+    Info = 1,
+    Warn = 2,
+    Error = 3,
+}
 
 /// Parse the initial std/log level from the `ASCRIPT_LOG` env value
 /// (case-insensitive `debug`/`info`/`warn`/`error`). Defaults to `Info` when
@@ -197,7 +207,10 @@ fn log_level_from_env_str(v: Option<&str>) -> LogLevel {
 /// std/log output format: `human` (`[WARN] msg key=val`) or `json` (one object/line).
 #[cfg(feature = "log")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum LogFormat { Human, Json }
+pub enum LogFormat {
+    Human,
+    Json,
+}
 
 /// All mutable interpreter state lives behind interior mutability (`RefCell`/
 /// `Cell`) so the `eval`/`exec`/`call_*` methods take `&self`, not `&mut self`.
@@ -256,7 +269,9 @@ pub(crate) struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.vm.inflight.set(self.vm.inflight.get().saturating_sub(1));
+        self.vm
+            .inflight
+            .set(self.vm.inflight.get().saturating_sub(1));
     }
 }
 
@@ -293,7 +308,9 @@ impl Interp {
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
             #[cfg(feature = "log")]
-            log_level: Cell::new(log_level_from_env_str(std::env::var("ASCRIPT_LOG").ok().as_deref())),
+            log_level: Cell::new(log_level_from_env_str(
+                std::env::var("ASCRIPT_LOG").ok().as_deref(),
+            )),
             #[cfg(feature = "log")]
             log_format: Cell::new(LogFormat::Human),
             #[cfg(feature = "log")]
@@ -343,7 +360,10 @@ impl Interp {
     /// Recover an owned `Rc<Interp>` from `&self`. Panics if `install_self` was
     /// never called (an entry-point bug).
     pub(crate) fn rc(&self) -> Rc<Interp> {
-        self.self_weak.borrow().upgrade().expect("Interp self-ref not installed")
+        self.self_weak
+            .borrow()
+            .upgrade()
+            .expect("Interp self-ref not installed")
     }
 
     /// Snapshot of all captured program output so far. Empty under `Live`.
@@ -373,22 +393,36 @@ impl Interp {
     #[cfg(feature = "log")]
     pub(crate) fn emit_log(&self, line: &str) {
         match &self.output {
-            OutputSink::Capture(_) => { let mut b = self.log_capture.borrow_mut(); b.push_str(line); b.push('\n'); }
-            OutputSink::Live => { use std::io::Write; let mut e = std::io::stderr().lock(); let _ = writeln!(e, "{}", line); }
+            OutputSink::Capture(_) => {
+                let mut b = self.log_capture.borrow_mut();
+                b.push_str(line);
+                b.push('\n');
+            }
+            OutputSink::Live => {
+                use std::io::Write;
+                let mut e = std::io::stderr().lock();
+                let _ = writeln!(e, "{}", line);
+            }
         }
     }
 
     /// Snapshot of all captured std/log output (test hook). Empty under `Live`.
     #[cfg(feature = "log")]
-    pub fn log_output(&self) -> String { self.log_capture.borrow().clone() }
+    pub fn log_output(&self) -> String {
+        self.log_capture.borrow().clone()
+    }
 
     /// Set the minimum std/log level.
     #[cfg(feature = "log")]
-    pub(crate) fn set_log_level(&self, l: LogLevel) { self.log_level.set(l); }
+    pub(crate) fn set_log_level(&self, l: LogLevel) {
+        self.log_level.set(l);
+    }
 
     /// Set the std/log output format.
     #[cfg(feature = "log")]
-    pub(crate) fn set_log_format(&self, f: LogFormat) { self.log_format.set(f); }
+    pub(crate) fn set_log_format(&self, f: LogFormat) {
+        self.log_format.set(f);
+    }
 
     /// `std/log` dispatch. `setLevel`/`setFormat` mutate per-interp state;
     /// `debug`/`info`/`warn`/`error` build a record (first string arg → `msg`,
@@ -397,7 +431,12 @@ impl Interp {
     /// is invoked ONLY then, so a filtered `log.debug(() => expensive())` is free.
     /// Serialization is total (`json::to_json_lossy`) so logging never panics.
     #[cfg(feature = "log")]
-    pub(crate) async fn call_log(&self, func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+    pub(crate) async fn call_log(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
         let level_of = |f: &str| match f {
             "debug" => Some(LogLevel::Debug),
             "info" => Some(LogLevel::Info),
@@ -409,21 +448,38 @@ impl Interp {
             "setLevel" => {
                 let s = match args.first() {
                     Some(Value::Str(s)) => s.to_string(),
-                    _ => return Err(AsError::at("log.setLevel expects a level string", span).into()),
+                    _ => {
+                        return Err(AsError::at("log.setLevel expects a level string", span).into())
+                    }
                 };
                 match level_of(&s) {
-                    Some(l) => { self.set_log_level(l); Ok(Value::Nil) }
+                    Some(l) => {
+                        self.set_log_level(l);
+                        Ok(Value::Nil)
+                    }
                     None => Err(AsError::at(format!("unknown log level {:?}", s), span).into()),
                 }
             }
             "setFormat" => {
                 let s = match args.first() {
                     Some(Value::Str(s)) => s.to_string(),
-                    _ => return Err(AsError::at("log.setFormat expects \"human\" or \"json\"", span).into()),
+                    _ => {
+                        return Err(AsError::at(
+                            "log.setFormat expects \"human\" or \"json\"",
+                            span,
+                        )
+                        .into())
+                    }
                 };
                 match s.as_str() {
-                    "human" => { self.set_log_format(LogFormat::Human); Ok(Value::Nil) }
-                    "json" => { self.set_log_format(LogFormat::Json); Ok(Value::Nil) }
+                    "human" => {
+                        self.set_log_format(LogFormat::Human);
+                        Ok(Value::Nil)
+                    }
+                    "json" => {
+                        self.set_log_format(LogFormat::Json);
+                        Ok(Value::Nil)
+                    }
                     o => Err(AsError::at(format!("unknown log format {:?}", o), span).into()),
                 }
             }
@@ -437,7 +493,10 @@ impl Interp {
                 let mut iter = args.iter();
                 // A thunk is only honored as the FIRST arg. It is invoked lazily
                 // (after the level filter above) so a filtered call is free.
-                if matches!(args.first(), Some(Value::Function(_)) | Some(Value::Builtin(_))) {
+                if matches!(
+                    args.first(),
+                    Some(Value::Function(_)) | Some(Value::Builtin(_))
+                ) {
                     let r = self.call_value(args[0].clone(), vec![], span).await?;
                     // An `async fn` thunk returns a `Value::Future`; drive it to
                     // completion using the same mechanism as `await` (M17).
@@ -452,7 +511,10 @@ impl Interp {
                     match a {
                         Value::Object(o) => {
                             for (k, val) in o.borrow().iter() {
-                                fields.insert(k.clone(), crate::stdlib::json::to_json_lossy(val, &mut Vec::new()));
+                                fields.insert(
+                                    k.clone(),
+                                    crate::stdlib::json::to_json_lossy(val, &mut Vec::new()),
+                                );
                             }
                         }
                         other => parts.push(other.to_string()),
@@ -464,7 +526,9 @@ impl Interp {
                         let mut rec = serde_json::Map::new();
                         // User fields FIRST, then reserved keys, so a user field
                         // named `level`/`msg` can never clobber the authoritative ones.
-                        for (k, v) in fields { rec.insert(k, v); }
+                        for (k, v) in fields {
+                            rec.insert(k, v);
+                        }
                         rec.insert("level".into(), serde_json::Value::String(func.into()));
                         rec.insert("msg".into(), serde_json::Value::String(msg));
                         serde_json::Value::Object(rec).to_string()
@@ -534,7 +598,11 @@ impl Interp {
     ) -> Value {
         let id = self.next_id();
         self.resources.borrow_mut().insert(id, state);
-        Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
+        Value::Native(std::rc::Rc::new(crate::value::NativeObject {
+            id,
+            kind,
+            fields,
+        }))
     }
 
     /// Remove and return the resource for `id` (used by `close`/`kill`/EOF, and to
@@ -684,27 +752,42 @@ impl Interp {
         if let Some(entry) = self.modules.borrow().get(&canon) {
             return Ok(entry.clone()); // cached, or in-progress (circular)
         }
-        let src = std::fs::read_to_string(&canon)
-            .map_err(|e| Control::Panic(AsError::new(format!("cannot read module {}: {}", canon.display(), e))))?;
+        let src = std::fs::read_to_string(&canon).map_err(|e| {
+            Control::Panic(AsError::new(format!(
+                "cannot read module {}: {}",
+                canon.display(),
+                e
+            )))
+        })?;
         // Child of the global (builtins) env so module-level definitions and
         // imports can shadow builtins (resolution walks up to find builtins).
         let env = global_env().child();
         let exports = Rc::new(RefCell::new(HashSet::new()));
-        let entry = ModuleEntry { env: env.clone(), exports: exports.clone() };
+        let entry = ModuleEntry {
+            env: env.clone(),
+            exports: exports.clone(),
+        };
         // Cache BEFORE executing so circular imports resolve to this entry.
-        self.modules.borrow_mut().insert(canon.clone(), entry.clone());
+        self.modules
+            .borrow_mut()
+            .insert(canon.clone(), entry.clone());
 
-        let dir = canon.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let dir = canon
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
         let prev_dir = self.module_dir.replace(dir);
         let prev_exports = self.current_exports.replace(exports);
 
-        let src_info =
-            Rc::new(crate::error::SourceInfo { path: canon.display().to_string(), text: src.clone() });
+        let src_info = Rc::new(crate::error::SourceInfo {
+            path: canon.display().to_string(),
+            text: src.clone(),
+        });
 
-        let tokens = lexer::lex(&src)
-            .map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
-        let program = parser::parse(&tokens)
-            .map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
+        let tokens =
+            lexer::lex(&src).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
+        let program =
+            parser::parse(&tokens).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
         let result = self.exec(&program, &env).await;
 
         *self.module_dir.borrow_mut() = prev_dir;
@@ -725,7 +808,10 @@ impl Interp {
             return Ok(entry.clone());
         }
         let exports_list = crate::stdlib::std_module_exports(source).ok_or_else(|| {
-            Control::Panic(AsError::new(format!("unknown standard library module '{}'", source)))
+            Control::Panic(AsError::new(format!(
+                "unknown standard library module '{}'",
+                source
+            )))
         })?;
         // Child of the global env so an export whose name collides with a global
         // builtin (e.g. std/regex exports `test`) shadows it rather than erroring.
@@ -766,7 +852,13 @@ impl Interp {
                 self.eval_expr(e, env).await?;
                 Ok(Flow::Normal)
             }
-            Stmt::Let { name, ty, value, mutable, .. } => {
+            Stmt::Let {
+                name,
+                ty,
+                value,
+                mutable,
+                ..
+            } => {
                 let v = match value {
                     Some(value) => {
                         let v = self.eval_expr(value, env).await?;
@@ -785,13 +877,22 @@ impl Interp {
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::LetDestructure { names, rest, value, mutable, .. } => {
+            Stmt::LetDestructure {
+                names,
+                rest,
+                value,
+                mutable,
+                ..
+            } => {
                 let v = self.eval_expr(value, env).await?;
                 let items = match v {
                     Value::Array(a) => a.borrow().clone(),
                     other => {
                         return Err(AsError::at(
-                            format!("cannot destructure a non-array value of type {}", type_name(&other)),
+                            format!(
+                                "cannot destructure a non-array value of type {}",
+                                type_name(&other)
+                            ),
                             value.span,
                         )
                         .into())
@@ -808,34 +909,56 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::LetDestructureObject { bindings, rest, value, mutable, .. } => {
+            Stmt::LetDestructureObject {
+                bindings,
+                rest,
+                value,
+                mutable,
+                ..
+            } => {
                 let v = self.eval_expr(value, env).await?;
                 if !matches!(v, Value::Object(_) | Value::Instance(_)) {
                     return Err(AsError::at(
-                        format!("cannot destructure a non-object value of type {}", type_name(&v)),
-                        value.span).into());
+                        format!(
+                            "cannot destructure a non-object value of type {}",
+                            type_name(&v)
+                        ),
+                        value.span,
+                    )
+                    .into());
                 }
                 let get = |key: &str| -> Value {
                     match &v {
                         Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
-                        Value::Instance(i) => i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil),
+                        Value::Instance(i) => {
+                            i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil)
+                        }
                         _ => Value::Nil,
                     }
                 };
                 for b in bindings {
-                    env.define(&b.binding, get(&b.key), *mutable).map_err(AsError::new)?;
+                    env.define(&b.binding, get(&b.key), *mutable)
+                        .map_err(AsError::new)?;
                 }
                 if let Some((rest_name, _)) = rest {
                     let bound: std::collections::HashSet<&str> =
                         bindings.iter().map(|b| b.key.as_str()).collect();
                     let mut remaining = indexmap::IndexMap::new();
                     match &v {
-                        Value::Object(o) => for (k, val) in o.borrow().iter() {
-                            if !bound.contains(k.as_str()) { remaining.insert(k.clone(), val.clone()); }
-                        },
-                        Value::Instance(i) => for (k, val) in i.borrow().fields.iter() {
-                            if !bound.contains(k.as_str()) { remaining.insert(k.clone(), val.clone()); }
-                        },
+                        Value::Object(o) => {
+                            for (k, val) in o.borrow().iter() {
+                                if !bound.contains(k.as_str()) {
+                                    remaining.insert(k.clone(), val.clone());
+                                }
+                            }
+                        }
+                        Value::Instance(i) => {
+                            for (k, val) in i.borrow().fields.iter() {
+                                if !bound.contains(k.as_str()) {
+                                    remaining.insert(k.clone(), val.clone());
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     let obj = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(remaining)));
@@ -847,7 +970,11 @@ impl Interp {
                 let child = env.child();
                 self.exec(stmts, &child).await
             }
-            Stmt::If { cond, then_branch, else_branch } => {
+            Stmt::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
                 if self.eval_expr(cond, env).await?.is_truthy() {
                     let child = env.child();
                     self.exec(then_branch, &child).await
@@ -869,17 +996,28 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::ForRange { var, start, end, body } => {
+            Stmt::ForRange {
+                var,
+                start,
+                end,
+                body,
+            } => {
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
                 let (lo, hi) = match (start_v, end_v) {
                     (Value::Number(a), Value::Number(b)) => (a, b),
-                    _ => return Err(AsError::at("for-range bounds must be numbers", start.span).into()),
+                    _ => {
+                        return Err(
+                            AsError::at("for-range bounds must be numbers", start.span).into()
+                        )
+                    }
                 };
                 let mut i = lo;
                 while i < hi {
                     let child = env.child();
-                    child.define(var, Value::Number(i), false).map_err(AsError::new)?;
+                    child
+                        .define(var, Value::Number(i), false)
+                        .map_err(AsError::new)?;
                     match self.exec(body, &child).await? {
                         Flow::Break => break,
                         Flow::Return(v) => return Ok(Flow::Return(v)),
@@ -889,14 +1027,24 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::ForOf { var, iter, body, for_await } => {
+            Stmt::ForOf {
+                var,
+                iter,
+                body,
+                for_await,
+            } => {
                 let iterable = self.eval_expr(iter, env).await?;
                 if *for_await {
-                    return self.exec_for_await(var, iterable, body, env, iter.span).await;
+                    return self
+                        .exec_for_await(var, iterable, body, env, iter.span)
+                        .await;
                 }
                 let items: Vec<Value> = match iterable {
                     Value::Array(arr) => arr.borrow().clone(),
-                    Value::Str(s) => s.chars().map(|c| Value::Str(c.to_string().into())).collect(),
+                    Value::Str(s) => s
+                        .chars()
+                        .map(|c| Value::Str(c.to_string().into()))
+                        .collect(),
                     other => {
                         return Err(AsError::at(
                             format!("value of type {} is not iterable", type_name(&other)),
@@ -925,7 +1073,15 @@ impl Interp {
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
-            Stmt::Fn { name, params, ret, body, is_async, is_generator, .. } => {
+            Stmt::Fn {
+                name,
+                params,
+                ret,
+                body,
+                is_async,
+                is_generator,
+                ..
+            } => {
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
@@ -952,16 +1108,35 @@ impl Interp {
                     }));
                     map.insert(v.name.clone(), variant);
                 }
-                let def = Value::Enum(std::rc::Rc::new(crate::value::EnumDef { name: name.clone(), variants: map }));
+                let def = Value::Enum(std::rc::Rc::new(crate::value::EnumDef {
+                    name: name.clone(),
+                    variants: map,
+                }));
                 env.define(name, def, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Class { name, superclass, fields, methods, .. } => {
+            Stmt::Class {
+                name,
+                superclass,
+                fields,
+                methods,
+                ..
+            } => {
                 let parent = match superclass {
                     Some(sup_name) => match env.get(sup_name) {
                         Some(Value::Class(c)) => Some(c),
-                        Some(_) => return Err(AsError::new(format!("'{}' is not a class", sup_name)).into()),
-                        None => return Err(AsError::new(format!("undefined superclass '{}'", sup_name)).into()),
+                        Some(_) => {
+                            return Err(
+                                AsError::new(format!("'{}' is not a class", sup_name)).into()
+                            )
+                        }
+                        None => {
+                            return Err(AsError::new(format!(
+                                "undefined superclass '{}'",
+                                sup_name
+                            ))
+                            .into())
+                        }
                     },
                     None => None,
                 };
@@ -969,17 +1144,23 @@ impl Interp {
                 for fd in fields {
                     field_map.insert(
                         fd.name.clone(),
-                        crate::value::FieldSchema { ty: fd.ty.clone(), default: fd.default.clone() },
+                        crate::value::FieldSchema {
+                            ty: fd.ty.clone(),
+                            default: fd.default.clone(),
+                        },
                     );
                 }
                 let mut method_map = indexmap::IndexMap::new();
                 for m in methods {
-                    method_map.insert(m.name.clone(), std::rc::Rc::new(crate::value::Method {
-                        params: m.params.clone(),
-                        ret: m.ret.clone(),
-                        body: m.body.clone(),
-                        is_async: m.is_async,
-                    }));
+                    method_map.insert(
+                        m.name.clone(),
+                        std::rc::Rc::new(crate::value::Method {
+                            params: m.params.clone(),
+                            ret: m.ret.clone(),
+                            body: m.body.clone(),
+                            is_async: m.is_async,
+                        }),
+                    );
                 }
                 let class = Value::Class(std::rc::Rc::new(crate::value::Class {
                     name: name.clone(),
@@ -1009,7 +1190,11 @@ impl Interp {
                     crate::ast::ImportNames::Named(names) => {
                         for name in names {
                             if !entry.exports.borrow().contains(name) {
-                                return Err(AsError::new(format!("module '{}' has no export '{}'", source, name)).into());
+                                return Err(AsError::new(format!(
+                                    "module '{}' has no export '{}'",
+                                    source, name
+                                ))
+                                .into());
                             }
                             let v = entry.env.get(name).unwrap_or(Value::Nil);
                             env.define(name, v, false).map_err(AsError::new)?;
@@ -1036,9 +1221,9 @@ impl Interp {
             ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Nil => Ok(Value::Nil),
-            ExprKind::Ident(name) => env
-                .get(name)
-                .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span).into()),
+            ExprKind::Ident(name) => env.get(name).ok_or_else(|| {
+                AsError::at(format!("undefined variable '{}'", name), expr.span).into()
+            }),
             ExprKind::Assign { target, value } => {
                 let v = self.eval_expr(value, env).await?;
                 self.assign_to(target, v, value.span, env).await
@@ -1057,15 +1242,27 @@ impl Interp {
                 match op {
                     BinOp::And => {
                         let l = self.eval_expr(lhs, env).await?;
-                        return if l.is_truthy() { self.eval_expr(rhs, env).await } else { Ok(l) };
+                        return if l.is_truthy() {
+                            self.eval_expr(rhs, env).await
+                        } else {
+                            Ok(l)
+                        };
                     }
                     BinOp::Or => {
                         let l = self.eval_expr(lhs, env).await?;
-                        return if l.is_truthy() { Ok(l) } else { self.eval_expr(rhs, env).await };
+                        return if l.is_truthy() {
+                            Ok(l)
+                        } else {
+                            self.eval_expr(rhs, env).await
+                        };
                     }
                     BinOp::Coalesce => {
                         let l = self.eval_expr(lhs, env).await?;
-                        return if l == Value::Nil { self.eval_expr(rhs, env).await } else { Ok(l) };
+                        return if l == Value::Nil {
+                            self.eval_expr(rhs, env).await
+                        } else {
+                            Ok(l)
+                        };
                     }
                     _ => {}
                 }
@@ -1086,7 +1283,11 @@ impl Interp {
                 if let BinOp::Range = op {
                     let (start, end) = match (&l, &r) {
                         (Value::Number(a), Value::Number(b)) => (*a, *b),
-                        _ => return Err(AsError::at("range bounds must be numbers", expr.span).into()),
+                        _ => {
+                            return Err(
+                                AsError::at("range bounds must be numbers", expr.span).into()
+                            )
+                        }
                     };
                     let mut items = Vec::new();
                     let mut i = start;
@@ -1119,14 +1320,23 @@ impl Interp {
                     BinOp::Le => Value::Bool(a <= b),
                     BinOp::Gt => Value::Bool(a > b),
                     BinOp::Ge => Value::Bool(a >= b),
-                    BinOp::Eq | BinOp::Ne | BinOp::And | BinOp::Or | BinOp::Coalesce
+                    BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::And
+                    | BinOp::Or
+                    | BinOp::Coalesce
                     | BinOp::Range => {
                         unreachable!("handled above")
                     }
                 };
                 Ok(result)
             }
-            ExprKind::Arrow { params, body, is_async, is_generator } => {
+            ExprKind::Arrow {
+                params,
+                body,
+                is_async,
+                is_generator,
+            } => {
                 let body_stmts = match body.as_ref() {
                     crate::ast::ArrowBody::Block(stmts) => stmts.clone(),
                     crate::ast::ArrowBody::Expr(e) => vec![Stmt::Return(Some((**e).clone()))],
@@ -1151,9 +1361,7 @@ impl Interp {
                         crate::ast::ArrayElem::Spread(x) => {
                             let v = self.eval_expr(x, env).await?;
                             match v {
-                                Value::Array(a) => {
-                                    values.extend(a.borrow().iter().cloned())
-                                }
+                                Value::Array(a) => values.extend(a.borrow().iter().cloned()),
                                 other => {
                                     return Err(AsError::at(
                                         format!(
@@ -1200,7 +1408,9 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(map))))
+                Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                    map,
+                ))))
             }
             ExprKind::Template { parts } => {
                 let mut out = String::new();
@@ -1358,12 +1568,19 @@ impl Interp {
                     Value::Array(arr) => {
                         let i = array_index(&idx, expr.span)?;
                         let arr = arr.borrow();
-                        arr.get(i)
-                            .cloned()
-                            .ok_or_else(|| AsError::at(format!("index {} out of bounds (len {})", i, arr.len()), expr.span))
+                        arr.get(i).cloned().ok_or_else(|| {
+                            AsError::at(
+                                format!("index {} out of bounds (len {})", i, arr.len()),
+                                expr.span,
+                            )
+                        })
                     }
                     Value::Object(map) => match idx {
-                        Value::Str(key) => Ok(map.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)),
+                        Value::Str(key) => Ok(map
+                            .borrow()
+                            .get(key.as_ref())
+                            .cloned()
+                            .unwrap_or(Value::Nil)),
                         _ => Err(AsError::at("object index must be a string", expr.span)),
                     },
                     _ => Err(AsError::at("cannot index this value", object.span)),
@@ -1407,15 +1624,16 @@ impl Interp {
     fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
         match obj {
             Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
-            Value::Enum(e) => e
-                .variants
-                .get(name)
-                .cloned()
-                .ok_or_else(|| AsError::at(format!("enum {} has no variant '{}'", e.name, name), span)),
+            Value::Enum(e) => e.variants.get(name).cloned().ok_or_else(|| {
+                AsError::at(format!("enum {} has no variant '{}'", e.name, name), span)
+            }),
             Value::EnumVariant(v) => match name {
                 "name" => Ok(Value::Str(v.name.as_str().into())),
                 "value" => Ok(v.value.clone()),
-                other => Err(AsError::at(format!("enum variant has no property '{}'", other), span)),
+                other => Err(AsError::at(
+                    format!("enum variant has no property '{}'", other),
+                    span,
+                )),
             },
             Value::Instance(inst) => {
                 let b = inst.borrow();
@@ -1423,26 +1641,36 @@ impl Interp {
                     return Ok(v.clone());
                 }
                 match crate::value::find_method(&b.class, name) {
-                    Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(crate::value::BoundMethod {
-                        receiver: obj.clone(),
-                        method,
-                        defining_class: def_class,
-                        name: name.to_string(),
-                    }))),
+                    Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(
+                        crate::value::BoundMethod {
+                            receiver: obj.clone(),
+                            method,
+                            defining_class: def_class,
+                            name: name.to_string(),
+                        },
+                    ))),
                     None => Ok(Value::Nil),
                 }
             }
             Value::Super(s) => match &s.start {
                 Some(start) => match crate::value::find_method(start, name) {
-                    Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(crate::value::BoundMethod {
-                        receiver: s.receiver.clone(),
-                        method,
-                        defining_class: def_class,
-                        name: name.to_string(),
-                    }))),
-                    None => Err(AsError::at(format!("no superclass method '{}'", name), span)),
+                    Some((method, def_class)) => Ok(Value::BoundMethod(std::rc::Rc::new(
+                        crate::value::BoundMethod {
+                            receiver: s.receiver.clone(),
+                            method,
+                            defining_class: def_class,
+                            name: name.to_string(),
+                        },
+                    ))),
+                    None => Err(AsError::at(
+                        format!("no superclass method '{}'", name),
+                        span,
+                    )),
                 },
-                None => Err(AsError::at(format!("no superclass method '{}' (no superclass)", name), span)),
+                None => Err(AsError::at(
+                    format!("no superclass method '{}' (no superclass)", name),
+                    span,
+                )),
             },
             Value::Native(n) => {
                 // `sse.lastEventId` is a LIVE property: the most recent `id:` seen,
@@ -1472,10 +1700,12 @@ impl Interp {
                         span,
                     ));
                 }
-                Ok(Value::NativeMethod(std::rc::Rc::new(crate::value::NativeMethod {
-                    receiver: n.clone(),
-                    method: name.to_string(),
-                })))
+                Ok(Value::NativeMethod(std::rc::Rc::new(
+                    crate::value::NativeMethod {
+                        receiver: n.clone(),
+                        method: name.to_string(),
+                    },
+                )))
             }
             Value::Generator(g) => match name {
                 // `gen.next` / `gen.close` are bound generator methods.
@@ -1493,14 +1723,25 @@ impl Interp {
                     span,
                 )),
             },
-            Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
-            _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
+            Value::Nil => Err(AsError::at(
+                format!("cannot read property '{}' of nil", name),
+                span,
+            )),
+            _ => Err(AsError::at(
+                format!("cannot read property '{}' of this value", name),
+                span,
+            )),
         }
     }
 
     // pub(crate): used by std/* modules (std/array callbacks) later in M10.
     #[async_recursion(?Send)]
-    pub(crate) async fn call_value(&self, callee: Value, args: Vec<Value>, span: Span) -> Result<Value, Control> {
+    pub(crate) async fn call_value(
+        &self,
+        callee: Value,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
         match callee {
             Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
             Value::Function(func) => self.call_function(func, args, span).await,
@@ -1553,9 +1794,7 @@ impl Interp {
                 g.close();
                 Ok(Value::Nil)
             }
-            other => {
-                Err(AsError::at(format!("generator has no method '{}'", other), span).into())
-            }
+            other => Err(AsError::at(format!("generator has no method '{}'", other), span).into()),
         }
     }
 
@@ -1672,7 +1911,10 @@ impl Interp {
             Value::Native(ref n) => {
                 let method = native_stream_method(n.kind).ok_or_else(|| {
                     AsError::at(
-                        format!("value of type {} is not async-iterable", type_name(&iterable)),
+                        format!(
+                            "value of type {} is not async-iterable",
+                            type_name(&iterable)
+                        ),
                         span,
                     )
                 })?;
@@ -1694,7 +1936,9 @@ impl Interp {
                     if err != Value::Nil {
                         // Surface a stream error as a Tier-2 panic at the loop site.
                         let msg = error_message(&err);
-                        return Err(AsError::at(format!("for await stream error: {}", msg), span).into());
+                        return Err(
+                            AsError::at(format!("for await stream error: {}", msg), span).into(),
+                        );
                     }
                     if value == Value::Nil {
                         break; // end-of-stream
@@ -1734,7 +1978,12 @@ impl Interp {
             // UNCHANGED fast path — exact arity, identical wording.
             if args.len() != params.len() {
                 return Err(AsError::at(
-                    format!("{} expected {} argument(s), got {}", what, params.len(), args.len()),
+                    format!(
+                        "{} expected {} argument(s), got {}",
+                        what,
+                        params.len(),
+                        args.len()
+                    ),
                     span,
                 )
                 .into());
@@ -1796,13 +2045,17 @@ impl Interp {
                 rest_vals.push(a);
             }
             let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(rest_vals)));
-            call_env.define(&rest_p.name, arr, true).map_err(AsError::new)?;
+            call_env
+                .define(&rest_p.name, arr, true)
+                .map_err(AsError::new)?;
         }
         let result = match self.exec(body, call_env).await {
             Ok(Flow::Return(v)) => v,
             Ok(Flow::Normal) => Value::Nil,
             Ok(Flow::Break) => return Err(AsError::at("'break' outside of a loop", span).into()),
-            Ok(Flow::Continue) => return Err(AsError::at("'continue' outside of a loop", span).into()),
+            Ok(Flow::Continue) => {
+                return Err(AsError::at("'continue' outside of a loop", span).into())
+            }
             Err(Control::Propagate(v)) => v,
             Err(Control::Panic(e)) => return Err(Control::Panic(e)),
         };
@@ -1839,10 +2092,12 @@ impl Interp {
             let vm = self.rc();
             let func = func.clone();
             let body: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Control>>>> =
-                Box::pin(async move {
-                    vm.run_function_body(func, args, call_env, span, what).await
-                });
-            return Ok(Value::Generator(Rc::new(crate::coro::GeneratorHandle::new(body))));
+                Box::pin(
+                    async move { vm.run_function_body(func, args, call_env, span, what).await },
+                );
+            return Ok(Value::Generator(Rc::new(
+                crate::coro::GeneratorHandle::new(body),
+            )));
         }
         // A script `async fn` is scheduled eagerly: build the body future, spawn it
         // onto the current-thread LocalSet, and hand back a `Value::Future`
@@ -1873,7 +2128,8 @@ impl Interp {
             self.maybe_yield_for_inflight().await;
             return Ok(Value::Future(fut));
         }
-        self.run_function_body(func, args, call_env, span, what).await
+        self.run_function_body(func, args, call_env, span, what)
+            .await
     }
 
     /// Run a (already-prepared) function body, owning the `Rc<Function>` for the
@@ -1888,7 +2144,11 @@ impl Interp {
         span: Span,
         what: String,
     ) -> Result<Value, Control> {
-        let spec = BodySpec { params: &func.params, ret: &func.ret, body: &func.body };
+        let spec = BodySpec {
+            params: &func.params,
+            ret: &func.ret,
+            body: &func.body,
+        };
         self.run_body(spec, args, &call_env, span, &what).await
     }
 
@@ -1932,7 +2192,11 @@ impl Interp {
             None => {
                 if !args.is_empty() {
                     return Err(AsError::at(
-                        format!("{} has no init but was given {} argument(s)", class.name, args.len()),
+                        format!(
+                            "{} has no init but was given {} argument(s)",
+                            class.name,
+                            args.len()
+                        ),
                         span,
                     )
                     .into());
@@ -1958,7 +2222,11 @@ impl Interp {
             Value::Object(m) => m.clone(),
             _ => {
                 return Err(AsError::at(
-                    format!("{} expects an object, got {}", field_owner_label(path, &class.name), type_name(obj)),
+                    format!(
+                        "{} expects an object, got {}",
+                        field_owner_label(path, &class.name),
+                        type_name(obj)
+                    ),
                     span,
                 ))
             }
@@ -1990,10 +2258,17 @@ impl Interp {
             }
             // Same scoping principle for the field's declared type: a nested class
             // name resolves in the env of the class that declared the field.
-            val = self.coerce_field(&fs.ty, val, &def_class.def_env, strict, &field_path, span).await?;
+            val = self
+                .coerce_field(&fs.ty, val, &def_class.def_env, strict, &field_path, span)
+                .await?;
             if !check_type(&val, &fs.ty) {
                 return Err(AsError::at(
-                    format!("type contract violated at {}: expected {}, got {}", field_path, fs.ty, type_name(&val)),
+                    format!(
+                        "type contract violated at {}: expected {}, got {}",
+                        field_path,
+                        fs.ty,
+                        type_name(&val)
+                    ),
                     span,
                 ));
             }
@@ -2004,17 +2279,23 @@ impl Interp {
             for k in map.borrow().keys() {
                 if !schema.contains_key(k) {
                     return Err(AsError::at(
-                        format!("unexpected key '{}' for {} (strict)", k, field_owner_label(path, &class.name)),
+                        format!(
+                            "unexpected key '{}' for {} (strict)",
+                            k,
+                            field_owner_label(path, &class.name)
+                        ),
                         span,
                     ));
                 }
             }
         }
 
-        Ok(Value::Instance(std::rc::Rc::new(std::cell::RefCell::new(crate::value::Instance {
-            class: class.clone(),
-            fields: inst_fields,
-        }))))
+        Ok(Value::Instance(std::rc::Rc::new(std::cell::RefCell::new(
+            crate::value::Instance {
+                class: class.clone(),
+                fields: inst_fields,
+            },
+        ))))
     }
 
     /// Recursively coerce a raw value to match a declared field type: a raw
@@ -2060,8 +2341,11 @@ impl Interp {
             },
             Type::Map(_, vty) => match &val {
                 Value::Map(m) => {
-                    let entries: Vec<(crate::value::MapKey, Value)> =
-                        m.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let entries: Vec<(crate::value::MapKey, Value)> = m
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
                     let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
                     for (k, v) in entries {
                         let p = format!("{}[{}]", path, k.to_value());
@@ -2077,13 +2361,17 @@ impl Interp {
                 // parsed-JSON `map<K, Class>` field would otherwise be an Object
                 // and fail the `map<K,V>` contract.
                 Value::Object(o) => {
-                    let entries: Vec<(String, Value)> =
-                        o.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let entries: Vec<(String, Value)> = o
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
                     let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
                     for (k, v) in entries {
                         let p = format!("{}[{}]", path, k);
                         let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
-                        out.borrow_mut().insert(crate::value::MapKey::Str(k.as_str().into()), cv);
+                        out.borrow_mut()
+                            .insert(crate::value::MapKey::Str(k.as_str().into()), cv);
                     }
                     Ok(Value::Map(out))
                 }
@@ -2101,13 +2389,17 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         let call_env = bm.defining_class.def_env.child();
-        call_env.define("self", bm.receiver.clone(), false).map_err(AsError::new)?;
+        call_env
+            .define("self", bm.receiver.clone(), false)
+            .map_err(AsError::new)?;
         // `super` lookup begins at the defining class's superclass.
         let super_ref = Value::Super(std::rc::Rc::new(crate::value::SuperRef {
             receiver: bm.receiver.clone(),
             start: bm.defining_class.superclass.clone(),
         }));
-        call_env.define("super", super_ref, false).map_err(AsError::new)?;
+        call_env
+            .define("super", super_ref, false)
+            .map_err(AsError::new)?;
         // An async method, like an async free function, is scheduled eagerly and
         // returns a `Value::Future`. We move owned copies (the `Rc<Method>`, name,
         // and prepared `call_env`) into the spawned task so the body can outlive
@@ -2131,7 +2423,11 @@ impl Interp {
             self.maybe_yield_for_inflight().await;
             return Ok(Value::Future(fut));
         }
-        let spec = BodySpec { params: &bm.method.params, ret: &bm.method.ret, body: &bm.method.body };
+        let spec = BodySpec {
+            params: &bm.method.params,
+            ret: &bm.method.ret,
+            body: &bm.method.body,
+        };
         self.run_body(spec, args, &call_env, span, &bm.name).await
     }
 
@@ -2146,7 +2442,11 @@ impl Interp {
         span: Span,
         what: String,
     ) -> Result<Value, Control> {
-        let spec = BodySpec { params: &method.params, ret: &method.ret, body: &method.body };
+        let spec = BodySpec {
+            params: &method.params,
+            ret: &method.ret,
+            body: &method.body,
+        };
         self.run_body(spec, args, &call_env, span, &what).await
     }
 
@@ -2154,7 +2454,11 @@ impl Interp {
     async fn call_builtin(&self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         match name {
             "print" => {
-                let mut line = args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+                let mut line = args
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 line.push('\n');
                 self.push_output(&line);
                 Ok(Value::Nil)
@@ -2184,9 +2488,10 @@ impl Interp {
                 let callee = args.first().cloned().unwrap_or(Value::Nil);
                 match self.call_value(callee, Vec::new(), span).await {
                     Ok(v) => Ok(make_pair(v, Value::Nil)),
-                    Err(Control::Panic(e)) => {
-                        Ok(make_pair(Value::Nil, make_error(Value::Str(e.message.into()))))
-                    }
+                    Err(Control::Panic(e)) => Ok(make_pair(
+                        Value::Nil,
+                        make_error(Value::Str(e.message.into())),
+                    )),
                     // A `?` propagation inside `fn` is already converted to fn's return
                     // value by call_function, so this is unreachable in practice; pass it through.
                     Err(Control::Propagate(v)) => Err(Control::Propagate(v)),
@@ -2213,7 +2518,10 @@ impl Interp {
                     Value::Bytes(b) => b.borrow().len(),
                     _ => {
                         return Err(AsError::at(
-                            format!("len() expects a string, array, object, map, or bytes, got {}", type_name(&v)),
+                            format!(
+                                "len() expects a string, array, object, map, or bytes, got {}",
+                                type_name(&v)
+                            ),
                             span,
                         )
                         .into())
@@ -2278,7 +2586,13 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    async fn assign_to(&self, target: &Expr, value: Value, value_span: Span, env: &Environment) -> Result<Value, Control> {
+    async fn assign_to(
+        &self,
+        target: &Expr,
+        value: Value,
+        value_span: Span,
+        env: &Environment,
+    ) -> Result<Value, Control> {
         match &target.kind {
             ExprKind::Ident(name) => match env.assign(name, value.clone()) {
                 Ok(()) => Ok(value),
@@ -2317,7 +2631,9 @@ impl Interp {
                         }
                         _ => Err(AsError::at("object index must be a string", target.span).into()),
                     },
-                    _ => Err(AsError::at("cannot index-assign a non-array value", object.span).into()),
+                    _ => Err(
+                        AsError::at("cannot index-assign a non-array value", object.span).into(),
+                    ),
                 }
             }
             ExprKind::Member { object, name } => {
@@ -2337,7 +2653,11 @@ impl Interp {
                         inst.borrow_mut().fields.insert(name.clone(), value.clone());
                         Ok(value)
                     }
-                    _ => Err(AsError::at(format!("cannot set property '{}' on this value", name), object.span).into()),
+                    _ => Err(AsError::at(
+                        format!("cannot set property '{}' on this value", name),
+                        object.span,
+                    )
+                    .into()),
                 }
             }
             _ => Err(AsError::at("invalid assignment target", target.span).into()),
@@ -2349,7 +2669,10 @@ impl Interp {
 fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
     match v {
         Value::Number(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
-        Value::Number(_) => Err(AsError::at("array index must be a non-negative integer", span)),
+        Value::Number(_) => Err(AsError::at(
+            "array index must be a non-negative integer",
+            span,
+        )),
         _ => Err(AsError::at("array index must be a number", span)),
     }
 }
@@ -2424,12 +2747,16 @@ fn exported_names(stmt: &Stmt) -> Vec<String> {
         Stmt::Enum { name, .. } => vec![name.clone()],
         Stmt::LetDestructure { names, rest, .. } => {
             let mut v = names.clone();
-            if let Some((r, _)) = rest { v.push(r.clone()); }
+            if let Some((r, _)) = rest {
+                v.push(r.clone());
+            }
             v
         }
         Stmt::LetDestructureObject { bindings, rest, .. } => {
             let mut v: Vec<String> = bindings.iter().map(|b| b.binding.clone()).collect();
-            if let Some((r, _)) = rest { v.push(r.clone()); }
+            if let Some((r, _)) = rest {
+                v.push(r.clone());
+            }
             v
         }
         _ => Vec::new(),
@@ -2539,7 +2866,12 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
 /// Build a contract-violation panic.
 fn contract_panic(ty: &crate::ast::Type, value: &Value, span: Span) -> Control {
     AsError::at(
-        format!("type contract violated: expected {}, got {} ({})", ty, type_name(value), value),
+        format!(
+            "type contract violated: expected {}, got {} ({})",
+            ty,
+            type_name(value),
+            value
+        ),
         span,
     )
     .into()
@@ -2575,7 +2907,9 @@ mod tests {
         let stmts = parse(&tokens).expect("parse");
         let env = global_env().child();
         let local = tokio::task::LocalSet::new();
-        local.run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") }).await;
+        local
+            .run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") })
+            .await;
         local.await; // drain spawned async-fn tasks
         interp.output()
     }
@@ -2589,7 +2923,9 @@ mod tests {
         let stmts = parse(&tokens).expect("parse");
         let env = global_env().child();
         let local = tokio::task::LocalSet::new();
-        local.run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") }).await;
+        local
+            .run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") })
+            .await;
         local.await;
         interp.log_output()
     }
@@ -2597,13 +2933,16 @@ mod tests {
     #[cfg(feature = "log")]
     #[tokio::test]
     async fn log_records_human_and_filtering() {
-        let logs = run_logs(r#"
+        let logs = run_logs(
+            r#"
 import * as log from "std/log"
 log.setLevel("warn")
 log.info("ignored", {a: 1})
 log.warn("disk low", {pct: 92})
 log.error("boom")
-"#).await;
+"#,
+        )
+        .await;
         assert!(!logs.contains("ignored"));
         assert!(logs.contains("[WARN]") && logs.contains("disk low") && logs.contains("pct=92"));
         assert!(logs.contains("[ERROR]") && logs.contains("boom"));
@@ -2612,13 +2951,20 @@ log.error("boom")
     #[cfg(feature = "log")]
     #[tokio::test]
     async fn log_json_format_and_thunk() {
-        let logs = run_logs(r#"
+        let logs = run_logs(
+            r#"
 import * as log from "std/log"
 log.setFormat("json")
 log.info("saved", {userId: 5})
 log.debug(() => "expensive")
-"#).await;
-        assert!(logs.contains("\"level\":\"info\"") && logs.contains("\"msg\":\"saved\"") && logs.contains("\"userId\":5"));
+"#,
+        )
+        .await;
+        assert!(
+            logs.contains("\"level\":\"info\"")
+                && logs.contains("\"msg\":\"saved\"")
+                && logs.contains("\"userId\":5")
+        );
         assert!(!logs.contains("expensive"));
     }
 
@@ -2634,12 +2980,18 @@ log.debug(() => "expensive")
     #[cfg(feature = "log")]
     #[tokio::test]
     async fn log_reserved_keys_win_and_no_silent_drop() {
-        let logs = run_logs(r#"
+        let logs = run_logs(
+            r#"
 import * as log from "std/log"
 log.setFormat("json")
 log.info("saved", {level: "HACK", userId: 5})
-"#).await;
-        assert!(logs.contains("\"level\":\"info\""), "auto level must win: {logs}");
+"#,
+        )
+        .await;
+        assert!(
+            logs.contains("\"level\":\"info\""),
+            "auto level must win: {logs}"
+        );
         assert!(logs.contains("\"userId\":5"));
         assert!(!logs.contains("HACK"));
     }
@@ -2661,7 +3013,11 @@ log.info("saved", {level: "HACK", userId: 5})
     #[tokio::test]
     async fn non_rest_arity_error_message_unchanged() {
         let e = run_err("fn f(a, b) {}\nf(1)").await;
-        assert!(e.message.contains("expected 2 argument(s), got 1"), "got: {}", e.message);
+        assert!(
+            e.message.contains("expected 2 argument(s), got 1"),
+            "got: {}",
+            e.message
+        );
     }
 
     #[tokio::test]
@@ -2679,7 +3035,11 @@ log.info("saved", {level: "HACK", userId: 5})
     #[tokio::test]
     async fn typed_rest_checks_each_element() {
         let e = run_err("fn f(...rest: array<number>) {}\nf(1, \"x\", 3)").await;
-        assert!(e.message.to_lowercase().contains("number"), "got: {}", e.message);
+        assert!(
+            e.message.to_lowercase().contains("number"),
+            "got: {}",
+            e.message
+        );
         let out = run("fn f(...rest: array<number>) { print(rest) }\nf(1, 2)").await;
         assert_eq!(out, "[1, 2]\n");
     }
@@ -2692,7 +3052,9 @@ log.info("saved", {level: "HACK", userId: 5})
         let stmts = parse(&tokens).expect("parse");
         let env = global_env().child();
         let local = tokio::task::LocalSet::new();
-        let r = local.run_until(async { interp.exec(&stmts, &env).await }).await;
+        let r = local
+            .run_until(async { interp.exec(&stmts, &env).await })
+            .await;
         local.await;
         match r {
             Err(Control::Panic(e)) => e,
@@ -2712,20 +3074,32 @@ let p = {...o, y: 2, x: 9}
 print(p)
 fn add(a, b, c) { return a + b + c }
 print(add(...[1, 2, 3]))
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "[1, 2, 3]\n{x: 9, y: 2}\n6\n");
     }
 
     #[tokio::test]
     async fn spread_wrong_type_panics() {
-        assert!(run_err("let a = [...5]").await.message.contains("can only spread an array"));
-        assert!(run_err("let o = {...5}").await.message.contains("can only spread an object"));
+        assert!(run_err("let a = [...5]")
+            .await
+            .message
+            .contains("can only spread an array"));
+        assert!(run_err("let o = {...5}")
+            .await
+            .message
+            .contains("can only spread an object"));
     }
 
     #[tokio::test]
     async fn spread_non_array_as_call_args_panics() {
         let e = run_err("fn f(a) { return a }\nf(...5)").await;
-        assert!(e.message.contains("can only spread an array as call arguments"), "got: {}", e.message);
+        assert!(
+            e.message
+                .contains("can only spread an array as call arguments"),
+            "got: {}",
+            e.message
+        );
     }
 
     #[tokio::test]
@@ -2741,7 +3115,8 @@ let p = P.from({x: 10, y: 20})
 let {x, y} = p
 print(x)
 print(y)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "1\n2\nnil\n10\n20\n");
     }
 
@@ -2768,14 +3143,24 @@ print(y)
         let interp = Interp::new();
         let mut fields = indexmap::IndexMap::new();
         fields.insert("pid".to_string(), Value::Number(42.0));
-        let h = interp.register_resource(crate::value::NativeKind::ChildProcess, fields, ResourceState::Closed);
+        let h = interp.register_resource(
+            crate::value::NativeKind::ChildProcess,
+            fields,
+            ResourceState::Closed,
+        );
         assert_eq!(type_name(&h), "childProcess");
-        assert_eq!(interp.read_member(&h, "pid", Span::new(0, 0)).unwrap(), Value::Number(42.0));
+        assert_eq!(
+            interp.read_member(&h, "pid", Span::new(0, 0)).unwrap(),
+            Value::Number(42.0)
+        );
         let m = interp.read_member(&h, "wait", Span::new(0, 0)).unwrap();
         assert!(matches!(m, Value::NativeMethod(_)));
         assert_eq!(h.to_string(), format!("<native childProcess #{}>", 0));
         // The resource is in the table until taken.
-        assert!(matches!(interp.take_resource(0), Some(ResourceState::Closed)));
+        assert!(matches!(
+            interp.take_resource(0),
+            Some(ResourceState::Closed)
+        ));
         assert!(interp.take_resource(0).is_none());
     }
 
@@ -2799,7 +3184,10 @@ print(y)
             "zero\n"
         );
         // Only the selected branch runs — the untaken branch would panic.
-        assert_eq!(run("let a = [1]\nprint(len(a) > 5 ? a[99] : \"safe\")").await, "safe\n");
+        assert_eq!(
+            run("let a = [1]\nprint(len(a) > 5 ? a[99] : \"safe\")").await,
+            "safe\n"
+        );
         // Only nil/false are falsy: 0 and "" are truthy conditions.
         assert_eq!(run("print(0 ? \"t\" : \"f\")").await, "t\n");
         assert_eq!(run("print(nil ? \"t\" : \"f\")").await, "f\n");
@@ -2887,13 +3275,19 @@ print(y)
                    print(m.text)\n\
                    print(m.index)\n\
                    print(type(re))";
-        assert_eq!(run(src).await, "true\n[\"1\", \"22\", \"333\"]\nx#y\n42\n2\nregex\n");
+        assert_eq!(
+            run(src).await,
+            "true\n[\"1\", \"22\", \"333\"]\nx#y\n42\n2\nregex\n"
+        );
     }
 
     #[cfg(feature = "data")]
     #[tokio::test]
     async fn std_uuid_end_to_end() {
-        assert_eq!(run("import * as uuid from \"std/uuid\"\nprint(len(uuid.v4()))").await, "36\n");
+        assert_eq!(
+            run("import * as uuid from \"std/uuid\"\nprint(len(uuid.v4()))").await,
+            "36\n"
+        );
     }
 
     #[cfg(feature = "data")]
@@ -2942,7 +3336,10 @@ print(y)
     #[tokio::test]
     async fn user_can_shadow_builtins() {
         assert_eq!(run("let len = 5\nprint(len)").await, "5\n");
-        assert_eq!(run("fn type(x) { return 99 }\nprint(type(1))").await, "99\n");
+        assert_eq!(
+            run("fn type(x) { return 99 }\nprint(type(1))").await,
+            "99\n"
+        );
     }
 
     #[cfg(feature = "data")]
@@ -2957,11 +3354,20 @@ print(y)
     async fn range_as_general_expression() {
         assert_eq!(run("let r = 0..5\nprint(r)").await, "[0, 1, 2, 3, 4]\n");
         assert_eq!(run("print(2..2)").await, "[]\n");
-        assert_eq!(run("import * as array from \"std/array\"\nprint(array.contains(1..4, 2))").await, "true\n");
+        assert_eq!(
+            run("import * as array from \"std/array\"\nprint(array.contains(1..4, 2))").await,
+            "true\n"
+        );
         // for-in over a non-literal range value (array)
-        assert_eq!(run("let r = 0..3\nlet s = 0\nfor (i in r) { s = s + i }\nprint(s)").await, "3\n");
+        assert_eq!(
+            run("let r = 0..3\nlet s = 0\nfor (i in r) { s = s + i }\nprint(s)").await,
+            "3\n"
+        );
         // common literal for-in still works (lazy ForRange path)
-        assert_eq!(run("let s = 0\nfor (i in 0..4) { s = s + i }\nprint(s)").await, "6\n");
+        assert_eq!(
+            run("let s = 0\nfor (i in 0..4) { s = s + i }\nprint(s)").await,
+            "6\n"
+        );
         // precedence: .. tighter than comparison, looser than +
         assert_eq!(run("print(1+1..5)").await, "[2, 3, 4]\n");
     }
@@ -3002,14 +3408,17 @@ print(y)
     async fn future_type_annotation_checks() {
         // Calling an async fn yields a future; the binding annotated `future<T>`
         // accepts it, and awaiting it produces the resolved value.
-        let ok = run(
-            "async fn f(): number { return 1 }\nlet x: future<number> = f()\nprint(await x)",
-        )
-        .await;
+        let ok =
+            run("async fn f(): number { return 1 }\nlet x: future<number> = f()\nprint(await x)")
+                .await;
         assert_eq!(ok, "1\n");
         // A non-future violates the contract; the message names `future`.
         let err = run_err("let y: future<number> = 5").await;
-        assert!(err.message.contains("future"), "message was {:?}", err.message);
+        assert!(
+            err.message.contains("future"),
+            "message was {:?}",
+            err.message
+        );
         assert_eq!(
             err.message,
             "type contract violated: expected future<number>, got number (5)"
@@ -3019,7 +3428,10 @@ print(y)
     #[tokio::test]
     async fn future_type_display_round_trips() {
         use crate::ast::Type;
-        assert_eq!(Type::Future(Box::new(Type::Number)).to_string(), "future<number>");
+        assert_eq!(
+            Type::Future(Box::new(Type::Number)).to_string(),
+            "future<number>"
+        );
         // Nested generic types Display correctly.
         let ty = Type::Future(Box::new(Type::Array(Box::new(Type::Number))));
         assert_eq!(ty.to_string(), "future<array<number>>");
@@ -3077,22 +3489,39 @@ print(y)
     #[tokio::test]
     async fn range_error_paths_and_fractional() {
         // zero step → panic
-        assert!(run_err("range(0, 5, 0)").await.message.contains("step must not be zero"));
+        assert!(run_err("range(0, 5, 0)")
+            .await
+            .message
+            .contains("step must not be zero"));
         // too many args → panic
-        assert!(run_err("range(1, 2, 3, 4)").await.message.contains("1 to 3 arguments"));
+        assert!(run_err("range(1, 2, 3, 4)")
+            .await
+            .message
+            .contains("1 to 3 arguments"));
         // non-number arg → panic
-        assert!(run_err("range(\"x\")").await.message.contains("number arguments"));
+        assert!(run_err("range(\"x\")")
+            .await
+            .message
+            .contains("number arguments"));
         // zero args → panic (0 falls into the >3/other arm)
-        assert!(run_err("range()").await.message.contains("1 to 3 arguments"));
+        assert!(run_err("range()")
+            .await
+            .message
+            .contains("1 to 3 arguments"));
         // fractional step: pin the IEEE-754 accumulation behavior (end-exclusive).
         // The 4th element is 0.3+0.3+0.3 = 0.8999999999999999 (< 1, so included);
         // the next accumulation exceeds 1 and is excluded. Accumulation drift is expected.
-        assert_eq!(run("print(range(0, 1, 0.3))").await, "[0, 0.3, 0.6, 0.8999999999999999]\n");
+        assert_eq!(
+            run("print(range(0, 1, 0.3))").await,
+            "[0, 0.3, 0.6, 0.8999999999999999]\n"
+        );
     }
 
     #[tokio::test]
     async fn destructures_array_into_bindings() {
-        let out = run("let [a, b] = [1, 2]\nprint(a)\nprint(b)\nlet [x, y] = [9]\nprint(x)\nprint(y)").await;
+        let out =
+            run("let [a, b] = [1, 2]\nprint(a)\nprint(b)\nlet [x, y] = [9]\nprint(x)\nprint(y)")
+                .await;
         assert_eq!(out, "1\n2\n9\nnil\n");
     }
 
@@ -3297,12 +3726,16 @@ print(bad[1].message)
     async fn optional_type_accepts_value_and_nil() {
         // nil and a number both satisfy number?; a string does not.
         assert_eq!(eval_to_value("let x: number? = nil\nx").await, Value::Nil);
-        assert_eq!(eval_to_value("let x: number? = 7\nx").await, Value::Number(7.0));
+        assert_eq!(
+            eval_to_value("let x: number? = 7\nx").await,
+            Value::Number(7.0)
+        );
     }
 
     #[tokio::test]
     async fn optional_type_rejects_wrong_type() {
-        let src = "let r = recover(() => { let x: number? = \"bad\"\n return nil })\nprint(r[1].message)";
+        let src =
+            "let r = recover(() => { let x: number? = \"bad\"\n return nil })\nprint(r[1].message)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let interp = Interp::new();
         let env = global_env();
@@ -3511,7 +3944,10 @@ print(r[1])
         let src = "class U { id: number\n name: string }\n\
                    let r = recover(() => U.from({ id: \"x\", name: \"Ada\" }))\nprint(r[1].message)";
         let out = run(src).await;
-        assert!(out.contains("u.id") && out.contains("type contract violated"), "got: {out}");
+        assert!(
+            out.contains("u.id") && out.contains("type contract violated"),
+            "got: {out}"
+        );
     }
 
     #[tokio::test]
@@ -3665,7 +4101,10 @@ print(r[1])
                    let [v, err] = json.parse(\"{\\\"id\\\":1,\\\"name\\\":\\\"Ada\\\"}\")\n\
                    print(err == nil)\nprint(v.id)\nprint(v.name)";
         let out = run(src).await;
-        assert!(out.contains("true") && out.contains("Ada") && out.contains('1'), "got: {out}");
+        assert!(
+            out.contains("true") && out.contains("Ada") && out.contains('1'),
+            "got: {out}"
+        );
     }
 
     #[cfg(feature = "data")]
@@ -3677,7 +4116,10 @@ print(r[1])
                        let [u, err] = json.parse(\"{\\\"id\\\":1,\\\"extra\\\":2}\", U)\n\
                        print(err == nil)\nprint(u.id)";
         let out = run(lenient).await;
-        assert!(out.contains("true") && out.contains('1'), "lenient got: {out}");
+        assert!(
+            out.contains("true") && out.contains('1'),
+            "lenient got: {out}"
+        );
         // strict=true (trailing 3rd arg): the unknown key is rejected → fused err.
         let strict = "import * as json from \"std/json\"\n\
                       class U { id: number }\n\
@@ -4020,7 +4462,8 @@ print(r[1])
 
     #[tokio::test]
     async fn arrow_block_body_with_return() {
-        let src = "let f = (n) => { if (n > 0) { return \"pos\" }\nreturn \"nonpos\" }\nprint(f(5))";
+        let src =
+            "let f = (n) => { if (n > 0) { return \"pos\" }\nreturn \"nonpos\" }\nprint(f(5))";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let interp = Interp::new();
         let env = global_env();
@@ -4294,7 +4737,10 @@ print(r[1])
                    print(convert.parseInt(\"ff\", 16)[0])\n\
                    print(convert.toString(123))\n\
                    print(convert.toBool(0))";
-        assert_eq!(run(src).await, "42\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\ntrue\n");
+        assert_eq!(
+            run(src).await,
+            "42\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\ntrue\n"
+        );
     }
 
     #[tokio::test]
@@ -4307,7 +4753,10 @@ print(r[1])
                    print(object.delete(p, \"age\"))\n\
                    print(object.keys(p))\n\
                    print(object.merge({ x: 1 }, { x: 2, y: 3 }))";
-        assert_eq!(run(src).await, "[\"name\", \"age\"]\n[\"Ada\", 36]\ntrue\ntrue\n[\"name\"]\n{x: 2, y: 3}\n");
+        assert_eq!(
+            run(src).await,
+            "[\"name\", \"age\"]\n[\"Ada\", 36]\ntrue\ntrue\n[\"name\"]\n{x: 2, y: 3}\n"
+        );
     }
 
     #[tokio::test]
@@ -4346,7 +4795,10 @@ print(r[1])
                    print(array.sort([3, 1, 2]))\n\
                    print(array.sort([\"b\", \"a\", \"c\"]))\n\
                    print(array.sort([3, 1, 2], (a, b) => b - a))";
-        assert_eq!(run(src).await, "[1, 2, 3]\n[\"a\", \"b\", \"c\"]\n[3, 2, 1]\n");
+        assert_eq!(
+            run(src).await,
+            "[1, 2, 3]\n[\"a\", \"b\", \"c\"]\n[3, 2, 1]\n"
+        );
     }
 
     #[tokio::test]
@@ -4355,12 +4807,17 @@ print(r[1])
         let src = "import * as array from \"std/array\"\n\
                    let pairs = [[1, \"a\"], [1, \"b\"], [0, \"c\"], [1, \"d\"]]\n\
                    print(array.sort(pairs, (x, y) => x[0] - y[0]))";
-        assert_eq!(run(src).await, "[[0, \"c\"], [1, \"a\"], [1, \"b\"], [1, \"d\"]]\n");
+        assert_eq!(
+            run(src).await,
+            "[[0, \"c\"], [1, \"a\"], [1, \"b\"], [1, \"d\"]]\n"
+        );
     }
 
     #[tokio::test]
     async fn named_import_from_std() {
-        let out = run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))").await;
+        let out =
+            run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))")
+                .await;
         assert_eq!(out, "12\n7\n");
     }
 
@@ -4385,7 +4842,8 @@ print(r[1])
     #[tokio::test]
     async fn std_time_sleep_suspends() {
         // sleep a tiny amount; assert it completes and returns nil
-        let out = run("import * as time from \"std/time\"\nawait time.sleep(5)\nprint(\"done\")").await;
+        let out =
+            run("import * as time from \"std/time\"\nawait time.sleep(5)\nprint(\"done\")").await;
         assert_eq!(out, "done\n");
     }
 
@@ -4397,38 +4855,38 @@ print(r[1])
         // runs, so its side effect does NOT appear. `task.spawn(...)` is the
         // explicit opt-out: it detaches the task, which runs to completion (its
         // side effect appears, produced during the top-level drain).
-        let cancelled = run(
-            "import * as time from \"std/time\"\n\
+        let cancelled = run("import * as time from \"std/time\"\n\
              async fn work() { await time.sleep(5) print(\"worked\") }\n\
              work()\n\
-             print(\"main\")",
-        )
+             print(\"main\")")
         .await;
         assert!(cancelled.contains("main\n"), "got: {cancelled:?}");
-        assert!(!cancelled.contains("worked"), "unawaited call must be cancelled: {cancelled:?}");
+        assert!(
+            !cancelled.contains("worked"),
+            "unawaited call must be cancelled: {cancelled:?}"
+        );
 
-        let detached = run(
-            "import * as time from \"std/time\"\n\
+        let detached = run("import * as time from \"std/time\"\n\
              import * as task from \"std/task\"\n\
              async fn work() { await time.sleep(5) print(\"worked\") }\n\
              task.spawn(work())\n\
-             print(\"main\")",
-        )
+             print(\"main\")")
         .await;
         assert!(detached.contains("main\n"), "got: {detached:?}");
-        assert!(detached.contains("worked\n"), "spawned task must run: {detached:?}");
+        assert!(
+            detached.contains("worked\n"),
+            "spawned task must run: {detached:?}"
+        );
     }
 
     // ---- M17 Phase 2: futures & real async ----
 
     #[tokio::test]
     async fn async_call_returns_future_awaited_for_value() {
-        let out = run(
-            "async fn answer() { return 42 }\n\
+        let out = run("async fn answer() { return 42 }\n\
              let f = answer()\n\
              print(type(f))\n\
-             print(await f)",
-        )
+             print(await f)")
         .await;
         assert_eq!(out, "future\n42\n");
     }
@@ -4451,8 +4909,7 @@ print(r[1])
         // Both tasks sleep 30ms then return; started before either is awaited, so
         // total wall-time is ~max(30,30), not ~60. Assert results plus a lenient
         // upper bound on elapsed time.
-        let out = run(
-            "import * as time from \"std/time\"\n\
+        let out = run("import * as time from \"std/time\"\n\
              import * as t from \"std/task\"\n\
              async fn job(n) { await time.sleep(30) return n }\n\
              let a = job(1)\n\
@@ -4461,21 +4918,18 @@ print(r[1])
              print(await a)\n\
              print(await b)\n\
              let elapsed = time.monotonic() - start\n\
-             print(elapsed < 200)",
-        )
+             print(elapsed < 200)")
         .await;
         assert_eq!(out, "1\n2\ntrue\n");
     }
 
     #[tokio::test]
     async fn gather_preserves_input_order() {
-        let out = run(
-            "import * as time from \"std/time\"\n\
+        let out = run("import * as time from \"std/time\"\n\
              import * as task from \"std/task\"\n\
              async fn job(ms, n) { await time.sleep(ms) return n }\n\
              let r = await task.gather([job(40, \"a\"), job(5, \"b\"), job(20, \"c\")])\n\
-             print(r)",
-        )
+             print(r)")
         .await;
         // Despite different completion times, results are in INPUT order.
         assert_eq!(out, "[\"a\", \"b\", \"c\"]\n");
@@ -4489,51 +4943,43 @@ print(r[1])
 
     #[tokio::test]
     async fn gather_mixes_futures_and_plain_values() {
-        let out = run(
-            "import * as task from \"std/task\"\n\
+        let out = run("import * as task from \"std/task\"\n\
              async fn f() { return 1 }\n\
-             print(await task.gather([f(), 2, f()]))",
-        )
+             print(await task.gather([f(), 2, f()]))")
         .await;
         assert_eq!(out, "[1, 2, 1]\n");
     }
 
     #[tokio::test]
     async fn race_returns_first_to_resolve() {
-        let out = run(
-            "import * as time from \"std/time\"\n\
+        let out = run("import * as time from \"std/time\"\n\
              import * as task from \"std/task\"\n\
              async fn job(ms, n) { await time.sleep(ms) return n }\n\
-             print(await task.race([job(50, \"slow\"), job(5, \"fast\")]))",
-        )
+             print(await task.race([job(50, \"slow\"), job(5, \"fast\")]))")
         .await;
         assert_eq!(out, "fast\n");
     }
 
     #[tokio::test]
     async fn timeout_fast_future_yields_ok_pair() {
-        let out = run(
-            "import * as time from \"std/time\"\n\
+        let out = run("import * as time from \"std/time\"\n\
              import * as task from \"std/task\"\n\
              async fn quick() { await time.sleep(5) return \"v\" }\n\
              let r = await task.timeout(500, quick())\n\
              print(r[0])\n\
-             print(r[1])",
-        )
+             print(r[1])")
         .await;
         assert_eq!(out, "v\nnil\n");
     }
 
     #[tokio::test]
     async fn timeout_slow_future_yields_err_pair() {
-        let out = run(
-            "import * as time from \"std/time\"\n\
+        let out = run("import * as time from \"std/time\"\n\
              import * as task from \"std/task\"\n\
              async fn slow() { await time.sleep(200) return \"v\" }\n\
              let r = await task.timeout(20, slow())\n\
              print(r[0])\n\
-             print(r[1].message)",
-        )
+             print(r[1].message)")
         .await;
         assert!(out.starts_with("nil\n"), "got: {out:?}");
         assert!(out.contains("timed out"), "got: {out:?}");
@@ -4554,98 +5000,84 @@ print(r[1])
     #[tokio::test]
     async fn question_propagation_across_await() {
         // An async fn returning a [nil, err] Result, awaited then `?`-propagated.
-        let out = run(
-            "async fn fails() { return Err(\"nope\") }\n\
+        let out = run("async fn fails() { return Err(\"nope\") }\n\
              fn caller() {\n\
                let v = (await fails())?\n\
                return Ok(v)\n\
              }\n\
              let r = caller()\n\
              print(r[0])\n\
-             print(r[1].message)",
-        )
+             print(r[1].message)")
         .await;
         assert_eq!(out, "nil\nnope\n");
     }
 
     #[tokio::test]
     async fn question_propagation_across_await_ok_path() {
-        let out = run(
-            "async fn ok() { return Ok(99) }\n\
+        let out = run("async fn ok() { return Ok(99) }\n\
              fn caller() {\n\
                let v = (await ok())?\n\
                return Ok(v)\n\
              }\n\
              let r = caller()\n\
-             print(r[0])",
-        )
+             print(r[0])")
         .await;
         assert_eq!(out, "99\n");
     }
 
     #[tokio::test]
     async fn spawn_wraps_sync_function_value() {
-        let out = run(
-            "import * as task from \"std/task\"\n\
+        let out = run("import * as task from \"std/task\"\n\
              let f = task.spawn(() => 7)\n\
              print(type(f))\n\
-             print(await f)",
-        )
+             print(await f)")
         .await;
         assert_eq!(out, "future\n7\n");
     }
 
     #[tokio::test]
     async fn spawn_of_async_call_returns_its_future() {
-        let out = run(
-            "import * as time from \"std/time\"\n\
+        let out = run("import * as time from \"std/time\"\n\
              import * as task from \"std/task\"\n\
              async fn job() { await time.sleep(5) return \"done\" }\n\
              let h = task.spawn(job)\n\
-             print(await h)",
-        )
+             print(await h)")
         .await;
         assert_eq!(out, "done\n");
     }
 
     #[tokio::test]
     async fn spawn_of_existing_future_passes_through() {
-        let out = run(
-            "import * as task from \"std/task\"\n\
+        let out = run("import * as task from \"std/task\"\n\
              async fn f() { return 3 }\n\
              let fut = f()\n\
              let same = task.spawn(fut)\n\
-             print(await same)",
-        )
+             print(await same)")
         .await;
         assert_eq!(out, "3\n");
     }
 
     #[tokio::test]
     async fn class_async_method_returns_future() {
-        let out = run(
-            "import * as time from \"std/time\"\n\
+        let out = run("import * as time from \"std/time\"\n\
              class Worker {\n\
                async fn work(n) { await time.sleep(5) return n * 2 }\n\
              }\n\
              let w = Worker()\n\
              let f = w.work(21)\n\
              print(type(f))\n\
-             print(await f)",
-        )
+             print(await f)")
         .await;
         assert_eq!(out, "future\n42\n");
     }
 
     #[tokio::test]
     async fn await_inside_a_loop() {
-        let out = run(
-            "import * as time from \"std/time\"\n\
+        let out = run("import * as time from \"std/time\"\n\
              async fn job(n) { await time.sleep(2) return n }\n\
              let total = 0\n\
              for (i in [1, 2, 3]) { total = total + (await job(i)) }\n\
-             print(total)",
-        )
+             print(total)")
         .await;
         // 1 + 2 + 3 = 6
         assert_eq!(out, "6\n");
@@ -4654,13 +5086,21 @@ print(r[1])
     #[tokio::test]
     async fn spawn_type_misuse_panics() {
         let err = run_err("import * as task from \"std/task\"\ntask.spawn(5)").await;
-        assert!(err.message.contains("future or a 0-argument function"), "got: {}", err.message);
+        assert!(
+            err.message.contains("future or a 0-argument function"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
     async fn gather_type_misuse_panics() {
         let err = run_err("import * as task from \"std/task\"\ntask.gather(5)").await;
-        assert!(err.message.contains("expects an array"), "got: {}", err.message);
+        assert!(
+            err.message.contains("expects an array"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

@@ -44,7 +44,10 @@ pub struct ResultCell(Rc<CellInner>);
 
 impl ResultCell {
     fn new() -> Self {
-        ResultCell(Rc::new(CellInner { slot: RefCell::new(None), ready: Notify::new() }))
+        ResultCell(Rc::new(CellInner {
+            slot: RefCell::new(None),
+            ready: Notify::new(),
+        }))
     }
 
     /// Resolve the cell (first writer wins) and wake all waiters.

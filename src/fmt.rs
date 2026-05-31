@@ -71,7 +71,13 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_expr(out, e, 0);
             out.push('\n');
         }
-        Stmt::Let { name, ty, value, mutable, .. } => {
+        Stmt::Let {
+            name,
+            ty,
+            value,
+            mutable,
+            ..
+        } => {
             indent(out, level);
             out.push_str(if *mutable { "let " } else { "const " });
             out.push_str(name);
@@ -86,7 +92,13 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             }
             out.push('\n');
         }
-        Stmt::LetDestructure { names, rest, value, mutable, .. } => {
+        Stmt::LetDestructure {
+            names,
+            rest,
+            value,
+            mutable,
+            ..
+        } => {
             indent(out, level);
             out.push_str(if *mutable { "let " } else { "const " });
             out.push('[');
@@ -99,7 +111,13 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_expr(out, value, 0);
             out.push('\n');
         }
-        Stmt::LetDestructureObject { bindings, rest, value, mutable, .. } => {
+        Stmt::LetDestructureObject {
+            bindings,
+            rest,
+            value,
+            mutable,
+            ..
+        } => {
             indent(out, level);
             out.push_str(if *mutable { "let " } else { "const " });
             out.push('{');
@@ -127,7 +145,11 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_block(out, body, level);
             out.push('\n');
         }
-        Stmt::If { cond, then_branch, else_branch } => {
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
             indent(out, level);
             out.push_str("if (");
             write_expr(out, cond, 0);
@@ -155,7 +177,12 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_block(out, body, level);
             out.push('\n');
         }
-        Stmt::ForRange { var, start, end, body } => {
+        Stmt::ForRange {
+            var,
+            start,
+            end,
+            body,
+        } => {
             indent(out, level);
             out.push_str("for (");
             out.push_str(var);
@@ -167,7 +194,12 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_block(out, body, level);
             out.push('\n');
         }
-        Stmt::ForOf { var, iter, body, for_await } => {
+        Stmt::ForOf {
+            var,
+            iter,
+            body,
+            for_await,
+        } => {
             indent(out, level);
             // `for await (x in e)` for async iteration; plain `for (x of e)`
             // otherwise. The async form uses `in` (matching the parser, which
@@ -203,7 +235,15 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("continue\n");
         }
-        Stmt::Fn { name, params, ret, body, is_async, is_generator, .. } => {
+        Stmt::Fn {
+            name,
+            params,
+            ret,
+            body,
+            is_async,
+            is_generator,
+            ..
+        } => {
             indent(out, level);
             if *is_async {
                 out.push_str("async ");
@@ -230,7 +270,13 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("}\n");
         }
-        Stmt::Class { name, superclass, fields, methods, .. } => {
+        Stmt::Class {
+            name,
+            superclass,
+            fields,
+            methods,
+            ..
+        } => {
             indent(out, level);
             out.push_str("class ");
             out.push_str(name);
@@ -456,7 +502,12 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             out.push_str(" = ");
             write_expr(out, value, PREC_ASSIGN);
         }
-        ExprKind::Arrow { params, body, is_async, .. } => {
+        ExprKind::Arrow {
+            params,
+            body,
+            is_async,
+            ..
+        } => {
             if *is_async {
                 out.push_str("async ");
             }
@@ -667,7 +718,8 @@ mod tests {
 
     #[test]
     fn formats_and_is_idempotent() {
-        let src = "let   x=1+2\nfn f(a,b){return a+b}\nif(x>2){print(\"big\")}else{print(\"small\")}";
+        let src =
+            "let   x=1+2\nfn f(a,b){return a+b}\nif(x>2){print(\"big\")}else{print(\"small\")}";
         let once = format_source(src).unwrap();
         let twice = format_source(&once).unwrap();
         assert_eq!(once, twice, "fmt must be idempotent");
@@ -873,8 +925,8 @@ mod tests {
         assert!(!paths.is_empty(), "no example files found");
         for path in paths {
             let src = std::fs::read_to_string(&path).unwrap();
-            let once = format_source(&src)
-                .unwrap_or_else(|e| panic!("fmt failed on {:?}: {}", path, e));
+            let once =
+                format_source(&src).unwrap_or_else(|e| panic!("fmt failed on {:?}: {}", path, e));
             let twice = format_source(&once)
                 .unwrap_or_else(|e| panic!("re-fmt failed on {:?}: {}", path, e));
             assert_eq!(once, twice, "fmt not idempotent on {:?}", path);

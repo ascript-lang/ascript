@@ -21,11 +21,19 @@ pub struct AsError {
 
 impl AsError {
     pub fn new(message: impl Into<String>) -> Self {
-        AsError { message: message.into(), span: None, source: None }
+        AsError {
+            message: message.into(),
+            span: None,
+            source: None,
+        }
     }
 
     pub fn at(message: impl Into<String>, span: Span) -> Self {
-        AsError { message: message.into(), span: Some(span), source: None }
+        AsError {
+            message: message.into(),
+            span: Some(span),
+            source: None,
+        }
     }
 
     /// Attach source context, but only if none is already set so the innermost

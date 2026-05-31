@@ -31,7 +31,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 Ok(n) => Ok(make_pair(Value::Number(n), Value::Nil)),
                 Err(_) => Ok(make_pair(
                     Value::Nil,
-                    make_error(Value::Str(format!("cannot parse '{}' as a number", s).into())),
+                    make_error(Value::Str(
+                        format!("cannot parse '{}' as a number", s).into(),
+                    )),
                 )),
             }
         }
@@ -42,13 +44,17 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 Some(v) => want_number(v, span, &ctx("parseInt"))? as u32,
             };
             if !(2..=36).contains(&radix) {
-                return Err(AsError::at("convert.parseInt radix must be between 2 and 36", span).into());
+                return Err(
+                    AsError::at("convert.parseInt radix must be between 2 and 36", span).into(),
+                );
             }
             match i64::from_str_radix(s.trim(), radix) {
                 Ok(n) => Ok(make_pair(Value::Number(n as f64), Value::Nil)),
                 Err(_) => Ok(make_pair(
                     Value::Nil,
-                    make_error(Value::Str(format!("cannot parse '{}' as an integer (radix {})", s, radix).into())),
+                    make_error(Value::Str(
+                        format!("cannot parse '{}' as an integer (radix {})", s, radix).into(),
+                    )),
                 )),
             }
         }
@@ -59,13 +65,34 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let v = arg(args, 0);
             let n = match &v {
                 Value::Number(n) => *n,
-                Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+                Value::Bool(b) => {
+                    if *b {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
                 Value::Nil => 0.0,
                 Value::Str(s) => match s.trim().parse::<f64>() {
                     Ok(n) => n,
-                    Err(_) => return Err(AsError::at(format!("convert.toNumber: cannot coerce '{}' to a number", s), span).into()),
+                    Err(_) => {
+                        return Err(AsError::at(
+                            format!("convert.toNumber: cannot coerce '{}' to a number", s),
+                            span,
+                        )
+                        .into())
+                    }
                 },
-                _ => return Err(AsError::at(format!("convert.toNumber: cannot coerce {} to a number", crate::interp::type_name(&v)), span).into()),
+                _ => {
+                    return Err(AsError::at(
+                        format!(
+                            "convert.toNumber: cannot coerce {} to a number",
+                            crate::interp::type_name(&v)
+                        ),
+                        span,
+                    )
+                    .into())
+                }
             };
             Ok(Value::Number(n))
         }
@@ -77,8 +104,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn sp() -> Span { Span::new(0, 0) }
-    fn s(x: &str) -> Value { Value::Str(x.into()) }
+    fn sp() -> Span {
+        Span::new(0, 0)
+    }
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
 
     #[test]
     fn parse_number_ok_and_err() {
@@ -90,34 +121,71 @@ mod tests {
 
     #[test]
     fn parse_int_radix() {
-        assert_eq!(call("parseInt", &[s("ff"), Value::Number(16.0)], sp()).unwrap().to_string(), "[255, nil]");
-        assert_eq!(call("parseInt", &[s("101"), Value::Number(2.0)], sp()).unwrap().to_string(), "[5, nil]");
-        assert_eq!(call("parseInt", &[s("42")], sp()).unwrap().to_string(), "[42, nil]");
+        assert_eq!(
+            call("parseInt", &[s("ff"), Value::Number(16.0)], sp())
+                .unwrap()
+                .to_string(),
+            "[255, nil]"
+        );
+        assert_eq!(
+            call("parseInt", &[s("101"), Value::Number(2.0)], sp())
+                .unwrap()
+                .to_string(),
+            "[5, nil]"
+        );
+        assert_eq!(
+            call("parseInt", &[s("42")], sp()).unwrap().to_string(),
+            "[42, nil]"
+        );
     }
 
     #[test]
     fn parse_int_bad_radix_panics() {
-        assert!(matches!(call("parseInt", &[s("1"), Value::Number(99.0)], sp()), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("parseInt", &[s("1"), Value::Number(99.0)], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 
     #[test]
     fn coercions() {
-        assert_eq!(call("toString", &[Value::Number(7.0)], sp()).unwrap(), s("7"));
-        assert_eq!(call("toNumber", &[Value::Bool(true)], sp()).unwrap(), Value::Number(1.0));
-        assert_eq!(call("toNumber", &[s(" 42 ")], sp()).unwrap(), Value::Number(42.0));
-        assert_eq!(call("toBool", &[Value::Number(0.0)], sp()).unwrap(), Value::Bool(true));
-        assert_eq!(call("toBool", &[Value::Nil], sp()).unwrap(), Value::Bool(false));
+        assert_eq!(
+            call("toString", &[Value::Number(7.0)], sp()).unwrap(),
+            s("7")
+        );
+        assert_eq!(
+            call("toNumber", &[Value::Bool(true)], sp()).unwrap(),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            call("toNumber", &[s(" 42 ")], sp()).unwrap(),
+            Value::Number(42.0)
+        );
+        assert_eq!(
+            call("toBool", &[Value::Number(0.0)], sp()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call("toBool", &[Value::Nil], sp()).unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]
     fn to_number_uncoercible_panics() {
-        assert!(matches!(call("toNumber", &[s("xyz")], sp()), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("toNumber", &[s("xyz")], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 
     #[test]
     fn parse_number_scientific_and_special() {
         let sp = sp();
-        assert_eq!(call("parseNumber", &[s("1e3")], sp).unwrap().to_string(), "[1000, nil]");
+        assert_eq!(
+            call("parseNumber", &[s("1e3")], sp).unwrap().to_string(),
+            "[1000, nil]"
+        );
         // inf/NaN are accepted (IEEE-754 stance); confirm they parse to a [value, nil] pair, not Err.
         let inf = call("parseNumber", &[s("inf")], sp).unwrap();
         assert!(inf.to_string().starts_with("[inf, nil]") || inf.to_string().starts_with("[inf,"));
@@ -128,13 +196,30 @@ mod tests {
         let sp = sp();
         // toNumber on a non-string, non-coercible value (array) → Tier-2 panic (distinct arm)
         let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![])));
-        assert!(matches!(call("toNumber", &[arr], sp), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("toNumber", &[arr], sp),
+            Err(Control::Panic(_))
+        ));
         // parseInt overflow → recoverable Err pair (NOT a panic)
         let over = call("parseInt", &[s("99999999999999999999999999")], sp).unwrap();
         assert!(over.to_string().starts_with("[nil, {message:"));
         // parseNumber on a non-string arg → Tier-2 panic (want_string)
-        assert!(matches!(call("parseNumber", &[Value::Number(1.0)], sp), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("parseNumber", &[Value::Number(1.0)], sp),
+            Err(Control::Panic(_))
+        ));
         // toString on a compound value
-        assert_eq!(call("toString", &[Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![Value::Number(1.0), Value::Number(2.0)])))], sp).unwrap().to_string(), "[1, 2]");
+        assert_eq!(
+            call(
+                "toString",
+                &[Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+                    vec![Value::Number(1.0), Value::Number(2.0)]
+                )))],
+                sp
+            )
+            .unwrap()
+            .to_string(),
+            "[1, 2]"
+        );
     }
 }

@@ -42,7 +42,10 @@ impl LineIndex {
             .iter()
             .map(|c| c.len_utf16() as u32)
             .sum();
-        Position { line: line as u32, character }
+        Position {
+            line: line as u32,
+            character,
+        }
     }
 
     /// Convert an LSP `Position` (UTF-16 column) back to a char offset.
@@ -100,7 +103,7 @@ mod tests {
         assert_eq!(idx.position(3), pos(1, 0)); // 'c'
         assert_eq!(idx.position(5), pos(1, 2)); // 'e'
         assert_eq!(idx.position(7), pos(2, 0)); // 'f'
-        // Round-trip each.
+                                                // Round-trip each.
         for off in [0usize, 1, 3, 5, 7] {
             assert_eq!(idx.offset(idx.position(off)), off);
         }

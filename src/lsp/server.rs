@@ -19,7 +19,10 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(client: Client) -> Self {
-        Backend { client, documents: Mutex::new(HashMap::new()) }
+        Backend {
+            client,
+            documents: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Store the document text and publish its diagnostics.
@@ -71,7 +74,8 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
-        self.analyze_and_publish(doc.uri, doc.text, Some(doc.version)).await;
+        self.analyze_and_publish(doc.uri, doc.text, Some(doc.version))
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -146,7 +150,10 @@ impl LanguageServer for Backend {
         let Some(range) = analysis::definition(text, offset) else {
             return Ok(None);
         };
-        Ok(Some(GotoDefinitionResponse::Scalar(Location { uri, range })))
+        Ok(Some(GotoDefinitionResponse::Scalar(Location {
+            uri,
+            range,
+        })))
     }
 
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
@@ -190,9 +197,16 @@ mod tests {
     #[test]
     fn capabilities_advertise_completion_and_definition() {
         let caps = server_capabilities();
-        let completion = caps.completion_provider.expect("expected a completion provider");
-        let triggers = completion.trigger_characters.expect("expected trigger characters");
-        assert!(triggers.contains(&".".to_string()), "triggers: {triggers:?}");
+        let completion = caps
+            .completion_provider
+            .expect("expected a completion provider");
+        let triggers = completion
+            .trigger_characters
+            .expect("expected trigger characters");
+        assert!(
+            triggers.contains(&".".to_string()),
+            "triggers: {triggers:?}"
+        );
         assert!(
             triggers.contains(&"\"".to_string()) || triggers.contains(&"'".to_string()),
             "expected a quote trigger char, got {triggers:?}"

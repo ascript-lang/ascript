@@ -39,12 +39,7 @@ fn escape_char(c: char) -> char {
 /// Read a quoted string body starting just after the opening `quote`, scanning
 /// until the matching unescaped `quote`. Advances `i` past the closing quote.
 /// Backslash escapes are translated via `escape_char`.
-fn lex_quoted(
-    chars: &[char],
-    i: &mut usize,
-    start: usize,
-    quote: char,
-) -> Result<String, AsError> {
+fn lex_quoted(chars: &[char], i: &mut usize, start: usize, quote: char) -> Result<String, AsError> {
     let mut s = String::new();
     while *i < chars.len() {
         let c = chars[*i];
@@ -121,99 +116,168 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
         match c {
             '+' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { tok: Tok::PlusEq, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::PlusEq,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Plus, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Plus,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '-' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { tok: Tok::MinusEq, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::MinusEq,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Minus, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Minus,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '*' => {
                 if i + 1 < chars.len() && chars[i + 1] == '*' {
-                    tokens.push(Token { tok: Tok::StarStar, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::StarStar,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { tok: Tok::StarEq, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::StarEq,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Star, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Star,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '!' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { tok: Tok::BangEq, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::BangEq,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Bang, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Bang,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '=' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { tok: Tok::EqEq, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::EqEq,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else if i + 1 < chars.len() && chars[i + 1] == '>' {
-                    tokens.push(Token { tok: Tok::FatArrow, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::FatArrow,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Eq, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Eq,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '<' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { tok: Tok::Le, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::Le,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Lt, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Lt,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '>' => {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { tok: Tok::Ge, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::Ge,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Gt, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Gt,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '&' => {
                 if i + 1 < chars.len() && chars[i + 1] == '&' {
-                    tokens.push(Token { tok: Tok::AmpAmp, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::AmpAmp,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    return Err(AsError::at("unexpected character '&'", Span::new(start, start + 1)));
+                    return Err(AsError::at(
+                        "unexpected character '&'",
+                        Span::new(start, start + 1),
+                    ));
                 }
             }
             '|' => {
                 if i + 1 < chars.len() && chars[i + 1] == '|' {
-                    tokens.push(Token { tok: Tok::PipePipe, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::PipePipe,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Pipe, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Pipe,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '?' => {
                 if i + 1 < chars.len() && chars[i + 1] == '?' {
-                    tokens.push(Token { tok: Tok::QuestionQuestion, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::QuestionQuestion,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else if i + 1 < chars.len() && chars[i + 1] == '.' {
-                    tokens.push(Token { tok: Tok::QuestionDot, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::QuestionDot,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Question, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Question,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
@@ -243,22 +307,37 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         ));
                     }
                 } else if i + 1 < chars.len() && chars[i + 1] == '=' {
-                    tokens.push(Token { tok: Tok::SlashEq, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::SlashEq,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Slash, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Slash,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
             '.' => {
                 if i + 2 < chars.len() && chars[i + 1] == '.' && chars[i + 2] == '.' {
-                    tokens.push(Token { tok: Tok::DotDotDot, span: Span::new(start, start + 3) });
+                    tokens.push(Token {
+                        tok: Tok::DotDotDot,
+                        span: Span::new(start, start + 3),
+                    });
                     i += 3;
                 } else if i + 1 < chars.len() && chars[i + 1] == '.' {
-                    tokens.push(Token { tok: Tok::DotDot, span: Span::new(start, start + 2) });
+                    tokens.push(Token {
+                        tok: Tok::DotDot,
+                        span: Span::new(start, start + 2),
+                    });
                     i += 2;
                 } else {
-                    tokens.push(Token { tok: Tok::Dot, span: Span::new(start, start + 1) });
+                    tokens.push(Token {
+                        tok: Tok::Dot,
+                        span: Span::new(start, start + 1),
+                    });
                     i += 1;
                 }
             }
@@ -303,12 +382,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
             '"' => {
                 i += 1;
                 let s = lex_quoted(&chars, &mut i, start, '"')?;
-                tokens.push(Token { tok: Tok::Str(s), span: Span::new(start, i) });
+                tokens.push(Token {
+                    tok: Tok::Str(s),
+                    span: Span::new(start, i),
+                });
             }
             '\'' => {
                 i += 1;
                 let s = lex_quoted(&chars, &mut i, start, '\'')?;
-                tokens.push(Token { tok: Tok::Str(s), span: Span::new(start, i) });
+                tokens.push(Token {
+                    tok: Tok::Str(s),
+                    span: Span::new(start, i),
+                });
             }
             '`' => {
                 i += 1;
@@ -349,8 +434,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         j += 1;
                     }
                     let span = Span::new(i, j);
-                    let digits: String =
-                        chars[i + 2..j].iter().filter(|&&ch| ch != '_').collect();
+                    let digits: String = chars[i + 2..j].iter().filter(|&&ch| ch != '_').collect();
                     let label = if radix == 16 {
                         "invalid hex number literal"
                     } else {
@@ -360,9 +444,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         return Err(AsError::at(label, span));
                     }
                     let n = u64::from_str_radix(&digits, radix)
-                        .map_err(|_| AsError::at(label, span))?
-                        as f64;
-                    tokens.push(Token { tok: Tok::Number(n), span });
+                        .map_err(|_| AsError::at(label, span))? as f64;
+                    tokens.push(Token {
+                        tok: Tok::Number(n),
+                        span,
+                    });
                     i = j;
                 } else {
                     // Decimal / float / scientific: \d[\d_]* (.\d[\d_]*)? ([eE][+-]?\d+)?
@@ -403,7 +489,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     let n: f64 = text
                         .parse()
                         .map_err(|_| AsError::at("invalid number", span))?;
-                    tokens.push(Token { tok: Tok::Number(n), span });
+                    tokens.push(Token {
+                        tok: Tok::Number(n),
+                        span,
+                    });
                     i = j;
                 }
             }
@@ -439,7 +528,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "yield" => Tok::Yield,
                     _ => Tok::Ident(text),
                 };
-                tokens.push(Token { tok, span: Span::new(i, j) });
+                tokens.push(Token {
+                    tok,
+                    span: Span::new(i, j),
+                });
                 i = j;
             }
             other => {
@@ -451,12 +543,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
         }
     }
 
-    tokens.push(Token { tok: Tok::Eof, span: Span::new(chars.len(), chars.len()) });
+    tokens.push(Token {
+        tok: Tok::Eof,
+        span: Span::new(chars.len(), chars.len()),
+    });
     Ok(tokens)
 }
 
 fn push(tokens: &mut Vec<Token>, tok: Tok, start: usize, i: &mut usize) {
-    tokens.push(Token { tok, span: Span::new(start, start + 1) });
+    tokens.push(Token {
+        tok,
+        span: Span::new(start, start + 1),
+    });
     *i += 1;
 }
 
@@ -470,13 +568,19 @@ mod tests {
 
     #[test]
     fn lexes_question_variants() {
-        assert_eq!(kinds("a ? b ?? c?.d"),
+        assert_eq!(
+            kinds("a ? b ?? c?.d"),
             vec![
-                Tok::Ident("a".into()), Tok::Question,
-                Tok::Ident("b".into()), Tok::QuestionQuestion,
-                Tok::Ident("c".into()), Tok::QuestionDot, Tok::Ident("d".into()),
+                Tok::Ident("a".into()),
+                Tok::Question,
+                Tok::Ident("b".into()),
+                Tok::QuestionQuestion,
+                Tok::Ident("c".into()),
+                Tok::QuestionDot,
+                Tok::Ident("d".into()),
                 Tok::Eof,
-            ]);
+            ]
+        );
     }
 
     #[test]
@@ -514,14 +618,23 @@ mod tests {
         assert_eq!(
             kinds("a ** b == c != d <= e >= f && g || h ?? i"),
             vec![
-                Tok::Ident("a".into()), Tok::StarStar, Tok::Ident("b".into()),
-                Tok::EqEq, Tok::Ident("c".into()),
-                Tok::BangEq, Tok::Ident("d".into()),
-                Tok::Le, Tok::Ident("e".into()),
-                Tok::Ge, Tok::Ident("f".into()),
-                Tok::AmpAmp, Tok::Ident("g".into()),
-                Tok::PipePipe, Tok::Ident("h".into()),
-                Tok::QuestionQuestion, Tok::Ident("i".into()),
+                Tok::Ident("a".into()),
+                Tok::StarStar,
+                Tok::Ident("b".into()),
+                Tok::EqEq,
+                Tok::Ident("c".into()),
+                Tok::BangEq,
+                Tok::Ident("d".into()),
+                Tok::Le,
+                Tok::Ident("e".into()),
+                Tok::Ge,
+                Tok::Ident("f".into()),
+                Tok::AmpAmp,
+                Tok::Ident("g".into()),
+                Tok::PipePipe,
+                Tok::Ident("h".into()),
+                Tok::QuestionQuestion,
+                Tok::Ident("i".into()),
                 Tok::Eof,
             ]
         );
@@ -532,9 +645,12 @@ mod tests {
         assert_eq!(
             kinds("!a < b > c"),
             vec![
-                Tok::Bang, Tok::Ident("a".into()),
-                Tok::Lt, Tok::Ident("b".into()),
-                Tok::Gt, Tok::Ident("c".into()),
+                Tok::Bang,
+                Tok::Ident("a".into()),
+                Tok::Lt,
+                Tok::Ident("b".into()),
+                Tok::Gt,
+                Tok::Ident("c".into()),
                 Tok::Eof,
             ]
         );
@@ -545,10 +661,15 @@ mod tests {
         assert_eq!(
             kinds("a += b -= c *= d /= e"),
             vec![
-                Tok::Ident("a".into()), Tok::PlusEq, Tok::Ident("b".into()),
-                Tok::MinusEq, Tok::Ident("c".into()),
-                Tok::StarEq, Tok::Ident("d".into()),
-                Tok::SlashEq, Tok::Ident("e".into()),
+                Tok::Ident("a".into()),
+                Tok::PlusEq,
+                Tok::Ident("b".into()),
+                Tok::MinusEq,
+                Tok::Ident("c".into()),
+                Tok::StarEq,
+                Tok::Ident("d".into()),
+                Tok::SlashEq,
+                Tok::Ident("e".into()),
                 Tok::Eof,
             ]
         );
@@ -558,13 +679,21 @@ mod tests {
     fn lexes_fat_arrow() {
         assert_eq!(
             kinds("x => x"),
-            vec![Tok::Ident("x".into()), Tok::FatArrow, Tok::Ident("x".into()), Tok::Eof]
+            vec![
+                Tok::Ident("x".into()),
+                Tok::FatArrow,
+                Tok::Ident("x".into()),
+                Tok::Eof
+            ]
         );
     }
 
     #[test]
     fn lexes_plain_template() {
-        assert_eq!(kinds("`hello`"), vec![Tok::TemplateStr("hello".into()), Tok::Eof]);
+        assert_eq!(
+            kinds("`hello`"),
+            vec![Tok::TemplateStr("hello".into()), Tok::Eof]
+        );
     }
 
     #[test]
@@ -648,7 +777,10 @@ mod tests {
     #[test]
     fn newline_escape_in_double_string() {
         // source: "line\nbreak"
-        assert_eq!(kinds("\"line\\nbreak\""), vec![Tok::Str("line\nbreak".into()), Tok::Eof]);
+        assert_eq!(
+            kinds("\"line\\nbreak\""),
+            vec![Tok::Str("line\nbreak".into()), Tok::Eof]
+        );
     }
 
     #[test]
@@ -660,13 +792,19 @@ mod tests {
     #[test]
     fn tab_escape_in_double_string() {
         // source: "tab\there"
-        assert_eq!(kinds("\"tab\\there\""), vec![Tok::Str("tab\there".into()), Tok::Eof]);
+        assert_eq!(
+            kinds("\"tab\\there\""),
+            vec![Tok::Str("tab\there".into()), Tok::Eof]
+        );
     }
 
     #[test]
     fn backslash_escape_in_double_string() {
         // source: "back\\slash"
-        assert_eq!(kinds("\"back\\\\slash\""), vec![Tok::Str("back\\slash".into()), Tok::Eof]);
+        assert_eq!(
+            kinds("\"back\\\\slash\""),
+            vec![Tok::Str("back\\slash".into()), Tok::Eof]
+        );
     }
 
     #[test]
@@ -677,26 +815,44 @@ mod tests {
 
     #[test]
     fn skips_line_comments() {
-        assert_eq!(kinds("1 // ignored\n+ 2"),
-            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]);
+        assert_eq!(
+            kinds("1 // ignored\n+ 2"),
+            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]
+        );
         // line comment to EOF (no trailing newline) is fine
         assert_eq!(kinds("42 // trailing"), vec![Tok::Number(42.0), Tok::Eof]);
     }
 
     #[test]
     fn skips_block_comments() {
-        assert_eq!(kinds("1 /* a * b / c */ + 2"),
-            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]);
+        assert_eq!(
+            kinds("1 /* a * b / c */ + 2"),
+            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]
+        );
         // block comment spanning constructs
         assert_eq!(kinds("/* x */ 7"), vec![Tok::Number(7.0), Tok::Eof]);
     }
 
     #[test]
     fn division_is_not_a_comment() {
-        assert_eq!(kinds("a / b"),
-            vec![Tok::Ident("a".into()), Tok::Slash, Tok::Ident("b".into()), Tok::Eof]);
-        assert_eq!(kinds("a /= b"),
-            vec![Tok::Ident("a".into()), Tok::SlashEq, Tok::Ident("b".into()), Tok::Eof]);
+        assert_eq!(
+            kinds("a / b"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Slash,
+                Tok::Ident("b".into()),
+                Tok::Eof
+            ]
+        );
+        assert_eq!(
+            kinds("a /= b"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::SlashEq,
+                Tok::Ident("b".into()),
+                Tok::Eof
+            ]
+        );
     }
 
     #[test]
@@ -755,7 +911,12 @@ mod tests {
     fn member_access_after_ident_unaffected() {
         assert_eq!(
             kinds("a.b"),
-            vec![Tok::Ident("a".into()), Tok::Dot, Tok::Ident("b".into()), Tok::Eof]
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Dot,
+                Tok::Ident("b".into()),
+                Tok::Eof
+            ]
         );
     }
 

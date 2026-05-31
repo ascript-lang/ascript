@@ -1,5 +1,6 @@
-//! `std/crypto` — hashing (sha256/sha512/md5), HMAC, CSPRNG bytes, and
-//! password hashing (argon2 + bcrypt).
+//! `std/crypto` — hashing (sha256/sha512/md5), HMAC, CSPRNG bytes,
+//! password hashing (argon2 + bcrypt), and non-cryptographic checksums
+//! (crc32/xxhash).
 //!
 //! Deterministic hashes return a plain lowercase-hex string. Password hashing
 //! is fallible (RNG / encoding), so it follows the Tier-1 `[value, err]`
@@ -32,6 +33,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("verifyPassword", bi("crypto.verifyPassword")),
         ("bcryptHash", bi("crypto.bcryptHash")),
         ("bcryptVerify", bi("crypto.bcryptVerify")),
+        ("crc32", bi("crypto.crc32")),
+        ("xxhash", bi("crypto.xxhash")),
     ]
 }
 
@@ -154,6 +157,17 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             // A malformed hash or a non-match both verify as `false`.
             let ok = bcrypt::verify(&pw, &hash).unwrap_or(false);
             Ok(Value::Bool(ok))
+        }
+        "crc32" => {
+            let bytes = source_bytes(&arg(args, 0), span, &ctx("crc32"))?;
+            let mut h = crc32fast::Hasher::new();
+            h.update(&bytes);
+            Ok(Value::Number(h.finalize() as f64))
+        }
+        "xxhash" => {
+            let bytes = source_bytes(&arg(args, 0), span, &ctx("xxhash"))?;
+            let digest = xxhash_rust::xxh64::xxh64(&bytes, 0);
+            Ok(Value::Str(format!("{:016x}", digest).into()))
         }
         _ => Err(AsError::at(format!("std/crypto has no function '{}'", func), span).into()),
     }
@@ -280,7 +294,12 @@ mod tests {
     #[test]
     fn verify_password_malformed_is_false() {
         assert_eq!(
-            call("verifyPassword", &[s("secret"), s("not-a-phc-string")], sp()).unwrap(),
+            call(
+                "verifyPassword",
+                &[s("secret"), s("not-a-phc-string")],
+                sp()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
     }
@@ -325,11 +344,55 @@ mod tests {
     }
 
     #[test]
+    fn checksums() {
+        // crc32 of "hello" (IEEE) — crc32fast uses the standard IEEE polynomial
+        let result = call("crc32", &[s("hello")], sp()).unwrap();
+        // We'll verify it's the correct CRC-32 value; the exact constant will be
+        // confirmed by the implementation (907060870 = 0x3610A686).
+        assert_eq!(result, Value::Number(907060870.0));
+        // xxhash returns a 16-char lowercase hex string (xxh64)
+        let r = call("xxhash", &[s("hello")], sp()).unwrap();
+        if let Value::Str(ref hex_str) = r {
+            assert_eq!(hex_str.len(), 16);
+            assert!(hex_str.chars().all(|c| c.is_ascii_hexdigit()));
+        } else {
+            panic!("xxhash should return a string, got {:?}", r);
+        }
+        // Pinned known vector: canonical xxh64("hello", seed=0) = 0x26c7827d889f6da3.
+        assert_eq!(
+            call("xxhash", &[s("hello")], sp()).unwrap(),
+            Value::Str("26c7827d889f6da3".into())
+        );
+        // bytes input also works for crc32
+        assert_eq!(
+            call(
+                "crc32",
+                &[Value::Bytes(Rc::new(RefCell::new(b"hello".to_vec())))],
+                sp()
+            )
+            .unwrap(),
+            Value::Number(907060870.0)
+        );
+        // bytes input also works for xxhash
+        let r2 = call(
+            "xxhash",
+            &[Value::Bytes(Rc::new(RefCell::new(b"hello".to_vec())))],
+            sp(),
+        )
+        .unwrap();
+        // Should produce same result as string "hello"
+        assert_eq!(r, r2);
+    }
+
+    #[test]
     fn arg_type_misuse_is_tier2_panic() {
         // A number is not a valid data source → Tier-2 (Control error).
         assert!(call("sha256", &[Value::Number(42.0)], sp()).is_err());
         assert!(call("md5", &[Value::Bool(true)], sp()).is_err());
         // hmac with a non-string/bytes key.
         assert!(call("hmacSha256", &[Value::Number(1.0), s("x")], sp()).is_err());
+        // The checksum arms reject non-string/bytes input too.
+        assert!(call("crc32", &[Value::Number(1.0)], sp()).is_err());
+        assert!(call("xxhash", &[Value::Number(1.0)], sp()).is_err());
     }
 }

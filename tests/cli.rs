@@ -77,7 +77,11 @@ fn runs_data_example() {
 #[test]
 fn runs_result_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/result.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/result.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     // compute(100,5,2): 100/5=20, 20/2=10 -> good[0]=10
@@ -91,19 +95,27 @@ fn runs_result_example() {
 #[test]
 fn runs_typed_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/typed.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/typed.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
-    assert!(out.contains("12\n"));            // area(3,4)
-    assert!(out.contains("hello, Ada"));      // greet
-    assert!(out.contains("12\n"));            // total 3+4+5=12
+    assert!(out.contains("12\n")); // area(3,4)
+    assert!(out.contains("hello, Ada")); // greet
+    assert!(out.contains("12\n")); // total 3+4+5=12
     assert!(out.contains("type contract violated")); // recovered contract panic
 }
 
 #[test]
 fn runs_oop_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/oop.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/oop.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("Rex is an animal, specifically a dog"));
@@ -136,18 +148,26 @@ fn run_error_shows_source_caret() {
 #[test]
 fn runs_modules_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/modules/main.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/modules/main.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("12.56636")); // circleArea(2) = 3.14159*4
-    assert!(out.contains("12\n"));     // Rect(3,4).area()
-    assert!(out.contains("3.14159"));  // geo.PI
+    assert!(out.contains("12\n")); // Rect(3,4).area()
+    assert!(out.contains("3.14159")); // geo.PI
 }
 
 #[test]
 fn runs_stdlib_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/stdlib.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/stdlib.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("brown, fox, quick, the"));
@@ -161,8 +181,11 @@ fn runs_stdlib_example() {
 #[cfg(feature = "data")] // example imports std/json etc.; only valid with the data feature.
 fn runs_serialization_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output =
-        Command::new(bin).arg("run").arg("examples/serialization.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/serialization.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     // json: parsed fields + stringify
@@ -192,7 +215,11 @@ fn runs_serialization_example() {
 #[cfg(all(feature = "datetime", feature = "intl"))] // imports std/date + std/intl
 fn runs_datetime_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/datetime.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/datetime.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     // time: seconds(3) = 3000 (deterministic; elapsed>=5 line varies, not asserted)
@@ -219,7 +246,12 @@ fn repl_evaluates_and_persists_bindings() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"let x = 21\nx * 2\n").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"let x = 21\nx * 2\n")
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("42"));
@@ -227,7 +259,8 @@ fn repl_evaluates_and_persists_bindings() {
 
 #[test]
 fn repl_buffers_multiline_class() {
-    let input = "class P {\n  x: number\n  y: number\n}\nlet p = P.from({x: 3, y: 4})\nprint(p.x + p.y)\n";
+    let input =
+        "class P {\n  x: number\n  y: number\n}\nlet p = P.from({x: 3, y: 4})\nprint(p.x + p.y)\n";
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ascript"))
         .arg("repl")
         .stdin(std::process::Stdio::piped())
@@ -279,8 +312,13 @@ fn test_runner_reports_pass_and_fail() {
     )
     .unwrap();
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let out = std::process::Command::new(bin).arg("test").arg(&file).output().unwrap();
-    let s = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    let out = std::process::Command::new(bin)
+        .arg("test")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let s =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(s.contains("1 passed") || s.contains("passed"));
     assert!(s.contains("fails") && s.contains("boom"));
     assert!(!out.status.success()); // a failing test → non-zero exit
@@ -301,8 +339,16 @@ fn runs_crypto_sha256_and_password_roundtrip() {
     )
     .unwrap();
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let out = std::process::Command::new(bin).arg("run").arg(&file).output().unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let out = std::process::Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\ntrue\ntrue\nfalse\n"
@@ -315,10 +361,20 @@ fn runs_crypto_sha256_and_password_roundtrip() {
 // features. It runs `echo`, so it is additionally gated to unix (mirroring the
 // existing process integration tests).
 #[test]
-#[cfg(all(feature = "sys", feature = "crypto", feature = "compress", feature = "sql", unix))]
+#[cfg(all(
+    feature = "sys",
+    feature = "crypto",
+    feature = "compress",
+    feature = "sql",
+    unix
+))]
 fn runs_system_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/system.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/system.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     // crypto: sha256("abc")
@@ -326,7 +382,7 @@ fn runs_system_example() {
     // fs.grep: 2 matches, first on line 2 ("beta TODO").
     assert_eq!(out.lines().nth(1), Some("2")); // match count
     assert_eq!(out.lines().nth(2), Some("2")); // first match line number
-    // compress: gzip -> gunzip round-trip is lossless.
+                                               // compress: gzip -> gunzip round-trip is lossless.
     assert!(out.contains("true"));
     // sqlite: queried row value.
     assert!(out.contains("ada"));
@@ -345,7 +401,11 @@ fn runs_system_example() {
 #[cfg(all(feature = "net", unix))]
 fn runs_net_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/net.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/net.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     // Three nil error slots (listen/connect/accept), then the round-tripped lines.
@@ -360,7 +420,11 @@ fn runs_net_example() {
 #[cfg(feature = "tui")]
 fn runs_tui_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let output = Command::new(bin).arg("run").arg("examples/tui.as").output().unwrap();
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/tui.as")
+        .output()
+        .unwrap();
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("AScript"), "missing AScript text:\n{}", out);
@@ -384,7 +448,11 @@ fn runs_generators_example_terminates_and_prints() {
     // task-based generator (zombie task parked in `yield`) would HANG here. The
     // test reaching its asserts is the proof that consumer-driven generators exit.
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let out = Command::new(bin).arg("run").arg("examples/generators.as").output().unwrap();
+    let out = Command::new(bin)
+        .arg("run")
+        .arg("examples/generators.as")
+        .output()
+        .unwrap();
     assert!(out.status.success(), "generators.as did not exit cleanly");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("6"), "got: {stdout}");
@@ -405,9 +473,16 @@ fn abandoned_infinite_generator_with_break_terminates() {
     )
     .unwrap();
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let out = Command::new(bin).arg("run").arg(path.to_str().unwrap()).output().unwrap();
+    let out = Command::new(bin)
+        .arg("run")
+        .arg(path.to_str().unwrap())
+        .output()
+        .unwrap();
     let _ = std::fs::remove_file(&path);
-    assert!(out.status.success(), "abandoned generator program did not exit");
+    assert!(
+        out.status.success(),
+        "abandoned generator program did not exit"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout, "0\n1\n2\ndone\n", "got: {stdout}");
 }
@@ -421,17 +496,18 @@ fn run_streams_output_and_keeps_it_before_panic() {
     let path = std::env::temp_dir().join("ascript_stream_before_panic.as");
     std::fs::write(&path, "print(\"before\")\nlen(1, 2, 3)\n").unwrap();
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let out = Command::new(bin).arg("run").arg(path.to_str().unwrap()).output().unwrap();
+    let out = Command::new(bin)
+        .arg("run")
+        .arg(path.to_str().unwrap())
+        .output()
+        .unwrap();
     let _ = std::fs::remove_file(&path);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !out.status.success(),
         "program should have panicked at len(1, 2, 3); stdout: {stdout:?}"
     );
-    assert!(
-        stdout.contains("before"),
-        "stdout was: {stdout:?}"
-    );
+    assert!(stdout.contains("before"), "stdout was: {stdout:?}");
 }
 
 #[test]
@@ -500,9 +576,15 @@ fn runs_logging_example() {
         String::from_utf8_lossy(&output.stdout)
     );
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("[DEBUG] starting pid=42"), "stderr was: {err:?}");
+    assert!(
+        err.contains("[DEBUG] starting pid=42"),
+        "stderr was: {err:?}"
+    );
     assert!(err.contains("[INFO] request"), "stderr was: {err:?}");
     assert!(err.contains("[WARN] slow query"), "stderr was: {err:?}");
-    assert!(err.contains("[ERROR] upstream failed"), "stderr was: {err:?}");
+    assert!(
+        err.contains("[ERROR] upstream failed"),
+        "stderr was: {err:?}"
+    );
     assert!(err.contains("\"msg\":\"saved\""), "stderr was: {err:?}");
 }

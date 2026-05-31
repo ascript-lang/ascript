@@ -6,25 +6,25 @@
 
 pub mod array;
 pub mod bytes;
+#[cfg(feature = "compress")]
+pub mod compress;
 pub mod convert;
 #[cfg(feature = "crypto")]
 pub mod crypto;
-#[cfg(feature = "datetime")]
-pub mod date;
-#[cfg(feature = "compress")]
-pub mod compress;
 #[cfg(feature = "data")]
 pub mod csv;
+#[cfg(feature = "datetime")]
+pub mod date;
 #[cfg(feature = "data")]
 pub mod encoding;
 #[cfg(feature = "sys")]
 pub mod env;
 #[cfg(feature = "sys")]
 pub mod fs;
+#[cfg(feature = "net")]
+pub mod http_server;
 #[cfg(feature = "intl")]
 pub mod intl;
-#[cfg(feature = "sys")]
-pub mod process;
 #[cfg(feature = "data")]
 pub mod json;
 #[cfg(feature = "log")]
@@ -32,14 +32,14 @@ pub mod log;
 pub mod map;
 pub mod math;
 #[cfg(feature = "net")]
-pub mod net_tcp;
-#[cfg(feature = "net")]
 pub mod net_http;
 #[cfg(feature = "net")]
-pub mod http_server;
+pub mod net_tcp;
 #[cfg(feature = "net")]
 pub mod net_ws;
 pub mod object;
+#[cfg(feature = "sys")]
+pub mod process;
 #[cfg(feature = "data")]
 pub mod regex;
 #[cfg(feature = "sql")]
@@ -47,10 +47,10 @@ pub mod sqlite;
 pub mod string;
 pub mod task_mod;
 pub mod time;
-#[cfg(feature = "tui")]
-pub mod tui;
 #[cfg(feature = "data")]
 pub mod toml;
+#[cfg(feature = "tui")]
+pub mod tui;
 #[cfg(feature = "data")]
 pub mod uuid;
 #[cfg(feature = "data")]
@@ -168,7 +168,7 @@ impl Interp {
             "math" => math::call(func, args, span),
             "string" => string::call(func, args, span),
             "array" => self.call_array(func, args, span).await,
-            "object" => object::call(func, args, span),
+            "object" => self.call_object(func, args, span).await,
             "map" => map::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
@@ -252,37 +252,85 @@ pub(crate) fn arg(args: &[Value], i: usize) -> Value {
 pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Control> {
     match v {
         Value::Number(n) => Ok(*n),
-        _ => Err(AsError::at(format!("{} expects a number, got {}", ctx, crate::interp::type_name(v)), span).into()),
+        _ => Err(AsError::at(
+            format!(
+                "{} expects a number, got {}",
+                ctx,
+                crate::interp::type_name(v)
+            ),
+            span,
+        )
+        .into()),
     }
 }
 
 pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, Control> {
     match v {
         Value::Str(s) => Ok(s.clone()),
-        _ => Err(AsError::at(format!("{} expects a string, got {}", ctx, crate::interp::type_name(v)), span).into()),
+        _ => Err(AsError::at(
+            format!(
+                "{} expects a string, got {}",
+                ctx,
+                crate::interp::type_name(v)
+            ),
+            span,
+        )
+        .into()),
     }
 }
 
-pub(crate) fn want_array(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cell::RefCell<Vec<Value>>>, Control> {
+pub(crate) fn want_array(
+    v: &Value,
+    span: Span,
+    ctx: &str,
+) -> Result<Rc<std::cell::RefCell<Vec<Value>>>, Control> {
     match v {
         Value::Array(a) => Ok(a.clone()),
-        _ => Err(AsError::at(format!("{} expects an array, got {}", ctx, crate::interp::type_name(v)), span).into()),
+        _ => Err(AsError::at(
+            format!(
+                "{} expects an array, got {}",
+                ctx,
+                crate::interp::type_name(v)
+            ),
+            span,
+        )
+        .into()),
     }
 }
 
 // want_object: used by the std/object module; the type-error message shape is
 // defined here so all std modules stay consistent.
-pub(crate) fn want_object(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cell::RefCell<indexmap::IndexMap<String, Value>>>, Control> {
+pub(crate) fn want_object(
+    v: &Value,
+    span: Span,
+    ctx: &str,
+) -> Result<Rc<std::cell::RefCell<indexmap::IndexMap<String, Value>>>, Control> {
     match v {
         Value::Object(o) => Ok(o.clone()),
-        _ => Err(AsError::at(format!("{} expects an object, got {}", ctx, crate::interp::type_name(v)), span).into()),
+        _ => Err(AsError::at(
+            format!(
+                "{} expects an object, got {}",
+                ctx,
+                crate::interp::type_name(v)
+            ),
+            span,
+        )
+        .into()),
     }
 }
 
-pub(crate) fn want_bytes(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cell::RefCell<Vec<u8>>>, Control> {
+pub(crate) fn want_bytes(
+    v: &Value,
+    span: Span,
+    ctx: &str,
+) -> Result<Rc<std::cell::RefCell<Vec<u8>>>, Control> {
     match v {
         Value::Bytes(b) => Ok(b.clone()),
-        _ => Err(AsError::at(format!("{} expects bytes, got {}", ctx, crate::interp::type_name(v)), span).into()),
+        _ => Err(AsError::at(
+            format!("{} expects bytes, got {}", ctx, crate::interp::type_name(v)),
+            span,
+        )
+        .into()),
     }
 }
 
@@ -292,7 +340,11 @@ pub(crate) fn want_bytes(v: &Value, span: Span, ctx: &str) -> Result<Rc<std::cel
 pub(crate) fn clamp_index(i: f64, len: usize) -> usize {
     if i < 0.0 {
         let from_end = len as f64 + i;
-        if from_end < 0.0 { 0 } else { from_end as usize }
+        if from_end < 0.0 {
+            0
+        } else {
+            from_end as usize
+        }
     } else if i as usize > len {
         len
     } else {

@@ -558,6 +558,34 @@ let [hash, _] = bcryptHash("secret")
 print(bcryptVerify("secret", hash))
 ```
 
+### crypto.crc32
+
+CRC-32 checksum (IEEE polynomial). Fast, non-cryptographic. Accepts a string (encoded as UTF-8) or bytes, and returns the checksum as a number.
+
+- **data** `string | bytes` — the input.
+- **Returns** `number` — the CRC-32 value.
+
+> [!TIER2] Panics if the input is not a string or bytes.
+
+```ascript
+import * as crypto from "std/crypto"
+crypto.crc32("hello")   // 907060870
+```
+
+### crypto.xxhash
+
+xxHash-64 (XXH64) with seed 0. Extremely fast, non-cryptographic. Accepts a string (encoded as UTF-8) or bytes, and returns the hash as a 16-character lowercase hex string.
+
+- **data** `string | bytes` — the input.
+- **Returns** `string` — 16-character lowercase hex digest.
+
+> [!TIER2] Panics if the input is not a string or bytes.
+
+```ascript
+import * as crypto from "std/crypto"
+crypto.xxhash("hello")   // "26c7827d889f6da3"
+```
+
 ## std/compress
 
 Gzip/deflate (de)compression and in-memory zip archives. Compression functions accept a string (encoded as UTF-8) or bytes and return bytes. Decompression takes bytes and is fallible (Tier-1).

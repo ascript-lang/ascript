@@ -18,8 +18,7 @@ fn language() -> tree_sitter::Language {
 fn example_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
     for dir in ["examples", "examples/modules"] {
-        let entries = fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("read_dir {dir}: {e}"));
+        let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir}: {e}"));
         for entry in entries {
             let path = entry.unwrap().path();
             if path.extension().and_then(|s| s.to_str()) == Some("as") {
@@ -62,8 +61,7 @@ fn interpreter_parser_accepts_all_examples() {
     let mut failures = Vec::new();
     for path in example_files() {
         let src = fs::read_to_string(&path).unwrap();
-        let result = ascript::lexer::lex(&src)
-            .and_then(|tokens| ascript::parser::parse(&tokens));
+        let result = ascript::lexer::lex(&src).and_then(|tokens| ascript::parser::parse(&tokens));
         if let Err(e) = result {
             failures.push(format!("{}: {e:?}", path.display()));
         }

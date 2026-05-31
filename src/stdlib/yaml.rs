@@ -9,7 +9,10 @@ use crate::stdlib::json::{from_ascript, to_ascript};
 use crate::value::Value;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("parse", bi("yaml.parse")), ("stringify", bi("yaml.stringify"))]
+    vec![
+        ("parse", bi("yaml.parse")),
+        ("stringify", bi("yaml.stringify")),
+    ]
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -19,7 +22,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let s = want_string(&arg(args, 0), span, &ctx("parse"))?;
             match serde_yaml::from_str::<serde_json::Value>(&s) {
                 Ok(jv) => Ok(make_pair(to_ascript(&jv), Value::Nil)),
-                Err(e) => Ok(make_pair(Value::Nil, make_error(Value::Str(format!("invalid YAML: {}", e).into())))),
+                Err(e) => Ok(make_pair(
+                    Value::Nil,
+                    make_error(Value::Str(format!("invalid YAML: {}", e).into())),
+                )),
             }
         }
         "stringify" => {
@@ -27,7 +33,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             match from_ascript(&v, &mut Vec::new()) {
                 Ok(jv) => match serde_yaml::to_string(&jv) {
                     Ok(text) => Ok(make_pair(Value::Str(text.into()), Value::Nil)),
-                    Err(e) => Ok(make_pair(Value::Nil, make_error(Value::Str(format!("cannot serialize to YAML: {}", e).into())))),
+                    Err(e) => Ok(make_pair(
+                        Value::Nil,
+                        make_error(Value::Str(
+                            format!("cannot serialize to YAML: {}", e).into(),
+                        )),
+                    )),
                 },
                 Err(msg) => Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into())))),
             }
@@ -39,16 +50,28 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn sp() -> Span { Span::new(0, 0) }
-    fn s(x: &str) -> Value { Value::Str(x.into()) }
+    fn sp() -> Span {
+        Span::new(0, 0)
+    }
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
 
     #[test]
     fn parse_basic() {
         // Mapping keys come out in source order (serde_json's preserve_order
         // feature backs the bridge map with an IndexMap). `36` renders as `36`
         // (not `36.0`).
-        let parsed = call("parse", &[s("name: Ada\nage: 36\ntags:\n  - a\n  - b")], sp()).unwrap();
-        assert_eq!(parsed.to_string(), "[{name: \"Ada\", age: 36, tags: [\"a\", \"b\"]}, nil]");
+        let parsed = call(
+            "parse",
+            &[s("name: Ada\nage: 36\ntags:\n  - a\n  - b")],
+            sp(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.to_string(),
+            "[{name: \"Ada\", age: 36, tags: [\"a\", \"b\"]}, nil]"
+        );
     }
 
     #[test]

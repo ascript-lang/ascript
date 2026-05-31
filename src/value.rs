@@ -323,9 +323,7 @@ impl PartialEq for Value {
             (Value::GeneratorMethod(a, an), Value::GeneratorMethod(b, bn)) => {
                 Rc::ptr_eq(a, b) && an == bn
             }
-            (Value::ClassMethod(a, an), Value::ClassMethod(b, bn)) => {
-                Rc::ptr_eq(a, b) && an == bn
-            }
+            (Value::ClassMethod(a, an), Value::ClassMethod(b, bn)) => Rc::ptr_eq(a, b) && an == bn,
             _ => false,
         }
     }
@@ -340,7 +338,11 @@ impl fmt::Debug for Value {
             Value::Str(s) => write!(f, "Str({:?})", s),
             Value::Builtin(name) => write!(f, "Builtin({:?})", name),
             Value::Function(func) => {
-                write!(f, "Function({})", func.name.as_deref().unwrap_or("<anonymous>"))
+                write!(
+                    f,
+                    "Function({})",
+                    func.name.as_deref().unwrap_or("<anonymous>")
+                )
             }
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
             Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
@@ -349,7 +351,12 @@ impl fmt::Debug for Value {
             #[cfg(feature = "data")]
             Value::Regex(r) => write!(f, "Regex({:?})", r.source),
             Value::Native(n) => write!(f, "Native({} #{})", n.kind.type_name(), n.id),
-            Value::NativeMethod(m) => write!(f, "NativeMethod({}.{})", m.receiver.kind.type_name(), m.method),
+            Value::NativeMethod(m) => write!(
+                f,
+                "NativeMethod({}.{})",
+                m.receiver.kind.type_name(),
+                m.method
+            ),
             Value::Enum(e) => write!(f, "Enum({})", e.name),
             Value::EnumVariant(v) => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
             Value::Class(c) => write!(f, "Class({})", c.name),
@@ -497,17 +504,26 @@ mod tests {
 
     #[test]
     fn builtins_compare_by_name_and_are_truthy() {
-        assert_eq!(Value::Builtin("print".into()), Value::Builtin("print".into()));
+        assert_eq!(
+            Value::Builtin("print".into()),
+            Value::Builtin("print".into())
+        );
         assert_ne!(Value::Builtin("print".into()), Value::Builtin("len".into()));
         assert!(Value::Builtin("print".into()).is_truthy());
-        assert_eq!(Value::Builtin("print".into()).to_string(), "<builtin print>");
+        assert_eq!(
+            Value::Builtin("print".into()).to_string(),
+            "<builtin print>"
+        );
     }
 
     #[test]
     fn arrays_compare_by_identity_and_display() {
         use std::cell::RefCell;
         use std::rc::Rc;
-        let a = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0), Value::Str("two".into())])));
+        let a = Value::Array(Rc::new(RefCell::new(vec![
+            Value::Number(1.0),
+            Value::Str("two".into()),
+        ])));
         assert_eq!(a.to_string(), "[1, \"two\"]");
         // identity: a clone of the SAME Rc is equal; a fresh array is not
         assert_eq!(a.clone(), a);

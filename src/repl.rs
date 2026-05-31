@@ -83,8 +83,7 @@ async fn run_tty(interp: &Interp, env: &Environment) -> std::io::Result<()> {
     use rustyline::error::ReadlineError;
     use rustyline::DefaultEditor;
 
-    let mut rl =
-        DefaultEditor::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut rl = DefaultEditor::new().map_err(|e| std::io::Error::other(e.to_string()))?;
     // Accumulate physical lines while the input is incomplete (unclosed
     // delimiters or an unterminated string/template), prompting with `..`.
     let mut buf = String::new();
@@ -157,7 +156,10 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) {
     if line.trim().is_empty() {
         return;
     }
-    let src_info = Rc::new(SourceInfo { path: "<repl>".to_string(), text: line.to_string() });
+    let src_info = Rc::new(SourceInfo {
+        path: "<repl>".to_string(),
+        text: line.to_string(),
+    });
 
     let tokens = match crate::lexer::lex(line) {
         Ok(t) => t,
@@ -239,9 +241,9 @@ mod tests {
         assert!(!is_incomplete("}")); // too many closers → not incomplete (real error)
         assert!(is_incomplete("let s = `hello")); // unterminated template → incomplete
         assert!(!is_incomplete("let s = `a ${x} b`")); // complete template w/ braces → balanced
-        // Open interpolation. `${` and `${x` lex Ok as TemplateStart with no
-        // closing brace → caught by the TemplateStart depth bump. `a${x}b`
-        // lexes Err-unterminated → caught by is_unterminated_at_eof.
+                                                       // Open interpolation. `${` and `${x` lex Ok as TemplateStart with no
+                                                       // closing brace → caught by the TemplateStart depth bump. `a${x}b`
+                                                       // lexes Err-unterminated → caught by is_unterminated_at_eof.
         assert!(is_incomplete("let f = `${"));
         assert!(is_incomplete("let f = `a${x}b")); // open second interp / unterminated tail
         assert!(!is_incomplete("let s = `a${x}b${y}c`")); // complete multi-interp → balanced

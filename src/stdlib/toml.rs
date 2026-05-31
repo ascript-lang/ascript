@@ -14,7 +14,10 @@ use crate::stdlib::json::{from_ascript, to_ascript};
 use crate::value::Value;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("parse", bi("toml.parse")), ("stringify", bi("toml.stringify"))]
+    vec![
+        ("parse", bi("toml.parse")),
+        ("stringify", bi("toml.stringify")),
+    ]
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -24,7 +27,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let s = want_string(&arg(args, 0), span, &ctx("parse"))?;
             match ::toml::from_str::<serde_json::Value>(&s) {
                 Ok(jv) => Ok(make_pair(to_ascript(&jv), Value::Nil)),
-                Err(e) => Ok(make_pair(Value::Nil, make_error(Value::Str(format!("invalid TOML: {}", e).into())))),
+                Err(e) => Ok(make_pair(
+                    Value::Nil,
+                    make_error(Value::Str(format!("invalid TOML: {}", e).into())),
+                )),
             }
         }
         "stringify" => {
@@ -32,7 +38,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             match from_ascript(&v, &mut Vec::new()) {
                 Ok(jv) => match ::toml::to_string(&jv) {
                     Ok(text) => Ok(make_pair(Value::Str(text.into()), Value::Nil)),
-                    Err(e) => Ok(make_pair(Value::Nil, make_error(Value::Str(format!("cannot serialize to TOML: {}", e).into())))),
+                    Err(e) => Ok(make_pair(
+                        Value::Nil,
+                        make_error(Value::Str(
+                            format!("cannot serialize to TOML: {}", e).into(),
+                        )),
+                    )),
                 },
                 Err(msg) => Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into())))),
             }
@@ -44,8 +55,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn sp() -> Span { Span::new(0, 0) }
-    fn s(x: &str) -> Value { Value::Str(x.into()) }
+    fn sp() -> Span {
+        Span::new(0, 0)
+    }
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
 
     #[test]
     fn parse_basic() {
@@ -58,7 +73,10 @@ mod tests {
 
     #[test]
     fn parse_invalid_is_err() {
-        assert!(call("parse", &[s("= bad")], sp()).unwrap().to_string().starts_with("[nil, {message:"));
+        assert!(call("parse", &[s("= bad")], sp())
+            .unwrap()
+            .to_string()
+            .starts_with("[nil, {message:"));
     }
 
     #[test]

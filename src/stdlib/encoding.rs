@@ -49,9 +49,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "base64Encode" => {
             let src = source_bytes(&arg(args, 0), span, &ctx("base64Encode"))?;
             Ok(Value::Str(
-                base64::engine::general_purpose::STANDARD
-                    .encode(src)
-                    .into(),
+                base64::engine::general_purpose::STANDARD.encode(src).into(),
             ))
         }
         "base64Decode" => {
@@ -139,15 +137,22 @@ mod tests {
 
     #[test]
     fn url_and_utf8() {
-        assert_eq!(call("urlEncode", &[s("a b&c")], sp()).unwrap(), s("a%20b%26c"));
         assert_eq!(
-            call("urlDecode", &[s("a%20b%26c")], sp()).unwrap().to_string(),
+            call("urlEncode", &[s("a b&c")], sp()).unwrap(),
+            s("a%20b%26c")
+        );
+        assert_eq!(
+            call("urlDecode", &[s("a%20b%26c")], sp())
+                .unwrap()
+                .to_string(),
             "[\"a b&c\", nil]"
         );
         let b = call("utf8Encode", &[s("hi")], sp()).unwrap();
         assert_eq!(crate::interp::type_name(&b), "bytes");
         assert_eq!(
-            call("utf8Decode", std::slice::from_ref(&b), sp()).unwrap().to_string(),
+            call("utf8Decode", std::slice::from_ref(&b), sp())
+                .unwrap()
+                .to_string(),
             "[\"hi\", nil]"
         );
     }

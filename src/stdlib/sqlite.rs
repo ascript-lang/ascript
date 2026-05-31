@@ -96,11 +96,9 @@ impl Interp {
             NativeKind::SqliteConnection => self.sqlite_conn_method(id, &m.method, &args, span),
             NativeKind::SqliteStatement => self.sqlite_stmt_method(id, &m.method, &args, span),
             // call_native_method only routes the two sqlite kinds here.
-            _ => Err(AsError::at(
-                format!("native handle has no method '{}'", m.method),
-                span,
-            )
-            .into()),
+            _ => {
+                Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
+            }
         }
     }
 
@@ -140,7 +138,10 @@ impl Interp {
                 let params = parse_params(args.get(1), span, "connection.query")?;
                 let conn = self.sqlite_conn(id).expect("checked present");
                 match query_sql(&conn, &sql, &params) {
-                    Ok(rows) => Ok(make_pair(Value::Array(Rc::new(RefCell::new(rows))), Value::Nil)),
+                    Ok(rows) => Ok(make_pair(
+                        Value::Array(Rc::new(RefCell::new(rows))),
+                        Value::Nil,
+                    )),
                     Err(e) => Ok(err_pair(format!("connection.query failed: {}", e))),
                 }
             }
@@ -158,18 +159,17 @@ impl Interp {
                 let handle = self.register_resource(
                     NativeKind::SqliteStatement,
                     indexmap::IndexMap::new(),
-                    ResourceState::SqliteStatement { conn_id: id, sql: sql.to_string() },
+                    ResourceState::SqliteStatement {
+                        conn_id: id,
+                        sql: sql.to_string(),
+                    },
                 );
                 Ok(make_pair(handle, Value::Nil))
             }
             "begin" => self.conn_exec_simple(id, "BEGIN", "connection.begin"),
             "commit" => self.conn_exec_simple(id, "COMMIT", "connection.commit"),
             "rollback" => self.conn_exec_simple(id, "ROLLBACK", "connection.rollback"),
-            _ => Err(AsError::at(
-                format!("connection has no method '{}'", method),
-                span,
-            )
-            .into()),
+            _ => Err(AsError::at(format!("connection has no method '{}'", method), span).into()),
         }
     }
 
@@ -214,15 +214,14 @@ impl Interp {
                 let params = parse_params(args.first(), span, "statement.all")?;
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
                 match query_cached(&conn, &sql, &params) {
-                    Ok(rows) => Ok(make_pair(Value::Array(Rc::new(RefCell::new(rows))), Value::Nil)),
+                    Ok(rows) => Ok(make_pair(
+                        Value::Array(Rc::new(RefCell::new(rows))),
+                        Value::Nil,
+                    )),
                     Err(e) => Ok(err_pair(format!("statement.all failed: {}", e))),
                 }
             }
-            _ => Err(AsError::at(
-                format!("statement has no method '{}'", method),
-                span,
-            )
-            .into()),
+            _ => Err(AsError::at(format!("statement has no method '{}'", method), span).into()),
         }
     }
 }
@@ -329,8 +328,10 @@ macro_rules! with_bound {
                 $body
             }
             Params::Named(p) => {
-                let refs: Vec<(&str, &dyn rusqlite::ToSql)> =
-                    p.iter().map(|(k, v)| (k.as_str(), v as &dyn rusqlite::ToSql)).collect();
+                let refs: Vec<(&str, &dyn rusqlite::ToSql)> = p
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v as &dyn rusqlite::ToSql))
+                    .collect();
                 let $bound = refs.as_slice();
                 $body
             }
@@ -348,18 +349,29 @@ fn exec_cached(conn: &rusqlite::Connection, sql: &str, params: &Params) -> rusql
     with_bound!(&mut stmt, params, |bound| stmt.execute(bound))
 }
 
-fn query_sql(conn: &rusqlite::Connection, sql: &str, params: &Params) -> rusqlite::Result<Vec<Value>> {
+fn query_sql(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &Params,
+) -> rusqlite::Result<Vec<Value>> {
     let mut stmt = conn.prepare(sql)?;
     collect_rows(&mut stmt, params)
 }
 
-fn query_cached(conn: &rusqlite::Connection, sql: &str, params: &Params) -> rusqlite::Result<Vec<Value>> {
+fn query_cached(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &Params,
+) -> rusqlite::Result<Vec<Value>> {
     let mut stmt = conn.prepare_cached(sql)?;
     collect_rows(&mut stmt, params)
 }
 
 /// Run a query and collect each row into an object keyed by column name.
-fn collect_rows(stmt: &mut rusqlite::Statement<'_>, params: &Params) -> rusqlite::Result<Vec<Value>> {
+fn collect_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: &Params,
+) -> rusqlite::Result<Vec<Value>> {
     let col_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
     let mut out = Vec::new();
     with_bound!(stmt, params, |bound| {
@@ -399,7 +411,8 @@ import { open } from "std/sqlite"
 let [conn, err] = open(":memory:")
 print(err)
 print(type(conn))
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\nconnection\n");
     }
 
@@ -413,7 +426,8 @@ print(c0)
 print(e0)
 let [c1, e1] = conn.exec("INSERT INTO t VALUES (1, 'alice')")
 print(c1)
-"#).await;
+"#)
+        .await;
         // CREATE reports 0 changes; the INSERT reports 1.
         assert_eq!(out, "0\nnil\n1\n");
     }
@@ -432,7 +446,8 @@ print(len(rows))
 print(rows[0].id)
 print(rows[0].name)
 print(rows[1].name)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\n2\n1\nalice\nbob\n");
     }
 
@@ -445,7 +460,8 @@ conn.exec("CREATE TABLE t (id INTEGER, name TEXT)")
 conn.exec("INSERT INTO t VALUES (?, ?)", [7, "gwen"])
 let [rows, _e1] = conn.query("SELECT name FROM t WHERE id = ?", [7])
 print(rows[0].name)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "gwen\n");
     }
 
@@ -458,7 +474,8 @@ conn.exec("CREATE TABLE t (id INTEGER, name TEXT)")
 conn.exec("INSERT INTO t VALUES (:id, :name)", { id: 3, name: "carol" })
 let [rows, _e1] = conn.query("SELECT name FROM t WHERE id = :id", { id: 3 })
 print(rows[0].name)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "carol\n");
     }
 
@@ -479,7 +496,8 @@ let [rows, _e4] = sel.all()
 print(len(rows))
 print(rows[0].name)
 print(rows[1].name)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\n1\n1\n2\na\nb\n");
     }
 
@@ -494,7 +512,8 @@ conn.exec("INSERT INTO t VALUES (1)")
 conn.commit()
 let [rows, _e1] = conn.query("SELECT id FROM t")
 print(len(rows))
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "1\n");
     }
 
@@ -509,18 +528,22 @@ conn.exec("INSERT INTO t VALUES (1)")
 conn.rollback()
 let [rows, _e1] = conn.query("SELECT id FROM t")
 print(len(rows))
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "0\n");
     }
 
     #[tokio::test]
     async fn close_then_use_is_use_after_close_panic() {
-        let msg = run_err(r#"
+        let msg = run_err(
+            r#"
 import { open } from "std/sqlite"
 let [conn, _] = open(":memory:")
 conn.close()
 conn.exec("CREATE TABLE t (id INTEGER)")
-"#).await;
+"#,
+        )
+        .await;
         assert!(msg.contains("use after close"), "got: {}", msg);
     }
 
@@ -532,7 +555,8 @@ let [conn, _] = open(":memory:")
 let [val, err] = conn.exec("CREATE TABBLE oops")
 print(val)
 print(err != nil)
-"#).await;
+"#)
+        .await;
         // Tier-1: value slot nil, err slot present.
         assert_eq!(out, "nil\ntrue\n");
     }
@@ -575,7 +599,8 @@ import { open } from "std/sqlite"
 let [conn, _] = open(":memory:")
 print(conn == conn)
 print(conn)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "true\n<native connection #0>\n");
     }
 
@@ -586,7 +611,11 @@ print(conn)
         use crate::interp::{Interp, ResourceState};
         let interp = Interp::new();
         let pair = interp
-            .call_sqlite_open("open", &[Value::Str(":memory:".into())], crate::span::Span::new(0, 0))
+            .call_sqlite_open(
+                "open",
+                &[Value::Str(":memory:".into())],
+                crate::span::Span::new(0, 0),
+            )
             .unwrap();
         let conn_handle = match &pair {
             Value::Array(a) => a.borrow()[0].clone(),

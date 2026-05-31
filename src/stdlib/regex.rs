@@ -34,7 +34,9 @@ fn want_regex(v: &Value, span: Span, ctx: &str) -> Result<Rc<RegexHandle>, Contr
                 re,
                 source: s.to_string(),
             })),
-            Err(e) => Err(AsError::at(format!("{}: invalid regex pattern: {}", ctx, e), span).into()),
+            Err(e) => {
+                Err(AsError::at(format!("{}: invalid regex pattern: {}", ctx, e), span).into())
+            }
         },
         _ => Err(AsError::at(
             format!(
@@ -85,11 +87,17 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     let groups: Vec<Value> = caps
                         .iter()
                         .skip(1)
-                        .map(|g| g.map(|m| Value::Str(m.as_str().into())).unwrap_or(Value::Nil))
+                        .map(|g| {
+                            g.map(|m| Value::Str(m.as_str().into()))
+                                .unwrap_or(Value::Nil)
+                        })
                         .collect();
                     let mut obj = indexmap::IndexMap::new();
                     obj.insert("text".to_string(), Value::Str(whole.as_str().into()));
-                    obj.insert("index".to_string(), Value::Number(char_index(&s, whole.start())));
+                    obj.insert(
+                        "index".to_string(),
+                        Value::Number(char_index(&s, whole.start())),
+                    );
                     obj.insert("groups".to_string(), arr(groups));
                     Ok(Value::Object(Rc::new(RefCell::new(obj))))
                 }
@@ -99,14 +107,20 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "findAll" => {
             let re = want_regex(&arg(args, 0), span, &ctx("findAll"))?;
             let s = want_string(&arg(args, 1), span, &ctx("findAll"))?;
-            let out: Vec<Value> = re.re.find_iter(&s).map(|m| Value::Str(m.as_str().into())).collect();
+            let out: Vec<Value> = re
+                .re
+                .find_iter(&s)
+                .map(|m| Value::Str(m.as_str().into()))
+                .collect();
             Ok(arr(out))
         }
         "replace" => {
             let re = want_regex(&arg(args, 0), span, &ctx("replace"))?;
             let s = want_string(&arg(args, 1), span, &ctx("replace"))?;
             let repl = want_string(&arg(args, 2), span, &ctx("replace"))?;
-            Ok(Value::Str(re.re.replace_all(&s, repl.as_ref()).into_owned().into()))
+            Ok(Value::Str(
+                re.re.replace_all(&s, repl.as_ref()).into_owned().into(),
+            ))
         }
         "split" => {
             let re = want_regex(&arg(args, 0), span, &ctx("split"))?;
@@ -130,12 +144,31 @@ mod tests {
 
     #[test]
     fn test_find_findall_replace_split() {
-        assert_eq!(call("test", &[s("\\d+"), s("ab12")], sp()).unwrap(), Value::Bool(true));
+        assert_eq!(
+            call("test", &[s("\\d+"), s("ab12")], sp()).unwrap(),
+            Value::Bool(true)
+        );
         let found = call("find", &[s("(\\d)(\\d)"), s("x42y")], sp()).unwrap();
-        assert_eq!(found.to_string(), "{text: \"42\", index: 1, groups: [\"4\", \"2\"]}");
-        assert_eq!(call("findAll", &[s("\\d"), s("a1b2")], sp()).unwrap().to_string(), "[\"1\", \"2\"]");
-        assert_eq!(call("replace", &[s("\\d"), s("a1b2"), s("#")], sp()).unwrap(), s("a#b#"));
-        assert_eq!(call("split", &[s(",\\s*"), s("a, b,c")], sp()).unwrap().to_string(), "[\"a\", \"b\", \"c\"]");
+        assert_eq!(
+            found.to_string(),
+            "{text: \"42\", index: 1, groups: [\"4\", \"2\"]}"
+        );
+        assert_eq!(
+            call("findAll", &[s("\\d"), s("a1b2")], sp())
+                .unwrap()
+                .to_string(),
+            "[\"1\", \"2\"]"
+        );
+        assert_eq!(
+            call("replace", &[s("\\d"), s("a1b2"), s("#")], sp()).unwrap(),
+            s("a#b#")
+        );
+        assert_eq!(
+            call("split", &[s(",\\s*"), s("a, b,c")], sp())
+                .unwrap()
+                .to_string(),
+            "[\"a\", \"b\", \"c\"]"
+        );
     }
 
     #[test]
@@ -147,8 +180,14 @@ mod tests {
         // reuse: the compiled value works across multiple calls
         if let Value::Array(a) = &compiled {
             let re = a.borrow()[0].clone();
-            assert_eq!(call("test", &[re.clone(), s("hello")], sp()).unwrap(), Value::Bool(true));
-            assert_eq!(call("test", &[re, s("123")], sp()).unwrap(), Value::Bool(false));
+            assert_eq!(
+                call("test", &[re.clone(), s("hello")], sp()).unwrap(),
+                Value::Bool(true)
+            );
+            assert_eq!(
+                call("test", &[re, s("123")], sp()).unwrap(),
+                Value::Bool(false)
+            );
         } else {
             panic!("expected array");
         }
@@ -156,6 +195,9 @@ mod tests {
 
     #[test]
     fn bad_inline_pattern_panics() {
-        assert!(matches!(call("test", &[s("("), s("x")], sp()), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("test", &[s("("), s("x")], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 }

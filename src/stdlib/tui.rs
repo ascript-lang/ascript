@@ -87,7 +87,12 @@ pub struct Cell {
 impl Default for Cell {
     /// A blank cell: a space with reset colors and no attributes.
     fn default() -> Self {
-        Cell { ch: ' ', fg: Color::Reset, bg: Color::Reset, attrs: Attrs::default() }
+        Cell {
+            ch: ' ',
+            fg: Color::Reset,
+            bg: Color::Reset,
+            attrs: Attrs::default(),
+        }
     }
 }
 
@@ -106,7 +111,11 @@ impl Buffer {
     /// A blank buffer of `width × height` cells.
     pub fn new(width: u16, height: u16) -> Self {
         let count = width as usize * height as usize;
-        Buffer { width, height, cells: vec![Cell::default(); count] }
+        Buffer {
+            width,
+            height,
+            cells: vec![Cell::default(); count],
+        }
     }
 
     /// Row-major flat index for `(x, y)`, or `None` if out of bounds.
@@ -154,7 +163,9 @@ impl Buffer {
     /// not wrap. A `y` past the bottom (or an `x` past the right) is a no-op.
     pub fn text(&mut self, x: u16, y: u16, s: &str, style: Style) {
         for (i, ch) in s.chars().enumerate() {
-            let Some(cx) = x.checked_add(i as u16) else { break };
+            let Some(cx) = x.checked_add(i as u16) else {
+                break;
+            };
             if cx >= self.width {
                 break;
             }
@@ -378,17 +389,21 @@ impl Interp {
                     let mut last_err: Option<String> = None;
                     if state.raw {
                         if let Err(e) = crossterm::terminal::disable_raw_mode() {
-                            last_err = Some(format!("terminal.{}: disable raw mode: {}", m.method, e));
+                            last_err =
+                                Some(format!("terminal.{}: disable raw mode: {}", m.method, e));
                         }
                     }
                     if state.alt {
-                        if let Err(e) =
-                            crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)
-                        {
-                            last_err = Some(format!("terminal.{}: leave alt screen: {}", m.method, e));
+                        if let Err(e) = crossterm::execute!(
+                            std::io::stdout(),
+                            crossterm::terminal::LeaveAlternateScreen
+                        ) {
+                            last_err =
+                                Some(format!("terminal.{}: leave alt screen: {}", m.method, e));
                         }
                     }
-                    if let Err(e) = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show) {
+                    if let Err(e) = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)
+                    {
                         last_err = Some(format!("terminal.{}: show cursor: {}", m.method, e));
                     }
                     match last_err {
@@ -410,7 +425,10 @@ impl Interp {
                 let state = self.terminal_mut(id).expect("checked present");
                 let mut map = indexmap::IndexMap::new();
                 map.insert("width".to_string(), Value::Number(state.back.width as f64));
-                map.insert("height".to_string(), Value::Number(state.back.height as f64));
+                map.insert(
+                    "height".to_string(),
+                    Value::Number(state.back.height as f64),
+                );
                 Ok(Value::Object(Rc::new(std::cell::RefCell::new(map))))
             }
             "clear" => {
@@ -425,24 +443,20 @@ impl Interp {
                 state.cursor = (x, y);
                 Ok(Value::Nil)
             }
-            "enterRaw" => {
-                match crossterm::terminal::enable_raw_mode() {
-                    Ok(()) => {
-                        self.terminal_mut(id).expect("checked present").raw = true;
-                        Ok(make_pair(Value::Nil, Value::Nil))
-                    }
-                    Err(e) => Ok(err_pair(format!("terminal.enterRaw failed: {}", e))),
+            "enterRaw" => match crossterm::terminal::enable_raw_mode() {
+                Ok(()) => {
+                    self.terminal_mut(id).expect("checked present").raw = true;
+                    Ok(make_pair(Value::Nil, Value::Nil))
                 }
-            }
-            "leaveRaw" => {
-                match crossterm::terminal::disable_raw_mode() {
-                    Ok(()) => {
-                        self.terminal_mut(id).expect("checked present").raw = false;
-                        Ok(make_pair(Value::Nil, Value::Nil))
-                    }
-                    Err(e) => Ok(err_pair(format!("terminal.leaveRaw failed: {}", e))),
+                Err(e) => Ok(err_pair(format!("terminal.enterRaw failed: {}", e))),
+            },
+            "leaveRaw" => match crossterm::terminal::disable_raw_mode() {
+                Ok(()) => {
+                    self.terminal_mut(id).expect("checked present").raw = false;
+                    Ok(make_pair(Value::Nil, Value::Nil))
                 }
-            }
+                Err(e) => Ok(err_pair(format!("terminal.leaveRaw failed: {}", e))),
+            },
             "enterAltScreen" => {
                 match crossterm::execute!(
                     std::io::stdout(),
@@ -487,7 +501,10 @@ impl Interp {
                 let ch = want_char(&super::arg(&args, 2), span, "terminal.setCell char")?;
                 let style = parse_style(&super::arg(&args, 3), span)?;
                 if let Some(ch) = ch {
-                    self.terminal_mut(id).expect("checked present").back.set_cell(x, y, ch, style);
+                    self.terminal_mut(id)
+                        .expect("checked present")
+                        .back
+                        .set_cell(x, y, ch, style);
                 }
                 Ok(Value::Nil)
             }
@@ -496,7 +513,10 @@ impl Interp {
                 let y = want_u16(&super::arg(&args, 1), span, "terminal.text y")?;
                 let s = super::want_string(&super::arg(&args, 2), span, "terminal.text str")?;
                 let style = parse_style(&super::arg(&args, 3), span)?;
-                self.terminal_mut(id).expect("checked present").back.text(x, y, &s, style);
+                self.terminal_mut(id)
+                    .expect("checked present")
+                    .back
+                    .text(x, y, &s, style);
                 Ok(Value::Nil)
             }
             "hline" => {
@@ -509,7 +529,10 @@ impl Interp {
                 };
                 let style = parse_style(&super::arg(&args, 4), span)?;
                 if let Some(ch) = ch {
-                    self.terminal_mut(id).expect("checked present").back.hline(x, y, len, ch, style);
+                    self.terminal_mut(id)
+                        .expect("checked present")
+                        .back
+                        .hline(x, y, len, ch, style);
                 }
                 Ok(Value::Nil)
             }
@@ -523,7 +546,10 @@ impl Interp {
                 };
                 let style = parse_style(&super::arg(&args, 4), span)?;
                 if let Some(ch) = ch {
-                    self.terminal_mut(id).expect("checked present").back.vline(x, y, len, ch, style);
+                    self.terminal_mut(id)
+                        .expect("checked present")
+                        .back
+                        .vline(x, y, len, ch, style);
                 }
                 Ok(Value::Nil)
             }
@@ -533,7 +559,10 @@ impl Interp {
                 let w = want_u16(&super::arg(&args, 2), span, "terminal.box w")?;
                 let h = want_u16(&super::arg(&args, 3), span, "terminal.box h")?;
                 let style = parse_style(&super::arg(&args, 4), span)?;
-                self.terminal_mut(id).expect("checked present").back.draw_box(x, y, w, h, style);
+                self.terminal_mut(id)
+                    .expect("checked present")
+                    .back
+                    .draw_box(x, y, w, h, style);
                 Ok(Value::Nil)
             }
             "fill" => {
@@ -544,7 +573,10 @@ impl Interp {
                 let ch = want_char(&super::arg(&args, 4), span, "terminal.fill char")?;
                 let style = parse_style(&super::arg(&args, 5), span)?;
                 if let Some(ch) = ch {
-                    self.terminal_mut(id).expect("checked present").back.fill(x, y, w, h, ch, style);
+                    self.terminal_mut(id)
+                        .expect("checked present")
+                        .back
+                        .fill(x, y, w, h, ch, style);
                 }
                 Ok(Value::Nil)
             }
@@ -593,7 +625,10 @@ impl Interp {
                                 remaining = 0;
                             }
                             Err(e) => {
-                                break Ok(err_pair(format!("terminal.pollEvent read failed: {}", e)))
+                                break Ok(err_pair(format!(
+                                    "terminal.pollEvent read failed: {}",
+                                    e
+                                )))
                             }
                         },
                         Ok(false) => break Ok(make_pair(Value::Nil, Value::Nil)),
@@ -625,9 +660,7 @@ impl Interp {
                 let state = self.terminal_mut(id).expect("checked present");
                 Ok(Value::Str(state.back.dump_row(y).into()))
             }
-            other => {
-                Err(AsError::at(format!("terminal has no method '{}'", other), span).into())
-            }
+            other => Err(AsError::at(format!("terminal has no method '{}'", other), span).into()),
         }
     }
 }
@@ -661,9 +694,7 @@ impl Interp {
 /// to the captured stream but are not asserted — the diff computation (pure) and
 /// the `flushed`←`back` sync are what the tests cover.
 fn flush_changes(changes: &[(u16, u16, Cell)], cursor: (u16, u16)) -> std::io::Result<()> {
-    use crossterm::style::{
-        Attribute, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    };
+    use crossterm::style::{Attribute, SetAttribute, SetBackgroundColor, SetForegroundColor};
     use crossterm::{cursor::MoveTo, queue, style::Print};
     let mut out = std::io::stdout();
     for &(x, y, cell) in changes {
@@ -696,11 +727,9 @@ fn flush_changes(changes: &[(u16, u16, Cell)], cursor: (u16, u16)) -> std::io::R
 fn want_u16(v: &Value, span: Span, ctx: &str) -> Result<u16, Control> {
     let n = super::want_number(v, span, ctx)?;
     if n < 0.0 || n.fract() != 0.0 || n > u16::MAX as f64 {
-        return Err(AsError::at(
-            format!("{} must be an integer 0..={}", ctx, u16::MAX),
-            span,
-        )
-        .into());
+        return Err(
+            AsError::at(format!("{} must be an integer 0..={}", ctx, u16::MAX), span).into(),
+        );
     }
     Ok(n as u16)
 }
@@ -711,11 +740,9 @@ fn want_u16(v: &Value, span: Span, ctx: &str) -> Result<u16, Control> {
 fn want_dim(v: &Value, span: Span, ctx: &str) -> Result<u16, Control> {
     let n = super::want_number(v, span, ctx)?;
     if n < 1.0 || n.fract() != 0.0 || n > u16::MAX as f64 {
-        return Err(AsError::at(
-            format!("{} must be an integer 1..={}", ctx, u16::MAX),
-            span,
-        )
-        .into());
+        return Err(
+            AsError::at(format!("{} must be an integer 1..={}", ctx, u16::MAX), span).into(),
+        );
     }
     Ok(n as u16)
 }
@@ -753,12 +780,19 @@ fn named_color(name: &str) -> Option<Color> {
 fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
     match v {
         Value::Str(s) => named_color(s).ok_or_else(|| {
-            AsError::at(format!("terminal style: unknown color name '{}' for '{}'", s, field), span).into()
+            AsError::at(
+                format!("terminal style: unknown color name '{}' for '{}'", s, field),
+                span,
+            )
+            .into()
         }),
         Value::Number(n) => {
             if *n < 0.0 || n.fract() != 0.0 || *n > 255.0 {
                 return Err(AsError::at(
-                    format!("terminal style: '{}' color index must be an integer 0..=255, got {}", field, n),
+                    format!(
+                        "terminal style: '{}' color index must be an integer 0..=255, got {}",
+                        field, n
+                    ),
                     span,
                 )
                 .into());
@@ -769,7 +803,11 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
             let a = a.borrow();
             if a.len() != 3 {
                 return Err(AsError::at(
-                    format!("terminal style: '{}' rgb array must have 3 elements, got {}", field, a.len()),
+                    format!(
+                        "terminal style: '{}' rgb array must have 3 elements, got {}",
+                        field,
+                        a.len()
+                    ),
                     span,
                 )
                 .into());
@@ -785,7 +823,10 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
                 };
                 if *n < 0.0 || n.fract() != 0.0 || *n > 255.0 {
                     return Err(AsError::at(
-                        format!("terminal style: '{}' rgb component must be an integer 0..=255, got {}", field, n),
+                        format!(
+                            "terminal style: '{}' rgb component must be an integer 0..=255, got {}",
+                            field, n
+                        ),
                         span,
                     )
                     .into());
@@ -808,12 +849,20 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
 
 /// One boolean style flag from a style object: a `bool`, or absent (→ `false`).
 /// A present-but-non-bool value is a Tier-2 panic.
-fn parse_flag(map: &indexmap::IndexMap<String, Value>, key: &str, span: Span) -> Result<bool, Control> {
+fn parse_flag(
+    map: &indexmap::IndexMap<String, Value>,
+    key: &str,
+    span: Span,
+) -> Result<bool, Control> {
     match map.get(key) {
         None | Some(Value::Nil) => Ok(false),
         Some(Value::Bool(b)) => Ok(*b),
         Some(other) => Err(AsError::at(
-            format!("terminal style: '{}' must be a boolean, got {}", key, crate::interp::type_name(other)),
+            format!(
+                "terminal style: '{}' must be a boolean, got {}",
+                key,
+                crate::interp::type_name(other)
+            ),
             span,
         )
         .into()),
@@ -830,7 +879,10 @@ pub fn parse_style(v: &Value, span: Span) -> Result<Style, Control> {
         Value::Object(o) => o.borrow(),
         other => {
             return Err(AsError::at(
-                format!("terminal style must be an object, got {}", crate::interp::type_name(other)),
+                format!(
+                    "terminal style must be an object, got {}",
+                    crate::interp::type_name(other)
+                ),
                 span,
             )
             .into())
@@ -862,7 +914,11 @@ fn want_bool(v: &Value, span: Span, ctx: &str) -> Result<bool, Control> {
     match v {
         Value::Bool(b) => Ok(*b),
         _ => Err(AsError::at(
-            format!("{} expects a boolean, got {}", ctx, crate::interp::type_name(v)),
+            format!(
+                "{} expects a boolean, got {}",
+                ctx,
+                crate::interp::type_name(v)
+            ),
             span,
         )
         .into()),
@@ -1037,7 +1093,10 @@ mod tests {
 
     #[test]
     fn parse_style_named_color_and_flags() {
-        let v = obj(vec![("fg", Value::Str("red".into())), ("bold", Value::Bool(true))]);
+        let v = obj(vec![
+            ("fg", Value::Str("red".into())),
+            ("bold", Value::Bool(true)),
+        ]);
         let s = parse_style(&v, Span::new(0, 0)).unwrap();
         assert_eq!(s.fg, Color::Named(Ct::DarkRed));
         assert!(s.attrs.bold);
@@ -1133,14 +1192,12 @@ mod tests {
 
     #[tokio::test]
     async fn init_returns_a_terminal_handle() {
-        let out = run(
-            r#"
+        let out = run(r#"
 import { init } from "std/tui"
 let [term, err] = init()
 print(err)
 print(type(term))
-"#,
-        )
+"#)
         .await;
         assert_eq!(out, "nil\nterminal\n");
     }
@@ -1149,8 +1206,7 @@ print(type(term))
     async fn size_returns_positive_dims_on_non_tty() {
         // No tty in CI → 80×24 fallback; assert the shape + positivity (not exact
         // values, which vary by environment).
-        let out = run(
-            r#"
+        let out = run(r#"
 import { init } from "std/tui"
 let [term, _] = init()
 let s = term.size()
@@ -1158,8 +1214,7 @@ print(s.width > 0)
 print(s.height > 0)
 print(type(s.width))
 print(type(s.height))
-"#,
-        )
+"#)
         .await;
         assert_eq!(out, "true\ntrue\nnumber\nnumber\n");
     }
@@ -1168,16 +1223,14 @@ print(type(s.height))
     async fn buffer_makes_offscreen_handle_with_given_size() {
         // tui.buffer(w,h) returns the handle DIRECTLY (not a [term, err] pair) —
         // it can only fail on bad args (which panic), so a pair would be noise.
-        let out = run(
-            r#"
+        let out = run(r#"
 import { buffer } from "std/tui"
 let term = buffer(10, 3)
 print(type(term))
 let s = term.size()
 print(s.width)
 print(s.height)
-"#,
-        )
+"#)
         .await;
         assert_eq!(out, "terminal\n10\n3\n");
     }
@@ -1199,14 +1252,12 @@ print(s.height)
 
     #[tokio::test]
     async fn buffer_supports_drawing_and_dump() {
-        let out = run(
-            r#"
+        let out = run(r#"
 import { buffer } from "std/tui"
 let term = buffer(4, 3)
 term.box(0, 0, 4, 3, { fg: "cyan" })
 print(term.dump())
-"#,
-        )
+"#)
         .await;
         // dump() ends each row with "\n" (3 rows); print adds one more "\n".
         assert_eq!(out, "┌──┐\n│  │\n└──┘\n\n");
@@ -1315,7 +1366,14 @@ term.size()
     #[test]
     fn text_applies_style_to_cells() {
         let mut b = Buffer::new(5, 1);
-        let style = Style { fg: Color::Named(Ct::DarkRed), bg: Color::Reset, attrs: Attrs { bold: true, ..Attrs::default() } };
+        let style = Style {
+            fg: Color::Named(Ct::DarkRed),
+            bg: Color::Reset,
+            attrs: Attrs {
+                bold: true,
+                ..Attrs::default()
+            },
+        };
         b.text(0, 0, "X", style);
         let c = b.get(0, 0).unwrap();
         assert_eq!(c.ch, 'X');
@@ -1327,15 +1385,13 @@ term.size()
 
     #[tokio::test]
     async fn e2e_draw_box_and_text_dump() {
-        let out = run(
-            r#"
+        let out = run(r#"
 import { init } from "std/tui"
 let [term, _] = init()
 term.box(0, 0, 10, 3)
 term.text(2, 1, "Hello")
 print(term.dump())
-"#,
-        )
+"#)
         .await;
         assert!(out.contains("┌────────┐"), "got: {}", out);
         assert!(out.contains("Hello"), "got: {}", out);
@@ -1343,28 +1399,24 @@ print(term.dump())
 
     #[tokio::test]
     async fn e2e_setcell_multichar_takes_first_char() {
-        let out = run(
-            r#"
+        let out = run(r#"
 import { init } from "std/tui"
 let [term, _] = init()
 term.setCell(0, 0, "abc")
 print(term.dumpRow(0))
-"#,
-        )
+"#)
         .await;
         assert_eq!(out, "a\n");
     }
 
     #[tokio::test]
     async fn e2e_setcell_empty_string_is_noop() {
-        let out = run(
-            r#"
+        let out = run(r#"
 import { init } from "std/tui"
 let [term, _] = init()
 term.setCell(0, 0, "")
 print("[" + term.dumpRow(0) + "]")
-"#,
-        )
+"#)
         .await;
         assert_eq!(out, "[]\n");
     }
@@ -1389,7 +1441,15 @@ print("[" + term.dumpRow(0) + "]")
         let prev = Buffer::new(3, 1);
         let mut back = prev.clone();
         // Same char, different fg → still a change.
-        back.set_cell(0, 0, ' ', Style { fg: Color::Rgb(1, 2, 3), ..Style::default() });
+        back.set_cell(
+            0,
+            0,
+            ' ',
+            Style {
+                fg: Color::Rgb(1, 2, 3),
+                ..Style::default()
+            },
+        );
         let d = back.diff(&prev);
         assert_eq!(d.len(), 1);
         assert_eq!((d[0].0, d[0].1), (0, 0));
@@ -1414,7 +1474,7 @@ print("[" + term.dumpRow(0) + "]")
     fn diff_full_repaint_on_dim_change() {
         let prev = Buffer::new(2, 2); // 4 cells
         let back = Buffer::new(3, 2); // 6 cells, different dims
-        // Mismatched dims → every cell of `back` reported.
+                                      // Mismatched dims → every cell of `back` reported.
         assert_eq!(back.diff(&prev).len(), 6);
     }
 
@@ -1427,28 +1487,36 @@ print("[" + term.dumpRow(0) + "]")
 
     /// Read a string field from an event object Value.
     fn field_str(v: &Value, key: &str) -> String {
-        let Value::Object(o) = v else { panic!("not an object: {:?}", v) };
+        let Value::Object(o) = v else {
+            panic!("not an object: {:?}", v)
+        };
         match o.borrow().get(key) {
             Some(Value::Str(s)) => s.to_string(),
             other => panic!("field {} not a string: {:?}", key, other),
         }
     }
     fn field_bool(v: &Value, key: &str) -> bool {
-        let Value::Object(o) = v else { panic!("not an object") };
+        let Value::Object(o) = v else {
+            panic!("not an object")
+        };
         match o.borrow().get(key) {
             Some(Value::Bool(b)) => *b,
             other => panic!("field {} not a bool: {:?}", key, other),
         }
     }
     fn field_num(v: &Value, key: &str) -> f64 {
-        let Value::Object(o) = v else { panic!("not an object") };
+        let Value::Object(o) = v else {
+            panic!("not an object")
+        };
         match o.borrow().get(key) {
             Some(Value::Number(n)) => *n,
             other => panic!("field {} not a number: {:?}", key, other),
         }
     }
     fn field_is_nil(v: &Value, key: &str) -> bool {
-        let Value::Object(o) = v else { panic!("not an object") };
+        let Value::Object(o) = v else {
+            panic!("not an object")
+        };
         matches!(o.borrow().get(key), Some(Value::Nil) | None)
     }
 
@@ -1473,17 +1541,53 @@ print("[" + term.dumpRow(0) + "]")
 
     #[test]
     fn event_named_keys() {
-        assert_eq!(field_str(&event_to_value(key(KeyCode::Enter, KeyModifiers::NONE)), "key"), "Enter");
-        assert_eq!(field_str(&event_to_value(key(KeyCode::Up, KeyModifiers::NONE)), "key"), "Up");
-        assert_eq!(field_str(&event_to_value(key(KeyCode::Esc, KeyModifiers::NONE)), "key"), "Esc");
-        assert_eq!(field_str(&event_to_value(key(KeyCode::Tab, KeyModifiers::NONE)), "key"), "Tab");
-        assert_eq!(field_str(&event_to_value(key(KeyCode::F(5), KeyModifiers::NONE)), "key"), "F5");
-        assert_eq!(field_str(&event_to_value(key(KeyCode::PageDown, KeyModifiers::NONE)), "key"), "PageDown");
+        assert_eq!(
+            field_str(
+                &event_to_value(key(KeyCode::Enter, KeyModifiers::NONE)),
+                "key"
+            ),
+            "Enter"
+        );
+        assert_eq!(
+            field_str(&event_to_value(key(KeyCode::Up, KeyModifiers::NONE)), "key"),
+            "Up"
+        );
+        assert_eq!(
+            field_str(
+                &event_to_value(key(KeyCode::Esc, KeyModifiers::NONE)),
+                "key"
+            ),
+            "Esc"
+        );
+        assert_eq!(
+            field_str(
+                &event_to_value(key(KeyCode::Tab, KeyModifiers::NONE)),
+                "key"
+            ),
+            "Tab"
+        );
+        assert_eq!(
+            field_str(
+                &event_to_value(key(KeyCode::F(5), KeyModifiers::NONE)),
+                "key"
+            ),
+            "F5"
+        );
+        assert_eq!(
+            field_str(
+                &event_to_value(key(KeyCode::PageDown, KeyModifiers::NONE)),
+                "key"
+            ),
+            "PageDown"
+        );
     }
 
     #[test]
     fn event_key_modifiers_combine() {
-        let v = event_to_value(key(KeyCode::Char('Z'), KeyModifiers::ALT | KeyModifiers::SHIFT));
+        let v = event_to_value(key(
+            KeyCode::Char('Z'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
         assert_eq!(field_str(&v, "key"), "Z");
         assert!(!field_bool(&v, "ctrl"));
         assert!(field_bool(&v, "alt"));
@@ -1576,15 +1680,13 @@ print("[" + term.dumpRow(0) + "]")
         // On a non-tty (CI), poll(0ms) returns Ok(false) (→ [nil, nil]) or Err (→ a
         // Tier-1 [nil, {message}]); either is fine. The point: it returns promptly
         // with no event (no panic, no hang). `err` is nil or an error object.
-        let out = run(
-            r#"
+        let out = run(r#"
 import { init } from "std/tui"
 let [term, _] = init()
 let [ev, err] = term.pollEvent(0)
 print(ev == nil)
 print(err == nil || type(err) == "object")
-"#,
-        )
+"#)
         .await;
         assert_eq!(out, "true\ntrue\n");
     }
@@ -1608,6 +1710,10 @@ term.text(0, 0, "x", { fg: "banana" })
 "#,
         )
         .await;
-        assert!(msg.contains("banana") || msg.contains("color"), "got: {}", msg);
+        assert!(
+            msg.contains("banana") || msg.contains("color"),
+            "got: {}",
+            msg
+        );
     }
 }
