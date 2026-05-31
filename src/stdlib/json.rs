@@ -130,6 +130,66 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
     }
 }
 
+/// AScript Value -> serde_json::Value, TOTAL: never errors. Cycles → "[Circular]",
+/// non-finite numbers → null, functions/native → "<function>"/"<type>". Used by
+/// std/log so a logging call never crashes the program.
+pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Nil => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::Number(n) => {
+            if !n.is_finite() { return J::Null; }
+            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
+                J::Number(serde_json::Number::from(*n as i64))
+            } else {
+                serde_json::Number::from_f64(*n).map(J::Number).unwrap_or(J::Null)
+            }
+        }
+        Value::Str(s) => J::String(s.to_string()),
+        Value::Array(a) => {
+            let ptr = Rc::as_ptr(a) as usize;
+            if seen.contains(&ptr) { return J::String("[Circular]".into()); }
+            seen.push(ptr);
+            let out = a.borrow().iter().map(|x| to_json_lossy(x, seen)).collect();
+            seen.pop();
+            J::Array(out)
+        }
+        Value::Object(o) => {
+            let ptr = Rc::as_ptr(o) as usize;
+            if seen.contains(&ptr) { return J::String("[Circular]".into()); }
+            seen.push(ptr);
+            let mut m = serde_json::Map::new();
+            for (k, val) in o.borrow().iter() { m.insert(k.clone(), to_json_lossy(val, seen)); }
+            seen.pop();
+            J::Object(m)
+        }
+        Value::Instance(i) => {
+            let ptr = Rc::as_ptr(i) as usize;
+            if seen.contains(&ptr) { return J::String("[Circular]".into()); }
+            seen.push(ptr);
+            let mut m = serde_json::Map::new();
+            for (k, val) in i.borrow().fields.iter() { m.insert(k.clone(), to_json_lossy(val, seen)); }
+            seen.pop();
+            J::Object(m)
+        }
+        Value::Map(mp) => {
+            let ptr = Rc::as_ptr(mp) as usize;
+            if seen.contains(&ptr) { return J::String("[Circular]".into()); }
+            seen.push(ptr);
+            let mut m = serde_json::Map::new();
+            for (k, val) in mp.borrow().iter() {
+                let key = match k.to_value() { Value::Str(s) => s.to_string(), other => other.to_string() };
+                m.insert(key, to_json_lossy(val, seen));
+            }
+            seen.pop();
+            J::Object(m)
+        }
+        Value::Function(_) | Value::Builtin(_) => J::String("<function>".into()),
+        other => J::String(format!("<{}>", crate::interp::type_name(other))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +227,15 @@ mod tests {
         let f = Value::Builtin("print".into());
         let err = call("stringify", std::slice::from_ref(&f), sp()).unwrap();
         assert!(err.to_string().starts_with("[nil, {message:"));
+    }
+
+    #[test]
+    fn lossy_serializer_never_errors() {
+        let a = Value::Array(Rc::new(RefCell::new(vec![])));
+        if let Value::Array(inner) = &a { inner.borrow_mut().push(a.clone()); }
+        assert_eq!(to_json_lossy(&a, &mut Vec::new()).to_string(), "[\"[Circular]\"]");
+        assert_eq!(to_json_lossy(&Value::Builtin("print".into()), &mut Vec::new()).to_string(), "\"<function>\"");
+        assert_eq!(to_json_lossy(&Value::Number(f64::NAN), &mut Vec::new()), serde_json::Value::Null);
     }
 
     #[test]
