@@ -4,6 +4,14 @@ use crate::error::AsError;
 use crate::span::Span;
 use crate::token::{Tok, Token};
 
+/// Lexer error message raised when a quoted string scan runs off the end of
+/// input. Shared with `repl::is_unterminated_at_eof` so the message and the
+/// "keep buffering" check have a single source of truth.
+pub const ERR_UNTERMINATED_STRING: &str = "unterminated string";
+/// Lexer error message raised when a template scan runs off the end of input.
+/// Shared with `repl::is_unterminated_at_eof` (see `ERR_UNTERMINATED_STRING`).
+pub const ERR_UNTERMINATED_TEMPLATE: &str = "unterminated template string";
+
 enum TemplateChunk {
     Full,  // `...`           (no interpolation)
     Start, // `...${          (more follows)
@@ -53,7 +61,7 @@ fn lex_quoted(
         s.push(c);
         *i += 1;
     }
-    Err(AsError::at("unterminated string", Span::new(start, *i)))
+    Err(AsError::at(ERR_UNTERMINATED_STRING, Span::new(start, *i)))
 }
 
 /// Read template text starting just after a backtick (or after `}` that closes
@@ -91,7 +99,7 @@ fn lex_template_chunk(
         text.push(c);
         *i += 1;
     }
-    Err(AsError::at("unterminated template string", Span::new(start, *i)))
+    Err(AsError::at(ERR_UNTERMINATED_TEMPLATE, Span::new(start, *i)))
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {

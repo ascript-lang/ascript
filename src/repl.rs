@@ -31,6 +31,14 @@ fn is_incomplete(src: &str) -> bool {
                 match t.tok {
                     Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
                     Tok::RBrace | Tok::RParen | Tok::RBracket => depth -= 1,
+                    // A template with an OPEN interpolation lexes Ok (e.g. `${`
+                    // → `TemplateStart` with no closing brace), so balance it
+                    // like a delimiter. A COMPLETE template nets to 0:
+                    // `a ${x} b` is Start(+1)..End(-1); a multi-interp
+                    // `a${x}b${y}c` is Start(+1)..Middle(0)..End(-1).
+                    Tok::TemplateStart(_) => depth += 1, // opened an interpolation
+                    Tok::TemplateEnd(_) => depth -= 1,   // closed the last interpolation
+                    Tok::TemplateMiddle(_) => {}         // closes one + opens one → net 0
                     _ => {}
                 }
             }
@@ -48,7 +56,8 @@ fn is_incomplete(src: &str) -> bool {
 /// than hang). Note: an unterminated *block comment* is intentionally NOT
 /// treated as incomplete here (spec: string/template at EOF only).
 fn is_unterminated_at_eof(e: &AsError, _src: &str) -> bool {
-    e.message == "unterminated string" || e.message == "unterminated template string"
+    e.message == crate::lexer::ERR_UNTERMINATED_STRING
+        || e.message == crate::lexer::ERR_UNTERMINATED_TEMPLATE
 }
 
 /// Run the interactive REPL until EOF (Ctrl-D) or Ctrl-C.
@@ -104,7 +113,12 @@ async fn run_tty(interp: &Interp, env: &Environment) -> std::io::Result<()> {
                     continue;
                 }
             }
-            Err(ReadlineError::Eof) => break,
+            Err(ReadlineError::Eof) => {
+                if !buf.is_empty() {
+                    eprintln!("(discarded incomplete input)");
+                }
+                break;
+            }
             Err(e) => {
                 return Err(std::io::Error::other(e.to_string()));
             }
@@ -225,5 +239,11 @@ mod tests {
         assert!(!is_incomplete("}")); // too many closers → not incomplete (real error)
         assert!(is_incomplete("let s = `hello")); // unterminated template → incomplete
         assert!(!is_incomplete("let s = `a ${x} b`")); // complete template w/ braces → balanced
+        // Open interpolation. `${` and `${x` lex Ok as TemplateStart with no
+        // closing brace → caught by the TemplateStart depth bump. `a${x}b`
+        // lexes Err-unterminated → caught by is_unterminated_at_eof.
+        assert!(is_incomplete("let f = `${"));
+        assert!(is_incomplete("let f = `a${x}b")); // open second interp / unterminated tail
+        assert!(!is_incomplete("let s = `a${x}b${y}c`")); // complete multi-interp → balanced
     }
 }

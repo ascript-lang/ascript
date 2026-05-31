@@ -32,16 +32,16 @@ ascript repl
 ```
 
 ```text
-> let xs = [1, 2, 3]
-> import * as array from "std/array"
-> array.reduce(xs, (a, b) => a + b, 0)
+>> let xs = [1, 2, 3]
+>> import * as array from "std/array"
+>> array.reduce(xs, (a, b) => a + b, 0)
 6
-> class Point {
+>> class Point {
 ..   x: number
 ..   y: number
 .. }
-> let p = Point.from({x: 3, y: 4})
-> p.x + p.y
+>> let p = Point.from({x: 3, y: 4})
+>> p.x + p.y
 7
 ```
 
