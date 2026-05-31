@@ -575,8 +575,20 @@ impl<'a> Parser<'a> {
             self.advance(); // consume '['
             let mut names = Vec::new();
             let mut name_spans = Vec::new();
+            let mut rest: Option<(String, Span)> = None;
             if *self.peek() != Tok::RBracket {
                 loop {
+                    if *self.peek() == Tok::DotDotDot {
+                        self.advance();
+                        let rspan = self.span();
+                        let rname = match self.advance() {
+                            Tok::Ident(n) => n,
+                            other => return Err(AsError::at(format!("expected a name after '...', found {:?}", other), self.tokens[self.pos - 1].span)),
+                        };
+                        rest = Some((rname, rspan));
+                        if *self.peek() == Tok::Comma { return Err(AsError::at("a rest element must be last", rspan)); }
+                        break;
+                    }
                     let span = self.span();
                     match self.advance() {
                         Tok::Ident(n) => {
@@ -600,7 +612,7 @@ impl<'a> Parser<'a> {
             self.eat(&Tok::Eq)?;
             let value = self.expr()?;
             let span = Span::new(start, self.prev_end());
-            return Ok(Stmt::LetDestructure { names, value, mutable, span, name_spans });
+            return Ok(Stmt::LetDestructure { names, rest, value, mutable, span, name_spans });
         }
         // `let {a, b as local} = expr` — object destructuring binding.
         if *self.peek() == Tok::LBrace {

@@ -214,9 +214,18 @@ fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol
                 None,
             ));
         }
-        Stmt::LetDestructure { names, mutable, span, name_spans, .. } => {
+        Stmt::LetDestructure { names, rest, mutable, span, name_spans, .. } => {
             let kind = if *mutable { SymbolKind::VARIABLE } else { SymbolKind::CONSTANT };
             for (name, nspan) in names.iter().zip(name_spans.iter()) {
+                out.push(symbol(
+                    name.clone(),
+                    kind,
+                    span_range(*span, index),
+                    span_range(*nspan, index),
+                    None,
+                ));
+            }
+            if let Some((name, nspan)) = rest {
                 out.push(symbol(
                     name.clone(),
                     kind,
@@ -601,8 +610,13 @@ fn local_let_before(body: &[Stmt], name: &str, offset: usize) -> Option<Span> {
             Stmt::Let { name: n, name_span, .. } if n == name && name_span.start <= offset => {
                 found = Some(*name_span);
             }
-            Stmt::LetDestructure { names, name_spans, .. } => {
+            Stmt::LetDestructure { names, rest, name_spans, .. } => {
                 for (n, s) in names.iter().zip(name_spans.iter()) {
+                    if n == name && s.start <= offset {
+                        found = Some(*s);
+                    }
+                }
+                if let Some((n, s)) = rest {
                     if n == name && s.start <= offset {
                         found = Some(*s);
                     }
@@ -641,11 +655,16 @@ fn collect_decl_name_span(stmt: &Stmt, name: &str, out: &mut Option<Span>) {
                 *out = Some(*name_span);
             }
         }
-        Stmt::LetDestructure { names, name_spans, .. } => {
+        Stmt::LetDestructure { names, rest, name_spans, .. } => {
             for (n, s) in names.iter().zip(name_spans.iter()) {
                 if n == name {
                     *out = Some(*s);
                     return;
+                }
+            }
+            if let Some((n, s)) = rest {
+                if n == name {
+                    *out = Some(*s);
                 }
             }
         }

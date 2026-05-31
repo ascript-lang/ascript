@@ -586,7 +586,7 @@ impl Interp {
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::LetDestructure { names, value, mutable, .. } => {
+            Stmt::LetDestructure { names, rest, value, mutable, .. } => {
                 let v = self.eval_expr(value, env).await?;
                 let items = match v {
                     Value::Array(a) => a.borrow().clone(),
@@ -601,6 +601,11 @@ impl Interp {
                 for (i, name) in names.iter().enumerate() {
                     let elem = items.get(i).cloned().unwrap_or(Value::Nil);
                     env.define(name, elem, *mutable).map_err(AsError::new)?;
+                }
+                if let Some((rest_name, _)) = rest {
+                    let tail: Vec<Value> = items.iter().skip(names.len()).cloned().collect();
+                    let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(tail)));
+                    env.define(rest_name, arr, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
             }
@@ -2218,7 +2223,11 @@ fn exported_names(stmt: &Stmt) -> Vec<String> {
         Stmt::Fn { name, .. } => vec![name.clone()],
         Stmt::Class { name, .. } => vec![name.clone()],
         Stmt::Enum { name, .. } => vec![name.clone()],
-        Stmt::LetDestructure { names, .. } => names.clone(),
+        Stmt::LetDestructure { names, rest, .. } => {
+            let mut v = names.clone();
+            if let Some((r, _)) = rest { v.push(r.clone()); }
+            v
+        }
         Stmt::LetDestructureObject { bindings, rest, .. } => {
             let mut v: Vec<String> = bindings.iter().map(|b| b.binding.clone()).collect();
             if let Some((r, _)) = rest { v.push(r.clone()); }
@@ -2463,6 +2472,12 @@ print(y)
     async fn object_destructuring_on_non_object_panics() {
         let err = run_err(r#"let {a} = 5"#).await;
         assert!(err.message.contains("cannot destructure a non-object"));
+    }
+
+    #[tokio::test]
+    async fn array_rest_destructuring() {
+        let out = run("let [first, ...others] = [1, 2, 3, 4]\nprint(first)\nprint(others)\nlet [only, ...none] = [9]\nprint(none)").await;
+        assert_eq!(out, "1\n[2, 3, 4]\n[]\n");
     }
 
     #[tokio::test]

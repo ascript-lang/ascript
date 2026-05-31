@@ -182,6 +182,8 @@ pub enum Stmt {
     /// declaration.
     LetDestructure {
         names: Vec<String>,
+        /// Optional `...name` collector for trailing elements (`let [a, ...rest] = arr`).
+        rest: Option<(String, Span)>,
         value: Expr,
         mutable: bool,
         span: Span,

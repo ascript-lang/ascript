@@ -86,11 +86,15 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             }
             out.push('\n');
         }
-        Stmt::LetDestructure { names, value, mutable, .. } => {
+        Stmt::LetDestructure { names, rest, value, mutable, .. } => {
             indent(out, level);
             out.push_str(if *mutable { "let " } else { "const " });
             out.push('[');
-            out.push_str(&names.join(", "));
+            let mut parts: Vec<String> = names.clone();
+            if let Some((rest_name, _)) = rest {
+                parts.push(format!("...{rest_name}"));
+            }
+            out.push_str(&parts.join(", "));
             out.push_str("] = ");
             write_expr(out, value, 0);
             out.push('\n');
@@ -883,6 +887,12 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn array_rest_destructuring_round_trips() {
+        let src = "let [a, ...rest] = xs\n";
+        assert_eq!(format_source(src).unwrap(), src);
     }
 
     #[test]
