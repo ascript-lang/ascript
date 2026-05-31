@@ -915,8 +915,35 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// Postfix Result operators `?` (propagate) and `!` (force-unwrap). They sit
+    /// LOOSER than `await`/unary but TIGHTER than every binary operator, so
+    /// `await x!` parses as `(await x)!` and `a! + b` as `(a!) + b`. Left-assoc.
+    fn unwrap_tier(&mut self) -> Result<Expr, AsError> {
+        let mut expr = self.unary()?;
+        loop {
+            match self.peek() {
+                Tok::Question => {
+                    // Leave a ternary `?` for `ternary()` higher up.
+                    if self.question_begins_ternary() {
+                        break;
+                    }
+                    self.advance();
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
+                }
+                Tok::Bang => {
+                    self.advance();
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Unwrap(Box::new(expr)), span };
+                }
+                _ => break,
+            }
+        }
+        Ok(expr)
+    }
+
     fn exponent(&mut self) -> Result<Expr, AsError> {
-        let base = self.unary()?;
+        let base = self.unwrap_tier()?;
         if *self.peek() == Tok::StarStar {
             self.advance();
             // right-associative: 2 ** 3 ** 2 == 2 ** (3 ** 2)
@@ -1017,16 +1044,6 @@ impl<'a> Parser<'a> {
                     };
                     let span = Span::new(expr.span.start, self.prev_end());
                     expr = Expr { kind: ExprKind::OptMember { object: Box::new(expr), name }, span };
-                }
-                Tok::Question => {
-                    // `?` is overloaded: postfix `Try` here, or the start of a
-                    // ternary. Defer the latter to `ternary()` by leaving it.
-                    if self.question_begins_ternary() {
-                        break;
-                    }
-                    self.advance();
-                    let span = Span::new(expr.span.start, self.prev_end());
-                    expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
                 }
                 _ => break,
             }
@@ -1451,6 +1468,26 @@ mod tests {
             Stmt::ForOf { for_await, .. } => assert!(!for_await),
             other => panic!("expected a plain for-of, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unwrap_and_propagate_bind_looser_than_await() {
+        // `!` and `?` apply to the resolved value, not the future.
+        assert_eq!(sexpr("await f()!"), "(unwrap (await (call f)))");
+        assert_eq!(sexpr("await f()?"), "(? (await (call f)))");
+    }
+
+    #[test]
+    fn unwrap_binds_tighter_than_binary() {
+        assert_eq!(sexpr("a! + b"), "(+ (unwrap a) b)");
+        assert_eq!(sexpr("f()?"), "(? (call f))");
+    }
+
+    #[test]
+    fn ternary_still_disambiguates_from_propagate() {
+        // A `?` followed by `:` is still a ternary, not a Try.
+        assert_eq!(sexpr("a ? b : c"), "(?: a b c)");
+        assert_eq!(sexpr("g()? ? a : b"), "(?: (? (call g)) a b)");
     }
 
     #[test]
