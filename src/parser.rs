@@ -1795,6 +1795,15 @@ mod tests {
     }
 
     #[test]
+    fn class_body_semicolon_edge_cases() {
+        assert!(parse(&lex("class C {}").unwrap()).is_ok()); // empty
+        assert!(parse(&lex("class C { ; x: number }").unwrap()).is_ok()); // leading ;
+        assert!(parse(&lex("class C { ; ; }").unwrap()).is_ok()); // only ;
+        assert!(parse(&lex("class C { a: number;; b: number }").unwrap()).is_ok()); // doubled ;;
+        assert!(parse(&lex("class C { fn a() {}; }").unwrap()).is_ok()); // trailing ;
+    }
+
+    #[test]
     fn class_with_semicolons_formats_to_newlines() {
         let out = crate::fmt::format_source("class P { x: number; y: number }").unwrap();
         assert!(out.contains("x: number\n"), "got: {out}");

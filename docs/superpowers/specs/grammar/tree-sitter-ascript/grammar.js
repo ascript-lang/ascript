@@ -203,9 +203,10 @@ module.exports = grammar({
       optional(seq('extends', field('superclass', $.identifier))),
       field('body', $.class_body),
     ),
-    // `;` is an optional separator between (and after) class members, mirroring
-    // the hand-written parser's `skip_semicolons` in class bodies.
-    class_body: $ => seq('{', repeat(seq($.class_member, optional(';'))), '}'),
+    // `;` is an optional run before the first member and after each member,
+    // mirroring the hand-written parser's `skip_semicolons` in class bodies
+    // (leading `;`, doubled `;;`, and only-`;` bodies are all accepted).
+    class_body: $ => seq('{', repeat(';'), repeat(seq($.class_member, repeat(';'))), '}'),
     class_member: $ => choice($.field_declaration, $.method_definition),
     field_declaration: $ => seq(
       field('name', $.identifier),
