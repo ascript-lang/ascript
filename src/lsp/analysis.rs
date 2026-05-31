@@ -226,6 +226,27 @@ fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol
                 ));
             }
         }
+        Stmt::LetDestructureObject { bindings, rest, mutable, span, .. } => {
+            let kind = if *mutable { SymbolKind::VARIABLE } else { SymbolKind::CONSTANT };
+            for b in bindings {
+                out.push(symbol(
+                    b.binding.clone(),
+                    kind,
+                    span_range(*span, index),
+                    span_range(b.binding_span, index),
+                    None,
+                ));
+            }
+            if let Some((name, nspan)) = rest {
+                out.push(symbol(
+                    name.clone(),
+                    kind,
+                    span_range(*span, index),
+                    span_range(*nspan, index),
+                    None,
+                ));
+            }
+        }
         _ => {}
     }
 }
@@ -587,6 +608,18 @@ fn local_let_before(body: &[Stmt], name: &str, offset: usize) -> Option<Span> {
                     }
                 }
             }
+            Stmt::LetDestructureObject { bindings, rest, .. } => {
+                for b in bindings {
+                    if b.binding == name && b.binding_span.start <= offset {
+                        found = Some(b.binding_span);
+                    }
+                }
+                if let Some((n, s)) = rest {
+                    if n == name && s.start <= offset {
+                        found = Some(*s);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -613,6 +646,19 @@ fn collect_decl_name_span(stmt: &Stmt, name: &str, out: &mut Option<Span>) {
                 if n == name {
                     *out = Some(*s);
                     return;
+                }
+            }
+        }
+        Stmt::LetDestructureObject { bindings, rest, .. } => {
+            for b in bindings {
+                if b.binding == name {
+                    *out = Some(b.binding_span);
+                    return;
+                }
+            }
+            if let Some((n, s)) = rest {
+                if n == name {
+                    *out = Some(*s);
                 }
             }
         }
