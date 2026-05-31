@@ -3,7 +3,7 @@
 use crate::ast::{ArrowBody, BinOp, Expr, ExprKind, Stmt, UnOp};
 use crate::error::AsError;
 use crate::span::Span;
-use crate::token::{Tok, Token};
+use crate::token::{is_ident_like, Tok, Token};
 
 pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>, AsError> {
     let mut parser = Parser { tokens, pos: 0 };
@@ -432,6 +432,12 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if *self.peek() != Tok::RParen {
             loop {
+                let is_rest = if *self.peek() == Tok::DotDotDot {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
                 let name = match self.advance() {
                     Tok::Ident(name) => name,
                     other => {
@@ -448,7 +454,13 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                params.push(crate::ast::Param { name, ty, name_span });
+                params.push(crate::ast::Param { name, ty, name_span, rest: is_rest });
+                if is_rest {
+                    if *self.peek() == Tok::Comma {
+                        return Err(AsError::at("a rest parameter must be last", name_span));
+                    }
+                    break;
+                }
                 if *self.peek() == Tok::Comma {
                     self.advance();
                     if *self.peek() == Tok::RParen {
@@ -563,8 +575,20 @@ impl<'a> Parser<'a> {
             self.advance(); // consume '['
             let mut names = Vec::new();
             let mut name_spans = Vec::new();
+            let mut rest: Option<(String, Span)> = None;
             if *self.peek() != Tok::RBracket {
                 loop {
+                    if *self.peek() == Tok::DotDotDot {
+                        self.advance();
+                        let rspan = self.span();
+                        let rname = match self.advance() {
+                            Tok::Ident(n) => n,
+                            other => return Err(AsError::at(format!("expected a name after '...', found {:?}", other), self.tokens[self.pos - 1].span)),
+                        };
+                        rest = Some((rname, rspan));
+                        if *self.peek() == Tok::Comma { return Err(AsError::at("a rest element must be last", rspan)); }
+                        break;
+                    }
                     let span = self.span();
                     match self.advance() {
                         Tok::Ident(n) => {
@@ -588,7 +612,64 @@ impl<'a> Parser<'a> {
             self.eat(&Tok::Eq)?;
             let value = self.expr()?;
             let span = Span::new(start, self.prev_end());
-            return Ok(Stmt::LetDestructure { names, value, mutable, span, name_spans });
+            return Ok(Stmt::LetDestructure { names, rest, value, mutable, span, name_spans });
+        }
+        // `let {a, b as local} = expr` — object destructuring binding.
+        if *self.peek() == Tok::LBrace {
+            self.advance(); // consume '{'
+            let mut bindings = Vec::new();
+            let mut rest: Option<(String, Span)> = None;
+            if *self.peek() != Tok::RBrace {
+                loop {
+                    if *self.peek() == Tok::DotDotDot {
+                        self.advance();
+                        let rspan = self.span();
+                        let rname = match self.advance() {
+                            Tok::Ident(n) => n,
+                            other => return Err(AsError::at(format!("expected a name after '...', found {:?}", other), self.tokens[self.pos - 1].span)),
+                        };
+                        rest = Some((rname, rspan));
+                        if *self.peek() == Tok::Comma { return Err(AsError::at("a rest element must be last", rspan)); }
+                        break;
+                    }
+                    let key_span = self.span();
+                    let key = match self.advance() {
+                        Tok::Ident(n) => n,
+                        Tok::Str(s) => s,
+                        other => return Err(AsError::at(
+                            format!("expected a key in object pattern, found {:?}", other),
+                            self.tokens[self.pos - 1].span)),
+                    };
+                    let (binding, binding_span) =
+                        if matches!(self.peek(), Tok::Ident(s) if s == "as") {
+                            self.advance();
+                            let bspan = self.span();
+                            match self.advance() {
+                                Tok::Ident(b) => (b, bspan),
+                                other => return Err(AsError::at(
+                                    format!("expected a local name after 'as', found {:?}", other),
+                                    self.tokens[self.pos - 1].span)),
+                            }
+                        } else {
+                            if !is_ident_like(&key) {
+                                return Err(AsError::at(
+                                    format!("key {:?} is not a valid binding name; use `as`", key),
+                                    key_span));
+                            }
+                            (key.clone(), key_span)
+                        };
+                    bindings.push(crate::ast::ObjBinding { key, binding, key_span, binding_span });
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                        if *self.peek() == Tok::RBrace { break; }
+                    } else { break; }
+                }
+            }
+            self.eat(&Tok::RBrace)?;
+            self.eat(&Tok::Eq)?;
+            let value = self.expr()?;
+            let span = Span::new(start, self.prev_end());
+            return Ok(Stmt::LetDestructureObject { bindings, rest, value, mutable, span });
         }
         let name_span = self.span();
         let name = match self.advance() {
@@ -734,7 +815,7 @@ impl<'a> Parser<'a> {
                 let end = self.prev_end();
                 return Ok(Some(Expr {
                     kind: ExprKind::Arrow {
-                        params: vec![crate::ast::Param { name, ty: None, name_span }],
+                        params: vec![crate::ast::Param { name, ty: None, name_span, rest: false }],
                         body: Box::new(body),
                         is_async,
                         is_generator: false,
@@ -1024,7 +1105,12 @@ impl<'a> Parser<'a> {
                     let mut args = Vec::new();
                     if *self.peek() != Tok::RParen {
                         loop {
-                            args.push(self.expr()?);
+                            if *self.peek() == Tok::DotDotDot {
+                                self.advance();
+                                args.push(crate::ast::CallArg::Spread(self.expr()?));
+                            } else {
+                                args.push(crate::ast::CallArg::Pos(self.expr()?));
+                            }
                             if *self.peek() == Tok::Comma {
                                 self.advance();
                                 if *self.peek() == Tok::RParen {
@@ -1104,7 +1190,12 @@ impl<'a> Parser<'a> {
                 let mut items = Vec::new();
                 if *self.peek() != Tok::RBracket {
                     loop {
-                        items.push(self.expr()?);
+                        if *self.peek() == Tok::DotDotDot {
+                            self.advance();
+                            items.push(crate::ast::ArrayElem::Spread(self.expr()?));
+                        } else {
+                            items.push(crate::ast::ArrayElem::Item(self.expr()?));
+                        }
                         if *self.peek() == Tok::Comma {
                             self.advance();
                             if *self.peek() == Tok::RBracket {
@@ -1123,19 +1214,24 @@ impl<'a> Parser<'a> {
                 let mut entries = Vec::new();
                 if *self.peek() != Tok::RBrace {
                     loop {
-                        let key = match self.advance() {
-                            Tok::Ident(name) => name,
-                            Tok::Str(s) => s,
-                            other => {
-                                return Err(AsError::at(
-                                    format!("expected object key, found {:?}", other),
-                                    self.tokens[self.pos - 1].span,
-                                ))
-                            }
-                        };
-                        self.eat(&Tok::Colon)?;
-                        let value = self.expr()?;
-                        entries.push((key, value));
+                        if *self.peek() == Tok::DotDotDot {
+                            self.advance();
+                            entries.push(crate::ast::ObjEntry::Spread(self.expr()?));
+                        } else {
+                            let key = match self.advance() {
+                                Tok::Ident(name) => name,
+                                Tok::Str(s) => s,
+                                other => {
+                                    return Err(AsError::at(
+                                        format!("expected object key, found {:?}", other),
+                                        self.tokens[self.pos - 1].span,
+                                    ))
+                                }
+                            };
+                            self.eat(&Tok::Colon)?;
+                            let value = self.expr()?;
+                            entries.push(crate::ast::ObjEntry::KV(key, value));
+                        }
                         if *self.peek() == Tok::Comma {
                             self.advance();
                             if *self.peek() == Tok::RBrace {
@@ -1265,6 +1361,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_rest_param_typed_and_untyped() {
+        match &parse(&lex("fn f(a, ...rest: array<number>) {}").unwrap()).unwrap()[0] {
+            Stmt::Fn { params, .. } => {
+                assert_eq!(params.len(), 2);
+                assert!(!params[0].rest);
+                assert!(params[1].rest);
+                assert_eq!(params[1].ty.as_ref().unwrap().to_string(), "array<number>");
+            }
+            o => panic!("got {o:?}"),
+        }
+        match &parse(&lex("fn g(...rest) {}").unwrap()).unwrap()[0] {
+            Stmt::Fn { params, .. } => assert!(params[0].rest && params[0].ty.is_none()),
+            o => panic!("got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn rest_param_must_be_last() {
+        assert!(parse(&lex("fn f(...rest, a) {}").unwrap()).is_err());
+    }
+
+    #[test]
     fn parses_array_destructuring_let() {
         let toks = lex("let [a, b] = pair").unwrap();
         let prog = parse(&toks).unwrap();
@@ -1275,6 +1393,35 @@ mod tests {
             }
             other => panic!("expected LetDestructure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_object_destructuring_shorthand_and_rename() {
+        let p = parse(&lex("let {a, b as local} = obj").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::LetDestructureObject { bindings, mutable, .. } => {
+                assert!(*mutable);
+                assert_eq!(bindings[0].key, "a"); assert_eq!(bindings[0].binding, "a");
+                assert_eq!(bindings[1].key, "b"); assert_eq!(bindings[1].binding, "local");
+            }
+            other => panic!("expected LetDestructureObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_object_destructuring_quoted_key() {
+        let p = parse(&lex(r#"let {"weird key" as wk} = obj"#).unwrap()).unwrap();
+        match &p[0] {
+            Stmt::LetDestructureObject { bindings, .. } => {
+                assert_eq!(bindings[0].key, "weird key"); assert_eq!(bindings[0].binding, "wk");
+            }
+            other => panic!("expected LetDestructureObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_destructuring_quoted_shorthand_is_error() {
+        assert!(parse(&lex(r#"let {"weird key"} = obj"#).unwrap()).is_err());
     }
 
     #[test]
@@ -1300,6 +1447,13 @@ mod tests {
         assert!(parse(&lex("let r: Result<string> = Ok(\"x\")").unwrap()).is_ok());
         assert!(parse(&lex("let u: number | nil = nil").unwrap()).is_ok());
         assert!(parse(&lex("let t: [number, string] = [1, \"a\"]").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn parses_spread_in_array_object_call() {
+        assert!(parse(&lex("let a = [...x, 1]").unwrap()).is_ok());
+        assert!(parse(&lex("let o = {...x, k: 1}").unwrap()).is_ok());
+        assert!(parse(&lex("f(...args, 2)").unwrap()).is_ok());
     }
 
     #[test]

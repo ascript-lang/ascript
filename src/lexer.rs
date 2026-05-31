@@ -243,7 +243,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 }
             }
             '.' => {
-                if i + 1 < chars.len() && chars[i + 1] == '.' {
+                if i + 2 < chars.len() && chars[i + 1] == '.' && chars[i + 2] == '.' {
+                    tokens.push(Token { tok: Tok::DotDotDot, span: Span::new(start, start + 3) });
+                    i += 3;
+                } else if i + 1 < chars.len() && chars[i + 1] == '.' {
                     tokens.push(Token { tok: Tok::DotDot, span: Span::new(start, start + 2) });
                     i += 2;
                 } else {
@@ -729,6 +732,15 @@ mod tests {
             kinds("0..5"),
             vec![Tok::Number(0.0), Tok::DotDot, Tok::Number(5.0), Tok::Eof]
         );
+    }
+
+    #[test]
+    fn lexes_triple_dot_as_spread_not_two_dots() {
+        let toks = lex("...x").unwrap();
+        assert_eq!(toks[0].tok, Tok::DotDotDot);
+        assert!(matches!(toks[1].tok, Tok::Ident(ref s) if s == "x"));
+        let r = lex("0..5").unwrap();
+        assert_eq!(r[1].tok, Tok::DotDot);
     }
 
     #[test]

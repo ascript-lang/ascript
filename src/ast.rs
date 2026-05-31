@@ -19,12 +19,12 @@ pub enum ExprKind {
     Ident(String),
     Unary { op: UnOp, expr: Box<Expr> },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<Expr> },
+    Call { callee: Box<Expr>, args: Vec<CallArg> },
     Assign { target: Box<Expr>, value: Box<Expr> },
     Arrow { params: Vec<Param>, body: Box<ArrowBody>, is_async: bool, is_generator: bool },
-    Array(Vec<Expr>),
+    Array(Vec<ArrayElem>),
     Index { object: Box<Expr>, index: Box<Expr> },
-    Object(Vec<(String, Expr)>),
+    Object(Vec<ObjEntry>),
     Member { object: Box<Expr>, name: String },
     OptMember { object: Box<Expr>, name: String },
     Try(Box<Expr>),
@@ -47,6 +47,31 @@ pub enum ExprKind {
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
     /// short-circuiting (spec §4, matching JS).
     Paren(Box<Expr>),
+}
+
+/// An element of an array literal: a plain item `x` or a spread `...x`.
+/// Spreading a non-array is a runtime panic (strict, no coercion).
+#[derive(Debug, Clone)]
+pub enum ArrayElem {
+    Item(Expr),
+    Spread(Expr),
+}
+
+/// An entry in an object literal: a key/value `k: v` or a spread `...o`.
+/// Object-spread is later-value-wins; `IndexMap` keeps first-seen key position.
+/// Spreading a non-object is a runtime panic (strict, no coercion).
+#[derive(Debug, Clone)]
+pub enum ObjEntry {
+    KV(String, Expr),
+    Spread(Expr),
+}
+
+/// A call argument: positional `x` or a spread `...args`.
+/// Spreading a non-array as call args is a runtime panic (strict).
+#[derive(Debug, Clone)]
+pub enum CallArg {
+    Pos(Expr),
+    Spread(Expr),
 }
 
 /// A type annotation (spec §5). Checked at runtime as a contract.
@@ -79,6 +104,21 @@ pub struct Param {
     pub ty: Option<Type>,
     /// Span of just the parameter name (for LSP go-to-definition).
     pub name_span: Span,
+    /// `true` if this is a rest parameter (`...name`), which collects trailing
+    /// arguments into an array. A rest parameter must be the last parameter.
+    pub rest: bool,
+}
+
+/// One `{key as binding}` entry in an object-destructuring pattern. `key` is the
+/// SOURCE key looked up in the value; `binding` is the local name introduced
+/// (equal to `key` for the shorthand `{key}`). `key_span` covers the key token,
+/// `binding_span` the local name (they coincide for shorthand).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjBinding {
+    pub key: String,
+    pub binding: String,
+    pub key_span: Span,
+    pub binding_span: Span,
 }
 
 impl std::fmt::Display for Type {
@@ -142,10 +182,22 @@ pub enum Stmt {
     /// declaration.
     LetDestructure {
         names: Vec<String>,
+        /// Optional `...name` collector for trailing elements (`let [a, ...rest] = arr`).
+        rest: Option<(String, Span)>,
         value: Expr,
         mutable: bool,
         span: Span,
         name_spans: Vec<Span>,
+    },
+    /// `let {a, b as local} = expr` — object destructuring (binds by key name).
+    LetDestructureObject {
+        bindings: Vec<ObjBinding>,
+        /// Optional trailing `...name` rest collector — gathers the leftover keys
+        /// (those not named by `bindings`) into a new object.
+        rest: Option<(String, Span)>,
+        value: Expr,
+        mutable: bool,
+        span: Span,
     },
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },
@@ -290,7 +342,10 @@ impl fmt::Display for ExprKind {
             ExprKind::Call { callee, args } => {
                 write!(f, "(call {}", callee)?;
                 for a in args {
-                    write!(f, " {}", a)?;
+                    match a {
+                        CallArg::Pos(x) => write!(f, " {}", x)?,
+                        CallArg::Spread(x) => write!(f, " ...{}", x)?,
+                    }
                 }
                 write!(f, ")")
             }
@@ -305,18 +360,24 @@ impl fmt::Display for ExprKind {
                     if i > 0 {
                         write!(f, " ")?;
                     }
-                    write!(f, "{}", it)?;
+                    match it {
+                        ArrayElem::Item(x) => write!(f, "{}", x)?,
+                        ArrayElem::Spread(x) => write!(f, "...{}", x)?,
+                    }
                 }
                 write!(f, "]")
             }
             ExprKind::Index { object, index } => write!(f, "(index {} {})", object, index),
             ExprKind::Object(entries) => {
                 write!(f, "{{")?;
-                for (i, (k, v)) in entries.iter().enumerate() {
+                for (i, e) in entries.iter().enumerate() {
                     if i > 0 {
                         write!(f, " ")?;
                     }
-                    write!(f, "{}: {}", k, v)?;
+                    match e {
+                        ObjEntry::KV(k, v) => write!(f, "{}: {}", k, v)?,
+                        ObjEntry::Spread(x) => write!(f, "...{}", x)?,
+                    }
                 }
                 write!(f, "}}")
             }

@@ -139,9 +139,33 @@ module.exports = grammar({
       optional(';'),
     ),
 
-    // `let [a, b] = ...` array destructuring (Result returns, §6).
-    _binding_target: $ => choice($.identifier, $.array_pattern),
-    array_pattern: $ => seq('[', commaSep($.identifier), optional(','), ']'),
+    // `let [a, b] = ...` array destructuring (Result returns, §6) and
+    // `let {a, b as local, "k" as v} = ...` object destructuring.
+    _binding_target: $ => choice($.identifier, $.array_pattern, $.object_pattern),
+    // `let [a, ...xs] = ...` — a trailing `...name` collects the remaining elements.
+    array_pattern: $ => seq(
+      '[',
+      optional(choice(
+        $.rest_element,
+        seq(commaSep1($.identifier), optional(seq(',', $.rest_element)), optional(',')),
+      )),
+      ']',
+    ),
+    // `let {a, ...rest} = ...` — a trailing `...name` collects the leftover keys.
+    object_pattern: $ => seq(
+      '{',
+      optional(choice(
+        $.rest_element,
+        seq(commaSep1($.object_pattern_entry), optional(seq(',', $.rest_element)), optional(',')),
+      )),
+      '}',
+    ),
+    object_pattern_entry: $ => seq(
+      field('key', choice($.identifier, $.string)),
+      optional(seq('as', field('binding', $.identifier))),
+    ),
+    // `...name` rest collector in array/object destructuring (must be last).
+    rest_element: $ => seq('...', field('name', $.identifier)),
 
     function_declaration: $ => seq(
       optional('async'),
@@ -153,8 +177,21 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
-    parameter_list: $ => seq('(', commaSep($.parameter), optional(','), ')'),
+    parameter_list: $ => seq(
+      '(',
+      optional(choice(
+        $.rest_parameter,
+        seq(commaSep1($.parameter), optional(seq(',', $.rest_parameter)), optional(',')),
+      )),
+      ')',
+    ),
     parameter: $ => seq(
+      field('name', $.identifier),
+      optional(seq(':', field('type', $._type))),
+    ),
+    // `...name[: array<T>]` rest parameter — collects trailing args (must be last).
+    rest_parameter: $ => seq(
+      '...',
       field('name', $.identifier),
       optional(seq(':', field('type', $._type))),
     ),
@@ -341,7 +378,12 @@ module.exports = grammar({
       field('function', $._postfix_expression),
       field('arguments', $.arguments),
     )),
-    arguments: $ => seq('(', commaSep($._expression), optional(','), ')'),
+    arguments: $ => seq('(', commaSep(choice($._expression, $.spread_element)), optional(','), ')'),
+
+    // ...expr — spread into an array literal, object literal, or call args
+    // (typed-element AST in the interpreter; strict: spreading the wrong
+    // container kind is a runtime panic).
+    spread_element: $ => seq('...', $._expression),
 
     member_expression: $ => prec(PREC.postfix, seq(
       field('object', $._postfix_expression),
@@ -413,10 +455,10 @@ module.exports = grammar({
 
     parenthesized_expression: $ => seq('(', $._expression, ')'),
 
-    array_literal: $ => seq('[', commaSep($._expression), optional(','), ']'),
+    array_literal: $ => seq('[', commaSep(choice($._expression, $.spread_element)), optional(','), ']'),
 
     object_literal: $ => prec(PREC.primary, seq(
-      '{', commaSep($.object_entry), optional(','), '}',
+      '{', commaSep(choice($.object_entry, $.spread_element)), optional(','), '}',
     )),
     object_entry: $ => seq(
       field('key', choice($.identifier, $.string)),

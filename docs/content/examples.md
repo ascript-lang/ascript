@@ -69,6 +69,6 @@ ascript run examples/advanced/http_server.as
 ascript run examples/advanced/http_client.as
 ```
 
-> [!NOTE] AScript buffers a program's `print` output and flushes it when the program ends. A server
-> started with the forever-looping `serve()` therefore won't stream its log lines live — pass
-> `serve({ maxRequests: N })` if you want it to finish (and flush) after N requests.
+> [!NOTE] Under the CLI `run` command, `print` output streams live to stdout (and is retained even
+> if the program later panics). `serve({ maxRequests: N })` still lets a `serve()` loop finish
+> gracefully after N requests, but it's no longer needed just to *see* a server's log lines.

@@ -33,6 +33,76 @@ let later              // declared without an initializer; value is nil
 `const` forbids rebinding the name; it does not deep-freeze the value (a `const` array can still have
 elements pushed).
 
+### Object destructuring
+
+A `let` (or `const`) binding can pull several fields out of an object or class instance at once, by
+key name:
+
+```ascript
+let user = { name: "Ada", role: "admin", "login count": 42 }
+
+let {name, role} = user            // shorthand: binds `name` and `role`
+let {role as r} = user             // rename: binds `r` from key `role`
+let {"login count" as logins} = user  // quoted key for non-identifier names
+
+let {missing} = user               // key not present → binds nil
+```
+
+Each entry is `key` or `key as local`; the key is `Ident | Str` (quote any key that is not a bare
+identifier), and `as` renames it to a local. Missing keys bind `nil` rather than erroring.
+Destructuring works on plain `Object` values and on class instances alike:
+
+```ascript
+class Point { x: number; y: number }
+let p = Point.from({x: 3, y: 4})
+let {x, y} = p                     // x = 3, y = 4
+```
+
+### Spread
+
+`...expr` expands a collection inline in three contexts — array literals, object literals, and call
+arguments:
+
+```ascript
+let base = [1, 2, 3]
+let more = [0, ...base, 4]         // [0, 1, 2, 3, 4]
+
+let defaults = {host: "local", port: 80}
+let config = {...defaults, port: 443}  // {host: "local", port: 443}
+
+fn sum3(a, b, c) { return a + b + c }
+let nums = [10, 20, 30]
+print(sum3(...nums))               // 60
+```
+
+Spread is **strict**: an array spread (`[...x]` or `f(...x)`) requires `x` to be an array, and an
+object spread (`{...x}`) requires `x` to be an object — there is no array↔object coercion, and
+spreading the wrong container kind is a runtime panic.
+
+In an object literal, spread is **later-value-wins**: a key written after a `...` overrides the
+spread-in value, and a `...` after an explicit entry overrides that. A key keeps its **first-seen
+position** in the result (so `{...a, k: v}` updates `k` in place if `a` already had it, rather than
+moving it to the end).
+
+### Rest in destructuring
+
+A destructuring pattern may end with a `...name` rest collector that gathers whatever the named
+entries did not bind. In an array pattern it collects the trailing elements into a new array; in an
+object pattern it collects the leftover keys into a new object:
+
+```ascript
+let [head, ...tail] = [10, 20, 30]  // head = 10, tail = [20, 30]
+let [only, ...rest] = [42]          // only = 42, rest = []  (empty when nothing remains)
+
+let {id, ...meta} = {id: 7, role: "admin", active: true}
+// id = 7, meta = {role: "admin", active: true}
+```
+
+The rest collector must be **last** in the pattern. Array-rest takes the elements past the named
+positions (an empty array `[]` when there are none). Object-rest takes every source key **not already
+bound** by an earlier entry — including keys reached through `as` renames — preserving their original
+order, and is `{}` when nothing is left over.
+
 ## Operators
 
 ```text
@@ -124,6 +194,38 @@ print(next())   // 2
 
 A function may be `async` (see [Modules & async](modules-async)). Arrow functions may be async too:
 `async (x) => x + 1`.
+
+### Rest parameters
+
+A function's final parameter may be a `...name` **rest parameter** that collects any trailing
+arguments into an array:
+
+```ascript
+fn tagged(label, ...rest) {
+  print(label)   // "nums"
+  print(rest)    // [1, 2]
+}
+tagged("nums", 1, 2)
+```
+
+When no extra arguments are passed, the rest parameter binds an empty array `[]`. A rest parameter
+must be **last** — nothing may follow it. It may carry a type annotation, which is always written as
+`array<T>` and is **checked per element** against `T`:
+
+```ascript
+fn sum(...nums: array<number>) {
+  let total = 0
+  for (n in nums) { total = total + n }
+  return total
+}
+print(sum(1, 2, 3, 4))   // 10
+print(sum())             // 0
+```
+
+Rest pairs naturally with [spread](#spread) for argument forwarding — `fn wrap(...args) { return
+sum(...args) }` collects then re-expands. For `async` functions and generators (`fn*`), arity and
+contract errors on a rest parameter surface **lazily**, when the returned future or generator is
+driven, rather than at the call site.
 
 ## Template strings
 

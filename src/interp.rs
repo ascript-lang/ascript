@@ -167,6 +167,38 @@ pub(crate) enum ResourceState {
     Closed,
 }
 
+/// Where `print` output goes. `Capture` buffers it (tests, REPL, embedders read
+/// it back via `output()`); `Live` streams to stdout as produced (CLI `run`) so a
+/// long-running program shows output immediately and output is not lost if the
+/// program later panics.
+pub enum OutputSink {
+    Capture(RefCell<String>),
+    Live,
+}
+
+/// std/log severity, ordered debug<info<warn<error for level filtering.
+#[cfg(feature = "log")]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum LogLevel { Debug = 0, Info = 1, Warn = 2, Error = 3 }
+
+/// Parse the initial std/log level from the `ASCRIPT_LOG` env value
+/// (case-insensitive `debug`/`info`/`warn`/`error`). Defaults to `Info` when
+/// unset or unrecognized. Pure (no env access) so it's race-free to unit-test.
+#[cfg(feature = "log")]
+fn log_level_from_env_str(v: Option<&str>) -> LogLevel {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("debug") => LogLevel::Debug,
+        Some("info") => LogLevel::Info,
+        Some("warn") => LogLevel::Warn,
+        Some("error") => LogLevel::Error,
+        _ => LogLevel::Info,
+    }
+}
+/// std/log output format: `human` (`[WARN] msg key=val`) or `json` (one object/line).
+#[cfg(feature = "log")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat { Human, Json }
+
 /// All mutable interpreter state lives behind interior mutability (`RefCell`/
 /// `Cell`) so the `eval`/`exec`/`call_*` methods take `&self`, not `&mut self`.
 /// This lets multiple concurrent eval futures (M17 Phase 2+) share one
@@ -174,9 +206,8 @@ pub(crate) enum ResourceState {
 /// hold a `RefCell` guard across an `.await` — take the resource OUT of the table
 /// first (`take_resource`) and put it back after (`return_resource`).
 pub struct Interp {
-    /// Captured program output (what `print` writes). Read via `output()` and
-    /// flushed to stdout by the CLI.
-    output: RefCell<String>,
+    /// Where `print` output goes. See [`OutputSink`].
+    output: OutputSink,
     modules: RefCell<HashMap<PathBuf, ModuleEntry>>,
     module_dir: RefCell<PathBuf>,
     current_exports: RefCell<Rc<RefCell<HashSet<String>>>>,
@@ -200,6 +231,15 @@ pub struct Interp {
     /// High-water mark of `inflight` over the program's life. Exposed for tests
     /// that assert async-task memory stays bounded (does not scale with N).
     max_inflight: Cell<u64>,
+    /// std/log minimum level (records below it are dropped). Default `Info`.
+    #[cfg(feature = "log")]
+    log_level: std::cell::Cell<LogLevel>,
+    /// std/log output format. Default `Human`.
+    #[cfg(feature = "log")]
+    log_format: std::cell::Cell<LogFormat>,
+    /// std/log capture buffer (used under `OutputSink::Capture`, i.e. tests).
+    #[cfg(feature = "log")]
+    log_capture: RefCell<String>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -231,8 +271,18 @@ pub struct TestSummary {
 
 impl Interp {
     pub fn new() -> Self {
+        Self::with_sink(OutputSink::Capture(RefCell::new(String::new())))
+    }
+
+    /// Like [`Interp::new`] but streams `print` output to stdout immediately
+    /// (CLI `run`) instead of buffering it. See [`OutputSink`].
+    pub fn new_live() -> Self {
+        Self::with_sink(OutputSink::Live)
+    }
+
+    fn with_sink(output: OutputSink) -> Self {
         Interp {
-            output: RefCell::new(String::new()),
+            output,
             modules: RefCell::new(HashMap::new()),
             module_dir: RefCell::new(PathBuf::from(".")),
             current_exports: RefCell::new(Rc::new(RefCell::new(HashSet::new()))),
@@ -242,6 +292,12 @@ impl Interp {
             self_weak: RefCell::new(std::rc::Weak::new()),
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
+            #[cfg(feature = "log")]
+            log_level: Cell::new(log_level_from_env_str(std::env::var("ASCRIPT_LOG").ok().as_deref())),
+            #[cfg(feature = "log")]
+            log_format: Cell::new(LogFormat::Human),
+            #[cfg(feature = "log")]
+            log_capture: RefCell::new(String::new()),
         }
     }
 
@@ -290,24 +346,167 @@ impl Interp {
         self.self_weak.borrow().upgrade().expect("Interp self-ref not installed")
     }
 
-    /// Snapshot of all captured program output so far.
+    /// Snapshot of all captured program output so far. Empty under `Live`.
     pub fn output(&self) -> String {
-        self.output.borrow().clone()
+        match &self.output {
+            OutputSink::Capture(buf) => buf.borrow().clone(),
+            OutputSink::Live => String::new(),
+        }
     }
 
-    /// Append to the captured program output (`print`).
+    /// Emit program output (`print`). Buffers under `Capture`, streams to stdout
+    /// under `Live`.
     pub(crate) fn push_output(&self, s: &str) {
-        self.output.borrow_mut().push_str(s);
+        match &self.output {
+            OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
+            OutputSink::Live => {
+                use std::io::Write;
+                let mut so = std::io::stdout().lock();
+                let _ = so.write_all(s.as_bytes());
+                let _ = so.flush();
+            }
+        }
     }
 
-    /// Is the captured output buffer empty? (REPL flush check.)
+    /// Emit one std/log record line. Buffers into `log_capture` under `Capture`
+    /// (tests read it via `log_output`); writes to stderr under `Live`.
+    #[cfg(feature = "log")]
+    pub(crate) fn emit_log(&self, line: &str) {
+        match &self.output {
+            OutputSink::Capture(_) => { let mut b = self.log_capture.borrow_mut(); b.push_str(line); b.push('\n'); }
+            OutputSink::Live => { use std::io::Write; let mut e = std::io::stderr().lock(); let _ = writeln!(e, "{}", line); }
+        }
+    }
+
+    /// Snapshot of all captured std/log output (test hook). Empty under `Live`.
+    #[cfg(feature = "log")]
+    pub fn log_output(&self) -> String { self.log_capture.borrow().clone() }
+
+    /// Set the minimum std/log level.
+    #[cfg(feature = "log")]
+    pub(crate) fn set_log_level(&self, l: LogLevel) { self.log_level.set(l); }
+
+    /// Set the std/log output format.
+    #[cfg(feature = "log")]
+    pub(crate) fn set_log_format(&self, f: LogFormat) { self.log_format.set(f); }
+
+    /// `std/log` dispatch. `setLevel`/`setFormat` mutate per-interp state;
+    /// `debug`/`info`/`warn`/`error` build a record (first string arg → `msg`,
+    /// object args merge as fields, auto `level`) and emit it via [`emit_log`],
+    /// but only when the level passes the filter — a thunk first arg (a function)
+    /// is invoked ONLY then, so a filtered `log.debug(() => expensive())` is free.
+    /// Serialization is total (`json::to_json_lossy`) so logging never panics.
+    #[cfg(feature = "log")]
+    pub(crate) async fn call_log(&self, func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+        let level_of = |f: &str| match f {
+            "debug" => Some(LogLevel::Debug),
+            "info" => Some(LogLevel::Info),
+            "warn" => Some(LogLevel::Warn),
+            "error" => Some(LogLevel::Error),
+            _ => None,
+        };
+        match func {
+            "setLevel" => {
+                let s = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _ => return Err(AsError::at("log.setLevel expects a level string", span).into()),
+                };
+                match level_of(&s) {
+                    Some(l) => { self.set_log_level(l); Ok(Value::Nil) }
+                    None => Err(AsError::at(format!("unknown log level {:?}", s), span).into()),
+                }
+            }
+            "setFormat" => {
+                let s = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _ => return Err(AsError::at("log.setFormat expects \"human\" or \"json\"", span).into()),
+                };
+                match s.as_str() {
+                    "human" => { self.set_log_format(LogFormat::Human); Ok(Value::Nil) }
+                    "json" => { self.set_log_format(LogFormat::Json); Ok(Value::Nil) }
+                    o => Err(AsError::at(format!("unknown log format {:?}", o), span).into()),
+                }
+            }
+            "debug" | "info" | "warn" | "error" => {
+                let lvl = level_of(func).unwrap();
+                if lvl < self.log_level.get() {
+                    return Ok(Value::Nil);
+                }
+                let mut parts: Vec<String> = Vec::new();
+                let mut fields = serde_json::Map::new();
+                let mut iter = args.iter();
+                // A thunk is only honored as the FIRST arg. It is invoked lazily
+                // (after the level filter above) so a filtered call is free.
+                if matches!(args.first(), Some(Value::Function(_)) | Some(Value::Builtin(_))) {
+                    let r = self.call_value(args[0].clone(), vec![], span).await?;
+                    // An `async fn` thunk returns a `Value::Future`; drive it to
+                    // completion using the same mechanism as `await` (M17).
+                    let r = match r {
+                        Value::Future(f) => f.get().await?,
+                        other => other,
+                    };
+                    parts.push(r.to_string());
+                    iter.next(); // consume index 0
+                }
+                for a in iter {
+                    match a {
+                        Value::Object(o) => {
+                            for (k, val) in o.borrow().iter() {
+                                fields.insert(k.clone(), crate::stdlib::json::to_json_lossy(val, &mut Vec::new()));
+                            }
+                        }
+                        other => parts.push(other.to_string()),
+                    }
+                }
+                let msg = parts.join(" ");
+                let line = match self.log_format.get() {
+                    LogFormat::Json => {
+                        let mut rec = serde_json::Map::new();
+                        // User fields FIRST, then reserved keys, so a user field
+                        // named `level`/`msg` can never clobber the authoritative ones.
+                        for (k, v) in fields { rec.insert(k, v); }
+                        rec.insert("level".into(), serde_json::Value::String(func.into()));
+                        rec.insert("msg".into(), serde_json::Value::String(msg));
+                        serde_json::Value::Object(rec).to_string()
+                    }
+                    LogFormat::Human => {
+                        let mut s = if msg.is_empty() {
+                            format!("[{}]", func.to_uppercase())
+                        } else {
+                            format!("[{}] {}", func.to_uppercase(), msg)
+                        };
+                        for (k, v) in &fields {
+                            let vs = match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            s.push_str(&format!(" {}={}", k, vs));
+                        }
+                        s
+                    }
+                };
+                self.emit_log(&line);
+                Ok(Value::Nil)
+            }
+            other => Err(AsError::at(format!("std/log has no function '{}'", other), span).into()),
+        }
+    }
+
+    /// Is the captured output buffer empty? (REPL flush check.) Always true under
+    /// `Live`.
     pub(crate) fn output_is_empty(&self) -> bool {
-        self.output.borrow().is_empty()
+        match &self.output {
+            OutputSink::Capture(buf) => buf.borrow().is_empty(),
+            OutputSink::Live => true,
+        }
     }
 
-    /// Clear the captured output buffer (REPL flushes after each line).
+    /// Clear the captured output buffer (REPL flushes after each line). No-op
+    /// under `Live`.
     pub(crate) fn clear_output(&self) {
-        self.output.borrow_mut().clear();
+        if let OutputSink::Capture(buf) = &self.output {
+            buf.borrow_mut().clear();
+        }
     }
 
     /// Allocate the next monotonic resource id.
@@ -586,7 +785,7 @@ impl Interp {
                 env.define(name, v, *mutable).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::LetDestructure { names, value, mutable, .. } => {
+            Stmt::LetDestructure { names, rest, value, mutable, .. } => {
                 let v = self.eval_expr(value, env).await?;
                 let items = match v {
                     Value::Array(a) => a.borrow().clone(),
@@ -601,6 +800,46 @@ impl Interp {
                 for (i, name) in names.iter().enumerate() {
                     let elem = items.get(i).cloned().unwrap_or(Value::Nil);
                     env.define(name, elem, *mutable).map_err(AsError::new)?;
+                }
+                if let Some((rest_name, _)) = rest {
+                    let tail: Vec<Value> = items.iter().skip(names.len()).cloned().collect();
+                    let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(tail)));
+                    env.define(rest_name, arr, *mutable).map_err(AsError::new)?;
+                }
+                Ok(Flow::Normal)
+            }
+            Stmt::LetDestructureObject { bindings, rest, value, mutable, .. } => {
+                let v = self.eval_expr(value, env).await?;
+                if !matches!(v, Value::Object(_) | Value::Instance(_)) {
+                    return Err(AsError::at(
+                        format!("cannot destructure a non-object value of type {}", type_name(&v)),
+                        value.span).into());
+                }
+                let get = |key: &str| -> Value {
+                    match &v {
+                        Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+                        Value::Instance(i) => i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil),
+                        _ => Value::Nil,
+                    }
+                };
+                for b in bindings {
+                    env.define(&b.binding, get(&b.key), *mutable).map_err(AsError::new)?;
+                }
+                if let Some((rest_name, _)) = rest {
+                    let bound: std::collections::HashSet<&str> =
+                        bindings.iter().map(|b| b.key.as_str()).collect();
+                    let mut remaining = indexmap::IndexMap::new();
+                    match &v {
+                        Value::Object(o) => for (k, val) in o.borrow().iter() {
+                            if !bound.contains(k.as_str()) { remaining.insert(k.clone(), val.clone()); }
+                        },
+                        Value::Instance(i) => for (k, val) in i.borrow().fields.iter() {
+                            if !bound.contains(k.as_str()) { remaining.insert(k.clone(), val.clone()); }
+                        },
+                        _ => {}
+                    }
+                    let obj = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(remaining)));
+                    env.define(rest_name, obj, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
             }
@@ -905,15 +1144,61 @@ impl Interp {
             ExprKind::Array(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
-                    values.push(self.eval_expr(item, env).await?);
+                    match item {
+                        crate::ast::ArrayElem::Item(x) => {
+                            values.push(self.eval_expr(x, env).await?)
+                        }
+                        crate::ast::ArrayElem::Spread(x) => {
+                            let v = self.eval_expr(x, env).await?;
+                            match v {
+                                Value::Array(a) => {
+                                    values.extend(a.borrow().iter().cloned())
+                                }
+                                other => {
+                                    return Err(AsError::at(
+                                        format!(
+                                            "can only spread an array into an array, got {}",
+                                            type_name(&other)
+                                        ),
+                                        x.span,
+                                    )
+                                    .into())
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
             ExprKind::Object(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
-                for (k, v) in entries {
-                    let value = self.eval_expr(v, env).await?;
-                    map.insert(k.clone(), value);
+                for entry in entries {
+                    match entry {
+                        crate::ast::ObjEntry::KV(k, v) => {
+                            let value = self.eval_expr(v, env).await?;
+                            map.insert(k.clone(), value);
+                        }
+                        crate::ast::ObjEntry::Spread(x) => {
+                            let v = self.eval_expr(x, env).await?;
+                            match v {
+                                Value::Object(o) => {
+                                    for (k, val) in o.borrow().iter() {
+                                        map.insert(k.clone(), val.clone());
+                                    }
+                                }
+                                other => {
+                                    return Err(AsError::at(
+                                        format!(
+                                            "can only spread an object into an object, got {}",
+                                            type_name(&other)
+                                        ),
+                                        x.span,
+                                    )
+                                    .into())
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(map))))
             }
@@ -1092,7 +1377,25 @@ impl Interp {
                 }
                 let mut values = Vec::new();
                 for a in args {
-                    values.push(self.eval_expr(a, env).await?);
+                    match a {
+                        crate::ast::CallArg::Pos(x) => values.push(self.eval_expr(x, env).await?),
+                        crate::ast::CallArg::Spread(x) => {
+                            let v = self.eval_expr(x, env).await?;
+                            match v {
+                                Value::Array(arr) => values.extend(arr.borrow().iter().cloned()),
+                                other => {
+                                    return Err(AsError::at(
+                                        format!(
+                                            "can only spread an array as call arguments, got {}",
+                                            type_name(&other)
+                                        ),
+                                        x.span,
+                                    )
+                                    .into())
+                                }
+                            }
+                        }
+                    }
                 }
                 let v = self.call_value(callee_v, values, expr.span).await;
                 Ok((v?, false))
@@ -1426,20 +1729,74 @@ impl Interp {
         what: &str,
     ) -> Result<Value, Control> {
         let BodySpec { params, ret, body } = spec;
-        if args.len() != params.len() {
-            return Err(AsError::at(
-                format!("{} expected {} argument(s), got {}", what, params.len(), args.len()),
-                span,
-            )
-            .into());
-        }
-        for (p, a) in params.iter().zip(args.into_iter()) {
-            if let Some(ty) = &p.ty {
-                if !check_type(&a, ty) {
-                    return Err(contract_panic(ty, &a, span));
-                }
+        let has_rest = params.last().is_some_and(|p| p.rest);
+        if !has_rest {
+            // UNCHANGED fast path — exact arity, identical wording.
+            if args.len() != params.len() {
+                return Err(AsError::at(
+                    format!("{} expected {} argument(s), got {}", what, params.len(), args.len()),
+                    span,
+                )
+                .into());
             }
-            call_env.define(&p.name, a, true).map_err(AsError::new)?;
+            for (p, a) in params.iter().zip(args.into_iter()) {
+                if let Some(ty) = &p.ty {
+                    if !check_type(&a, ty) {
+                        return Err(contract_panic(ty, &a, span));
+                    }
+                }
+                call_env.define(&p.name, a, true).map_err(AsError::new)?;
+            }
+        } else {
+            let n_fixed = params.len() - 1;
+            if args.len() < n_fixed {
+                return Err(AsError::at(
+                    format!(
+                        "{} expected at least {} argument(s), got {}",
+                        what,
+                        n_fixed,
+                        args.len()
+                    ),
+                    span,
+                )
+                .into());
+            }
+            let mut it = args.into_iter();
+            for p in &params[..n_fixed] {
+                let a = it.next().unwrap();
+                if let Some(ty) = &p.ty {
+                    if !check_type(&a, ty) {
+                        return Err(contract_panic(ty, &a, span));
+                    }
+                }
+                call_env.define(&p.name, a, true).map_err(AsError::new)?;
+            }
+            let rest_p = &params[n_fixed];
+            let elem_ty = match &rest_p.ty {
+                Some(crate::ast::Type::Array(inner)) => Some(inner.as_ref()),
+                Some(other) => {
+                    return Err(AsError::at(
+                        format!(
+                            "a rest parameter type must be an array type (array<T>), got {}",
+                            other
+                        ),
+                        span,
+                    )
+                    .into())
+                }
+                None => None,
+            };
+            let mut rest_vals = Vec::new();
+            for a in it {
+                if let Some(t) = elem_ty {
+                    if !check_type(&a, t) {
+                        return Err(contract_panic(t, &a, span));
+                    }
+                }
+                rest_vals.push(a);
+            }
+            let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(rest_vals)));
+            call_env.define(&rest_p.name, arr, true).map_err(AsError::new)?;
         }
         let result = match self.exec(body, call_env).await {
             Ok(Flow::Return(v)) => v,
@@ -1797,9 +2154,9 @@ impl Interp {
     async fn call_builtin(&self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         match name {
             "print" => {
-                let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect();
-                self.push_output(&parts.join(" "));
-                self.push_output("\n");
+                let mut line = args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+                line.push('\n');
+                self.push_output(&line);
                 Ok(Value::Nil)
             }
             "Ok" => {
@@ -2065,7 +2422,16 @@ fn exported_names(stmt: &Stmt) -> Vec<String> {
         Stmt::Fn { name, .. } => vec![name.clone()],
         Stmt::Class { name, .. } => vec![name.clone()],
         Stmt::Enum { name, .. } => vec![name.clone()],
-        Stmt::LetDestructure { names, .. } => names.clone(),
+        Stmt::LetDestructure { names, rest, .. } => {
+            let mut v = names.clone();
+            if let Some((r, _)) = rest { v.push(r.clone()); }
+            v
+        }
+        Stmt::LetDestructureObject { bindings, rest, .. } => {
+            let mut v: Vec<String> = bindings.iter().map(|b| b.binding.clone()).collect();
+            if let Some((r, _)) = rest { v.push(r.clone()); }
+            v
+        }
         _ => Vec::new(),
     }
 }
@@ -2214,6 +2580,110 @@ mod tests {
         interp.output()
     }
 
+    /// Like `run`, but returns the captured std/log output (not `print` output).
+    #[cfg(feature = "log")]
+    async fn run_logs(src: &str) -> String {
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let tokens = lex(src).expect("lex");
+        let stmts = parse(&tokens).expect("parse");
+        let env = global_env().child();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") }).await;
+        local.await;
+        interp.log_output()
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_records_human_and_filtering() {
+        let logs = run_logs(r#"
+import * as log from "std/log"
+log.setLevel("warn")
+log.info("ignored", {a: 1})
+log.warn("disk low", {pct: 92})
+log.error("boom")
+"#).await;
+        assert!(!logs.contains("ignored"));
+        assert!(logs.contains("[WARN]") && logs.contains("disk low") && logs.contains("pct=92"));
+        assert!(logs.contains("[ERROR]") && logs.contains("boom"));
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_json_format_and_thunk() {
+        let logs = run_logs(r#"
+import * as log from "std/log"
+log.setFormat("json")
+log.info("saved", {userId: 5})
+log.debug(() => "expensive")
+"#).await;
+        assert!(logs.contains("\"level\":\"info\"") && logs.contains("\"msg\":\"saved\"") && logs.contains("\"userId\":5"));
+        assert!(!logs.contains("expensive"));
+    }
+
+    #[cfg(feature = "log")]
+    #[test]
+    fn log_level_from_env_parsing() {
+        assert_eq!(log_level_from_env_str(Some("warn")), LogLevel::Warn);
+        assert_eq!(log_level_from_env_str(Some("DEBUG")), LogLevel::Debug);
+        assert_eq!(log_level_from_env_str(None), LogLevel::Info);
+        assert_eq!(log_level_from_env_str(Some("nonsense")), LogLevel::Info);
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_reserved_keys_win_and_no_silent_drop() {
+        let logs = run_logs(r#"
+import * as log from "std/log"
+log.setFormat("json")
+log.info("saved", {level: "HACK", userId: 5})
+"#).await;
+        assert!(logs.contains("\"level\":\"info\""), "auto level must win: {logs}");
+        assert!(logs.contains("\"userId\":5"));
+        assert!(!logs.contains("HACK"));
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_non_object_args_append_to_msg() {
+        let logs = run_logs("import * as log from \"std/log\"\nlog.info(\"a\", \"b\", 3)").await;
+        assert!(logs.contains("[INFO] a b 3"), "got: {logs}");
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_empty_msg_no_trailing_space() {
+        let logs = run_logs("import * as log from \"std/log\"\nlog.warn()").await;
+        assert!(logs.lines().any(|l| l == "[WARN]"), "got: {logs:?}");
+    }
+
+    #[tokio::test]
+    async fn non_rest_arity_error_message_unchanged() {
+        let e = run_err("fn f(a, b) {}\nf(1)").await;
+        assert!(e.message.contains("expected 2 argument(s), got 1"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
+    async fn rest_param_collects_trailing_args_as_array() {
+        let out = run("fn f(a, ...rest) { print(a)\n print(rest) }\nf(1)\nf(1, 2, 3)").await;
+        assert_eq!(out, "1\n[]\n1\n[2, 3]\n");
+    }
+
+    #[tokio::test]
+    async fn rest_param_too_few_fixed_args_panics() {
+        let e = run_err("fn f(a, b, ...r) {}\nf(1)").await;
+        assert!(e.message.contains("at least 2"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
+    async fn typed_rest_checks_each_element() {
+        let e = run_err("fn f(...rest: array<number>) {}\nf(1, \"x\", 3)").await;
+        assert!(e.message.to_lowercase().contains("number"), "got: {}", e.message);
+        let out = run("fn f(...rest: array<number>) { print(rest) }\nf(1, 2)").await;
+        assert_eq!(out, "[1, 2]\n");
+    }
+
     /// Like `run`, but expects a runtime panic and returns its `AsError`.
     async fn run_err(src: &str) -> AsError {
         let interp = std::rc::Rc::new(Interp::new());
@@ -2229,6 +2699,68 @@ mod tests {
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn spread_array_object_call_eval() {
+        let out = run(r#"
+let a = [1, 2]
+let b = [...a, 3]
+print(b)
+let o = {x: 1}
+let p = {...o, y: 2, x: 9}
+print(p)
+fn add(a, b, c) { return a + b + c }
+print(add(...[1, 2, 3]))
+"#).await;
+        assert_eq!(out, "[1, 2, 3]\n{x: 9, y: 2}\n6\n");
+    }
+
+    #[tokio::test]
+    async fn spread_wrong_type_panics() {
+        assert!(run_err("let a = [...5]").await.message.contains("can only spread an array"));
+        assert!(run_err("let o = {...5}").await.message.contains("can only spread an object"));
+    }
+
+    #[tokio::test]
+    async fn spread_non_array_as_call_args_panics() {
+        let e = run_err("fn f(a) { return a }\nf(...5)").await;
+        assert!(e.message.contains("can only spread an array as call arguments"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
+    async fn object_destructuring_binds_from_object_and_instance() {
+        let out = run(r#"
+let {a, b as local, missing} = {a: 1, b: 2}
+print(a)
+print(local)
+print(missing)
+class P { x: number
+ y: number }
+let p = P.from({x: 10, y: 20})
+let {x, y} = p
+print(x)
+print(y)
+"#).await;
+        assert_eq!(out, "1\n2\nnil\n10\n20\n");
+    }
+
+    #[tokio::test]
+    async fn object_destructuring_on_non_object_panics() {
+        let err = run_err(r#"let {a} = 5"#).await;
+        assert!(err.message.contains("cannot destructure a non-object"));
+    }
+
+    #[tokio::test]
+    async fn array_rest_destructuring() {
+        let out = run("let [first, ...others] = [1, 2, 3, 4]\nprint(first)\nprint(others)\nlet [only, ...none] = [9]\nprint(none)").await;
+        assert_eq!(out, "1\n[2, 3, 4]\n[]\n");
+    }
+
+    #[tokio::test]
+    async fn object_rest_destructuring_excludes_source_keys() {
+        let out = run("let {a, b as local, ...rest} = {a: 1, b: 2, c: 3, d: 4}\nprint(a)\nprint(local)\nprint(rest)").await;
+        assert_eq!(out, "1\n2\n{c: 3, d: 4}\n");
     }
 
     #[tokio::test]
@@ -3173,6 +3705,14 @@ print(r[1])
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output(), "7\n");
+    }
+
+    #[tokio::test]
+    async fn capture_sink_buffers_output() {
+        // The default `Interp::new()` uses `OutputSink::Capture`, which buffers
+        // `print` output for read-back via `output()`.
+        let out = run("print(1)\nprint(2)").await;
+        assert_eq!(out, "1\n2\n");
     }
 
     #[tokio::test]

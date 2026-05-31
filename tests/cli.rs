@@ -392,3 +392,98 @@ fn abandoned_infinite_generator_with_break_terminates() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout, "0\n1\n2\ndone\n", "got: {stdout}");
 }
+
+#[test]
+fn run_streams_output_and_keeps_it_before_panic() {
+    // `print("before")` runs, then `len(1, 2, 3)` is a runtime (Tier-2) panic
+    // because its first arg is a number. Under OutputSink::Live the "before"
+    // output is streamed to stdout immediately, so it must survive the panic
+    // even though `run_file` returns `Err`.
+    let path = std::env::temp_dir().join("ascript_stream_before_panic.as");
+    std::fs::write(&path, "print(\"before\")\nlen(1, 2, 3)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(path.to_str().unwrap()).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "program should have panicked at len(1, 2, 3); stdout: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("before"),
+        "stdout was: {stdout:?}"
+    );
+}
+
+#[test]
+fn runs_object_destructuring_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/object_destructuring.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Ada\nadmin\n42\nnil\n7\n"
+    );
+}
+
+#[test]
+fn runs_spread_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/spread.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[0, 1, 2, 3, 4]\n{host: \"local\", port: 443}\n60\n"
+    );
+}
+
+#[test]
+fn runs_rest_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/rest.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "10\n0\nnums\n[1, 2]\n10\n[20, 30]\n7\n{role: \"admin\", active: true}\n18\n"
+    );
+}
+
+#[test]
+#[cfg(feature = "log")]
+fn runs_logging_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/logging.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    // Logs go to STDERR, never STDOUT.
+    assert!(
+        output.stdout.is_empty(),
+        "logs must not go to stdout; stdout was: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("[DEBUG] starting pid=42"), "stderr was: {err:?}");
+    assert!(err.contains("[INFO] request"), "stderr was: {err:?}");
+    assert!(err.contains("[WARN] slow query"), "stderr was: {err:?}");
+    assert!(err.contains("[ERROR] upstream failed"), "stderr was: {err:?}");
+    assert!(err.contains("\"msg\":\"saved\""), "stderr was: {err:?}");
+}

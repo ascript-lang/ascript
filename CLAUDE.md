@@ -28,9 +28,12 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
   fs, process, datetime, tui, plus HTTP/WebSocket/SSE client+server pairs). Verify with
   `target/release/ascript run <file>`.
 
-> Language notes worth knowing when writing `.as` code or docs: `print` output is **buffered and
-> flushed at program exit** (a forever-looping server won't stream logs live — use
-> `serve({maxRequests:N})`). Template `${…}` interpolation fully supports nested string literals
+> Language notes worth knowing when writing `.as` code or docs: under the CLI `run` command, `print`
+> **streams live to stdout** (`OutputSink::Live`) and output is retained even if the program later
+> panics; `run_source`/REPL/tests **capture** it instead (`OutputSink::Capture`), and async tasks in
+> tests buffer via that capture path. `serve({maxRequests:N})` still gives a forever-looping server a
+> graceful shutdown but is no longer needed just to *see* its `print` output. Template `${…}`
+> interpolation fully supports nested string literals
 > (incl. strings containing `}`/`{`/`${` and nested templates) — see the `template_interpolation_*`
 > tests.
 >
@@ -70,6 +73,30 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > field. The same `validate_into` core powers typed parse: `json.parse(text, Class)` and
 > `resp.json(Class)` fuse a parse/decode failure and a shape mismatch into ONE Tier-1 `[value, err]`
 > pair (no panic); the class is an ordinary value argument (no generics).
+>
+> **Object destructuring**: `let {a, b as local, "k" as v} = obj` binds by key from an `Object` or
+> `Instance` (`Stmt::LetDestructureObject`); missing keys bind `nil`. Keys are `Ident | Str` (quote
+> non-identifier keys); rename with the soft keyword `as`. A trailing `...rest` collector is active
+> (see the rest note below).
+>
+> **Spread `...`** (`Tok::DotDotDot`): valid in array literals, object literals, and call args via
+> typed-element AST (`ArrayElem`/`ObjEntry`/`CallArg`), so spread is unrepresentable elsewhere.
+> Strict: spreading the wrong container is a Tier-2 panic; object-spread is later-value-wins with
+> `IndexMap` keeping a key's first-seen position. After grammar changes, regen `parser.c` with
+> `tree-sitter generate --abi 14`.
+>
+> **Rest `...name`**: rest params collect trailing args into an array (typed `...name: array<T>`,
+> per-element checked) via a `has_rest` fast-path branch in `run_body` (non-rest calls byte-identical).
+> Array/object rest patterns (`let [a, ...r]`, `let {a, ...r}`) collect the tail / leftover keys;
+> object-rest excludes already-bound SOURCE keys. For async/`fn*`, arity/contract errors surface
+> lazily when the future is driven.
+>
+> **`std/log`**: leveled (`debug/info/warn/error`) structured logging; `Interp`-stateful
+> (`log_level`/`log_format`), routed via `self.call_log`. Emits to stderr (Live) or a capture buffer
+> (tests, `log_output()`). Total serialization via `json::to_json_lossy` (cycles→`"[Circular]"`,
+> functions→`"<function>"`, NaN→null — never panics). Non-object args join into `msg`; object args
+> merge as fields; reserved `level`/`msg` always win; a thunk first-arg (incl. `async fn`, awaited)
+> defers message work past the level filter. Default level from `ASCRIPT_LOG`.
 
 ## Commands
 
@@ -174,7 +201,8 @@ Tier-2 panic.
 ### Feature flags (`Cargo.toml`)
 The stdlib is split into Cargo features, all on by `default`: `data` (json/regex/encoding/csv/toml/
 yaml/uuid/bytes), `datetime`, `intl`, `sys` (fs/process/env), `crypto`, `compress`, `sql` (sqlite),
-`net` (tcp/http/ws/server), `tui` (crossterm), `lsp` (tower-lsp). Every module is `#[cfg]`-gated so
+`net` (tcp/http/ws/server), `log` (std/log — default-on, depends on `data` for JSON serialization),
+`tui` (crossterm), `lsp` (tower-lsp). Every module is `#[cfg]`-gated so
 `--no-default-features` builds the bare language. `http3` is opt-in and additionally requires
 `RUSTFLAGS="--cfg reqwest_unstable"` (reqwest's http3 is unstable).
 

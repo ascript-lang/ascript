@@ -70,6 +70,7 @@ json, crypto, …) need no `await`.
 | [System & files](system) | `fs` · `env` · `process` · `crypto` · `compress` · `sqlite` |
 | [Time & locale](time) | `time` · `date` · `intl` |
 | [Networking & HTTP](net) | `net/tcp` · `net/http` · `http/server` · `net/ws` |
+| [Logging](log) | `log` |
 | [Terminal UI](tui) | `tui` |
 
 ## Feature flags

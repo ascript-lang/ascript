@@ -36,6 +36,9 @@ Design priorities, in strict order: **simplicity → safety → familiarity → 
 - **Gradual type contracts** — optional annotations, checked at runtime as contracts, never erased. Includes the nullable suffix `T?` (≡ `T | nil`) and typed class fields (required, optional, defaulted) checked on assignment.
 - **Errors as values** — no exceptions; fallible calls return `[value, err]`; the `?` operator propagates and the `!` force-unwrap asserts success (panicking, recoverably, with the original message). Bugs panic, loudly.
 - **Shape validation** — turn untrusted data into checked instances: `ClassName.from(obj)` validates a raw object (recursing into nested classes, `array<Class>`, and `map<K, Class>`), and the typed parse `json.parse(text, Class)` / `resp.json(Class)` fuses decode + validation into one result — `let user = await resp.json(User)?`.
+- **Destructuring** — pull fields out of an object or instance by key with `let {a, b as local, "k" as v} = obj`; missing keys bind `nil`.
+- **Spread** — expand a collection inline with `...` in array literals, object literals, and call arguments (`[0, ...xs]`, `{...defaults, k: v}`, `f(...args)`); strict about container kind, object-spread is later-value-wins.
+- **Rest** — collect what's left over with a trailing `...name`: a rest parameter gathers extra arguments into an array (`fn sum(...nums: array<number>)`, per-element typed), and rest destructuring takes the tail/leftover keys (`let [head, ...tail] = xs`, `let {id, ...meta} = obj`).
 - **Single-threaded async & concurrency** — `await` any I/O on a cooperative event loop; `future<T>` and `std/task` (`spawn`/`gather`/`race`/`timeout`); structured concurrency with cancel-on-drop (un-awaited work is cancelled, `task.spawn` detaches); the HTTP server serves connections concurrently. No data races.
 - **Generators & coroutines** — `fn*`/`async fn*` with `yield`, bidirectional `gen.next(v)`, `gen.close()`, and `for await` over generators and native streams (composable async pipelines).
 - **Batteries included** — JSON, regex, SQLite, crypto, compression, a modern HTTP client, WebSockets, and a TUI.
@@ -86,6 +89,7 @@ ascript run hello.as
 | Time & locale | `std/time` · `std/date` · `std/intl` |
 | Networking | `std/net/tcp` · `std/net/http` · `std/http/server` · `std/net/ws` |
 | Concurrency | `std/task` (`spawn` · `gather` · `race` · `timeout` over `future<T>`) |
+| Logging | `std/log` (`debug` · `info` · `warn` · `error`; human/json, structured fields) |
 | Terminal UI | `std/tui` |
 
 ## Documentation

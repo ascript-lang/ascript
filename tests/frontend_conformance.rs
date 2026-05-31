@@ -154,6 +154,16 @@ fn interpreter_parses_each_grammar_construct() {
         "let boolty: bool = true",
         "let errty: error = nil",
         "let nilty: nil = nil",
+        // --- destructuring / spread / rest ---
+        "let [a, ...rest] = xs",
+        "let {a, b as local} = obj",
+        "let {\"k\" as v} = obj",
+        "let {a, ...rest} = obj",
+        "let a = [...x, 1]",
+        "let o = {...x, k: 1}",
+        "f(...args)",
+        "fn f(a, ...rest) { return rest }",
+        "fn f(...rest: array<number>) { return rest }",
     ];
     for s in snippets {
         accepts(s);

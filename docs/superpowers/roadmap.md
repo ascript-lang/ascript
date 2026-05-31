@@ -192,6 +192,40 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   `specs/adr/2026-05-30-async-generators.md`. Plan:
   `plans/2026-05-30-async-generators-coroutines.md`.
 
+## Phase 6 — Ergonomics & observability (post-spec extension)
+
+- ✅ **M18 — Destructuring, spread/rest, print streaming, `std/log`.** A batch of
+  JS-flavored ergonomics plus live output and structured logging:
+  - **Object destructuring** `let {a, b as local, "k" as v} = obj` — binds by key from
+    an `object` or class `Instance`; missing key → `nil`; keys are `Ident | Str` (quote
+    non-identifier keys); rename via the soft keyword `as` (`Stmt::LetDestructureObject`).
+  - **Spread `...`** (`Tok::DotDotDot`) in array literals `[...a, b]`, object literals
+    `{...o, k: v}`, and call args `f(...args)` — typed-element AST
+    (`ArrayElem`/`ObjEntry`/`CallArg`). Strict: spreading the wrong container kind is a
+    Tier-2 panic; no array↔object coercion. Object-spread is later-value-wins with
+    `IndexMap` first-seen key position.
+  - **Rest collectors** — rest params `fn f(a, ...rest: array<T>)` (array-type spelling,
+    per-element checked; bare `...rest` untyped; must be last) via a fast-path branch in
+    `run_body` (non-rest calls unchanged); array-rest `let [a, ...rest] = arr`;
+    object-rest `let {a, ...rest} = obj` (excludes already-bound SOURCE keys). Empty
+    rest = `[]`/`{}`. For `async`/`fn*`, arity/contract errors surface lazily.
+  - **Print streaming** — `print` streams live to stdout under the CLI `run` command
+    (`OutputSink::Live`) and output survives a later panic; `run_source`/REPL/tests
+    capture it (`OutputSink::Capture`). `run_file` now returns `Result<(), AsError>`.
+  - **`std/log`** — leveled (`debug/info/warn/error`, default `info`, `ASCRIPT_LOG`
+    env) structured logging; `setLevel`/`setFormat` (human/json); first non-object args
+    → `msg`, object args merge as fields, reserved `level`/`msg` always win; thunk
+    first-arg defers work past the level filter; total serialization (cycles →
+    `"[Circular]"`, functions → `"<function>"`, NaN → null, never panics) via
+    `json::to_json_lossy`; emits to stderr (or capture in tests). `log` Cargo feature
+    (default-on, depends on `data`).
+  - **Front-end + tooling kept in lockstep:** Tree-sitter grammar (regenerated),
+    LSP keyword/symbol surface, `fmt` round-trips, spec (§3 spread, §5 rest params,
+    §6 destructuring, §11.6 `std/log`, §12.1 `OutputSink`) and docs all updated; 4 new
+    examples (`object_destructuring.as`, `spread.as`, `rest.as`, `logging.as`).
+  - **Test posture:** 682 passing (default features) / 370 (`--no-default-features`);
+    `cargo clippy --all-targets` clean in both configs. Merged.
+
 ---
 
 ## Working notes (carry forward across compaction)

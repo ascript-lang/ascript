@@ -6,8 +6,8 @@
 //! re-parses to an equivalent program, and `format(format(x)) == format(x)`.
 
 use crate::ast::{
-    ArrowBody, BinOp, EnumVariantDecl, Expr, ExprKind, FieldDecl, ImportNames, MatchArm,
-    MethodDecl, Param, Stmt, TemplatePart, Type, UnOp,
+    ArrayElem, ArrowBody, BinOp, CallArg, EnumVariantDecl, Expr, ExprKind, FieldDecl, ImportNames,
+    MatchArm, MethodDecl, ObjEntry, Param, Stmt, TemplatePart, Type, UnOp,
 };
 use crate::error::AsError;
 
@@ -47,6 +47,9 @@ fn write_params(out: &mut String, params: &[Param]) {
         if i > 0 {
             out.push_str(", ");
         }
+        if p.rest {
+            out.push_str("...");
+        }
         out.push_str(&p.name);
         if let Some(ty) = &p.ty {
             out.push_str(": ");
@@ -83,12 +86,39 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             }
             out.push('\n');
         }
-        Stmt::LetDestructure { names, value, mutable, .. } => {
+        Stmt::LetDestructure { names, rest, value, mutable, .. } => {
             indent(out, level);
             out.push_str(if *mutable { "let " } else { "const " });
             out.push('[');
-            out.push_str(&names.join(", "));
+            let mut parts: Vec<String> = names.clone();
+            if let Some((rest_name, _)) = rest {
+                parts.push(format!("...{rest_name}"));
+            }
+            out.push_str(&parts.join(", "));
             out.push_str("] = ");
+            write_expr(out, value, 0);
+            out.push('\n');
+        }
+        Stmt::LetDestructureObject { bindings, rest, value, mutable, .. } => {
+            indent(out, level);
+            out.push_str(if *mutable { "let " } else { "const " });
+            out.push('{');
+            let mut parts: Vec<String> = bindings
+                .iter()
+                .map(|b| {
+                    let key = object_key(&b.key);
+                    if b.binding == b.key {
+                        key
+                    } else {
+                        format!("{key} as {}", b.binding)
+                    }
+                })
+                .collect();
+            if let Some((rest_name, _)) = rest {
+                parts.push(format!("...{rest_name}"));
+            }
+            out.push_str(&parts.join(", "));
+            out.push_str("} = ");
             write_expr(out, value, 0);
             out.push('\n');
         }
@@ -411,7 +441,13 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_expr(out, a, PREC_ASSIGN);
+                match a {
+                    CallArg::Pos(x) => write_expr(out, x, PREC_ASSIGN),
+                    CallArg::Spread(x) => {
+                        out.push_str("...");
+                        write_expr(out, x, PREC_ASSIGN);
+                    }
+                }
             }
             out.push(')');
         }
@@ -426,7 +462,7 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             }
             // Single un-annotated param renders without parens (`x => …`);
             // anything else uses the parenthesized form.
-            if params.len() == 1 && params[0].ty.is_none() {
+            if params.len() == 1 && params[0].ty.is_none() && !params[0].rest {
                 out.push_str(&params[0].name);
             } else {
                 write_params(out, params);
@@ -443,7 +479,13 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_expr(out, it, PREC_ASSIGN);
+                match it {
+                    ArrayElem::Item(x) => write_expr(out, x, PREC_ASSIGN),
+                    ArrayElem::Spread(x) => {
+                        out.push_str("...");
+                        write_expr(out, x, PREC_ASSIGN);
+                    }
+                }
             }
             out.push(']');
         }
@@ -458,13 +500,21 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                 out.push_str("{}");
             } else {
                 out.push_str("{ ");
-                for (i, (k, v)) in entries.iter().enumerate() {
+                for (i, e) in entries.iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    out.push_str(&object_key(k));
-                    out.push_str(": ");
-                    write_expr(out, v, PREC_ASSIGN);
+                    match e {
+                        ObjEntry::KV(k, v) => {
+                            out.push_str(&object_key(k));
+                            out.push_str(": ");
+                            write_expr(out, v, PREC_ASSIGN);
+                        }
+                        ObjEntry::Spread(x) => {
+                            out.push_str("...");
+                            write_expr(out, x, PREC_ASSIGN);
+                        }
+                    }
                 }
                 out.push_str(" }");
             }
@@ -559,13 +609,10 @@ fn op_str_bin(op: BinOp) -> String {
 
 /// Object keys that are valid identifiers stay bare; others are quoted.
 fn object_key(k: &str) -> String {
-    let is_ident = !k.is_empty()
-        && k.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
-        && k.chars().all(|c| c.is_alphanumeric() || c == '_');
-    if is_ident {
+    if crate::token::is_ident_like(k) {
         k.to_string()
     } else {
-        format!("\"{}\"", k)
+        format!("\"{}\"", escape_str_lit(k))
     }
 }
 
@@ -646,6 +693,23 @@ mod tests {
         }
         // a single explicit paren group renders as exactly one set
         assert_eq!(format_source("(a + b) * c").unwrap(), "(a + b) * c\n");
+    }
+
+    #[test]
+    fn fmt_spread_roundtrips() {
+        // Arrays and calls round-trip exactly; object literals canonicalize to
+        // the spaced `{ ... }` form (matching all other object output).
+        let cases = [
+            ("let a = [...x, 1]\n", "let a = [...x, 1]\n"),
+            ("let o = {...x, k: 1}\n", "let o = { ...x, k: 1 }\n"),
+            ("f(...args, 2)\n", "f(...args, 2)\n"),
+        ];
+        for (src, expected) in cases {
+            let out = format_source(src).unwrap();
+            assert_eq!(out, expected, "fmt mismatch for: {src}");
+            // and idempotent
+            assert_eq!(format_source(&out).unwrap(), expected);
+        }
     }
 
     #[test]
@@ -733,6 +797,14 @@ mod tests {
     }
 
     #[test]
+    fn fmt_object_destructuring_escapes_quotes_in_key() {
+        // A non-identifier object key containing a `"` must be emitted with the
+        // quote escaped so the formatted output re-lexes to the same key.
+        let src = "let {\"a\\\"b\" as x} = obj\n";
+        assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
     fn formats_future_type_annotation() {
         // A `future<T>` binding annotation round-trips through the formatter.
         // (Space before `=` so the lexer does not read `>=` as a single token.)
@@ -815,5 +887,27 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn array_rest_destructuring_round_trips() {
+        let src = "let [a, ...rest] = xs\n";
+        assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
+    fn object_rest_destructuring_round_trips() {
+        let src = "let {a, ...rest} = obj\n";
+        assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
+    fn rest_param_round_trips() {
+        let src = "fn f(a, ...rest) {\n  return rest\n}\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        let src2 = "fn f(...rest: array<number>) {\n  return rest\n}\n";
+        assert_eq!(format_source(src2).unwrap(), src2);
+        let src3 = "let f = (a, ...rest) => rest\n";
+        assert_eq!(format_source(src3).unwrap(), src3);
     }
 }
