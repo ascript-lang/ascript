@@ -206,11 +206,17 @@ signature or side effects `init` has.
   `Address.from(value, strict)`. An already-`Address` instance passes through unchanged.
 - **Array of class** (`tags: array<Tag>`): each element that is a raw `Object` is
   validated via `Tag.from(element, strict)`; the contract `array<Tag>` then holds.
-- **Map of class** (`byId: map<string, Tag>`): each *value* that is a raw `Object` is
-  validated via `Tag.from(value, strict)`; the contract `map<string, Tag>` then holds.
-  (Keys are not recursed — map keys are scalars.) This completes recursion symmetry
-  across all three container shapes (nested class, `array<Class>`, `map<K, Class>`); the
-  three are handled by the same `match` on the field's declared type.
+- **Map of class** (`byId: map<string, Tag>`): each *value* is validated via
+  `Tag.from(value, strict)` and the contract `map<string, Tag>` then holds. (Keys are not
+  recursed — map keys are scalars.) **Object→Map boundary coercion:** because JSON objects
+  decode to AScript `Object`s (not `Map`s), a `map<K, V>`-typed field whose value is a raw
+  `Object` is coerced into a `Map` *at the `.from` boundary* (string keys → map keys, each
+  value recursed through the value type) before the contract is checked. This coercion is
+  scoped strictly to `.from`/typed-parse (untrusted-data ingestion) — it is **not** a
+  general language Object↔Map coercion — and it is what makes `map<string, Tag>` usable for
+  the common JSON-dictionary shape `{"byId": {"1": {…}}}`. An already-`Map` value recurses
+  its values directly. This completes recursion symmetry across all three container shapes
+  (nested class, `array<Class>`, `map<K, Class>`).
 - **Cycles:** JSON cannot express cycles, and `.from` consumes plain data, so unbounded
   recursion is not a concern in practice. (No cycle guard in v1; revisit only if `.from`
   is ever pointed at script-constructed graphs.)
