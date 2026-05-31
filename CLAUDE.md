@@ -70,6 +70,11 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > field. The same `validate_into` core powers typed parse: `json.parse(text, Class)` and
 > `resp.json(Class)` fuse a parse/decode failure and a shape mismatch into ONE Tier-1 `[value, err]`
 > pair (no panic); the class is an ordinary value argument (no generics).
+>
+> **Object destructuring**: `let {a, b as local, "k" as v} = obj` binds by key from an `Object` or
+> `Instance` (`Stmt::LetDestructureObject`); missing keys bind `nil`. Keys are `Ident | Str` (quote
+> non-identifier keys); rename with the soft keyword `as`. Object-rest is plumbed but inactive until
+> a later phase.
 
 ## Commands
 

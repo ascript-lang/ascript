@@ -33,6 +33,31 @@ let later              // declared without an initializer; value is nil
 `const` forbids rebinding the name; it does not deep-freeze the value (a `const` array can still have
 elements pushed).
 
+### Object destructuring
+
+A `let` (or `const`) binding can pull several fields out of an object or class instance at once, by
+key name:
+
+```ascript
+let user = { name: "Ada", role: "admin", "login count": 42 }
+
+let {name, role} = user            // shorthand: binds `name` and `role`
+let {role as r} = user             // rename: binds `r` from key `role`
+let {"login count" as logins} = user  // quoted key for non-identifier names
+
+let {missing} = user               // key not present → binds nil
+```
+
+Each entry is `key` or `key as local`; the key is `Ident | Str` (quote any key that is not a bare
+identifier), and `as` renames it to a local. Missing keys bind `nil` rather than erroring.
+Destructuring works on plain `Object` values and on class instances alike:
+
+```ascript
+class Point { x: number; y: number }
+let p = Point.from({x: 3, y: 4})
+let {x, y} = p                     // x = 3, y = 4
+```
+
 ## Operators
 
 ```text
