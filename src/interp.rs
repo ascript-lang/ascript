@@ -1992,9 +1992,9 @@ impl Interp {
     async fn call_builtin(&self, name: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         match name {
             "print" => {
-                let parts: Vec<String> = args.iter().map(|v| v.to_string()).collect();
-                self.push_output(&parts.join(" "));
-                self.push_output("\n");
+                let mut line = args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+                line.push('\n');
+                self.push_output(&line);
                 Ok(Value::Nil)
             }
             "Ok" => {
