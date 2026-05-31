@@ -538,15 +538,15 @@ mod tests {
     async fn array_structural() {
         let interp = Interp::new();
         let a = arr(vec![n(1.0), n(2.0), n(2.0), n(3.0)]);
-        assert_eq!(interp.call_array("reverse", &[a.clone()], sp()).await.unwrap().to_string(), "[3, 2, 2, 1]");
-        assert_eq!(interp.call_array("unique", &[a.clone()], sp()).await.unwrap().to_string(), "[1, 2, 3]");
-        assert_eq!(interp.call_array("first", &[a.clone()], sp()).await.unwrap(), n(1.0));
-        assert_eq!(interp.call_array("last", &[a.clone()], sp()).await.unwrap(), n(3.0));
+        assert_eq!(interp.call_array("reverse", std::slice::from_ref(&a), sp()).await.unwrap().to_string(), "[3, 2, 2, 1]");
+        assert_eq!(interp.call_array("unique", std::slice::from_ref(&a), sp()).await.unwrap().to_string(), "[1, 2, 3]");
+        assert_eq!(interp.call_array("first", std::slice::from_ref(&a), sp()).await.unwrap(), n(1.0));
+        assert_eq!(interp.call_array("last", std::slice::from_ref(&a), sp()).await.unwrap(), n(3.0));
         assert_eq!(interp.call_array("first", &[arr(vec![])], sp()).await.unwrap(), Value::Nil);
         assert_eq!(interp.call_array("take", &[a.clone(), n(2.0)], sp()).await.unwrap().to_string(), "[1, 2]");
         assert_eq!(interp.call_array("drop", &[a.clone(), n(2.0)], sp()).await.unwrap().to_string(), "[2, 3]");
         let nested = arr(vec![arr(vec![n(1.0)]), arr(vec![n(2.0), n(3.0)])]);
-        assert_eq!(interp.call_array("flat", &[nested.clone()], sp()).await.unwrap().to_string(), "[1, 2, 3]");
+        assert_eq!(interp.call_array("flat", std::slice::from_ref(&nested), sp()).await.unwrap().to_string(), "[1, 2, 3]");
         let b = arr(vec![n(4.0)]);
         assert_eq!(interp.call_array("concat", &[arr(vec![n(1.0)]), b], sp()).await.unwrap().to_string(), "[1, 4]");
     }
