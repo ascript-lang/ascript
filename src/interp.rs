@@ -167,6 +167,15 @@ pub(crate) enum ResourceState {
     Closed,
 }
 
+/// Where `print` output goes. `Capture` buffers it (tests, REPL, embedders read
+/// it back via `output()`); `Live` streams to stdout as produced (CLI `run`) so a
+/// long-running program shows output immediately and output is not lost if the
+/// program later panics.
+pub enum OutputSink {
+    Capture(RefCell<String>),
+    Live,
+}
+
 /// All mutable interpreter state lives behind interior mutability (`RefCell`/
 /// `Cell`) so the `eval`/`exec`/`call_*` methods take `&self`, not `&mut self`.
 /// This lets multiple concurrent eval futures (M17 Phase 2+) share one
@@ -174,9 +183,8 @@ pub(crate) enum ResourceState {
 /// hold a `RefCell` guard across an `.await` — take the resource OUT of the table
 /// first (`take_resource`) and put it back after (`return_resource`).
 pub struct Interp {
-    /// Captured program output (what `print` writes). Read via `output()` and
-    /// flushed to stdout by the CLI.
-    output: RefCell<String>,
+    /// Where `print` output goes. See [`OutputSink`].
+    output: OutputSink,
     modules: RefCell<HashMap<PathBuf, ModuleEntry>>,
     module_dir: RefCell<PathBuf>,
     current_exports: RefCell<Rc<RefCell<HashSet<String>>>>,
@@ -231,8 +239,18 @@ pub struct TestSummary {
 
 impl Interp {
     pub fn new() -> Self {
+        Self::with_sink(OutputSink::Capture(RefCell::new(String::new())))
+    }
+
+    /// Like [`Interp::new`] but streams `print` output to stdout immediately
+    /// (CLI `run`) instead of buffering it. See [`OutputSink`].
+    pub fn new_live() -> Self {
+        Self::with_sink(OutputSink::Live)
+    }
+
+    fn with_sink(output: OutputSink) -> Self {
         Interp {
-            output: RefCell::new(String::new()),
+            output,
             modules: RefCell::new(HashMap::new()),
             module_dir: RefCell::new(PathBuf::from(".")),
             current_exports: RefCell::new(Rc::new(RefCell::new(HashSet::new()))),
@@ -290,24 +308,43 @@ impl Interp {
         self.self_weak.borrow().upgrade().expect("Interp self-ref not installed")
     }
 
-    /// Snapshot of all captured program output so far.
+    /// Snapshot of all captured program output so far. Empty under `Live`.
     pub fn output(&self) -> String {
-        self.output.borrow().clone()
+        match &self.output {
+            OutputSink::Capture(buf) => buf.borrow().clone(),
+            OutputSink::Live => String::new(),
+        }
     }
 
-    /// Append to the captured program output (`print`).
+    /// Emit program output (`print`). Buffers under `Capture`, streams to stdout
+    /// under `Live`.
     pub(crate) fn push_output(&self, s: &str) {
-        self.output.borrow_mut().push_str(s);
+        match &self.output {
+            OutputSink::Capture(buf) => buf.borrow_mut().push_str(s),
+            OutputSink::Live => {
+                use std::io::Write;
+                let mut so = std::io::stdout().lock();
+                let _ = so.write_all(s.as_bytes());
+                let _ = so.flush();
+            }
+        }
     }
 
-    /// Is the captured output buffer empty? (REPL flush check.)
+    /// Is the captured output buffer empty? (REPL flush check.) Always true under
+    /// `Live`.
     pub(crate) fn output_is_empty(&self) -> bool {
-        self.output.borrow().is_empty()
+        match &self.output {
+            OutputSink::Capture(buf) => buf.borrow().is_empty(),
+            OutputSink::Live => true,
+        }
     }
 
-    /// Clear the captured output buffer (REPL flushes after each line).
+    /// Clear the captured output buffer (REPL flushes after each line). No-op
+    /// under `Live`.
     pub(crate) fn clear_output(&self) {
-        self.output.borrow_mut().clear();
+        if let OutputSink::Capture(buf) = &self.output {
+            buf.borrow_mut().clear();
+        }
     }
 
     /// Allocate the next monotonic resource id.
@@ -3428,6 +3465,14 @@ print(r[1])
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output(), "7\n");
+    }
+
+    #[tokio::test]
+    async fn capture_sink_buffers_output() {
+        // The default `Interp::new()` uses `OutputSink::Capture`, which buffers
+        // `print` output for read-back via `output()`.
+        let out = run("print(1)\nprint(2)").await;
+        assert_eq!(out, "1\n2\n");
     }
 
     #[tokio::test]
