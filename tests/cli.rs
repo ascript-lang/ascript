@@ -588,3 +588,350 @@ fn runs_logging_example() {
     );
     assert!(err.contains("\"msg\":\"saved\""), "stderr was: {err:?}");
 }
+
+// ─── exit() builtin tests ─────────────────────────────────────────────────────
+
+#[test]
+fn exit_code_2_returns_process_exit_2() {
+    let path = std::env::temp_dir().join(format!("ascript_exit2_{}.as", std::process::id()));
+    std::fs::write(&path, "exit(2)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit code 2, got {:?}",
+        out.status.code()
+    );
+}
+
+#[test]
+fn exit_code_0_returns_success() {
+    let path = std::env::temp_dir().join(format!("ascript_exit0_{}.as", std::process::id()));
+    std::fs::write(&path, "print(\"hi\")\nexit(0)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "expected exit code 0, got {:?}",
+        out.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hi"), "stdout: {stdout}");
+}
+
+#[test]
+fn exit_no_arg_defaults_to_0() {
+    let path = std::env::temp_dir().join(format!("ascript_exitnoarg_{}.as", std::process::id()));
+    std::fs::write(&path, "exit()\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "expected exit code 0 for exit(), got {:?}",
+        out.status.code()
+    );
+}
+
+#[test]
+fn exit_during_test_run_is_a_clear_failure_not_fake_pass() {
+    // `exit()` inside a test file must NOT report an empty all-pass summary (exit 0).
+    // It is a hard error for `ascript test`: non-zero exit + a clear message.
+    let path = std::env::temp_dir().join(format!("ascript_test_exit_{}.as", std::process::id()));
+    std::fs::write(&path, "test(\"calls exit\", () => { exit(0) })\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("test").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !out.status.success(),
+        "exit() in a test must fail the run, got status {:?}",
+        out.status.code()
+    );
+    let combined =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        combined.contains("exit() called during test run"),
+        "expected a clear message; got: {combined}"
+    );
+}
+
+#[test]
+fn exit_out_of_range_panics() {
+    // exit(300) is out of 0..=255 — must be a Tier-2 panic → exit code 1 from the diagnostic path.
+    let path = std::env::temp_dir().join(format!("ascript_exit_oor_{}.as", std::process::id()));
+    std::fs::write(&path, "exit(300)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    // The panic surfaces as a diagnostic on stderr, process exits 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit code 1 for out-of-range exit(300), got {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("0..=255"),
+        "expected 0..=255 in error; stderr: {stderr}"
+    );
+}
+
+// ---- std/io stdin tests ----
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readline_returns_first_line() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_rl_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nprint(await io.readLine())\n",
+    )
+    .unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello\nworld\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readline_multiple_calls_buffers_correctly() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_rl2_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nprint(await io.readLine())\nprint(await io.readLine())\n",
+    )
+    .unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello\nworld\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\nworld\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readall_returns_full_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_ra_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nprint(await io.readAll())\n",
+    )
+    .unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"abc").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readall_is_utf8_lossy_on_invalid_bytes() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_lossy_{}.as", std::process::id()));
+    // readAll must NOT error on invalid UTF-8; it returns a string (with the
+    // U+FFFD replacement char for the bad byte).
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nlet s = await io.readAll()\nprint(type(s))\nprint(len(s) > 0)\n",
+    )
+    .unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // 0xff is an invalid lone byte; followed by valid "hi".
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&[0xff, b'h', b'i'])
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "readAll must not error on invalid UTF-8; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "string\ntrue\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readline_eof_returns_nil() {
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_eof_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nprint(await io.readLine())\n",
+    )
+    .unwrap();
+    // No stdin written — immediate EOF
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Drop stdin immediately to signal EOF
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nil\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readlines_returns_all_lines() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_rls_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nlet lines = await io.readLines()\nfor (l in lines) { print(l) }\n",
+    )
+    .unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"alpha\nbeta\ngamma\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "alpha\nbeta\ngamma\n");
+}
+
+// ---- env.args() tests ----
+
+#[test]
+#[cfg(feature = "sys")] // `std/env` is sys-gated; the binary lacks it under --no-default-features.
+fn env_args_returns_script_args() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_env_args_test.as");
+    std::fs::write(&file, "import { args } from \"std/env\"\nprint(args())\n").unwrap();
+    let out = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .arg("a")
+        .arg("b")
+        .arg("--x")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "process failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // AScript array Display quotes strings: ["a", "b", "--x"]
+    assert!(
+        stdout.contains("[\"a\", \"b\", \"--x\"]"),
+        "expected [\"a\", \"b\", \"--x\"] in stdout; got: {stdout}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sys")] // `std/env` is sys-gated; the binary lacks it under --no-default-features.
+fn env_args_no_args_returns_empty_array() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_env_args_empty.as");
+    std::fs::write(&file, "import { args } from \"std/env\"\nprint(args())\n").unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "process failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[]"),
+        "expected [] in stdout; got: {stdout}"
+    );
+}

@@ -146,3 +146,20 @@ if (err != nil) {
 `recover` exists for the REPL, the test runner (`ascript test` wraps each case in it), and embedding
 hosts — **not** for routine control flow. Reach for Tier-1 results and `?` in ordinary code; reserve
 `recover` for the outermost boundary where a crash would otherwise be unacceptable.
+
+## `exit` — clean program termination
+
+`exit(code?)` terminates the program immediately with the given integer exit status. The `code` must be an integer in `0..=255`; it defaults to `0`. `exit` unwinds the async runtime cleanly and is **not** catchable by `recover`.
+
+```ascript
+// exit with success
+exit(0)
+
+// exit with a non-zero status to signal failure to the shell
+exit(1)
+
+// default: exit(0)
+exit()
+```
+
+`exit` is a global builtin — no import needed. Call it only after all output has been flushed (or at the very end of the program); because `print` output is buffered and flushed at normal program exit, an `exit` call in the middle of output may cause in-flight `print` calls to be dropped. For scripts that need to signal failure to the shell, `exit(1)` at the end is the conventional idiom.

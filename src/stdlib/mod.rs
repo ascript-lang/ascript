@@ -6,6 +6,8 @@
 
 pub mod array;
 pub mod bytes;
+pub mod cli;
+pub mod color;
 #[cfg(feature = "compress")]
 pub mod compress;
 pub mod convert;
@@ -25,6 +27,8 @@ pub mod fs;
 pub mod http_server;
 #[cfg(feature = "intl")]
 pub mod intl;
+#[cfg(feature = "sys")]
+pub mod io;
 #[cfg(feature = "data")]
 pub mod json;
 #[cfg(feature = "log")]
@@ -52,6 +56,8 @@ pub mod toml;
 #[cfg(feature = "tui")]
 pub mod tui;
 #[cfg(feature = "data")]
+pub mod url;
+#[cfg(feature = "data")]
 pub mod uuid;
 #[cfg(feature = "data")]
 pub mod yaml;
@@ -71,6 +77,8 @@ pub(crate) fn bi(qualified: &str) -> Value {
 /// if `path` is not a known stdlib module.
 pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
+        "std/cli" => cli::exports(),
+        "std/color" => color::exports(),
         "std/math" => math::exports(),
         "std/string" => string::exports(),
         "std/array" => array::exports(),
@@ -99,6 +107,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         #[cfg(feature = "sys")]
         "std/fs" => fs::exports(),
         #[cfg(feature = "sys")]
+        "std/io" => io::exports(),
+        #[cfg(feature = "sys")]
         "std/process" => process::exports(),
         #[cfg(feature = "net")]
         "std/net/tcp" => net_tcp::exports(),
@@ -112,6 +122,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/regex" => regex::exports(),
         #[cfg(feature = "sql")]
         "std/sqlite" => sqlite::exports(),
+        #[cfg(feature = "data")]
+        "std/url" => url::exports(),
         #[cfg(feature = "data")]
         "std/uuid" => uuid::exports(),
         #[cfg(feature = "data")]
@@ -165,6 +177,8 @@ impl Interp {
             }
         }
         match module {
+            "cli" => self.call_cli(func, args, span).await,
+            "color" => color::call(func, args, span),
             "math" => math::call(func, args, span),
             "string" => string::call(func, args, span),
             "array" => self.call_array(func, args, span).await,
@@ -189,9 +203,18 @@ impl Interp {
             #[cfg(feature = "compress")]
             "compress" => compress::call(func, args, span),
             #[cfg(feature = "sys")]
-            "env" => env::call(func, args, span),
+            "env" => {
+                // `args()` must see the interpreter's stored CLI args, so it is
+                // handled here before the pure `env::call` fallthrough.
+                if func == "args" {
+                    return Ok(self.get_cli_args());
+                }
+                env::call(func, args, span)
+            }
             #[cfg(feature = "sys")]
             "fs" => fs::call(func, args, span),
+            #[cfg(feature = "sys")]
+            "io" => self.call_io(func, args, span).await,
             #[cfg(feature = "sys")]
             "process" => self.call_process(func, args, span).await,
             #[cfg(feature = "net")]
@@ -206,6 +229,8 @@ impl Interp {
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "sql")]
             "sqlite" => self.call_sqlite_open(func, args, span),
+            #[cfg(feature = "data")]
+            "url" => url::call(func, args, span),
             #[cfg(feature = "data")]
             "uuid" => uuid::call(func, args, span),
             #[cfg(feature = "data")]

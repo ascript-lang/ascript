@@ -185,6 +185,7 @@ dependencies = [
  "toml",
  "tower-lsp",
  "tree-sitter",
+ "url",
  "uuid",
  "walkdir",
  "xxhash-rust",

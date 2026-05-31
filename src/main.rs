@@ -11,7 +11,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a .as program
-    Run { file: String },
+    Run {
+        file: String,
+        /// Trailing arguments forwarded to the script as `env.args()`.
+        /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Start the interactive REPL
     Repl,
     /// Format .as source files
@@ -29,14 +35,17 @@ enum Command {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { file } => match ascript::run_file(std::path::Path::new(&file)).await {
-            // Output already streamed live by `run_file` (OutputSink::Live).
-            Ok(_) => ExitCode::SUCCESS,
-            Err(e) => {
-                ascript::diagnostics::report(&e);
-                ExitCode::from(1)
+        Command::Run { file, args } => {
+            match ascript::run_file(std::path::Path::new(&file), &args).await {
+                // Output already streamed live by `run_file` (OutputSink::Live).
+                // `code` is 0 for normal exit or whatever `exit(n)` requested.
+                Ok(code) => ExitCode::from(code as u8),
+                Err(e) => {
+                    ascript::diagnostics::report(&e);
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
         Command::Repl => match ascript::repl::run_repl().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

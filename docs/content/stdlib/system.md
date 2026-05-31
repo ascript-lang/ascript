@@ -8,7 +8,7 @@ Most of these modules are gated behind Cargo features, all of which are **on by 
 
 | Modules | Cargo feature |
 | --- | --- |
-| `std/fs`, `std/env`, `std/process` | `sys` |
+| `std/fs`, `std/env`, `std/process`, `std/io` | `sys` |
 | `std/crypto` | `crypto` |
 | `std/compress` | `compress` |
 | `std/sqlite` | `sql` |
@@ -321,6 +321,75 @@ import { loadDotenv, get } from "std/env"
 let [count, err] = loadDotenv(".env")
 print(count)
 print(get("DATABASE_URL"))
+```
+
+### env.args
+
+Returns the script's trailing CLI arguments — the tokens after `ascript run file.as` that were not consumed by the runner. When `ascript` is not passed extra arguments (or the script is run in the REPL), this returns an empty array.
+
+- Takes no arguments.
+- **Returns** `array<string>`.
+
+```ascript
+import * as env from "std/env"
+let args = env.args()
+print(len(args))
+if (len(args) > 0) {
+  print(args[0])
+}
+```
+
+> [!NOTE]
+> `std/cli`'s `cli.parse(spec)` calls `env.args()` automatically when no `args` argument is supplied, so you rarely need to call `env.args()` directly.
+
+## std/io
+
+Standard-input reading. `std/io` provides three async functions for consuming `stdin`; they share a single internal `BufReader` so that bytes are never silently dropped between calls.
+
+> [!NOTE]
+> `std/io` is part of the `sys` Cargo feature (enabled by default).
+
+### io.readLine
+
+Reads one line from stdin, stripping the trailing newline.
+
+- Takes no arguments.
+- **Returns** `string | nil` — the line text (without `\n`), or `nil` at EOF.
+
+```ascript
+import * as io from "std/io"
+let line = await io.readLine()
+if (line != nil) {
+  print("got: " + line)
+}
+```
+
+### io.readAll
+
+Reads all remaining stdin as a single UTF-8 string (lossy — invalid bytes become the replacement character).
+
+- Takes no arguments.
+- **Returns** `string`.
+
+```ascript
+import * as io from "std/io"
+let text = await io.readAll()
+print(len(text))
+```
+
+### io.readLines
+
+Reads every remaining line of stdin and returns them as an array.
+
+- Takes no arguments.
+- **Returns** `array<string>` — one element per line, each without the trailing `\n`.
+
+```ascript
+import * as io from "std/io"
+let lines = await io.readLines()
+for (let line of lines) {
+  print(line)
+}
 ```
 
 ## std/process

@@ -27,6 +27,7 @@ csv = { version = "1", optional = true }
 toml = { version = "0.8", optional = true }
 serde_yaml = { version = "0.9", optional = true }
 percent-encoding = { version = "2", optional = true }
+url = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4", "v7"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 icu = { version = "1", features = ["compiled_data"], optional = true }
@@ -64,7 +65,7 @@ tree-sitter = "0.25"
 
 [features]
 default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log"]
-data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
+data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding", "dep:url"]
 # std/log: leveled structured logging. Reuses json's total `to_json_lossy`
 # serializer (behind `data`), so it pulls in `data`. Default-on; cfg's out
 # cleanly under --no-default-features.
