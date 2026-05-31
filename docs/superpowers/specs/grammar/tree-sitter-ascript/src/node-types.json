@@ -1200,6 +1200,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "object_pattern",
+            "named": true
           }
         ]
       },
@@ -2407,6 +2411,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "object_pattern",
+            "named": true
           }
         ]
       },
@@ -3171,6 +3179,51 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "object_pattern",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "object_pattern_entry",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "object_pattern_entry",
+    "named": true,
+    "fields": {
+      "binding": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "key": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {

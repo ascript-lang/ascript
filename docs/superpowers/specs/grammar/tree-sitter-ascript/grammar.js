@@ -139,9 +139,15 @@ module.exports = grammar({
       optional(';'),
     ),
 
-    // `let [a, b] = ...` array destructuring (Result returns, §6).
-    _binding_target: $ => choice($.identifier, $.array_pattern),
+    // `let [a, b] = ...` array destructuring (Result returns, §6) and
+    // `let {a, b as local, "k" as v} = ...` object destructuring.
+    _binding_target: $ => choice($.identifier, $.array_pattern, $.object_pattern),
     array_pattern: $ => seq('[', commaSep($.identifier), optional(','), ']'),
+    object_pattern: $ => seq('{', commaSep($.object_pattern_entry), optional(','), '}'),
+    object_pattern_entry: $ => seq(
+      field('key', choice($.identifier, $.string)),
+      optional(seq('as', field('binding', $.identifier))),
+    ),
 
     function_declaration: $ => seq(
       optional('async'),
