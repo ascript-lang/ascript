@@ -54,6 +54,8 @@ pub mod toml;
 #[cfg(feature = "tui")]
 pub mod tui;
 #[cfg(feature = "data")]
+pub mod url;
+#[cfg(feature = "data")]
 pub mod uuid;
 #[cfg(feature = "data")]
 pub mod yaml;
@@ -116,6 +118,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/regex" => regex::exports(),
         #[cfg(feature = "sql")]
         "std/sqlite" => sqlite::exports(),
+        #[cfg(feature = "data")]
+        "std/url" => url::exports(),
         #[cfg(feature = "data")]
         "std/uuid" => uuid::exports(),
         #[cfg(feature = "data")]
@@ -219,6 +223,8 @@ impl Interp {
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "sql")]
             "sqlite" => self.call_sqlite_open(func, args, span),
+            #[cfg(feature = "data")]
+            "url" => url::call(func, args, span),
             #[cfg(feature = "data")]
             "uuid" => uuid::call(func, args, span),
             #[cfg(feature = "data")]
