@@ -1897,6 +1897,8 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         // type the future *resolves to*, which cannot be inspected until it is
         // awaited, so it is advisory/erased at the binding site.
         Type::Future(_) => matches!(value, Value::Future(_)),
+        // `T?` ≡ `T | nil`.
+        Type::Optional(inner) => check_type(value, inner) || matches!(value, Value::Nil),
     }
 }
 
@@ -2489,6 +2491,27 @@ print(bad[1].message)
         interp.exec(&stmts, &env).await.unwrap();
         assert!(interp.output().starts_with("nil\n"));
         assert!(interp.output().contains("type contract violated"));
+    }
+
+    #[tokio::test]
+    async fn optional_type_accepts_value_and_nil() {
+        // nil and a number both satisfy number?; a string does not.
+        assert_eq!(eval_to_value("let x: number? = nil\nx").await, Value::Nil);
+        assert_eq!(eval_to_value("let x: number? = 7\nx").await, Value::Number(7.0));
+    }
+
+    #[tokio::test]
+    async fn optional_type_rejects_wrong_type() {
+        let src = "let r = recover(() => { let x: number? = \"bad\"\n return nil })\nprint(r[1].message)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert!(
+            interp.output().contains("type contract violated"),
+            "got: {}",
+            interp.output()
+        );
     }
 
     #[tokio::test]
