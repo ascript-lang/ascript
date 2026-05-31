@@ -1304,7 +1304,7 @@ impl Interp {
     pub(crate) async fn call_http_response_method(
         &self,
         m: &Rc<NativeMethod>,
-        _args: Vec<Value>,
+        args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
         let id = m.receiver.id;
@@ -1338,7 +1338,21 @@ impl Interp {
                     },
                     "json" => match resp.bytes().await {
                         Ok(b) => match serde_json::from_slice::<serde_json::Value>(&b) {
-                            Ok(jv) => Ok(make_pair(crate::stdlib::json::to_ascript(&jv), Value::Nil)),
+                            Ok(jv) => {
+                                let val = crate::stdlib::json::to_ascript(&jv);
+                                // Typed parse: resp.json(Class) validates the decoded
+                                // body against the class, fusing a decode failure and a
+                                // shape mismatch into one Tier-1 [val, err] pair. With no
+                                // class argument the raw decoded value is returned.
+                                if let Some(Value::Class(c)) = args.first() {
+                                    match self.validate_into(c, &val, false, "", span).await {
+                                        Ok(inst) => Ok(make_pair(inst, Value::Nil)),
+                                        Err(e) => Ok(err_pair(e.message)),
+                                    }
+                                } else {
+                                    Ok(make_pair(val, Value::Nil))
+                                }
+                            }
                             Err(e) => Ok(err_pair(format!("response.json failed: {}", e))),
                         },
                         Err(e) => Ok(err_pair(format!("response.json failed: {}", e))),
