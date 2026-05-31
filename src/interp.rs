@@ -717,7 +717,7 @@ impl Interp {
                 env.define(name, def, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Class { name, superclass, methods, .. } => {
+            Stmt::Class { name, superclass, fields, methods, .. } => {
                 let parent = match superclass {
                     Some(sup_name) => match env.get(sup_name) {
                         Some(Value::Class(c)) => Some(c),
@@ -726,6 +726,13 @@ impl Interp {
                     },
                     None => None,
                 };
+                let mut field_map = indexmap::IndexMap::new();
+                for fd in fields {
+                    field_map.insert(
+                        fd.name.clone(),
+                        crate::value::FieldSchema { ty: fd.ty.clone(), default: fd.default.clone() },
+                    );
+                }
                 let mut method_map = indexmap::IndexMap::new();
                 for m in methods {
                     method_map.insert(m.name.clone(), std::rc::Rc::new(crate::value::Method {
@@ -738,6 +745,7 @@ impl Interp {
                 let class = Value::Class(std::rc::Rc::new(crate::value::Class {
                     name: name.clone(),
                     superclass: parent,
+                    fields: field_map,
                     methods: method_map,
                     def_env: env.clone(),
                 }));

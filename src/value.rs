@@ -69,9 +69,16 @@ pub struct Method {
     pub is_async: bool,
 }
 
+#[derive(Clone)]
+pub struct FieldSchema {
+    pub ty: crate::ast::Type,
+    pub default: Option<crate::ast::Expr>,
+}
+
 pub struct Class {
     pub name: String,
     pub superclass: Option<Rc<Class>>,
+    pub fields: IndexMap<String, FieldSchema>,
     pub methods: IndexMap<String, Rc<Method>>,
     pub def_env: Environment,
 }
