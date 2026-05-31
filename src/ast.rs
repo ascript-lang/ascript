@@ -169,6 +169,7 @@ pub enum Stmt {
     Class {
         name: String,
         superclass: Option<String>,
+        fields: Vec<FieldDecl>,
         methods: Vec<MethodDecl>,
         span: Span,
         name_span: Span,
@@ -181,6 +182,16 @@ pub enum Stmt {
 pub enum ImportNames {
     Named(Vec<String>),
     Namespace(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldDecl {
+    pub name: String,
+    pub ty: Type,
+    /// Lazily-evaluated default (in the class def env) when the field is absent.
+    pub default: Option<Expr>,
+    pub span: Span,
+    pub name_span: Span,
 }
 
 #[derive(Clone, Debug)]
