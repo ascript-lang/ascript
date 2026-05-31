@@ -1528,6 +1528,30 @@ impl Interp {
             fields: indexmap::IndexMap::new(),
         }));
         let inst_val = Value::Instance(instance);
+        // Pre-populate declared-field defaults (base-class first so a subclass
+        // default overrides). `init` may then override; .from (Task 4) handles
+        // its own defaults. Defaults eval lazily in the class def env.
+        {
+            let mut chain = Vec::new();
+            let mut cur = Some(class.clone());
+            while let Some(c) = cur {
+                chain.push(c.clone());
+                cur = c.superclass.clone();
+            }
+            for c in chain.into_iter().rev() {
+                for (fname, schema) in &c.fields {
+                    if let Some(def) = &schema.default {
+                        let dv = self.eval_expr(def, &c.def_env).await?;
+                        if !check_type(&dv, &schema.ty) {
+                            return Err(contract_panic(&schema.ty, &dv, span));
+                        }
+                        if let Value::Instance(i) = &inst_val {
+                            i.borrow_mut().fields.insert(fname.clone(), dv);
+                        }
+                    }
+                }
+            }
+        }
         match crate::value::find_method(&class, "init") {
             Some((method, def_class)) => {
                 let bm = crate::value::BoundMethod {
@@ -1786,6 +1810,12 @@ impl Interp {
                         Ok(value)
                     }
                     Value::Instance(inst) => {
+                        let class = inst.borrow().class.clone();
+                        if let Some(schema) = lookup_field_schema(&class, name) {
+                            if !check_type(&value, &schema.ty) {
+                                return Err(contract_panic(&schema.ty, &value, object.span));
+                            }
+                        }
                         inst.borrow_mut().fields.insert(name.clone(), value.clone());
                         Ok(value)
                     }
@@ -1876,6 +1906,21 @@ fn exported_names(stmt: &Stmt) -> Vec<String> {
         Stmt::LetDestructure { names, .. } => names.clone(),
         _ => Vec::new(),
     }
+}
+
+/// Look up the declared schema for `field` on `class` or any superclass.
+fn lookup_field_schema(
+    class: &std::rc::Rc<crate::value::Class>,
+    field: &str,
+) -> Option<crate::value::FieldSchema> {
+    let mut cur = Some(class.clone());
+    while let Some(c) = cur {
+        if let Some(s) = c.fields.get(field) {
+            return Some(s.clone());
+        }
+        cur = c.superclass.clone();
+    }
+    None
 }
 
 /// Runtime contract check (spec §5). Eagerly checks parametric types to full depth.
@@ -2551,6 +2596,32 @@ print(bad[1].message)
             "got: {}",
             interp.output()
         );
+    }
+
+    #[tokio::test]
+    async fn declared_field_type_checked_on_assignment() {
+        // Assigning a wrong-typed declared field panics (recoverable).
+        let src = "class C { id: number\n fn init(v) { self.id = v } }\n\
+                   let r = recover(() => C(\"bad\"))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("type contract violated"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn declared_field_default_applied_at_construction() {
+        let src = "class C { role: string = \"guest\"\n fn init() {} }\n\
+                   let c = C()\nprint(c.role)";
+        let out = run(src).await;
+        assert!(out.contains("guest"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn undeclared_field_stays_dynamic() {
+        // A field the class did not declare is unchecked.
+        let src = "class C { fn init() { self.x = 1\n self.x = \"now a string\" } }\n\
+                   let c = C()\nprint(c.x)";
+        let out = run(src).await;
+        assert!(out.contains("now a string"), "got: {out}");
     }
 
     #[tokio::test]
