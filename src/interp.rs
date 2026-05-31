@@ -349,8 +349,7 @@ impl Interp {
     }
 
     /// Return the stored CLI args as a `Value::Array` of strings.
-    /// Only called from the `sys`-gated `env.args` dispatch.
-    #[cfg(feature = "sys")]
+    /// Called from `env.args` (sys-gated) and `cli.parse` (always available).
     pub(crate) fn get_cli_args(&self) -> Value {
         let args: Vec<Value> = self
             .cli_args
