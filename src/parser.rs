@@ -323,9 +323,9 @@ impl<'a> Parser<'a> {
     fn parse_type_atom(&mut self) -> Result<crate::ast::Type, AsError> {
         use crate::ast::Type;
         let span = self.span();
-        match self.advance() {
-            Tok::Nil => Ok(Type::Nil),
-            Tok::Fn => Ok(Type::Fn),
+        let atom = match self.advance() {
+            Tok::Nil => Type::Nil,
+            Tok::Fn => Type::Fn,
             Tok::LBracket => {
                 // tuple type [T1, T2, ...]
                 let mut parts = Vec::new();
@@ -343,32 +343,32 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.eat(&Tok::RBracket)?;
-                Ok(Type::Tuple(parts))
+                Type::Tuple(parts)
             }
             Tok::Ident(name) => match name.as_str() {
-                "number" => Ok(Type::Number),
-                "string" => Ok(Type::String),
-                "bool" => Ok(Type::Bool),
-                "any" => Ok(Type::Any),
-                "object" => Ok(Type::Object),
-                "error" => Ok(Type::Error),
+                "number" => Type::Number,
+                "string" => Type::String,
+                "bool" => Type::Bool,
+                "any" => Type::Any,
+                "object" => Type::Object,
+                "error" => Type::Error,
                 "array" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
                     self.eat(&Tok::Gt)?;
-                    Ok(Type::Array(Box::new(inner)))
+                    Type::Array(Box::new(inner))
                 }
                 "Result" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
                     self.eat(&Tok::Gt)?;
-                    Ok(Type::Result(Box::new(inner)))
+                    Type::Result(Box::new(inner))
                 }
                 "future" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
                     self.eat(&Tok::Gt)?;
-                    Ok(Type::Future(Box::new(inner)))
+                    Type::Future(Box::new(inner))
                 }
                 "map" => {
                     self.eat(&Tok::Lt)?;
@@ -376,11 +376,20 @@ impl<'a> Parser<'a> {
                     self.eat(&Tok::Comma)?;
                     let v = self.parse_type()?;
                     self.eat(&Tok::Gt)?;
-                    Ok(Type::Map(Box::new(k), Box::new(v)))
+                    Type::Map(Box::new(k), Box::new(v))
                 }
-                _ => Ok(Type::Named(name)),
+                _ => Type::Named(name),
             },
-            other => Err(AsError::at(format!("expected a type, found {:?}", other), span)),
+            other => return Err(AsError::at(format!("expected a type, found {:?}", other), span)),
+        };
+        // `T?` nullable suffix (sugar for `T | nil`). Only reachable in type
+        // position (after `:` / inside `<...>`), so it never collides with the
+        // expression-level `?` (ternary / propagate).
+        if *self.peek() == Tok::Question {
+            self.advance();
+            Ok(Type::Optional(Box::new(atom)))
+        } else {
+            Ok(atom)
         }
     }
 
@@ -1449,6 +1458,30 @@ mod tests {
         // `await f()` => Await(Call(f)); `await a + b` => (await a) + b.
         assert_eq!(sexpr("await f()"), "(await (call f))");
         assert_eq!(sexpr("await a + b"), "(+ (await a) b)");
+    }
+
+    #[test]
+    fn optional_type_suffix_parses() {
+        // `number?` in a let binding parses to Type::Optional(Number).
+        let stmts = parse(&lex("let x: number? = nil").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Let { ty: Some(t), .. } => {
+                assert_eq!(t.to_string(), "number?");
+            }
+            other => panic!("expected a typed let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_type_in_param_and_return() {
+        let stmts = parse(&lex("fn f(a: string?): number? { return nil }").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Fn { params, ret: Some(r), .. } => {
+                assert_eq!(params[0].ty.as_ref().unwrap().to_string(), "string?");
+                assert_eq!(r.to_string(), "number?");
+            }
+            other => panic!("expected a typed fn, got {other:?}"),
+        }
     }
 
     #[test]
