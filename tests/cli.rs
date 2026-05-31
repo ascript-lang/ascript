@@ -414,3 +414,76 @@ fn run_streams_output_and_keeps_it_before_panic() {
         "stdout was: {stdout:?}"
     );
 }
+
+#[test]
+fn runs_object_destructuring_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/object_destructuring.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Ada\nadmin\n42\nnil\n7\n"
+    );
+}
+
+#[test]
+fn runs_spread_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/spread.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "[0, 1, 2, 3, 4]\n{host: \"local\", port: 443}\n60\n"
+    );
+}
+
+#[test]
+fn runs_rest_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/rest.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "10\n0\nnums\n[1, 2]\n10\n[20, 30]\n7\n{role: \"admin\", active: true}\n18\n"
+    );
+}
+
+#[test]
+#[cfg(feature = "log")]
+fn runs_logging_example() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("examples/logging.as")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "process failed: {:?}", output);
+    // Logs go to STDERR, never STDOUT.
+    assert!(
+        output.stdout.is_empty(),
+        "logs must not go to stdout; stdout was: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("[DEBUG] starting pid=42"), "stderr was: {err:?}");
+    assert!(err.contains("[INFO] request"), "stderr was: {err:?}");
+    assert!(err.contains("[WARN] slow query"), "stderr was: {err:?}");
+    assert!(err.contains("[ERROR] upstream failed"), "stderr was: {err:?}");
+    assert!(err.contains("\"msg\":\"saved\""), "stderr was: {err:?}");
+}
