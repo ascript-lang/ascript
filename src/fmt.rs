@@ -316,7 +316,8 @@ fn expr_prec(e: &Expr) -> u8 {
         | ExprKind::Index { .. }
         | ExprKind::Member { .. }
         | ExprKind::OptMember { .. }
-        | ExprKind::Try(_) => PREC_POSTFIX,
+        | ExprKind::Try(_)
+        | ExprKind::Unwrap(_) => PREC_POSTFIX,
         // A `Paren` node already emits exactly one set of parens in
         // `write_expr_inner`, so it must be treated as an atom here to prevent
         // `write_expr` from wrapping it in a second, redundant set (which would
@@ -464,8 +465,12 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             out.push_str(name);
         }
         ExprKind::Try(inner) => {
-            write_expr(out, inner, PREC_POSTFIX);
+            write_expr(out, inner, PREC_UNARY);
             out.push('?');
+        }
+        ExprKind::Unwrap(inner) => {
+            write_expr(out, inner, PREC_UNARY);
+            out.push('!');
         }
         ExprKind::Ternary { cond, then, els } => {
             // `cond` and `then` bind one tier above the ternary so a nested
@@ -632,6 +637,18 @@ mod tests {
     fn formats_canonically() {
         let out = format_source("let x=1").unwrap();
         assert_eq!(out, "let x = 1\n");
+    }
+
+    #[test]
+    fn unwrap_and_await_format_without_parens() {
+        // `await x!` and `await x?` are canonical (no parens) — `!`/`?` are
+        // looser than await, so the grouping is implicit. A binary inner still
+        // keeps its parens. `format_source` emits the statement-expression plus
+        // a trailing newline, so we compare against that.
+        assert_eq!(format_source("await f()!").unwrap(), "await f()!\n");
+        assert_eq!(format_source("await f()?").unwrap(), "await f()?\n");
+        assert_eq!(format_source("a! + b").unwrap(), "a! + b\n");
+        assert_eq!(format_source("(a + b)!").unwrap(), "(a + b)!\n");
     }
 
     #[test]
