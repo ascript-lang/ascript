@@ -82,6 +82,7 @@ fn interpreter_parses_each_grammar_construct() {
         // --- classes / inheritance / enums ---
         "class C extends B { fn init() { super() } }",
         "class D { fn m(x) { return x } }",
+        "class P { x: number; y: number }", // `;` optional separator between class members
         "enum E { A, B = 2 }",
         "enum E2 { A, B, C }",
         // --- import / export ---
