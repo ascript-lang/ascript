@@ -61,8 +61,12 @@ cc = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding"]
+# std/log: leveled structured logging. Reuses json's total `to_json_lossy`
+# serializer (behind `data`), so it pulls in `data`. Default-on; cfg's out
+# cleanly under --no-default-features.
+log = ["data"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
 # Task 2 wires `dotenvy` for std/env; Task 3 (fs) adds walkdir/ignore/regex; Task 7

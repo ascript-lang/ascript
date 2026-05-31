@@ -376,6 +376,91 @@ impl Interp {
     #[cfg(feature = "log")]
     pub(crate) fn set_log_format(&self, f: LogFormat) { self.log_format.set(f); }
 
+    /// `std/log` dispatch. `setLevel`/`setFormat` mutate per-interp state;
+    /// `debug`/`info`/`warn`/`error` build a record (first string arg → `msg`,
+    /// object args merge as fields, auto `level`) and emit it via [`emit_log`],
+    /// but only when the level passes the filter — a thunk first arg (a function)
+    /// is invoked ONLY then, so a filtered `log.debug(() => expensive())` is free.
+    /// Serialization is total (`json::to_json_lossy`) so logging never panics.
+    #[cfg(feature = "log")]
+    pub(crate) async fn call_log(&self, func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+        let level_of = |f: &str| match f {
+            "debug" => Some(LogLevel::Debug),
+            "info" => Some(LogLevel::Info),
+            "warn" => Some(LogLevel::Warn),
+            "error" => Some(LogLevel::Error),
+            _ => None,
+        };
+        match func {
+            "setLevel" => {
+                let s = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _ => return Err(AsError::at("log.setLevel expects a level string", span).into()),
+                };
+                match level_of(&s) {
+                    Some(l) => { self.set_log_level(l); Ok(Value::Nil) }
+                    None => Err(AsError::at(format!("unknown log level {:?}", s), span).into()),
+                }
+            }
+            "setFormat" => {
+                let s = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _ => return Err(AsError::at("log.setFormat expects \"human\" or \"json\"", span).into()),
+                };
+                match s.as_str() {
+                    "human" => { self.set_log_format(LogFormat::Human); Ok(Value::Nil) }
+                    "json" => { self.set_log_format(LogFormat::Json); Ok(Value::Nil) }
+                    o => Err(AsError::at(format!("unknown log format {:?}", o), span).into()),
+                }
+            }
+            "debug" | "info" | "warn" | "error" => {
+                let lvl = level_of(func).unwrap();
+                if lvl < self.log_level.get() {
+                    return Ok(Value::Nil);
+                }
+                let (msg, field_args): (String, &[Value]) = match args.first() {
+                    Some(Value::Function(_)) | Some(Value::Builtin(_)) => {
+                        let r = self.call_value(args[0].clone(), vec![], span).await?;
+                        (r.to_string(), &args[1..])
+                    }
+                    Some(v) => (v.to_string(), &args[1..]),
+                    None => (String::new(), &args[..0]),
+                };
+                let mut fields = serde_json::Map::new();
+                for a in field_args {
+                    if let Value::Object(o) = a {
+                        for (k, val) in o.borrow().iter() {
+                            fields.insert(k.clone(), crate::stdlib::json::to_json_lossy(val, &mut Vec::new()));
+                        }
+                    }
+                }
+                let line = match self.log_format.get() {
+                    LogFormat::Json => {
+                        let mut rec = serde_json::Map::new();
+                        rec.insert("level".into(), serde_json::Value::String(func.into()));
+                        rec.insert("msg".into(), serde_json::Value::String(msg));
+                        for (k, v) in fields { rec.insert(k, v); }
+                        serde_json::Value::Object(rec).to_string()
+                    }
+                    LogFormat::Human => {
+                        let mut s = format!("[{}] {}", func.to_uppercase(), msg);
+                        for (k, v) in &fields {
+                            let vs = match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            s.push_str(&format!(" {}={}", k, vs));
+                        }
+                        s
+                    }
+                };
+                self.emit_log(&line);
+                Ok(Value::Nil)
+            }
+            other => Err(AsError::at(format!("std/log has no function '{}'", other), span).into()),
+        }
+    }
+
     /// Is the captured output buffer empty? (REPL flush check.) Always true under
     /// `Live`.
     pub(crate) fn output_is_empty(&self) -> bool {
@@ -2462,6 +2547,48 @@ mod tests {
         local.run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") }).await;
         local.await; // drain spawned async-fn tasks
         interp.output()
+    }
+
+    /// Like `run`, but returns the captured std/log output (not `print` output).
+    #[cfg(feature = "log")]
+    async fn run_logs(src: &str) -> String {
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let tokens = lex(src).expect("lex");
+        let stmts = parse(&tokens).expect("parse");
+        let env = global_env().child();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") }).await;
+        local.await;
+        interp.log_output()
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_records_human_and_filtering() {
+        let logs = run_logs(r#"
+import * as log from "std/log"
+log.setLevel("warn")
+log.info("ignored", {a: 1})
+log.warn("disk low", {pct: 92})
+log.error("boom")
+"#).await;
+        assert!(!logs.contains("ignored"));
+        assert!(logs.contains("[WARN]") && logs.contains("disk low") && logs.contains("pct=92"));
+        assert!(logs.contains("[ERROR]") && logs.contains("boom"));
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_json_format_and_thunk() {
+        let logs = run_logs(r#"
+import * as log from "std/log"
+log.setFormat("json")
+log.info("saved", {userId: 5})
+log.debug(() => "expensive")
+"#).await;
+        assert!(logs.contains("\"level\":\"info\"") && logs.contains("\"msg\":\"saved\"") && logs.contains("\"userId\":5"));
+        assert!(!logs.contains("expensive"));
     }
 
     #[tokio::test]

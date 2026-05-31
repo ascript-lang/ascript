@@ -27,6 +27,8 @@ pub mod intl;
 pub mod process;
 #[cfg(feature = "data")]
 pub mod json;
+#[cfg(feature = "log")]
+pub mod log;
 pub mod map;
 pub mod math;
 #[cfg(feature = "net")]
@@ -84,6 +86,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/intl" => intl::exports(),
         #[cfg(feature = "data")]
         "std/json" => json::exports(),
+        #[cfg(feature = "log")]
+        "std/log" => log::exports(),
         #[cfg(feature = "data")]
         "std/encoding" => encoding::exports(),
         #[cfg(feature = "crypto")]
@@ -176,6 +180,8 @@ impl Interp {
             "intl" => intl::call(func, args, span),
             #[cfg(feature = "data")]
             "json" => json::call(func, args, span),
+            #[cfg(feature = "log")]
+            "log" => self.call_log(func, args, span).await,
             #[cfg(feature = "data")]
             "encoding" => encoding::call(func, args, span),
             #[cfg(feature = "crypto")]
