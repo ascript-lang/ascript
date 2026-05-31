@@ -84,6 +84,25 @@ spread-in value, and a `...` after an explicit entry overrides that. A key keeps
 position** in the result (so `{...a, k: v}` updates `k` in place if `a` already had it, rather than
 moving it to the end).
 
+### Rest in destructuring
+
+A destructuring pattern may end with a `...name` rest collector that gathers whatever the named
+entries did not bind. In an array pattern it collects the trailing elements into a new array; in an
+object pattern it collects the leftover keys into a new object:
+
+```ascript
+let [head, ...tail] = [10, 20, 30]  // head = 10, tail = [20, 30]
+let [only, ...rest] = [42]          // only = 42, rest = []  (empty when nothing remains)
+
+let {id, ...meta} = {id: 7, role: "admin", active: true}
+// id = 7, meta = {role: "admin", active: true}
+```
+
+The rest collector must be **last** in the pattern. Array-rest takes the elements past the named
+positions (an empty array `[]` when there are none). Object-rest takes every source key **not already
+bound** by an earlier entry — including keys reached through `as` renames — preserving their original
+order, and is `{}` when nothing is left over.
+
 ## Operators
 
 ```text
@@ -175,6 +194,38 @@ print(next())   // 2
 
 A function may be `async` (see [Modules & async](modules-async)). Arrow functions may be async too:
 `async (x) => x + 1`.
+
+### Rest parameters
+
+A function's final parameter may be a `...name` **rest parameter** that collects any trailing
+arguments into an array:
+
+```ascript
+fn tagged(label, ...rest) {
+  print(label)   // "nums"
+  print(rest)    // [1, 2]
+}
+tagged("nums", 1, 2)
+```
+
+When no extra arguments are passed, the rest parameter binds an empty array `[]`. A rest parameter
+must be **last** — nothing may follow it. It may carry a type annotation, which is always written as
+`array<T>` and is **checked per element** against `T`:
+
+```ascript
+fn sum(...nums: array<number>) {
+  let total = 0
+  for (n in nums) { total = total + n }
+  return total
+}
+print(sum(1, 2, 3, 4))   // 10
+print(sum())             // 0
+```
+
+Rest pairs naturally with [spread](#spread) for argument forwarding — `fn wrap(...args) { return
+sum(...args) }` collects then re-expands. For `async` functions and generators (`fn*`), arity and
+contract errors on a rest parameter surface **lazily**, when the returned future or generator is
+driven, rather than at the call site.
 
 ## Template strings
 
