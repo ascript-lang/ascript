@@ -176,6 +176,15 @@ pub enum OutputSink {
     Live,
 }
 
+/// std/log severity, ordered debug<info<warn<error for level filtering.
+#[cfg(feature = "log")]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel { Debug = 0, Info = 1, Warn = 2, Error = 3 }
+/// std/log output format: `human` (`[WARN] msg key=val`) or `json` (one object/line).
+#[cfg(feature = "log")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat { Human, Json }
+
 /// All mutable interpreter state lives behind interior mutability (`RefCell`/
 /// `Cell`) so the `eval`/`exec`/`call_*` methods take `&self`, not `&mut self`.
 /// This lets multiple concurrent eval futures (M17 Phase 2+) share one
@@ -208,6 +217,15 @@ pub struct Interp {
     /// High-water mark of `inflight` over the program's life. Exposed for tests
     /// that assert async-task memory stays bounded (does not scale with N).
     max_inflight: Cell<u64>,
+    /// std/log minimum level (records below it are dropped). Default `Info`.
+    #[cfg(feature = "log")]
+    log_level: std::cell::Cell<LogLevel>,
+    /// std/log output format. Default `Human`.
+    #[cfg(feature = "log")]
+    log_format: std::cell::Cell<LogFormat>,
+    /// std/log capture buffer (used under `OutputSink::Capture`, i.e. tests).
+    #[cfg(feature = "log")]
+    log_capture: RefCell<String>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -260,6 +278,12 @@ impl Interp {
             self_weak: RefCell::new(std::rc::Weak::new()),
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
+            #[cfg(feature = "log")]
+            log_level: Cell::new(LogLevel::Info),
+            #[cfg(feature = "log")]
+            log_format: Cell::new(LogFormat::Human),
+            #[cfg(feature = "log")]
+            log_capture: RefCell::new(String::new()),
         }
     }
 
@@ -329,6 +353,28 @@ impl Interp {
             }
         }
     }
+
+    /// Emit one std/log record line. Buffers into `log_capture` under `Capture`
+    /// (tests read it via `log_output`); writes to stderr under `Live`.
+    #[cfg(feature = "log")]
+    pub(crate) fn emit_log(&self, line: &str) {
+        match &self.output {
+            OutputSink::Capture(_) => { let mut b = self.log_capture.borrow_mut(); b.push_str(line); b.push('\n'); }
+            OutputSink::Live => { use std::io::Write; let mut e = std::io::stderr().lock(); let _ = writeln!(e, "{}", line); }
+        }
+    }
+
+    /// Snapshot of all captured std/log output (test hook). Empty under `Live`.
+    #[cfg(feature = "log")]
+    pub fn log_output(&self) -> String { self.log_capture.borrow().clone() }
+
+    /// Set the minimum std/log level.
+    #[cfg(feature = "log")]
+    pub(crate) fn set_log_level(&self, l: LogLevel) { self.log_level.set(l); }
+
+    /// Set the std/log output format.
+    #[cfg(feature = "log")]
+    pub(crate) fn set_log_format(&self, f: LogFormat) { self.log_format.set(f); }
 
     /// Is the captured output buffer empty? (REPL flush check.) Always true under
     /// `Live`.
