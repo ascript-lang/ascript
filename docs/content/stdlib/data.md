@@ -38,6 +38,10 @@ fields defaulted to nil), exactly as if you had called [`Class.from`](../languag
 the decoded object. The class is an ordinary value argument (no generics). With **no** class
 argument, `json.parse` returns the raw decoded value unchanged, as above.
 
+An optional trailing `strict` bool — `json.parse(text, Class, true)` — rejects any key not
+declared on the class (at every nesting level), surfacing it in `err`. Omitted or `false`,
+unknown keys are ignored (lenient, the default).
+
 ```ascript
 class User {
   id: number

@@ -257,8 +257,11 @@ let user = await resp.json(User)?     // ≡ (await resp.json(User))?  — see �
 let [user, err] = await resp.json(User)   // or handle the pair explicitly
 ```
 
-The shortcut uses default lenient (`strict = false`) matching. A caller needing strict
-matching parses raw and then validates explicitly: `Class.from(raw, true)` (§4.2).
+Both decoders take an **optional trailing `strict` bool** (default `false`, lenient):
+`json.parse(text, Class, strict)` and `resp.json(Class, strict)`. So strict matching is
+available directly in the one-liner — `let user = await resp.json(User, true)?` — behaving
+exactly like `Class.from(raw, true)` (§4.2), rejecting unknown keys at every nesting level.
+Omitted or `false`, unknown keys are ignored.
 
 ---
 

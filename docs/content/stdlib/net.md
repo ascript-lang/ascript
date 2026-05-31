@@ -167,6 +167,10 @@ in the *same* error channel — neither panics. The class is an ordinary value a
 on success the value is a validated instance (defaults applied, optionals defaulted to nil), exactly
 as if you had called [`Class.from`](../language/classes-enums) on the decoded object.
 
+An optional trailing `strict` bool — `await resp.json(User, true)?` — rejects any key not declared
+on the class (at every nesting level), fused into the same `err` channel. Omitted or `false`,
+unknown keys are ignored (lenient, the default).
+
 ```ascript
 class User {
   id: number

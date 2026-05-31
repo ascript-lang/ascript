@@ -139,6 +139,8 @@ impl Interp {
         #[cfg(feature = "data")]
         if module == "json" && func == "parse" {
             if let Some(Value::Class(c)) = args.get(1) {
+                // `json.parse(text, Class, strict?)` — optional trailing bool.
+                let strict = matches!(args.get(2), Some(Value::Bool(true)));
                 let parsed = json::call(func, &args[..1], span)?; // [val, err]
                 if let Value::Array(a) = &parsed {
                     let (val, err) = {
@@ -148,7 +150,7 @@ impl Interp {
                     if err != Value::Nil {
                         return Ok(parsed); // parse error stays in the err channel
                     }
-                    return match self.validate_into(c, &val, false, "", span).await {
+                    return match self.validate_into(c, &val, strict, "", span).await {
                         Ok(inst) => Ok(crate::interp::make_pair(inst, Value::Nil)),
                         Err(e) => Ok(crate::interp::make_pair(
                             Value::Nil,

@@ -3136,6 +3136,28 @@ print(r[1])
         assert!(out.contains("true") && out.contains("Ada") && out.contains('1'), "got: {out}");
     }
 
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_with_class_strict_flag() {
+        // Default (lenient): an unknown key is ignored → a validated instance.
+        let lenient = "import * as json from \"std/json\"\n\
+                       class U { id: number }\n\
+                       let [u, err] = json.parse(\"{\\\"id\\\":1,\\\"extra\\\":2}\", U)\n\
+                       print(err == nil)\nprint(u.id)";
+        let out = run(lenient).await;
+        assert!(out.contains("true") && out.contains('1'), "lenient got: {out}");
+        // strict=true (trailing 3rd arg): the unknown key is rejected → fused err.
+        let strict = "import * as json from \"std/json\"\n\
+                      class U { id: number }\n\
+                      let [u, err] = json.parse(\"{\\\"id\\\":1,\\\"extra\\\":2}\", U, true)\n\
+                      print(u == nil)\nprint(err.message)";
+        let out2 = run(strict).await;
+        assert!(
+            out2.contains("true") && out2.contains("unexpected key 'extra'"),
+            "strict got: {out2}"
+        );
+    }
+
     #[tokio::test]
     async fn evaluates_arithmetic_with_precedence() {
         match eval_to_value("1 + 2 * 3").await {

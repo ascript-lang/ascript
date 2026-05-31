@@ -1345,7 +1345,9 @@ impl Interp {
                                 // shape mismatch into one Tier-1 [val, err] pair. With no
                                 // class argument the raw decoded value is returned.
                                 if let Some(Value::Class(c)) = args.first() {
-                                    match self.validate_into(c, &val, false, "", span).await {
+                                    // `resp.json(Class, strict?)` — optional trailing bool.
+                                    let strict = matches!(args.get(1), Some(Value::Bool(true)));
+                                    match self.validate_into(c, &val, strict, "", span).await {
                                         Ok(inst) => Ok(make_pair(inst, Value::Nil)),
                                         Err(e) => Ok(err_pair(e.message)),
                                     }
