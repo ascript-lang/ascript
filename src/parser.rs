@@ -590,6 +590,52 @@ impl<'a> Parser<'a> {
             let span = Span::new(start, self.prev_end());
             return Ok(Stmt::LetDestructure { names, value, mutable, span, name_spans });
         }
+        // `let {a, b as local} = expr` — object destructuring binding.
+        if *self.peek() == Tok::LBrace {
+            self.advance(); // consume '{'
+            let mut bindings = Vec::new();
+            let rest: Option<(String, Span)> = None; // populated in a later phase
+            if *self.peek() != Tok::RBrace {
+                loop {
+                    let key_span = self.span();
+                    let key = match self.advance() {
+                        Tok::Ident(n) => n,
+                        Tok::Str(s) => s,
+                        other => return Err(AsError::at(
+                            format!("expected a key in object pattern, found {:?}", other),
+                            self.tokens[self.pos - 1].span)),
+                    };
+                    let (binding, binding_span) =
+                        if matches!(self.peek(), Tok::Ident(s) if s == "as") {
+                            self.advance();
+                            let bspan = self.span();
+                            match self.advance() {
+                                Tok::Ident(b) => (b, bspan),
+                                other => return Err(AsError::at(
+                                    format!("expected a local name after 'as', found {:?}", other),
+                                    self.tokens[self.pos - 1].span)),
+                            }
+                        } else {
+                            if !is_ident_like(&key) {
+                                return Err(AsError::at(
+                                    format!("key {:?} is not a valid binding name; use `as`", key),
+                                    key_span));
+                            }
+                            (key.clone(), key_span)
+                        };
+                    bindings.push(crate::ast::ObjBinding { key, binding, key_span, binding_span });
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                        if *self.peek() == Tok::RBrace { break; }
+                    } else { break; }
+                }
+            }
+            self.eat(&Tok::RBrace)?;
+            self.eat(&Tok::Eq)?;
+            let value = self.expr()?;
+            let span = Span::new(start, self.prev_end());
+            return Ok(Stmt::LetDestructureObject { bindings, rest, value, mutable, span });
+        }
         let name_span = self.span();
         let name = match self.advance() {
             Tok::Ident(name) => name,
@@ -1248,6 +1294,13 @@ fn is_assignable(expr: &Expr) -> bool {
         expr.kind,
         ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::Member { .. }
     )
+}
+
+/// A string is "identifier-like" if it can be a bare binding name.
+fn is_ident_like(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() { Some(c) if c.is_alphabetic() || c == '_' => {} _ => return false, }
+    cs.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
