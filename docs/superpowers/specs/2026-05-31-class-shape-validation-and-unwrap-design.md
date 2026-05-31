@@ -131,10 +131,9 @@ field_decl := Ident "?"? ":" type ("=" expression)?
 
 ### 3.4 Touch points
 
-Lexer (no new tokens), parser (class-body parsing), tree-sitter grammar
-(`tree-sitter generate --abi 14`), `fmt.rs` (emit field declarations), `ast.rs` Display,
-interp (store schema on `Class`; check on declared-field assignment), LSP (no semantic
-change; field names become known identifiers — best-effort).
+See the consolidated subsystem inventory in §8 (AST `FieldDecl`, parser class-body,
+runtime `Class` schema + assignment checks, formatter `write_field`, tree-sitter
+`class_member`, LSP `PROPERTY` symbols, docs).
 
 ---
 
@@ -269,11 +268,10 @@ The token is the existing `Tok::Bang`. Prefix `!x` (logical not, in `unary()`) v
 
 ### 5.3 Touch points
 
-Parser (new precedence level; move `Try`; add unwrap), `ast.rs`
-(`ExprKind::Unwrap` + Display), interp eval arm, `fmt.rs` `write_expr_inner` arm,
-tree-sitter grammar (declare the prefix/postfix `!` interaction; regen `--abi 14`),
-LSP keyword/operator awareness (best-effort). Per CLAUDE.md, every `ExprKind` addition
-needs arms in interp (eval), `fmt.rs`, and `ast.rs` (Display).
+See §8. Note the CLAUDE.md invariant: every new `ExprKind` (here `Unwrap`) needs arms in
+interp (eval), `fmt.rs` (`write_expr_inner`), and `ast.rs` (`Display`) — plus the
+precedence-tier move (`Try`/`Unwrap` looser than `await`) mirrored in both the parser and
+the formatter's `expr_prec`, and in the tree-sitter grammar (regen `parser.c --abi 14`).
 
 ---
 
@@ -343,17 +341,50 @@ Failure modes, all surfaced as one Tier-1 error out of `loadUser`:
 
 ---
 
-## 8. Documentation Impact
+## 8. Implementation Surface (subsystem-by-subsystem)
 
-- Update the language guide: class fields (`docs/content/language/…`), the error-tier
-  page (add `!` next to `?` and `recover`), and the types/contracts section.
-- Update the stdlib reference pages for the typed-parse arguments:
-  `docs/content/stdlib/net.md` (`resp.json(Class)`) and `docs/content/stdlib/data.md`
-  (`json.parse(text, Class)`).
-- Update `README.md` feature list and `CLAUDE.md` (note the new `ExprKind::Unwrap` match
-  obligations and the `?`/`!` precedence relationship to `await`).
-- Add the end-to-end example under `examples/` (introductory) and/or
-  `examples/advanced/` (HTTP + validation).
+This is the authoritative checklist of everything that must be aware of the new syntax
+and semantics. Subsystems are listed with the *specific* change and a verdict.
+"No change — why" entries are intentional: they record that the subsystem was audited.
+
+### 8.1 Front-end (compiler core)
+
+| Subsystem | File(s) | Change |
+|---|---|---|
+| Lexer / tokens | `src/lexer.rs`, `src/token.rs` | **No new tokens.** `Tok::Bang` (`!`), `Tok::Question` (`?`), `Colon`, `Eq`, `Ident` all exist; `!=` is already a single `BangEq`. Field decls and postfix `!` reuse existing tokens. |
+| AST | `src/ast.rs` | Add `FieldDecl { name, ty, optional, default, span, name_span }`; add `fields: Vec<FieldDecl>` to `Stmt::Class`; add `ExprKind::Unwrap(Box<Expr>)`. Add `Display` arms for the new `ExprKind` and for field declarations in `Stmt::Class`. |
+| Parser | `src/parser.rs` | Parse field declarations in class body (`Ident "?"? ":" type ("=" expr)?`); add postfix `!`; **restructure precedence** so `?` (`Try`) and `!` (`Unwrap`) move out of the `postfix()` loop into a new tier *looser than `await`/unary* (so `await x!` ⇒ `(await x)!`, `await x?` ⇒ `(await x)?`). Add parser unit tests (`sexpr(...)`) pinning the grouping. |
+| Interpreter | `src/interp.rs` | Store `FieldSchema` on the runtime `Class` (`value.rs`); check declared-field types on assignment (incl. inside `init`); implement `validate_into(class, obj, strict) -> Result<Instance, _>` (recurses into nested class / `array<Class>` / `map<K,Class>` fields, applies defaults, builds field path for errors); `.from` adapter (panics on `Err`); `ExprKind::Unwrap` eval arm (panic carrying the original error on `[_, err!=nil]`). |
+| Values | `src/value.rs` | Add `fields: IndexMap<String, FieldSchema>` to `struct Class`. |
+
+### 8.2 Tooling that consumes the front-end
+
+| Subsystem | File(s) | Change |
+|---|---|---|
+| Formatter | `src/fmt.rs` | New `write_field` (emits `name?: Type = default`, **fields before methods** in the class body); add `ExprKind::Unwrap` arm to `write_expr_inner`; **add a precedence tier** in `expr_prec` (`PREC_TRY` between assign and unary) and move `Try` there + add `Unwrap` at postfix, so the formatter does **not** wrongly parenthesize `await x?` / `await x!`. Round-trip tests. |
+| Tree-sitter grammar | `docs/superpowers/specs/grammar/tree-sitter-ascript/grammar.js` | `class_body` → `repeat($.class_member)` where `class_member = choice(field_declaration, method_definition)`; new `field_declaration` rule with `?` **after the name, before `:`** (matching §3.1: `field('name'), optional('?'), ':', field('type'), optional(seq('=', $._expression))`); new `unwrap_expression` (postfix `!`); move `propagate_expression` (`?`) to a precedence tier looser than `unary`. Keep the declared `[$._expression, $.propagate_expression]` GLR conflict; watch for any new conflict on `!` (prefix-vs-postfix is position-disambiguated, `!=` is one token). **Regenerate `parser.c` with `tree-sitter generate --abi 14`.** |
+| LSP | `src/lsp/analysis.rs` | Extend `document_symbols` `Stmt::Class` arm to emit declared fields as `SymbolKind::PROPERTY` children (currently methods-only). **Keyword list unchanged** (operators aren't completion items; `!`/`?` need no entry). No `ExprKind::Unwrap` arm needed (symbols walk statements, not expressions). Completion/hover for `obj.field` is **out of scope** (would need member type inference, which the LSP does not do). |
+| REPL | `src/repl.rs` | **No change.** It delegates entirely to `lexer::lex` + `parser::parse` + `Interp`; single-line (no completeness heuristic to update). Multi-line class bodies are a pre-existing limitation, unaffected. |
+
+### 8.3 Conformance & lint gates
+
+| Gate | Change |
+|---|---|
+| `tests/treesitter_conformance.rs` | The new `examples/*.as` must be accepted by **both** the hand-written parser and the tree-sitter grammar with no errors. |
+| `tests/frontend_conformance.rs` | Differential guardrail must still pass on the new syntax. |
+| Clippy | Clean under **both** `--all-targets` and `--no-default-features --all-targets`. |
+
+### 8.4 Documentation (prose + examples + renderer)
+
+| Doc | Change |
+|---|---|
+| `docs/content/language/*` | Class fields (typed, `?` optional, defaults) on the classes page; add `!` next to `?`/`recover` on the error-tier page; note the `?`/`!` precedence-vs-`await` rule; extend the types/contracts page. |
+| `docs/content/stdlib/net.md` | Document `resp.json(Class)` typed-parse argument. |
+| `docs/content/stdlib/data.md` | Document `json.parse(text, Class)` typed-parse argument. |
+| `docs/assets/app.js` (renderer) | **No change required.** The custom `highlightAScript()` keyword lists need no additions (no new keywords; field decls use existing tokens), and its operator regex already colorizes `!`/`?`. **Action: visually verify** the new examples render correctly once added (it's an audit, not an edit). |
+| `README.md` | Update the feature/stdlib summary. |
+| `CLAUDE.md` | Record the new `ExprKind::Unwrap` match obligations (interp eval, `fmt.rs`, `ast.rs` Display), the `class_body` grammar change, and the `?`/`!`-looser-than-`await` precedence rule. |
+| `examples/` | Add an introductory example (typed fields + `.from` + `!`); optionally an `examples/advanced/` HTTP + `resp.json(User)` example. Both must stay runnable (conformance). |
 
 ---
 
