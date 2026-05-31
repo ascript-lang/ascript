@@ -25,6 +25,85 @@ print(a.speak())           // Rex makes a sound
 - `init` runs when you call the class; assign fields with `self.field = …`.
 - Methods may be `async fn`.
 
+### Typed fields
+
+A class body may declare fields with [contract types](type-contracts) before its methods. There are
+three kinds:
+
+```ascript
+class User {
+  id: number              // required
+  name: string            // required
+  nickname: string?       // optional (nullable) — defaults to nil
+  role: string = "guest"  // defaulted — applied at construction
+  fn init(id, name) {
+    self.id = id
+    self.name = name
+  }
+}
+```
+
+- **Required** (`id: number`) — a declared type with no default.
+- **Optional** (`nickname: string?`) — a [nullable](type-contracts) type; absent values become nil.
+- **Defaulted** (`role: string = "guest"`) — the default is applied when the instance is built.
+
+Declared field types are **checked on assignment**, including inside `init` — assigning a string to
+`self.id` panics with a [type-contract](type-contracts) error. Defaults are applied at construction.
+Fields you never declare stay fully **dynamic** (the gradual rule): you can still assign arbitrary
+`self.whatever = …` without a declaration.
+
+> [!NOTE] The optional field above can be spelled two ways — `nickname: string?` or the marker form
+> `nickname?: string`. **Both lower to the same node** (`string | nil`); the formatter normalizes the
+> marker form to the canonical `nickname: string?`.
+
+### `ClassName.from` — validate a raw object into an instance
+
+`ClassName.from(obj, strict = false)` turns an untrusted plain object (for example, the result of
+[`json.parse`](../stdlib/data)) into a checked instance. It:
+
+- validates every declared field against its type, building a **field path** (e.g.
+  `user.address.zip`) for error messages;
+- **recurses** into nested class fields, `array<Class>` elements, and `map<K, Class>` values —
+  including an **Object→Map boundary coercion**, so a raw JSON dictionary `{ "home": {...} }`
+  validates into a `map<string, Address>` field;
+- applies field **defaults** and lets optional fields fall to nil;
+- **does not** run `init` (it constructs a validated instance directly);
+- on a shape mismatch, raises a **recoverable** [panic](errors) carrying the field path — wrap it in
+  `recover` (or use `!`) to turn it into a Tier-1 result.
+
+With `strict = true`, unknown keys in the source object are rejected; the default (`false`) ignores
+them.
+
+```ascript
+class Address {
+  street: string
+  zip: number
+}
+class User {
+  id: number
+  name: string
+  nickname: string?
+  role: string = "guest"
+  address: Address                    // nested class — recursively validated
+  places: map<string, Address>        // JSON dictionary → map<string, Address>
+}
+
+let u = User.from({
+  id: 1,
+  name: "Ada",
+  address: { street: "1 Lovelace Way", zip: 90210 },
+  places: { home: { street: "1 Lovelace Way", zip: 90210 } },
+})
+// u.role == "guest" (default), u.nickname == nil, u.address.zip == 90210
+
+// A shape mismatch is a recoverable panic carrying a field path.
+let [user, err] = recover(() => User.from({ id: 1, name: "Bug", address: { street: "x", zip: "nope" } }))
+// err.message points at address.zip
+```
+
+See [typed parse](../stdlib/data) for the fused `json.parse(text, User)` shortcut that combines
+decoding and validation into one Tier-1 result.
+
 ### Inheritance
 
 A class may `extend` one parent and call up with `super`:
