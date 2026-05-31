@@ -3,7 +3,7 @@
 use crate::ast::{ArrowBody, BinOp, Expr, ExprKind, Stmt, UnOp};
 use crate::error::AsError;
 use crate::span::Span;
-use crate::token::{Tok, Token};
+use crate::token::{is_ident_like, Tok, Token};
 
 pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>, AsError> {
     let mut parser = Parser { tokens, pos: 0 };
@@ -1294,13 +1294,6 @@ fn is_assignable(expr: &Expr) -> bool {
         expr.kind,
         ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::Member { .. }
     )
-}
-
-/// A string is "identifier-like" if it can be a bare binding name.
-fn is_ident_like(s: &str) -> bool {
-    let mut cs = s.chars();
-    match cs.next() { Some(c) if c.is_alphabetic() || c == '_' => {} _ => return false, }
-    cs.all(|c| c.is_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]

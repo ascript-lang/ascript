@@ -78,3 +78,15 @@ pub struct Token {
     pub tok: Tok,
     pub span: Span,
 }
+
+/// A string is "identifier-like" if it can be a bare binding name / unquoted
+/// object key: starts with a letter or `_`, followed by alphanumerics/`_`.
+/// Shared by the parser (object-key keys) and the formatter (object_key emission).
+pub(crate) fn is_ident_like(s: &str) -> bool {
+    let mut cs = s.chars();
+    match cs.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_alphanumeric() || c == '_')
+}

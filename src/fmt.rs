@@ -582,10 +582,7 @@ fn op_str_bin(op: BinOp) -> String {
 
 /// Object keys that are valid identifiers stay bare; others are quoted.
 fn object_key(k: &str) -> String {
-    let is_ident = !k.is_empty()
-        && k.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
-        && k.chars().all(|c| c.is_alphanumeric() || c == '_');
-    if is_ident {
+    if crate::token::is_ident_like(k) {
         k.to_string()
     } else {
         format!("\"{}\"", escape_str_lit(k))
