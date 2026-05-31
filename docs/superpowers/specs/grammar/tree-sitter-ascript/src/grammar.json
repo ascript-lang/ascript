@@ -2360,25 +2360,21 @@
       ]
     },
     "unwrap_expression": {
-      "type": "PREC",
-      "value": 12,
-      "content": {
-        "type": "SEQ",
-        "members": [
-          {
-            "type": "FIELD",
-            "name": "operand",
-            "content": {
-              "type": "SYMBOL",
-              "name": "_postfix_expression"
-            }
-          },
-          {
-            "type": "STRING",
-            "value": "!"
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "operand",
+          "content": {
+            "type": "SYMBOL",
+            "name": "_postfix_expression"
           }
-        ]
-      }
+        },
+        {
+          "type": "STRING",
+          "value": "!"
+        }
+      ]
     },
     "ternary_expression": {
       "type": "PREC_RIGHT",
@@ -3142,6 +3138,10 @@
     [
       "_expression",
       "propagate_expression"
+    ],
+    [
+      "_expression",
+      "unwrap_expression"
     ]
   ],
   "precedences": [],

@@ -29,7 +29,6 @@ const PREC = {
   add: 9,
   mul: 10,
   exp: 11,    // right-associative
-  unwrap: 12, // postfix ? and ! — looser than unary/await, tighter than binary
   unary: 13,
   postfix: 14, // call, member, index, optional-member
   primary: 15,
@@ -56,6 +55,12 @@ module.exports = grammar({
     // `propagate_expression`. GLR keeps both alive until a following `:` (ternary)
     // or end-of-expression (propagation) decides.
     [$._expression, $.propagate_expression],
+    // `<postfix-expr> !` has the same GLR ambiguity as propagation: the postfix
+    // expression could reduce to `_expression` or extend into `unwrap_expression`.
+    // Mirror propagate's precedence-less + declared-conflict treatment so the
+    // ambiguity is resolved by GLR rather than a precedence the runtime may
+    // interpret differently across tree-sitter versions.
+    [$._expression, $.unwrap_expression],
   ],
 
   rules: {
@@ -360,10 +365,10 @@ module.exports = grammar({
     ),
     // expr! — force-unwrap (dual of ?). Position-disambiguated from prefix `!`
     // (operand precedes it) and from `!=` (a single token).
-    unwrap_expression: $ => prec(PREC.unwrap, seq(
+    unwrap_expression: $ => seq(
       field('operand', $._postfix_expression),
       '!',
-    )),
+    ),
 
     // cond ? then : else — the conditional operator (§3). Right-associative,
     // binds just above assignment. Shares the `expr ?` prefix with
