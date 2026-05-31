@@ -29,9 +29,10 @@ const PREC = {
   add: 9,
   mul: 10,
   exp: 11,    // right-associative
-  unary: 12,
-  postfix: 13, // call, member, index, optional-member, ? propagation
-  primary: 14,
+  unwrap: 12, // postfix ? and ! — looser than unary/await, tighter than binary
+  unary: 13,
+  postfix: 14, // call, member, index, optional-member
+  primary: 15,
 };
 
 module.exports = grammar({
@@ -317,6 +318,7 @@ module.exports = grammar({
       $.member_expression,
       $.optional_member_expression,
       $.index_expression,
+      $.unwrap_expression,
       $.propagate_expression,
       $._primary_expression,
     ),
@@ -356,6 +358,12 @@ module.exports = grammar({
       field('operand', $._postfix_expression),
       '?',
     ),
+    // expr! — force-unwrap (dual of ?). Position-disambiguated from prefix `!`
+    // (operand precedes it) and from `!=` (a single token).
+    unwrap_expression: $ => prec(PREC.unwrap, seq(
+      field('operand', $._postfix_expression),
+      '!',
+    )),
 
     // cond ? then : else — the conditional operator (§3). Right-associative,
     // binds just above assignment. Shares the `expr ?` prefix with
