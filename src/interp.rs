@@ -1547,28 +1547,19 @@ impl Interp {
             fields: indexmap::IndexMap::new(),
         }));
         let inst_val = Value::Instance(instance.clone());
-        // Pre-populate declared-field defaults (base-class first so a subclass
-        // default overrides). `init` may then override; .from (Task 4) handles
-        // its own defaults. Defaults eval lazily in the class def env.
-        {
-            let mut chain = Vec::new();
-            let mut cur = Some(class.clone());
-            while let Some(c) = cur {
-                chain.push(c.clone());
-                cur = c.superclass.clone();
-            }
-            for c in chain.into_iter().rev() {
-                for (fname, schema) in &c.fields {
-                    if let Some(def) = &schema.default {
-                        // Eval into a local first (never hold the instance borrow
-                        // across `.await`).
-                        let dv = self.eval_expr(def, &c.def_env).await?;
-                        if !check_type(&dv, &schema.ty) {
-                            return Err(contract_panic(&schema.ty, &dv, span));
-                        }
-                        instance.borrow_mut().fields.insert(fname.clone(), dv);
-                    }
+        // Pre-populate declared-field defaults (merged base-class first so a
+        // subclass default overrides). `init` may then override; `.from` (Task 4)
+        // handles its own defaults. Each default evals lazily in the def env of
+        // the class that declared it.
+        for (fname, (schema, def_class)) in crate::value::merged_field_schema(&class) {
+            if let Some(def) = &schema.default {
+                // Eval into a local first (never hold the instance borrow across
+                // `.await`).
+                let dv = self.eval_expr(def, &def_class.def_env).await?;
+                if !check_type(&dv, &schema.ty) {
+                    return Err(contract_panic(&schema.ty, &dv, span));
                 }
+                instance.borrow_mut().fields.insert(fname.clone(), dv);
             }
         }
         match crate::value::find_method(&class, "init") {
@@ -1610,27 +1601,16 @@ impl Interp {
             Value::Object(m) => m.clone(),
             _ => {
                 return Err(AsError::at(
-                    format!("{} expects an object, got {}", display_path(path, &class.name), type_name(obj)),
+                    format!("{} expects an object, got {}", field_owner_label(path, &class.name), type_name(obj)),
                     span,
                 ))
             }
         };
-        // Declared fields, base-class first (subclass last so it wins on name clash).
-        let mut chain = Vec::new();
-        let mut cur = Some(class.clone());
-        while let Some(c) = cur {
-            chain.push(c.clone());
-            cur = c.superclass.clone();
-        }
-        let mut schema: indexmap::IndexMap<String, crate::value::FieldSchema> = indexmap::IndexMap::new();
-        for c in chain.into_iter().rev() {
-            for (n, s) in &c.fields {
-                schema.insert(n.clone(), s.clone());
-            }
-        }
+        // Declared fields merged base-class first (subclass overrides on clash).
+        let schema = crate::value::merged_field_schema(class);
 
         let mut inst_fields = indexmap::IndexMap::new();
-        for (fname, fs) in &schema {
+        for (fname, (fs, _def_class)) in &schema {
             let field_path = if path.is_empty() {
                 format!("{}.{}", class.name.to_lowercase(), fname)
             } else {
@@ -1660,7 +1640,7 @@ impl Interp {
             for k in map.borrow().keys() {
                 if !schema.contains_key(k) {
                     return Err(AsError::at(
-                        format!("unexpected key '{}' for {} (strict)", k, display_path(path, &class.name)),
+                        format!("unexpected key '{}' for {} (strict)", k, field_owner_label(path, &class.name)),
                         span,
                     ));
                 }
@@ -2098,7 +2078,10 @@ fn lookup_field_schema(
     None
 }
 
-fn display_path(path: &str, class_name: &str) -> String {
+/// The owner label for a `.from` validation diagnostic: at the root (empty
+/// path) this is the class header `"{ClassName}.from"`; once recursion has
+/// descended into a field, it echoes that field path (e.g. `u.addr`).
+fn field_owner_label(path: &str, class_name: &str) -> String {
     if path.is_empty() {
         format!("{}.from", class_name)
     } else {
@@ -2109,6 +2092,10 @@ fn display_path(path: &str, class_name: &str) -> String {
 fn control_to_aserror(c: Control, span: Span) -> AsError {
     match c {
         Control::Panic(e) => e,
+        // Defensive fallback: `?`-propagation cannot escape a field-default
+        // initializer through current surface syntax (a default is an expression,
+        // not a fn body that could early-return a Result), so this arm is not
+        // reachable today; kept to keep the conversion total.
         Control::Propagate(_) => AsError::at("unexpected ? propagation in a field default", span),
     }
 }
@@ -3055,6 +3042,38 @@ print(r[1])
         let out = run(src).await;
         assert!(
             out.contains("w.byId[1].v") && out.contains("type contract violated"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_on_non_object_rejected() {
+        let src = "class U { id: number }\n\
+                   let r = recover(() => U.from(5))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("expects an object"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_missing_required_field_reports_path() {
+        let src = "class U { id: number\n name: string }\n\
+                   let r = recover(() => U.from({ id: 1 }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(
+            out.contains("u.name") && out.contains("expected string"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_nested_non_object_where_class_expected() {
+        // `coerce_field`'s Named `_ => Ok(val)` fall-through leaves a non-object
+        // value for `check_type` to reject, with the field path.
+        let src = "class A { x: number }\nclass V { a: A }\n\
+                   let r = recover(() => V.from({ a: 5 }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(
+            out.contains("v.a") && out.contains("type contract violated"),
             "got: {out}"
         );
     }

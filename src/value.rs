@@ -201,6 +201,28 @@ pub fn find_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Clas
     None
 }
 
+/// Merge the declared field schemas across a class's inheritance chain,
+/// **base-class first** so a subclass declaration overrides a base one with the
+/// same name. Each entry carries the class that declared it, so callers that
+/// evaluate field defaults can use the *defining* class's `def_env`. Insertion
+/// order is base-first, then subclass (a subclass override keeps the field's
+/// original position, matching `IndexMap::insert` semantics).
+pub fn merged_field_schema(class: &Rc<Class>) -> IndexMap<String, (FieldSchema, Rc<Class>)> {
+    let mut chain = Vec::new();
+    let mut cur = Some(class.clone());
+    while let Some(c) = cur {
+        cur = c.superclass.clone();
+        chain.push(c);
+    }
+    let mut schema: IndexMap<String, (FieldSchema, Rc<Class>)> = IndexMap::new();
+    for c in chain.into_iter().rev() {
+        for (n, s) in &c.fields {
+            schema.insert(n.clone(), (s.clone(), c.clone()));
+        }
+    }
+    schema
+}
+
 /// A user-defined function with its captured (closure) environment.
 pub struct Function {
     pub name: Option<String>,
