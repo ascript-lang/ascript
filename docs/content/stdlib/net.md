@@ -148,6 +148,7 @@ Three async accessor methods read the (buffered) body. Each returns `[value, err
 - `await resp.text()` → `[string, err]`
 - `await resp.bytes()` → `[bytes, err]`
 - `await resp.json()` → `[value, err]` — parses the body as JSON into an AScript value.
+- `await resp.json(Class)` → `[instance, err]` — parses **and validates** the body against a class in one step.
 
 > [!TIER2] Each accessor **consumes** the response. Calling a second body accessor on the same response is a Tier-2 panic: `"response body already consumed"`. On a streaming response, these accessors are unavailable — read `resp.body` instead.
 
@@ -157,6 +158,32 @@ if (err != nil) { /* network error */ }
 if (!resp.ok) { /* status >= 300 — still a valid resp */ }
 let [data, jerr] = await resp.json()
 ```
+
+#### Typed parse: `resp.json(Class)`
+
+Passing a [class](../language/classes-enums) as an argument fuses JSON decoding and shape validation
+into a single Tier-1 result. A decode failure **and** a shape mismatch both surface as `[nil, err]`
+in the *same* error channel — neither panics. The class is an ordinary value argument (no generics);
+on success the value is a validated instance (defaults applied, optionals defaulted to nil), exactly
+as if you had called [`Class.from`](../language/classes-enums) on the decoded object.
+
+```ascript
+class User {
+  id: number
+  name: string
+  role: string = "guest"
+}
+
+// `?` and `!` bind looser than `await`, so no parens are needed:
+let user = await resp.json(User)?     // unwrap to a User, or propagate [nil, err]
+
+// Or handle the fused error explicitly:
+let [u, err] = await resp.json(User)
+// err != nil on bad JSON OR a wrong shape (e.g. a non-number id)
+```
+
+See [typed parse on the data page](data) for the standalone `json.parse(text, Class)` form, and the
+runnable `examples/advanced/typed_http.as` for an end-to-end client+server demo.
 
 ### Request options
 
