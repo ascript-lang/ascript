@@ -5,7 +5,8 @@ use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
 use crate::value::Value;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -42,6 +43,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("median", bi("math.median")),
         ("variance", bi("math.variance")),
         ("stddev", bi("math.stddev")),
+        ("randomInt", bi("math.randomInt")),
+        ("shuffle", bi("math.shuffle")),
+        ("choice", bi("math.choice")),
     ]
 }
 
@@ -202,6 +206,35 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let var = ss / denom;
             Ok(Value::Number(if func == "stddev" { var.sqrt() } else { var }))
         }
+        "randomInt" => {
+            let min = want_int(want_number(&arg(args, 0), span, &ctx("randomInt"))?, span, "math.randomInt")?;
+            let max = want_int(want_number(&arg(args, 1), span, &ctx("randomInt"))?, span, "math.randomInt")?;
+            if min > max {
+                return Err(AsError::at("math.randomInt requires min <= max", span).into());
+            }
+            let span_len = (max - min + 1) as f64;
+            let v = min + (next_random() * span_len).floor() as i64;
+            Ok(Value::Number(v as f64))
+        }
+        "shuffle" => {
+            let a = want_array(&arg(args, 0), span, &ctx("shuffle"))?;
+            let mut items = a.borrow().clone();
+            let len = items.len();
+            for i in (1..len).rev() {
+                let j = (next_random() * (i as f64 + 1.0)).floor() as usize;
+                items.swap(i, j.min(i));
+            }
+            Ok(Value::Array(Rc::new(RefCell::new(items))))
+        }
+        "choice" => {
+            let a = want_array(&arg(args, 0), span, &ctx("choice"))?;
+            let b = a.borrow();
+            if b.is_empty() {
+                return Ok(Value::Nil);
+            }
+            let idx = (next_random() * b.len() as f64).floor() as usize;
+            Ok(b[idx.min(b.len() - 1)].clone())
+        }
         _ => Err(AsError::at(format!("std/math has no function '{}'", func), span).into()),
     }
 }
@@ -309,6 +342,33 @@ mod tests {
         // sample variance needs >= 2 elements
         let one = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![n(5.0)])));
         assert!(matches!(call("variance", &[one, Value::Bool(true)], sp()), Err(Control::Panic(_))));
+    }
+
+    #[test]
+    fn math_random_helpers() {
+        for _ in 0..100 {
+            let r = call("randomInt", &[n(1.0), n(6.0)], sp()).unwrap();
+            if let Value::Number(x) = r { assert!((1.0..=6.0).contains(&x) && x.fract() == 0.0); } else { panic!() }
+        }
+        assert_eq!(call("randomInt", &[n(5.0), n(5.0)], sp()).unwrap(), n(5.0));
+        assert!(matches!(call("randomInt", &[n(6.0), n(1.0)], sp()), Err(Control::Panic(_))));
+        let a = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![n(1.0), n(2.0), n(3.0)])));
+        let sh = call("shuffle", std::slice::from_ref(&a), sp()).unwrap();
+        if let Value::Array(v) = sh { assert_eq!(v.borrow().len(), 3); } else { panic!() }
+        // shuffle is non-mutating: original unchanged length & content set
+        if let Value::Array(orig) = &a { assert_eq!(orig.borrow().len(), 3); }
+        // choice returns an element actually in the array
+        let elem = call("choice", std::slice::from_ref(&a), sp()).unwrap();
+        assert!([n(1.0), n(2.0), n(3.0)].contains(&elem));
+        // shuffle preserves the multiset of elements (sorted equal to original)
+        let sh2 = call("shuffle", std::slice::from_ref(&a), sp()).unwrap();
+        if let Value::Array(v) = sh2 {
+            let mut got: Vec<f64> = v.borrow().iter().map(|x| if let Value::Number(n) = x { *n } else { f64::NAN }).collect();
+            got.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            assert_eq!(got, vec![1.0, 2.0, 3.0]);
+        } else { panic!() }
+        let empty = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![])));
+        assert_eq!(call("choice", std::slice::from_ref(&empty), sp()).unwrap(), Value::Nil);
     }
 
     #[test]
