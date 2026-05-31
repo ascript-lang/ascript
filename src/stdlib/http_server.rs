@@ -766,6 +766,14 @@ impl Interp {
                     Err(Control::Propagate(v)) => {
                         Some(simple_response(500, &error_message(&propagated_error(&v))))
                     }
+                    // exit() inside a request handler: the connection task cannot
+                    // propagate a Control::Exit to the entry-point LocalSet (it runs
+                    // in a fire-and-forget spawn_local). Treat it as a 500 here; the
+                    // same exit() call will also surface at the program's top level
+                    // through run_file/run_source if the server is invoked from script.
+                    Err(Control::Exit(code)) => {
+                        Some(simple_response(500, &format!("exit({code}) called in handler")))
+                    }
                 }
             }
             // Clean EOF before any bytes: client closed; nothing to write.
@@ -887,6 +895,8 @@ impl Interp {
                 // An escaped `?` carries the err pair's value; surface its message.
                 simple_response(500, &error_message(&propagated_error(&v)))
             }
+            // exit() inside a handler: re-propagate so the server task unwinds.
+            Err(Control::Exit(code)) => return Err(Control::Exit(code)),
         };
         Ok(resp)
     }

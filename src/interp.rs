@@ -39,6 +39,10 @@ pub enum Control {
     /// A `?`-operator early return: the enclosing function should return this
     /// `[nil, err]` Result pair.
     Propagate(Value),
+    /// `exit(code)` — unwinds to the entry point so destructors run; NOT
+    /// catchable by `recover`. The i32 carries the requested exit code (0..=255
+    /// validated at the call site).
+    Exit(i32),
 }
 
 impl From<AsError> for Control {
@@ -51,7 +55,7 @@ impl From<AsError> for Control {
 pub fn global_env() -> Environment {
     let env = Environment::global();
     for name in [
-        "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range",
+        "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit",
     ] {
         env.define(name, Value::Builtin(name.into()), false)
             .expect("global env starts empty");
@@ -728,7 +732,9 @@ impl Interp {
     /// Run every test registered via the `test(name, fn)` builtin. Each test fn
     /// is invoked with no arguments; a `Control::Panic` (e.g. a failed `assert`)
     /// is recorded as a failure, while a clean return or a `?` propagation passes.
-    pub async fn run_registered_tests(&self) -> TestSummary {
+    /// Returns `Err(Control::Exit)` if a test calls `exit()` — that unwinds the
+    /// test runner rather than being counted as a pass or fail.
+    pub async fn run_registered_tests(&self) -> Result<TestSummary, Control> {
         let mut summary = TestSummary::default();
         // Clone out the registrations first so the table borrow is not held across
         // each `call_value` await.
@@ -740,9 +746,12 @@ impl Interp {
                     summary.failed += 1;
                     summary.failures.push((name, e.message));
                 }
+                // exit() inside a test function surfaces the exit request; re-propagate
+                // so the test runner unwinds rather than recording it as pass/fail.
+                Err(Control::Exit(code)) => return Err(Control::Exit(code)),
             }
         }
-        summary
+        Ok(summary)
     }
 
     /// Load (or fetch from cache) the module at `path`, returning its entry.
@@ -2058,6 +2067,8 @@ impl Interp {
             }
             Err(Control::Propagate(v)) => v,
             Err(Control::Panic(e)) => return Err(Control::Panic(e)),
+            // exit() unwinds through function calls unchanged — re-propagate.
+            Err(Control::Exit(code)) => return Err(Control::Exit(code)),
         };
         if let Some(ty) = ret {
             if !check_type(&result, ty) {
@@ -2495,7 +2506,40 @@ impl Interp {
                     // A `?` propagation inside `fn` is already converted to fn's return
                     // value by call_function, so this is unreachable in practice; pass it through.
                     Err(Control::Propagate(v)) => Err(Control::Propagate(v)),
+                    // exit() is NOT catchable by recover — pass it through unchanged.
+                    Err(Control::Exit(code)) => Err(Control::Exit(code)),
                 }
+            }
+            "exit" => {
+                // exit(code?) — default 0; code must be an integer in 0..=255.
+                let code: i32 = match args.first() {
+                    None => 0,
+                    Some(Value::Number(n)) => {
+                        let n = *n;
+                        if n.fract() != 0.0 || !(0.0..=255.0).contains(&n) {
+                            return Err(AsError::at(
+                                format!(
+                                    "exit code must be an integer in 0..=255, got {}",
+                                    n
+                                ),
+                                span,
+                            )
+                            .into());
+                        }
+                        n as i32
+                    }
+                    Some(v) => {
+                        return Err(AsError::at(
+                            format!(
+                                "exit code must be an integer in 0..=255, got {}",
+                                type_name(v)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                Err(Control::Exit(code))
             }
             "test" => {
                 let name = match args.first() {
@@ -2797,6 +2841,11 @@ fn control_to_aserror(c: Control, span: Span) -> AsError {
         // not a fn body that could early-return a Result), so this arm is not
         // reachable today; kept to keep the conversion total.
         Control::Propagate(_) => AsError::at("unexpected ? propagation in a field default", span),
+        // An exit() inside a field default expression is unreachable in normal
+        // usage; convert defensively rather than silently swallowing it.
+        Control::Exit(code) => {
+            AsError::at(format!("exit({}) called during field default init", code), span)
+        }
     }
 }
 
@@ -2894,6 +2943,7 @@ mod tests {
         match c {
             Control::Panic(e) => e,
             Control::Propagate(_) => panic!("expected a panic, got a `?` propagation"),
+            Control::Exit(code) => panic!("expected a panic, got exit({code})"),
         }
     }
 
@@ -3060,6 +3110,7 @@ log.info("saved", {level: "HACK", userId: 5})
             Err(Control::Panic(e)) => e,
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
+            Err(Control::Exit(code)) => panic!("expected a panic, got exit({code})"),
         }
     }
 
@@ -5142,5 +5193,69 @@ print(r[1])
             run(src).await,
             "1,234,567\n1.234.567\nİSTANBUL\nISTANBUL\n-1\n"
         );
+    }
+
+    // ─── exit() builtin unit tests ────────────────────────────────────────────
+
+    /// Helper: exec a program and return the raw `Result<Flow, Control>`.
+    async fn exec_raw(src: &str) -> Result<Flow, Control> {
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let tokens = lex(src).expect("lex");
+        let stmts = parse(&tokens).expect("parse");
+        let env = global_env().child();
+        let local = tokio::task::LocalSet::new();
+        let r = local
+            .run_until(async { interp.exec(&stmts, &env).await })
+            .await;
+        local.await;
+        r
+    }
+
+    #[tokio::test]
+    async fn exit_3_produces_control_exit_3() {
+        match exec_raw("exit(3)").await {
+            Err(Control::Exit(3)) => {}
+            other => panic!("expected Control::Exit(3), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_0_produces_control_exit_0() {
+        match exec_raw("exit(0)").await {
+            Err(Control::Exit(0)) => {}
+            other => panic!("expected Control::Exit(0), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_no_arg_produces_control_exit_0() {
+        match exec_raw("exit()").await {
+            Err(Control::Exit(0)) => {}
+            other => panic!("expected Control::Exit(0) for exit(), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_does_not_catch_exit() {
+        // `recover(() => { exit(5) })` must NOT catch the exit — it passes through.
+        match exec_raw("recover(() => { exit(5) })").await {
+            Err(Control::Exit(5)) => {}
+            other => panic!("expected Control::Exit(5) to pass through recover, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_out_of_range_is_tier2_panic() {
+        match exec_raw("exit(300)").await {
+            Err(Control::Panic(e)) => {
+                assert!(
+                    e.message.contains("0..=255"),
+                    "expected 0..=255 in panic message, got: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected Control::Panic for exit(300), got {other:?}"),
+        }
     }
 }

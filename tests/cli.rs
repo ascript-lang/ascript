@@ -588,3 +588,97 @@ fn runs_logging_example() {
     );
     assert!(err.contains("\"msg\":\"saved\""), "stderr was: {err:?}");
 }
+
+// ─── exit() builtin tests ─────────────────────────────────────────────────────
+
+#[test]
+fn exit_code_2_returns_process_exit_2() {
+    let path = std::env::temp_dir().join(format!("ascript_exit2_{}.as", std::process::id()));
+    std::fs::write(&path, "exit(2)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit code 2, got {:?}",
+        out.status.code()
+    );
+}
+
+#[test]
+fn exit_code_0_returns_success() {
+    let path = std::env::temp_dir().join(format!("ascript_exit0_{}.as", std::process::id()));
+    std::fs::write(&path, "print(\"hi\")\nexit(0)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "expected exit code 0, got {:?}",
+        out.status.code()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hi"), "stdout: {stdout}");
+}
+
+#[test]
+fn exit_no_arg_defaults_to_0() {
+    let path = std::env::temp_dir().join(format!("ascript_exitnoarg_{}.as", std::process::id()));
+    std::fs::write(&path, "exit()\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "expected exit code 0 for exit(), got {:?}",
+        out.status.code()
+    );
+}
+
+#[test]
+fn exit_during_test_run_is_a_clear_failure_not_fake_pass() {
+    // `exit()` inside a test file must NOT report an empty all-pass summary (exit 0).
+    // It is a hard error for `ascript test`: non-zero exit + a clear message.
+    let path = std::env::temp_dir().join(format!("ascript_test_exit_{}.as", std::process::id()));
+    std::fs::write(&path, "test(\"calls exit\", () => { exit(0) })\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("test").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        !out.status.success(),
+        "exit() in a test must fail the run, got status {:?}",
+        out.status.code()
+    );
+    let combined =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        combined.contains("exit() called during test run"),
+        "expected a clear message; got: {combined}"
+    );
+}
+
+#[test]
+fn exit_out_of_range_panics() {
+    // exit(300) is out of 0..=255 — must be a Tier-2 panic → exit code 1 from the diagnostic path.
+    let path =
+        std::env::temp_dir().join(format!("ascript_exit_oor_{}.as", std::process::id()));
+    std::fs::write(&path, "exit(300)\n").unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    // The panic surfaces as a diagnostic on stderr, process exits 1.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit code 1 for out-of-range exit(300), got {:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("0..=255"),
+        "expected 0..=255 in error; stderr: {stderr}"
+    );
+}

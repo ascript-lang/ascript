@@ -31,7 +31,8 @@ async fn main() -> ExitCode {
     match cli.command {
         Command::Run { file } => match ascript::run_file(std::path::Path::new(&file)).await {
             // Output already streamed live by `run_file` (OutputSink::Live).
-            Ok(_) => ExitCode::SUCCESS,
+            // `code` is 0 for normal exit or whatever `exit(n)` requested.
+            Ok(code) => ExitCode::from(code as u8),
             Err(e) => {
                 ascript::diagnostics::report(&e);
                 ExitCode::from(1)

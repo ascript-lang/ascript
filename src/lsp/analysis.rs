@@ -27,7 +27,7 @@ const KEYWORDS: &[&str] = &[
 
 /// The global builtins offered as completions (FUNCTION kind). Mirrors `builtin_doc`.
 const BUILTINS: &[&str] = &[
-    "print", "len", "type", "assert", "range", "Ok", "Err", "recover", "test",
+    "print", "len", "type", "assert", "range", "Ok", "Err", "recover", "test", "exit",
 ];
 
 /// The known stdlib module paths offered when completing an `import ... from "..."`
@@ -400,6 +400,7 @@ fn builtin_doc(name: &str) -> Option<&'static str> {
         "Err" => "```\nErr(error): Result\n```\nWrap an error as a failed `Result`.",
         "recover" => "```\nrecover(fn): Result\n```\nRun `fn`, capturing any panic as an `Err` instead of unwinding.",
         "test" => "```\ntest(name, fn)\n```\nRegister a test for `ascript test`.",
+        "exit" => "```\nexit(code?: number)\n```\nTerminate the program with the given exit code (0–255, default 0). Unwinds cleanly — does not skip destructors.",
         _ => return None,
     };
     Some(s)

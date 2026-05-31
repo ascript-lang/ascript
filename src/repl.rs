@@ -99,8 +99,11 @@ async fn run_tty(interp: &Interp, env: &Environment) -> std::io::Result<()> {
                     continue;
                 }
                 let _ = rl.add_history_entry(buf.as_str());
-                eval_line(interp, env, &buf).await;
+                let exiting = eval_line(interp, env, &buf).await;
                 buf.clear();
+                if exiting {
+                    return Ok(());
+                }
             }
             // Ctrl-C clears a partial buffer (cancels the entry) instead of
             // exiting; on an empty buffer it exits. Ctrl-D (Eof) always exits.
@@ -139,7 +142,9 @@ async fn run_piped(interp: &Interp, env: &Environment) -> std::io::Result<()> {
         if is_incomplete(&buf) {
             continue;
         }
-        eval_line(interp, env, &buf).await;
+        if eval_line(interp, env, &buf).await {
+            return Ok(());
+        }
         buf.clear();
     }
     // EOF: surface any leftover (e.g. an input that never closed its delimiter).
@@ -151,10 +156,11 @@ async fn run_piped(interp: &Interp, env: &Environment) -> std::io::Result<()> {
 
 /// Lex+parse one input line and evaluate it against the shared interpreter and
 /// environment. Errors (lex/parse/panic) are reported and swallowed so the loop
-/// continues with the environment intact.
-async fn eval_line(interp: &Interp, env: &Environment, line: &str) {
+/// continues with the environment intact. Returns `true` if `exit()` was called
+/// and the REPL loop should end.
+async fn eval_line(interp: &Interp, env: &Environment, line: &str) -> bool {
     if line.trim().is_empty() {
-        return;
+        return false;
     }
     let src_info = Rc::new(SourceInfo {
         path: "<repl>".to_string(),
@@ -165,14 +171,14 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) {
         Ok(t) => t,
         Err(e) => {
             crate::diagnostics::report(&e.with_source(src_info));
-            return;
+            return false;
         }
     };
     let mut program = match crate::parser::parse(&tokens) {
         Ok(p) => p,
         Err(e) => {
             crate::diagnostics::report(&e.with_source(src_info));
-            return;
+            return false;
         }
     };
 
@@ -186,12 +192,20 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) {
     // Drive each input under a LocalSet so spawned tasks join before the prompt
     // returns (no-op until Phase 2).
     let local = tokio::task::LocalSet::new();
-    local
+    let should_exit = local
         .run_until(async {
-            if let Err(Control::Panic(e)) = interp.exec(&program, env).await {
-                flush_output(interp);
-                crate::diagnostics::report(&e.with_source(src_info.clone()));
-                return;
+            match interp.exec(&program, env).await {
+                Err(Control::Panic(e)) => {
+                    flush_output(interp);
+                    crate::diagnostics::report(&e.with_source(src_info.clone()));
+                    return false;
+                }
+                // exit() — signal the REPL loop to end cleanly.
+                Err(Control::Exit(_)) => {
+                    flush_output(interp);
+                    return true;
+                }
+                _ => {}
             }
 
             if let Some(Stmt::Expr(expr)) = trailing {
@@ -207,13 +221,20 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) {
                         crate::diagnostics::report(&e.with_source(src_info));
                     }
                     Err(Control::Propagate(_)) => flush_output(interp),
+                    // exit() during trailing-expression evaluation — end the REPL.
+                    Err(Control::Exit(_)) => {
+                        flush_output(interp);
+                        return true;
+                    }
                 }
             } else {
                 flush_output(interp);
             }
+            false
         })
         .await;
     local.await;
+    should_exit
 }
 
 /// Print and clear any output captured by `print` during this input.
