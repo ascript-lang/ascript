@@ -1278,6 +1278,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_object_destructuring_shorthand_and_rename() {
+        let p = parse(&lex("let {a, b as local} = obj").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::LetDestructureObject { bindings, mutable, .. } => {
+                assert!(*mutable);
+                assert_eq!(bindings[0].key, "a"); assert_eq!(bindings[0].binding, "a");
+                assert_eq!(bindings[1].key, "b"); assert_eq!(bindings[1].binding, "local");
+            }
+            other => panic!("expected LetDestructureObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_object_destructuring_quoted_key() {
+        let p = parse(&lex(r#"let {"weird key" as wk} = obj"#).unwrap()).unwrap();
+        match &p[0] {
+            Stmt::LetDestructureObject { bindings, .. } => {
+                assert_eq!(bindings[0].key, "weird key"); assert_eq!(bindings[0].binding, "wk");
+            }
+            other => panic!("expected LetDestructureObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_destructuring_quoted_shorthand_is_error() {
+        assert!(parse(&lex(r#"let {"weird key"} = obj"#).unwrap()).is_err());
+    }
+
+    #[test]
     fn parses_map_type_annotation() {
         let toks = lex("let m: map<string, number> = empty").unwrap();
         let prog = parse(&toks).unwrap();

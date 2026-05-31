@@ -604,6 +604,10 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::LetDestructureObject { .. } => {
+                // Implemented in Task 1.3.
+                unreachable!("object destructuring eval added in Task 1.3")
+            }
             Stmt::Block(stmts) => {
                 let child = env.child();
                 self.exec(stmts, &child).await

@@ -81,6 +81,18 @@ pub struct Param {
     pub name_span: Span,
 }
 
+/// One `{key as binding}` entry in an object-destructuring pattern. `key` is the
+/// SOURCE key looked up in the value; `binding` is the local name introduced
+/// (equal to `key` for the shorthand `{key}`). `key_span` covers the key token,
+/// `binding_span` the local name (they coincide for shorthand).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObjBinding {
+    pub key: String,
+    pub binding: String,
+    pub key_span: Span,
+    pub binding_span: Span,
+}
+
 impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -146,6 +158,15 @@ pub enum Stmt {
         mutable: bool,
         span: Span,
         name_spans: Vec<Span>,
+    },
+    /// `let {a, b as local} = expr` — object destructuring (binds by key name).
+    /// `rest` is the optional `...name` collector (later phase); `None` for now.
+    LetDestructureObject {
+        bindings: Vec<ObjBinding>,
+        rest: Option<(String, Span)>,
+        value: Expr,
+        mutable: bool,
+        span: Span,
     },
     Block(Vec<Stmt>),
     If { cond: Expr, then_branch: Vec<Stmt>, else_branch: Option<Vec<Stmt>> },

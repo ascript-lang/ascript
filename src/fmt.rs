@@ -92,6 +92,29 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             write_expr(out, value, 0);
             out.push('\n');
         }
+        Stmt::LetDestructureObject { bindings, rest, value, mutable, .. } => {
+            indent(out, level);
+            out.push_str(if *mutable { "let " } else { "const " });
+            out.push('{');
+            let mut parts: Vec<String> = bindings
+                .iter()
+                .map(|b| {
+                    let key = object_key(&b.key);
+                    if b.binding == b.key {
+                        key
+                    } else {
+                        format!("{key} as {}", b.binding)
+                    }
+                })
+                .collect();
+            if let Some((rest_name, _)) = rest {
+                parts.push(format!("...{rest_name}"));
+            }
+            out.push_str(&parts.join(", "));
+            out.push_str("} = ");
+            write_expr(out, value, 0);
+            out.push('\n');
+        }
         Stmt::Block(body) => {
             indent(out, level);
             write_block(out, body, level);
