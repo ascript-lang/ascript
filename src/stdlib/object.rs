@@ -1,8 +1,10 @@
 //! `std/object` — object (string-keyed map) operations.
+//! Callback-taking functions (`mapValues`) live on `impl Interp`; everything
+//! else is pure and lives in the top-level `call` function.
 
 use super::{arg, bi, want_array, want_object, want_string};
 use crate::error::AsError;
-use crate::interp::Control;
+use crate::interp::{Control, Interp};
 use crate::span::Span;
 use crate::value::{Instance, MapKey, Value};
 use indexmap::IndexMap;
@@ -23,6 +25,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("omit", bi("object.omit")),
         ("deepClone", bi("object.deepClone")),
         ("deepEqual", bi("object.deepEqual")),
+        ("mapValues", bi("object.mapValues")),
     ]
 }
 
@@ -268,6 +271,40 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     }
 }
 
+impl Interp {
+    /// Object dispatch: callback-taking fns live here; everything else delegates
+    /// to the pure `object::call`.
+    pub(crate) async fn call_object(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        match func {
+            "mapValues" => {
+                let o = want_object(&arg(args, 0), span, "object.mapValues")?;
+                let f = arg(args, 1);
+                // Clone out the entries before any .await to avoid holding a
+                // RefCell borrow across an await point.
+                let src = o.borrow().clone();
+                let mut out = IndexMap::new();
+                for (k, v) in src.iter() {
+                    let mapped = self
+                        .call_value(
+                            f.clone(),
+                            vec![v.clone(), Value::Str(k.as_str().into())],
+                            span,
+                        )
+                        .await?;
+                    out.insert(k.clone(), mapped);
+                }
+                Ok(Value::Object(Rc::new(RefCell::new(out))))
+            }
+            _ => call(func, args, span),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +441,71 @@ mod tests {
         let keys = arr(vec![s("c"), s("a")]);
         assert_eq!(call("pick", &[o, keys], sp()).unwrap().to_string(),
                    obj(vec![("c", Value::Number(3.0)), ("a", Value::Number(1.0))]).to_string());
+    }
+
+    /// Compile a single AScript expression to a runtime `Value` (callback helper).
+    /// Mirrors the same idiom used in `array.rs` tests.
+    async fn val(interp: &Interp, src: &str) -> Value {
+        let program = format!("let __v = {};", src);
+        let tokens = crate::lexer::lex(&program).expect("lex");
+        let stmts = crate::parser::parse(&tokens).expect("parse");
+        let env = crate::interp::global_env().child();
+        interp.exec(&stmts, &env).await.expect("exec");
+        env.get("__v").expect("binding")
+    }
+
+    #[tokio::test]
+    async fn map_values_routes_and_panics_on_noncallable() {
+        let interp = Interp::new();
+        let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        // A non-callable callback must produce a Tier-2 panic — proves that
+        // call_object routing reaches call_value rather than "unknown function".
+        let r = interp.call_object("mapValues", &[o, Value::Number(0.0)], sp()).await;
+        assert!(matches!(r, Err(Control::Panic(_))));
+    }
+
+    #[tokio::test]
+    async fn map_values_doubles() {
+        let interp = Interp::new();
+        // callback: (v, k) => v * 2
+        let f = val(&interp, "(v, k) => v * 2").await;
+        let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        let result = interp.call_object("mapValues", &[o, f], sp()).await.unwrap();
+        assert_eq!(result.to_string(), "{a: 2, b: 4}");
+    }
+
+    #[tokio::test]
+    async fn map_values_receives_key() {
+        let interp = Interp::new();
+        // callback: (v, k) => k — maps every value to its own key name
+        let f = val(&interp, "(v, k) => k").await;
+        let o = obj(vec![("x", Value::Number(99.0))]);
+        let result = interp.call_object("mapValues", &[o, f], sp()).await.unwrap();
+        assert_eq!(result.to_string(), "{x: \"x\"}");
+    }
+
+    #[tokio::test]
+    async fn map_values_empty_object() {
+        let interp = Interp::new();
+        let f = val(&interp, "(v) => v").await;
+        let o = obj(vec![]);
+        let result = interp.call_object("mapValues", &[o, f], sp()).await.unwrap();
+        assert_eq!(result.to_string(), "{}");
+    }
+
+    #[tokio::test]
+    async fn call_object_delegates_pure_fns() {
+        let interp = Interp::new();
+        let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        // keys/values/entries etc. must still work through call_object
+        let keys = interp.call_object("keys", std::slice::from_ref(&o), sp()).await.unwrap();
+        assert_eq!(keys.to_string(), "[\"a\", \"b\"]");
+        let vals = interp.call_object("values", std::slice::from_ref(&o), sp()).await.unwrap();
+        assert_eq!(vals.to_string(), "[1, 2]");
+        // unknown function still panics
+        assert!(matches!(
+            interp.call_object("nope", &[o], sp()).await,
+            Err(Control::Panic(_))
+        ));
     }
 }

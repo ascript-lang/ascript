@@ -168,7 +168,7 @@ impl Interp {
             "math" => math::call(func, args, span),
             "string" => string::call(func, args, span),
             "array" => self.call_array(func, args, span).await,
-            "object" => object::call(func, args, span),
+            "object" => self.call_object(func, args, span).await,
             "map" => map::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
