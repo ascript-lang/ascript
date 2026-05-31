@@ -264,50 +264,82 @@ impl<'a> Parser<'a> {
             None
         };
         self.eat(&Tok::LBrace)?;
+        let mut fields = Vec::new();
         let mut methods = Vec::new();
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
-            let mstart = self.span().start;
-            let is_async = if *self.peek() == Tok::Async {
-                self.advance();
-                true
+            // A member starting with `async` or `fn` is a method; otherwise a field.
+            if *self.peek() == Tok::Async || *self.peek() == Tok::Fn {
+                let mstart = self.span().start;
+                let is_async = if *self.peek() == Tok::Async {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                self.eat(&Tok::Fn)?;
+                let is_generator = if *self.peek() == Tok::Star {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let mname_span = self.span();
+                let mname = match self.advance() {
+                    Tok::Ident(n) => n,
+                    other => return Err(AsError::at(format!("expected method name, found {:?}", other), self.tokens[self.pos - 1].span)),
+                };
+                let params = self.param_list()?;
+                let ret = if *self.peek() == Tok::Colon {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                let body = self.block()?;
+                let mspan = Span::new(mstart, self.prev_end());
+                methods.push(crate::ast::MethodDecl {
+                    name: mname,
+                    params,
+                    ret,
+                    body,
+                    is_async,
+                    is_generator,
+                    span: mspan,
+                    name_span: mname_span,
+                });
             } else {
-                false
-            };
-            self.eat(&Tok::Fn)?;
-            let is_generator = if *self.peek() == Tok::Star {
-                self.advance();
-                true
-            } else {
-                false
-            };
-            let mname_span = self.span();
-            let mname = match self.advance() {
-                Tok::Ident(n) => n,
-                other => return Err(AsError::at(format!("expected method name, found {:?}", other), self.tokens[self.pos - 1].span)),
-            };
-            let params = self.param_list()?;
-            let ret = if *self.peek() == Tok::Colon {
-                self.advance();
-                Some(self.parse_type()?)
-            } else {
-                None
-            };
-            let body = self.block()?;
-            let mspan = Span::new(mstart, self.prev_end());
-            methods.push(crate::ast::MethodDecl {
-                name: mname,
-                params,
-                ret,
-                body,
-                is_async,
-                is_generator,
-                span: mspan,
-                name_span: mname_span,
-            });
+                // Field declaration: Ident ["?"] ":" type ["=" expr]
+                let fstart = self.span().start;
+                let fname_span = self.span();
+                let fname = match self.advance() {
+                    Tok::Ident(n) => n,
+                    other => return Err(AsError::at(format!("expected a field name or method, found {:?}", other), self.tokens[self.pos - 1].span)),
+                };
+                // `name?:` marker — lower to Optional below.
+                let marker_optional = if *self.peek() == Tok::Question {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                self.eat(&Tok::Colon)?;
+                let mut ty = self.parse_type()?;
+                if marker_optional && !matches!(ty, crate::ast::Type::Optional(_)) {
+                    ty = crate::ast::Type::Optional(Box::new(ty));
+                }
+                let default = if *self.peek() == Tok::Eq {
+                    self.advance();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                let fspan = Span::new(fstart, self.prev_end());
+                fields.push(crate::ast::FieldDecl { name: fname, ty, default, span: fspan, name_span: fname_span });
+            }
         }
         self.eat(&Tok::RBrace)?;
         let span = Span::new(start, self.prev_end());
-        Ok(Stmt::Class { name, superclass, methods, span, name_span })
+        Ok(Stmt::Class { name, superclass, fields, methods, span, name_span })
     }
 
     fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {
@@ -1518,6 +1550,27 @@ mod tests {
                 assert_eq!(r.to_string(), "number?");
             }
             other => panic!("expected a typed fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_fields_both_spellings_parse() {
+        let src = "class U {\n  id: number\n  nick: string?\n  avatar?: string\n  role: string = \"guest\"\n  fn init() {}\n}";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Class { fields, methods, .. } => {
+                assert_eq!(fields.len(), 4);
+                assert_eq!(fields[0].name, "id");
+                assert_eq!(fields[0].ty.to_string(), "number");
+                // `string?` and `avatar?` both lower to Optional.
+                assert_eq!(fields[1].ty.to_string(), "string?");
+                assert_eq!(fields[2].name, "avatar");
+                assert_eq!(fields[2].ty.to_string(), "string?");
+                // default present
+                assert!(fields[3].default.is_some());
+                assert_eq!(methods.len(), 1);
+            }
+            other => panic!("expected a class, got {other:?}"),
         }
     }
 
