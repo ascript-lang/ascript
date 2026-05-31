@@ -166,7 +166,15 @@ module.exports = grammar({
       optional(seq('extends', field('superclass', $.identifier))),
       field('body', $.class_body),
     ),
-    class_body: $ => seq('{', repeat($.method_definition), '}'),
+    class_body: $ => seq('{', repeat($.class_member), '}'),
+    class_member: $ => choice($.field_declaration, $.method_definition),
+    field_declaration: $ => seq(
+      field('name', $.identifier),
+      optional('?'),                    // `name?:` marker (lowers to T | nil)
+      ':',
+      field('type', $._type),           // also covers `name: T?`
+      optional(seq('=', field('default', $._expression))),
+    ),
     method_definition: $ => seq(
       optional('async'),
       'fn',
