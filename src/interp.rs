@@ -1575,6 +1575,144 @@ impl Interp {
         Ok(inst_val)
     }
 
+    /// Validate a raw object against a class's declared fields, producing a
+    /// checked instance. Recurses into nested class / array<Class> / map<K,Class>
+    /// fields. Does NOT run `init`. Non-panicking: returns Err on mismatch.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn validate_into(
+        &self,
+        class: &std::rc::Rc<crate::value::Class>,
+        obj: &Value,
+        strict: bool,
+        path: &str,
+        span: Span,
+    ) -> Result<Value, AsError> {
+        let map = match obj {
+            Value::Object(m) => m.clone(),
+            _ => {
+                return Err(AsError::at(
+                    format!("{} expects an object, got {}", display_path(path, &class.name), type_name(obj)),
+                    span,
+                ))
+            }
+        };
+        // Declared fields, base-class first (subclass last so it wins on name clash).
+        let mut chain = Vec::new();
+        let mut cur = Some(class.clone());
+        while let Some(c) = cur {
+            chain.push(c.clone());
+            cur = c.superclass.clone();
+        }
+        let mut schema: indexmap::IndexMap<String, crate::value::FieldSchema> = indexmap::IndexMap::new();
+        for c in chain.into_iter().rev() {
+            for (n, s) in &c.fields {
+                schema.insert(n.clone(), s.clone());
+            }
+        }
+
+        let mut inst_fields = indexmap::IndexMap::new();
+        for (fname, fs) in &schema {
+            let field_path = if path.is_empty() {
+                format!("{}.{}", class.name.to_lowercase(), fname)
+            } else {
+                format!("{}.{}", path, fname)
+            };
+            let raw = map.borrow().get(fname).cloned();
+            let mut val = raw.unwrap_or(Value::Nil);
+            if val == Value::Nil {
+                if let Some(def) = &fs.default {
+                    val = self
+                        .eval_expr(def, &class.def_env)
+                        .await
+                        .map_err(|c| control_to_aserror(c, span))?;
+                }
+            }
+            val = self.coerce_field(&fs.ty, val, &class.def_env, strict, &field_path, span).await?;
+            if !check_type(&val, &fs.ty) {
+                return Err(AsError::at(
+                    format!("type contract violated at {}: expected {}, got {}", field_path, fs.ty, type_name(&val)),
+                    span,
+                ));
+            }
+            inst_fields.insert(fname.clone(), val);
+        }
+
+        if strict {
+            for k in map.borrow().keys() {
+                if !schema.contains_key(k) {
+                    return Err(AsError::at(
+                        format!("unexpected key '{}' for {} (strict)", k, display_path(path, &class.name)),
+                        span,
+                    ));
+                }
+            }
+        }
+
+        Ok(Value::Instance(std::rc::Rc::new(std::cell::RefCell::new(crate::value::Instance {
+            class: class.clone(),
+            fields: inst_fields,
+        }))))
+    }
+
+    /// Recursively coerce a raw value to match a declared field type: a raw
+    /// Object whose field type is a class becomes that class's validated
+    /// instance; arrays/maps of a class recurse element/value-wise; Optional
+    /// passes non-nil through to the inner type. Everything else is unchanged.
+    #[async_recursion::async_recursion(?Send)]
+    async fn coerce_field(
+        &self,
+        ty: &crate::ast::Type,
+        val: Value,
+        env: &Environment,
+        strict: bool,
+        path: &str,
+        span: Span,
+    ) -> Result<Value, AsError> {
+        use crate::ast::Type;
+        match ty {
+            Type::Optional(inner) => {
+                if val == Value::Nil {
+                    Ok(Value::Nil)
+                } else {
+                    self.coerce_field(inner, val, env, strict, path, span).await
+                }
+            }
+            Type::Named(name) => match (&val, env.get(name)) {
+                (Value::Object(_), Some(Value::Class(c))) => {
+                    self.validate_into(&c, &val, strict, path, span).await
+                }
+                _ => Ok(val),
+            },
+            Type::Array(elem) => match &val {
+                Value::Array(a) => {
+                    let items: Vec<Value> = a.borrow().clone();
+                    let mut out = Vec::with_capacity(items.len());
+                    for (i, it) in items.into_iter().enumerate() {
+                        let p = format!("{}[{}]", path, i);
+                        out.push(self.coerce_field(elem, it, env, strict, &p, span).await?);
+                    }
+                    Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+                }
+                _ => Ok(val),
+            },
+            Type::Map(_, vty) => match &val {
+                Value::Map(m) => {
+                    let entries: Vec<(crate::value::MapKey, Value)> =
+                        m.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
+                    for (k, v) in entries {
+                        let p = format!("{}[{}]", path, k.to_value());
+                        let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
+                        out.borrow_mut().insert(k, cv);
+                    }
+                    Ok(Value::Map(out))
+                }
+                _ => Ok(val),
+            },
+            _ => Ok(val),
+        }
+    }
+
     #[async_recursion(?Send)]
     async fn invoke_method(
         &self,
@@ -1921,6 +2059,21 @@ fn lookup_field_schema(
         cur = c.superclass.clone();
     }
     None
+}
+
+fn display_path(path: &str, class_name: &str) -> String {
+    if path.is_empty() {
+        format!("{}.from", class_name)
+    } else {
+        path.to_string()
+    }
+}
+
+fn control_to_aserror(c: Control, span: Span) -> AsError {
+    match c {
+        Control::Panic(e) => e,
+        Control::Propagate(_) => AsError::at("unexpected ? propagation in a field default", span),
+    }
 }
 
 /// Runtime contract check (spec §5). Eagerly checks parametric types to full depth.
