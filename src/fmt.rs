@@ -47,6 +47,9 @@ fn write_params(out: &mut String, params: &[Param]) {
         if i > 0 {
             out.push_str(", ");
         }
+        if p.rest {
+            out.push_str("...");
+        }
         out.push_str(&p.name);
         if let Some(ty) = &p.ty {
             out.push_str(": ");
@@ -455,7 +458,7 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             }
             // Single un-annotated param renders without parens (`x => …`);
             // anything else uses the parenthesized form.
-            if params.len() == 1 && params[0].ty.is_none() {
+            if params.len() == 1 && params[0].ty.is_none() && !params[0].rest {
                 out.push_str(&params[0].name);
             } else {
                 write_params(out, params);
@@ -880,5 +883,15 @@ mod tests {
                 path
             );
         }
+    }
+
+    #[test]
+    fn rest_param_round_trips() {
+        let src = "fn f(a, ...rest) {\n  return rest\n}\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        let src2 = "fn f(...rest: array<number>) {\n  return rest\n}\n";
+        assert_eq!(format_source(src2).unwrap(), src2);
+        let src3 = "let f = (a, ...rest) => rest\n";
+        assert_eq!(format_source(src3).unwrap(), src3);
     }
 }
