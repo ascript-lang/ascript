@@ -1525,20 +1525,74 @@ impl Interp {
         what: &str,
     ) -> Result<Value, Control> {
         let BodySpec { params, ret, body } = spec;
-        if args.len() != params.len() {
-            return Err(AsError::at(
-                format!("{} expected {} argument(s), got {}", what, params.len(), args.len()),
-                span,
-            )
-            .into());
-        }
-        for (p, a) in params.iter().zip(args.into_iter()) {
-            if let Some(ty) = &p.ty {
-                if !check_type(&a, ty) {
-                    return Err(contract_panic(ty, &a, span));
-                }
+        let has_rest = params.last().is_some_and(|p| p.rest);
+        if !has_rest {
+            // UNCHANGED fast path — exact arity, identical wording.
+            if args.len() != params.len() {
+                return Err(AsError::at(
+                    format!("{} expected {} argument(s), got {}", what, params.len(), args.len()),
+                    span,
+                )
+                .into());
             }
-            call_env.define(&p.name, a, true).map_err(AsError::new)?;
+            for (p, a) in params.iter().zip(args.into_iter()) {
+                if let Some(ty) = &p.ty {
+                    if !check_type(&a, ty) {
+                        return Err(contract_panic(ty, &a, span));
+                    }
+                }
+                call_env.define(&p.name, a, true).map_err(AsError::new)?;
+            }
+        } else {
+            let n_fixed = params.len() - 1;
+            if args.len() < n_fixed {
+                return Err(AsError::at(
+                    format!(
+                        "{} expected at least {} argument(s), got {}",
+                        what,
+                        n_fixed,
+                        args.len()
+                    ),
+                    span,
+                )
+                .into());
+            }
+            let mut it = args.into_iter();
+            for p in &params[..n_fixed] {
+                let a = it.next().unwrap();
+                if let Some(ty) = &p.ty {
+                    if !check_type(&a, ty) {
+                        return Err(contract_panic(ty, &a, span));
+                    }
+                }
+                call_env.define(&p.name, a, true).map_err(AsError::new)?;
+            }
+            let rest_p = &params[n_fixed];
+            let elem_ty = match &rest_p.ty {
+                Some(crate::ast::Type::Array(inner)) => Some(inner.as_ref()),
+                Some(other) => {
+                    return Err(AsError::at(
+                        format!(
+                            "a rest parameter type must be an array type (array<T>), got {}",
+                            other
+                        ),
+                        span,
+                    )
+                    .into())
+                }
+                None => None,
+            };
+            let mut rest_vals = Vec::new();
+            for a in it {
+                if let Some(t) = elem_ty {
+                    if !check_type(&a, t) {
+                        return Err(contract_panic(t, &a, span));
+                    }
+                }
+                rest_vals.push(a);
+            }
+            let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(rest_vals)));
+            call_env.define(&rest_p.name, arr, true).map_err(AsError::new)?;
         }
         let result = match self.exec(body, call_env).await {
             Ok(Flow::Return(v)) => v,
@@ -2316,6 +2370,32 @@ mod tests {
         local.run_until(async { interp.exec(&stmts, &env).await.expect("program panicked") }).await;
         local.await; // drain spawned async-fn tasks
         interp.output()
+    }
+
+    #[tokio::test]
+    async fn non_rest_arity_error_message_unchanged() {
+        let e = run_err("fn f(a, b) {}\nf(1)").await;
+        assert!(e.message.contains("expected 2 argument(s), got 1"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
+    async fn rest_param_collects_trailing_args_as_array() {
+        let out = run("fn f(a, ...rest) { print(a)\n print(rest) }\nf(1)\nf(1, 2, 3)").await;
+        assert_eq!(out, "1\n[]\n1\n[2, 3]\n");
+    }
+
+    #[tokio::test]
+    async fn rest_param_too_few_fixed_args_panics() {
+        let e = run_err("fn f(a, b, ...r) {}\nf(1)").await;
+        assert!(e.message.contains("at least 2"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
+    async fn typed_rest_checks_each_element() {
+        let e = run_err("fn f(...rest: array<number>) {}\nf(1, \"x\", 3)").await;
+        assert!(e.message.to_lowercase().contains("number"), "got: {}", e.message);
+        let out = run("fn f(...rest: array<number>) { print(rest) }\nf(1, 2)").await;
+        assert_eq!(out, "[1, 2]\n");
     }
 
     /// Like `run`, but expects a runtime panic and returns its `AsError`.
