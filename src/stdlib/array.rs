@@ -5,7 +5,8 @@ use super::{arg, bi, clamp_index, want_array, want_number};
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
-use crate::value::Value;
+use crate::value::{MapKey, Value};
+use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -34,6 +35,10 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("unique", bi("array.unique")),
         ("take", bi("array.take")),
         ("drop", bi("array.drop")),
+        ("chunk", bi("array.chunk")),
+        ("zip", bi("array.zip")),
+        ("groupBy", bi("array.groupBy")),
+        ("partition", bi("array.partition")),
     ]
 }
 
@@ -280,6 +285,70 @@ impl Interp {
                 let out = a.borrow()[k..].to_vec();
                 Ok(Value::Array(Rc::new(RefCell::new(out))))
             }
+            "chunk" => {
+                let a = want_array(&arg(args, 0), span, &ctx("chunk"))?;
+                let nf = want_number(&arg(args, 1), span, &ctx("chunk"))?;
+                if nf < 1.0 || nf.fract() != 0.0 {
+                    return Err(AsError::at("array.chunk size must be a positive integer", span).into());
+                }
+                let n = nf as usize;
+                let out: Vec<Value> = a.borrow()
+                    .chunks(n)
+                    .map(|c| Value::Array(Rc::new(RefCell::new(c.to_vec()))))
+                    .collect();
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
+            "zip" => {
+                if args.is_empty() {
+                    return Err(AsError::at("array.zip requires at least one array", span).into());
+                }
+                let mut cols: Vec<Vec<Value>> = Vec::with_capacity(args.len());
+                for (i, v) in args.iter().enumerate() {
+                    cols.push(want_array(v, span, &format!("array.zip arg {}", i))?.borrow().clone());
+                }
+                let len = cols.iter().map(|c| c.len()).min().unwrap_or(0);
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    let tuple: Vec<Value> = cols.iter().map(|c| c[i].clone()).collect();
+                    out.push(Value::Array(Rc::new(RefCell::new(tuple))));
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
+            "groupBy" => {
+                let a = want_array(&arg(args, 0), span, &ctx("groupBy"))?;
+                let f = arg(args, 1);
+                let items = a.borrow().clone();
+                let mut groups: IndexMap<MapKey, Vec<Value>> = IndexMap::new();
+                for item in items.into_iter() {
+                    let key = self.call_value(f.clone(), vec![item.clone()], span).await?;
+                    let mk = MapKey::from_value(&key).ok_or_else(|| -> Control {
+                        AsError::at("array.groupBy key must be a string, number, or bool", span).into()
+                    })?;
+                    groups.entry(mk).or_default().push(item);
+                }
+                let map: IndexMap<MapKey, Value> = groups
+                    .into_iter()
+                    .map(|(k, v)| (k, Value::Array(Rc::new(RefCell::new(v)))))
+                    .collect();
+                Ok(Value::Map(Rc::new(RefCell::new(map))))
+            }
+            "partition" => {
+                let a = want_array(&arg(args, 0), span, &ctx("partition"))?;
+                let f = arg(args, 1);
+                let items = a.borrow().clone();
+                let (mut pass, mut fail) = (Vec::new(), Vec::new());
+                for item in items.into_iter() {
+                    if self.call_value(f.clone(), vec![item.clone()], span).await?.is_truthy() {
+                        pass.push(item);
+                    } else {
+                        fail.push(item);
+                    }
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(vec![
+                    Value::Array(Rc::new(RefCell::new(pass))),
+                    Value::Array(Rc::new(RefCell::new(fail))),
+                ]))))
+            }
             _ => Err(AsError::at(format!("std/array has no function '{}'", func), span).into()),
         }
     }
@@ -328,6 +397,20 @@ mod tests {
     }
     fn arr(xs: Vec<Value>) -> Value {
         Value::Array(Rc::new(RefCell::new(xs)))
+    }
+
+    /// Compile a single AScript expression (e.g. an arrow function) to a runtime
+    /// `Value` so callback-driven array fns can be exercised in-process. Uses the
+    /// repo's established lex → parse → exec test idiom (cf. the net_tcp/process
+    /// test modules). Synchronous arrow callbacks run inline, so a plain `Interp`
+    /// (no `LocalSet`/`install_self`) suffices.
+    async fn val(interp: &Interp, src: &str) -> Value {
+        let program = format!("let __v = {};", src);
+        let tokens = crate::lexer::lex(&program).expect("lex");
+        let stmts = crate::parser::parse(&tokens).expect("parse");
+        let env = crate::interp::global_env().child();
+        interp.exec(&stmts, &env).await.expect("exec");
+        env.get("__v").expect("binding")
     }
 
     #[tokio::test]
@@ -395,6 +478,60 @@ mod tests {
         let a = arr(vec![n(1.0), n(2.0), n(3.0)]);
         assert_eq!(interp.call_array("indexOf", &[a.clone(), n(2.0)], sp()).await.unwrap(), n(1.0));
         assert_eq!(interp.call_array("indexOf", &[a.clone(), n(9.0)], sp()).await.unwrap(), n(-1.0));
+    }
+
+    #[tokio::test]
+    async fn array_grouping() {
+        let interp = Interp::new();
+        let a = arr(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        assert_eq!(interp.call_array("chunk", &[a.clone(), n(2.0)], sp()).await.unwrap().to_string(), "[[1, 2], [3, 4], [5]]");
+        let b = arr(vec![n(10.0), n(20.0)]);
+        assert_eq!(interp.call_array("zip", &[a.clone(), b], sp()).await.unwrap().to_string(), "[[1, 10], [2, 20]]");
+        assert!(matches!(interp.call_array("chunk", &[a.clone(), n(0.0)], sp()).await, Err(Control::Panic(_))));
+    }
+
+    #[tokio::test]
+    async fn group_by_callback() {
+        let interp = Interp::new();
+        let a = arr(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        // Group by parity; the IndexMap preserves first-seen key order ("odd" then "even").
+        let f = val(&interp, r#"(x) => x % 2 == 0 ? "even" : "odd""#).await;
+        let result = interp.call_array("groupBy", &[a, f], sp()).await.unwrap();
+        let map = match &result {
+            Value::Map(m) => m.borrow(),
+            other => panic!("expected map, got {}", other),
+        };
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&MapKey::from_value(&Value::Str("odd".into())).unwrap()).unwrap().to_string(), "[1, 3, 5]");
+        assert_eq!(map.get(&MapKey::from_value(&Value::Str("even".into())).unwrap()).unwrap().to_string(), "[2, 4]");
+        // Full stringification confirms insertion order.
+        drop(map);
+        assert_eq!(result.to_string(), r#"map {"odd": [1, 3, 5], "even": [2, 4]}"#);
+    }
+
+    #[tokio::test]
+    async fn group_by_non_hashable_key_panics() {
+        let interp = Interp::new();
+        let a = arr(vec![n(1.0)]);
+        // A callback returning an array yields a non-hashable key → Tier-2 panic.
+        let f = val(&interp, "(x) => [x]").await;
+        assert!(matches!(interp.call_array("groupBy", &[a, f], sp()).await, Err(Control::Panic(_))));
+    }
+
+    #[tokio::test]
+    async fn partition_predicate() {
+        let interp = Interp::new();
+        let a = arr(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
+        let even = val(&interp, "(x) => x % 2 == 0").await;
+        assert_eq!(
+            interp.call_array("partition", &[a, even.clone()], sp()).await.unwrap().to_string(),
+            "[[2, 4], [1, 3, 5]]"
+        );
+        // Empty input → two empty partitions.
+        assert_eq!(
+            interp.call_array("partition", &[arr(vec![]), even], sp()).await.unwrap().to_string(),
+            "[[], []]"
+        );
     }
 
     #[tokio::test]
