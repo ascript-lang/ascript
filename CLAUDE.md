@@ -90,6 +90,13 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > Array/object rest patterns (`let [a, ...r]`, `let {a, ...r}`) collect the tail / leftover keys;
 > object-rest excludes already-bound SOURCE keys. For async/`fn*`, arity/contract errors surface
 > lazily when the future is driven.
+>
+> **`std/log`**: leveled (`debug/info/warn/error`) structured logging; `Interp`-stateful
+> (`log_level`/`log_format`), routed via `self.call_log`. Emits to stderr (Live) or a capture buffer
+> (tests, `log_output()`). Total serialization via `json::to_json_lossy` (cycles→`"[Circular]"`,
+> functions→`"<function>"`, NaN→null — never panics). Non-object args join into `msg`; object args
+> merge as fields; reserved `level`/`msg` always win; a thunk first-arg (incl. `async fn`, awaited)
+> defers message work past the level filter. Default level from `ASCRIPT_LOG`.
 
 ## Commands
 
@@ -194,7 +201,8 @@ Tier-2 panic.
 ### Feature flags (`Cargo.toml`)
 The stdlib is split into Cargo features, all on by `default`: `data` (json/regex/encoding/csv/toml/
 yaml/uuid/bytes), `datetime`, `intl`, `sys` (fs/process/env), `crypto`, `compress`, `sql` (sqlite),
-`net` (tcp/http/ws/server), `tui` (crossterm), `lsp` (tower-lsp). Every module is `#[cfg]`-gated so
+`net` (tcp/http/ws/server), `log` (std/log — default-on, depends on `data` for JSON serialization),
+`tui` (crossterm), `lsp` (tower-lsp). Every module is `#[cfg]`-gated so
 `--no-default-features` builds the bare language. `http3` is opt-in and additionally requires
 `RUSTFLAGS="--cfg reqwest_unstable"` (reqwest's http3 is unstable).
 

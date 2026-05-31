@@ -89,6 +89,7 @@ ascript run hello.as
 | Time & locale | `std/time` · `std/date` · `std/intl` |
 | Networking | `std/net/tcp` · `std/net/http` · `std/http/server` · `std/net/ws` |
 | Concurrency | `std/task` (`spawn` · `gather` · `race` · `timeout` over `future<T>`) |
+| Logging | `std/log` (`debug` · `info` · `warn` · `error`; human/json, structured fields) |
 | Terminal UI | `std/tui` |
 
 ## Documentation
