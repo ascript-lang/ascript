@@ -604,9 +604,40 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::LetDestructureObject { .. } => {
-                // Implemented in Task 1.3.
-                unreachable!("object destructuring eval added in Task 1.3")
+            Stmt::LetDestructureObject { bindings, rest, value, mutable, .. } => {
+                let v = self.eval_expr(value, env).await?;
+                if !matches!(v, Value::Object(_) | Value::Instance(_)) {
+                    return Err(AsError::at(
+                        format!("cannot destructure a non-object value of type {}", type_name(&v)),
+                        value.span).into());
+                }
+                let get = |key: &str| -> Value {
+                    match &v {
+                        Value::Object(o) => o.borrow().get(key).cloned().unwrap_or(Value::Nil),
+                        Value::Instance(i) => i.borrow().fields.get(key).cloned().unwrap_or(Value::Nil),
+                        _ => Value::Nil,
+                    }
+                };
+                for b in bindings {
+                    env.define(&b.binding, get(&b.key), *mutable).map_err(AsError::new)?;
+                }
+                if let Some((rest_name, _)) = rest {
+                    let bound: std::collections::HashSet<&str> =
+                        bindings.iter().map(|b| b.key.as_str()).collect();
+                    let mut remaining = indexmap::IndexMap::new();
+                    match &v {
+                        Value::Object(o) => for (k, val) in o.borrow().iter() {
+                            if !bound.contains(k.as_str()) { remaining.insert(k.clone(), val.clone()); }
+                        },
+                        Value::Instance(i) => for (k, val) in i.borrow().fields.iter() {
+                            if !bound.contains(k.as_str()) { remaining.insert(k.clone(), val.clone()); }
+                        },
+                        _ => {}
+                    }
+                    let obj = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(remaining)));
+                    env.define(rest_name, obj, *mutable).map_err(AsError::new)?;
+                }
+                Ok(Flow::Normal)
             }
             Stmt::Block(stmts) => {
                 let child = env.child();
@@ -2070,6 +2101,11 @@ fn exported_names(stmt: &Stmt) -> Vec<String> {
         Stmt::Class { name, .. } => vec![name.clone()],
         Stmt::Enum { name, .. } => vec![name.clone()],
         Stmt::LetDestructure { names, .. } => names.clone(),
+        Stmt::LetDestructureObject { bindings, rest, .. } => {
+            let mut v: Vec<String> = bindings.iter().map(|b| b.binding.clone()).collect();
+            if let Some((r, _)) = rest { v.push(r.clone()); }
+            v
+        }
         _ => Vec::new(),
     }
 }
@@ -2233,6 +2269,29 @@ mod tests {
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn object_destructuring_binds_from_object_and_instance() {
+        let out = run(r#"
+let {a, b as local, missing} = {a: 1, b: 2}
+print(a)
+print(local)
+print(missing)
+class P { x: number
+ y: number }
+let p = P.from({x: 10, y: 20})
+let {x, y} = p
+print(x)
+print(y)
+"#).await;
+        assert_eq!(out, "1\n2\nnil\n10\n20\n");
+    }
+
+    #[tokio::test]
+    async fn object_destructuring_on_non_object_panics() {
+        let err = run_err(r#"let {a} = 5"#).await;
+        assert!(err.message.contains("cannot destructure a non-object"));
     }
 
     #[tokio::test]
