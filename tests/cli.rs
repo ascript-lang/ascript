@@ -226,6 +226,25 @@ fn repl_evaluates_and_persists_bindings() {
 }
 
 #[test]
+fn repl_buffers_multiline_class() {
+    let input = "class P {\n  x: number\n  y: number\n}\nlet p = P.from({x: 3, y: 4})\nprint(p.x + p.y)\n";
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ascript"))
+        .arg("repl")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            use std::io::Write;
+            c.stdin.take().unwrap().write_all(input.as_bytes())?;
+            c.wait_with_output()
+        })
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains('7'), "expected 7; stdout: {stdout}");
+}
+
+#[test]
 fn fmt_subcommand_rewrites_in_place_and_is_idempotent() {
     let file = std::env::temp_dir().join(format!("ascript_fmt_{}.as", std::process::id()));
     // A deliberately messy source: cramped spacing, no spaces around `=`/operators.

@@ -76,14 +76,35 @@ async fn run_tty(interp: &Interp, env: &Environment) -> std::io::Result<()> {
 
     let mut rl =
         DefaultEditor::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Accumulate physical lines while the input is incomplete (unclosed
+    // delimiters or an unterminated string/template), prompting with `..`.
+    let mut buf = String::new();
     loop {
-        match rl.readline(">> ") {
+        let prompt = if buf.is_empty() { ">> " } else { ".. " };
+        match rl.readline(prompt) {
             Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                eval_line(interp, env, &line).await;
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(&line);
+                if is_incomplete(&buf) {
+                    continue;
+                }
+                let _ = rl.add_history_entry(buf.as_str());
+                eval_line(interp, env, &buf).await;
+                buf.clear();
             }
-            // Ctrl-C / Ctrl-D both exit cleanly.
-            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+            // Ctrl-C clears a partial buffer (cancels the entry) instead of
+            // exiting; on an empty buffer it exits. Ctrl-D (Eof) always exits.
+            Err(ReadlineError::Interrupted) => {
+                if buf.is_empty() {
+                    break;
+                } else {
+                    buf.clear();
+                    continue;
+                }
+            }
+            Err(ReadlineError::Eof) => break,
             Err(e) => {
                 return Err(std::io::Error::other(e.to_string()));
             }
@@ -95,9 +116,22 @@ async fn run_tty(interp: &Interp, env: &Environment) -> std::io::Result<()> {
 /// Non-TTY path: read lines straight from stdin (used by the piped test).
 async fn run_piped(interp: &Interp, env: &Environment) -> std::io::Result<()> {
     let stdin = std::io::stdin();
+    let mut buf = String::new();
     for line in stdin.lock().lines() {
         let line = line?;
-        eval_line(interp, env, &line).await;
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(&line);
+        if is_incomplete(&buf) {
+            continue;
+        }
+        eval_line(interp, env, &buf).await;
+        buf.clear();
+    }
+    // EOF: surface any leftover (e.g. an input that never closed its delimiter).
+    if !buf.trim().is_empty() {
+        eval_line(interp, env, &buf).await;
     }
     Ok(())
 }
