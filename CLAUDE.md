@@ -134,6 +134,11 @@ Source flows as: `lexer::lex(src)` → `parser::parse(&tokens)` → `Interp::exe
 token and AST node carries a `Span` (byte offsets + line/col) so `diagnostics` (ariadne-backed) can
 point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_source`, `run_tests`.
 
+**REPL multi-line input**: `repl.rs` buffers lines while `is_incomplete` (positive delimiter-TOKEN
+depth, or unterminated string/template at EOF) on a `..` prompt, then execs the whole buffer against
+the persistent session `Interp`+`Environment` (state already persists across lines). Token-depth
+(not raw-brace) counting keeps `${…}` template braces from skewing the depth.
+
 ### The interpreter (`src/interp.rs`)
 - `eval_expr`/`exec` are `async` (`#[async_recursion]`) and take **`&self`** (not `&mut self`) —
   `Interp` state lives behind interior-mutability cells (`RefCell`/`Cell`) so multiple eval futures can
