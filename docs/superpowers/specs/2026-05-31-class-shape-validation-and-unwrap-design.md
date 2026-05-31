@@ -40,10 +40,11 @@ result today requires several lines of manual destructuring.
 3. Add a small, general **force-unwrap operator** that is the dual of `?`, so the
    common case collapses to one expression.
 
-The target one-liner this design makes real:
+The target one-liner this design makes real (no parens around `await` needed — see
+the precedence rule in §5.2):
 
 ```javascript
-let user = recover(() => User.from((await resp.json())!))?
+let user = recover(() => User.from(await resp.json()!))?
 ```
 
 ### Non-goals (and why)
@@ -254,7 +255,8 @@ async fn loadUser(resp): Result<User> {
   // `!` promotes a JSON parse failure to a panic AND unwraps the pair;
   // `User.from` panics on a shape mismatch; `recover` catches either;
   // `?` propagates the unified error.
-  return recover(() => User.from((await resp.json())!))?
+  // No parens around `await` — `!` binds looser than `await` (§5.2).
+  return recover(() => User.from(await resp.json()!))?
 }
 ```
 
@@ -304,7 +306,7 @@ Failure modes, all surfaced as one Tier-1 error out of `loadUser`:
   arrays thereof. Recursing into `map<string, SomeClass>` values is a natural extension;
   deferred unless needed.
 - **`resp.json(User)` convenience:** deferred (see §1 non-goals); revisit if the
-  `recover(… .from((await …)!))?` shape proves common enough to warrant sugar.
+  `recover(… .from(await …!))?` shape proves common enough to warrant sugar.
 - **Field declarations as constructor surface:** this design keeps `init` and field
   declarations independent. A future "auto-`init` from declared fields" is possible but
   out of scope.
