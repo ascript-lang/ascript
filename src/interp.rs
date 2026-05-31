@@ -2357,6 +2357,12 @@ print(add(...[1, 2, 3]))
     }
 
     #[tokio::test]
+    async fn spread_non_array_as_call_args_panics() {
+        let e = run_err("fn f(a) { return a }\nf(...5)").await;
+        assert!(e.message.contains("can only spread an array as call arguments"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
     async fn object_destructuring_binds_from_object_and_instance() {
         let out = run(r#"
 let {a, b as local, missing} = {a: 1, b: 2}
