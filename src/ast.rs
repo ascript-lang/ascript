@@ -28,6 +28,10 @@ pub enum ExprKind {
     Member { object: Box<Expr>, name: String },
     OptMember { object: Box<Expr>, name: String },
     Try(Box<Expr>),
+    /// `expr!` — force-unwrap a Tier-1 `[value, err]` pair: evaluates to `value`
+    /// when `err == nil`, otherwise panics (carrying the original error's
+    /// message). The dual of `Try` (`?`).
+    Unwrap(Box<Expr>),
     /// The conditional operator `cond ? then : els` (spec §3). Right-associative,
     /// binds just above assignment. `then`/`els` are evaluated lazily — only the
     /// selected branch runs.
@@ -308,6 +312,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
             ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
             ExprKind::Try(e) => write!(f, "(? {})", e),
+            ExprKind::Unwrap(e) => write!(f, "(unwrap {})", e),
             ExprKind::Ternary { cond, then, els } => write!(f, "(?: {} {} {})", cond, then, els),
             ExprKind::Template { .. } => write!(f, "(template)"),
             ExprKind::Match { .. } => write!(f, "(match)"),
