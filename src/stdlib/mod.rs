@@ -23,12 +23,12 @@ pub mod encoding;
 pub mod env;
 #[cfg(feature = "sys")]
 pub mod fs;
-#[cfg(feature = "sys")]
-pub mod io;
 #[cfg(feature = "net")]
 pub mod http_server;
 #[cfg(feature = "intl")]
 pub mod intl;
+#[cfg(feature = "sys")]
+pub mod io;
 #[cfg(feature = "data")]
 pub mod json;
 #[cfg(feature = "log")]

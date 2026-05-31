@@ -771,9 +771,10 @@ impl Interp {
                     // in a fire-and-forget spawn_local). Treat it as a 500 here; the
                     // same exit() call will also surface at the program's top level
                     // through run_file/run_source if the server is invoked from script.
-                    Err(Control::Exit(code)) => {
-                        Some(simple_response(500, &format!("exit({code}) called in handler")))
-                    }
+                    Err(Control::Exit(code)) => Some(simple_response(
+                        500,
+                        &format!("exit({code}) called in handler"),
+                    )),
                 }
             }
             // Clean EOF before any bytes: client closed; nothing to write.

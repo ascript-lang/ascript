@@ -35,15 +35,17 @@ enum Command {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { file, args } => match ascript::run_file(std::path::Path::new(&file), &args).await {
-            // Output already streamed live by `run_file` (OutputSink::Live).
-            // `code` is 0 for normal exit or whatever `exit(n)` requested.
-            Ok(code) => ExitCode::from(code as u8),
-            Err(e) => {
-                ascript::diagnostics::report(&e);
-                ExitCode::from(1)
+        Command::Run { file, args } => {
+            match ascript::run_file(std::path::Path::new(&file), &args).await {
+                // Output already streamed live by `run_file` (OutputSink::Live).
+                // `code` is 0 for normal exit or whatever `exit(n)` requested.
+                Ok(code) => ExitCode::from(code as u8),
+                Err(e) => {
+                    ascript::diagnostics::report(&e);
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
         Command::Repl => match ascript::repl::run_repl().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

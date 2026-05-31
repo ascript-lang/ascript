@@ -86,44 +86,80 @@ struct SubcommandSpec {
 
 /// Extract a string field from an object. Returns `""` when absent/nil. Tier-2
 /// panics if the field is present but not a string.
-fn str_field(obj: &IndexMap<String, Value>, key: &str, ctx: &str, span: Span) -> Result<String, Control> {
+fn str_field(
+    obj: &IndexMap<String, Value>,
+    key: &str,
+    ctx: &str,
+    span: Span,
+) -> Result<String, Control> {
     match obj.get(key) {
         None | Some(Value::Nil) => Ok(String::new()),
         Some(Value::Str(s)) => Ok(s.to_string()),
         Some(other) => Err(AsError::at(
-            format!("cli.parse spec: {}.{} must be a string, got {}", ctx, key, crate::interp::type_name(other)),
+            format!(
+                "cli.parse spec: {}.{} must be a string, got {}",
+                ctx,
+                key,
+                crate::interp::type_name(other)
+            ),
             span,
-        ).into()),
+        )
+        .into()),
     }
 }
 
 /// Extract a bool field from an object. Returns `false` when absent/nil. Tier-2
 /// panic if present but not a bool.
-fn bool_field(obj: &IndexMap<String, Value>, key: &str, ctx: &str, span: Span) -> Result<bool, Control> {
+fn bool_field(
+    obj: &IndexMap<String, Value>,
+    key: &str,
+    ctx: &str,
+    span: Span,
+) -> Result<bool, Control> {
     match obj.get(key) {
         None | Some(Value::Nil) => Ok(false),
         Some(Value::Bool(b)) => Ok(*b),
         Some(other) => Err(AsError::at(
-            format!("cli.parse spec: {}.{} must be a bool, got {}", ctx, key, crate::interp::type_name(other)),
+            format!(
+                "cli.parse spec: {}.{} must be a bool, got {}",
+                ctx,
+                key,
+                crate::interp::type_name(other)
+            ),
             span,
-        ).into()),
+        )
+        .into()),
     }
 }
 
 fn parse_flag_spec(v: &Value, span: Span) -> Result<FlagSpec, Control> {
     let obj = match v {
         Value::Object(o) => o.borrow().clone(),
-        other => return Err(AsError::at(
-            format!("cli.parse spec: flags entry must be an object, got {}", crate::interp::type_name(other)),
-            span,
-        ).into()),
+        other => {
+            return Err(AsError::at(
+                format!(
+                    "cli.parse spec: flags entry must be an object, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into())
+        }
     };
     let name = str_field(&obj, "name", "flag", span)?;
     if name.is_empty() {
-        return Err(AsError::at("cli.parse spec: flag entry must have a non-empty 'name'", span).into());
+        return Err(AsError::at(
+            "cli.parse spec: flag entry must have a non-empty 'name'",
+            span,
+        )
+        .into());
     }
     let short_raw = str_field(&obj, "short", "flag", span)?;
-    let short = if short_raw.is_empty() { None } else { Some(short_raw) };
+    let short = if short_raw.is_empty() {
+        None
+    } else {
+        Some(short_raw)
+    };
     let help = str_field(&obj, "help", "flag", span)?;
     Ok(FlagSpec { name, short, help })
 }
@@ -131,17 +167,31 @@ fn parse_flag_spec(v: &Value, span: Span) -> Result<FlagSpec, Control> {
 fn parse_option_spec(v: &Value, span: Span) -> Result<OptionSpec, Control> {
     let obj = match v {
         Value::Object(o) => o.borrow().clone(),
-        other => return Err(AsError::at(
-            format!("cli.parse spec: options entry must be an object, got {}", crate::interp::type_name(other)),
-            span,
-        ).into()),
+        other => {
+            return Err(AsError::at(
+                format!(
+                    "cli.parse spec: options entry must be an object, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into())
+        }
     };
     let name = str_field(&obj, "name", "option", span)?;
     if name.is_empty() {
-        return Err(AsError::at("cli.parse spec: option entry must have a non-empty 'name'", span).into());
+        return Err(AsError::at(
+            "cli.parse spec: option entry must have a non-empty 'name'",
+            span,
+        )
+        .into());
     }
     let short_raw = str_field(&obj, "short", "option", span)?;
-    let short = if short_raw.is_empty() { None } else { Some(short_raw) };
+    let short = if short_raw.is_empty() {
+        None
+    } else {
+        Some(short_raw)
+    };
     let default_raw = str_field(&obj, "default", "option", span)?;
     let default = if default_raw.is_empty() {
         // also allow explicit nil → no default
@@ -153,24 +203,43 @@ fn parse_option_spec(v: &Value, span: Span) -> Result<OptionSpec, Control> {
         Some(default_raw)
     };
     let help = str_field(&obj, "help", "option", span)?;
-    Ok(OptionSpec { name, short, default, help })
+    Ok(OptionSpec {
+        name,
+        short,
+        default,
+        help,
+    })
 }
 
 fn parse_positional_spec(v: &Value, span: Span) -> Result<PositionalSpec, Control> {
     let obj = match v {
         Value::Object(o) => o.borrow().clone(),
-        other => return Err(AsError::at(
-            format!("cli.parse spec: positionals entry must be an object, got {}", crate::interp::type_name(other)),
-            span,
-        ).into()),
+        other => {
+            return Err(AsError::at(
+                format!(
+                    "cli.parse spec: positionals entry must be an object, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into())
+        }
     };
     let name = str_field(&obj, "name", "positional", span)?;
     if name.is_empty() {
-        return Err(AsError::at("cli.parse spec: positional entry must have a non-empty 'name'", span).into());
+        return Err(AsError::at(
+            "cli.parse spec: positional entry must have a non-empty 'name'",
+            span,
+        )
+        .into());
     }
     let required = bool_field(&obj, "required", "positional", span)?;
     let help = str_field(&obj, "help", "positional", span)?;
-    Ok(PositionalSpec { name, required, help })
+    Ok(PositionalSpec {
+        name,
+        required,
+        help,
+    })
 }
 
 fn parse_array_of<T>(
@@ -186,19 +255,30 @@ fn parse_array_of<T>(
             items.iter().map(|v| parse_fn(v, span)).collect()
         }
         Some(other) => Err(AsError::at(
-            format!("cli.parse spec: '{}' must be an array, got {}", key, crate::interp::type_name(other)),
+            format!(
+                "cli.parse spec: '{}' must be an array, got {}",
+                key,
+                crate::interp::type_name(other)
+            ),
             span,
-        ).into()),
+        )
+        .into()),
     }
 }
 
 fn parse_spec(spec_val: &Value, span: Span) -> Result<CliSpec, Control> {
     let obj = match spec_val {
         Value::Object(o) => o.borrow().clone(),
-        other => return Err(AsError::at(
-            format!("cli.parse: spec must be an object, got {}", crate::interp::type_name(other)),
-            span,
-        ).into()),
+        other => {
+            return Err(AsError::at(
+                format!(
+                    "cli.parse: spec must be an object, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into())
+        }
     };
 
     let name = str_field(&obj, "name", "spec", span)?;
@@ -211,36 +291,62 @@ fn parse_spec(spec_val: &Value, span: Span) -> Result<CliSpec, Control> {
         None | Some(Value::Nil) => Vec::new(),
         Some(Value::Array(a)) => {
             let items = a.borrow().clone();
-            items.iter().map(|v| -> Result<SubcommandSpec, Control> {
-                let sub_obj = match v {
-                    Value::Object(o) => o.borrow().clone(),
-                    other => return Err(AsError::at(
-                        format!("cli.parse spec: subcommands entry must be an object, got {}", crate::interp::type_name(other)),
-                        span,
-                    ).into()),
-                };
-                let sub_name = str_field(&sub_obj, "name", "subcommand", span)?;
-                if sub_name.is_empty() {
-                    return Err(AsError::at("cli.parse spec: subcommand entry must have a non-empty 'name'", span).into());
-                }
-                let sub_flags = parse_array_of(&sub_obj, "flags", span, parse_flag_spec)?;
-                let sub_options = parse_array_of(&sub_obj, "options", span, parse_option_spec)?;
-                let sub_positionals = parse_array_of(&sub_obj, "positionals", span, parse_positional_spec)?;
-                Ok(SubcommandSpec {
-                    name: sub_name,
-                    flags: sub_flags,
-                    options: sub_options,
-                    positionals: sub_positionals,
+            items
+                .iter()
+                .map(|v| -> Result<SubcommandSpec, Control> {
+                    let sub_obj = match v {
+                        Value::Object(o) => o.borrow().clone(),
+                        other => {
+                            return Err(AsError::at(
+                                format!(
+                                    "cli.parse spec: subcommands entry must be an object, got {}",
+                                    crate::interp::type_name(other)
+                                ),
+                                span,
+                            )
+                            .into())
+                        }
+                    };
+                    let sub_name = str_field(&sub_obj, "name", "subcommand", span)?;
+                    if sub_name.is_empty() {
+                        return Err(AsError::at(
+                            "cli.parse spec: subcommand entry must have a non-empty 'name'",
+                            span,
+                        )
+                        .into());
+                    }
+                    let sub_flags = parse_array_of(&sub_obj, "flags", span, parse_flag_spec)?;
+                    let sub_options = parse_array_of(&sub_obj, "options", span, parse_option_spec)?;
+                    let sub_positionals =
+                        parse_array_of(&sub_obj, "positionals", span, parse_positional_spec)?;
+                    Ok(SubcommandSpec {
+                        name: sub_name,
+                        flags: sub_flags,
+                        options: sub_options,
+                        positionals: sub_positionals,
+                    })
                 })
-            }).collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()?
         }
-        Some(other) => return Err(AsError::at(
-            format!("cli.parse spec: 'subcommands' must be an array, got {}", crate::interp::type_name(other)),
-            span,
-        ).into()),
+        Some(other) => {
+            return Err(AsError::at(
+                format!(
+                    "cli.parse spec: 'subcommands' must be an array, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into())
+        }
     };
 
-    Ok(CliSpec { name, flags, options, positionals, subcommands })
+    Ok(CliSpec {
+        name,
+        flags,
+        options,
+        positionals,
+        subcommands,
+    })
 }
 
 // ── help text generation ──────────────────────────────────────────────────────
@@ -318,7 +424,7 @@ fn generate_help(
         out.push_str("\nArguments:\n");
         for p in positionals {
             let req = if p.required { " (required)" } else { "" };
-            out.push_str(&format!("  <{}>{}",  p.name, req));
+            out.push_str(&format!("  <{}>{}", p.name, req));
             if !p.help.is_empty() {
                 out.push_str(&format!("  {}", p.help));
             }
@@ -427,7 +533,10 @@ fn parse_args_against_spec(
             if let Some(f) = flags.iter().find(|f| f.short.as_deref() == Some(short_key)) {
                 flag_map.insert(f.name.clone(), Value::Bool(true));
                 i += 1;
-            } else if let Some(o) = options.iter().find(|o| o.short.as_deref() == Some(short_key)) {
+            } else if let Some(o) = options
+                .iter()
+                .find(|o| o.short.as_deref() == Some(short_key))
+            {
                 i += 1;
                 if i >= args.len() {
                     return Err(format!("option '-{}' requires a value", short_key));
@@ -465,7 +574,11 @@ fn parse_args_against_spec(
         ));
     }
 
-    Ok(ParseResult { flags: flag_map, options: option_map, positionals_map })
+    Ok(ParseResult {
+        flags: flag_map,
+        options: option_map,
+        positionals_map,
+    })
 }
 
 /// A pre-scan of `raw_args` that walks the token stream the same way the main
@@ -522,7 +635,10 @@ fn pre_scan(raw_args: &[String], flags: &[FlagSpec], options: &[OptionSpec]) -> 
             // Short option/flag. `-o value` consumes the next token; `-v` (flag)
             // or an unknown short consumes one.
             let short_key = &tok[1..];
-            if options.iter().any(|o| o.short.as_deref() == Some(short_key)) {
+            if options
+                .iter()
+                .any(|o| o.short.as_deref() == Some(short_key))
+            {
                 i += 2;
             } else {
                 i += 1;
@@ -535,15 +651,27 @@ fn pre_scan(raw_args: &[String], flags: &[FlagSpec], options: &[OptionSpec]) -> 
             i += 1;
         }
     }
-    PreScan { help, first_positional }
+    PreScan {
+        help,
+        first_positional,
+    }
 }
 
 /// Build an AScript Object from the ParseResult.
 fn result_to_value(pr: ParseResult, subcommand: Value, help: Value) -> Value {
     let mut map = IndexMap::new();
-    map.insert("flags".to_string(), Value::Object(Rc::new(RefCell::new(pr.flags))));
-    map.insert("options".to_string(), Value::Object(Rc::new(RefCell::new(pr.options))));
-    map.insert("positionals".to_string(), Value::Object(Rc::new(RefCell::new(pr.positionals_map))));
+    map.insert(
+        "flags".to_string(),
+        Value::Object(Rc::new(RefCell::new(pr.flags))),
+    );
+    map.insert(
+        "options".to_string(),
+        Value::Object(Rc::new(RefCell::new(pr.options))),
+    );
+    map.insert(
+        "positionals".to_string(),
+        Value::Object(Rc::new(RefCell::new(pr.positionals_map))),
+    );
     map.insert("subcommand".to_string(), subcommand);
     map.insert("help".to_string(), help);
     Value::Object(Rc::new(RefCell::new(map)))
@@ -572,23 +700,32 @@ impl Interp {
 
                 // Extract the args array (Tier-2 panic if wrong type)
                 let raw_args: Vec<String> = match &args_val {
-                    Value::Array(a) => {
-                        a.borrow()
-                         .iter()
-                         .map(|v| match v {
-                             Value::Str(s) => Ok(s.to_string()),
-                             other => Err(AsError::at(
-                                 format!("cli.parse: args must be an array of strings, got {}", crate::interp::type_name(other)),
-                                 span,
-                             ).into()),
-                         })
-                         .collect::<Result<Vec<_>, Control>>()?
-                    }
+                    Value::Array(a) => a
+                        .borrow()
+                        .iter()
+                        .map(|v| match v {
+                            Value::Str(s) => Ok(s.to_string()),
+                            other => Err(AsError::at(
+                                format!(
+                                    "cli.parse: args must be an array of strings, got {}",
+                                    crate::interp::type_name(other)
+                                ),
+                                span,
+                            )
+                            .into()),
+                        })
+                        .collect::<Result<Vec<_>, Control>>()?,
                     Value::Nil => Vec::new(),
-                    other => return Err(AsError::at(
-                        format!("cli.parse: args must be an array, got {}", crate::interp::type_name(other)),
-                        span,
-                    ).into()),
+                    other => {
+                        return Err(AsError::at(
+                            format!(
+                                "cli.parse: args must be an array, got {}",
+                                crate::interp::type_name(other)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
                 };
 
                 // One walk used for both --help detection and subcommand
@@ -608,11 +745,24 @@ impl Interp {
                     );
                     // Return a "success" result with help populated, no error
                     let pr = ParseResult {
-                        flags: spec.flags.iter().map(|f| (f.name.clone(), Value::Bool(false))).collect(),
-                        options: spec.options.iter().map(|o| (
-                            o.name.clone(),
-                            o.default.as_deref().map(|d| Value::Str(d.into())).unwrap_or(Value::Nil),
-                        )).collect(),
+                        flags: spec
+                            .flags
+                            .iter()
+                            .map(|f| (f.name.clone(), Value::Bool(false)))
+                            .collect(),
+                        options: spec
+                            .options
+                            .iter()
+                            .map(|o| {
+                                (
+                                    o.name.clone(),
+                                    o.default
+                                        .as_deref()
+                                        .map(|d| Value::Str(d.into()))
+                                        .unwrap_or(Value::Nil),
+                                )
+                            })
+                            .collect(),
                         positionals_map: IndexMap::new(),
                     };
                     let result = result_to_value(pr, Value::Nil, Value::Str(help_text.into()));
@@ -638,15 +788,24 @@ impl Interp {
                     let sub_args: Vec<String> = raw_args[sub_tok_idx + 1..].to_vec();
 
                     // Parse top-level (without positionals — the subcommand consumed that slot)
-                    let top_pr = match parse_args_against_spec(&top_args, &spec.flags, &spec.options, &[]) {
-                        Ok(pr) => pr,
-                        Err(msg) => {
-                            return Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into()))));
-                        }
-                    };
+                    let top_pr =
+                        match parse_args_against_spec(&top_args, &spec.flags, &spec.options, &[]) {
+                            Ok(pr) => pr,
+                            Err(msg) => {
+                                return Ok(make_pair(
+                                    Value::Nil,
+                                    make_error(Value::Str(msg.into())),
+                                ));
+                            }
+                        };
 
                     // Parse subcommand
-                    let sub_pr = match parse_args_against_spec(&sub_args, &sub.flags, &sub.options, &sub.positionals) {
+                    let sub_pr = match parse_args_against_spec(
+                        &sub_args,
+                        &sub.flags,
+                        &sub.options,
+                        &sub.positionals,
+                    ) {
                         Ok(pr) => pr,
                         Err(msg) => {
                             return Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into()))));
@@ -656,9 +815,18 @@ impl Interp {
                     // Build subcommand result object
                     let mut sub_map = IndexMap::new();
                     sub_map.insert("name".to_string(), Value::Str(sub_name.as_str().into()));
-                    sub_map.insert("flags".to_string(), Value::Object(Rc::new(RefCell::new(sub_pr.flags))));
-                    sub_map.insert("options".to_string(), Value::Object(Rc::new(RefCell::new(sub_pr.options))));
-                    sub_map.insert("positionals".to_string(), Value::Object(Rc::new(RefCell::new(sub_pr.positionals_map))));
+                    sub_map.insert(
+                        "flags".to_string(),
+                        Value::Object(Rc::new(RefCell::new(sub_pr.flags))),
+                    );
+                    sub_map.insert(
+                        "options".to_string(),
+                        Value::Object(Rc::new(RefCell::new(sub_pr.options))),
+                    );
+                    sub_map.insert(
+                        "positionals".to_string(),
+                        Value::Object(Rc::new(RefCell::new(sub_pr.positionals_map))),
+                    );
                     let sub_val = Value::Object(Rc::new(RefCell::new(sub_map)));
 
                     let result = result_to_value(top_pr, sub_val, Value::Nil);
@@ -666,7 +834,12 @@ impl Interp {
                 }
 
                 // Regular parse (no subcommand)
-                match parse_args_against_spec(&raw_args, &spec.flags, &spec.options, &spec.positionals) {
+                match parse_args_against_spec(
+                    &raw_args,
+                    &spec.flags,
+                    &spec.options,
+                    &spec.positionals,
+                ) {
                     Ok(pr) => {
                         let result = result_to_value(pr, Value::Nil, Value::Nil);
                         Ok(make_pair(result, Value::Nil))
@@ -796,7 +969,13 @@ mod tests {
     #[tokio::test]
     async fn flag_long_present() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![flag_spec("verbose", "v")], vec![], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![flag_spec("verbose", "v")],
+            vec![],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![s("--verbose")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result), "unexpected error: {}", pair_err(&result));
@@ -808,7 +987,13 @@ mod tests {
     #[tokio::test]
     async fn flag_short_present() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![flag_spec("verbose", "v")], vec![], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![flag_spec("verbose", "v")],
+            vec![],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![s("-v")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -819,7 +1004,13 @@ mod tests {
     #[tokio::test]
     async fn flag_absent_is_false() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![flag_spec("verbose", "v")], vec![], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![flag_spec("verbose", "v")],
+            vec![],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -830,7 +1021,13 @@ mod tests {
     #[tokio::test]
     async fn option_long_space() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![option_spec("output", "o", Some("out.txt"))], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![option_spec("output", "o", Some("out.txt"))],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![s("--output"), s("result.txt")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -841,7 +1038,13 @@ mod tests {
     #[tokio::test]
     async fn option_long_equals() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![option_spec("output", "o", Some("out.txt"))], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![option_spec("output", "o", Some("out.txt"))],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![s("--output=result.txt")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -852,7 +1055,13 @@ mod tests {
     #[tokio::test]
     async fn option_short() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![option_spec("output", "o", None)], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![option_spec("output", "o", None)],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![s("-o"), s("myfile.txt")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -863,7 +1072,13 @@ mod tests {
     #[tokio::test]
     async fn option_absent_uses_default() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![option_spec("output", "o", Some("out.txt"))], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![option_spec("output", "o", Some("out.txt"))],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -874,7 +1089,13 @@ mod tests {
     #[tokio::test]
     async fn option_absent_no_default_is_nil() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![option_spec("output", "o", None)], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![option_spec("output", "o", None)],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -885,7 +1106,13 @@ mod tests {
     #[tokio::test]
     async fn required_positional_present() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![], vec![pos_spec("input", true)], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![],
+            vec![pos_spec("input", true)],
+            vec![],
+        );
         let args = arr(vec![s("myfile.txt")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -896,12 +1123,25 @@ mod tests {
     #[tokio::test]
     async fn required_positional_missing_is_tier1_err() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![], vec![pos_spec("input", true)], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![],
+            vec![pos_spec("input", true)],
+            vec![],
+        );
         let args = arr(vec![]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
-        assert!(is_err(&result), "expected error for missing required positional");
+        assert!(
+            is_err(&result),
+            "expected error for missing required positional"
+        );
         let err_msg = get_field(&pair_err(&result), "message");
-        assert!(err_msg.to_string().contains("missing"), "err msg: {}", err_msg);
+        assert!(
+            err_msg.to_string().contains("missing"),
+            "err msg: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
@@ -925,7 +1165,11 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(!help_str.is_empty(), "help text should not be empty");
-        assert!(help_str.contains("verbose") || help_str.contains("Usage"), "help: {}", help_str);
+        assert!(
+            help_str.contains("verbose") || help_str.contains("Usage"),
+            "help: {}",
+            help_str
+        );
     }
 
     #[tokio::test]
@@ -1015,7 +1259,13 @@ mod tests {
     #[tokio::test]
     async fn no_args_no_required_positional_ok() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![], vec![pos_spec("file", false)], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![],
+            vec![pos_spec("file", false)],
+            vec![],
+        );
         let args = arr(vec![]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result));
@@ -1026,7 +1276,13 @@ mod tests {
     #[tokio::test]
     async fn too_many_positionals_is_tier1_err() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![], vec![pos_spec("file", true)], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![],
+            vec![pos_spec("file", true)],
+            vec![],
+        );
         let args = arr(vec![s("a.txt"), s("b.txt")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(is_err(&result), "expected error for too many positionals");
@@ -1035,7 +1291,13 @@ mod tests {
     #[tokio::test]
     async fn missing_option_value_is_tier1_err() {
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![option_spec("output", "o", None)], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![option_spec("output", "o", None)],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![s("--output")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(is_err(&result), "expected error for missing option value");
@@ -1045,8 +1307,13 @@ mod tests {
     async fn bad_spec_is_tier2_panic() {
         let interp = Interp::new();
         // Passing a non-object spec → Tier-2 panic (Control::Panic)
-        let result = interp.call_cli("parse", &[s("not-an-object"), arr(vec![])], sp()).await;
-        assert!(matches!(result, Err(Control::Panic(_))), "expected Tier-2 panic");
+        let result = interp
+            .call_cli("parse", &[s("not-an-object"), arr(vec![])], sp())
+            .await;
+        assert!(
+            matches!(result, Err(Control::Panic(_))),
+            "expected Tier-2 panic"
+        );
     }
 
     #[tokio::test]
@@ -1075,7 +1342,11 @@ mod tests {
         assert!(!is_err(&result), "err: {}", pair_err(&result));
         let val = pair_val(&result);
         // No subcommand dispatch.
-        assert_eq!(get_field(&val, "subcommand"), Value::Nil, "should NOT dispatch subcommand");
+        assert_eq!(
+            get_field(&val, "subcommand"),
+            Value::Nil,
+            "should NOT dispatch subcommand"
+        );
         // output is the literal "build".
         let options = get_field(&val, "options");
         assert_eq!(get_field(&options, "output"), s("build"));
@@ -1089,12 +1360,22 @@ mod tests {
         // `-- --help`: after the terminator, `--help` is a positional, NOT a
         // help request.
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![], vec![pos_spec("file", true)], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![],
+            vec![pos_spec("file", true)],
+            vec![],
+        );
         let args = arr(vec![s("--"), s("--help")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result), "err: {}", pair_err(&result));
         let val = pair_val(&result);
-        assert_eq!(get_field(&val, "help"), Value::Nil, "should NOT be help mode");
+        assert_eq!(
+            get_field(&val, "help"),
+            Value::Nil,
+            "should NOT be help mode"
+        );
         let positionals = get_field(&val, "positionals");
         assert_eq!(get_field(&positionals, "file"), s("--help"));
     }
@@ -1110,12 +1391,22 @@ mod tests {
             ("options", arr(vec![])),
             ("positionals", arr(vec![])),
         ]);
-        let spec = make_spec("mytool", vec![], vec![], vec![pos_spec("file", true)], vec![sub]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![],
+            vec![pos_spec("file", true)],
+            vec![sub],
+        );
         let args = arr(vec![s("--"), s("build")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result), "err: {}", pair_err(&result));
         let val = pair_val(&result);
-        assert_eq!(get_field(&val, "subcommand"), Value::Nil, "should NOT dispatch subcommand");
+        assert_eq!(
+            get_field(&val, "subcommand"),
+            Value::Nil,
+            "should NOT dispatch subcommand"
+        );
         let positionals = get_field(&val, "positionals");
         assert_eq!(get_field(&positionals, "file"), s("build"));
     }
@@ -1125,7 +1416,13 @@ mod tests {
         // `--opt=a=b=c`: only the first `=` splits key/value, so the value is
         // the literal `a=b=c`.
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![option_spec("opt", "o", None)], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![option_spec("opt", "o", None)],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![s("--opt=a=b=c")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result), "err: {}", pair_err(&result));
@@ -1138,7 +1435,13 @@ mod tests {
         // `-o --x`: `--x` is consumed as the *value* of `-o`, not parsed as an
         // option.
         let interp = Interp::new();
-        let spec = make_spec("mytool", vec![], vec![option_spec("opt", "o", None)], vec![], vec![]);
+        let spec = make_spec(
+            "mytool",
+            vec![],
+            vec![option_spec("opt", "o", None)],
+            vec![],
+            vec![],
+        );
         let args = arr(vec![s("-o"), s("--x")]);
         let result = interp.call_cli("parse", &[spec, args], sp()).await.unwrap();
         assert!(!is_err(&result), "err: {}", pair_err(&result));

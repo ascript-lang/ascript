@@ -131,9 +131,7 @@ impl Interp {
                 }
                 Err(e) => {
                     self.return_resource(STDIN_RESOURCE_ID, ResourceState::StdinReader(reader));
-                    return Err(
-                        AsError::at(format!("io.readLines failed: {}", e), span).into()
-                    );
+                    return Err(AsError::at(format!("io.readLines failed: {}", e), span).into());
                 }
             }
         }

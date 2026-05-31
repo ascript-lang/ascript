@@ -2556,10 +2556,7 @@ impl Interp {
                         let n = *n;
                         if n.fract() != 0.0 || !(0.0..=255.0).contains(&n) {
                             return Err(AsError::at(
-                                format!(
-                                    "exit code must be an integer in 0..=255, got {}",
-                                    n
-                                ),
+                                format!("exit code must be an integer in 0..=255, got {}", n),
                                 span,
                             )
                             .into());
@@ -2881,9 +2878,10 @@ fn control_to_aserror(c: Control, span: Span) -> AsError {
         Control::Propagate(_) => AsError::at("unexpected ? propagation in a field default", span),
         // An exit() inside a field default expression is unreachable in normal
         // usage; convert defensively rather than silently swallowing it.
-        Control::Exit(code) => {
-            AsError::at(format!("exit({}) called during field default init", code), span)
-        }
+        Control::Exit(code) => AsError::at(
+            format!("exit({}) called during field default init", code),
+            span,
+        ),
     }
 }
 

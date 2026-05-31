@@ -194,14 +194,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 format!("{}://{}", scheme, host)
             };
             match ::url::Url::parse(&base) {
-                Err(e) => {
-                    Ok(make_pair(
-                        Value::Nil,
-                        make_error(Value::Str(
-                            format!("url.build: invalid base '{}': {}", base, e).into(),
-                        )),
-                    ))
-                }
+                Err(e) => Ok(make_pair(
+                    Value::Nil,
+                    make_error(Value::Str(
+                        format!("url.build: invalid base '{}': {}", base, e).into(),
+                    )),
+                )),
                 Ok(mut u) => {
                     // Set path
                     if !path.is_empty() {

@@ -28,7 +28,11 @@ pub(crate) fn color_enabled() -> bool {
 
 /// Wrap `s` with `code` if `enabled`, otherwise return `s` as-is.
 fn wrap(enabled: bool, code: &str, s: &str) -> String {
-    if enabled { sgr(code, s) } else { s.to_string() }
+    if enabled {
+        sgr(code, s)
+    } else {
+        s.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,23 +88,23 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
         // foreground colors
-        ("black",   bi("color.black")),
-        ("red",     bi("color.red")),
-        ("green",   bi("color.green")),
-        ("yellow",  bi("color.yellow")),
-        ("blue",    bi("color.blue")),
+        ("black", bi("color.black")),
+        ("red", bi("color.red")),
+        ("green", bi("color.green")),
+        ("yellow", bi("color.yellow")),
+        ("blue", bi("color.blue")),
         ("magenta", bi("color.magenta")),
-        ("cyan",    bi("color.cyan")),
-        ("white",   bi("color.white")),
-        ("gray",    bi("color.gray")),
-        ("grey",    bi("color.grey")),
+        ("cyan", bi("color.cyan")),
+        ("white", bi("color.white")),
+        ("gray", bi("color.gray")),
+        ("grey", bi("color.grey")),
         // styles
-        ("bold",      bi("color.bold")),
-        ("dim",       bi("color.dim")),
-        ("italic",    bi("color.italic")),
+        ("bold", bi("color.bold")),
+        ("dim", bi("color.dim")),
+        ("italic", bi("color.italic")),
         ("underline", bi("color.underline")),
         // truecolor
-        ("rgb",   bi("color.rgb")),
+        ("rgb", bi("color.rgb")),
         ("bgRgb", bi("color.bgRgb")),
         // utility
         ("strip", bi("color.strip")),
@@ -200,11 +204,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let s = want_string(&arg(args, 0), span, "color.strip")?;
             strip_ansi(&s)
         }
-        _ => {
-            return Err(
-                AsError::at(format!("color.{func}: unknown function"), span).into(),
-            )
-        }
+        _ => return Err(AsError::at(format!("color.{func}: unknown function"), span).into()),
     };
     Ok(Value::Str(result.into()))
 }
@@ -272,45 +272,59 @@ mod tests {
     #[test]
     fn call_red_exact() {
         // Guard: only assert ANSI codes when color is enabled in this process.
-        if !color_enabled() { return; }
+        if !color_enabled() {
+            return;
+        }
         assert_eq!(call_ok("red", &[sv("x")]), "\x1b[31mx\x1b[0m");
     }
 
     #[test]
     fn call_green_exact() {
-        if !color_enabled() { return; }
+        if !color_enabled() {
+            return;
+        }
         assert_eq!(call_ok("green", &[sv("x")]), "\x1b[32mx\x1b[0m");
     }
 
     #[test]
     fn call_bold_exact() {
-        if !color_enabled() { return; }
+        if !color_enabled() {
+            return;
+        }
         assert_eq!(call_ok("bold", &[sv("hello")]), "\x1b[1mhello\x1b[0m");
     }
 
     #[test]
     fn call_underline_exact() {
-        if !color_enabled() { return; }
+        if !color_enabled() {
+            return;
+        }
         assert_eq!(call_ok("underline", &[sv("u")]), "\x1b[4mu\x1b[0m");
     }
 
     #[test]
     fn call_gray_grey_same() {
-        if !color_enabled() { return; }
+        if !color_enabled() {
+            return;
+        }
         assert_eq!(call_ok("gray", &[sv("g")]), call_ok("grey", &[sv("g")]));
         assert_eq!(call_ok("gray", &[sv("g")]), "\x1b[90mg\x1b[0m");
     }
 
     #[test]
     fn call_rgb_exact() {
-        if !color_enabled() { return; }
+        if !color_enabled() {
+            return;
+        }
         let args = [nv(255.0), nv(0.0), nv(0.0), sv("x")];
         assert_eq!(call_ok("rgb", &args), "\x1b[38;2;255;0;0mx\x1b[0m");
     }
 
     #[test]
     fn call_bg_rgb_exact() {
-        if !color_enabled() { return; }
+        if !color_enabled() {
+            return;
+        }
         let args = [nv(0.0), nv(128.0), nv(255.0), sv("bg")];
         assert_eq!(call_ok("bgRgb", &args), "\x1b[48;2;0;128;255mbg\x1b[0m");
     }
@@ -387,7 +401,7 @@ mod tests {
     fn no_color_disables_coloring() {
         // Use `wrap` directly with an explicit flag — fully env-independent.
         assert_eq!(wrap(false, "31", "x"), "x");
-        assert_eq!(wrap(true,  "31", "x"), "\x1b[31mx\x1b[0m");
+        assert_eq!(wrap(true, "31", "x"), "\x1b[31mx\x1b[0m");
     }
 
     #[test]

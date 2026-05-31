@@ -2,7 +2,7 @@
 
 # Data & serialization
 
-AScript ships a family of data-handling modules for the formats you reach for every day: JSON, CSV, TOML, and YAML serialization; base64/hex/URL/UTF-8 encoding; regular expressions; and UUID generation. All seven modules — `std/json`, `std/csv`, `std/toml`, `std/yaml`, `std/encoding`, `std/regex`, and `std/uuid` — are provided by the `data` Cargo feature, which is enabled by default. If you build AScript with a custom feature set, include `data` to keep these modules available.
+AScript ships a family of data-handling modules for the formats you reach for every day: JSON, CSV, TOML, and YAML serialization; base64/hex/URL/UTF-8 encoding; regular expressions; UUID generation; and URL manipulation. All eight modules — `std/json`, `std/csv`, `std/toml`, `std/yaml`, `std/encoding`, `std/regex`, `std/uuid`, and `std/url` — are provided by the `data` Cargo feature, which is enabled by default. If you build AScript with a custom feature set, include `data` to keep these modules available.
 
 > [!TIER1] Fallible functions return a two-element `[value, err]` pair — `err` is `nil` on success. Destructure: `let [v, e] = json.parse(s)`.
 
@@ -477,4 +477,116 @@ Generates a time-ordered (version 7) UUID based on the current timestamp.
 ```ascript
 let id = uuid.v7()
 // id == "018f9b4e-3a7c-7c1d-9f2a-1b2c3d4e5f60"  (time-ordered, 36 chars)
+```
+
+## std/url
+
+RFC-3986 URL parsing, building, and query-string helpers. Backed by the `url` crate (same engine used internally by the HTTP client). All functions are pure and synchronous.
+
+> [!TIER1] `url.parse`, `url.build`, and `url.decode` return `[value, err]` pairs. `url.parseQuery`, `url.buildQuery`, and `url.encode` are infallible and return a value directly.
+
+### url.parse
+
+Parses a URL string into a component object.
+
+- **s** `string` — the URL to parse.
+- **Returns** `[obj, err]`. On success, `obj` has the fields below; absent components are `nil`.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `scheme` | `string` | `"https"`, `"http"`, … |
+| `host` | `string \| nil` | host name or IP |
+| `port` | `number \| nil` | explicit port; `nil` when the port matches the scheme default |
+| `path` | `string` | always present; `"/"` for the root |
+| `query` | `string \| nil` | raw query string (not decoded) |
+| `fragment` | `string \| nil` | fragment identifier (without `#`) |
+| `username` | `string \| nil` | |
+| `password` | `string \| nil` | |
+
+```ascript
+import * as url from "std/url"
+let [u, err] = url.parse("https://api.example.com:8080/v1?key=abc#top")
+// u.scheme == "https", u.host == "api.example.com", u.port == 8080
+// u.path == "/v1", u.query == "key=abc", u.fragment == "top"
+```
+
+### url.parseQuery
+
+Parses an `application/x-www-form-urlencoded` query string into an object. Values are percent-decoded. When a key appears more than once, the last value wins.
+
+- **s** `string` — the query string (without the leading `?`).
+- **Returns** `object`.
+
+```ascript
+import * as url from "std/url"
+let q = url.parseQuery("name=Ada+Lovelace&page=2")
+// q.name == "Ada Lovelace", q.page == "2"
+```
+
+### url.buildQuery
+
+Serializes an object into an `application/x-www-form-urlencoded` query string. Spaces are encoded as `+` (standard for form encoding, not `%20`). Keys are emitted in insertion order.
+
+- **obj** `object` — keys and values (string, number, bool, or nil).
+- **Returns** `string`.
+
+```ascript
+import * as url from "std/url"
+let qs = url.buildQuery({ q: "hello world", page: "1" })
+// qs == "q=hello+world&page=1"
+```
+
+#### Round-trip example
+
+```ascript
+import * as url from "std/url"
+let params = { search: "a b", filter: "active" }
+let qs = url.buildQuery(params)
+let back = url.parseQuery(qs)
+// back.search == "a b", back.filter == "active"
+```
+
+### url.build
+
+Assembles a URL string from a component object (same shape as `url.parse` output).
+
+- **obj** `object` — must contain at least `scheme`. All other fields are optional.
+- **Returns** `[string, err]` — the assembled URL, or an error if the components are invalid.
+
+```ascript
+import * as url from "std/url"
+let [u, err] = url.build({
+  scheme: "https",
+  host: "example.com",
+  port: 9090,
+  path: "/api",
+  query: "v=2",
+})
+// u == "https://example.com:9090/api?v=2"
+```
+
+### url.encode
+
+Percent-encodes a single URL component. All non-alphanumeric characters are escaped (same output as `encoding.urlEncode`).
+
+- **s** `string` — the text to encode.
+- **Returns** `string`.
+
+```ascript
+import * as url from "std/url"
+let s = url.encode("a b&c")
+// s == "a%20b%26c"
+```
+
+### url.decode
+
+Percent-decodes a URL component.
+
+- **s** `string` — the percent-encoded text.
+- **Returns** `[string, err]` — the decoded string, or `[nil, err]` if the result is not valid UTF-8.
+
+```ascript
+import * as url from "std/url"
+let [s, err] = url.decode("a%20b%26c")
+// s == "a b&c", err == nil
 ```

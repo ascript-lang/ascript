@@ -66,8 +66,9 @@ json, crypto, …) need no `await`.
 | Page | Modules |
 |---|---|
 | [Core & collections](collections) | `string` · `array` · `object` · `map` · `math` · `convert` · `bytes` |
-| [Data & serialization](data) | `json` · `csv` · `toml` · `yaml` · `encoding` · `regex` · `uuid` |
-| [System & files](system) | `fs` · `env` · `process` · `crypto` · `compress` · `sqlite` |
+| [Data & serialization](data) | `json` · `csv` · `toml` · `yaml` · `encoding` · `regex` · `uuid` · `url` |
+| [System & files](system) | `fs` · `env` · `io` · `process` · `crypto` · `compress` · `sqlite` |
+| [CLI & terminal](cli) | `cli` · `color` |
 | [Time & locale](time) | `time` · `date` · `intl` |
 | [Networking & HTTP](net) | `net/tcp` · `net/http` · `http/server` · `net/ws` |
 | [Logging](log) | `log` |
@@ -77,4 +78,4 @@ json, crypto, …) need no `await`.
 
 Every module is behind a Cargo feature, all enabled by `default`. A build with
 `--no-default-features` exposes only the gateless core (`string`, `array`, `object`, `map`, `math`,
-`convert`, `time`). See [Getting started](../getting-started#feature-flags) for the full mapping.
+`convert`, `time`, `cli`, `color`). See [Getting started](../getting-started#feature-flags) for the full mapping.

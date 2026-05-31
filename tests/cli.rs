@@ -663,8 +663,7 @@ fn exit_during_test_run_is_a_clear_failure_not_fake_pass() {
 #[test]
 fn exit_out_of_range_panics() {
     // exit(300) is out of 0..=255 — must be a Tier-2 panic → exit code 1 from the diagnostic path.
-    let path =
-        std::env::temp_dir().join(format!("ascript_exit_oor_{}.as", std::process::id()));
+    let path = std::env::temp_dir().join(format!("ascript_exit_oor_{}.as", std::process::id()));
     std::fs::write(&path, "exit(300)\n").unwrap();
     let bin = env!("CARGO_BIN_EXE_ascript");
     let out = Command::new(bin).arg("run").arg(&path).output().unwrap();
@@ -692,7 +691,11 @@ fn io_readline_returns_first_line() {
     use std::process::Stdio;
     let bin = env!("CARGO_BIN_EXE_ascript");
     let file = std::env::temp_dir().join(format!("ascript_io_rl_{}.as", std::process::id()));
-    std::fs::write(&file, "import * as io from \"std/io\"\nprint(await io.readLine())\n").unwrap();
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nprint(await io.readLine())\n",
+    )
+    .unwrap();
     let mut child = Command::new(bin)
         .arg("run")
         .arg(&file)
@@ -701,7 +704,12 @@ fn io_readline_returns_first_line() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"hello\nworld\n").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello\nworld\n")
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     let _ = std::fs::remove_file(&file);
     assert!(
@@ -732,7 +740,12 @@ fn io_readline_multiple_calls_buffers_correctly() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"hello\nworld\n").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello\nworld\n")
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     let _ = std::fs::remove_file(&file);
     assert!(
@@ -750,7 +763,11 @@ fn io_readall_returns_full_stdin() {
     use std::process::Stdio;
     let bin = env!("CARGO_BIN_EXE_ascript");
     let file = std::env::temp_dir().join(format!("ascript_io_ra_{}.as", std::process::id()));
-    std::fs::write(&file, "import * as io from \"std/io\"\nprint(await io.readAll())\n").unwrap();
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nprint(await io.readAll())\n",
+    )
+    .unwrap();
     let mut child = Command::new(bin)
         .arg("run")
         .arg(&file)
@@ -815,7 +832,11 @@ fn io_readline_eof_returns_nil() {
     use std::process::Stdio;
     let bin = env!("CARGO_BIN_EXE_ascript");
     let file = std::env::temp_dir().join(format!("ascript_io_eof_{}.as", std::process::id()));
-    std::fs::write(&file, "import * as io from \"std/io\"\nprint(await io.readLine())\n").unwrap();
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nprint(await io.readLine())\n",
+    )
+    .unwrap();
     // No stdin written — immediate EOF
     let mut child = Command::new(bin)
         .arg("run")
@@ -857,7 +878,12 @@ fn io_readlines_returns_all_lines() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"alpha\nbeta\ngamma\n").unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"alpha\nbeta\ngamma\n")
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     let _ = std::fs::remove_file(&file);
     assert!(
@@ -900,11 +926,7 @@ fn env_args_no_args_returns_empty_array() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let file = std::env::temp_dir().join("ascript_env_args_empty.as");
     std::fs::write(&file, "import { args } from \"std/env\"\nprint(args())\n").unwrap();
-    let out = Command::new(bin)
-        .arg("run")
-        .arg(&file)
-        .output()
-        .unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
     let _ = std::fs::remove_file(&file);
     assert!(out.status.success(), "process failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
