@@ -63,6 +63,9 @@ pub enum Type {
     Named(String),
     Map(Box<Type>, Box<Type>),
     Future(Box<Type>),
+    /// `T?` — nullable type, sugar for `T | nil`. Both `T?` and the class-field
+    /// marker `name?:` lower to this node.
+    Optional(Box<Type>),
 }
 
 /// A function parameter: a name with an optional type annotation.
@@ -101,6 +104,7 @@ impl std::fmt::Display for Type {
             Type::Named(n) => write!(f, "{}", n),
             Type::Map(k, v) => write!(f, "map<{}, {}>", k, v),
             Type::Future(t) => write!(f, "future<{}>", t),
+            Type::Optional(t) => write!(f, "{}?", t),
         }
     }
 }
