@@ -170,6 +170,14 @@ pub(crate) enum ResourceState {
     // Boxed to keep the `ResourceState` enum compact (the two buffers are sizeable).
     #[cfg(feature = "tui")]
     Terminal(Box<crate::stdlib::tui::TerminalState>),
+    // std/io: a lazily-created buffered reader over process stdin. Stored so that
+    // multiple `io.readLine()` calls share ONE BufReader and buffered bytes are
+    // not lost between calls. Boxed to keep the enum compact (BufReader is sizeable).
+    // Created on first `readLine`/`readAll`/`readLines` call; a fixed id
+    // (STDIN_RESOURCE_ID = 0xFFFF_FFFF_FFFF_FFFE) is used so the reader is found
+    // across calls without scanning the table.
+    #[cfg(feature = "sys")]
+    StdinReader(Box<tokio::io::BufReader<tokio::io::Stdin>>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -268,6 +276,12 @@ pub struct Interp {
 /// after spawning so the executor can reap finished/cancelled tasks. Keeps a
 /// no-await loop of un-awaited async calls bounded instead of growing to N.
 const INFLIGHT_YIELD_CAP: u64 = 256;
+
+/// Fixed resource-table id for the lazily-created stdin `BufReader` (std/io).
+/// Uses a sentinel near `u64::MAX` so it never collides with auto-incrementing ids
+/// (which start at 0 and count up). The `sys` gate matches the StdinReader variant.
+#[cfg(feature = "sys")]
+pub(crate) const STDIN_RESOURCE_ID: u64 = 0xFFFF_FFFF_FFFF_FFFE;
 
 /// Decrements `Interp::inflight` when dropped. Created at spawn time and moved
 /// into the spawned task so the count tracks the task's real lifetime — it

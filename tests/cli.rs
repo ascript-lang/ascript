@@ -683,6 +683,191 @@ fn exit_out_of_range_panics() {
     );
 }
 
+// ---- std/io stdin tests ----
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readline_returns_first_line() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_rl_{}.as", std::process::id()));
+    std::fs::write(&file, "import * as io from \"std/io\"\nprint(await io.readLine())\n").unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"hello\nworld\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readline_multiple_calls_buffers_correctly() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_rl2_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nprint(await io.readLine())\nprint(await io.readLine())\n",
+    )
+    .unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"hello\nworld\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\nworld\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readall_returns_full_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_ra_{}.as", std::process::id()));
+    std::fs::write(&file, "import * as io from \"std/io\"\nprint(await io.readAll())\n").unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"abc").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "abc\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readall_is_utf8_lossy_on_invalid_bytes() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_lossy_{}.as", std::process::id()));
+    // readAll must NOT error on invalid UTF-8; it returns a string (with the
+    // U+FFFD replacement char for the bad byte).
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nlet s = await io.readAll()\nprint(type(s))\nprint(len(s) > 0)\n",
+    )
+    .unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // 0xff is an invalid lone byte; followed by valid "hi".
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&[0xff, b'h', b'i'])
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "readAll must not error on invalid UTF-8; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "string\ntrue\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readline_eof_returns_nil() {
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_eof_{}.as", std::process::id()));
+    std::fs::write(&file, "import * as io from \"std/io\"\nprint(await io.readLine())\n").unwrap();
+    // No stdin written — immediate EOF
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Drop stdin immediately to signal EOF
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nil\n");
+}
+
+#[test]
+#[cfg(feature = "sys")]
+fn io_readlines_returns_all_lines() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_io_rls_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "import * as io from \"std/io\"\nlet lines = await io.readLines()\nfor (l in lines) { print(l) }\n",
+    )
+    .unwrap();
+    let mut child = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"alpha\nbeta\ngamma\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "alpha\nbeta\ngamma\n");
+}
+
 // ---- env.args() tests ----
 
 #[test]
