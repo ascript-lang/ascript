@@ -25,6 +25,15 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("some", bi("array.some")),
         ("every", bi("array.every")),
         ("indexOf", bi("array.indexOf")),
+        ("flat", bi("array.flat")),
+        ("flatMap", bi("array.flatMap")),
+        ("reverse", bi("array.reverse")),
+        ("concat", bi("array.concat")),
+        ("first", bi("array.first")),
+        ("last", bi("array.last")),
+        ("unique", bi("array.unique")),
+        ("take", bi("array.take")),
+        ("drop", bi("array.drop")),
     ]
 }
 
@@ -192,7 +201,96 @@ impl Interp {
                 let idx = a.borrow().iter().position(|x| *x == needle);
                 Ok(Value::Number(idx.map(|i| i as f64).unwrap_or(-1.0)))
             }
+            "flat" => {
+                let a = want_array(&arg(args, 0), span, &ctx("flat"))?;
+                let depth = match args.get(1) {
+                    None | Some(Value::Nil) => 1usize,
+                    Some(v) => {
+                        let d = want_number(v, span, &ctx("flat"))?;
+                        if d < 0.0 || d.fract() != 0.0 {
+                            return Err(AsError::at("array.flat depth must be a non-negative integer", span).into());
+                        }
+                        d as usize
+                    }
+                };
+                let mut out = Vec::new();
+                flatten_into(&a.borrow(), depth, &mut out);
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
+            "flatMap" => {
+                let a = want_array(&arg(args, 0), span, &ctx("flatMap"))?;
+                let f = arg(args, 1);
+                let items = a.borrow().clone();
+                let mut out = Vec::new();
+                for item in items.into_iter() {
+                    let mapped = self.call_value(f.clone(), vec![item], span).await?;
+                    match mapped {
+                        Value::Array(inner) => out.extend(inner.borrow().iter().cloned()),
+                        other => out.push(other),
+                    }
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
+            "reverse" => {
+                let a = want_array(&arg(args, 0), span, &ctx("reverse"))?;
+                let mut items = a.borrow().clone();
+                items.reverse();
+                Ok(Value::Array(Rc::new(RefCell::new(items))))
+            }
+            "concat" => {
+                let a = want_array(&arg(args, 0), span, &ctx("concat"))?;
+                let mut out = a.borrow().clone();
+                for (i, extra) in args.iter().enumerate().skip(1) {
+                    let more = want_array(extra, span, &format!("array.concat arg {}", i))?;
+                    out.extend(more.borrow().iter().cloned());
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
+            "first" => {
+                let a = want_array(&arg(args, 0), span, &ctx("first"))?;
+                let val = a.borrow().first().cloned().unwrap_or(Value::Nil);
+                Ok(val)
+            }
+            "last" => {
+                let a = want_array(&arg(args, 0), span, &ctx("last"))?;
+                let val = a.borrow().last().cloned().unwrap_or(Value::Nil);
+                Ok(val)
+            }
+            "unique" => {
+                let a = want_array(&arg(args, 0), span, &ctx("unique"))?;
+                let mut out: Vec<Value> = Vec::new();
+                for item in a.borrow().iter() {
+                    if !out.contains(item) {
+                        out.push(item.clone());
+                    }
+                }
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
+            "take" => {
+                let a = want_array(&arg(args, 0), span, &ctx("take"))?;
+                let nf = want_number(&arg(args, 1), span, &ctx("take"))?;
+                let k = if nf < 0.0 { 0 } else { (nf as usize).min(a.borrow().len()) };
+                let out = a.borrow()[..k].to_vec();
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
+            "drop" => {
+                let a = want_array(&arg(args, 0), span, &ctx("drop"))?;
+                let nf = want_number(&arg(args, 1), span, &ctx("drop"))?;
+                let k = if nf < 0.0 { 0 } else { (nf as usize).min(a.borrow().len()) };
+                let out = a.borrow()[k..].to_vec();
+                Ok(Value::Array(Rc::new(RefCell::new(out))))
+            }
             _ => Err(AsError::at(format!("std/array has no function '{}'", func), span).into()),
+        }
+    }
+}
+
+/// Flatten `items` to `depth` levels into `out`.
+fn flatten_into(items: &[Value], depth: usize, out: &mut Vec<Value>) {
+    for item in items {
+        match item {
+            Value::Array(inner) if depth > 0 => flatten_into(&inner.borrow(), depth - 1, out),
+            other => out.push(other.clone()),
         }
     }
 }
@@ -297,5 +395,22 @@ mod tests {
         let a = arr(vec![n(1.0), n(2.0), n(3.0)]);
         assert_eq!(interp.call_array("indexOf", &[a.clone(), n(2.0)], sp()).await.unwrap(), n(1.0));
         assert_eq!(interp.call_array("indexOf", &[a.clone(), n(9.0)], sp()).await.unwrap(), n(-1.0));
+    }
+
+    #[tokio::test]
+    async fn array_structural() {
+        let interp = Interp::new();
+        let a = arr(vec![n(1.0), n(2.0), n(2.0), n(3.0)]);
+        assert_eq!(interp.call_array("reverse", &[a.clone()], sp()).await.unwrap().to_string(), "[3, 2, 2, 1]");
+        assert_eq!(interp.call_array("unique", &[a.clone()], sp()).await.unwrap().to_string(), "[1, 2, 3]");
+        assert_eq!(interp.call_array("first", &[a.clone()], sp()).await.unwrap(), n(1.0));
+        assert_eq!(interp.call_array("last", &[a.clone()], sp()).await.unwrap(), n(3.0));
+        assert_eq!(interp.call_array("first", &[arr(vec![])], sp()).await.unwrap(), Value::Nil);
+        assert_eq!(interp.call_array("take", &[a.clone(), n(2.0)], sp()).await.unwrap().to_string(), "[1, 2]");
+        assert_eq!(interp.call_array("drop", &[a.clone(), n(2.0)], sp()).await.unwrap().to_string(), "[2, 3]");
+        let nested = arr(vec![arr(vec![n(1.0)]), arr(vec![n(2.0), n(3.0)])]);
+        assert_eq!(interp.call_array("flat", &[nested.clone()], sp()).await.unwrap().to_string(), "[1, 2, 3]");
+        let b = arr(vec![n(4.0)]);
+        assert_eq!(interp.call_array("concat", &[arr(vec![n(1.0)]), b], sp()).await.unwrap().to_string(), "[1, 4]");
     }
 }
