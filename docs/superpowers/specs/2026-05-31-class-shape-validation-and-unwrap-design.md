@@ -120,12 +120,16 @@ type          := … | type "?"                       // nullable suffix, any ty
 field_decl    := Ident "?"? ":" type ("=" expression)?
 ```
 
-- **Canonical form (formatter output): `name: Type?`.** The `name?: T` alias is
-  normalized *to* `name: T?` on format, so `?` always sits in one place (on the type)
-  across fields, bindings, params, and returns. Because both spellings lower to the same
-  `Type::Optional` node, they are indistinguishable after parse — which is what lets the
-  formatter pick one. (An explicitly written `T | nil` union is *not* rewritten to `T?`;
-  the formatter preserves authorial intent and only normalizes the two `?` spellings.)
+- **Both spellings run identically.** The parser accepts `name?: T` and `name: T?`
+  equally and lowers both to the same `Type::Optional` node, so they are the same program
+  to the interpreter, LSP, and tree-sitter. Neither requires the formatter to be valid or
+  to run — writing `name?: T` and never formatting changes nothing about execution.
+- **Canonical form (formatter output only): `name: Type?`.** The formatter is a separate,
+  optional, *cosmetic* tool (`ascript fmt`); it is never in the `ascript run` path and
+  never changes semantics. When run, it rewrites the `name?: T` alias *to* `name: T?` so
+  `?` always sits in one place across fields, bindings, params, and returns. (An
+  explicitly written `T | nil` union is *not* rewritten to `T?`; the formatter preserves
+  authorial intent and only normalizes the two `?` spellings.)
 - A default expression also makes a field optional regardless of `?` (it is evaluated
   lazily — see §3.3).
 - `?` in **type position** (nullable suffix) never overlaps `?` in **expression
