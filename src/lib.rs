@@ -28,7 +28,10 @@ use std::rc::Rc;
 /// on, any tasks it spawns) lives on the current-thread runtime. After the root
 /// future completes we drive the LocalSet to drain spawned tasks — a no-op today.
 pub async fn run_file(path: &Path) -> Result<String, AsError> {
-    let interp = Rc::new(Interp::new());
+    // CLI `run` streams `print` output live to stdout (so it appears immediately
+    // and survives a later panic). `output()` is empty under `Live`, so the
+    // returned string is empty on success — the caller does not re-print it.
+    let interp = Rc::new(Interp::new_live());
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(interp.load_module(path)).await;
