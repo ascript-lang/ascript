@@ -409,6 +409,7 @@ module.exports = grammar({
     ),
     union_type: $ => prec.left(seq($._type_atom, repeat1(seq('|', $._type_atom)))),
     _type_atom: $ => choice(
+      $.optional_type,
       $.primitive_type,
       $.array_type,
       $.map_type,
@@ -425,6 +426,14 @@ module.exports = grammar({
     result_type: $ => seq('Result', '<', $._type, '>'),
     future_type: $ => seq('future', '<', $._type, '>'),
     tuple_type: $ => seq('[', commaSep1($._type), optional(','), ']'),
+    // T? — nullable suffix (sugar for `T | nil`). Reachable only inside `_type`.
+    optional_type: $ => prec(PREC.postfix, seq(
+      choice(
+        $.primitive_type, $.array_type, $.map_type, $.result_type,
+        $.future_type, $.tuple_type, $.identifier,
+      ),
+      '?',
+    )),
 
     // ----- Literals (§2) ---------------------------------------------------
     identifier: _ => /[A-Za-z_][A-Za-z0-9_]*/,

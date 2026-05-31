@@ -237,6 +237,10 @@
           "named": true
         },
         {
+          "type": "optional_type",
+          "named": true
+        },
+        {
           "type": "primitive_type",
           "named": true
         },
@@ -1165,6 +1169,10 @@
             "named": true
           },
           {
+            "type": "optional_type",
+            "named": true
+          },
+          {
             "type": "primitive_type",
             "named": true
           },
@@ -1738,6 +1746,10 @@
             "named": true
           },
           {
+            "type": "optional_type",
+            "named": true
+          },
+          {
             "type": "primitive_type",
             "named": true
           },
@@ -1779,6 +1791,10 @@
         },
         {
           "type": "map_type",
+          "named": true
+        },
+        {
+          "type": "optional_type",
           "named": true
         },
         {
@@ -2176,6 +2192,10 @@
             "named": true
           },
           {
+            "type": "optional_type",
+            "named": true
+          },
+          {
             "type": "primitive_type",
             "named": true
           },
@@ -2311,6 +2331,10 @@
         },
         {
           "type": "map_type",
+          "named": true
+        },
+        {
+          "type": "optional_type",
           "named": true
         },
         {
@@ -2729,6 +2753,10 @@
             "named": true
           },
           {
+            "type": "optional_type",
+            "named": true
+          },
+          {
             "type": "primitive_type",
             "named": true
           },
@@ -2961,6 +2989,45 @@
     }
   },
   {
+    "type": "optional_type",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "array_type",
+          "named": true
+        },
+        {
+          "type": "future_type",
+          "named": true
+        },
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "map_type",
+          "named": true
+        },
+        {
+          "type": "primitive_type",
+          "named": true
+        },
+        {
+          "type": "result_type",
+          "named": true
+        },
+        {
+          "type": "tuple_type",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "or_pattern",
     "named": true,
     "fields": {},
@@ -3067,6 +3134,10 @@
           },
           {
             "type": "map_type",
+            "named": true
+          },
+          {
+            "type": "optional_type",
             "named": true
           },
           {
@@ -3298,6 +3369,10 @@
         },
         {
           "type": "map_type",
+          "named": true
+        },
+        {
+          "type": "optional_type",
           "named": true
         },
         {
@@ -3926,6 +4001,10 @@
           "named": true
         },
         {
+          "type": "optional_type",
+          "named": true
+        },
+        {
           "type": "primitive_type",
           "named": true
         },
@@ -4080,6 +4159,10 @@
         },
         {
           "type": "map_type",
+          "named": true
+        },
+        {
+          "type": "optional_type",
           "named": true
         },
         {

@@ -2672,6 +2672,10 @@
       "members": [
         {
           "type": "SYMBOL",
+          "name": "optional_type"
+        },
+        {
+          "type": "SYMBOL",
           "name": "primitive_type"
         },
         {
@@ -2878,6 +2882,52 @@
           "value": "]"
         }
       ]
+    },
+    "optional_type": {
+      "type": "PREC",
+      "value": 13,
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "primitive_type"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "array_type"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "map_type"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "result_type"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "future_type"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "tuple_type"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "identifier"
+              }
+            ]
+          },
+          {
+            "type": "STRING",
+            "value": "?"
+          }
+        ]
+      }
     },
     "identifier": {
       "type": "PATTERN",
