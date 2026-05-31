@@ -190,9 +190,10 @@ pub enum Stmt {
         name_spans: Vec<Span>,
     },
     /// `let {a, b as local} = expr` — object destructuring (binds by key name).
-    /// `rest` is the optional `...name` collector (later phase); `None` for now.
     LetDestructureObject {
         bindings: Vec<ObjBinding>,
+        /// Optional trailing `...name` rest collector — gathers the leftover keys
+        /// (those not named by `bindings`) into a new object.
         rest: Option<(String, Span)>,
         value: Expr,
         mutable: bool,
