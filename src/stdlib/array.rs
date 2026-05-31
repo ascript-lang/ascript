@@ -20,6 +20,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("sort", bi("array.sort")),
         ("contains", bi("array.contains")),
         ("get", bi("array.get")),
+        ("find", bi("array.find")),
+        ("findIndex", bi("array.findIndex")),
+        ("some", bi("array.some")),
+        ("every", bi("array.every")),
+        ("indexOf", bi("array.indexOf")),
     ]
 }
 
@@ -137,6 +142,56 @@ impl Interp {
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(items))))
             }
+            "find" => {
+                let a = want_array(&arg(args, 0), span, &ctx("find"))?;
+                let f = arg(args, 1);
+                let items = a.borrow().clone();
+                for item in items.into_iter() {
+                    if self.call_value(f.clone(), vec![item.clone()], span).await?.is_truthy() {
+                        return Ok(item);
+                    }
+                }
+                Ok(Value::Nil)
+            }
+            "findIndex" => {
+                let a = want_array(&arg(args, 0), span, &ctx("findIndex"))?;
+                let f = arg(args, 1);
+                let items = a.borrow().clone();
+                for (i, item) in items.into_iter().enumerate() {
+                    if self.call_value(f.clone(), vec![item], span).await?.is_truthy() {
+                        return Ok(Value::Number(i as f64));
+                    }
+                }
+                Ok(Value::Number(-1.0))
+            }
+            "some" => {
+                let a = want_array(&arg(args, 0), span, &ctx("some"))?;
+                let f = arg(args, 1);
+                let items = a.borrow().clone();
+                for item in items.into_iter() {
+                    if self.call_value(f.clone(), vec![item], span).await?.is_truthy() {
+                        return Ok(Value::Bool(true));
+                    }
+                }
+                Ok(Value::Bool(false))
+            }
+            "every" => {
+                let a = want_array(&arg(args, 0), span, &ctx("every"))?;
+                let f = arg(args, 1);
+                let items = a.borrow().clone();
+                for item in items.into_iter() {
+                    if !self.call_value(f.clone(), vec![item], span).await?.is_truthy() {
+                        return Ok(Value::Bool(false));
+                    }
+                }
+                Ok(Value::Bool(true))
+            }
+            "indexOf" => {
+                let a = want_array(&arg(args, 0), span, &ctx("indexOf"))?;
+                let needle = arg(args, 1);
+                let idx = a.borrow().iter().position(|x| *x == needle);
+                Ok(Value::Number(idx.map(|i| i as f64).unwrap_or(-1.0)))
+            }
             _ => Err(AsError::at(format!("std/array has no function '{}'", func), span).into()),
         }
     }
@@ -234,5 +289,13 @@ mod tests {
         let interp = Interp::new();
         assert!(matches!(interp.call_array("push", &[n(1.0), n(2.0)], sp()).await, Err(Control::Panic(_))));
         assert!(matches!(interp.call_array("nope", &[arr(vec![])], sp()).await, Err(Control::Panic(_))));
+    }
+
+    #[tokio::test]
+    async fn array_predicates_and_indexof() {
+        let interp = Interp::new();
+        let a = arr(vec![n(1.0), n(2.0), n(3.0)]);
+        assert_eq!(interp.call_array("indexOf", &[a.clone(), n(2.0)], sp()).await.unwrap(), n(1.0));
+        assert_eq!(interp.call_array("indexOf", &[a.clone(), n(9.0)], sp()).await.unwrap(), n(-1.0));
     }
 }
