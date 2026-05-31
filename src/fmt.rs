@@ -6,8 +6,8 @@
 //! re-parses to an equivalent program, and `format(format(x)) == format(x)`.
 
 use crate::ast::{
-    ArrowBody, BinOp, EnumVariantDecl, Expr, ExprKind, ImportNames, MatchArm, MethodDecl, Param,
-    Stmt, TemplatePart, Type, UnOp,
+    ArrowBody, BinOp, EnumVariantDecl, Expr, ExprKind, FieldDecl, ImportNames, MatchArm,
+    MethodDecl, Param, Stmt, TemplatePart, Type, UnOp,
 };
 use crate::error::AsError;
 
@@ -200,7 +200,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("}\n");
         }
-        Stmt::Class { name, superclass, methods, .. } => {
+        Stmt::Class { name, superclass, fields, methods, .. } => {
             indent(out, level);
             out.push_str("class ");
             out.push_str(name);
@@ -209,6 +209,9 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
                 out.push_str(sup);
             }
             out.push_str(" {\n");
+            for fd in fields {
+                write_field(out, fd, level + 1);
+            }
             for m in methods {
                 write_method(out, m, level + 1);
             }
@@ -254,6 +257,18 @@ fn write_enum_variant(out: &mut String, v: &EnumVariantDecl, level: usize) {
         write_expr(out, value, 0);
     }
     out.push_str(",\n");
+}
+
+fn write_field(out: &mut String, fd: &FieldDecl, level: usize) {
+    indent(out, level);
+    out.push_str(&fd.name);
+    out.push_str(": ");
+    out.push_str(&render_type(&fd.ty)); // Type::Optional renders as `T?` (canonical)
+    if let Some(def) = &fd.default {
+        out.push_str(" = ");
+        write_expr(out, def, PREC_ASSIGN);
+    }
+    out.push('\n');
 }
 
 fn write_method(out: &mut String, m: &MethodDecl, level: usize) {
@@ -687,6 +702,17 @@ mod tests {
             assert_eq!(once, twice, "fmt not idempotent for: {src}");
             assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
         }
+    }
+
+    #[test]
+    fn class_fields_format_canonically() {
+        // `name?: T` normalizes to `name: T?`; fields print before methods.
+        let src = "class U {\n  id: number\n  nick?: string\n  role: string = \"guest\"\n  fn init() {}\n}\n";
+        let want = "class U {\n  id: number\n  nick: string?\n  role: string = \"guest\"\n  fn init() {\n  }\n}\n";
+        assert_eq!(format_source(src).unwrap(), want);
+        // idempotent
+        let once = format_source(src).unwrap();
+        assert_eq!(format_source(&once).unwrap(), once);
     }
 
     #[test]
