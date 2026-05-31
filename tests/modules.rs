@@ -63,6 +63,31 @@ fn circular_import_resolves_partial() {
 }
 
 #[test]
+fn from_resolves_inherited_default_in_base_module_scope() {
+    // A base class declares a defaulted field whose default references a
+    // module-scoped binding visible only in the base module. A subclass in
+    // another module inherits the field; `Sub.from({...})` must resolve that
+    // default in the *declaring* (base) class's def env — matching `Sub(...)`.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let d = temp_dir("from_inherited_default_scope");
+    fs::write(
+        d.join("base.as"),
+        "const BASE_ROLE = \"admin\"\nexport class Base {\n  id: number\n  role: string = BASE_ROLE\n}",
+    )
+    .unwrap();
+    fs::write(
+        d.join("main.as"),
+        "import { Base } from \"./base\"\nclass Sub extends Base {\n  name: string\n}\n\
+         let s = Sub.from({ id: 1, name: \"x\" })\nprint(s.role)\nprint(s.id)\nprint(s.name)",
+    )
+    .unwrap();
+    let out = std::process::Command::new(bin).arg("run").arg(d.join("main.as")).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    // BASE_ROLE is not in scope in main.as; the default must still resolve to it.
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "admin\n1\nx\n");
+}
+
+#[test]
 fn exports_destructured_names() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let d = temp_dir("destructure_export");

@@ -1610,7 +1610,7 @@ impl Interp {
         let schema = crate::value::merged_field_schema(class);
 
         let mut inst_fields = indexmap::IndexMap::new();
-        for (fname, (fs, _def_class)) in &schema {
+        for (fname, (fs, def_class)) in &schema {
             let field_path = if path.is_empty() {
                 format!("{}.{}", class.name.to_lowercase(), fname)
             } else {
@@ -1620,13 +1620,20 @@ impl Interp {
             let mut val = raw.unwrap_or(Value::Nil);
             if val == Value::Nil {
                 if let Some(def) = &fs.default {
+                    // Resolve the default in the DECLARING class's def env (the
+                    // scope where the field was written), consistent with
+                    // `construct`. Using the leaf class's env would diverge for an
+                    // inherited field whose default references a module-scoped name
+                    // visible only in the base class's module.
                     val = self
-                        .eval_expr(def, &class.def_env)
+                        .eval_expr(def, &def_class.def_env)
                         .await
                         .map_err(|c| control_to_aserror(c, span))?;
                 }
             }
-            val = self.coerce_field(&fs.ty, val, &class.def_env, strict, &field_path, span).await?;
+            // Same scoping principle for the field's declared type: a nested class
+            // name resolves in the env of the class that declared the field.
+            val = self.coerce_field(&fs.ty, val, &def_class.def_env, strict, &field_path, span).await?;
             if !check_type(&val, &fs.ty) {
                 return Err(AsError::at(
                     format!("type contract violated at {}: expected {}, got {}", field_path, fs.ty, type_name(&val)),
