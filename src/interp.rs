@@ -1022,15 +1022,7 @@ impl Interp {
                 } else {
                     // Promote the Tier-1 error to a Tier-2 panic, preserving the
                     // original error's message so `recover` round-trips it.
-                    let msg = match &err {
-                        Value::Object(o) => match o.borrow().get("message") {
-                            Some(Value::Str(s)) => s.to_string(),
-                            _ => err.to_string(),
-                        },
-                        Value::Str(s) => s.to_string(),
-                        _ => err.to_string(),
-                    };
-                    Err(AsError::at(msg, expr.span).into())
+                    Err(AsError::at(error_message(&err), expr.span).into())
                 }
             }
             ExprKind::OptMember { .. }
@@ -1371,14 +1363,7 @@ impl Interp {
                     };
                     if err != Value::Nil {
                         // Surface a stream error as a Tier-2 panic at the loop site.
-                        let msg = match &err {
-                            Value::Object(o) => o
-                                .borrow()
-                                .get("message")
-                                .map(|m| m.to_string())
-                                .unwrap_or_else(|| err.to_string()),
-                            other => other.to_string(),
-                        };
+                        let msg = error_message(&err);
                         return Err(AsError::at(format!("for await stream error: {}", msg), span).into());
                     }
                     if value == Value::Nil {
@@ -1834,6 +1819,20 @@ fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> 
 }
 
 /// Human-readable type name for diagnostics.
+/// Human-readable message for a Tier-1 error value. If `err` is an Object with a
+/// `message` field, that field's value is rendered; otherwise the whole value is.
+/// Single source of truth shared by `expr!` (Unwrap) and `for await` error paths.
+fn error_message(err: &Value) -> String {
+    match err {
+        Value::Object(o) => o
+            .borrow()
+            .get("message")
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| err.to_string()),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Nil => "nil",
@@ -2661,14 +2660,6 @@ print(r[1])
         }
     }
 
-    async fn run_to_output(src: &str) -> String {
-        let stmts = parse(&lex(src).unwrap()).unwrap();
-        let interp = Interp::new();
-        let env = global_env();
-        interp.exec(&stmts, &env).await.unwrap();
-        interp.output().to_string()
-    }
-
     #[tokio::test]
     async fn unwrap_returns_value_on_ok_pair() {
         assert_eq!(eval_to_value("[42, nil]!").await, Value::Number(42.0));
@@ -2679,14 +2670,14 @@ print(r[1])
     async fn unwrap_panics_on_err_pair_preserving_message() {
         // `!` on an error pair panics; recover round-trips the original message.
         let src = "let r = recover(() => Err(\"boom\")!)\nprint(r[1].message)";
-        let out = run_to_output(src).await;
+        let out = run(src).await;
         assert!(out.contains("boom"), "got: {out}");
     }
 
     #[tokio::test]
     async fn unwrap_on_non_pair_is_a_panic() {
         let src = "let r = recover(() => 5!)\nprint(r[1] != nil)";
-        let out = run_to_output(src).await;
+        let out = run(src).await;
         assert!(out.contains("true"), "got: {out}");
     }
 

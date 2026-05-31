@@ -29,6 +29,7 @@ const PREC = {
   add: 9,
   mul: 10,
   exp: 11,    // right-associative
+  // (12 intentionally free: postfix ?/! are precedence-less, GLR-resolved)
   unary: 13,
   postfix: 14, // call, member, index, optional-member
   primary: 15,
