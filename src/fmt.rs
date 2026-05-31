@@ -588,7 +588,7 @@ fn object_key(k: &str) -> String {
     if is_ident {
         k.to_string()
     } else {
-        format!("\"{}\"", k)
+        format!("\"{}\"", escape_str_lit(k))
     }
 }
 
@@ -753,6 +753,14 @@ mod tests {
     fn formats_array_destructuring() {
         let out = format_source("let [a, b] = pair").unwrap();
         assert_eq!(out, "let [a, b] = pair\n");
+    }
+
+    #[test]
+    fn fmt_object_destructuring_escapes_quotes_in_key() {
+        // A non-identifier object key containing a `"` must be emitted with the
+        // quote escaped so the formatted output re-lexes to the same key.
+        let src = "let {\"a\\\"b\" as x} = obj\n";
+        assert_eq!(format_source(src).unwrap(), src);
     }
 
     #[test]
