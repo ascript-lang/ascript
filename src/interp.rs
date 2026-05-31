@@ -802,7 +802,7 @@ impl Interp {
                 .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span).into()),
             ExprKind::Assign { target, value } => {
                 let v = self.eval_expr(value, env).await?;
-                self.assign_to(target, v, env).await
+                self.assign_to(target, v, value.span, env).await
             }
             ExprKind::Unary { op, expr: operand } => {
                 let v = self.eval_expr(operand, env).await?;
@@ -1527,7 +1527,7 @@ impl Interp {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
         }));
-        let inst_val = Value::Instance(instance);
+        let inst_val = Value::Instance(instance.clone());
         // Pre-populate declared-field defaults (base-class first so a subclass
         // default overrides). `init` may then override; .from (Task 4) handles
         // its own defaults. Defaults eval lazily in the class def env.
@@ -1541,13 +1541,13 @@ impl Interp {
             for c in chain.into_iter().rev() {
                 for (fname, schema) in &c.fields {
                     if let Some(def) = &schema.default {
+                        // Eval into a local first (never hold the instance borrow
+                        // across `.await`).
                         let dv = self.eval_expr(def, &c.def_env).await?;
                         if !check_type(&dv, &schema.ty) {
                             return Err(contract_panic(&schema.ty, &dv, span));
                         }
-                        if let Value::Instance(i) = &inst_val {
-                            i.borrow_mut().fields.insert(fname.clone(), dv);
-                        }
+                        instance.borrow_mut().fields.insert(fname.clone(), dv);
                     }
                 }
             }
@@ -1760,7 +1760,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    async fn assign_to(&self, target: &Expr, value: Value, env: &Environment) -> Result<Value, Control> {
+    async fn assign_to(&self, target: &Expr, value: Value, value_span: Span, env: &Environment) -> Result<Value, Control> {
         match &target.kind {
             ExprKind::Ident(name) => match env.assign(name, value.clone()) {
                 Ok(()) => Ok(value),
@@ -1813,7 +1813,7 @@ impl Interp {
                         let class = inst.borrow().class.clone();
                         if let Some(schema) = lookup_field_schema(&class, name) {
                             if !check_type(&value, &schema.ty) {
-                                return Err(contract_panic(&schema.ty, &value, object.span));
+                                return Err(contract_panic(&schema.ty, &value, value_span));
                             }
                         }
                         inst.borrow_mut().fields.insert(name.clone(), value.clone());
@@ -2622,6 +2622,27 @@ print(bad[1].message)
                    let c = C()\nprint(c.x)";
         let out = run(src).await;
         assert!(out.contains("now a string"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn inherited_field_type_checked_on_assignment() {
+        // A field declared on the BASE class is type-checked when assigned from
+        // a subclass instance (locks in lookup_field_schema's superclass walk).
+        let src = "class A { id: number\n fn init() {} }\n\
+                   class B extends A { fn init() { self.id = \"bad\" } }\n\
+                   let r = recover(() => B())\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("type contract violated"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn declared_field_default_type_checked_at_construction() {
+        // A default whose value violates the declared type is a recoverable panic.
+        let src = "class C { n: number = \"oops\"\n fn init() {} }\n\
+                   let r = recover(() => C())\nprint(r[1] != nil)\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("true"), "expected an err pair, got: {out}");
+        assert!(out.contains("type contract violated"), "got: {out}");
     }
 
     #[tokio::test]
