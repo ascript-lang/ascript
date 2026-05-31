@@ -21,6 +21,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("unset", bi("env.unset")),
         ("vars", bi("env.vars")),
         ("loadDotenv", bi("env.loadDotenv")),
+        // args() is routed through the Interp (needs cli_args access), but the
+        // binding must appear here so `import { args } from "std/env"` resolves.
+        ("args", bi("env.args")),
     ]
 }
 

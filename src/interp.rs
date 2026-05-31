@@ -257,6 +257,11 @@ pub struct Interp {
     /// std/log capture buffer (used under `OutputSink::Capture`, i.e. tests).
     #[cfg(feature = "log")]
     log_capture: RefCell<String>,
+    /// The script's own CLI arguments (`ascript run file.as <args...>`).
+    /// Excludes the binary name and the script path — only the trailing args.
+    /// Empty unless set by [`Interp::set_cli_args`] (i.e. the REPL and test
+    /// runner always see `[]`, which is correct).
+    cli_args: RefCell<Vec<Rc<str>>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -319,7 +324,27 @@ impl Interp {
             log_format: Cell::new(LogFormat::Human),
             #[cfg(feature = "log")]
             log_capture: RefCell::new(String::new()),
+            cli_args: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Store the script's trailing CLI arguments so `env.args()` can return them.
+    /// Called by `run_file` after construction, before execution.
+    pub fn set_cli_args(&self, args: &[String]) {
+        *self.cli_args.borrow_mut() = args.iter().map(|s| Rc::from(s.as_str())).collect();
+    }
+
+    /// Return the stored CLI args as a `Value::Array` of strings.
+    /// Only called from the `sys`-gated `env.args` dispatch.
+    #[cfg(feature = "sys")]
+    pub(crate) fn get_cli_args(&self) -> Value {
+        let args: Vec<Value> = self
+            .cli_args
+            .borrow()
+            .iter()
+            .map(|s| Value::Str(s.clone()))
+            .collect();
+        Value::Array(Rc::new(RefCell::new(args)))
     }
 
     /// Register one newly-spawned async task: bump `inflight` (and the high-water

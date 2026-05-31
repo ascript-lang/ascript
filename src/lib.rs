@@ -30,11 +30,16 @@ use std::rc::Rc;
 /// The program runs inside a `tokio::task::LocalSet` so it (and, from M17 Phase 2
 /// on, any tasks it spawns) lives on the current-thread runtime. After the root
 /// future completes we drive the LocalSet to drain spawned tasks — a no-op today.
-pub async fn run_file(path: &Path) -> Result<i32, AsError> {
+///
+/// `script_args` are the trailing command-line arguments after the file path
+/// (only the script's own args — NOT the binary name or the file path).
+/// Pass `&[]` if the caller provides no trailing args.
+pub async fn run_file(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
     // CLI `run` streams `print` output live to stdout (so it appears immediately
     // and survives a later panic). Under `Live` there is no captured string, so
     // the success contract is `()` — the caller does not re-print anything.
     let interp = Rc::new(Interp::new_live());
+    interp.set_cli_args(script_args);
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(interp.load_module(path)).await;

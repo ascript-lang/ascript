@@ -189,7 +189,14 @@ impl Interp {
             #[cfg(feature = "compress")]
             "compress" => compress::call(func, args, span),
             #[cfg(feature = "sys")]
-            "env" => env::call(func, args, span),
+            "env" => {
+                // `args()` must see the interpreter's stored CLI args, so it is
+                // handled here before the pure `env::call` fallthrough.
+                if func == "args" {
+                    return Ok(self.get_cli_args());
+                }
+                env::call(func, args, span)
+            }
             #[cfg(feature = "sys")]
             "fs" => fs::call(func, args, span),
             #[cfg(feature = "sys")]

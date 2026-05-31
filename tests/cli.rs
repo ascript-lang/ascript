@@ -682,3 +682,49 @@ fn exit_out_of_range_panics() {
         "expected 0..=255 in error; stderr: {stderr}"
     );
 }
+
+// ---- env.args() tests ----
+
+#[test]
+#[cfg(feature = "sys")] // `std/env` is sys-gated; the binary lacks it under --no-default-features.
+fn env_args_returns_script_args() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_env_args_test.as");
+    std::fs::write(&file, "import { args } from \"std/env\"\nprint(args())\n").unwrap();
+    let out = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .arg("a")
+        .arg("b")
+        .arg("--x")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "process failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // AScript array Display quotes strings: ["a", "b", "--x"]
+    assert!(
+        stdout.contains("[\"a\", \"b\", \"--x\"]"),
+        "expected [\"a\", \"b\", \"--x\"] in stdout; got: {stdout}"
+    );
+}
+
+#[test]
+#[cfg(feature = "sys")] // `std/env` is sys-gated; the binary lacks it under --no-default-features.
+fn env_args_no_args_returns_empty_array() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_env_args_empty.as");
+    std::fs::write(&file, "import { args } from \"std/env\"\nprint(args())\n").unwrap();
+    let out = Command::new(bin)
+        .arg("run")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "process failed: {:?}", out);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[]"),
+        "expected [] in stdout; got: {stdout}"
+    );
+}
