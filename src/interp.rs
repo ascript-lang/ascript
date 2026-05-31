@@ -2481,6 +2481,12 @@ print(y)
     }
 
     #[tokio::test]
+    async fn object_rest_destructuring_excludes_source_keys() {
+        let out = run("let {a, b as local, ...rest} = {a: 1, b: 2, c: 3, d: 4}\nprint(a)\nprint(local)\nprint(rest)").await;
+        assert_eq!(out, "1\n2\n{c: 3, d: 4}\n");
+    }
+
+    #[tokio::test]
     async fn native_handle_fields_and_methods() {
         let interp = Interp::new();
         let mut fields = indexmap::IndexMap::new();

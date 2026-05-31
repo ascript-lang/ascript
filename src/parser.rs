@@ -618,9 +618,20 @@ impl<'a> Parser<'a> {
         if *self.peek() == Tok::LBrace {
             self.advance(); // consume '{'
             let mut bindings = Vec::new();
-            let rest: Option<(String, Span)> = None; // populated in a later phase
+            let mut rest: Option<(String, Span)> = None;
             if *self.peek() != Tok::RBrace {
                 loop {
+                    if *self.peek() == Tok::DotDotDot {
+                        self.advance();
+                        let rspan = self.span();
+                        let rname = match self.advance() {
+                            Tok::Ident(n) => n,
+                            other => return Err(AsError::at(format!("expected a name after '...', found {:?}", other), self.tokens[self.pos - 1].span)),
+                        };
+                        rest = Some((rname, rspan));
+                        if *self.peek() == Tok::Comma { return Err(AsError::at("a rest element must be last", rspan)); }
+                        break;
+                    }
                     let key_span = self.span();
                     let key = match self.advance() {
                         Tok::Ident(n) => n,

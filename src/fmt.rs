@@ -896,6 +896,12 @@ mod tests {
     }
 
     #[test]
+    fn object_rest_destructuring_round_trips() {
+        let src = "let {a, ...rest} = obj\n";
+        assert_eq!(format_source(src).unwrap(), src);
+    }
+
+    #[test]
     fn rest_param_round_trips() {
         let src = "fn f(a, ...rest) {\n  return rest\n}\n";
         assert_eq!(format_source(src).unwrap(), src);
