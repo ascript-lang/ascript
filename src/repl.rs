@@ -15,9 +15,41 @@ use std::rc::Rc;
 
 use crate::ast::Stmt;
 use crate::env::Environment;
-use crate::error::SourceInfo;
+use crate::error::{AsError, SourceInfo};
 use crate::interp::{Control, Interp};
+use crate::token::Tok;
 use crate::value::Value;
+
+/// Should the REPL buffer more lines? True only for unclosed delimiters or an
+/// unterminated string/template at EOF — NOT for genuine mid-line syntax errors.
+/// Counts delimiter TOKENS so `${...}` template braces never skew the depth.
+fn is_incomplete(src: &str) -> bool {
+    match crate::lexer::lex(src) {
+        Ok(tokens) => {
+            let mut depth: i32 = 0;
+            for t in &tokens {
+                match t.tok {
+                    Tok::LBrace | Tok::LParen | Tok::LBracket => depth += 1,
+                    Tok::RBrace | Tok::RParen | Tok::RBracket => depth -= 1,
+                    _ => {}
+                }
+            }
+            depth > 0
+        }
+        Err(e) => is_unterminated_at_eof(&e, src),
+    }
+}
+
+/// Distinguish an unterminated string/template at EOF (→ keep buffering) from a
+/// genuine bad-character lex error (→ report now). The lexer raises
+/// `"unterminated string"` / `"unterminated template string"` only when the
+/// scan runs off the end of input, so the message is a precise EOF signal.
+/// Deliberately conservative: any other lex error returns false (report rather
+/// than hang). Note: an unterminated *block comment* is intentionally NOT
+/// treated as incomplete here (spec: string/template at EOF only).
+fn is_unterminated_at_eof(e: &AsError, _src: &str) -> bool {
+    e.message == "unterminated string" || e.message == "unterminated template string"
+}
 
 /// Run the interactive REPL until EOF (Ctrl-D) or Ctrl-C.
 ///
@@ -139,5 +171,25 @@ fn flush_output(interp: &Interp) {
     if !interp.output_is_empty() {
         print!("{}", interp.output());
         interp.clear_output();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_incomplete;
+
+    #[test]
+    fn detects_incomplete_input() {
+        assert!(is_incomplete("class P {"));
+        assert!(is_incomplete("fn f() {"));
+        assert!(is_incomplete("let o = {"));
+        assert!(is_incomplete("let a = [1,"));
+        assert!(is_incomplete("print("));
+        assert!(!is_incomplete("let x = 1"));
+        assert!(!is_incomplete("class P { x: number }"));
+        assert!(!is_incomplete("print(1 + 2)"));
+        assert!(!is_incomplete("}")); // too many closers → not incomplete (real error)
+        assert!(is_incomplete("let s = `hello")); // unterminated template → incomplete
+        assert!(!is_incomplete("let s = `a ${x} b`")); // complete template w/ braces → balanced
     }
 }
