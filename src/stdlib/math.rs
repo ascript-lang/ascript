@@ -1,6 +1,6 @@
 //! `std/math` — numeric functions and constants.
 
-use super::{arg, bi, want_number};
+use super::{arg, bi, want_array, want_number};
 use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
@@ -37,6 +37,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("hypot", bi("math.hypot")),
         ("gcd", bi("math.gcd")),
         ("lcm", bi("math.lcm")),
+        ("sum", bi("math.sum")),
+        ("mean", bi("math.mean")),
+        ("median", bi("math.median")),
+        ("variance", bi("math.variance")),
+        ("stddev", bi("math.stddev")),
     ]
 }
 
@@ -57,6 +62,16 @@ fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
         a = t;
     }
     a
+}
+
+/// Collect an array argument into a Vec<f64>, panicking on non-number elements.
+fn want_number_vec(v: &Value, span: Span, ctx: &str) -> Result<Vec<f64>, Control> {
+    let a = want_array(v, span, ctx)?;
+    let mut out = Vec::with_capacity(a.borrow().len());
+    for el in a.borrow().iter() {
+        out.push(want_number(el, span, ctx)?);
+    }
+    Ok(out)
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -151,6 +166,42 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             };
             Ok(Value::Number(r as f64))
         }
+        "sum" => {
+            let xs = want_number_vec(&arg(args, 0), span, &ctx("sum"))?;
+            Ok(Value::Number(xs.iter().sum()))
+        }
+        "mean" => {
+            let xs = want_number_vec(&arg(args, 0), span, &ctx("mean"))?;
+            if xs.is_empty() {
+                return Err(AsError::at("math.mean of empty array", span).into());
+            }
+            Ok(Value::Number(xs.iter().sum::<f64>() / xs.len() as f64))
+        }
+        "median" => {
+            let mut xs = want_number_vec(&arg(args, 0), span, &ctx("median"))?;
+            if xs.is_empty() {
+                return Err(AsError::at("math.median of empty array", span).into());
+            }
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let m = xs.len() / 2;
+            let med = if xs.len() % 2 == 1 { xs[m] } else { (xs[m - 1] + xs[m]) / 2.0 };
+            Ok(Value::Number(med))
+        }
+        "variance" | "stddev" => {
+            let xs = want_number_vec(&arg(args, 0), span, &ctx(func))?;
+            let sample = matches!(args.get(1), Some(v) if v.is_truthy());
+            if xs.is_empty() {
+                return Err(AsError::at(format!("math.{} of empty array", func), span).into());
+            }
+            if sample && xs.len() < 2 {
+                return Err(AsError::at(format!("math.{} (sample) requires at least 2 values", func), span).into());
+            }
+            let mean = xs.iter().sum::<f64>() / xs.len() as f64;
+            let ss: f64 = xs.iter().map(|x| (x - mean).powi(2)).sum();
+            let denom = if sample { xs.len() as f64 - 1.0 } else { xs.len() as f64 };
+            let var = ss / denom;
+            Ok(Value::Number(if func == "stddev" { var.sqrt() } else { var }))
+        }
         _ => Err(AsError::at(format!("std/math has no function '{}'", func), span).into()),
     }
 }
@@ -237,6 +288,27 @@ mod tests {
         let sp = Span::new(0, 0);
         assert!(matches!(call("min", &[], sp), Err(Control::Panic(_))));
         assert!(matches!(call("max", &[], sp), Err(Control::Panic(_))));
+    }
+
+    #[test]
+    fn math_stats() {
+        let a = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![n(1.0), n(2.0), n(3.0), n(4.0)])));
+        assert_eq!(call("sum", std::slice::from_ref(&a), sp()).unwrap(), n(10.0));
+        assert_eq!(call("mean", std::slice::from_ref(&a), sp()).unwrap(), n(2.5));
+        assert_eq!(call("median", std::slice::from_ref(&a), sp()).unwrap(), n(2.5));
+        assert_eq!(call("variance", std::slice::from_ref(&a), sp()).unwrap(), n(1.25));
+        let sv = call("variance", &[a.clone(), Value::Bool(true)], sp()).unwrap();
+        assert!(matches!(sv, Value::Number(x) if (x - 5.0/3.0).abs() < 1e-12));
+        // stddev returns sqrt(population variance)
+        assert!(matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Number(x) if (x - 1.25f64.sqrt()).abs() < 1e-12));
+        let empty = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![])));
+        assert_eq!(call("sum", std::slice::from_ref(&empty), sp()).unwrap(), n(0.0));
+        assert!(matches!(call("mean", std::slice::from_ref(&empty), sp()), Err(Control::Panic(_))));
+        // median of empty array panics
+        assert!(matches!(call("median", std::slice::from_ref(&empty), sp()), Err(Control::Panic(_))));
+        // sample variance needs >= 2 elements
+        let one = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![n(5.0)])));
+        assert!(matches!(call("variance", &[one, Value::Bool(true)], sp()), Err(Control::Panic(_))));
     }
 
     #[test]
