@@ -23,6 +23,14 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("padStart", bi("string.padStart")),
         ("padEnd", bi("string.padEnd")),
         ("repeat", bi("string.repeat")),
+        ("startsWith", bi("string.startsWith")),
+        ("endsWith", bi("string.endsWith")),
+        ("contains", bi("string.contains")),
+        ("chars", bi("string.chars")),
+        ("lines", bi("string.lines")),
+        ("reverse", bi("string.reverse")),
+        ("count", bi("string.count")),
+        ("splitN", bi("string.splitN")),
     ]
 }
 
@@ -114,6 +122,52 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 return Err(AsError::at("string.repeat count must be non-negative", span).into());
             }
             Ok(str_val(s.repeat(n as usize)))
+        }
+        "startsWith" => {
+            let s = want_string(&arg(args, 0), span, &ctx("startsWith"))?;
+            let p = want_string(&arg(args, 1), span, &ctx("startsWith"))?;
+            Ok(Value::Bool(s.starts_with(p.as_ref())))
+        }
+        "endsWith" => {
+            let s = want_string(&arg(args, 0), span, &ctx("endsWith"))?;
+            let p = want_string(&arg(args, 1), span, &ctx("endsWith"))?;
+            Ok(Value::Bool(s.ends_with(p.as_ref())))
+        }
+        "contains" => {
+            let s = want_string(&arg(args, 0), span, &ctx("contains"))?;
+            let sub = want_string(&arg(args, 1), span, &ctx("contains"))?;
+            Ok(Value::Bool(s.contains(sub.as_ref())))
+        }
+        "chars" => {
+            let s = want_string(&arg(args, 0), span, &ctx("chars"))?;
+            let out: Vec<Value> = s.chars().map(|c| Value::Str(c.to_string().into())).collect();
+            Ok(Value::Array(Rc::new(RefCell::new(out))))
+        }
+        "lines" => {
+            let s = want_string(&arg(args, 0), span, &ctx("lines"))?;
+            let out: Vec<Value> = s.lines().map(|l| Value::Str(l.into())).collect();
+            Ok(Value::Array(Rc::new(RefCell::new(out))))
+        }
+        "reverse" => {
+            let s = want_string(&arg(args, 0), span, &ctx("reverse"))?;
+            Ok(Value::Str(s.chars().rev().collect::<String>().into()))
+        }
+        "count" => {
+            let s = want_string(&arg(args, 0), span, &ctx("count"))?;
+            let sub = want_string(&arg(args, 1), span, &ctx("count"))?;
+            let n = if sub.is_empty() { 0 } else { s.matches(sub.as_ref()).count() };
+            Ok(Value::Number(n as f64))
+        }
+        "splitN" => {
+            let s = want_string(&arg(args, 0), span, &ctx("splitN"))?;
+            let sep = want_string(&arg(args, 1), span, &ctx("splitN"))?;
+            let n_raw = want_number(&arg(args, 2), span, &ctx("splitN"))?;
+            if n_raw < 1.0 {
+                return Err(AsError::at("string.splitN requires n >= 1", span).into());
+            }
+            let n = n_raw as usize;
+            let out: Vec<Value> = s.splitn(n, sep.as_ref()).map(|p| Value::Str(p.into())).collect();
+            Ok(Value::Array(Rc::new(RefCell::new(out))))
         }
         _ => Err(AsError::at(format!("std/string has no function '{}'", func), span).into()),
     }
@@ -211,5 +265,23 @@ mod tests {
     fn misuse_panics() {
         assert!(matches!(call("split", &[Value::Number(1.0), s(",")], sp()), Err(Control::Panic(_))));
         assert!(matches!(call("format", &[s("{}")], sp()), Err(Control::Panic(_))));
+    }
+
+    #[test]
+    fn string_completeness() {
+        assert_eq!(call("startsWith", &[s("hello"), s("he")], sp()).unwrap(), Value::Bool(true));
+        assert_eq!(call("startsWith", &[s("hello"), s("xy")], sp()).unwrap(), Value::Bool(false));
+        assert_eq!(call("endsWith", &[s("hello"), s("lo")], sp()).unwrap(), Value::Bool(true));
+        assert_eq!(call("contains", &[s("hello"), s("ell")], sp()).unwrap(), Value::Bool(true));
+        assert_eq!(call("contains", &[s("hello"), s("")], sp()).unwrap(), Value::Bool(true));
+        assert_eq!(call("contains", &[s("hello"), s("zzz")], sp()).unwrap(), Value::Bool(false));
+        assert_eq!(call("chars", &[s("ab")], sp()).unwrap().to_string(), "[\"a\", \"b\"]");
+        assert_eq!(call("lines", &[s("a\nb\n")], sp()).unwrap().to_string(), "[\"a\", \"b\"]");
+        assert_eq!(call("reverse", &[s("abc")], sp()).unwrap(), s("cba"));
+        assert_eq!(call("count", &[s("a.a.a"), s(".")], sp()).unwrap(), Value::Number(2.0));
+        assert_eq!(call("count", &[s("abc"), s("")], sp()).unwrap(), Value::Number(0.0));
+        assert_eq!(call("splitN", &[s("a:b:c"), s(":"), Value::Number(2.0)], sp()).unwrap().to_string(), "[\"a\", \"b:c\"]");
+        assert_eq!(call("splitN", &[s("a:b:c"), s(":"), Value::Number(1.0)], sp()).unwrap().to_string(), "[\"a:b:c\"]");
+        assert!(matches!(call("splitN", &[s("a:b"), s(":"), Value::Number(0.0)], sp()), Err(Control::Panic(_))));
     }
 }
