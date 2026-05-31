@@ -717,7 +717,7 @@ impl Interp {
                 env.define(name, def, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Class { name, superclass, methods, .. } => {
+            Stmt::Class { name, superclass, fields, methods, .. } => {
                 let parent = match superclass {
                     Some(sup_name) => match env.get(sup_name) {
                         Some(Value::Class(c)) => Some(c),
@@ -726,6 +726,13 @@ impl Interp {
                     },
                     None => None,
                 };
+                let mut field_map = indexmap::IndexMap::new();
+                for fd in fields {
+                    field_map.insert(
+                        fd.name.clone(),
+                        crate::value::FieldSchema { ty: fd.ty.clone(), default: fd.default.clone() },
+                    );
+                }
                 let mut method_map = indexmap::IndexMap::new();
                 for m in methods {
                     method_map.insert(m.name.clone(), std::rc::Rc::new(crate::value::Method {
@@ -738,6 +745,7 @@ impl Interp {
                 let class = Value::Class(std::rc::Rc::new(crate::value::Class {
                     name: name.clone(),
                     superclass: parent,
+                    fields: field_map,
                     methods: method_map,
                     def_env: env.clone(),
                 }));
@@ -794,7 +802,7 @@ impl Interp {
                 .ok_or_else(|| AsError::at(format!("undefined variable '{}'", name), expr.span).into()),
             ExprKind::Assign { target, value } => {
                 let v = self.eval_expr(value, env).await?;
-                self.assign_to(target, v, env).await
+                self.assign_to(target, v, value.span, env).await
             }
             ExprKind::Unary { op, expr: operand } => {
                 let v = self.eval_expr(operand, env).await?;
@@ -1001,6 +1009,30 @@ impl Interp {
                     Err(Control::Propagate(make_pair(Value::Nil, err)))
                 }
             }
+            ExprKind::Unwrap(inner) => {
+                let v = self.eval_expr(inner, env).await?;
+                let arr = match &v {
+                    Value::Array(a) if a.borrow().len() == 2 => a.clone(),
+                    _ => {
+                        return Err(AsError::at(
+                            "the ! operator requires a Result pair [value, err]",
+                            expr.span,
+                        )
+                        .into())
+                    }
+                };
+                let (value, err) = {
+                    let b = arr.borrow();
+                    (b[0].clone(), b[1].clone())
+                };
+                if err == Value::Nil {
+                    Ok(value)
+                } else {
+                    // Promote the Tier-1 error to a Tier-2 panic, preserving the
+                    // original error's message so `recover` round-trips it.
+                    Err(AsError::at(error_message(&err), expr.span).into())
+                }
+            }
             ExprKind::OptMember { .. }
             | ExprKind::Member { .. }
             | ExprKind::Index { .. }
@@ -1151,6 +1183,13 @@ impl Interp {
                     span,
                 )),
             },
+            Value::Class(c) => match name {
+                "from" => Ok(Value::ClassMethod(c.clone(), "from")),
+                other => Err(AsError::at(
+                    format!("class {} has no static member '{}'", c.name, other),
+                    span,
+                )),
+            },
             Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
             _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
@@ -1168,6 +1207,18 @@ impl Interp {
             Value::GeneratorMethod(g, method) => {
                 self.call_generator_method(&g, method, args, span).await
             }
+            Value::ClassMethod(c, "from") => {
+                let obj = args.first().cloned().unwrap_or(Value::Nil);
+                let strict = matches!(args.get(1), Some(Value::Bool(true)));
+                self.validate_into(&c, &obj, strict, "", span)
+                    .await
+                    .map_err(Control::from)
+            }
+            Value::ClassMethod(c, other) => Err(AsError::at(
+                format!("class {} has no static member '{}'", c.name, other),
+                span,
+            )
+            .into()),
             _ => Err(AsError::at("value is not callable", span).into()),
         }
     }
@@ -1339,14 +1390,7 @@ impl Interp {
                     };
                     if err != Value::Nil {
                         // Surface a stream error as a Tier-2 panic at the loop site.
-                        let msg = match &err {
-                            Value::Object(o) => o
-                                .borrow()
-                                .get("message")
-                                .map(|m| m.to_string())
-                                .unwrap_or_else(|| err.to_string()),
-                            other => other.to_string(),
-                        };
+                        let msg = error_message(&err);
                         return Err(AsError::at(format!("for await stream error: {}", msg), span).into());
                     }
                     if value == Value::Nil {
@@ -1502,7 +1546,22 @@ impl Interp {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
         }));
-        let inst_val = Value::Instance(instance);
+        let inst_val = Value::Instance(instance.clone());
+        // Pre-populate declared-field defaults (merged base-class first so a
+        // subclass default overrides). `init` may then override; `.from` (Task 4)
+        // handles its own defaults. Each default evals lazily in the def env of
+        // the class that declared it.
+        for (fname, (schema, def_class)) in crate::value::merged_field_schema(&class) {
+            if let Some(def) = &schema.default {
+                // Eval into a local first (never hold the instance borrow across
+                // `.await`).
+                let dv = self.eval_expr(def, &def_class.def_env).await?;
+                if !check_type(&dv, &schema.ty) {
+                    return Err(contract_panic(&schema.ty, &dv, span));
+                }
+                instance.borrow_mut().fields.insert(fname.clone(), dv);
+            }
+        }
         match crate::value::find_method(&class, "init") {
             Some((method, def_class)) => {
                 let bm = crate::value::BoundMethod {
@@ -1524,6 +1583,157 @@ impl Interp {
             }
         }
         Ok(inst_val)
+    }
+
+    /// Validate a raw object against a class's declared fields, producing a
+    /// checked instance. Recurses into nested class / array<Class> / map<K,Class>
+    /// fields. Does NOT run `init`. Non-panicking: returns Err on mismatch.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn validate_into(
+        &self,
+        class: &std::rc::Rc<crate::value::Class>,
+        obj: &Value,
+        strict: bool,
+        path: &str,
+        span: Span,
+    ) -> Result<Value, AsError> {
+        let map = match obj {
+            Value::Object(m) => m.clone(),
+            _ => {
+                return Err(AsError::at(
+                    format!("{} expects an object, got {}", field_owner_label(path, &class.name), type_name(obj)),
+                    span,
+                ))
+            }
+        };
+        // Declared fields merged base-class first (subclass overrides on clash).
+        let schema = crate::value::merged_field_schema(class);
+
+        let mut inst_fields = indexmap::IndexMap::new();
+        for (fname, (fs, def_class)) in &schema {
+            let field_path = if path.is_empty() {
+                format!("{}.{}", class.name.to_lowercase(), fname)
+            } else {
+                format!("{}.{}", path, fname)
+            };
+            let raw = map.borrow().get(fname).cloned();
+            let mut val = raw.unwrap_or(Value::Nil);
+            if val == Value::Nil {
+                if let Some(def) = &fs.default {
+                    // Resolve the default in the DECLARING class's def env (the
+                    // scope where the field was written), consistent with
+                    // `construct`. Using the leaf class's env would diverge for an
+                    // inherited field whose default references a module-scoped name
+                    // visible only in the base class's module.
+                    val = self
+                        .eval_expr(def, &def_class.def_env)
+                        .await
+                        .map_err(|c| control_to_aserror(c, span))?;
+                }
+            }
+            // Same scoping principle for the field's declared type: a nested class
+            // name resolves in the env of the class that declared the field.
+            val = self.coerce_field(&fs.ty, val, &def_class.def_env, strict, &field_path, span).await?;
+            if !check_type(&val, &fs.ty) {
+                return Err(AsError::at(
+                    format!("type contract violated at {}: expected {}, got {}", field_path, fs.ty, type_name(&val)),
+                    span,
+                ));
+            }
+            inst_fields.insert(fname.clone(), val);
+        }
+
+        if strict {
+            for k in map.borrow().keys() {
+                if !schema.contains_key(k) {
+                    return Err(AsError::at(
+                        format!("unexpected key '{}' for {} (strict)", k, field_owner_label(path, &class.name)),
+                        span,
+                    ));
+                }
+            }
+        }
+
+        Ok(Value::Instance(std::rc::Rc::new(std::cell::RefCell::new(crate::value::Instance {
+            class: class.clone(),
+            fields: inst_fields,
+        }))))
+    }
+
+    /// Recursively coerce a raw value to match a declared field type: a raw
+    /// Object whose field type is a class becomes that class's validated
+    /// instance; arrays/maps of a class recurse element/value-wise; Optional
+    /// passes non-nil through to the inner type. Everything else is unchanged.
+    #[async_recursion::async_recursion(?Send)]
+    async fn coerce_field(
+        &self,
+        ty: &crate::ast::Type,
+        val: Value,
+        env: &Environment,
+        strict: bool,
+        path: &str,
+        span: Span,
+    ) -> Result<Value, AsError> {
+        use crate::ast::Type;
+        match ty {
+            Type::Optional(inner) => {
+                if val == Value::Nil {
+                    Ok(Value::Nil)
+                } else {
+                    self.coerce_field(inner, val, env, strict, path, span).await
+                }
+            }
+            Type::Named(name) => match (&val, env.get(name)) {
+                (Value::Object(_), Some(Value::Class(c))) => {
+                    self.validate_into(&c, &val, strict, path, span).await
+                }
+                _ => Ok(val),
+            },
+            Type::Array(elem) => match &val {
+                Value::Array(a) => {
+                    let items: Vec<Value> = a.borrow().clone();
+                    let mut out = Vec::with_capacity(items.len());
+                    for (i, it) in items.into_iter().enumerate() {
+                        let p = format!("{}[{}]", path, i);
+                        out.push(self.coerce_field(elem, it, env, strict, &p, span).await?);
+                    }
+                    Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+                }
+                _ => Ok(val),
+            },
+            Type::Map(_, vty) => match &val {
+                Value::Map(m) => {
+                    let entries: Vec<(crate::value::MapKey, Value)> =
+                        m.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
+                    for (k, v) in entries {
+                        let p = format!("{}[{}]", path, k.to_value());
+                        let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
+                        out.borrow_mut().insert(k, cv);
+                    }
+                    Ok(Value::Map(out))
+                }
+                // A raw Object (e.g. a JSON dictionary) coerces into a Map at the
+                // `.from` boundary: each string key becomes a `MapKey::Str` and
+                // each value is recursively coerced through the declared value
+                // type. Insertion order is preserved. This closes the gap where a
+                // parsed-JSON `map<K, Class>` field would otherwise be an Object
+                // and fail the `map<K,V>` contract.
+                Value::Object(o) => {
+                    let entries: Vec<(String, Value)> =
+                        o.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
+                    for (k, v) in entries {
+                        let p = format!("{}[{}]", path, k);
+                        let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
+                        out.borrow_mut().insert(crate::value::MapKey::Str(k.as_str().into()), cv);
+                    }
+                    Ok(Value::Map(out))
+                }
+                _ => Ok(val),
+            },
+            _ => Ok(val),
+        }
     }
 
     #[async_recursion(?Send)]
@@ -1711,7 +1921,7 @@ impl Interp {
     }
 
     #[async_recursion(?Send)]
-    async fn assign_to(&self, target: &Expr, value: Value, env: &Environment) -> Result<Value, Control> {
+    async fn assign_to(&self, target: &Expr, value: Value, value_span: Span, env: &Environment) -> Result<Value, Control> {
         match &target.kind {
             ExprKind::Ident(name) => match env.assign(name, value.clone()) {
                 Ok(()) => Ok(value),
@@ -1761,6 +1971,12 @@ impl Interp {
                         Ok(value)
                     }
                     Value::Instance(inst) => {
+                        let class = inst.borrow().class.clone();
+                        if let Some(schema) = lookup_field_schema(&class, name) {
+                            if !check_type(&value, &schema.ty) {
+                                return Err(contract_panic(&schema.ty, &value, value_span));
+                            }
+                        }
                         inst.borrow_mut().fields.insert(name.clone(), value.clone());
                         Ok(value)
                     }
@@ -1802,6 +2018,20 @@ fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> 
 }
 
 /// Human-readable type name for diagnostics.
+/// Human-readable message for a Tier-1 error value. If `err` is an Object with a
+/// `message` field, that field's value is rendered; otherwise the whole value is.
+/// Single source of truth shared by `expr!` (Unwrap) and `for await` error paths.
+fn error_message(err: &Value) -> String {
+    match err {
+        Value::Object(o) => o
+            .borrow()
+            .get("message")
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| err.to_string()),
+        other => other.to_string(),
+    }
+}
+
 pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Nil => "nil",
@@ -1825,6 +2055,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Future(_) => "future",
         Value::Generator(_) => "generator",
         Value::GeneratorMethod(..) => "function",
+        Value::ClassMethod(..) => "function",
     }
 }
 
@@ -1836,6 +2067,43 @@ fn exported_names(stmt: &Stmt) -> Vec<String> {
         Stmt::Enum { name, .. } => vec![name.clone()],
         Stmt::LetDestructure { names, .. } => names.clone(),
         _ => Vec::new(),
+    }
+}
+
+/// Look up the declared schema for `field` on `class` or any superclass.
+fn lookup_field_schema(
+    class: &std::rc::Rc<crate::value::Class>,
+    field: &str,
+) -> Option<crate::value::FieldSchema> {
+    let mut cur = Some(class.clone());
+    while let Some(c) = cur {
+        if let Some(s) = c.fields.get(field) {
+            return Some(s.clone());
+        }
+        cur = c.superclass.clone();
+    }
+    None
+}
+
+/// The owner label for a `.from` validation diagnostic: at the root (empty
+/// path) this is the class header `"{ClassName}.from"`; once recursion has
+/// descended into a field, it echoes that field path (e.g. `u.addr`).
+fn field_owner_label(path: &str, class_name: &str) -> String {
+    if path.is_empty() {
+        format!("{}.from", class_name)
+    } else {
+        path.to_string()
+    }
+}
+
+fn control_to_aserror(c: Control, span: Span) -> AsError {
+    match c {
+        Control::Panic(e) => e,
+        // Defensive fallback: `?`-propagation cannot escape a field-default
+        // initializer through current surface syntax (a default is an expression,
+        // not a fn body that could early-return a Result), so this arm is not
+        // reachable today; kept to keep the conversion total.
+        Control::Propagate(_) => AsError::at("unexpected ? propagation in a field default", span),
     }
 }
 
@@ -1897,6 +2165,8 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         // type the future *resolves to*, which cannot be inspected until it is
         // awaited, so it is advisory/erased at the binding site.
         Type::Future(_) => matches!(value, Value::Future(_)),
+        // `T?` ≡ `T | nil`.
+        Type::Optional(inner) => check_type(value, inner) || matches!(value, Value::Nil),
     }
 }
 
@@ -2492,6 +2762,74 @@ print(bad[1].message)
     }
 
     #[tokio::test]
+    async fn optional_type_accepts_value_and_nil() {
+        // nil and a number both satisfy number?; a string does not.
+        assert_eq!(eval_to_value("let x: number? = nil\nx").await, Value::Nil);
+        assert_eq!(eval_to_value("let x: number? = 7\nx").await, Value::Number(7.0));
+    }
+
+    #[tokio::test]
+    async fn optional_type_rejects_wrong_type() {
+        let src = "let r = recover(() => { let x: number? = \"bad\"\n return nil })\nprint(r[1].message)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert!(
+            interp.output().contains("type contract violated"),
+            "got: {}",
+            interp.output()
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_field_type_checked_on_assignment() {
+        // Assigning a wrong-typed declared field panics (recoverable).
+        let src = "class C { id: number\n fn init(v) { self.id = v } }\n\
+                   let r = recover(() => C(\"bad\"))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("type contract violated"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn declared_field_default_applied_at_construction() {
+        let src = "class C { role: string = \"guest\"\n fn init() {} }\n\
+                   let c = C()\nprint(c.role)";
+        let out = run(src).await;
+        assert!(out.contains("guest"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn undeclared_field_stays_dynamic() {
+        // A field the class did not declare is unchecked.
+        let src = "class C { fn init() { self.x = 1\n self.x = \"now a string\" } }\n\
+                   let c = C()\nprint(c.x)";
+        let out = run(src).await;
+        assert!(out.contains("now a string"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn inherited_field_type_checked_on_assignment() {
+        // A field declared on the BASE class is type-checked when assigned from
+        // a subclass instance (locks in lookup_field_schema's superclass walk).
+        let src = "class A { id: number\n fn init() {} }\n\
+                   class B extends A { fn init() { self.id = \"bad\" } }\n\
+                   let r = recover(() => B())\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("type contract violated"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn declared_field_default_type_checked_at_construction() {
+        // A default whose value violates the declared type is a recoverable panic.
+        let src = "class C { n: number = \"oops\"\n fn init() {} }\n\
+                   let r = recover(() => C())\nprint(r[1] != nil)\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("true"), "expected an err pair, got: {out}");
+        assert!(out.contains("type contract violated"), "got: {out}");
+    }
+
+    #[tokio::test]
     async fn ok_and_err_construct_result_pairs() {
         let src = "let r = Ok(5)\nprint(r[0])\nprint(r[1])\nlet e = Err(\"boom\")\nprint(e[0])\nprint(e[1].message)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
@@ -2604,6 +2942,198 @@ print(r[1])
             Stmt::Expr(e) => interp.eval_expr(e, &env).await.unwrap(),
             _ => panic!("last statement must be an expression"),
         }
+    }
+
+    #[tokio::test]
+    async fn unwrap_returns_value_on_ok_pair() {
+        assert_eq!(eval_to_value("[42, nil]!").await, Value::Number(42.0));
+        assert_eq!(eval_to_value("Ok(7)!").await, Value::Number(7.0));
+    }
+
+    #[tokio::test]
+    async fn unwrap_panics_on_err_pair_preserving_message() {
+        // `!` on an error pair panics; recover round-trips the original message.
+        let src = "let r = recover(() => Err(\"boom\")!)\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("boom"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn unwrap_on_non_pair_is_a_panic() {
+        let src = "let r = recover(() => 5!)\nprint(r[1] != nil)";
+        let out = run(src).await;
+        assert!(out.contains("true"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_builds_validated_instance() {
+        let src = "class U { id: number\n name: string }\n\
+                   let o = { id: 1, name: \"Ada\" }\n\
+                   let u = U.from(o)\nprint(u.id)\nprint(u.name)";
+        let out = run(src).await;
+        assert!(out.contains("1") && out.contains("Ada"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_rejects_wrong_type_with_field_path() {
+        let src = "class U { id: number\n name: string }\n\
+                   let r = recover(() => U.from({ id: \"x\", name: \"Ada\" }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("u.id") && out.contains("type contract violated"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_optional_and_default() {
+        let src = "class U { id: number\n nick: string?\n role: string = \"guest\" }\n\
+                   let u = U.from({ id: 2 })\nprint(u.nick == nil)\nprint(u.role)";
+        let out = run(src).await;
+        assert!(out.contains("true") && out.contains("guest"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_recurses_into_nested_class() {
+        let src = "class Addr { zip: number }\nclass U { id: number\n addr: Addr }\n\
+                   let u = U.from({ id: 1, addr: { zip: 90210 } })\nprint(u.addr.zip)";
+        let out = run(src).await;
+        assert!(out.contains("90210"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_nested_path_in_error() {
+        let src = "class Addr { zip: number }\nclass U { id: number\n addr: Addr }\n\
+                   let r = recover(() => U.from({ id: 1, addr: { zip: \"x\" } }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("u.addr.zip"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_recurses_into_array_of_class() {
+        let src = "class Tag { v: number }\nclass U { tags: array<Tag> }\n\
+                   let u = U.from({ tags: [{ v: 1 }, { v: 2 }] })\nprint(u.tags[1].v)";
+        let out = run(src).await;
+        assert!(out.contains("2"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_recurses_into_map_of_class() {
+        // A `map<K, Class>` field whose values are raw objects validates each
+        // value into the class. (Maps are a distinct value kind from objects, so
+        // the raw map is built with `map.new` from [key, value] pairs.)
+        let src = "import * as map from \"std/map\"\n\
+                   class Tag { v: number }\nclass U { tags: map<string, Tag> }\n\
+                   let raw = map.new([[\"a\", { v: 1 }], [\"b\", { v: 2 }]])\n\
+                   let u = U.from({ tags: raw })\nprint(map.get(u.tags, \"b\").v)";
+        let out = run(src).await;
+        assert!(out.contains("2"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_coerces_object_into_map_of_class() {
+        // A raw JSON-shaped Object validates into a `map<string, Tag>` field, with
+        // each nested object validated into a Tag instance.
+        let src = "import * as map from \"std/map\"\n\
+                   class Tag { v: number }\nclass W { byId: map<string, Tag> }\n\
+                   let w = W.from({ byId: { \"1\": { v: 10 }, \"2\": { v: 20 } } })\n\
+                   print(map.get(w.byId, \"1\").v)\nprint(map.get(w.byId, \"2\").v)";
+        let out = run(src).await;
+        assert!(out.contains("10") && out.contains("20"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_object_map_nested_path_in_error() {
+        // A bad nested value inside an Object-sourced map reports a path like
+        // `w.byId[1].v` — only the root class name is lowercased; field names
+        // and Object map keys keep their original casing.
+        let src = "class Tag { v: number }\nclass W { byId: map<string, Tag> }\n\
+                   let r = recover(() => W.from({ byId: { \"1\": { v: \"oops\" } } }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(
+            out.contains("w.byId[1].v") && out.contains("type contract violated"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_on_non_object_rejected() {
+        let src = "class U { id: number }\n\
+                   let r = recover(() => U.from(5))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("expects an object"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_missing_required_field_reports_path() {
+        let src = "class U { id: number\n name: string }\n\
+                   let r = recover(() => U.from({ id: 1 }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(
+            out.contains("u.name") && out.contains("expected string"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_nested_non_object_where_class_expected() {
+        // `coerce_field`'s Named `_ => Ok(val)` fall-through leaves a non-object
+        // value for `check_type` to reject, with the field path.
+        let src = "class A { x: number }\nclass V { a: A }\n\
+                   let r = recover(() => V.from({ a: 5 }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(
+            out.contains("v.a") && out.contains("type contract violated"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn from_strict_rejects_extra_keys() {
+        let src = "class U { id: number }\n\
+                   let r = recover(() => U.from({ id: 1, extra: true }, true))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("unexpected key 'extra'"), "got: {out}");
+        // Lenient (default) ignores extras:
+        let src2 = "class U { id: number }\nlet u = U.from({ id: 1, extra: true })\nprint(u.id)";
+        let out2 = run(src2).await;
+        assert!(out2.contains("1"), "got: {out2}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_with_class_validates() {
+        let src = "import * as json from \"std/json\"\n\
+                   class U { id: number\n name: string }\n\
+                   let [u, err] = json.parse(\"{\\\"id\\\":1,\\\"name\\\":\\\"Ada\\\"}\", U)\n\
+                   print(err == nil)\nprint(u.id)\nprint(u.name)";
+        let out = run(src).await;
+        assert!(out.contains("true") && out.contains("Ada"), "got: {out}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_with_class_fuses_errors() {
+        // shape mismatch comes back as a Tier-1 err, not a panic
+        let src = "import * as json from \"std/json\"\n\
+                   class U { id: number }\n\
+                   let [u, err] = json.parse(\"{\\\"id\\\":\\\"x\\\"}\", U)\n\
+                   print(u == nil)\nprint(err != nil)";
+        let out = run(src).await;
+        assert!(out.contains("true"), "got: {out}");
+        // bad JSON also comes back as err (parse channel)
+        let src2 = "import * as json from \"std/json\"\nclass U { id: number }\n\
+                    let [u, err] = json.parse(\"{not json\", U)\nprint(err != nil)";
+        let out2 = run(src2).await;
+        assert!(out2.contains("true"), "got: {out2}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_without_class_returns_raw_object() {
+        // With NO class argument, json.parse behaves exactly as before.
+        let src = "import * as json from \"std/json\"\n\
+                   let [v, err] = json.parse(\"{\\\"id\\\":1,\\\"name\\\":\\\"Ada\\\"}\")\n\
+                   print(err == nil)\nprint(v.id)\nprint(v.name)";
+        let out = run(src).await;
+        assert!(out.contains("true") && out.contains("Ada") && out.contains('1'), "got: {out}");
     }
 
     #[tokio::test]

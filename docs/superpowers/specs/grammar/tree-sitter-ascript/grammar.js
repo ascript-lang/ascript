@@ -29,9 +29,10 @@ const PREC = {
   add: 9,
   mul: 10,
   exp: 11,    // right-associative
-  unary: 12,
-  postfix: 13, // call, member, index, optional-member, ? propagation
-  primary: 14,
+  // (12 intentionally free: postfix ?/! are precedence-less, GLR-resolved)
+  unary: 13,
+  postfix: 14, // call, member, index, optional-member
+  primary: 15,
 };
 
 module.exports = grammar({
@@ -55,6 +56,12 @@ module.exports = grammar({
     // `propagate_expression`. GLR keeps both alive until a following `:` (ternary)
     // or end-of-expression (propagation) decides.
     [$._expression, $.propagate_expression],
+    // `<postfix-expr> !` has the same GLR ambiguity as propagation: the postfix
+    // expression could reduce to `_expression` or extend into `unwrap_expression`.
+    // Mirror propagate's precedence-less + declared-conflict treatment so the
+    // ambiguity is resolved by GLR rather than a precedence the runtime may
+    // interpret differently across tree-sitter versions.
+    [$._expression, $.unwrap_expression],
   ],
 
   rules: {
@@ -159,7 +166,15 @@ module.exports = grammar({
       optional(seq('extends', field('superclass', $.identifier))),
       field('body', $.class_body),
     ),
-    class_body: $ => seq('{', repeat($.method_definition), '}'),
+    class_body: $ => seq('{', repeat($.class_member), '}'),
+    class_member: $ => choice($.field_declaration, $.method_definition),
+    field_declaration: $ => seq(
+      field('name', $.identifier),
+      optional('?'),                    // `name?:` marker (lowers to T | nil)
+      ':',
+      field('type', $._type),           // also covers `name: T?`
+      optional(seq('=', field('default', $._expression))),
+    ),
     method_definition: $ => seq(
       optional('async'),
       'fn',
@@ -317,6 +332,7 @@ module.exports = grammar({
       $.member_expression,
       $.optional_member_expression,
       $.index_expression,
+      $.unwrap_expression,
       $.propagate_expression,
       $._primary_expression,
     ),
@@ -355,6 +371,12 @@ module.exports = grammar({
     propagate_expression: $ => seq(
       field('operand', $._postfix_expression),
       '?',
+    ),
+    // expr! — force-unwrap (dual of ?). Position-disambiguated from prefix `!`
+    // (operand precedes it) and from `!=` (a single token).
+    unwrap_expression: $ => seq(
+      field('operand', $._postfix_expression),
+      '!',
     ),
 
     // cond ? then : else — the conditional operator (§3). Right-associative,
@@ -409,6 +431,7 @@ module.exports = grammar({
     ),
     union_type: $ => prec.left(seq($._type_atom, repeat1(seq('|', $._type_atom)))),
     _type_atom: $ => choice(
+      $.optional_type,
       $.primitive_type,
       $.array_type,
       $.map_type,
@@ -425,6 +448,17 @@ module.exports = grammar({
     result_type: $ => seq('Result', '<', $._type, '>'),
     future_type: $ => seq('future', '<', $._type, '>'),
     tuple_type: $ => seq('[', commaSep1($._type), optional(','), ']'),
+    // T? — nullable suffix (sugar for `T | nil`). Reachable only inside `_type`.
+    // The inner `choice` is the non-recursive subset of `_type_atom` (avoids
+    // left-recursion / `T??`); KEEP IN SYNC with `_type_atom` if a new type atom
+    // is added there and should accept a `?` suffix.
+    optional_type: $ => prec(PREC.postfix, seq(
+      choice(
+        $.primitive_type, $.array_type, $.map_type, $.result_type,
+        $.future_type, $.tuple_type, $.identifier,
+      ),
+      '?',
+    )),
 
     // ----- Literals (§2) ---------------------------------------------------
     identifier: _ => /[A-Za-z_][A-Za-z0-9_]*/,

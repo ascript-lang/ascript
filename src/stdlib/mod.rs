@@ -132,6 +132,32 @@ impl Interp {
         args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
+        // Typed parse: json.parse(text, Class) — parse, then validate against the
+        // class, fusing a parse failure and a shape mismatch into one Tier-1
+        // [val, err] pair. With no class argument this falls through to the normal
+        // 1-arg parse below (unchanged behavior).
+        #[cfg(feature = "data")]
+        if module == "json" && func == "parse" {
+            if let Some(Value::Class(c)) = args.get(1) {
+                let parsed = json::call(func, &args[..1], span)?; // [val, err]
+                if let Value::Array(a) = &parsed {
+                    let (val, err) = {
+                        let b = a.borrow();
+                        (b[0].clone(), b[1].clone())
+                    };
+                    if err != Value::Nil {
+                        return Ok(parsed); // parse error stays in the err channel
+                    }
+                    return match self.validate_into(c, &val, false, "", span).await {
+                        Ok(inst) => Ok(crate::interp::make_pair(inst, Value::Nil)),
+                        Err(e) => Ok(crate::interp::make_pair(
+                            Value::Nil,
+                            crate::interp::make_error(Value::Str(e.message.into())),
+                        )),
+                    };
+                }
+            }
+        }
         match module {
             "math" => math::call(func, args, span),
             "string" => string::call(func, args, span),

@@ -6,8 +6,8 @@
 //! re-parses to an equivalent program, and `format(format(x)) == format(x)`.
 
 use crate::ast::{
-    ArrowBody, BinOp, EnumVariantDecl, Expr, ExprKind, ImportNames, MatchArm, MethodDecl, Param,
-    Stmt, TemplatePart, Type, UnOp,
+    ArrowBody, BinOp, EnumVariantDecl, Expr, ExprKind, FieldDecl, ImportNames, MatchArm,
+    MethodDecl, Param, Stmt, TemplatePart, Type, UnOp,
 };
 use crate::error::AsError;
 
@@ -200,7 +200,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             indent(out, level);
             out.push_str("}\n");
         }
-        Stmt::Class { name, superclass, methods, .. } => {
+        Stmt::Class { name, superclass, fields, methods, .. } => {
             indent(out, level);
             out.push_str("class ");
             out.push_str(name);
@@ -209,6 +209,9 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
                 out.push_str(sup);
             }
             out.push_str(" {\n");
+            for fd in fields {
+                write_field(out, fd, level + 1);
+            }
             for m in methods {
                 write_method(out, m, level + 1);
             }
@@ -254,6 +257,18 @@ fn write_enum_variant(out: &mut String, v: &EnumVariantDecl, level: usize) {
         write_expr(out, value, 0);
     }
     out.push_str(",\n");
+}
+
+fn write_field(out: &mut String, fd: &FieldDecl, level: usize) {
+    indent(out, level);
+    out.push_str(&fd.name);
+    out.push_str(": ");
+    out.push_str(&render_type(&fd.ty)); // Type::Optional renders as `T?` (canonical)
+    if let Some(def) = &fd.default {
+        out.push_str(" = ");
+        write_expr(out, def, PREC_ASSIGN);
+    }
+    out.push('\n');
 }
 
 fn write_method(out: &mut String, m: &MethodDecl, level: usize) {
@@ -316,7 +331,8 @@ fn expr_prec(e: &Expr) -> u8 {
         | ExprKind::Index { .. }
         | ExprKind::Member { .. }
         | ExprKind::OptMember { .. }
-        | ExprKind::Try(_) => PREC_POSTFIX,
+        | ExprKind::Try(_)
+        | ExprKind::Unwrap(_) => PREC_POSTFIX,
         // A `Paren` node already emits exactly one set of parens in
         // `write_expr_inner`, so it must be treated as an atom here to prevent
         // `write_expr` from wrapping it in a second, redundant set (which would
@@ -464,8 +480,12 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             out.push_str(name);
         }
         ExprKind::Try(inner) => {
-            write_expr(out, inner, PREC_POSTFIX);
+            write_expr(out, inner, PREC_UNARY);
             out.push('?');
+        }
+        ExprKind::Unwrap(inner) => {
+            write_expr(out, inner, PREC_UNARY);
+            out.push('!');
         }
         ExprKind::Ternary { cond, then, els } => {
             // `cond` and `then` bind one tier above the ternary so a nested
@@ -635,6 +655,27 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_and_await_format_without_parens() {
+        // `await x!` and `await x?` are canonical (no parens) — `!`/`?` are
+        // looser than await, so the grouping is implicit. A binary inner still
+        // keeps its parens. `format_source` emits the statement-expression plus
+        // a trailing newline, so we compare against that.
+        assert_eq!(format_source("await f()!").unwrap(), "await f()!\n");
+        assert_eq!(format_source("await f()?").unwrap(), "await f()?\n");
+        assert_eq!(format_source("a! + b").unwrap(), "a! + b\n");
+        assert_eq!(format_source("(a + b)!").unwrap(), "(a + b)!\n");
+    }
+
+    #[test]
+    fn optional_type_round_trips() {
+        // `T?` survives a format pass unchanged in let/param/return positions.
+        let src = "let x: number? = nil\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        let src2 = "fn f(a: string?): number? {\n  return nil\n}\n";
+        assert_eq!(format_source(src2).unwrap(), src2);
+    }
+
+    #[test]
     fn formats_ternary() {
         // Canonical spacing.
         assert_eq!(format_source("let x=a?b:c").unwrap(), "let x = a ? b : c\n");
@@ -661,6 +702,17 @@ mod tests {
             assert_eq!(once, twice, "fmt not idempotent for: {src}");
             assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
         }
+    }
+
+    #[test]
+    fn class_fields_format_canonically() {
+        // `name?: T` normalizes to `name: T?`; fields print before methods.
+        let src = "class U {\n  id: number\n  nick?: string\n  role: string = \"guest\"\n  fn init() {}\n}\n";
+        let want = "class U {\n  id: number\n  nick: string?\n  role: string = \"guest\"\n  fn init() {\n  }\n}\n";
+        assert_eq!(format_source(src).unwrap(), want);
+        // idempotent
+        let once = format_source(src).unwrap();
+        assert_eq!(format_source(&once).unwrap(), once);
     }
 
     #[test]

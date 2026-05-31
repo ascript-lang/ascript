@@ -52,6 +52,27 @@ scale("3")   // panic: type contract violated: expected number, got string ("3")
 | `T1 \| T2` | a union — satisfied if either side matches |
 | `ClassName` | an instance of that class or any subclass |
 | `EnumName` | any variant of that enum |
+| `T?` | `T` **or** nil — the nullable suffix, sugar for `T \| nil` |
+
+## The nullable suffix `T?`
+
+A trailing `?` on any type makes it nullable: `T?` is exactly `T | nil`. It is valid in **every**
+type position — `let` / `const` bindings, function parameters, return types, and class fields — and
+renders canonically as `T?` (the formatter normalizes an explicit `T | nil` written this way only
+when you spell it as the suffix; an explicit union is left as you wrote it).
+
+```ascript
+let a: number? = nil    // ok — nil satisfies number?
+let b: number? = 42     // ok — and so does a number
+
+fn pick(x: string?): string? {
+  return x              // accepts and returns string-or-nil
+}
+```
+
+Because `T?` is just `T | nil`, it composes with the rest of the grammar: `array<string?>` is an
+array whose elements are each a string or nil, and a [class field](classes-enums) declared
+`nickname: string?` is an optional field that defaults to nil.
 
 ## Contracts are checked eagerly and deeply
 

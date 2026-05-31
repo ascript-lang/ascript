@@ -67,6 +67,39 @@ character, while keeping every error path explicit.
 > [!NOTE] `?` is only valid inside a function whose return value is a result pair. Using it elsewhere
 > is an error. It composes with `await`: `await fetchUser(id)?` awaits, then propagates.
 
+## The `!` force-unwrap operator
+
+The postfix `!` operator is the **dual of `?`**. It evaluates its operand to a result pair `[value,
+err]`; if `err == nil` it yields `value`, and if `err != nil` it **panics**, carrying the original
+error's message. Unlike `?` (which propagates up to the enclosing function), `!` asserts that the
+operation *cannot* have failed — reach for it when a failure would be a bug, or at the outermost
+boundary inside a `recover`.
+
+```ascript
+fn half(n) {
+  if (n % 2 != 0) { return Err("odd") }
+  return Ok(n / 2)
+}
+
+half(8)!                          // 4 — unwraps the success value
+let [v, e] = recover(() => half(3)!)
+// e.message == "odd" — the panic carries the original message
+```
+
+### Precedence with `await`
+
+Both `?` and `!` bind **looser than `await`** (and looser than prefix unary `!x` / `-x`). That means
+`await resp.json()!` parses as `(await resp.json())!` and `await resp.json(User)?` parses as
+`(await resp.json(User))?` — **no parentheses needed**. (Prefix `!x` for logical-not is unaffected:
+position disambiguates it from postfix `!`.)
+
+```ascript
+// Decode + validate an HTTP body, then unwrap or propagate — no parens:
+let user = await resp.json(User)?                       // [stdlib/net]
+// Equivalent primitive composition with `.from` and force-unwrap:
+let user = recover(() => User.from(await resp.json()!))?
+```
+
 ## Tier 2 — bugs panic
 
 A **panic** is an unrecoverable programmer error. It unwinds the runtime, prints a diagnostic with a
@@ -77,6 +110,8 @@ include:
 - Indexing an array out of bounds with `arr[i]` (the checked `array.get(arr, i)` returns `nil`).
 - Calling a non-function, or reading a field of `nil`.
 - An explicit `assert(cond, msg)` failure.
+- A `!` [force-unwrap](#the--force-unwrap-operator) on a failed result pair (recoverable via `recover`).
+- A `ClassName.from(obj)` [shape mismatch](classes-enums) (recoverable, carries a field path).
 - Misusing a builtin (e.g. `len` on a number).
 
 ```ascript

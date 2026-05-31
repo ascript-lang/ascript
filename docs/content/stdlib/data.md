@@ -29,6 +29,46 @@ let [bad, e] = json.parse("{not valid")
 // e   == { message: "invalid JSON: ..." }
 ```
 
+#### Typed parse: `json.parse(text, Class)`
+
+Passing a [class](../language/classes-enums) as a second argument parses **and validates** in one
+step. A parse failure and a shape mismatch are **fused into one Tier-1 `[value, err]` pair** —
+neither panics. On success the value is a validated instance (with defaults applied and optional
+fields defaulted to nil), exactly as if you had called [`Class.from`](../language/classes-enums) on
+the decoded object. The class is an ordinary value argument (no generics). With **no** class
+argument, `json.parse` returns the raw decoded value unchanged, as above.
+
+```ascript
+class User {
+  id: number
+  name: string
+  nickname: string?
+  role: string = "guest"
+}
+
+let [u, err] = json.parse("{\"id\": 1, \"name\": \"Ada\"}", User)
+// u.id == 1, u.role == "guest" (default), u.nickname == nil; err == nil
+
+// A shape mismatch fuses into the err channel (NOT a panic):
+let [bad, e] = json.parse("{\"id\": \"x\", \"name\": \"Bug\"}", User)
+// bad == nil; e.message describes the bad field
+
+// Malformed JSON surfaces in the same channel:
+let [bad2, e2] = json.parse("{not json", User)   // bad2 == nil; e2 != nil
+```
+
+Because `?` and `!` compose with this, a validating loader is a single line:
+
+```ascript
+fn loadUser(text: string): Result<User> {
+  let user = json.parse(text, User)?    // propagates [nil, err] on bad JSON or bad shape
+  return Ok(user)
+}
+```
+
+See `examples/typed_parse.as` for a runnable walkthrough, and the
+[HTTP `resp.json(Class)`](net) accessor for the over-the-wire equivalent.
+
 ### json.stringify
 
 Serializes an AScript value to a JSON string.

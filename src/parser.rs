@@ -264,50 +264,82 @@ impl<'a> Parser<'a> {
             None
         };
         self.eat(&Tok::LBrace)?;
+        let mut fields = Vec::new();
         let mut methods = Vec::new();
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
-            let mstart = self.span().start;
-            let is_async = if *self.peek() == Tok::Async {
-                self.advance();
-                true
+            // A member starting with `async` or `fn` is a method; otherwise a field.
+            if *self.peek() == Tok::Async || *self.peek() == Tok::Fn {
+                let mstart = self.span().start;
+                let is_async = if *self.peek() == Tok::Async {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                self.eat(&Tok::Fn)?;
+                let is_generator = if *self.peek() == Tok::Star {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let mname_span = self.span();
+                let mname = match self.advance() {
+                    Tok::Ident(n) => n,
+                    other => return Err(AsError::at(format!("expected method name, found {:?}", other), self.tokens[self.pos - 1].span)),
+                };
+                let params = self.param_list()?;
+                let ret = if *self.peek() == Tok::Colon {
+                    self.advance();
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                let body = self.block()?;
+                let mspan = Span::new(mstart, self.prev_end());
+                methods.push(crate::ast::MethodDecl {
+                    name: mname,
+                    params,
+                    ret,
+                    body,
+                    is_async,
+                    is_generator,
+                    span: mspan,
+                    name_span: mname_span,
+                });
             } else {
-                false
-            };
-            self.eat(&Tok::Fn)?;
-            let is_generator = if *self.peek() == Tok::Star {
-                self.advance();
-                true
-            } else {
-                false
-            };
-            let mname_span = self.span();
-            let mname = match self.advance() {
-                Tok::Ident(n) => n,
-                other => return Err(AsError::at(format!("expected method name, found {:?}", other), self.tokens[self.pos - 1].span)),
-            };
-            let params = self.param_list()?;
-            let ret = if *self.peek() == Tok::Colon {
-                self.advance();
-                Some(self.parse_type()?)
-            } else {
-                None
-            };
-            let body = self.block()?;
-            let mspan = Span::new(mstart, self.prev_end());
-            methods.push(crate::ast::MethodDecl {
-                name: mname,
-                params,
-                ret,
-                body,
-                is_async,
-                is_generator,
-                span: mspan,
-                name_span: mname_span,
-            });
+                // Field declaration: Ident ["?"] ":" type ["=" expr]
+                let fstart = self.span().start;
+                let fname_span = self.span();
+                let fname = match self.advance() {
+                    Tok::Ident(n) => n,
+                    other => return Err(AsError::at(format!("expected a field name or method, found {:?}", other), self.tokens[self.pos - 1].span)),
+                };
+                // `name?:` marker — lower to Optional below.
+                let marker_optional = if *self.peek() == Tok::Question {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                self.eat(&Tok::Colon)?;
+                let mut ty = self.parse_type()?;
+                if marker_optional && !matches!(ty, crate::ast::Type::Optional(_)) {
+                    ty = crate::ast::Type::Optional(Box::new(ty));
+                }
+                let default = if *self.peek() == Tok::Eq {
+                    self.advance();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                let fspan = Span::new(fstart, self.prev_end());
+                fields.push(crate::ast::FieldDecl { name: fname, ty, default, span: fspan, name_span: fname_span });
+            }
         }
         self.eat(&Tok::RBrace)?;
         let span = Span::new(start, self.prev_end());
-        Ok(Stmt::Class { name, superclass, methods, span, name_span })
+        Ok(Stmt::Class { name, superclass, fields, methods, span, name_span })
     }
 
     fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {
@@ -323,9 +355,9 @@ impl<'a> Parser<'a> {
     fn parse_type_atom(&mut self) -> Result<crate::ast::Type, AsError> {
         use crate::ast::Type;
         let span = self.span();
-        match self.advance() {
-            Tok::Nil => Ok(Type::Nil),
-            Tok::Fn => Ok(Type::Fn),
+        let atom = match self.advance() {
+            Tok::Nil => Type::Nil,
+            Tok::Fn => Type::Fn,
             Tok::LBracket => {
                 // tuple type [T1, T2, ...]
                 let mut parts = Vec::new();
@@ -343,32 +375,32 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.eat(&Tok::RBracket)?;
-                Ok(Type::Tuple(parts))
+                Type::Tuple(parts)
             }
             Tok::Ident(name) => match name.as_str() {
-                "number" => Ok(Type::Number),
-                "string" => Ok(Type::String),
-                "bool" => Ok(Type::Bool),
-                "any" => Ok(Type::Any),
-                "object" => Ok(Type::Object),
-                "error" => Ok(Type::Error),
+                "number" => Type::Number,
+                "string" => Type::String,
+                "bool" => Type::Bool,
+                "any" => Type::Any,
+                "object" => Type::Object,
+                "error" => Type::Error,
                 "array" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
                     self.eat(&Tok::Gt)?;
-                    Ok(Type::Array(Box::new(inner)))
+                    Type::Array(Box::new(inner))
                 }
                 "Result" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
                     self.eat(&Tok::Gt)?;
-                    Ok(Type::Result(Box::new(inner)))
+                    Type::Result(Box::new(inner))
                 }
                 "future" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
                     self.eat(&Tok::Gt)?;
-                    Ok(Type::Future(Box::new(inner)))
+                    Type::Future(Box::new(inner))
                 }
                 "map" => {
                     self.eat(&Tok::Lt)?;
@@ -376,11 +408,20 @@ impl<'a> Parser<'a> {
                     self.eat(&Tok::Comma)?;
                     let v = self.parse_type()?;
                     self.eat(&Tok::Gt)?;
-                    Ok(Type::Map(Box::new(k), Box::new(v)))
+                    Type::Map(Box::new(k), Box::new(v))
                 }
-                _ => Ok(Type::Named(name)),
+                _ => Type::Named(name),
             },
-            other => Err(AsError::at(format!("expected a type, found {:?}", other), span)),
+            other => return Err(AsError::at(format!("expected a type, found {:?}", other), span)),
+        };
+        // `T?` nullable suffix (sugar for `T | nil`). Only reachable in type
+        // position (after `:` / inside `<...>`), so it never collides with the
+        // expression-level `?` (ternary / propagate).
+        if *self.peek() == Tok::Question {
+            self.advance();
+            Ok(Type::Optional(Box::new(atom)))
+        } else {
+            Ok(atom)
         }
     }
 
@@ -906,8 +947,35 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// Postfix Result operators `?` (propagate) and `!` (force-unwrap). They sit
+    /// LOOSER than `await`/unary but TIGHTER than every binary operator, so
+    /// `await x!` parses as `(await x)!` and `a! + b` as `(a!) + b`. Left-assoc.
+    fn unwrap_tier(&mut self) -> Result<Expr, AsError> {
+        let mut expr = self.unary()?;
+        loop {
+            match self.peek() {
+                Tok::Question => {
+                    // Leave a ternary `?` for `ternary()` higher up.
+                    if self.question_begins_ternary() {
+                        break;
+                    }
+                    self.advance();
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
+                }
+                Tok::Bang => {
+                    self.advance();
+                    let span = Span::new(expr.span.start, self.prev_end());
+                    expr = Expr { kind: ExprKind::Unwrap(Box::new(expr)), span };
+                }
+                _ => break,
+            }
+        }
+        Ok(expr)
+    }
+
     fn exponent(&mut self) -> Result<Expr, AsError> {
-        let base = self.unary()?;
+        let base = self.unwrap_tier()?;
         if *self.peek() == Tok::StarStar {
             self.advance();
             // right-associative: 2 ** 3 ** 2 == 2 ** (3 ** 2)
@@ -1008,16 +1076,6 @@ impl<'a> Parser<'a> {
                     };
                     let span = Span::new(expr.span.start, self.prev_end());
                     expr = Expr { kind: ExprKind::OptMember { object: Box::new(expr), name }, span };
-                }
-                Tok::Question => {
-                    // `?` is overloaded: postfix `Try` here, or the start of a
-                    // ternary. Defer the latter to `ternary()` by leaving it.
-                    if self.question_begins_ternary() {
-                        break;
-                    }
-                    self.advance();
-                    let span = Span::new(expr.span.start, self.prev_end());
-                    expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
                 }
                 _ => break,
             }
@@ -1445,10 +1503,75 @@ mod tests {
     }
 
     #[test]
+    fn unwrap_and_propagate_bind_looser_than_await() {
+        // `!` and `?` apply to the resolved value, not the future.
+        assert_eq!(sexpr("await f()!"), "(unwrap (await (call f)))");
+        assert_eq!(sexpr("await f()?"), "(? (await (call f)))");
+    }
+
+    #[test]
+    fn unwrap_binds_tighter_than_binary() {
+        assert_eq!(sexpr("a! + b"), "(+ (unwrap a) b)");
+        assert_eq!(sexpr("f()?"), "(? (call f))");
+    }
+
+    #[test]
+    fn ternary_still_disambiguates_from_propagate() {
+        // A `?` followed by `:` is still a ternary, not a Try.
+        assert_eq!(sexpr("a ? b : c"), "(?: a b c)");
+        assert_eq!(sexpr("g()? ? a : b"), "(?: (? (call g)) a b)");
+    }
+
+    #[test]
     fn await_parses_at_unary_precedence() {
         // `await f()` => Await(Call(f)); `await a + b` => (await a) + b.
         assert_eq!(sexpr("await f()"), "(await (call f))");
         assert_eq!(sexpr("await a + b"), "(+ (await a) b)");
+    }
+
+    #[test]
+    fn optional_type_suffix_parses() {
+        // `number?` in a let binding parses to Type::Optional(Number).
+        let stmts = parse(&lex("let x: number? = nil").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Let { ty: Some(t), .. } => {
+                assert_eq!(t.to_string(), "number?");
+            }
+            other => panic!("expected a typed let, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optional_type_in_param_and_return() {
+        let stmts = parse(&lex("fn f(a: string?): number? { return nil }").unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Fn { params, ret: Some(r), .. } => {
+                assert_eq!(params[0].ty.as_ref().unwrap().to_string(), "string?");
+                assert_eq!(r.to_string(), "number?");
+            }
+            other => panic!("expected a typed fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn class_fields_both_spellings_parse() {
+        let src = "class U {\n  id: number\n  nick: string?\n  avatar?: string\n  role: string = \"guest\"\n  fn init() {}\n}";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        match &stmts[0] {
+            Stmt::Class { fields, methods, .. } => {
+                assert_eq!(fields.len(), 4);
+                assert_eq!(fields[0].name, "id");
+                assert_eq!(fields[0].ty.to_string(), "number");
+                // `string?` and `avatar?` both lower to Optional.
+                assert_eq!(fields[1].ty.to_string(), "string?");
+                assert_eq!(fields[2].name, "avatar");
+                assert_eq!(fields[2].ty.to_string(), "string?");
+                // default present
+                assert!(fields[3].default.is_some());
+                assert_eq!(methods.len(), 1);
+            }
+            other => panic!("expected a class, got {other:?}"),
+        }
     }
 
     #[test]

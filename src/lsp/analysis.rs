@@ -153,19 +153,28 @@ fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol
                 None,
             ));
         }
-        Stmt::Class { name, methods, span, name_span, .. } => {
-            let children: Vec<DocumentSymbol> = methods
+        Stmt::Class { name, fields, methods, span, name_span, .. } => {
+            let mut children: Vec<DocumentSymbol> = fields
                 .iter()
-                .map(|m| {
+                .map(|fd| {
                     symbol(
-                        m.name.clone(),
-                        SymbolKind::METHOD,
-                        span_range(m.span, index),
-                        span_range(m.name_span, index),
+                        fd.name.clone(),
+                        SymbolKind::PROPERTY,
+                        span_range(fd.span, index),
+                        span_range(fd.name_span, index),
                         None,
                     )
                 })
                 .collect();
+            children.extend(methods.iter().map(|m| {
+                symbol(
+                    m.name.clone(),
+                    SymbolKind::METHOD,
+                    span_range(m.span, index),
+                    span_range(m.name_span, index),
+                    None,
+                )
+            }));
             out.push(symbol(
                 name.clone(),
                 SymbolKind::CLASS,

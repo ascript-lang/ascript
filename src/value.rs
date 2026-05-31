@@ -69,9 +69,16 @@ pub struct Method {
     pub is_async: bool,
 }
 
+#[derive(Clone)]
+pub struct FieldSchema {
+    pub ty: crate::ast::Type,
+    pub default: Option<crate::ast::Expr>,
+}
+
 pub struct Class {
     pub name: String,
     pub superclass: Option<Rc<Class>>,
+    pub fields: IndexMap<String, FieldSchema>,
     pub methods: IndexMap<String, Rc<Method>>,
     pub def_env: Environment,
 }
@@ -194,6 +201,28 @@ pub fn find_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Clas
     None
 }
 
+/// Merge the declared field schemas across a class's inheritance chain,
+/// **base-class first** so a subclass declaration overrides a base one with the
+/// same name. Each entry carries the class that declared it, so callers that
+/// evaluate field defaults can use the *defining* class's `def_env`. Insertion
+/// order is base-first, then subclass (a subclass override keeps the field's
+/// original position, matching `IndexMap::insert` semantics).
+pub fn merged_field_schema(class: &Rc<Class>) -> IndexMap<String, (FieldSchema, Rc<Class>)> {
+    let mut chain = Vec::new();
+    let mut cur = Some(class.clone());
+    while let Some(c) = cur {
+        cur = c.superclass.clone();
+        chain.push(c);
+    }
+    let mut schema: IndexMap<String, (FieldSchema, Rc<Class>)> = IndexMap::new();
+    for c in chain.into_iter().rev() {
+        for (n, s) in &c.fields {
+            schema.insert(n.clone(), (s.clone(), c.clone()));
+        }
+    }
+    schema
+}
+
 /// A user-defined function with its captured (closure) environment.
 pub struct Function {
     pub name: Option<String>,
@@ -247,6 +276,8 @@ pub enum Value {
     /// async `call_generator_method`. Generators have no `NativeObject`, so they
     /// can't reuse `NativeMethod`; this is the parallel binding for them.
     GeneratorMethod(Rc<crate::coro::GeneratorHandle>, &'static str),
+    /// A class associated function bound to its class, e.g. `User.from`.
+    ClassMethod(Rc<Class>, &'static str),
 }
 
 impl Value {
@@ -292,6 +323,9 @@ impl PartialEq for Value {
             (Value::GeneratorMethod(a, an), Value::GeneratorMethod(b, bn)) => {
                 Rc::ptr_eq(a, b) && an == bn
             }
+            (Value::ClassMethod(a, an), Value::ClassMethod(b, bn)) => {
+                Rc::ptr_eq(a, b) && an == bn
+            }
             _ => false,
         }
     }
@@ -325,6 +359,7 @@ impl fmt::Debug for Value {
             Value::Future(_) => write!(f, "Future"),
             Value::Generator(_) => write!(f, "Generator"),
             Value::GeneratorMethod(_, m) => write!(f, "GeneratorMethod({})", m),
+            Value::ClassMethod(c, m) => write!(f, "ClassMethod({}.{})", c.name, m),
         }
     }
 }
@@ -416,6 +451,7 @@ impl Value {
             Value::Future(_) => write!(f, "<future>"),
             Value::Generator(_) => write!(f, "<generator>"),
             Value::GeneratorMethod(_, m) => write!(f, "<generator method {}>", m),
+            Value::ClassMethod(c, m) => write!(f, "<class method {}.{}>", c.name, m),
         }
     }
 

@@ -28,6 +28,10 @@ pub enum ExprKind {
     Member { object: Box<Expr>, name: String },
     OptMember { object: Box<Expr>, name: String },
     Try(Box<Expr>),
+    /// `expr!` — force-unwrap a Tier-1 `[value, err]` pair: evaluates to `value`
+    /// when `err == nil`, otherwise panics (carrying the original error's
+    /// message). The dual of `Try` (`?`).
+    Unwrap(Box<Expr>),
     /// The conditional operator `cond ? then : els` (spec §3). Right-associative,
     /// binds just above assignment. `then`/`els` are evaluated lazily — only the
     /// selected branch runs.
@@ -63,6 +67,9 @@ pub enum Type {
     Named(String),
     Map(Box<Type>, Box<Type>),
     Future(Box<Type>),
+    /// `T?` — nullable type, sugar for `T | nil`. The class-field marker
+    /// `name?:` will also lower to this node once class fields land (Phase 3).
+    Optional(Box<Type>),
 }
 
 /// A function parameter: a name with an optional type annotation.
@@ -101,6 +108,7 @@ impl std::fmt::Display for Type {
             Type::Named(n) => write!(f, "{}", n),
             Type::Map(k, v) => write!(f, "map<{}, {}>", k, v),
             Type::Future(t) => write!(f, "future<{}>", t),
+            Type::Optional(t) => write!(f, "{}?", t),
         }
     }
 }
@@ -161,6 +169,7 @@ pub enum Stmt {
     Class {
         name: String,
         superclass: Option<String>,
+        fields: Vec<FieldDecl>,
         methods: Vec<MethodDecl>,
         span: Span,
         name_span: Span,
@@ -173,6 +182,16 @@ pub enum Stmt {
 pub enum ImportNames {
     Named(Vec<String>),
     Namespace(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct FieldDecl {
+    pub name: String,
+    pub ty: Type,
+    /// Lazily-evaluated default (in the class def env) when the field is absent.
+    pub default: Option<Expr>,
+    pub span: Span,
+    pub name_span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -304,6 +323,7 @@ impl fmt::Display for ExprKind {
             ExprKind::Member { object, name } => write!(f, "(. {} {})", object, name),
             ExprKind::OptMember { object, name } => write!(f, "(?. {} {})", object, name),
             ExprKind::Try(e) => write!(f, "(? {})", e),
+            ExprKind::Unwrap(e) => write!(f, "(unwrap {})", e),
             ExprKind::Ternary { cond, then, els } => write!(f, "(?: {} {} {})", cond, then, els),
             ExprKind::Template { .. } => write!(f, "(template)"),
             ExprKind::Match { .. } => write!(f, "(match)"),

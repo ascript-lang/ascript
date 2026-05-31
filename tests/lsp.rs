@@ -226,7 +226,7 @@ fn lsp_protocol_end_to_end() {
                 "uri": sym_uri,
                 "languageId": "ascript",
                 "version": 1,
-                "text": "fn greet(name) { return name }\nclass Point { fn init() {} }\n"
+                "text": "fn greet(name) { return name }\nclass Point {\n  x: number\n  label: string?\n  fn init() {}\n}\n"
             }
         }),
     );
@@ -244,6 +244,23 @@ fn lsp_protocol_end_to_end() {
         symbols.iter().filter_map(|s| s["name"].as_str()).collect();
     assert!(names.contains(&"greet"), "expected `greet` in symbols: {names:?}");
     assert!(names.contains(&"Point"), "expected `Point` in symbols: {names:?}");
+
+    // Declared class fields are emitted as PROPERTY (kind 7) children, before methods.
+    let point = symbols
+        .iter()
+        .find(|s| s["name"].as_str() == Some("Point"))
+        .expect("Point class symbol");
+    let children = point["children"].as_array().expect("Point children array");
+    let child_names: Vec<&str> = children.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!(
+        child_names,
+        vec!["x", "label", "init"],
+        "expected fields before methods: {child_names:?}"
+    );
+    // `x` and `label` are PROPERTY (SymbolKind::PROPERTY == 7); `init` is METHOD (6).
+    assert_eq!(children[0]["kind"].as_i64(), Some(7), "x should be PROPERTY");
+    assert_eq!(children[1]["kind"].as_i64(), Some(7), "label should be PROPERTY");
+    assert_eq!(children[2]["kind"].as_i64(), Some(6), "init should be METHOD");
 
     // 5. hover over the `greet` identifier (line 0, char 3) -> a sensible result.
     client.request(
