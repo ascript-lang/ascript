@@ -90,33 +90,60 @@ Class bodies gain **field declarations** that may appear alongside methods:
 class User {
   id: number              // required
   name: string            // required
-  nickname?: string       // optional      — sugar for `nickname: string | nil`
+  nickname: string?       // optional — `T?` is sugar for `T | nil`
+  avatar?: string         // also optional — `name?:` field marker, same meaning
   role: string = "guest"  // optional with default
   fn init(...) { ... }    // methods unchanged
 }
 ```
 
-Grammar (field declaration, inside a class body):
+**Optionality has two accepted spellings, both lowering to the same thing
+(`T | nil`):**
+
+1. **`T?` — a type-level suffix (the general feature).** Valid in *any* type position —
+   field, `let`/`const` binding, function parameter, and return type:
+   ```javascript
+   let port: number? = nil
+   fn lookup(key: string): User? { ... }
+   ```
+   `T?` desugars to `T | nil` and is represented by a `Type::Optional(Box<Type>)` AST
+   node (see §3.2). `check_type(v, Optional(T))` ≡ `check_type(v, T) || v == nil`.
+
+2. **`name?: T` — a field-only marker (accepted alias).** Familiar to JS/TS authors.
+   In field-declaration position only, it lowers to a field of type `Type::Optional(T)`
+   — i.e. exactly what `name: T?` produces. It carries no separate semantics.
+
+Grammar:
 
 ```
-field_decl := Ident "?"? ":" type ("=" expression)?
+type          := … | type "?"                       // nullable suffix, any type position
+field_decl    := Ident "?"? ":" type ("=" expression)?
 ```
 
-- The `?` suffix appears **only** in field-declaration position (immediately after the
-  field name, before `:`). It is unambiguous there and does not interact with the
-  expression-level `?` (ternary / propagate).
-- `name?: T` desugars to a field of type `T | nil`.
-- A default expression makes a field optional regardless of `?`; it is evaluated lazily
-  (see §3.3).
+- **Canonical form (formatter output): `name: Type?`.** The `name?: T` alias is
+  normalized *to* `name: T?` on format, so `?` always sits in one place (on the type)
+  across fields, bindings, params, and returns. Because both spellings lower to the same
+  `Type::Optional` node, they are indistinguishable after parse — which is what lets the
+  formatter pick one. (An explicitly written `T | nil` union is *not* rewritten to `T?`;
+  the formatter preserves authorial intent and only normalizes the two `?` spellings.)
+- A default expression also makes a field optional regardless of `?` (it is evaluated
+  lazily — see §3.3).
+- `?` in **type position** (nullable suffix) never overlaps `?` in **expression
+  position** (ternary / propagate): a type only appears after `:` in a declaration,
+  parameter, return, or field. The tree-sitter grammar declares the boundary conflict
+  (see §8).
 
 ### 3.2 Data model
 
+- **Type AST** (`ast.rs`, the `Type` enum): add `Type::Optional(Box<Type>)`. Both `T?`
+  and the `name?:` marker produce it; `check_type` treats `Optional(T)` as `T | nil`.
+  This is a general type-system addition, not class-specific.
 - **AST** (`ast.rs`, the `Class` node): add `fields: Vec<FieldDecl>` where
-  `FieldDecl { name: String, ty: Type, optional: bool, default: Option<Expr>, span: Span }`.
+  `FieldDecl { name: String, ty: Type, default: Option<Expr>, span: Span, name_span: Span }`.
+  No separate `optional` flag is needed — optionality lives in the type (`Type::Optional`)
+  or is implied by a `default`.
 - **Runtime** (`value.rs`, `struct Class`): add
-  `fields: IndexMap<String, FieldSchema>` where
-  `FieldSchema { ty: Type, optional: bool, default: Option<Expr> }`. (`optional` is
-  pre-folded so the stored `ty` already includes `| nil` when `?` was used.)
+  `fields: IndexMap<String, FieldSchema>` where `FieldSchema { ty: Type, default: Option<Expr> }`.
 
 ### 3.3 Semantics
 
@@ -286,7 +313,7 @@ class Address {
 class User {
   id: number
   name: string
-  nickname?: string          // optional
+  nickname: string?          // optional (canonical spelling)
   role: string = "guest"     // defaulted
   address: Address           // nested — User.from recurses
 }
@@ -318,9 +345,13 @@ Failure modes, all surfaced as one Tier-1 error out of `loadUser`:
 
 ## 7. Testing
 
-- **Typed fields:** declared-field assignment checks (pass + violation); `?` accepts
-  `nil`; default applied when absent; undeclared field stays dynamic/unchecked;
-  back-compat (existing field-free classes unchanged). Unit tests in `interp.rs`.
+- **Optional type `T?`:** desugars to `T | nil` and `check_type` accepts both `T` and
+  `nil`, in *all* positions — field, `let`/`const`, parameter, return. Both spellings
+  (`name: T?` and `name?: T`) parse to the same `Type::Optional` node.
+- **Typed fields:** declared-field assignment checks (pass + violation); optional field
+  accepts `nil` and absent; default applied when absent; undeclared field stays
+  dynamic/unchecked; back-compat (existing field-free classes unchanged). Unit tests in
+  `interp.rs`.
 - **`.from`:** happy path; missing required → panic; optional/defaulted handling;
   `strict` rejects/ignores extras; nested object recursion; `array<Class>` and
   `map<K, Class>` recursion; field-path in error message; recoverable via `recover`.
@@ -336,7 +367,9 @@ Failure modes, all surfaced as one Tier-1 error out of `loadUser`:
 - **Grammar guardrails:** add an `examples/*.as` exercising all three; both the
   hand-written parser and the tree-sitter grammar must accept it
   (`tests/treesitter_conformance.rs`, `tests/frontend_conformance.rs`).
-- **Formatter:** field declarations and `expr!` round-trip through `fmt`.
+- **Formatter:** field declarations and `expr!` round-trip through `fmt`; `name?: T`
+  normalizes to canonical `name: T?`; `T?` round-trips in `let`/param/return positions;
+  an explicit `T | nil` is left unchanged (not rewritten to `T?`).
 - Clippy clean under **both** `--all-targets` and `--no-default-features --all-targets`.
 
 ---
@@ -352,17 +385,17 @@ and semantics. Subsystems are listed with the *specific* change and a verdict.
 | Subsystem | File(s) | Change |
 |---|---|---|
 | Lexer / tokens | `src/lexer.rs`, `src/token.rs` | **No new tokens.** `Tok::Bang` (`!`), `Tok::Question` (`?`), `Colon`, `Eq`, `Ident` all exist; `!=` is already a single `BangEq`. Field decls and postfix `!` reuse existing tokens. |
-| AST | `src/ast.rs` | Add `FieldDecl { name, ty, optional, default, span, name_span }`; add `fields: Vec<FieldDecl>` to `Stmt::Class`; add `ExprKind::Unwrap(Box<Expr>)`. Add `Display` arms for the new `ExprKind` and for field declarations in `Stmt::Class`. |
-| Parser | `src/parser.rs` | Parse field declarations in class body (`Ident "?"? ":" type ("=" expr)?`); add postfix `!`; **restructure precedence** so `?` (`Try`) and `!` (`Unwrap`) move out of the `postfix()` loop into a new tier *looser than `await`/unary* (so `await x!` ⇒ `(await x)!`, `await x?` ⇒ `(await x)?`). Add parser unit tests (`sexpr(...)`) pinning the grouping. |
-| Interpreter | `src/interp.rs` | Store `FieldSchema` on the runtime `Class` (`value.rs`); check declared-field types on assignment (incl. inside `init`); implement `validate_into(class, obj, strict) -> Result<Instance, _>` (recurses into nested class / `array<Class>` / `map<K,Class>` fields, applies defaults, builds field path for errors); `.from` adapter (panics on `Err`); `ExprKind::Unwrap` eval arm (panic carrying the original error on `[_, err!=nil]`). |
+| AST | `src/ast.rs` | Add `Type::Optional(Box<Type>)` (the `T?` / `name?:` nullable type); add `FieldDecl { name, ty, default, span, name_span }` (no `optional` flag — optionality lives in `ty`); add `fields: Vec<FieldDecl>` to `Stmt::Class`; add `ExprKind::Unwrap(Box<Expr>)`. Add `Display` arms for `Type::Optional` (renders `T?`), the new `ExprKind`, and field declarations in `Stmt::Class`. |
+| Parser | `src/parser.rs` | **Type parser:** accept a trailing `?` after any type → `Type::Optional` (works in `let`/`const`/param/return/field — general, not class-only). **Class body:** parse field declarations, accepting both `name?: T` (marker, lower to `Optional`) and `name: T?`. **Expressions:** add postfix `!`; **restructure precedence** so `?` (`Try`) and `!` (`Unwrap`) move out of the `postfix()` loop into a new tier *looser than `await`/unary* (so `await x!` ⇒ `(await x)!`, `await x?` ⇒ `(await x)?`). Add parser unit tests (`sexpr(...)`) pinning both the grouping and `T?` desugaring. |
+| Interpreter | `src/interp.rs` | Add a `check_type` arm for `Type::Optional(T)` (≡ `check_type(v, T) || v == nil`); store `FieldSchema` on the runtime `Class` (`value.rs`); check declared-field types on assignment (incl. inside `init`); implement `validate_into(class, obj, strict) -> Result<Instance, _>` (recurses into nested class / `array<Class>` / `map<K,Class>` fields, applies defaults, builds field path for errors); `.from` adapter (panics on `Err`); `ExprKind::Unwrap` eval arm (panic carrying the original error on `[_, err!=nil]`). |
 | Values | `src/value.rs` | Add `fields: IndexMap<String, FieldSchema>` to `struct Class`. |
 
 ### 8.2 Tooling that consumes the front-end
 
 | Subsystem | File(s) | Change |
 |---|---|---|
-| Formatter | `src/fmt.rs` | New `write_field` (emits `name?: Type = default`, **fields before methods** in the class body); add `ExprKind::Unwrap` arm to `write_expr_inner`; **add a precedence tier** in `expr_prec` (`PREC_TRY` between assign and unary) and move `Try` there + add `Unwrap` at postfix, so the formatter does **not** wrongly parenthesize `await x?` / `await x!`. Round-trip tests. |
-| Tree-sitter grammar | `docs/superpowers/specs/grammar/tree-sitter-ascript/grammar.js` | `class_body` → `repeat($.class_member)` where `class_member = choice(field_declaration, method_definition)`; new `field_declaration` rule with `?` **after the name, before `:`** (matching §3.1: `field('name'), optional('?'), ':', field('type'), optional(seq('=', $._expression))`); new `unwrap_expression` (postfix `!`); move `propagate_expression` (`?`) to a precedence tier looser than `unary`. Keep the declared `[$._expression, $.propagate_expression]` GLR conflict; watch for any new conflict on `!` (prefix-vs-postfix is position-disambiguated, `!=` is one token). **Regenerate `parser.c` with `tree-sitter generate --abi 14`.** |
+| Formatter | `src/fmt.rs` | Render `Type::Optional(T)` as `T?` (type rendering, used in all positions); new `write_field` emitting the **canonical** `name: Type? = default` form (i.e. normalize the `name?:` marker to a type-suffix `?`), **fields before methods** in the class body; do **not** rewrite an explicit `T \| nil` union to `T?`. Add `ExprKind::Unwrap` arm to `write_expr_inner`; **add a precedence tier** in `expr_prec` (`PREC_TRY` between assign and unary), move `Try` there, add `Unwrap` at postfix, so the formatter does **not** wrongly parenthesize `await x?` / `await x!`. Round-trip tests (incl. `name?:` → `name: T?` normalization). |
+| Tree-sitter grammar | `docs/superpowers/specs/grammar/tree-sitter-ascript/grammar.js` | New `optional_type` rule (`seq($._type, '?')`) added to `_type` — the general nullable suffix. `class_body` → `repeat($.class_member)` where `class_member = choice(field_declaration, method_definition)`; new `field_declaration` accepting **both** `name?: T` (`?` after name, before `:`) and `name: T?` (`field('name'), optional('?'), ':', field('type'), optional(seq('=', $._expression))`). New `unwrap_expression` (postfix `!`); move `propagate_expression` (`?`) to a precedence tier looser than `unary`. Keep `[$._expression, $.propagate_expression]`; **add a declared conflict for `?` at the type-position boundary** (nullable-suffix vs ternary/propagate) if `tree-sitter generate` reports one; watch for new `!` conflicts (prefix-vs-postfix is position-disambiguated, `!=` is one token). **Regenerate `parser.c` with `tree-sitter generate --abi 14`.** |
 | LSP | `src/lsp/analysis.rs` | Extend `document_symbols` `Stmt::Class` arm to emit declared fields as `SymbolKind::PROPERTY` children (currently methods-only). **Keyword list unchanged** (operators aren't completion items; `!`/`?` need no entry). No `ExprKind::Unwrap` arm needed (symbols walk statements, not expressions). Completion/hover for `obj.field` is **out of scope** (would need member type inference, which the LSP does not do). |
 | REPL | `src/repl.rs` | **No change.** It delegates entirely to `lexer::lex` + `parser::parse` + `Interp`; single-line (no completeness heuristic to update). Multi-line class bodies are a pre-existing limitation, unaffected. |
 
@@ -378,7 +411,7 @@ and semantics. Subsystems are listed with the *specific* change and a verdict.
 
 | Doc | Change |
 |---|---|
-| `docs/content/language/*` | Class fields (typed, `?` optional, defaults) on the classes page; add `!` next to `?`/`recover` on the error-tier page; note the `?`/`!` precedence-vs-`await` rule; extend the types/contracts page. |
+| `docs/content/language/*` | Types page: document the nullable suffix `T?` (≡ `T \| nil`, all positions) on the types/contracts page. Classes page: typed fields, both optional spellings (`name: T?` and `name?: T`), defaults. Error-tier page: add `!` next to `?`/`recover` and note the `?`/`!` precedence-vs-`await` rule. |
 | `docs/content/stdlib/net.md` | Document `resp.json(Class)` typed-parse argument. |
 | `docs/content/stdlib/data.md` | Document `json.parse(text, Class)` typed-parse argument. |
 | `docs/assets/app.js` (renderer) | **No change required.** The custom `highlightAScript()` keyword lists need no additions (no new keywords; field decls use existing tokens), and its operator regex already colorizes `!`/`?`. **Action: visually verify** the new examples render correctly once added (it's an audit, not an edit). |
