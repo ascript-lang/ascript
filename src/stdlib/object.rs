@@ -179,6 +179,20 @@ fn arr(v: Vec<Value>) -> Value {
     Value::Array(Rc::new(RefCell::new(v)))
 }
 
+/// Clone the field map of an object-like value (Object or class Instance).
+/// Tier-2 panic on any other kind.
+fn object_like_fields(
+    v: &Value,
+    span: Span,
+    ctx: &str,
+) -> Result<IndexMap<String, Value>, Control> {
+    match v {
+        Value::Object(o) => Ok(o.borrow().clone()),
+        Value::Instance(i) => Ok(i.borrow().fields.clone()),
+        _ => Err(AsError::at(format!("{} expects an object or instance", ctx), span).into()),
+    }
+}
+
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     let ctx = |f: &str| format!("object.{}", f);
     match func {
@@ -245,9 +259,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             Ok(Value::Object(Rc::new(RefCell::new(out))))
         }
         "pick" => {
-            let o = want_object(&arg(args, 0), span, &ctx("pick"))?;
+            let src = object_like_fields(&arg(args, 0), span, "object.pick")?;
             let keys = want_array(&arg(args, 1), span, &ctx("pick"))?;
-            let src = o.borrow();
             let mut out = IndexMap::new();
             for k in keys.borrow().iter() {
                 let k = want_string(k, span, &ctx("pick"))?;
@@ -258,15 +271,14 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             Ok(Value::Object(Rc::new(RefCell::new(out))))
         }
         "omit" => {
-            let o = want_object(&arg(args, 0), span, &ctx("omit"))?;
+            let src = object_like_fields(&arg(args, 0), span, "object.omit")?;
             let keys = want_array(&arg(args, 1), span, &ctx("omit"))?;
             let drop_set: std::collections::HashSet<String> = keys
                 .borrow()
                 .iter()
                 .map(|k| want_string(k, span, &ctx("omit")).map(|s| s.to_string()))
                 .collect::<Result<_, _>>()?;
-            let out: IndexMap<String, Value> = o
-                .borrow()
+            let out: IndexMap<String, Value> = src
                 .iter()
                 .filter(|(k, _)| !drop_set.contains(*k))
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -293,11 +305,10 @@ impl Interp {
     ) -> Result<Value, Control> {
         match func {
             "mapValues" => {
-                let o = want_object(&arg(args, 0), span, "object.mapValues")?;
+                // object_like_fields already clones out the map, so no RefCell
+                // borrow is held across any .await point.
+                let src = object_like_fields(&arg(args, 0), span, "object.mapValues")?;
                 let f = arg(args, 1);
-                // Clone out the entries before any .await to avoid holding a
-                // RefCell borrow across an await point.
-                let src = o.borrow().clone();
                 let mut out = IndexMap::new();
                 for (k, v) in src.iter() {
                     let mapped = self
@@ -585,6 +596,87 @@ mod tests {
         // unknown function still panics
         assert!(matches!(
             interp.call_object("nope", &[o], sp()).await,
+            Err(Control::Panic(_))
+        ));
+    }
+
+    /// Run a full multi-statement AScript program and retrieve a named binding.
+    async fn prog(interp: &Interp, src: &str, binding: &str) -> Value {
+        let tokens = crate::lexer::lex(src).expect("lex");
+        let stmts = crate::parser::parse(&tokens).expect("parse");
+        let env = crate::interp::global_env().child();
+        interp.exec(&stmts, &env).await.expect("exec");
+        env.get(binding).expect("binding")
+    }
+
+    #[tokio::test]
+    async fn object_fns_accept_instances() {
+        let interp = Interp::new();
+        // Build a class with default fields and construct an instance.
+        let inst = prog(
+            &interp,
+            r#"class P { name: string = "x"
+age: number = 3 }
+let __inst = P()"#,
+            "__inst",
+        )
+        .await;
+        // Confirm we actually got an Instance value
+        assert!(
+            matches!(inst, Value::Instance(_)),
+            "expected Instance, got: {inst}"
+        );
+
+        // pick on an instance -> Object with only picked fields
+        let picked = interp
+            .call_object("pick", &[inst.clone(), arr(vec![s("name")])], sp())
+            .await
+            .unwrap();
+        assert_eq!(picked.to_string(), obj(vec![("name", s("x"))]).to_string());
+
+        // omit on an instance -> Object without omitted field
+        let omitted = interp
+            .call_object("omit", &[inst.clone(), arr(vec![s("name")])], sp())
+            .await
+            .unwrap();
+        assert_eq!(
+            omitted.to_string(),
+            obj(vec![("age", Value::Number(3.0))]).to_string()
+        );
+
+        // mapValues on an instance -> Object with mapped values
+        let f = val(&interp, "(v, k) => k").await;
+        let mapped = interp
+            .call_object("mapValues", &[inst.clone(), f], sp())
+            .await
+            .unwrap();
+        // Each value maps to its key name
+        assert_eq!(
+            mapped.to_string(),
+            obj(vec![("name", s("name")), ("age", s("age"))]).to_string()
+        );
+
+        // a non-object/instance still produces a Tier-2 panic
+        assert!(matches!(
+            interp
+                .call_object("pick", &[Value::Number(1.0), arr(vec![])], sp())
+                .await,
+            Err(Control::Panic(_))
+        ));
+        assert!(matches!(
+            interp
+                .call_object("omit", &[Value::Number(1.0), arr(vec![])], sp())
+                .await,
+            Err(Control::Panic(_))
+        ));
+        assert!(matches!(
+            interp
+                .call_object(
+                    "mapValues",
+                    &[Value::Number(1.0), val(&interp, "(v) => v").await],
+                    sp()
+                )
+                .await,
             Err(Control::Panic(_))
         ));
     }

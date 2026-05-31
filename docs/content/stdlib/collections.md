@@ -734,37 +734,46 @@ object.fromEntries([["a", 1], ["b", 2]])   // {a: 1, b: 2}
 
 Return a new object containing only the specified keys.
 
-- `o: object` — the source object
+- `o: object | instance` — the source object or class instance (instance → its fields)
 - `keys: array` — array of `string` keys to keep
 - Returns: a new `object`
 
 ```ascript
 object.pick({a: 1, b: 2, c: 3}, ["a", "c"])   // {a: 1, c: 3}
+
+class Point { x: number = 0; y: number = 0; z: number = 0 }
+object.pick(Point(), ["x", "z"])               // {x: 0, z: 0}
 ```
 
 ### object.omit
 
 Return a new object with the specified keys removed.
 
-- `o: object` — the source object
+- `o: object | instance` — the source object or class instance (instance → its fields)
 - `keys: array` — array of `string` keys to remove
 - Returns: a new `object`
 
 ```ascript
 object.omit({a: 1, b: 2, c: 3}, ["b"])   // {a: 1, c: 3}
+
+class Point { x: number = 0; y: number = 0; z: number = 0 }
+object.omit(Point(), ["z"])               // {x: 0, y: 0}
 ```
 
 ### object.mapValues
 
 Return a new object with each value transformed by `f`. The callback receives both the value and the key.
 
-- `o: object` — the source object
+- `o: object | instance` — the source object or class instance (instance → its fields)
 - `f: function` — called as `f(value, key)`, returns the new value
 - Returns: a new `object`
 
 ```ascript
 object.mapValues({a: 1, b: 2}, (v, k) => v * 10)   // {a: 10, b: 20}
 object.mapValues({x: 1}, (v, k) => k)               // {x: "x"}
+
+class Coords { lat: number = 0; lng: number = 0 }
+object.mapValues(Coords(), (v, k) => "${k}=${v}")   // {lat: "lat=0", lng: "lng=0"}
 ```
 
 ### object.deepClone
