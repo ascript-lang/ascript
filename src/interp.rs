@@ -3097,6 +3097,45 @@ print(r[1])
         assert!(out2.contains("1"), "got: {out2}");
     }
 
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_with_class_validates() {
+        let src = "import * as json from \"std/json\"\n\
+                   class U { id: number\n name: string }\n\
+                   let [u, err] = json.parse(\"{\\\"id\\\":1,\\\"name\\\":\\\"Ada\\\"}\", U)\n\
+                   print(err == nil)\nprint(u.id)\nprint(u.name)";
+        let out = run(src).await;
+        assert!(out.contains("true") && out.contains("Ada"), "got: {out}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_with_class_fuses_errors() {
+        // shape mismatch comes back as a Tier-1 err, not a panic
+        let src = "import * as json from \"std/json\"\n\
+                   class U { id: number }\n\
+                   let [u, err] = json.parse(\"{\\\"id\\\":\\\"x\\\"}\", U)\n\
+                   print(u == nil)\nprint(err != nil)";
+        let out = run(src).await;
+        assert!(out.contains("true"), "got: {out}");
+        // bad JSON also comes back as err (parse channel)
+        let src2 = "import * as json from \"std/json\"\nclass U { id: number }\n\
+                    let [u, err] = json.parse(\"{not json\", U)\nprint(err != nil)";
+        let out2 = run(src2).await;
+        assert!(out2.contains("true"), "got: {out2}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_without_class_returns_raw_object() {
+        // With NO class argument, json.parse behaves exactly as before.
+        let src = "import * as json from \"std/json\"\n\
+                   let [v, err] = json.parse(\"{\\\"id\\\":1,\\\"name\\\":\\\"Ada\\\"}\")\n\
+                   print(err == nil)\nprint(v.id)\nprint(v.name)";
+        let out = run(src).await;
+        assert!(out.contains("true") && out.contains("Ada") && out.contains('1'), "got: {out}");
+    }
+
     #[tokio::test]
     async fn evaluates_arithmetic_with_precedence() {
         match eval_to_value("1 + 2 * 3").await {
