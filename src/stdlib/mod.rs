@@ -7,6 +7,7 @@
 pub mod array;
 pub mod bytes;
 pub mod cli;
+pub mod color;
 #[cfg(feature = "compress")]
 pub mod compress;
 pub mod convert;
@@ -77,6 +78,7 @@ pub(crate) fn bi(qualified: &str) -> Value {
 pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
         "std/cli" => cli::exports(),
+        "std/color" => color::exports(),
         "std/math" => math::exports(),
         "std/string" => string::exports(),
         "std/array" => array::exports(),
@@ -176,6 +178,7 @@ impl Interp {
         }
         match module {
             "cli" => self.call_cli(func, args, span).await,
+            "color" => color::call(func, args, span),
             "math" => math::call(func, args, span),
             "string" => string::call(func, args, span),
             "array" => self.call_array(func, args, span).await,
