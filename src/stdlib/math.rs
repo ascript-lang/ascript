@@ -31,7 +31,32 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("log10", bi("math.log10")),
         ("pi", Value::Number(std::f64::consts::PI)),
         ("e", Value::Number(std::f64::consts::E)),
+        ("sign", bi("math.sign")),
+        ("trunc", bi("math.trunc")),
+        ("clamp", bi("math.clamp")),
+        ("hypot", bi("math.hypot")),
+        ("gcd", bi("math.gcd")),
+        ("lcm", bi("math.lcm")),
     ]
+}
+
+/// Require `x` to be an integer-valued finite f64; returns it as i64 or panics.
+fn want_int(x: f64, span: Span, ctx: &str) -> Result<i64, Control> {
+    if x.fract() != 0.0 || !x.is_finite() {
+        return Err(AsError::at(format!("{} requires finite integer values", ctx), span).into());
+    }
+    Ok(x as i64)
+}
+
+fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
+    a = a.abs();
+    b = b.abs();
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -77,6 +102,55 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "ln" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("ln"))?.ln())),
         "log2" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("log2"))?.log2())),
         "log10" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("log10"))?.log10())),
+        "sign" => {
+            let x = want_number(&arg(args, 0), span, &ctx("sign"))?;
+            let r = if x.is_nan() {
+                f64::NAN
+            } else if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            Ok(Value::Number(r))
+        }
+        "trunc" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("trunc"))?.trunc())),
+        "clamp" => {
+            let x = want_number(&arg(args, 0), span, &ctx("clamp"))?;
+            let lo = want_number(&arg(args, 1), span, &ctx("clamp"))?;
+            let hi = want_number(&arg(args, 2), span, &ctx("clamp"))?;
+            if lo > hi {
+                return Err(AsError::at("math.clamp requires lo <= hi", span).into());
+            }
+            Ok(Value::Number(x.max(lo).min(hi)))
+        }
+        "hypot" => {
+            let x = want_number(&arg(args, 0), span, &ctx("hypot"))?;
+            let y = want_number(&arg(args, 1), span, &ctx("hypot"))?;
+            Ok(Value::Number(x.hypot(y)))
+        }
+        "gcd" => {
+            let a = want_int(want_number(&arg(args, 0), span, &ctx("gcd"))?, span, "math.gcd")?;
+            let b = want_int(want_number(&arg(args, 1), span, &ctx("gcd"))?, span, "math.gcd")?;
+            Ok(Value::Number(gcd_i64(a, b) as f64))
+        }
+        "lcm" => {
+            let a = want_int(want_number(&arg(args, 0), span, &ctx("lcm"))?, span, "math.lcm")?;
+            let b = want_int(want_number(&arg(args, 1), span, &ctx("lcm"))?, span, "math.lcm")?;
+            let g = gcd_i64(a, b);
+            let r = if g == 0 {
+                0i64
+            } else {
+                let product = (a as i128 / g as i128) * b as i128;
+                let abs = product.abs();
+                if abs > i64::MAX as i128 {
+                    return Err(AsError::at("math.lcm result overflows integer range", span).into());
+                }
+                abs as i64
+            };
+            Ok(Value::Number(r as f64))
+        }
         _ => Err(AsError::at(format!("std/math has no function '{}'", func), span).into()),
     }
 }
@@ -163,5 +237,19 @@ mod tests {
         let sp = Span::new(0, 0);
         assert!(matches!(call("min", &[], sp), Err(Control::Panic(_))));
         assert!(matches!(call("max", &[], sp), Err(Control::Panic(_))));
+    }
+
+    #[test]
+    fn math_scalar_helpers() {
+        assert_eq!(call("sign", &[n(-3.0)], sp()).unwrap(), n(-1.0));
+        assert_eq!(call("sign", &[n(0.0)], sp()).unwrap(), n(0.0));
+        assert!(matches!(call("sign", &[n(f64::NAN)], sp()).unwrap(), Value::Number(x) if x.is_nan()));
+        assert_eq!(call("trunc", &[n(3.7)], sp()).unwrap(), n(3.0));
+        assert_eq!(call("clamp", &[n(5.0), n(0.0), n(3.0)], sp()).unwrap(), n(3.0));
+        assert_eq!(call("hypot", &[n(3.0), n(4.0)], sp()).unwrap(), n(5.0));
+        assert_eq!(call("gcd", &[n(12.0), n(8.0)], sp()).unwrap(), n(4.0));
+        assert_eq!(call("lcm", &[n(4.0), n(6.0)], sp()).unwrap(), n(12.0));
+        assert!(matches!(call("clamp", &[n(1.0), n(3.0), n(0.0)], sp()), Err(Control::Panic(_))));
+        assert!(matches!(call("gcd", &[n(1.5), n(2.0)], sp()), Err(Control::Panic(_))));
     }
 }
