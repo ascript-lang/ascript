@@ -142,12 +142,30 @@ module.exports = grammar({
     // `let [a, b] = ...` array destructuring (Result returns, §6) and
     // `let {a, b as local, "k" as v} = ...` object destructuring.
     _binding_target: $ => choice($.identifier, $.array_pattern, $.object_pattern),
-    array_pattern: $ => seq('[', commaSep($.identifier), optional(','), ']'),
-    object_pattern: $ => seq('{', commaSep($.object_pattern_entry), optional(','), '}'),
+    // `let [a, ...xs] = ...` — a trailing `...name` collects the remaining elements.
+    array_pattern: $ => seq(
+      '[',
+      optional(choice(
+        $.rest_element,
+        seq(commaSep1($.identifier), optional(seq(',', $.rest_element)), optional(',')),
+      )),
+      ']',
+    ),
+    // `let {a, ...rest} = ...` — a trailing `...name` collects the leftover keys.
+    object_pattern: $ => seq(
+      '{',
+      optional(choice(
+        $.rest_element,
+        seq(commaSep1($.object_pattern_entry), optional(seq(',', $.rest_element)), optional(',')),
+      )),
+      '}',
+    ),
     object_pattern_entry: $ => seq(
       field('key', choice($.identifier, $.string)),
       optional(seq('as', field('binding', $.identifier))),
     ),
+    // `...name` rest collector in array/object destructuring (must be last).
+    rest_element: $ => seq('...', field('name', $.identifier)),
 
     function_declaration: $ => seq(
       optional('async'),
@@ -159,8 +177,21 @@ module.exports = grammar({
       field('body', $.block),
     ),
 
-    parameter_list: $ => seq('(', commaSep($.parameter), optional(','), ')'),
+    parameter_list: $ => seq(
+      '(',
+      optional(choice(
+        $.rest_parameter,
+        seq(commaSep1($.parameter), optional(seq(',', $.rest_parameter)), optional(',')),
+      )),
+      ')',
+    ),
     parameter: $ => seq(
+      field('name', $.identifier),
+      optional(seq(':', field('type', $._type))),
+    ),
+    // `...name[: array<T>]` rest parameter — collects trailing args (must be last).
+    rest_parameter: $ => seq(
+      '...',
       field('name', $.identifier),
       optional(seq(':', field('type', $._type))),
     ),

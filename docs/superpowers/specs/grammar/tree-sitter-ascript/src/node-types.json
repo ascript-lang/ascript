@@ -224,6 +224,10 @@
         {
           "type": "identifier",
           "named": true
+        },
+        {
+          "type": "rest_element",
+          "named": true
         }
       ]
     }
@@ -3204,6 +3208,10 @@
         {
           "type": "object_pattern_entry",
           "named": true
+        },
+        {
+          "type": "rest_element",
+          "named": true
         }
       ]
     }
@@ -3507,6 +3515,10 @@
         {
           "type": "parameter",
           "named": true
+        },
+        {
+          "type": "rest_parameter",
+          "named": true
         }
       ]
     }
@@ -3685,6 +3697,80 @@
           },
           {
             "type": "unwrap_expression",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "rest_element",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "rest_parameter",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "array_type",
+            "named": true
+          },
+          {
+            "type": "future_type",
+            "named": true
+          },
+          {
+            "type": "identifier",
+            "named": true
+          },
+          {
+            "type": "map_type",
+            "named": true
+          },
+          {
+            "type": "optional_type",
+            "named": true
+          },
+          {
+            "type": "primitive_type",
+            "named": true
+          },
+          {
+            "type": "result_type",
+            "named": true
+          },
+          {
+            "type": "tuple_type",
+            "named": true
+          },
+          {
+            "type": "union_type",
             "named": true
           }
         ]
