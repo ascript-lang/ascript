@@ -119,6 +119,27 @@ primary     := literal | identifier | "(" expr ")" | arrayLit | objectLit
 Precedence (high → low): `() [] . ?` → unary `! -` → `**` → `* / %` →
 `+ -` → comparison → `==`/`!=` → `&&` → `||` → `??` → assignment.
 
+### The spread operator `...`
+
+`...expr` expands a container in place. It is valid in three positions:
+
+```ascript
+let more   = [0, ...base, 4]              // array literal
+let config = {...defaults, port: 443}     // object literal
+sum3(...nums)                             // call arguments
+```
+
+- **In an array literal**, `...x` requires `x` to be an `array`; its elements are
+  inlined at that position. Spreads and plain items mix freely.
+- **In an object literal**, `...o` requires `o` to be an `object`; its entries are
+  merged. Merging is **later-value-wins** — a key appearing after a spread overrides
+  it — while the key keeps its **first-seen position** (insertion order is preserved).
+- **In a call**, `...args` requires `args` to be an `array`; its elements become
+  positional arguments (and combine with `...rest` parameters, §5).
+
+Spread is **strict**: spreading the wrong container kind (e.g. `[...5]`, `{...5}`, or
+a non-array as call args) is a Tier-2 panic (§6). There is no array↔object coercion.
+
 ---
 
 ## 4. Value Model
@@ -206,6 +227,32 @@ acceptable because checks happen only at typed binding/parameter/return sites, n
 on every element access. Use `array` (unparameterized) or `any` to opt out of the
 element scan.
 
+### Rest parameters
+
+A function's **last** parameter may be a rest collector `...name`, which gathers the
+trailing positional arguments into a fresh array (empty `[]` when none are passed):
+
+```ascript
+fn sum(...nums: array<number>) {        // nums : array<number>
+  let total = 0
+  for (n in nums) { total = total + n }
+  return total
+}
+sum(1, 2, 3, 4)   // 10
+sum()             // 0
+
+fn tagged(label, ...rest) { ... }       // fixed param + untyped rest
+```
+
+A rest parameter's type, if present, must be an **array type** (`array<T>`); each
+collected argument is contract-checked against the element type `T` as it is gathered
+(a mismatch panics, §6). A bare `...rest` (no annotation) is untyped. Declaring a rest
+parameter that is not last, or giving it a non-array type, is an error. Spread (below,
+§3) is the inverse: `f(...args)` expands an array back into positional arguments, so
+`...rest` collectors and `...spread` round-trip. For `async fn` / `fn*`, arity and
+rest-element contract errors surface lazily (when the future/generator is driven),
+consistent with §7.
+
 ---
 
 ## 6. Error Handling — Result Values (Two Tiers)
@@ -255,6 +302,47 @@ fn load(): Result<object> {
 `expr?` evaluates `expr` to a `[value, err]` pair; if `err != nil` it makes the
 enclosing function `return [nil, err]`, otherwise it evaluates to `value`. Using `?`
 in a function that does not return a Result pair is a compile-time error.
+
+### Destructuring `let` bindings
+
+The Tier-1 `[value, err]` convention is read with **array destructuring**; the same
+binding form also destructures objects.
+
+**Array destructuring** binds positionally:
+
+```ascript
+let [data, err] = readFile("config.toml")   // the Result idiom
+let [head, ...tail] = [10, 20, 30]           // head = 10, tail = [20, 30]
+```
+
+A trailing `...rest` collector gathers the remaining elements into a fresh array
+(empty `[]` if none remain). The collector must be last.
+
+**Object destructuring** binds by key from an `object` **or a class instance**:
+
+```ascript
+let user = {name: "Ada", role: "admin", "login count": 42}
+let {name, role as r} = user            // name = "Ada", r = "admin"
+let {"login count" as logins, missing} = user  // logins = 42, missing = nil
+```
+
+- A bare `{a}` binds local `a` to the value at key `"a"`; `{a as local}` renames via
+  the soft keyword `as`. Keys are identifiers or string literals — quote any key that
+  is not a bare identifier (`"login count" as logins`).
+- A **missing key binds `nil`** (no panic), so destructuring is total over the keys
+  it names.
+- A trailing `...rest` collector gathers the **remaining** keys into a fresh object,
+  excluding every key named in the pattern (matched against the source keys, by their
+  original name). Insertion order of the source object is preserved; empty `{}` if
+  nothing remains.
+
+```ascript
+let {id, ...meta} = {id: 7, role: "admin", active: true}
+// id = 7, meta = {role: "admin", active: true}
+```
+
+Destructuring a non-object (object pattern) or a non-array (array pattern) is a
+Tier-2 panic (§6) — there is no coercion between the two shapes.
 
 ### Tier 2 — Programmer bugs *panic*
 
@@ -626,6 +714,7 @@ Legend: ⚡ = async (returns awaitables); ⬡ = backed by a Rust crate.
 | `std/encoding` | base64, hex, url-encode/decode, utf8↔bytes | ⬡ `base64`, `hex` |
 | `std/bytes` | buffer type, read/write ints, endian handling | — |
 | `std/uuid` | v4 (random), v7 (time-ordered) | ⬡ `uuid` |
+| `std/log` | leveled structured logging — debug/info/warn/error, setLevel/setFormat (human/json), field merge, lazy thunks (§11.6) | — (reuses `std/json`) |
 
 **Time & locale**
 
@@ -912,6 +1001,45 @@ SSE client · response trailers.
 Everything else in the enumerated set is in-scope for **M14 (Async I/O)** and on by
 default.
 
+### 11.6 Structured logging (`std/log`)
+
+`std/log` is leveled, structured logging. Records emit to **stderr** under the CLI
+`run` command (the `Live` output sink, §12.1) — keeping `print`'s stdout clean — and
+buffer separately under `Capture` for tests.
+
+```ascript
+import * as log from "std/log"
+
+log.setLevel("debug")                                  // default "info"
+log.info("request", {method: "GET", path: "/users", ms: 12})
+log.warn("slow query", {ms: 540})
+
+log.setFormat("json")                                  // "human" (default) | "json"
+log.info("saved", {userId: 7, ok: true})
+log.debug(() => expensiveDetail())                     // thunk: only run if level passes
+```
+
+- **Levels:** `debug` < `info` < `warn` < `error`. `setLevel(name)` sets the
+  threshold; calls below it are dropped. The **initial level** is read from the
+  `ASCRIPT_LOG` environment variable (`debug`/`info`/`warn`/`error`), defaulting to
+  `info`.
+- **Record shape:** each `debug/info/warn/error(...)` call builds a record with a
+  `level` and a `msg` plus arbitrary fields. The **first argument**, if not an object,
+  becomes `msg`; subsequent **object** arguments are merged as fields; other
+  non-object args also fold into `msg`. The reserved keys `level` and `msg` are
+  authoritative — a user field of the same name can never clobber them.
+- **Lazy thunk:** if the **first** argument is a function, it is the message and is
+  invoked **only when the level passes** (after the filter), so a filtered
+  `log.debug(() => …)` does no work. An `async fn` thunk is awaited.
+- **Formats:** `setFormat("human")` (default) renders `[LEVEL] msg key=value …`;
+  `setFormat("json")` emits one JSON object per line (JSON-lines).
+- **Total serialization:** field values are serialized with a **lossy, never-panicking**
+  `Value`→JSON conversion — cycles become `"[Circular]"`, functions `"<function>"`,
+  `NaN`→`null` — so logging can never itself crash the program.
+
+`std/log` is gated by a default-on **`log` Cargo feature** (which depends on `data`,
+for the JSON serializer).
+
 ---
 
 ## 12. Runtime Architecture (Rust)
@@ -925,6 +1053,21 @@ source(.as)
   → resolver   → scope + module binding, ?-validity, const checks
   → interp     → async tree-walking evaluator on the Tokio executor
 ```
+
+**`print` output sink.** Where `print` writes is chosen by the host via an
+`OutputSink`:
+
+- **`Live`** — used by the CLI `run` command. Each `print` is written straight to
+  `stdout` as it executes, so a long-running program streams its output live (and any
+  output already produced **survives a later panic** instead of being lost with a
+  buffered string). `run_file` returns `Result<(), AsError>` — it owns no captured
+  output.
+- **`Capture`** — used by `run_source`, the REPL, and the test runner. Output is
+  buffered into a string the host reads back, so embedders and tests can assert on it
+  deterministically.
+
+`std/log` records follow the same split: under `Live` they go to **stderr** (keeping
+`print` on stdout clean); under `Capture` they buffer separately for tests.
 
 ### 12.2 Crate/module layout (workspace)
 
@@ -960,8 +1103,9 @@ Single-threaded ⇒ `Rc`/`RefCell`, never `Arc`/`Mutex`.
 
 ### 12.4 Dependency feature gating
 
-Stdlib groups are Cargo features (`data`, `net`, `sql`, `tui`, `intl`, `crypto`)
-so an embedder can build a smaller `ascript` without, say, SQLite or TUI.
+Stdlib groups are Cargo features (`data`, `net`, `sql`, `tui`, `intl`, `crypto`,
+`log` — the last depends on `data`) so an embedder can build a smaller `ascript`
+without, say, SQLite or TUI.
 
 ---
 
