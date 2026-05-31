@@ -635,6 +635,15 @@ mod tests {
     }
 
     #[test]
+    fn optional_type_round_trips() {
+        // `T?` survives a format pass unchanged in let/param/return positions.
+        let src = "let x: number? = nil\n";
+        assert_eq!(format_source(src).unwrap(), src);
+        let src2 = "fn f(a: string?): number? {\n  return nil\n}\n";
+        assert_eq!(format_source(src2).unwrap(), src2);
+    }
+
+    #[test]
     fn formats_ternary() {
         // Canonical spacing.
         assert_eq!(format_source("let x=a?b:c").unwrap(), "let x = a ? b : c\n");
