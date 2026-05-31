@@ -1001,6 +1001,38 @@ impl Interp {
                     Err(Control::Propagate(make_pair(Value::Nil, err)))
                 }
             }
+            ExprKind::Unwrap(inner) => {
+                let v = self.eval_expr(inner, env).await?;
+                let arr = match &v {
+                    Value::Array(a) if a.borrow().len() == 2 => a.clone(),
+                    _ => {
+                        return Err(AsError::at(
+                            "the ! operator requires a Result pair [value, err]",
+                            expr.span,
+                        )
+                        .into())
+                    }
+                };
+                let (value, err) = {
+                    let b = arr.borrow();
+                    (b[0].clone(), b[1].clone())
+                };
+                if err == Value::Nil {
+                    Ok(value)
+                } else {
+                    // Promote the Tier-1 error to a Tier-2 panic, preserving the
+                    // original error's message so `recover` round-trips it.
+                    let msg = match &err {
+                        Value::Object(o) => match o.borrow().get("message") {
+                            Some(Value::Str(s)) => s.to_string(),
+                            _ => err.to_string(),
+                        },
+                        Value::Str(s) => s.to_string(),
+                        _ => err.to_string(),
+                    };
+                    Err(AsError::at(msg, expr.span).into())
+                }
+            }
             ExprKind::OptMember { .. }
             | ExprKind::Member { .. }
             | ExprKind::Index { .. }
@@ -2627,6 +2659,35 @@ print(r[1])
             Stmt::Expr(e) => interp.eval_expr(e, &env).await.unwrap(),
             _ => panic!("last statement must be an expression"),
         }
+    }
+
+    async fn run_to_output(src: &str) -> String {
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        interp.output().to_string()
+    }
+
+    #[tokio::test]
+    async fn unwrap_returns_value_on_ok_pair() {
+        assert_eq!(eval_to_value("[42, nil]!").await, Value::Number(42.0));
+        assert_eq!(eval_to_value("Ok(7)!").await, Value::Number(7.0));
+    }
+
+    #[tokio::test]
+    async fn unwrap_panics_on_err_pair_preserving_message() {
+        // `!` on an error pair panics; recover round-trips the original message.
+        let src = "let r = recover(() => Err(\"boom\")!)\nprint(r[1].message)";
+        let out = run_to_output(src).await;
+        assert!(out.contains("boom"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn unwrap_on_non_pair_is_a_panic() {
+        let src = "let r = recover(() => 5!)\nprint(r[1] != nil)";
+        let out = run_to_output(src).await;
+        assert!(out.contains("true"), "got: {out}");
     }
 
     #[tokio::test]
