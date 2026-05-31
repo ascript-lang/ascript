@@ -6,8 +6,8 @@
 //! re-parses to an equivalent program, and `format(format(x)) == format(x)`.
 
 use crate::ast::{
-    ArrowBody, BinOp, EnumVariantDecl, Expr, ExprKind, FieldDecl, ImportNames, MatchArm,
-    MethodDecl, Param, Stmt, TemplatePart, Type, UnOp,
+    ArrayElem, ArrowBody, BinOp, CallArg, EnumVariantDecl, Expr, ExprKind, FieldDecl, ImportNames,
+    MatchArm, MethodDecl, ObjEntry, Param, Stmt, TemplatePart, Type, UnOp,
 };
 use crate::error::AsError;
 
@@ -434,7 +434,13 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_expr(out, a, PREC_ASSIGN);
+                match a {
+                    CallArg::Pos(x) => write_expr(out, x, PREC_ASSIGN),
+                    CallArg::Spread(x) => {
+                        out.push_str("...");
+                        write_expr(out, x, PREC_ASSIGN);
+                    }
+                }
             }
             out.push(')');
         }
@@ -466,7 +472,13 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                 if i > 0 {
                     out.push_str(", ");
                 }
-                write_expr(out, it, PREC_ASSIGN);
+                match it {
+                    ArrayElem::Item(x) => write_expr(out, x, PREC_ASSIGN),
+                    ArrayElem::Spread(x) => {
+                        out.push_str("...");
+                        write_expr(out, x, PREC_ASSIGN);
+                    }
+                }
             }
             out.push(']');
         }
@@ -481,13 +493,21 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                 out.push_str("{}");
             } else {
                 out.push_str("{ ");
-                for (i, (k, v)) in entries.iter().enumerate() {
+                for (i, e) in entries.iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
                     }
-                    out.push_str(&object_key(k));
-                    out.push_str(": ");
-                    write_expr(out, v, PREC_ASSIGN);
+                    match e {
+                        ObjEntry::KV(k, v) => {
+                            out.push_str(&object_key(k));
+                            out.push_str(": ");
+                            write_expr(out, v, PREC_ASSIGN);
+                        }
+                        ObjEntry::Spread(x) => {
+                            out.push_str("...");
+                            write_expr(out, x, PREC_ASSIGN);
+                        }
+                    }
                 }
                 out.push_str(" }");
             }
@@ -666,6 +686,23 @@ mod tests {
         }
         // a single explicit paren group renders as exactly one set
         assert_eq!(format_source("(a + b) * c").unwrap(), "(a + b) * c\n");
+    }
+
+    #[test]
+    fn fmt_spread_roundtrips() {
+        // Arrays and calls round-trip exactly; object literals canonicalize to
+        // the spaced `{ ... }` form (matching all other object output).
+        let cases = [
+            ("let a = [...x, 1]\n", "let a = [...x, 1]\n"),
+            ("let o = {...x, k: 1}\n", "let o = { ...x, k: 1 }\n"),
+            ("f(...args, 2)\n", "f(...args, 2)\n"),
+        ];
+        for (src, expected) in cases {
+            let out = format_source(src).unwrap();
+            assert_eq!(out, expected, "fmt mismatch for: {src}");
+            // and idempotent
+            assert_eq!(format_source(&out).unwrap(), expected);
+        }
     }
 
     #[test]

@@ -940,15 +940,61 @@ impl Interp {
             ExprKind::Array(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
-                    values.push(self.eval_expr(item, env).await?);
+                    match item {
+                        crate::ast::ArrayElem::Item(x) => {
+                            values.push(self.eval_expr(x, env).await?)
+                        }
+                        crate::ast::ArrayElem::Spread(x) => {
+                            let v = self.eval_expr(x, env).await?;
+                            match v {
+                                Value::Array(a) => {
+                                    values.extend(a.borrow().iter().cloned())
+                                }
+                                other => {
+                                    return Err(AsError::at(
+                                        format!(
+                                            "can only spread an array into an array, got {}",
+                                            type_name(&other)
+                                        ),
+                                        x.span,
+                                    )
+                                    .into())
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(Value::Array(Rc::new(RefCell::new(values))))
             }
             ExprKind::Object(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
-                for (k, v) in entries {
-                    let value = self.eval_expr(v, env).await?;
-                    map.insert(k.clone(), value);
+                for entry in entries {
+                    match entry {
+                        crate::ast::ObjEntry::KV(k, v) => {
+                            let value = self.eval_expr(v, env).await?;
+                            map.insert(k.clone(), value);
+                        }
+                        crate::ast::ObjEntry::Spread(x) => {
+                            let v = self.eval_expr(x, env).await?;
+                            match v {
+                                Value::Object(o) => {
+                                    for (k, val) in o.borrow().iter() {
+                                        map.insert(k.clone(), val.clone());
+                                    }
+                                }
+                                other => {
+                                    return Err(AsError::at(
+                                        format!(
+                                            "can only spread an object into an object, got {}",
+                                            type_name(&other)
+                                        ),
+                                        x.span,
+                                    )
+                                    .into())
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(map))))
             }
@@ -1127,7 +1173,25 @@ impl Interp {
                 }
                 let mut values = Vec::new();
                 for a in args {
-                    values.push(self.eval_expr(a, env).await?);
+                    match a {
+                        crate::ast::CallArg::Pos(x) => values.push(self.eval_expr(x, env).await?),
+                        crate::ast::CallArg::Spread(x) => {
+                            let v = self.eval_expr(x, env).await?;
+                            match v {
+                                Value::Array(arr) => values.extend(arr.borrow().iter().cloned()),
+                                other => {
+                                    return Err(AsError::at(
+                                        format!(
+                                            "can only spread an array as call arguments, got {}",
+                                            type_name(&other)
+                                        ),
+                                        x.span,
+                                    )
+                                    .into())
+                                }
+                            }
+                        }
+                    }
                 }
                 let v = self.call_value(callee_v, values, expr.span).await;
                 Ok((v?, false))
@@ -2269,6 +2333,27 @@ mod tests {
             Ok(_) => panic!("expected a runtime panic, but the program succeeded"),
             Err(Control::Propagate(_)) => panic!("expected a panic, got a `?` propagation"),
         }
+    }
+
+    #[tokio::test]
+    async fn spread_array_object_call_eval() {
+        let out = run(r#"
+let a = [1, 2]
+let b = [...a, 3]
+print(b)
+let o = {x: 1}
+let p = {...o, y: 2, x: 9}
+print(p)
+fn add(a, b, c) { return a + b + c }
+print(add(...[1, 2, 3]))
+"#).await;
+        assert_eq!(out, "[1, 2, 3]\n{x: 9, y: 2}\n6\n");
+    }
+
+    #[tokio::test]
+    async fn spread_wrong_type_panics() {
+        assert!(run_err("let a = [...5]").await.message.contains("can only spread an array"));
+        assert!(run_err("let o = {...5}").await.message.contains("can only spread an object"));
     }
 
     #[tokio::test]

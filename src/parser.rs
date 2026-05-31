@@ -1070,7 +1070,12 @@ impl<'a> Parser<'a> {
                     let mut args = Vec::new();
                     if *self.peek() != Tok::RParen {
                         loop {
-                            args.push(self.expr()?);
+                            if *self.peek() == Tok::DotDotDot {
+                                self.advance();
+                                args.push(crate::ast::CallArg::Spread(self.expr()?));
+                            } else {
+                                args.push(crate::ast::CallArg::Pos(self.expr()?));
+                            }
                             if *self.peek() == Tok::Comma {
                                 self.advance();
                                 if *self.peek() == Tok::RParen {
@@ -1150,7 +1155,12 @@ impl<'a> Parser<'a> {
                 let mut items = Vec::new();
                 if *self.peek() != Tok::RBracket {
                     loop {
-                        items.push(self.expr()?);
+                        if *self.peek() == Tok::DotDotDot {
+                            self.advance();
+                            items.push(crate::ast::ArrayElem::Spread(self.expr()?));
+                        } else {
+                            items.push(crate::ast::ArrayElem::Item(self.expr()?));
+                        }
                         if *self.peek() == Tok::Comma {
                             self.advance();
                             if *self.peek() == Tok::RBracket {
@@ -1169,19 +1179,24 @@ impl<'a> Parser<'a> {
                 let mut entries = Vec::new();
                 if *self.peek() != Tok::RBrace {
                     loop {
-                        let key = match self.advance() {
-                            Tok::Ident(name) => name,
-                            Tok::Str(s) => s,
-                            other => {
-                                return Err(AsError::at(
-                                    format!("expected object key, found {:?}", other),
-                                    self.tokens[self.pos - 1].span,
-                                ))
-                            }
-                        };
-                        self.eat(&Tok::Colon)?;
-                        let value = self.expr()?;
-                        entries.push((key, value));
+                        if *self.peek() == Tok::DotDotDot {
+                            self.advance();
+                            entries.push(crate::ast::ObjEntry::Spread(self.expr()?));
+                        } else {
+                            let key = match self.advance() {
+                                Tok::Ident(name) => name,
+                                Tok::Str(s) => s,
+                                other => {
+                                    return Err(AsError::at(
+                                        format!("expected object key, found {:?}", other),
+                                        self.tokens[self.pos - 1].span,
+                                    ))
+                                }
+                            };
+                            self.eat(&Tok::Colon)?;
+                            let value = self.expr()?;
+                            entries.push(crate::ast::ObjEntry::KV(key, value));
+                        }
                         if *self.peek() == Tok::Comma {
                             self.advance();
                             if *self.peek() == Tok::RBrace {
@@ -1375,6 +1390,13 @@ mod tests {
         assert!(parse(&lex("let r: Result<string> = Ok(\"x\")").unwrap()).is_ok());
         assert!(parse(&lex("let u: number | nil = nil").unwrap()).is_ok());
         assert!(parse(&lex("let t: [number, string] = [1, \"a\"]").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn parses_spread_in_array_object_call() {
+        assert!(parse(&lex("let a = [...x, 1]").unwrap()).is_ok());
+        assert!(parse(&lex("let o = {...x, k: 1}").unwrap()).is_ok());
+        assert!(parse(&lex("f(...args, 2)").unwrap()).is_ok());
     }
 
     #[test]

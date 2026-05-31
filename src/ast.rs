@@ -19,12 +19,12 @@ pub enum ExprKind {
     Ident(String),
     Unary { op: UnOp, expr: Box<Expr> },
     Binary { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
-    Call { callee: Box<Expr>, args: Vec<Expr> },
+    Call { callee: Box<Expr>, args: Vec<CallArg> },
     Assign { target: Box<Expr>, value: Box<Expr> },
     Arrow { params: Vec<Param>, body: Box<ArrowBody>, is_async: bool, is_generator: bool },
-    Array(Vec<Expr>),
+    Array(Vec<ArrayElem>),
     Index { object: Box<Expr>, index: Box<Expr> },
-    Object(Vec<(String, Expr)>),
+    Object(Vec<ObjEntry>),
     Member { object: Box<Expr>, name: String },
     OptMember { object: Box<Expr>, name: String },
     Try(Box<Expr>),
@@ -47,6 +47,31 @@ pub enum ExprKind {
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
     /// short-circuiting (spec §4, matching JS).
     Paren(Box<Expr>),
+}
+
+/// An element of an array literal: a plain item `x` or a spread `...x`.
+/// Spreading a non-array is a runtime panic (strict, no coercion).
+#[derive(Debug, Clone)]
+pub enum ArrayElem {
+    Item(Expr),
+    Spread(Expr),
+}
+
+/// An entry in an object literal: a key/value `k: v` or a spread `...o`.
+/// Object-spread is later-value-wins; `IndexMap` keeps first-seen key position.
+/// Spreading a non-object is a runtime panic (strict, no coercion).
+#[derive(Debug, Clone)]
+pub enum ObjEntry {
+    KV(String, Expr),
+    Spread(Expr),
+}
+
+/// A call argument: positional `x` or a spread `...args`.
+/// Spreading a non-array as call args is a runtime panic (strict).
+#[derive(Debug, Clone)]
+pub enum CallArg {
+    Pos(Expr),
+    Spread(Expr),
 }
 
 /// A type annotation (spec §5). Checked at runtime as a contract.
@@ -311,7 +336,10 @@ impl fmt::Display for ExprKind {
             ExprKind::Call { callee, args } => {
                 write!(f, "(call {}", callee)?;
                 for a in args {
-                    write!(f, " {}", a)?;
+                    match a {
+                        CallArg::Pos(x) => write!(f, " {}", x)?,
+                        CallArg::Spread(x) => write!(f, " ...{}", x)?,
+                    }
                 }
                 write!(f, ")")
             }
@@ -326,18 +354,24 @@ impl fmt::Display for ExprKind {
                     if i > 0 {
                         write!(f, " ")?;
                     }
-                    write!(f, "{}", it)?;
+                    match it {
+                        ArrayElem::Item(x) => write!(f, "{}", x)?,
+                        ArrayElem::Spread(x) => write!(f, "...{}", x)?,
+                    }
                 }
                 write!(f, "]")
             }
             ExprKind::Index { object, index } => write!(f, "(index {} {})", object, index),
             ExprKind::Object(entries) => {
                 write!(f, "{{")?;
-                for (i, (k, v)) in entries.iter().enumerate() {
+                for (i, e) in entries.iter().enumerate() {
                     if i > 0 {
                         write!(f, " ")?;
                     }
-                    write!(f, "{}: {}", k, v)?;
+                    match e {
+                        ObjEntry::KV(k, v) => write!(f, "{}: {}", k, v)?,
+                        ObjEntry::Spread(x) => write!(f, "...{}", x)?,
+                    }
                 }
                 write!(f, "}}")
             }
