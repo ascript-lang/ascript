@@ -104,6 +104,9 @@ pub struct Param {
     pub ty: Option<Type>,
     /// Span of just the parameter name (for LSP go-to-definition).
     pub name_span: Span,
+    /// `true` if this is a rest parameter (`...name`), which collects trailing
+    /// arguments into an array. A rest parameter must be the last parameter.
+    pub rest: bool,
 }
 
 /// One `{key as binding}` entry in an object-destructuring pattern. `key` is the

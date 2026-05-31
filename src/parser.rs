@@ -432,6 +432,12 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if *self.peek() != Tok::RParen {
             loop {
+                let is_rest = if *self.peek() == Tok::DotDotDot {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
                 let name = match self.advance() {
                     Tok::Ident(name) => name,
                     other => {
@@ -448,7 +454,13 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                params.push(crate::ast::Param { name, ty, name_span });
+                params.push(crate::ast::Param { name, ty, name_span, rest: is_rest });
+                if is_rest {
+                    if *self.peek() == Tok::Comma {
+                        return Err(AsError::at("a rest parameter must be last", name_span));
+                    }
+                    break;
+                }
                 if *self.peek() == Tok::Comma {
                     self.advance();
                     if *self.peek() == Tok::RParen {
@@ -780,7 +792,7 @@ impl<'a> Parser<'a> {
                 let end = self.prev_end();
                 return Ok(Some(Expr {
                     kind: ExprKind::Arrow {
-                        params: vec![crate::ast::Param { name, ty: None, name_span }],
+                        params: vec![crate::ast::Param { name, ty: None, name_span, rest: false }],
                         body: Box::new(body),
                         is_async,
                         is_generator: false,
@@ -1323,6 +1335,28 @@ mod tests {
             Stmt::Expr(e) => e.to_string(),
             _ => panic!("expected an expression statement"),
         }
+    }
+
+    #[test]
+    fn parses_rest_param_typed_and_untyped() {
+        match &parse(&lex("fn f(a, ...rest: array<number>) {}").unwrap()).unwrap()[0] {
+            Stmt::Fn { params, .. } => {
+                assert_eq!(params.len(), 2);
+                assert!(!params[0].rest);
+                assert!(params[1].rest);
+                assert_eq!(params[1].ty.as_ref().unwrap().to_string(), "array<number>");
+            }
+            o => panic!("got {o:?}"),
+        }
+        match &parse(&lex("fn g(...rest) {}").unwrap()).unwrap()[0] {
+            Stmt::Fn { params, .. } => assert!(params[0].rest && params[0].ty.is_none()),
+            o => panic!("got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn rest_param_must_be_last() {
+        assert!(parse(&lex("fn f(...rest, a) {}").unwrap()).is_err());
     }
 
     #[test]
