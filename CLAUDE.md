@@ -47,6 +47,11 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > exhaustive matches in `interp.rs` (eval), `fmt.rs` (`write_expr_inner`), and `ast.rs` (`Display`)
 > must each get an arm.
 >
+> **`;` separators**: `;` is an optional statement separator (`skip_semicolons`) honored in
+> top-level/block statement lists AND class bodies (members are self-delimiting). Enums/match-arms/
+> params/literals are comma-delimited and do NOT take `;`. The formatter always canonicalizes to
+> newlines.
+>
 > **Unwrap `!` and the `?`/`!` precedence tier (class-shape-validation feature).** Postfix `!` is
 > `ExprKind::Unwrap(Box<Expr>)` (force-unwrap of a `[value, err]` pair — yields `value`, or a
 > *recoverable* panic carrying the original error message). Both `?` (`Try`) and `!` (`Unwrap`) live
@@ -128,6 +133,11 @@ is static-analysis only and never instantiates the interpreter).
 Source flows as: `lexer::lex(src)` → `parser::parse(&tokens)` → `Interp::exec`/`load_module`. Every
 token and AST node carries a `Span` (byte offsets + line/col) so `diagnostics` (ariadne-backed) can
 point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_source`, `run_tests`.
+
+**REPL multi-line input**: `repl.rs` buffers lines while `is_incomplete` (positive delimiter-TOKEN
+depth, or unterminated string/template at EOF) on a `..` prompt, then execs the whole buffer against
+the persistent session `Interp`+`Environment` (state already persists across lines). Token-depth
+(not raw-brace) counting keeps `${…}` template braces from skewing the depth.
 
 ### The interpreter (`src/interp.rs`)
 - `eval_expr`/`exec` are `async` (`#[async_recursion]`) and take **`&self`** (not `&mut self`) —

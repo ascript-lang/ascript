@@ -15,7 +15,9 @@ Source files are UTF-8 and use the `.as` extension.
 ```
 
 Statements are newline-terminated with lightweight automatic semicolon insertion. An explicit `;` is
-always allowed but never required.
+always allowed but never required. The same optional `;` may separate **class members**
+(`class P { x: number; y: number }`); newlines are the canonical form and the formatter normalizes
+`;` back to newlines. Note that `enum` variants are **comma**-separated, not `;`-separated.
 
 **Keywords:** `let const fn return if else while for of in match async await class extends super self
 enum import export nil true false`.

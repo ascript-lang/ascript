@@ -75,8 +75,10 @@ For quick experiments, start the interactive read-eval-print loop:
 ascript repl
 ```
 
-Expressions are evaluated and printed; `let`/`const` bindings persist across lines within the
-session. See [The ascript CLI](cli) for the formatter, test runner, and language server.
+Expressions are evaluated and printed; `let`/`const` bindings, functions, and imports persist across
+lines within the session. Multi-line constructs (a `class`, a `fn` body, a multi-line object/array)
+continue on a `..` prompt until the input is complete — press `Ctrl-C` to cancel a partial entry.
+See [The ascript CLI](cli) for the formatter, test runner, and language server.
 
 ## Feature flags
 

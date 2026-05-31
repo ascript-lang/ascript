@@ -18,18 +18,31 @@ prints a diagnostic with a source span and exits with a non-zero status.
 
 ## `ascript repl`
 
-Start the interactive read-eval-print loop. Expression results are printed automatically; `let` and
-`const` bindings persist for the session.
+Start the interactive read-eval-print loop. Expression results are printed automatically. Session
+state persists across lines — `let`/`const` bindings, function definitions, and imports all stay
+available for the rest of the session.
+
+Multi-line input continues automatically: when a line leaves a delimiter unclosed (or a string /
+template unterminated), the REPL switches to a `..` continuation prompt and keeps reading until the
+input is complete, then runs the whole buffer at once. Press `Ctrl-C` to cancel a partial entry
+(this clears the buffer rather than exiting).
 
 ```text
 ascript repl
 ```
 
 ```text
-> let xs = [1, 2, 3]
-> import * as array from "std/array"
-> array.reduce(xs, (a, b) => a + b, 0)
+>> let xs = [1, 2, 3]
+>> import * as array from "std/array"
+>> array.reduce(xs, (a, b) => a + b, 0)
 6
+>> class Point {
+..   x: number
+..   y: number
+.. }
+>> let p = Point.from({x: 3, y: 4})
+>> p.x + p.y
+7
 ```
 
 ## `ascript fmt`

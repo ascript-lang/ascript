@@ -267,6 +267,11 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         let mut methods = Vec::new();
         while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            // `;` is an optional separator between (and after) class members.
+            self.skip_semicolons();
+            if *self.peek() == Tok::RBrace {
+                break;
+            }
             // A member starting with `async` or `fn` is a method; otherwise a field.
             if *self.peek() == Tok::Async || *self.peek() == Tok::Fn {
                 let mstart = self.span().start;
@@ -1775,5 +1780,33 @@ mod tests {
         assert_eq!(stmts.len(), 2);
         assert!(matches!(&stmts[0], Stmt::Expr(e) if matches!(e.kind, ExprKind::Try(_))));
         assert!(matches!(&stmts[1], Stmt::Expr(e) if matches!(e.kind, ExprKind::Ternary { .. })));
+    }
+
+    #[test]
+    fn class_body_allows_semicolon_separators() {
+        let p = parse(&lex("class P { x: number; y: number }").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::Class { fields, .. } => assert_eq!(fields.len(), 2),
+            other => panic!("expected Class, got {other:?}"),
+        }
+        assert!(parse(&lex("class C { fn a() {}; fn b() {}; }").unwrap()).is_ok());
+        assert!(parse(&lex("class M { n: number; fn get() { return self.n } }").unwrap()).is_ok());
+        assert!(parse(&lex("class N {\n  a: number\n  b: number\n}").unwrap()).is_ok()); // no regression
+    }
+
+    #[test]
+    fn class_body_semicolon_edge_cases() {
+        assert!(parse(&lex("class C {}").unwrap()).is_ok()); // empty
+        assert!(parse(&lex("class C { ; x: number }").unwrap()).is_ok()); // leading ;
+        assert!(parse(&lex("class C { ; ; }").unwrap()).is_ok()); // only ;
+        assert!(parse(&lex("class C { a: number;; b: number }").unwrap()).is_ok()); // doubled ;;
+        assert!(parse(&lex("class C { fn a() {}; }").unwrap()).is_ok()); // trailing ;
+    }
+
+    #[test]
+    fn class_with_semicolons_formats_to_newlines() {
+        let out = crate::fmt::format_source("class P { x: number; y: number }").unwrap();
+        assert!(out.contains("x: number\n"), "got: {out}");
+        assert!(!out.contains(';'), "formatter should not emit semicolons: {out}");
     }
 }
