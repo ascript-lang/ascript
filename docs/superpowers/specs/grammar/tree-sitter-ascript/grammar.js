@@ -427,6 +427,9 @@ module.exports = grammar({
     future_type: $ => seq('future', '<', $._type, '>'),
     tuple_type: $ => seq('[', commaSep1($._type), optional(','), ']'),
     // T? — nullable suffix (sugar for `T | nil`). Reachable only inside `_type`.
+    // The inner `choice` is the non-recursive subset of `_type_atom` (avoids
+    // left-recursion / `T??`); KEEP IN SYNC with `_type_atom` if a new type atom
+    // is added there and should accept a `?` suffix.
     optional_type: $ => prec(PREC.postfix, seq(
       choice(
         $.primitive_type, $.array_type, $.map_type, $.result_type,

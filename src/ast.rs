@@ -63,8 +63,8 @@ pub enum Type {
     Named(String),
     Map(Box<Type>, Box<Type>),
     Future(Box<Type>),
-    /// `T?` — nullable type, sugar for `T | nil`. Both `T?` and the class-field
-    /// marker `name?:` lower to this node.
+    /// `T?` — nullable type, sugar for `T | nil`. The class-field marker
+    /// `name?:` will also lower to this node once class fields land (Phase 3).
     Optional(Box<Type>),
 }
 
