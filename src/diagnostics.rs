@@ -28,5 +28,8 @@ pub fn report(err: &AsError) {
 
 /// Convert a char offset into a byte offset within `text`.
 fn char_to_byte(text: &str, char_off: usize) -> usize {
-    text.char_indices().nth(char_off).map(|(b, _)| b).unwrap_or(text.len())
+    text.char_indices()
+        .nth(char_off)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
 }

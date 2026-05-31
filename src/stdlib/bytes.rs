@@ -24,7 +24,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     ]
 }
 
-fn bytes_val(v: Vec<u8>) -> Value { Value::Bytes(Rc::new(RefCell::new(v))) }
+fn bytes_val(v: Vec<u8>) -> Value {
+    Value::Bytes(Rc::new(RefCell::new(v)))
+}
 
 /// A non-negative integer offset/index/size, validated BEFORE the f64→usize
 /// cast so a pathological value (NaN, inf, 1e30) yields a clean AScript Tier-2
@@ -32,7 +34,14 @@ fn bytes_val(v: Vec<u8>) -> Value { Value::Bytes(Rc::new(RefCell::new(v))) }
 fn want_index(v: &Value, span: Span, ctx: &str) -> Result<usize, Control> {
     let n = want_number(v, span, ctx)?;
     if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > (u32::MAX as f64) {
-        return Err(AsError::at(format!("{}: expected a non-negative integer offset/size, got {}", ctx, n), span).into());
+        return Err(AsError::at(
+            format!(
+                "{}: expected a non-negative integer offset/size, got {}",
+                ctx, n
+            ),
+            span,
+        )
+        .into());
     }
     Ok(n as usize)
 }
@@ -40,7 +49,11 @@ fn want_index(v: &Value, span: Span, ctx: &str) -> Result<usize, Control> {
 fn want_byte(v: &Value, span: Span, ctx: &str) -> Result<u8, Control> {
     let n = want_number(v, span, ctx)?;
     if n.fract() != 0.0 || !(0.0..=255.0).contains(&n) {
-        return Err(AsError::at(format!("{}: byte value must be an integer 0..=255, got {}", ctx, n), span).into());
+        return Err(AsError::at(
+            format!("{}: byte value must be an integer 0..=255, got {}", ctx, n),
+            span,
+        )
+        .into());
     }
     Ok(n as u8)
 }
@@ -71,14 +84,24 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "toArray" => {
             let b = want_bytes(&arg(args, 0), span, &ctx("toArray"))?;
-            let arr: Vec<Value> = b.borrow().iter().map(|&x| Value::Number(x as f64)).collect();
+            let arr: Vec<Value> = b
+                .borrow()
+                .iter()
+                .map(|&x| Value::Number(x as f64))
+                .collect();
             Ok(Value::Array(Rc::new(RefCell::new(arr))))
         }
         "get" => {
             let b = want_bytes(&arg(args, 0), span, &ctx("get"))?;
             let i = want_number(&arg(args, 1), span, &ctx("get"))?;
-            if i < 0.0 || i.fract() != 0.0 { return Ok(Value::Nil); }
-            let out = b.borrow().get(i as usize).map(|&x| Value::Number(x as f64)).unwrap_or(Value::Nil);
+            if i < 0.0 || i.fract() != 0.0 {
+                return Ok(Value::Nil);
+            }
+            let out = b
+                .borrow()
+                .get(i as usize)
+                .map(|&x| Value::Number(x as f64))
+                .unwrap_or(Value::Nil);
             Ok(out)
         }
         "set" => {
@@ -87,7 +110,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let v = want_byte(&arg(args, 2), span, &ctx("set"))?;
             let mut bb = b.borrow_mut();
             if idx >= bb.len() {
-                return Err(AsError::at(format!("bytes.set index {} out of bounds (len {})", idx, bb.len()), span).into());
+                return Err(AsError::at(
+                    format!("bytes.set index {} out of bounds (len {})", idx, bb.len()),
+                    span,
+                )
+                .into());
             }
             bb[idx] = v;
             Ok(Value::Nil)
@@ -101,7 +128,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 None | Some(Value::Nil) => len,
                 Some(v) => clamp_index(want_number(v, span, &ctx("slice"))?, len),
             };
-            let out = if start < end { bb[start..end].to_vec() } else { Vec::new() };
+            let out = if start < end {
+                bb[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
             Ok(bytes_val(out))
         }
         "concat" => {
@@ -118,7 +149,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let n = want_index(&arg(args, 2), span, &ctx(func))?;
             let little = want_endian(&arg(args, 3), span, &ctx(func))?;
             if !(1..=8).contains(&n) {
-                return Err(AsError::at(format!("{}: byte length must be 1..=8", ctx(func)), span).into());
+                return Err(
+                    AsError::at(format!("{}: byte length must be 1..=8", ctx(func)), span).into(),
+                );
             }
             let bb = b.borrow();
             if offset + n > bb.len() {
@@ -155,19 +188,38 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let n = want_index(&arg(args, 3), span, &ctx(func))?;
             let little = want_endian(&arg(args, 4), span, &ctx(func))?;
             if !(1..=8).contains(&n) {
-                return Err(AsError::at(format!("{}: byte length must be 1..=8", ctx(func)), span).into());
+                return Err(
+                    AsError::at(format!("{}: byte length must be 1..=8", ctx(func)), span).into(),
+                );
             }
             if !value.is_finite() || value.fract() != 0.0 {
-                return Err(AsError::at(format!("{}: value must be a finite integer, got {}", ctx(func), value), span).into());
+                return Err(AsError::at(
+                    format!(
+                        "{}: value must be a finite integer, got {}",
+                        ctx(func),
+                        value
+                    ),
+                    span,
+                )
+                .into());
             }
             let raw = if func == "writeUint" {
                 if value < 0.0 {
-                    return Err(AsError::at("bytes.writeUint value must be non-negative", span).into());
+                    return Err(
+                        AsError::at("bytes.writeUint value must be non-negative", span).into(),
+                    );
                 }
                 let raw = value as u64;
                 // Reject values that don't fit in n bytes (n == 8 always fits in u64).
                 if n < 8 && raw >= (1u64 << (8 * n)) {
-                    return Err(AsError::at(format!("bytes.writeUint: value {} does not fit in {} byte(s)", raw, n), span).into());
+                    return Err(AsError::at(
+                        format!(
+                            "bytes.writeUint: value {} does not fit in {} byte(s)",
+                            raw, n
+                        ),
+                        span,
+                    )
+                    .into());
                 }
                 raw
             } else {
@@ -178,7 +230,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     let max = (1i64 << (bits - 1)) - 1;
                     let v = value as i64;
                     if v < min || v > max {
-                        return Err(AsError::at(format!("bytes.writeInt: value {} does not fit in {} byte(s)", v, n), span).into());
+                        return Err(AsError::at(
+                            format!("bytes.writeInt: value {} does not fit in {} byte(s)", v, n),
+                            span,
+                        )
+                        .into());
                     }
                 }
                 (value as i64) as u64
@@ -186,7 +242,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let le = raw.to_le_bytes();
             let mut bb = b.borrow_mut();
             if offset + n > bb.len() {
-                return Err(AsError::at(format!("{}: write out of bounds", ctx(func)), span).into());
+                return Err(
+                    AsError::at(format!("{}: write out of bounds", ctx(func)), span).into(),
+                );
             }
             if little {
                 bb[offset..offset + n].copy_from_slice(&le[..n]);
@@ -203,38 +261,120 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn sp() -> Span { Span::new(0, 0) }
-    fn num(n: f64) -> Value { Value::Number(n) }
+    fn sp() -> Span {
+        Span::new(0, 0)
+    }
+    fn num(n: f64) -> Value {
+        Value::Number(n)
+    }
 
     #[test]
     fn alloc_from_to_array_get_set() {
         let b = call("alloc", &[num(3.0)], sp()).unwrap();
-        assert_eq!(call("toArray", std::slice::from_ref(&b), sp()).unwrap().to_string(), "[0, 0, 0]");
+        assert_eq!(
+            call("toArray", std::slice::from_ref(&b), sp())
+                .unwrap()
+                .to_string(),
+            "[0, 0, 0]"
+        );
         call("set", &[b.clone(), num(1.0), num(255.0)], sp()).unwrap();
-        assert_eq!(call("get", &[b.clone(), num(1.0)], sp()).unwrap(), num(255.0));
-        assert_eq!(call("get", &[b.clone(), num(9.0)], sp()).unwrap(), Value::Nil);
+        assert_eq!(
+            call("get", &[b.clone(), num(1.0)], sp()).unwrap(),
+            num(255.0)
+        );
+        assert_eq!(
+            call("get", &[b.clone(), num(9.0)], sp()).unwrap(),
+            Value::Nil
+        );
         // out-of-range byte → panic
-        assert!(matches!(call("set", &[b.clone(), num(0.0), num(300.0)], sp()), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("set", &[b.clone(), num(0.0), num(300.0)], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 
     #[test]
     fn endian_roundtrip() {
         let b = call("alloc", &[num(4.0)], sp()).unwrap();
-        call("writeUint", &[b.clone(), num(0.0), num(0x01020304 as f64), num(4.0), Value::Str("be".into())], sp()).unwrap();
-        assert_eq!(call("toArray", std::slice::from_ref(&b), sp()).unwrap().to_string(), "[1, 2, 3, 4]");
-        assert_eq!(call("readUint", &[b.clone(), num(0.0), num(4.0), Value::Str("be".into())], sp()).unwrap(), num(0x01020304 as f64));
+        call(
+            "writeUint",
+            &[
+                b.clone(),
+                num(0.0),
+                num(0x01020304 as f64),
+                num(4.0),
+                Value::Str("be".into()),
+            ],
+            sp(),
+        )
+        .unwrap();
+        assert_eq!(
+            call("toArray", std::slice::from_ref(&b), sp())
+                .unwrap()
+                .to_string(),
+            "[1, 2, 3, 4]"
+        );
+        assert_eq!(
+            call(
+                "readUint",
+                &[b.clone(), num(0.0), num(4.0), Value::Str("be".into())],
+                sp()
+            )
+            .unwrap(),
+            num(0x01020304 as f64)
+        );
         // little-endian write of the same value
         let b2 = call("alloc", &[num(4.0)], sp()).unwrap();
-        call("writeUint", &[b2.clone(), num(0.0), num(0x01020304 as f64), num(4.0), Value::Str("le".into())], sp()).unwrap();
-        assert_eq!(call("toArray", std::slice::from_ref(&b2), sp()).unwrap().to_string(), "[4, 3, 2, 1]");
+        call(
+            "writeUint",
+            &[
+                b2.clone(),
+                num(0.0),
+                num(0x01020304 as f64),
+                num(4.0),
+                Value::Str("le".into()),
+            ],
+            sp(),
+        )
+        .unwrap();
+        assert_eq!(
+            call("toArray", std::slice::from_ref(&b2), sp())
+                .unwrap()
+                .to_string(),
+            "[4, 3, 2, 1]"
+        );
     }
 
     #[test]
     fn signed_roundtrip_and_concat() {
         let b = call("alloc", &[num(2.0)], sp()).unwrap();
-        call("writeInt", &[b.clone(), num(0.0), num(-1.0), num(2.0), Value::Str("be".into())], sp()).unwrap();
-        assert_eq!(call("toArray", std::slice::from_ref(&b), sp()).unwrap().to_string(), "[255, 255]");
-        assert_eq!(call("readInt", &[b.clone(), num(0.0), num(2.0), Value::Str("be".into())], sp()).unwrap(), num(-1.0));
+        call(
+            "writeInt",
+            &[
+                b.clone(),
+                num(0.0),
+                num(-1.0),
+                num(2.0),
+                Value::Str("be".into()),
+            ],
+            sp(),
+        )
+        .unwrap();
+        assert_eq!(
+            call("toArray", std::slice::from_ref(&b), sp())
+                .unwrap()
+                .to_string(),
+            "[255, 255]"
+        );
+        assert_eq!(
+            call(
+                "readInt",
+                &[b.clone(), num(0.0), num(2.0), Value::Str("be".into())],
+                sp()
+            )
+            .unwrap(),
+            num(-1.0)
+        );
         let c = call("concat", &[b.clone(), b.clone()], sp()).unwrap();
         assert_eq!(crate::interp::type_name(&c), "bytes");
     }
@@ -245,16 +385,34 @@ mod tests {
         // A huge offset must NOT saturate-cast + overflow into a Rust abort;
         // it must be a clean AScript Tier-2 panic.
         assert!(matches!(
-            call("readUint", &[b.clone(), num(1e30), num(2.0), Value::Str("be".into())], sp()),
+            call(
+                "readUint",
+                &[b.clone(), num(1e30), num(2.0), Value::Str("be".into())],
+                sp()
+            ),
             Err(Control::Panic(_))
         ));
         assert!(matches!(
-            call("writeUint", &[b.clone(), num(1e30), num(0.0), num(2.0), Value::Str("be".into())], sp()),
+            call(
+                "writeUint",
+                &[
+                    b.clone(),
+                    num(1e30),
+                    num(0.0),
+                    num(2.0),
+                    Value::Str("be".into())
+                ],
+                sp()
+            ),
             Err(Control::Panic(_))
         ));
         // NaN / non-integer offsets too.
         assert!(matches!(
-            call("readUint", &[b.clone(), num(f64::NAN), num(2.0), Value::Str("be".into())], sp()),
+            call(
+                "readUint",
+                &[b.clone(), num(f64::NAN), num(2.0), Value::Str("be".into())],
+                sp()
+            ),
             Err(Control::Panic(_))
         ));
         assert!(matches!(
@@ -268,23 +426,88 @@ mod tests {
         let b = call("alloc", &[num(1.0)], sp()).unwrap();
         // 256 doesn't fit in 1 byte → panic
         assert!(matches!(
-            call("writeUint", &[b.clone(), num(0.0), num(256.0), num(1.0), Value::Str("be".into())], sp()),
+            call(
+                "writeUint",
+                &[
+                    b.clone(),
+                    num(0.0),
+                    num(256.0),
+                    num(1.0),
+                    Value::Str("be".into())
+                ],
+                sp()
+            ),
             Err(Control::Panic(_))
         ));
         // 255 fits in 1 byte → ok
-        call("writeUint", &[b.clone(), num(0.0), num(255.0), num(1.0), Value::Str("be".into())], sp()).unwrap();
-        assert_eq!(call("toArray", std::slice::from_ref(&b), sp()).unwrap().to_string(), "[255]");
+        call(
+            "writeUint",
+            &[
+                b.clone(),
+                num(0.0),
+                num(255.0),
+                num(1.0),
+                Value::Str("be".into()),
+            ],
+            sp(),
+        )
+        .unwrap();
+        assert_eq!(
+            call("toArray", std::slice::from_ref(&b), sp())
+                .unwrap()
+                .to_string(),
+            "[255]"
+        );
         // 200 > 127 → out of range for a signed byte → panic
         assert!(matches!(
-            call("writeInt", &[b.clone(), num(0.0), num(200.0), num(1.0), Value::Str("be".into())], sp()),
+            call(
+                "writeInt",
+                &[
+                    b.clone(),
+                    num(0.0),
+                    num(200.0),
+                    num(1.0),
+                    Value::Str("be".into())
+                ],
+                sp()
+            ),
             Err(Control::Panic(_))
         ));
         // -128 is the min signed byte → ok
-        call("writeInt", &[b.clone(), num(0.0), num(-128.0), num(1.0), Value::Str("be".into())], sp()).unwrap();
-        assert_eq!(call("readInt", &[b.clone(), num(0.0), num(1.0), Value::Str("be".into())], sp()).unwrap(), num(-128.0));
+        call(
+            "writeInt",
+            &[
+                b.clone(),
+                num(0.0),
+                num(-128.0),
+                num(1.0),
+                Value::Str("be".into()),
+            ],
+            sp(),
+        )
+        .unwrap();
+        assert_eq!(
+            call(
+                "readInt",
+                &[b.clone(), num(0.0), num(1.0), Value::Str("be".into())],
+                sp()
+            )
+            .unwrap(),
+            num(-128.0)
+        );
         // -129 is out of range → panic
         assert!(matches!(
-            call("writeInt", &[b.clone(), num(0.0), num(-129.0), num(1.0), Value::Str("be".into())], sp()),
+            call(
+                "writeInt",
+                &[
+                    b.clone(),
+                    num(0.0),
+                    num(-129.0),
+                    num(1.0),
+                    Value::Str("be".into())
+                ],
+                sp()
+            ),
             Err(Control::Panic(_))
         ));
     }

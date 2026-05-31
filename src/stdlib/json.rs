@@ -11,7 +11,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("parse", bi("json.parse")), ("stringify", bi("json.stringify"))]
+    vec![
+        ("parse", bi("json.parse")),
+        ("stringify", bi("json.stringify")),
+    ]
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -21,7 +24,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let s = want_string(&arg(args, 0), span, &ctx("parse"))?;
             match serde_json::from_str::<serde_json::Value>(&s) {
                 Ok(jv) => Ok(make_pair(to_ascript(&jv), Value::Nil)),
-                Err(e) => Ok(make_pair(Value::Nil, make_error(Value::Str(format!("invalid JSON: {}", e).into())))),
+                Err(e) => Ok(make_pair(
+                    Value::Nil,
+                    make_error(Value::Str(format!("invalid JSON: {}", e).into())),
+                )),
             }
         }
         "stringify" => {
@@ -37,7 +43,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     };
                     match s {
                         Ok(text) => Ok(make_pair(Value::Str(text.into()), Value::Nil)),
-                        Err(e) => Ok(make_pair(Value::Nil, make_error(Value::Str(format!("cannot serialize: {}", e).into())))),
+                        Err(e) => Ok(make_pair(
+                            Value::Nil,
+                            make_error(Value::Str(format!("cannot serialize: {}", e).into())),
+                        )),
                     }
                 }
                 Err(msg) => Ok(make_pair(Value::Nil, make_error(Value::Str(msg.into())))),
@@ -81,7 +90,9 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             // serializes as a JSON integer (`1`, not `1.0`). serde_json's
             // Number::from_f64 always renders a float with a trailing `.0`.
             if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
-                Ok(serde_json::Value::Number(serde_json::Number::from(*n as i64)))
+                Ok(serde_json::Value::Number(serde_json::Number::from(
+                    *n as i64,
+                )))
             } else {
                 serde_json::Number::from_f64(*n)
                     .map(serde_json::Value::Number)
@@ -91,7 +102,9 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
         Value::Str(s) => Ok(serde_json::Value::String(s.to_string())),
         Value::Array(a) => {
             let ptr = Rc::as_ptr(a) as usize;
-            if seen.contains(&ptr) { return Err("cannot serialize a cyclic structure to JSON".into()); }
+            if seen.contains(&ptr) {
+                return Err("cannot serialize a cyclic structure to JSON".into());
+            }
             seen.push(ptr);
             let mut out = Vec::new();
             for item in a.borrow().iter() {
@@ -102,7 +115,9 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
         }
         Value::Object(o) => {
             let ptr = Rc::as_ptr(o) as usize;
-            if seen.contains(&ptr) { return Err("cannot serialize a cyclic structure to JSON".into()); }
+            if seen.contains(&ptr) {
+                return Err("cannot serialize a cyclic structure to JSON".into());
+            }
             seen.push(ptr);
             let mut map = serde_json::Map::new();
             for (k, val) in o.borrow().iter() {
@@ -114,19 +129,31 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
         Value::Map(m) => {
             // A Map serializes as a JSON object only if every key is a string.
             let ptr = Rc::as_ptr(m) as usize;
-            if seen.contains(&ptr) { return Err("cannot serialize a cyclic structure to JSON".into()); }
+            if seen.contains(&ptr) {
+                return Err("cannot serialize a cyclic structure to JSON".into());
+            }
             seen.push(ptr);
             let mut map = serde_json::Map::new();
             for (k, val) in m.borrow().iter() {
                 match k.to_value() {
-                    Value::Str(s) => { map.insert(s.to_string(), from_ascript(val, seen)?); }
-                    other => return Err(format!("cannot serialize a map with a non-string key ({}) to JSON", crate::interp::type_name(&other))),
+                    Value::Str(s) => {
+                        map.insert(s.to_string(), from_ascript(val, seen)?);
+                    }
+                    other => {
+                        return Err(format!(
+                            "cannot serialize a map with a non-string key ({}) to JSON",
+                            crate::interp::type_name(&other)
+                        ))
+                    }
                 }
             }
             seen.pop();
             Ok(serde_json::Value::Object(map))
         }
-        other => Err(format!("cannot serialize a value of type {} to JSON", crate::interp::type_name(other))),
+        other => Err(format!(
+            "cannot serialize a value of type {} to JSON",
+            crate::interp::type_name(other)
+        )),
     }
 }
 
@@ -139,17 +166,23 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
         Value::Nil => J::Null,
         Value::Bool(b) => J::Bool(*b),
         Value::Number(n) => {
-            if !n.is_finite() { return J::Null; }
+            if !n.is_finite() {
+                return J::Null;
+            }
             if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
                 J::Number(serde_json::Number::from(*n as i64))
             } else {
-                serde_json::Number::from_f64(*n).map(J::Number).unwrap_or(J::Null)
+                serde_json::Number::from_f64(*n)
+                    .map(J::Number)
+                    .unwrap_or(J::Null)
             }
         }
         Value::Str(s) => J::String(s.to_string()),
         Value::Array(a) => {
             let ptr = Rc::as_ptr(a) as usize;
-            if seen.contains(&ptr) { return J::String("[Circular]".into()); }
+            if seen.contains(&ptr) {
+                return J::String("[Circular]".into());
+            }
             seen.push(ptr);
             let out = a.borrow().iter().map(|x| to_json_lossy(x, seen)).collect();
             seen.pop();
@@ -157,29 +190,42 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
         }
         Value::Object(o) => {
             let ptr = Rc::as_ptr(o) as usize;
-            if seen.contains(&ptr) { return J::String("[Circular]".into()); }
+            if seen.contains(&ptr) {
+                return J::String("[Circular]".into());
+            }
             seen.push(ptr);
             let mut m = serde_json::Map::new();
-            for (k, val) in o.borrow().iter() { m.insert(k.clone(), to_json_lossy(val, seen)); }
+            for (k, val) in o.borrow().iter() {
+                m.insert(k.clone(), to_json_lossy(val, seen));
+            }
             seen.pop();
             J::Object(m)
         }
         Value::Instance(i) => {
             let ptr = Rc::as_ptr(i) as usize;
-            if seen.contains(&ptr) { return J::String("[Circular]".into()); }
+            if seen.contains(&ptr) {
+                return J::String("[Circular]".into());
+            }
             seen.push(ptr);
             let mut m = serde_json::Map::new();
-            for (k, val) in i.borrow().fields.iter() { m.insert(k.clone(), to_json_lossy(val, seen)); }
+            for (k, val) in i.borrow().fields.iter() {
+                m.insert(k.clone(), to_json_lossy(val, seen));
+            }
             seen.pop();
             J::Object(m)
         }
         Value::Map(mp) => {
             let ptr = Rc::as_ptr(mp) as usize;
-            if seen.contains(&ptr) { return J::String("[Circular]".into()); }
+            if seen.contains(&ptr) {
+                return J::String("[Circular]".into());
+            }
             seen.push(ptr);
             let mut m = serde_json::Map::new();
             for (k, val) in mp.borrow().iter() {
-                let key = match k.to_value() { Value::Str(s) => s.to_string(), other => other.to_string() };
+                let key = match k.to_value() {
+                    Value::Str(s) => s.to_string(),
+                    other => other.to_string(),
+                };
                 m.insert(key, to_json_lossy(val, seen));
             }
             seen.pop();
@@ -193,22 +239,40 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn sp() -> Span { Span::new(0, 0) }
-    fn s(x: &str) -> Value { Value::Str(x.into()) }
+    fn sp() -> Span {
+        Span::new(0, 0)
+    }
+    fn s(x: &str) -> Value {
+        Value::Str(x.into())
+    }
 
     #[test]
     fn parse_roundtrip() {
-        let parsed = call("parse", &[s("{\"a\": 1, \"b\": [true, null, \"x\"]}")], sp()).unwrap();
+        let parsed = call(
+            "parse",
+            &[s("{\"a\": 1, \"b\": [true, null, \"x\"]}")],
+            sp(),
+        )
+        .unwrap();
         // parsed is [value, nil]; pull the value (index 0)
-        assert!(parsed.to_string().starts_with("[{a: 1, b: [true, nil, \"x\"]}, nil]"));
+        assert!(parsed
+            .to_string()
+            .starts_with("[{a: 1, b: [true, nil, \"x\"]}, nil]"));
     }
 
     #[test]
     fn parse_preserves_key_order() {
         // serde_json's preserve_order feature keeps object keys in source order
         // (not alphabetical), matching AScript's insertion-ordered objects.
-        let parsed = call("parse", &[Value::Str("{\"name\": 1, \"age\": 2, \"zoo\": 3}".into())], Span::new(0, 0)).unwrap();
-        assert!(parsed.to_string().starts_with("[{name: 1, age: 2, zoo: 3}, nil]"));
+        let parsed = call(
+            "parse",
+            &[Value::Str("{\"name\": 1, \"age\": 2, \"zoo\": 3}".into())],
+            Span::new(0, 0),
+        )
+        .unwrap();
+        assert!(parsed
+            .to_string()
+            .starts_with("[{name: 1, age: 2, zoo: 3}, nil]"));
     }
 
     #[test]
@@ -232,10 +296,21 @@ mod tests {
     #[test]
     fn lossy_serializer_never_errors() {
         let a = Value::Array(Rc::new(RefCell::new(vec![])));
-        if let Value::Array(inner) = &a { inner.borrow_mut().push(a.clone()); }
-        assert_eq!(to_json_lossy(&a, &mut Vec::new()).to_string(), "[\"[Circular]\"]");
-        assert_eq!(to_json_lossy(&Value::Builtin("print".into()), &mut Vec::new()).to_string(), "\"<function>\"");
-        assert_eq!(to_json_lossy(&Value::Number(f64::NAN), &mut Vec::new()), serde_json::Value::Null);
+        if let Value::Array(inner) = &a {
+            inner.borrow_mut().push(a.clone());
+        }
+        assert_eq!(
+            to_json_lossy(&a, &mut Vec::new()).to_string(),
+            "[\"[Circular]\"]"
+        );
+        assert_eq!(
+            to_json_lossy(&Value::Builtin("print".into()), &mut Vec::new()).to_string(),
+            "\"<function>\""
+        );
+        assert_eq!(
+            to_json_lossy(&Value::Number(f64::NAN), &mut Vec::new()),
+            serde_json::Value::Null
+        );
     }
 
     #[test]

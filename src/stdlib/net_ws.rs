@@ -91,12 +91,17 @@ pub struct WsConnState {
 
 impl WsConnState {
     pub fn new<S: WsStream + 'static>(stream: S) -> Self {
-        WsConnState { inner: Box::new(stream) }
+        WsConnState {
+            inner: Box::new(stream),
+        }
     }
 }
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("connect", bi("net_ws.connect")), ("listen", bi("net_ws.listen"))]
+    vec![
+        ("connect", bi("net_ws.connect")),
+        ("listen", bi("net_ws.listen")),
+    ]
 }
 
 fn err_pair(msg: String) -> Value {
@@ -184,8 +189,8 @@ fn ws_connect_headers(opts: &Value, span: Span) -> Result<Vec<(String, String)>,
                 Some(Value::Nil) | None => String::new(),
                 Some(p) => want_string(p, span, "net/ws.connect auth.basic[1]")?.to_string(),
             };
-            let creds = base64::engine::general_purpose::STANDARD
-                .encode(format!("{}:{}", user, pass));
+            let creds =
+                base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, pass));
             out.push(("Authorization".to_string(), format!("Basic {}", creds)));
         } else {
             return Err(AsError::at(
@@ -229,7 +234,10 @@ impl Interp {
             let uri: Uri = match url.parse() {
                 Ok(u) => u,
                 Err(e) => {
-                    return Ok(err_pair(format!("net/ws.connect invalid url {}: {}", url, e)));
+                    return Ok(err_pair(format!(
+                        "net/ws.connect invalid url {}: {}",
+                        url, e
+                    )));
                 }
             };
             let mut builder = ClientRequestBuilder::new(uri);
@@ -257,7 +265,7 @@ impl Interp {
         let port = super::want_number(&arg(args, 1), span, "net/ws.listen port")?;
         if !(0.0..=65535.0).contains(&port) || port.fract() != 0.0 {
             return Err(
-                AsError::at("net/ws.listen port must be an integer 0..=65535", span).into()
+                AsError::at("net/ws.listen port must be an integer 0..=65535", span).into(),
             );
         }
         let addr = format!("{}:{}", host, port as u16);
@@ -289,7 +297,9 @@ impl Interp {
         match m.receiver.kind {
             NativeKind::WsConnection => self.ws_conn_method(id, &m.method, &args, span).await,
             NativeKind::WsListener => self.ws_listener_method(id, &m.method, &args, span).await,
-            _ => Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into()),
+            _ => {
+                Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
+            }
         }
     }
 
@@ -320,7 +330,9 @@ impl Interp {
                 let mut conn = match self.take_resource(id) {
                     Some(ResourceState::WsConnection(c)) => c,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(err_pair("ws.send: connection is closed".to_string()));
                     }
                 };
@@ -337,7 +349,9 @@ impl Interp {
                 let mut conn = match self.take_resource(id) {
                     Some(ResourceState::WsConnection(c)) => c,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(make_pair(Value::Nil, Value::Nil));
                     }
                 };
@@ -365,10 +379,7 @@ impl Interp {
                             // A transport-level reset after the peer is gone is an EOF
                             // for our purposes: drop the conn and surface nil, not a
                             // Tier-1 err (matches the tcp reader's EOF-as-nil contract).
-                            if matches!(
-                                e,
-                                WsError::ConnectionClosed | WsError::AlreadyClosed
-                            ) {
+                            if matches!(e, WsError::ConnectionClosed | WsError::AlreadyClosed) {
                                 return Ok(make_pair(Value::Nil, Value::Nil));
                             }
                             return Ok(err_pair(format!("ws.recv failed: {}", e)));
@@ -383,7 +394,9 @@ impl Interp {
                 }
                 Ok(make_pair(Value::Nil, Value::Nil))
             }
-            other => Err(AsError::at(format!("wsConnection has no method '{}'", other), span).into()),
+            other => {
+                Err(AsError::at(format!("wsConnection has no method '{}'", other), span).into())
+            }
         }
     }
 
@@ -399,8 +412,12 @@ impl Interp {
                 let listener = match self.take_resource(id) {
                     Some(ResourceState::WsListener(l)) => l,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
-                        return Ok(err_pair("ws listener.accept: listener is closed".to_string()));
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
+                        return Ok(err_pair(
+                            "ws listener.accept: listener is closed".to_string(),
+                        ));
                     }
                 };
                 let accepted = listener.accept().await;
@@ -419,7 +436,10 @@ impl Interp {
                         );
                         Ok(make_pair(handle, Value::Nil))
                     }
-                    Err(e) => Ok(err_pair(format!("ws listener.accept handshake failed: {}", e))),
+                    Err(e) => Ok(err_pair(format!(
+                        "ws listener.accept handshake failed: {}",
+                        e
+                    ))),
                 }
             }
             "close" => {
@@ -460,7 +480,9 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.expect("accept");
-            let mut ws = tokio_tungstenite::accept_async(tcp).await.expect("handshake");
+            let mut ws = tokio_tungstenite::accept_async(tcp)
+                .await
+                .expect("handshake");
             while let Some(msg) = ws.next().await {
                 match msg {
                     Ok(Message::Text(t)) => {
@@ -485,8 +507,7 @@ mod tests {
     // The handshake `Callback` returns tungstenite's `Result<Response, ErrorResponse>`;
     // the large `Err` variant is dictated by that external trait, not our choice.
     #[allow(clippy::result_large_err)]
-    async fn spawn_header_capturing_server(
-    ) -> (u16, tokio::sync::oneshot::Receiver<String>) {
+    async fn spawn_header_capturing_server() -> (u16, tokio::sync::oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
@@ -538,7 +559,11 @@ conn.close()
         let out = run(&src).await;
         assert_eq!(out, "nil\nhi\n");
         let headers = rx.await.expect("server should report captured headers");
-        assert!(headers.contains("x-test: yes"), "missing x-test header in:\n{}", headers);
+        assert!(
+            headers.contains("x-test: yes"),
+            "missing x-test header in:\n{}",
+            headers
+        );
         assert!(
             headers.contains("authorization: Bearer tok"),
             "missing bearer auth header in:\n{}",
@@ -582,7 +607,9 @@ let [conn, _e] = connect("ws://127.0.0.1:{port}", 42)
 print(conn)
 "#
         );
-        let err = crate::run_source(&src).await.expect_err("non-object opts must panic");
+        let err = crate::run_source(&src)
+            .await
+            .expect_err("non-object opts must panic");
         assert!(
             err.to_string().contains("opts expects an object"),
             "unexpected error: {}",
@@ -719,7 +746,11 @@ conn.close()
 "#
         );
         run_on(&interp, &src).await;
-        assert_eq!(interp.resource_count(), baseline, "connection should be reclaimed on close");
+        assert_eq!(
+            interp.resource_count(),
+            baseline,
+            "connection should be reclaimed on close"
+        );
     }
 
     #[tokio::test]
@@ -772,15 +803,13 @@ server.close()
 
     #[tokio::test]
     async fn listen_port_zero_assigns_real_port() {
-        let out = run(
-            r#"
+        let out = run(r#"
 import { listen } from "std/net/ws"
 let [server, err] = listen("127.0.0.1", 0)
 print(err)
 print(server.port > 0)
 server.close()
-"#,
-        )
+"#)
         .await;
         assert_eq!(out, "nil\ntrue\n");
     }

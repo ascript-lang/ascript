@@ -26,8 +26,9 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// The global builtins offered as completions (FUNCTION kind). Mirrors `builtin_doc`.
-const BUILTINS: &[&str] =
-    &["print", "len", "type", "assert", "range", "Ok", "Err", "recover", "test"];
+const BUILTINS: &[&str] = &[
+    "print", "len", "type", "assert", "range", "Ok", "Err", "recover", "test",
+];
 
 /// The known stdlib module paths offered when completing an `import ... from "..."`
 /// string. Hardcoded (rather than derived from `std_module_exports`) so the list is
@@ -82,9 +83,15 @@ pub fn diagnostics(text: &str) -> Vec<Diagnostic> {
 /// `LineIndex`) for the range, or the whole first line when no span is present.
 fn error_diagnostic(error: &AsError, index: &LineIndex) -> Diagnostic {
     let range = match error.span {
-        Some(span) => Range { start: index.position(span.start), end: index.position(span.end) },
+        Some(span) => Range {
+            start: index.position(span.start),
+            end: index.position(span.end),
+        },
         // No span: point at the start of the document (line 0).
-        None => Range { start: Position::new(0, 0), end: Position::new(0, 0) },
+        None => Range {
+            start: Position::new(0, 0),
+            end: Position::new(0, 0),
+        },
     };
     Diagnostic {
         range,
@@ -97,7 +104,10 @@ fn error_diagnostic(error: &AsError, index: &LineIndex) -> Diagnostic {
 
 /// Convert a char-offset `Span` into an LSP `Range` via the `LineIndex`.
 fn span_range(span: Span, index: &LineIndex) -> Range {
-    Range { start: index.position(span.start), end: index.position(span.end) }
+    Range {
+        start: index.position(span.start),
+        end: index.position(span.end),
+    }
 }
 
 /// Build a `DocumentSymbol` literal. `#[allow(deprecated)]` is required because
@@ -144,7 +154,12 @@ pub fn document_symbols(text: &str) -> Vec<DocumentSymbol> {
 fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol>) {
     match stmt {
         Stmt::Export(inner) => symbols_for_stmt(inner, index, out),
-        Stmt::Fn { name, span, name_span, .. } => {
+        Stmt::Fn {
+            name,
+            span,
+            name_span,
+            ..
+        } => {
             out.push(symbol(
                 name.clone(),
                 SymbolKind::FUNCTION,
@@ -153,7 +168,14 @@ fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol
                 None,
             ));
         }
-        Stmt::Class { name, fields, methods, span, name_span, .. } => {
+        Stmt::Class {
+            name,
+            fields,
+            methods,
+            span,
+            name_span,
+            ..
+        } => {
             let mut children: Vec<DocumentSymbol> = fields
                 .iter()
                 .map(|fd| {
@@ -183,7 +205,12 @@ fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol
                 Some(children),
             ));
         }
-        Stmt::Enum { name, variants, span, name_span } => {
+        Stmt::Enum {
+            name,
+            variants,
+            span,
+            name_span,
+        } => {
             let children: Vec<DocumentSymbol> = variants
                 .iter()
                 .map(|v| {
@@ -204,8 +231,18 @@ fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol
                 Some(children),
             ));
         }
-        Stmt::Let { name, mutable, span, name_span, .. } => {
-            let kind = if *mutable { SymbolKind::VARIABLE } else { SymbolKind::CONSTANT };
+        Stmt::Let {
+            name,
+            mutable,
+            span,
+            name_span,
+            ..
+        } => {
+            let kind = if *mutable {
+                SymbolKind::VARIABLE
+            } else {
+                SymbolKind::CONSTANT
+            };
             out.push(symbol(
                 name.clone(),
                 kind,
@@ -214,8 +251,19 @@ fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol
                 None,
             ));
         }
-        Stmt::LetDestructure { names, rest, mutable, span, name_spans, .. } => {
-            let kind = if *mutable { SymbolKind::VARIABLE } else { SymbolKind::CONSTANT };
+        Stmt::LetDestructure {
+            names,
+            rest,
+            mutable,
+            span,
+            name_spans,
+            ..
+        } => {
+            let kind = if *mutable {
+                SymbolKind::VARIABLE
+            } else {
+                SymbolKind::CONSTANT
+            };
             for (name, nspan) in names.iter().zip(name_spans.iter()) {
                 out.push(symbol(
                     name.clone(),
@@ -235,8 +283,18 @@ fn symbols_for_stmt(stmt: &Stmt, index: &LineIndex, out: &mut Vec<DocumentSymbol
                 ));
             }
         }
-        Stmt::LetDestructureObject { bindings, rest, mutable, span, .. } => {
-            let kind = if *mutable { SymbolKind::VARIABLE } else { SymbolKind::CONSTANT };
+        Stmt::LetDestructureObject {
+            bindings,
+            rest,
+            mutable,
+            span,
+            ..
+        } => {
+            let kind = if *mutable {
+                SymbolKind::VARIABLE
+            } else {
+                SymbolKind::CONSTANT
+            };
             for b in bindings {
                 out.push(symbol(
                     b.binding.clone(),
@@ -304,7 +362,9 @@ fn keyword_doc(tok: &Tok) -> Option<&'static str> {
         Tok::Match => "`match` — pattern-match a value against arms.",
         Tok::Async => "`async` — declare an asynchronous function returning a future.",
         Tok::Await => "`await` — suspend until an async value resolves.",
-        Tok::Yield => "`yield` — produce a value from a generator (`fn*`); evaluates to the resume value.",
+        Tok::Yield => {
+            "`yield` — produce a value from a generator (`fn*`); evaluates to the resume value."
+        }
         Tok::Class => "`class` — declare a class with methods.",
         Tok::Enum => "`enum` — declare an enumeration of named variants.",
         Tok::Import => "`import` — import names from another module.",
@@ -363,7 +423,11 @@ fn decl_doc(name: &str, text: &str) -> Option<String> {
 
 /// A baseline completion item (keyword or builtin).
 fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
-    CompletionItem { label: label.to_string(), kind: Some(kind), ..CompletionItem::default() }
+    CompletionItem {
+        label: label.to_string(),
+        kind: Some(kind),
+        ..CompletionItem::default()
+    }
 }
 
 /// The always-offered baseline completions: every keyword + every global builtin.
@@ -422,7 +486,10 @@ pub fn completions(text: &str, offset: usize) -> Vec<CompletionItem> {
 /// that quote ends with `from`.
 fn in_import_path_string(chars: &[char], offset: usize) -> bool {
     // Restrict to the current line (imports are single-line).
-    let line_start = chars[..offset].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1);
+    let line_start = chars[..offset]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map_or(0, |p| p + 1);
     let line = &chars[line_start..offset];
 
     // The cursor is inside a string iff the most recent quote on the line has no
@@ -557,12 +624,22 @@ fn collect_fn_bodies<'a>(stmts: &'a [Stmt], out: &mut Vec<FnBody<'a>>) {
     for stmt in stmts {
         match stmt {
             Stmt::Export(inner) => collect_fn_bodies(std::slice::from_ref(inner), out),
-            Stmt::Fn { params, body, span, .. } => {
-                out.push(FnBody { params, body, span: *span });
+            Stmt::Fn {
+                params, body, span, ..
+            } => {
+                out.push(FnBody {
+                    params,
+                    body,
+                    span: *span,
+                });
             }
             Stmt::Class { methods, .. } => {
                 for m in methods {
-                    out.push(FnBody { params: &m.params, body: &m.body, span: m.span });
+                    out.push(FnBody {
+                        params: &m.params,
+                        body: &m.body,
+                        span: m.span,
+                    });
                 }
             }
             _ => {}
@@ -607,10 +684,17 @@ fn local_let_before(body: &[Stmt], name: &str, offset: usize) -> Option<Span> {
     let mut found = None;
     for stmt in body {
         match stmt {
-            Stmt::Let { name: n, name_span, .. } if n == name && name_span.start <= offset => {
+            Stmt::Let {
+                name: n, name_span, ..
+            } if n == name && name_span.start <= offset => {
                 found = Some(*name_span);
             }
-            Stmt::LetDestructure { names, rest, name_spans, .. } => {
+            Stmt::LetDestructure {
+                names,
+                rest,
+                name_spans,
+                ..
+            } => {
                 for (n, s) in names.iter().zip(name_spans.iter()) {
                     if n == name && s.start <= offset {
                         found = Some(*s);
@@ -647,15 +731,28 @@ fn collect_decl_name_span(stmt: &Stmt, name: &str, out: &mut Option<Span>) {
     }
     match stmt {
         Stmt::Export(inner) => collect_decl_name_span(inner, name, out),
-        Stmt::Fn { name: n, name_span, .. }
-        | Stmt::Class { name: n, name_span, .. }
-        | Stmt::Enum { name: n, name_span, .. }
-        | Stmt::Let { name: n, name_span, .. } => {
+        Stmt::Fn {
+            name: n, name_span, ..
+        }
+        | Stmt::Class {
+            name: n, name_span, ..
+        }
+        | Stmt::Enum {
+            name: n, name_span, ..
+        }
+        | Stmt::Let {
+            name: n, name_span, ..
+        } => {
             if n == name {
                 *out = Some(*name_span);
             }
         }
-        Stmt::LetDestructure { names, rest, name_spans, .. } => {
+        Stmt::LetDestructure {
+            names,
+            rest,
+            name_spans,
+            ..
+        } => {
             for (n, s) in names.iter().zip(name_spans.iter()) {
                 if n == name {
                     *out = Some(*s);
@@ -752,7 +849,10 @@ export fn bar() {}
         assert!(names.contains(&"K"), "names: {names:?}");
         assert!(names.contains(&"v"), "names: {names:?}");
         // The exported decl still appears.
-        assert!(names.contains(&"bar"), "exported bar should appear: {names:?}");
+        assert!(
+            names.contains(&"bar"),
+            "exported bar should appear: {names:?}"
+        );
 
         // Kinds.
         assert_eq!(find(&syms, "foo").kind, SymbolKind::FUNCTION);
@@ -858,7 +958,10 @@ export fn bar() {}
         let items = completions(src, src.chars().count());
         let ls = labels(&items);
         for expected in ["fn", "let", "match", "print", "Ok"] {
-            assert!(ls.contains(&expected), "baseline should contain {expected:?}: {ls:?}");
+            assert!(
+                ls.contains(&expected),
+                "baseline should contain {expected:?}: {ls:?}"
+            );
         }
         // Kinds are set.
         let fnkw = items.iter().find(|i| i.label == "fn").unwrap();
@@ -873,9 +976,14 @@ export fn bar() {}
         let items = completions(src, src.chars().count());
         let ls = labels(&items);
         for expected in ["std/string", "std/json", "std/net/http"] {
-            assert!(ls.contains(&expected), "import ctx should contain {expected:?}: {ls:?}");
+            assert!(
+                ls.contains(&expected),
+                "import ctx should contain {expected:?}: {ls:?}"
+            );
         }
-        assert!(items.iter().all(|i| i.kind == Some(CompletionItemKind::MODULE)));
+        assert!(items
+            .iter()
+            .all(|i| i.kind == Some(CompletionItemKind::MODULE)));
     }
 
     #[test]
@@ -891,7 +999,10 @@ export fn bar() {}
         let items = completions(src, src.chars().count());
         let ls = labels(&items);
         for expected in ["sqrt", "abs", "pi"] {
-            assert!(ls.contains(&expected), "math. should contain {expected:?}: {ls:?}");
+            assert!(
+                ls.contains(&expected),
+                "math. should contain {expected:?}: {ls:?}"
+            );
         }
     }
 
@@ -1045,13 +1156,20 @@ export fn bar() {}
         let src = "fn* g() { yield 1 }";
         let off = src.find("yield").unwrap();
         let h = hover(src, off).expect("expected hover on yield keyword");
-        assert!(markup(&h).to_lowercase().contains("generator"), "got: {}", markup(&h));
+        assert!(
+            markup(&h).to_lowercase().contains("generator"),
+            "got: {}",
+            markup(&h)
+        );
     }
 
     #[test]
     fn completions_baseline_includes_yield_keyword() {
         let items = completions("", 0);
-        let y = items.iter().find(|i| i.label == "yield").expect("yield keyword in baseline");
+        let y = items
+            .iter()
+            .find(|i| i.label == "yield")
+            .expect("yield keyword in baseline");
         assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
     }
 
@@ -1060,14 +1178,20 @@ export fn bar() {}
         // A `fn*` declaration still produces a FUNCTION symbol (the parser flows
         // through the shared AST that the LSP walks).
         let syms = document_symbols("fn* count() { yield 1 }");
-        let f = syms.iter().find(|s| s.name == "count").expect("count symbol");
+        let f = syms
+            .iter()
+            .find(|s| s.name == "count")
+            .expect("count symbol");
         assert_eq!(f.kind, SymbolKind::FUNCTION);
     }
 
     #[test]
     fn completions_baseline_includes_test_builtin() {
         let items = completions("", 0);
-        let t = items.iter().find(|i| i.label == "test").expect("test builtin in baseline");
+        let t = items
+            .iter()
+            .find(|i| i.label == "test")
+            .expect("test builtin in baseline");
         assert_eq!(t.kind, Some(CompletionItemKind::FUNCTION));
     }
 }

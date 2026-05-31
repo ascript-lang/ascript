@@ -134,7 +134,11 @@ pub struct HttpServerState {
 
 impl HttpServerState {
     fn new() -> Self {
-        HttpServerState { routes: Vec::new(), middleware: Vec::new(), listener: None }
+        HttpServerState {
+            routes: Vec::new(),
+            middleware: Vec::new(),
+            listener: None,
+        }
     }
 }
 
@@ -178,7 +182,10 @@ async fn read_request(
         if buf.len() > MAX_HEADER_BYTES {
             return Err(ReadError::HeadersTooLarge);
         }
-        let n = stream.read(&mut tmp).await.map_err(|_| ReadError::BadRequest)?;
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|_| ReadError::BadRequest)?;
         if n == 0 {
             if buf.is_empty() {
                 return Ok(None); // clean EOF, no request
@@ -218,9 +225,16 @@ async fn read_request(
 
     // Body: header block is `header_end..header_end+4` (the CRLFCRLF), body follows.
     let body_start = header_end + 4;
-    let mut body = if buf.len() > body_start { buf[body_start..].to_vec() } else { Vec::new() };
+    let mut body = if buf.len() > body_start {
+        buf[body_start..].to_vec()
+    } else {
+        Vec::new()
+    };
     while body.len() < content_length {
-        let n = stream.read(&mut tmp).await.map_err(|_| ReadError::BadRequest)?;
+        let n = stream
+            .read(&mut tmp)
+            .await
+            .map_err(|_| ReadError::BadRequest)?;
         if n == 0 {
             break;
         }
@@ -228,7 +242,12 @@ async fn read_request(
     }
     body.truncate(content_length);
 
-    Ok(Some(RawRequest { method, target, headers, body }))
+    Ok(Some(RawRequest {
+        method,
+        target,
+        headers,
+        body,
+    }))
 }
 
 /// Find the index of the start of the `\r\n\r\n` header terminator, if present.
@@ -394,12 +413,24 @@ fn value_to_response(v: &Value) -> HttpResponse {
                 Some(Value::Nil) | None => Vec::new(),
                 Some(other) => other.to_string().into_bytes(),
             };
-            if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) && !body.is_empty() {
+            if !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                && !body.is_empty()
+            {
                 headers.push(("content-type".into(), "text/plain; charset=utf-8".into()));
             }
-            HttpResponse { status, headers, body }
+            HttpResponse {
+                status,
+                headers,
+                body,
+            }
         }
-        Value::Nil => HttpResponse { status: 200, headers: Vec::new(), body: Vec::new() },
+        Value::Nil => HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+        },
         other => HttpResponse {
             status: 200,
             headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
@@ -485,7 +516,9 @@ impl Interp {
                 m.insert("body".to_string(), Value::Str("not found".into()));
                 m
             })))),
-            _ => Err(AsError::at(format!("std/http/server has no function '{}'", func), span).into()),
+            _ => {
+                Err(AsError::at(format!("std/http/server has no function '{}'", func), span).into())
+            }
         }
     }
 
@@ -501,7 +534,8 @@ impl Interp {
         let server = Value::Native(m.receiver.clone());
         match m.method.as_str() {
             "route" => {
-                let method = want_string(&arg(&args, 0), span, "server.route method")?.to_uppercase();
+                let method =
+                    want_string(&arg(&args, 0), span, "server.route method")?.to_uppercase();
                 let path = want_string(&arg(&args, 1), span, "server.route path")?.to_string();
                 let handler = arg(&args, 2);
                 if !is_callable(&handler) {
@@ -516,7 +550,9 @@ impl Interp {
             "use" => {
                 let mw = arg(&args, 0);
                 if !is_callable(&mw) {
-                    return Err(AsError::at("server.use middleware must be a function", span).into());
+                    return Err(
+                        AsError::at("server.use middleware must be a function", span).into(),
+                    );
                 }
                 match self.http_server_mut(id) {
                     Some(mut s) => s.middleware.push(mw),
@@ -528,7 +564,9 @@ impl Interp {
                 let host = want_string(&arg(&args, 0), span, "server.bind host")?;
                 let port = super::want_number(&arg(&args, 1), span, "server.bind port")?;
                 if !(0.0..=65535.0).contains(&port) || port.fract() != 0.0 {
-                    return Err(AsError::at("server.bind port must be an integer 0..=65535", span).into());
+                    return Err(
+                        AsError::at("server.bind port must be an integer 0..=65535", span).into(),
+                    );
                 }
                 let addr = format!("{}:{}", host, port as u16);
                 match TcpListener::bind(&addr).await {
@@ -547,12 +585,16 @@ impl Interp {
             "listen" => {
                 // bind + serve convenience.
                 let bind_args = vec![arg(&args, 0), arg(&args, 1)];
-                let bound = self.call_http_server_method(
-                    &Rc::new(NativeMethod { receiver: m.receiver.clone(), method: "bind".into() }),
-                    bind_args,
-                    span,
-                )
-                .await?;
+                let bound = self
+                    .call_http_server_method(
+                        &Rc::new(NativeMethod {
+                            receiver: m.receiver.clone(),
+                            method: "bind".into(),
+                        }),
+                        bind_args,
+                        span,
+                    )
+                    .await?;
                 // If bind returned an error pair, propagate it.
                 if let Value::Array(a) = &bound {
                     if !matches!(a.borrow().get(1), Some(Value::Nil)) {
@@ -620,7 +662,9 @@ impl Interp {
             Some(mut s) => match s.listener.take() {
                 Some(l) => l,
                 None => {
-                    return Ok(err_pair("server.serve: not bound (call bind/listen first)".into()))
+                    return Ok(err_pair(
+                        "server.serve: not bound (call bind/listen first)".into(),
+                    ))
                 }
             },
             None => return Ok(err_pair("server.serve: server is closed".into())),
@@ -670,7 +714,8 @@ impl Interp {
             // for the task's whole lifetime, then dropped (released) on completion.
             let handle = tokio::task::spawn_local(async move {
                 let _permit = permit;
-                vm.handle_connection(id, stream, max_body, timeout_ms, span).await;
+                vm.handle_connection(id, stream, max_body, timeout_ms, span)
+                    .await;
             });
             served += 1;
             if max_requests.is_some() {
@@ -725,7 +770,9 @@ impl Interp {
             }
             // Clean EOF before any bytes: client closed; nothing to write.
             Ok(Ok(None)) => None,
-            Ok(Err(ReadError::HeadersTooLarge)) => Some(simple_response(431, "request header fields too large")),
+            Ok(Err(ReadError::HeadersTooLarge)) => {
+                Some(simple_response(431, "request header fields too large"))
+            }
             Ok(Err(ReadError::BodyTooLarge)) => Some(simple_response(413, "payload too large")),
             Ok(Err(ReadError::BadRequest)) => Some(simple_response(400, "bad request")),
             // Timer elapsed: the read didn't complete in time.
@@ -785,7 +832,10 @@ impl Interp {
         req_obj.insert("query".to_string(), query);
         req_obj.insert("headers".to_string(), obj(headers_obj));
         req_obj.insert("params".to_string(), obj(params));
-        req_obj.insert("body".to_string(), Value::Str(String::from_utf8_lossy(&req.body).into_owned().into()));
+        req_obj.insert(
+            "body".to_string(),
+            Value::Str(String::from_utf8_lossy(&req.body).into_owned().into()),
+        );
         let request = obj(req_obj);
 
         // The terminal handler: the matched route, or a built-in 404.
@@ -815,7 +865,10 @@ impl Interp {
         // non-future, so this is the identity for sequential handlers (mirrors how the
         // `await` expression drives a future, spec: `await 5 == 5`). Errors inside the
         // future surface as `Control` and become a 500 below.
-        let result = match self.run_chain(middleware, 0, handler, request, dispatch_id, span).await {
+        let result = match self
+            .run_chain(middleware, 0, handler, request, dispatch_id, span)
+            .await
+        {
             Ok(Value::Future(f)) => f.get().await,
             other => other,
         };
@@ -872,9 +925,10 @@ impl Interp {
             ResourceState::HttpNext(Box::new(next_state)),
         );
         let next = match &next_handle {
-            Value::Native(n) => {
-                Value::NativeMethod(Rc::new(NativeMethod { receiver: n.clone(), method: "call".into() }))
-            }
+            Value::Native(n) => Value::NativeMethod(Rc::new(NativeMethod {
+                receiver: n.clone(),
+                method: "call".into(),
+            })),
             _ => unreachable!("register_resource returns a Native handle"),
         };
         self.call_value(mw, vec![request, next], span).await
@@ -894,14 +948,23 @@ impl Interp {
         // Take the continuation out (a `next` is single-use, like Express's).
         let state = match self.take_resource(id) {
             Some(ResourceState::HttpNext(s)) => *s,
-            _ => return Err(AsError::at("next() called twice or on an invalid handle", span).into()),
+            _ => {
+                return Err(AsError::at("next() called twice or on an invalid handle", span).into())
+            }
         };
         let request = match args.first() {
             Some(v) if !matches!(v, Value::Nil) => v.clone(),
             _ => state.request,
         };
-        self.run_chain(state.middleware, state.index, state.handler, request, state.dispatch_id, span)
-            .await
+        self.run_chain(
+            state.middleware,
+            state.index,
+            state.handler,
+            request,
+            state.dispatch_id,
+            span,
+        )
+        .await
     }
 }
 
@@ -922,7 +985,11 @@ pub struct NextState {
 fn is_callable(v: &Value) -> bool {
     matches!(
         v,
-        Value::Function(_) | Value::Builtin(_) | Value::Class(_) | Value::BoundMethod(_) | Value::NativeMethod(_)
+        Value::Function(_)
+            | Value::Builtin(_)
+            | Value::Class(_)
+            | Value::BoundMethod(_)
+            | Value::NativeMethod(_)
     )
 }
 
@@ -978,7 +1045,9 @@ mod tests {
     {
         let client_task = tokio::spawn(client());
         let interp = new_interp();
-        run_on(&interp, src).await.unwrap_or_else(|e| panic!("server: {e}"));
+        run_on(&interp, src)
+            .await
+            .unwrap_or_else(|e| panic!("server: {e}"));
         client_task.await.unwrap()
     }
 
@@ -999,8 +1068,10 @@ await s.serve({{ maxRequests: 1 }})
         );
         let _ = base;
         let url = format!("http://127.0.0.1:{port}/hello");
-        let (status, body) =
-            with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
+        let (status, body) = with_server(&src, move || async move {
+            client_request("GET", &url, None).await
+        })
+        .await;
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert_eq!(body, "world");
     }
@@ -1018,8 +1089,10 @@ await s.serve({{ maxRequests: 1 }})
 "#
         );
         let url = format!("http://127.0.0.1:{port}/users/42");
-        let (status, body) =
-            with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
+        let (status, body) = with_server(&src, move || async move {
+            client_request("GET", &url, None).await
+        })
+        .await;
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert_eq!(body, "user 42");
     }
@@ -1064,7 +1137,10 @@ await s.serve({{ maxRequests: 1 }})
         })
         .await;
         assert_eq!(status, "HTTP/1.1 201 Created");
-        assert!(raw.to_lowercase().contains("x-made: yes"), "missing header in:\n{raw}");
+        assert!(
+            raw.to_lowercase().contains("x-made: yes"),
+            "missing header in:\n{raw}"
+        );
         assert!(raw.ends_with("created"), "body wrong in:\n{raw}");
     }
 
@@ -1081,8 +1157,10 @@ await s.serve({{ maxRequests: 1 }})
 "#
         );
         let url = format!("http://127.0.0.1:{port}/unknown");
-        let (status, body) =
-            with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
+        let (status, body) = with_server(&src, move || async move {
+            client_request("GET", &url, None).await
+        })
+        .await;
         assert_eq!(status, "HTTP/1.1 404 Not Found");
         assert_eq!(body, "not found");
     }
@@ -1102,8 +1180,10 @@ await s.serve({{ maxRequests: 1 }})
 "#
         );
         let url = format!("http://127.0.0.1:{port}/secret");
-        let (status, body) =
-            with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
+        let (status, body) = with_server(&src, move || async move {
+            client_request("GET", &url, None).await
+        })
+        .await;
         assert_eq!(status, "HTTP/1.1 401 Unauthorized");
         assert_eq!(body, "denied");
     }
@@ -1126,8 +1206,10 @@ await s.serve({{ maxRequests: 1 }})
 "#
         );
         let url = format!("http://127.0.0.1:{port}/ok");
-        let (status, body) =
-            with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
+        let (status, body) = with_server(&src, move || async move {
+            client_request("GET", &url, None).await
+        })
+        .await;
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert_eq!(body, "handled");
     }
@@ -1150,10 +1232,15 @@ await s.serve({{ maxRequests: 1 }})
 "#
         );
         let url = format!("http://127.0.0.1:{port}/page");
-        let (status, raw) =
-            with_server(&src, move || async move { client_request_raw("GET", &url, None).await }).await;
+        let (status, raw) = with_server(&src, move || async move {
+            client_request_raw("GET", &url, None).await
+        })
+        .await;
         assert_eq!(status, "HTTP/1.1 200 OK");
-        assert!(raw.to_lowercase().contains("x-powered-by: ascript"), "missing header:\n{raw}");
+        assert!(
+            raw.to_lowercase().contains("x-powered-by: ascript"),
+            "missing header:\n{raw}"
+        );
         assert!(raw.ends_with("hi"), "body wrong:\n{raw}");
     }
 
@@ -1170,8 +1257,10 @@ await s.serve({{ maxRequests: 1 }})
 "#
         );
         let url = format!("http://127.0.0.1:{port}/search?q=cats&page=2");
-        let (status, body) =
-            with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
+        let (status, body) = with_server(&src, move || async move {
+            client_request("GET", &url, None).await
+        })
+        .await;
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert_eq!(body, "cats/2");
     }
@@ -1209,7 +1298,10 @@ print(out)
 "#
         );
         let client = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             rt.block_on(async move {
                 let interp = new_interp();
                 run_on(&interp, &client_src).await.expect("client ran");
@@ -1246,7 +1338,11 @@ await s.serve({{ maxRequests: 1 }})
         // The server handle itself was closed implicitly? No — `create()`'s handle
         // outlives the program, but the transient next-continuation must be gone.
         // Resource count returns to (baseline + 1 server handle), with NO next handle.
-        assert_eq!(interp.resource_count(), baseline + 1, "only the server handle should remain");
+        assert_eq!(
+            interp.resource_count(),
+            baseline + 1,
+            "only the server handle should remain"
+        );
     }
 
     #[tokio::test]
@@ -1275,8 +1371,14 @@ await s.serve({{ maxRequests: 2 }})
         })
         .await;
         let ((boom_status, _boom_body), (ok_status, ok_body)) = results;
-        assert_eq!(boom_status, "HTTP/1.1 500 Internal Server Error", "panic must yield 500");
-        assert_eq!(ok_status, "HTTP/1.1 200 OK", "server must survive the panic");
+        assert_eq!(
+            boom_status, "HTTP/1.1 500 Internal Server Error",
+            "panic must yield 500"
+        );
+        assert_eq!(
+            ok_status, "HTTP/1.1 200 OK",
+            "server must survive the panic"
+        );
         assert_eq!(ok_body, "alive");
     }
 
@@ -1305,8 +1407,14 @@ await s.serve({{ maxRequests: 2, maxBodySize: 10 }})
         })
         .await;
         let ((up_status, _up_body), (ping_status, ping_body)) = results;
-        assert_eq!(up_status, "HTTP/1.1 413 Payload Too Large", "oversized body must be 413");
-        assert_eq!(ping_status, "HTTP/1.1 200 OK", "server must survive the rejected body");
+        assert_eq!(
+            up_status, "HTTP/1.1 413 Payload Too Large",
+            "oversized body must be 413"
+        );
+        assert_eq!(
+            ping_status, "HTTP/1.1 200 OK",
+            "server must survive the rejected body"
+        );
         assert_eq!(ping_body, "pong");
     }
 
@@ -1332,32 +1440,33 @@ await s.serve({{ maxRequests: 2 }})
         );
         let slow_url = format!("http://127.0.0.1:{port}/slow");
         let fast_url = format!("http://127.0.0.1:{port}/fast");
-        let (slow_elapsed_ms, fast_elapsed_ms, slow_body, fast_body) = with_server(&src, move || async move {
-            let start = std::time::Instant::now();
-            // Fire the slow request first so it is (likely) accepted first; then the
-            // fast one. Concurrency means the fast one still returns quickly.
-            let slow = tokio::spawn({
-                let url = slow_url.clone();
-                async move {
-                    let (_s, b) = client_request("GET", &url, None).await;
-                    (start.elapsed().as_millis(), b)
-                }
-            });
-            // Tiny stagger so /slow is accepted first, exposing head-of-line blocking
-            // if the server were sequential.
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-            let fast = tokio::spawn({
-                let url = fast_url.clone();
-                async move {
-                    let (_s, b) = client_request("GET", &url, None).await;
-                    (start.elapsed().as_millis(), b)
-                }
-            });
-            let (slow_ms, slow_b) = slow.await.unwrap();
-            let (fast_ms, fast_b) = fast.await.unwrap();
-            (slow_ms, fast_ms, slow_b, fast_b)
-        })
-        .await;
+        let (slow_elapsed_ms, fast_elapsed_ms, slow_body, fast_body) =
+            with_server(&src, move || async move {
+                let start = std::time::Instant::now();
+                // Fire the slow request first so it is (likely) accepted first; then the
+                // fast one. Concurrency means the fast one still returns quickly.
+                let slow = tokio::spawn({
+                    let url = slow_url.clone();
+                    async move {
+                        let (_s, b) = client_request("GET", &url, None).await;
+                        (start.elapsed().as_millis(), b)
+                    }
+                });
+                // Tiny stagger so /slow is accepted first, exposing head-of-line blocking
+                // if the server were sequential.
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let fast = tokio::spawn({
+                    let url = fast_url.clone();
+                    async move {
+                        let (_s, b) = client_request("GET", &url, None).await;
+                        (start.elapsed().as_millis(), b)
+                    }
+                });
+                let (slow_ms, slow_b) = slow.await.unwrap();
+                let (fast_ms, fast_b) = fast.await.unwrap();
+                (slow_ms, fast_ms, slow_b, fast_b)
+            })
+            .await;
         assert_eq!(slow_body, "slow");
         assert_eq!(fast_body, "fast");
         // The fast response must come back well before the slow handler finishes
@@ -1369,7 +1478,10 @@ await s.serve({{ maxRequests: 2 }})
             "fast response should overlap the slow handler (got {fast_elapsed_ms}ms; slow took {slow_elapsed_ms}ms)"
         );
         // Sanity: the slow handler really did take ~400ms (it slept).
-        assert!(slow_elapsed_ms >= 350, "slow handler should have slept ~400ms (got {slow_elapsed_ms}ms)");
+        assert!(
+            slow_elapsed_ms >= 350,
+            "slow handler should have slept ~400ms (got {slow_elapsed_ms}ms)"
+        );
     }
 
     #[tokio::test]
@@ -1391,9 +1503,14 @@ await s.serve({{ maxRequests: 1 }})
 "#
         );
         let url = format!("http://127.0.0.1:{port}/slow");
-        let (status, body) =
-            with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
-        assert_eq!(status, "HTTP/1.1 200 OK", "in-flight slow handler must be drained before serve returns");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("GET", &url, None).await
+        })
+        .await;
+        assert_eq!(
+            status, "HTTP/1.1 200 OK",
+            "in-flight slow handler must be drained before serve returns"
+        );
         assert_eq!(body, "drained-ok");
     }
 
@@ -1419,7 +1536,9 @@ await s.serve({{ maxRequests: {n}, maxConcurrent: 2 }})
             let mut tasks = Vec::new();
             for _ in 0..n {
                 let u = url.clone();
-                tasks.push(tokio::spawn(async move { client_request("GET", &u, None).await }));
+                tasks.push(tokio::spawn(async move {
+                    client_request("GET", &u, None).await
+                }));
             }
             let mut out = Vec::new();
             for t in tasks {
@@ -1430,7 +1549,10 @@ await s.serve({{ maxRequests: {n}, maxConcurrent: 2 }})
         .await;
         assert_eq!(bodies.len(), n);
         for (status, body) in &bodies {
-            assert_eq!(status, "HTTP/1.1 200 OK", "every request must succeed under the cap");
+            assert_eq!(
+                status, "HTTP/1.1 200 OK",
+                "every request must succeed under the cap"
+            );
             assert_eq!(body, "done");
         }
     }
@@ -1440,8 +1562,12 @@ await s.serve({{ maxRequests: {n}, maxConcurrent: 2 }})
     async fn client_request_raw(method: &str, url: &str, body: Option<String>) -> (String, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let rest = url.strip_prefix("http://").unwrap();
-        let (hostport, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap();
-        let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n");
+        let (hostport, path) = rest
+            .split_once('/')
+            .map(|(h, p)| (h, format!("/{p}")))
+            .unwrap();
+        let mut req =
+            format!("{method} {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n");
         if let Some(b) = &body {
             req.push_str(&format!("Content-Length: {}\r\n", b.len()));
         }
@@ -1470,10 +1596,12 @@ await s.serve({{ maxRequests: {n}, maxConcurrent: 2 }})
     async fn client_request(method: &str, url: &str, body: Option<String>) -> (String, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let rest = url.strip_prefix("http://").unwrap();
-        let (hostport, path) = rest.split_once('/').map(|(h, p)| (h, format!("/{p}"))).unwrap();
-        let mut req = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n"
-        );
+        let (hostport, path) = rest
+            .split_once('/')
+            .map(|(h, p)| (h, format!("/{p}")))
+            .unwrap();
+        let mut req =
+            format!("{method} {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n");
         if let Some(b) = &body {
             req.push_str(&format!("Content-Length: {}\r\n", b.len()));
         }

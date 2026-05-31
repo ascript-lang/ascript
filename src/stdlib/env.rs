@@ -61,13 +61,20 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "loadDotenv" => {
             let path = match args.first() {
                 None | Some(Value::Nil) => std::path::PathBuf::from(".env"),
-                Some(_) => std::path::PathBuf::from(want_string(&arg(args, 0), span, &ctx("loadDotenv"))?.as_ref()),
+                Some(_) => std::path::PathBuf::from(
+                    want_string(&arg(args, 0), span, &ctx("loadDotenv"))?.as_ref(),
+                ),
             };
             // Iterate the file's entries, setting each into the process env and
             // counting successfully-set vars. A read/parse failure → Tier-1 err.
             let iter = match dotenvy::from_path_iter(&path) {
                 Ok(iter) => iter,
-                Err(e) => return Ok(make_pair(Value::Nil, make_error(Value::Str(format!("cannot load dotenv: {}", e).into())))),
+                Err(e) => {
+                    return Ok(make_pair(
+                        Value::Nil,
+                        make_error(Value::Str(format!("cannot load dotenv: {}", e).into())),
+                    ))
+                }
             };
             let mut count = 0u64;
             for entry in iter {
@@ -76,7 +83,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         std::env::set_var(&k, &v);
                         count += 1;
                     }
-                    Err(e) => return Ok(make_pair(Value::Nil, make_error(Value::Str(format!("cannot parse dotenv: {}", e).into())))),
+                    Err(e) => {
+                        return Ok(make_pair(
+                            Value::Nil,
+                            make_error(Value::Str(format!("cannot parse dotenv: {}", e).into())),
+                        ))
+                    }
                 }
             }
             Ok(make_pair(Value::Number(count as f64), Value::Nil))
@@ -101,7 +113,10 @@ mod tests {
         // initially unset
         assert_eq!(call("get", &[s(key)], sp()).unwrap(), Value::Nil);
         // set then get
-        assert_eq!(call("set", &[s(key), s("hello")], sp()).unwrap(), Value::Nil);
+        assert_eq!(
+            call("set", &[s(key), s("hello")], sp()).unwrap(),
+            Value::Nil
+        );
         assert_eq!(call("get", &[s(key)], sp()).unwrap(), s("hello"));
         // unset then get is nil again
         assert_eq!(call("unset", &[s(key)], sp()).unwrap(), Value::Nil);

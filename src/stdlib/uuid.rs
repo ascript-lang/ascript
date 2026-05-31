@@ -21,7 +21,9 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn sp() -> Span { Span::new(0, 0) }
+    fn sp() -> Span {
+        Span::new(0, 0)
+    }
 
     #[test]
     fn v4_v7_format() {
@@ -30,11 +32,17 @@ mod tests {
             assert_eq!(s.len(), 36);
             assert_eq!(s.chars().filter(|&c| c == '-').count(), 4);
             assert_eq!(&s[14..15], "4"); // version nibble
-        } else { panic!("expected string"); }
+        } else {
+            panic!("expected string");
+        }
         let a = call("v4", &[], sp()).unwrap();
         let b = call("v4", &[], sp()).unwrap();
         assert_ne!(a, b); // random → distinct
         let v7 = call("v7", &[], sp()).unwrap();
-        if let Value::Str(s) = v7 { assert_eq!(&s[14..15], "7"); } else { panic!(); }
+        if let Value::Str(s) = v7 {
+            assert_eq!(&s[14..15], "7");
+        } else {
+            panic!();
+        }
     }
 }

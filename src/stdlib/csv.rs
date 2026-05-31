@@ -9,7 +9,10 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("parse", bi("csv.parse")), ("stringify", bi("csv.stringify"))]
+    vec![
+        ("parse", bi("csv.parse")),
+        ("stringify", bi("csv.stringify")),
+    ]
 }
 
 fn arr(v: Vec<Value>) -> Value {
@@ -117,14 +120,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 for row in rows.iter() {
                     let r = match row {
                         Value::Array(a) => a,
-                        _ => {
-                            return Ok(make_pair(
-                                Value::Nil,
-                                make_error(str_v(
-                                    "csv.stringify expects an array of arrays or an array of objects",
-                                )),
-                            ))
-                        }
+                        _ => return Ok(make_pair(
+                            Value::Nil,
+                            make_error(str_v(
+                                "csv.stringify expects an array of arrays or an array of objects",
+                            )),
+                        )),
                     };
                     let fields: Vec<String> = r.borrow().iter().map(|v| v.to_string()).collect();
                     // Infallible in-memory write; flush errors surface via into_inner().
@@ -166,7 +167,10 @@ mod tests {
         opt.insert("header".to_string(), Value::Bool(true));
         let withhdr = call(
             "parse",
-            &[s("name,age\nAda,36"), Value::Object(Rc::new(RefCell::new(opt)))],
+            &[
+                s("name,age\nAda,36"),
+                Value::Object(Rc::new(RefCell::new(opt))),
+            ],
             sp(),
         )
         .unwrap();

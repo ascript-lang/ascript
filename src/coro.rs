@@ -197,9 +197,18 @@ mod tests {
     async fn three_value_generator_yields_then_done() {
         on_localset(async {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), Some(Value::Number(1.0)));
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), Some(Value::Number(2.0)));
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), Some(Value::Number(3.0)));
+            assert_eq!(
+                g.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(1.0))
+            );
+            assert_eq!(
+                g.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(2.0))
+            );
+            assert_eq!(
+                g.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(3.0))
+            );
             assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
             // Idempotent: still None after done.
             assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
@@ -232,14 +241,20 @@ mod tests {
                 Ok(Value::Nil)
             });
             let g = Rc::new(GeneratorHandle::new(body));
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), Some(Value::Number(10.0)));
+            assert_eq!(
+                g.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(10.0))
+            );
             assert_eq!(
                 g.resume(Value::Str("first".into())).await.unwrap(),
                 Some(Value::Number(20.0))
             );
             assert_eq!(g.resume(Value::Str("second".into())).await.unwrap(), None);
             let s = seen.borrow();
-            assert_eq!(s.as_slice(), &[Value::Str("first".into()), Value::Str("second".into())]);
+            assert_eq!(
+                s.as_slice(),
+                &[Value::Str("first".into()), Value::Str("second".into())]
+            );
         })
         .await;
     }
@@ -269,7 +284,10 @@ mod tests {
         // surrounding LocalSet completes (this test returning IS that proof).
         on_localset(async {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), Some(Value::Number(1.0)));
+            assert_eq!(
+                g.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(1.0))
+            );
             drop(g);
         })
         .await;
@@ -284,7 +302,10 @@ mod tests {
                 Err(Control::Panic(AsError::new("boom")))
             });
             let g = Rc::new(GeneratorHandle::new(body));
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), Some(Value::Number(1.0)));
+            assert_eq!(
+                g.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(1.0))
+            );
             match g.resume(Value::Nil).await {
                 Err(Control::Panic(e)) => assert_eq!(e.message, "boom"),
                 other => panic!("expected a panic surfaced to the consumer, got {other:?}"),
@@ -299,7 +320,10 @@ mod tests {
     async fn close_then_resume_is_none() {
         on_localset(async {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
-            assert_eq!(g.resume(Value::Nil).await.unwrap(), Some(Value::Number(1.0)));
+            assert_eq!(
+                g.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(1.0))
+            );
             g.close();
             assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
         })
@@ -322,8 +346,14 @@ mod tests {
                 Ok(Value::Nil)
             });
             let outer = Rc::new(GeneratorHandle::new(outer_body));
-            assert_eq!(outer.resume(Value::Nil).await.unwrap(), Some(Value::Number(2.0)));
-            assert_eq!(outer.resume(Value::Nil).await.unwrap(), Some(Value::Number(4.0)));
+            assert_eq!(
+                outer.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(2.0))
+            );
+            assert_eq!(
+                outer.resume(Value::Nil).await.unwrap(),
+                Some(Value::Number(4.0))
+            );
             assert_eq!(outer.resume(Value::Nil).await.unwrap(), None);
             // The stack is balanced after all polling.
             assert!(current_generator().is_none());

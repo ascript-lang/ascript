@@ -31,7 +31,10 @@ pub enum AssignError {
 impl Environment {
     /// Create a new, empty global scope.
     pub fn global() -> Self {
-        Environment(Rc::new(RefCell::new(Scope { vars: HashMap::new(), parent: None })))
+        Environment(Rc::new(RefCell::new(Scope {
+            vars: HashMap::new(),
+            parent: None,
+        })))
     }
 
     /// Create a new child scope whose parent is `self`.
@@ -49,7 +52,9 @@ impl Environment {
         if scope.vars.contains_key(name) {
             return Err(format!("'{}' is already defined in this scope", name));
         }
-        scope.vars.insert(name.to_string(), Binding { value, mutable });
+        scope
+            .vars
+            .insert(name.to_string(), Binding { value, mutable });
         Ok(())
     }
 
@@ -120,7 +125,13 @@ mod tests {
         let child = parent.child();
         child.assign("m", Value::Number(10.0)).unwrap();
         assert!(matches!(parent.get("m"), Some(Value::Number(n)) if n == 10.0));
-        assert_eq!(child.assign("c", Value::Number(3.0)), Err(AssignError::Immutable));
-        assert_eq!(child.assign("nope", Value::Nil), Err(AssignError::Undefined));
+        assert_eq!(
+            child.assign("c", Value::Number(3.0)),
+            Err(AssignError::Immutable)
+        );
+        assert_eq!(
+            child.assign("nope", Value::Nil),
+            Err(AssignError::Undefined)
+        );
     }
 }

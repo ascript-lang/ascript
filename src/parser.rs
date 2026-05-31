@@ -102,12 +102,20 @@ impl<'a> Parser<'a> {
             self.advance();
             // `as`
             if !matches!(self.peek(), Tok::Ident(s) if s == "as") {
-                return Err(AsError::at("expected 'as' after '*' in import", self.span()));
+                return Err(AsError::at(
+                    "expected 'as' after '*' in import",
+                    self.span(),
+                ));
             }
             self.advance();
             let alias = match self.advance() {
                 Tok::Ident(n) => n,
-                other => return Err(AsError::at(format!("expected namespace alias, found {:?}", other), self.tokens[self.pos - 1].span)),
+                other => {
+                    return Err(AsError::at(
+                        format!("expected namespace alias, found {:?}", other),
+                        self.tokens[self.pos - 1].span,
+                    ))
+                }
             };
             crate::ast::ImportNames::Namespace(alias)
         } else {
@@ -117,11 +125,18 @@ impl<'a> Parser<'a> {
                 loop {
                     match self.advance() {
                         Tok::Ident(n) => names.push(n),
-                        other => return Err(AsError::at(format!("expected import name, found {:?}", other), self.tokens[self.pos - 1].span)),
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected import name, found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
                     }
                     if *self.peek() == Tok::Comma {
                         self.advance();
-                        if *self.peek() == Tok::RBrace { break; }
+                        if *self.peek() == Tok::RBrace {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -137,7 +152,12 @@ impl<'a> Parser<'a> {
         self.advance();
         let source = match self.advance() {
             Tok::Str(s) => s,
-            other => return Err(AsError::at(format!("expected module path string, found {:?}", other), self.tokens[self.pos - 1].span)),
+            other => {
+                return Err(AsError::at(
+                    format!("expected module path string, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
         };
         Ok(Stmt::Import { names, source })
     }
@@ -161,14 +181,22 @@ impl<'a> Parser<'a> {
             }
             Tok::Class => self.class_decl()?,
             Tok::Enum => self.enum_decl()?,
-            other => return Err(AsError::at(format!("only let/const/fn/class/enum can be exported, found {:?}", other), self.span())),
+            other => {
+                return Err(AsError::at(
+                    format!(
+                        "only let/const/fn/class/enum can be exported, found {:?}",
+                        other
+                    ),
+                    self.span(),
+                ))
+            }
         };
         Ok(Stmt::Export(Box::new(inner)))
     }
 
     fn return_stmt(&mut self) -> Result<Stmt, AsError> {
         self.advance(); // consume `return`
-        // No value if the next token cannot begin an expression in this position.
+                        // No value if the next token cannot begin an expression in this position.
         match self.peek() {
             Tok::RBrace | Tok::Eof | Tok::Semicolon => Ok(Stmt::Return(None)),
             _ => {
@@ -208,7 +236,16 @@ impl<'a> Parser<'a> {
         };
         let body = self.block()?;
         let span = Span::new(start, self.prev_end());
-        Ok(Stmt::Fn { name, params, ret, body, is_async, is_generator, span, name_span })
+        Ok(Stmt::Fn {
+            name,
+            params,
+            ret,
+            body,
+            is_async,
+            is_generator,
+            span,
+            name_span,
+        })
     }
 
     fn enum_decl(&mut self) -> Result<Stmt, AsError> {
@@ -217,7 +254,12 @@ impl<'a> Parser<'a> {
         let name_span = self.span();
         let name = match self.advance() {
             Tok::Ident(n) => n,
-            other => return Err(AsError::at(format!("expected enum name, found {:?}", other), self.tokens[self.pos - 1].span)),
+            other => {
+                return Err(AsError::at(
+                    format!("expected enum name, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
         };
         self.eat(&Tok::LBrace)?;
         let mut variants = Vec::new();
@@ -225,7 +267,12 @@ impl<'a> Parser<'a> {
             let vname_span = self.span();
             let vname = match self.advance() {
                 Tok::Ident(n) => n,
-                other => return Err(AsError::at(format!("expected variant name, found {:?}", other), self.tokens[self.pos - 1].span)),
+                other => {
+                    return Err(AsError::at(
+                        format!("expected variant name, found {:?}", other),
+                        self.tokens[self.pos - 1].span,
+                    ))
+                }
             };
             let value = if *self.peek() == Tok::Eq {
                 self.advance();
@@ -233,7 +280,11 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            variants.push(crate::ast::EnumVariantDecl { name: vname, value, name_span: vname_span });
+            variants.push(crate::ast::EnumVariantDecl {
+                name: vname,
+                value,
+                name_span: vname_span,
+            });
             if *self.peek() == Tok::Comma {
                 self.advance();
             } else {
@@ -242,7 +293,12 @@ impl<'a> Parser<'a> {
         }
         self.eat(&Tok::RBrace)?;
         let span = Span::new(start, self.prev_end());
-        Ok(Stmt::Enum { name, variants, span, name_span })
+        Ok(Stmt::Enum {
+            name,
+            variants,
+            span,
+            name_span,
+        })
     }
 
     fn class_decl(&mut self) -> Result<Stmt, AsError> {
@@ -251,14 +307,24 @@ impl<'a> Parser<'a> {
         let name_span = self.span();
         let name = match self.advance() {
             Tok::Ident(n) => n,
-            other => return Err(AsError::at(format!("expected class name, found {:?}", other), self.tokens[self.pos - 1].span)),
+            other => {
+                return Err(AsError::at(
+                    format!("expected class name, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
         };
         let superclass = if matches!(self.peek(), Tok::Ident(s) if s == "extends") {
             // `extends` is a soft keyword here (lexes as Ident)
             self.advance();
             match self.advance() {
                 Tok::Ident(n) => Some(n),
-                other => return Err(AsError::at(format!("expected superclass name, found {:?}", other), self.tokens[self.pos - 1].span)),
+                other => {
+                    return Err(AsError::at(
+                        format!("expected superclass name, found {:?}", other),
+                        self.tokens[self.pos - 1].span,
+                    ))
+                }
             }
         } else {
             None
@@ -291,7 +357,12 @@ impl<'a> Parser<'a> {
                 let mname_span = self.span();
                 let mname = match self.advance() {
                     Tok::Ident(n) => n,
-                    other => return Err(AsError::at(format!("expected method name, found {:?}", other), self.tokens[self.pos - 1].span)),
+                    other => {
+                        return Err(AsError::at(
+                            format!("expected method name, found {:?}", other),
+                            self.tokens[self.pos - 1].span,
+                        ))
+                    }
                 };
                 let params = self.param_list()?;
                 let ret = if *self.peek() == Tok::Colon {
@@ -318,7 +389,12 @@ impl<'a> Parser<'a> {
                 let fname_span = self.span();
                 let fname = match self.advance() {
                     Tok::Ident(n) => n,
-                    other => return Err(AsError::at(format!("expected a field name or method, found {:?}", other), self.tokens[self.pos - 1].span)),
+                    other => {
+                        return Err(AsError::at(
+                            format!("expected a field name or method, found {:?}", other),
+                            self.tokens[self.pos - 1].span,
+                        ))
+                    }
                 };
                 // `name?:` marker — lower to Optional below.
                 let marker_optional = if *self.peek() == Tok::Question {
@@ -339,12 +415,25 @@ impl<'a> Parser<'a> {
                     None
                 };
                 let fspan = Span::new(fstart, self.prev_end());
-                fields.push(crate::ast::FieldDecl { name: fname, ty, default, span: fspan, name_span: fname_span });
+                fields.push(crate::ast::FieldDecl {
+                    name: fname,
+                    ty,
+                    default,
+                    span: fspan,
+                    name_span: fname_span,
+                });
             }
         }
         self.eat(&Tok::RBrace)?;
         let span = Span::new(start, self.prev_end());
-        Ok(Stmt::Class { name, superclass, fields, methods, span, name_span })
+        Ok(Stmt::Class {
+            name,
+            superclass,
+            fields,
+            methods,
+            span,
+            name_span,
+        })
     }
 
     fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {
@@ -417,7 +506,12 @@ impl<'a> Parser<'a> {
                 }
                 _ => Type::Named(name),
             },
-            other => return Err(AsError::at(format!("expected a type, found {:?}", other), span)),
+            other => {
+                return Err(AsError::at(
+                    format!("expected a type, found {:?}", other),
+                    span,
+                ))
+            }
         };
         // `T?` nullable suffix (sugar for `T | nil`). Only reachable in type
         // position (after `:` / inside `<...>`), so it never collides with the
@@ -459,7 +553,12 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                params.push(crate::ast::Param { name, ty, name_span, rest: is_rest });
+                params.push(crate::ast::Param {
+                    name,
+                    ty,
+                    name_span,
+                    rest: is_rest,
+                });
                 if is_rest {
                     if *self.peek() == Tok::Comma {
                         return Err(AsError::at("a rest parameter must be last", name_span));
@@ -509,7 +608,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Stmt::If { cond, then_branch, else_branch })
+        Ok(Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        })
     }
 
     fn while_stmt(&mut self) -> Result<Stmt, AsError> {
@@ -553,17 +656,37 @@ impl<'a> Parser<'a> {
                 // over a `..` range it would be a non-iterable Tier-2 error, but
                 // a range is never async-iterable so keep it ForOf for the error).
                 if !for_await {
-                    if let ExprKind::Binary { op: BinOp::Range, lhs, rhs } = iter.kind {
-                        return Ok(Stmt::ForRange { var, start: *lhs, end: *rhs, body });
+                    if let ExprKind::Binary {
+                        op: BinOp::Range,
+                        lhs,
+                        rhs,
+                    } = iter.kind
+                    {
+                        return Ok(Stmt::ForRange {
+                            var,
+                            start: *lhs,
+                            end: *rhs,
+                            body,
+                        });
                     }
                 }
-                Ok(Stmt::ForOf { var, iter, body, for_await })
+                Ok(Stmt::ForOf {
+                    var,
+                    iter,
+                    body,
+                    for_await,
+                })
             }
             Tok::Of => {
                 let iter = self.expr()?;
                 self.eat(&Tok::RParen)?;
                 let body = self.block()?;
-                Ok(Stmt::ForOf { var, iter, body, for_await })
+                Ok(Stmt::ForOf {
+                    var,
+                    iter,
+                    body,
+                    for_await,
+                })
             }
             other => Err(AsError::at(
                 format!("expected 'in' or 'of' in for-loop, found {:?}", other),
@@ -575,7 +698,7 @@ impl<'a> Parser<'a> {
     fn let_stmt(&mut self, mutable: bool) -> Result<Stmt, AsError> {
         let start = self.span().start;
         self.advance(); // consume `let` / `const`
-        // `let [a, b] = expr` — array destructuring binding (spec §6).
+                        // `let [a, b] = expr` — array destructuring binding (spec §6).
         if *self.peek() == Tok::LBracket {
             self.advance(); // consume '['
             let mut names = Vec::new();
@@ -588,10 +711,17 @@ impl<'a> Parser<'a> {
                         let rspan = self.span();
                         let rname = match self.advance() {
                             Tok::Ident(n) => n,
-                            other => return Err(AsError::at(format!("expected a name after '...', found {:?}", other), self.tokens[self.pos - 1].span)),
+                            other => {
+                                return Err(AsError::at(
+                                    format!("expected a name after '...', found {:?}", other),
+                                    self.tokens[self.pos - 1].span,
+                                ))
+                            }
                         };
                         rest = Some((rname, rspan));
-                        if *self.peek() == Tok::Comma { return Err(AsError::at("a rest element must be last", rspan)); }
+                        if *self.peek() == Tok::Comma {
+                            return Err(AsError::at("a rest element must be last", rspan));
+                        }
                         break;
                     }
                     let span = self.span();
@@ -600,14 +730,21 @@ impl<'a> Parser<'a> {
                             names.push(n);
                             name_spans.push(span);
                         }
-                        other => return Err(AsError::at(
-                            format!("expected an identifier in destructuring pattern, found {:?}", other),
-                            self.tokens[self.pos - 1].span,
-                        )),
+                        other => {
+                            return Err(AsError::at(
+                                format!(
+                                    "expected an identifier in destructuring pattern, found {:?}",
+                                    other
+                                ),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
                     }
                     if *self.peek() == Tok::Comma {
                         self.advance();
-                        if *self.peek() == Tok::RBracket { break; }
+                        if *self.peek() == Tok::RBracket {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -617,7 +754,14 @@ impl<'a> Parser<'a> {
             self.eat(&Tok::Eq)?;
             let value = self.expr()?;
             let span = Span::new(start, self.prev_end());
-            return Ok(Stmt::LetDestructure { names, rest, value, mutable, span, name_spans });
+            return Ok(Stmt::LetDestructure {
+                names,
+                rest,
+                value,
+                mutable,
+                span,
+                name_spans,
+            });
         }
         // `let {a, b as local} = expr` — object destructuring binding.
         if *self.peek() == Tok::LBrace {
@@ -631,50 +775,79 @@ impl<'a> Parser<'a> {
                         let rspan = self.span();
                         let rname = match self.advance() {
                             Tok::Ident(n) => n,
-                            other => return Err(AsError::at(format!("expected a name after '...', found {:?}", other), self.tokens[self.pos - 1].span)),
+                            other => {
+                                return Err(AsError::at(
+                                    format!("expected a name after '...', found {:?}", other),
+                                    self.tokens[self.pos - 1].span,
+                                ))
+                            }
                         };
                         rest = Some((rname, rspan));
-                        if *self.peek() == Tok::Comma { return Err(AsError::at("a rest element must be last", rspan)); }
+                        if *self.peek() == Tok::Comma {
+                            return Err(AsError::at("a rest element must be last", rspan));
+                        }
                         break;
                     }
                     let key_span = self.span();
                     let key = match self.advance() {
                         Tok::Ident(n) => n,
                         Tok::Str(s) => s,
-                        other => return Err(AsError::at(
-                            format!("expected a key in object pattern, found {:?}", other),
-                            self.tokens[self.pos - 1].span)),
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected a key in object pattern, found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
                     };
-                    let (binding, binding_span) =
-                        if matches!(self.peek(), Tok::Ident(s) if s == "as") {
-                            self.advance();
-                            let bspan = self.span();
-                            match self.advance() {
-                                Tok::Ident(b) => (b, bspan),
-                                other => return Err(AsError::at(
-                                    format!("expected a local name after 'as', found {:?}", other),
-                                    self.tokens[self.pos - 1].span)),
-                            }
-                        } else {
-                            if !is_ident_like(&key) {
+                    let (binding, binding_span) = if matches!(self.peek(), Tok::Ident(s) if s == "as")
+                    {
+                        self.advance();
+                        let bspan = self.span();
+                        match self.advance() {
+                            Tok::Ident(b) => (b, bspan),
+                            other => {
                                 return Err(AsError::at(
-                                    format!("key {:?} is not a valid binding name; use `as`", key),
-                                    key_span));
+                                    format!("expected a local name after 'as', found {:?}", other),
+                                    self.tokens[self.pos - 1].span,
+                                ))
                             }
-                            (key.clone(), key_span)
-                        };
-                    bindings.push(crate::ast::ObjBinding { key, binding, key_span, binding_span });
+                        }
+                    } else {
+                        if !is_ident_like(&key) {
+                            return Err(AsError::at(
+                                format!("key {:?} is not a valid binding name; use `as`", key),
+                                key_span,
+                            ));
+                        }
+                        (key.clone(), key_span)
+                    };
+                    bindings.push(crate::ast::ObjBinding {
+                        key,
+                        binding,
+                        key_span,
+                        binding_span,
+                    });
                     if *self.peek() == Tok::Comma {
                         self.advance();
-                        if *self.peek() == Tok::RBrace { break; }
-                    } else { break; }
+                        if *self.peek() == Tok::RBrace {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
             self.eat(&Tok::RBrace)?;
             self.eat(&Tok::Eq)?;
             let value = self.expr()?;
             let span = Span::new(start, self.prev_end());
-            return Ok(Stmt::LetDestructureObject { bindings, rest, value, mutable, span });
+            return Ok(Stmt::LetDestructureObject {
+                bindings,
+                rest,
+                value,
+                mutable,
+                span,
+            });
         }
         let name_span = self.span();
         let name = match self.advance() {
@@ -701,10 +874,20 @@ impl<'a> Parser<'a> {
         } else if mutable {
             None
         } else {
-            return Err(AsError::at("const declarations must be initialized", self.span()));
+            return Err(AsError::at(
+                "const declarations must be initialized",
+                self.span(),
+            ));
         };
         let span = Span::new(start, self.prev_end());
-        Ok(Stmt::Let { name, ty, value, mutable, span, name_span })
+        Ok(Stmt::Let {
+            name,
+            ty,
+            value,
+            mutable,
+            span,
+            name_span,
+        })
     }
 
     fn expr(&mut self) -> Result<Expr, AsError> {
@@ -719,11 +902,11 @@ impl<'a> Parser<'a> {
         if *self.peek() == Tok::Yield {
             let start = self.span().start;
             self.advance(); // consume `yield`
-            // An operand is present iff the next token can begin an expression.
-            // AScript has no newline tokens (ASI is parser-driven), so a bare
-            // `yield` is recognized by what follows: a terminator (`)`, `}`, `,`,
-            // `;`, `:`, EOF) or a statement keyword (`let`, `return`, `if`, …)
-            // that cannot start an expression ends the `yield`.
+                            // An operand is present iff the next token can begin an expression.
+                            // AScript has no newline tokens (ASI is parser-driven), so a bare
+                            // `yield` is recognized by what follows: a terminator (`)`, `}`, `,`,
+                            // `;`, `:`, EOF) or a statement keyword (`let`, `return`, `if`, …)
+                            // that cannot start an expression ends the `yield`.
             let operand = if starts_expression(self.peek()) {
                 Some(Box::new(self.assignment()?))
             } else {
@@ -772,7 +955,10 @@ impl<'a> Parser<'a> {
         };
 
         Ok(Expr {
-            kind: ExprKind::Assign { target: Box::new(target), value: Box::new(value) },
+            kind: ExprKind::Assign {
+                target: Box::new(target),
+                value: Box::new(value),
+            },
             span,
         })
     }
@@ -780,7 +966,14 @@ impl<'a> Parser<'a> {
     /// Build a left-associative binary node from an already-parsed left side.
     fn make_binary(left: Expr, op: BinOp, right: Expr) -> Expr {
         let span = Span::new(left.span.start, right.span.end);
-        Expr { kind: ExprKind::Binary { op, lhs: Box::new(left), rhs: Box::new(right) }, span }
+        Expr {
+            kind: ExprKind::Binary {
+                op,
+                lhs: Box::new(left),
+                rhs: Box::new(right),
+            },
+            span,
+        }
     }
 
     /// Attempt to parse an arrow function at the current position. Returns
@@ -792,7 +985,9 @@ impl<'a> Parser<'a> {
         let is_async = if *self.peek() == Tok::Async {
             let next = &self.tokens[self.pos + 1].tok;
             let looks_like_arrow = match next {
-                Tok::Ident(_) => self.tokens.get(self.pos + 2).map(|t| &t.tok) == Some(&Tok::FatArrow),
+                Tok::Ident(_) => {
+                    self.tokens.get(self.pos + 2).map(|t| &t.tok) == Some(&Tok::FatArrow)
+                }
                 Tok::LParen => {
                     let saved = self.pos;
                     self.pos += 1;
@@ -820,7 +1015,12 @@ impl<'a> Parser<'a> {
                 let end = self.prev_end();
                 return Ok(Some(Expr {
                     kind: ExprKind::Arrow {
-                        params: vec![crate::ast::Param { name, ty: None, name_span, rest: false }],
+                        params: vec![crate::ast::Param {
+                            name,
+                            ty: None,
+                            name_span,
+                            rest: false,
+                        }],
                         body: Box::new(body),
                         is_async,
                         is_generator: false,
@@ -838,7 +1038,12 @@ impl<'a> Parser<'a> {
             let body = self.arrow_body()?;
             let end = self.prev_end();
             return Ok(Some(Expr {
-                kind: ExprKind::Arrow { params, body: Box::new(body), is_async, is_generator: false },
+                kind: ExprKind::Arrow {
+                    params,
+                    body: Box::new(body),
+                    is_async,
+                    is_generator: false,
+                },
                 span: Span::new(start, end),
             }));
         }
@@ -1047,12 +1252,18 @@ impl<'a> Parser<'a> {
                     }
                     self.advance();
                     let span = Span::new(expr.span.start, self.prev_end());
-                    expr = Expr { kind: ExprKind::Try(Box::new(expr)), span };
+                    expr = Expr {
+                        kind: ExprKind::Try(Box::new(expr)),
+                        span,
+                    };
                 }
                 Tok::Bang => {
                     self.advance();
                     let span = Span::new(expr.span.start, self.prev_end());
-                    expr = Expr { kind: ExprKind::Unwrap(Box::new(expr)), span };
+                    expr = Expr {
+                        kind: ExprKind::Unwrap(Box::new(expr)),
+                        span,
+                    };
                 }
                 _ => break,
             }
@@ -1094,7 +1305,10 @@ impl<'a> Parser<'a> {
             let operand = self.unary()?;
             let span = Span::new(start, operand.span.end);
             return Ok(Expr {
-                kind: ExprKind::Unary { op, expr: Box::new(operand) },
+                kind: ExprKind::Unary {
+                    op,
+                    expr: Box::new(operand),
+                },
                 span,
             });
         }
@@ -1128,7 +1342,13 @@ impl<'a> Parser<'a> {
                     }
                     self.eat(&Tok::RParen)?;
                     let span = Span::new(expr.span.start, self.prev_end());
-                    expr = Expr { kind: ExprKind::Call { callee: Box::new(expr), args }, span };
+                    expr = Expr {
+                        kind: ExprKind::Call {
+                            callee: Box::new(expr),
+                            args,
+                        },
+                        span,
+                    };
                 }
                 Tok::LBracket => {
                     self.advance();
@@ -1136,7 +1356,10 @@ impl<'a> Parser<'a> {
                     self.eat(&Tok::RBracket)?;
                     let span = Span::new(expr.span.start, self.prev_end());
                     expr = Expr {
-                        kind: ExprKind::Index { object: Box::new(expr), index: Box::new(index) },
+                        kind: ExprKind::Index {
+                            object: Box::new(expr),
+                            index: Box::new(index),
+                        },
                         span,
                     };
                 }
@@ -1152,7 +1375,13 @@ impl<'a> Parser<'a> {
                         }
                     };
                     let span = Span::new(expr.span.start, self.prev_end());
-                    expr = Expr { kind: ExprKind::Member { object: Box::new(expr), name }, span };
+                    expr = Expr {
+                        kind: ExprKind::Member {
+                            object: Box::new(expr),
+                            name,
+                        },
+                        span,
+                    };
                 }
                 Tok::QuestionDot => {
                     self.advance();
@@ -1166,7 +1395,13 @@ impl<'a> Parser<'a> {
                         }
                     };
                     let span = Span::new(expr.span.start, self.prev_end());
-                    expr = Expr { kind: ExprKind::OptMember { object: Box::new(expr), name }, span };
+                    expr = Expr {
+                        kind: ExprKind::OptMember {
+                            object: Box::new(expr),
+                            name,
+                        },
+                        span,
+                    };
                 }
                 _ => break,
             }
@@ -1189,7 +1424,10 @@ impl<'a> Parser<'a> {
                 // Preserve the parentheses so they break an optional chain
                 // (`(a?.b).c` must not short-circuit). See ExprKind::Paren.
                 let span = Span::new(tok_span.start, self.prev_end());
-                return Ok(Expr { kind: ExprKind::Paren(Box::new(inner)), span });
+                return Ok(Expr {
+                    kind: ExprKind::Paren(Box::new(inner)),
+                    span,
+                });
             }
             Tok::LBracket => {
                 let mut items = Vec::new();
@@ -1213,7 +1451,10 @@ impl<'a> Parser<'a> {
                 }
                 self.eat(&Tok::RBracket)?;
                 let span = Span::new(tok_span.start, self.prev_end());
-                return Ok(Expr { kind: ExprKind::Array(items), span });
+                return Ok(Expr {
+                    kind: ExprKind::Array(items),
+                    span,
+                });
             }
             Tok::LBrace => {
                 let mut entries = Vec::new();
@@ -1249,12 +1490,18 @@ impl<'a> Parser<'a> {
                 }
                 self.eat(&Tok::RBrace)?;
                 let span = Span::new(tok_span.start, self.prev_end());
-                return Ok(Expr { kind: ExprKind::Object(entries), span });
+                return Ok(Expr {
+                    kind: ExprKind::Object(entries),
+                    span,
+                });
             }
             Tok::TemplateStr(s) => {
                 let parts = vec![crate::ast::TemplatePart::Lit(s)];
                 let span = Span::new(tok_span.start, self.prev_end());
-                return Ok(Expr { kind: ExprKind::Template { parts }, span });
+                return Ok(Expr {
+                    kind: ExprKind::Template { parts },
+                    span,
+                });
             }
             Tok::TemplateStart(s) => {
                 let mut parts = vec![crate::ast::TemplatePart::Lit(s)];
@@ -1276,7 +1523,10 @@ impl<'a> Parser<'a> {
                     }
                 }
                 let span = Span::new(tok_span.start, self.prev_end());
-                return Ok(Expr { kind: ExprKind::Template { parts }, span });
+                return Ok(Expr {
+                    kind: ExprKind::Template { parts },
+                    span,
+                });
             }
             Tok::Match => {
                 let subject = self.expr()?;
@@ -1308,11 +1558,25 @@ impl<'a> Parser<'a> {
                 }
                 self.eat(&Tok::RBrace)?;
                 let span = Span::new(tok_span.start, self.prev_end());
-                return Ok(Expr { kind: ExprKind::Match { subject: Box::new(subject), arms }, span });
+                return Ok(Expr {
+                    kind: ExprKind::Match {
+                        subject: Box::new(subject),
+                        arms,
+                    },
+                    span,
+                });
             }
-            other => return Err(AsError::at(format!("unexpected token {:?}", other), tok_span)),
+            other => {
+                return Err(AsError::at(
+                    format!("unexpected token {:?}", other),
+                    tok_span,
+                ))
+            }
         };
-        Ok(Expr { kind, span: tok_span })
+        Ok(Expr {
+            kind,
+            span: tok_span,
+        })
     }
 }
 
@@ -1404,10 +1668,14 @@ mod tests {
     fn parses_object_destructuring_shorthand_and_rename() {
         let p = parse(&lex("let {a, b as local} = obj").unwrap()).unwrap();
         match &p[0] {
-            Stmt::LetDestructureObject { bindings, mutable, .. } => {
+            Stmt::LetDestructureObject {
+                bindings, mutable, ..
+            } => {
                 assert!(*mutable);
-                assert_eq!(bindings[0].key, "a"); assert_eq!(bindings[0].binding, "a");
-                assert_eq!(bindings[1].key, "b"); assert_eq!(bindings[1].binding, "local");
+                assert_eq!(bindings[0].key, "a");
+                assert_eq!(bindings[0].binding, "a");
+                assert_eq!(bindings[1].key, "b");
+                assert_eq!(bindings[1].binding, "local");
             }
             other => panic!("expected LetDestructureObject, got {other:?}"),
         }
@@ -1418,7 +1686,8 @@ mod tests {
         let p = parse(&lex(r#"let {"weird key" as wk} = obj"#).unwrap()).unwrap();
         match &p[0] {
             Stmt::LetDestructureObject { bindings, .. } => {
-                assert_eq!(bindings[0].key, "weird key"); assert_eq!(bindings[0].binding, "wk");
+                assert_eq!(bindings[0].key, "weird key");
+                assert_eq!(bindings[0].binding, "wk");
             }
             other => panic!("expected LetDestructureObject, got {other:?}"),
         }
@@ -1447,7 +1716,9 @@ mod tests {
     #[test]
     fn parses_type_annotations() {
         assert!(parse(&lex("let x: number = 5").unwrap()).is_ok());
-        assert!(parse(&lex("fn add(a: number, b: number): number { return a + b }").unwrap()).is_ok());
+        assert!(
+            parse(&lex("fn add(a: number, b: number): number { return a + b }").unwrap()).is_ok()
+        );
         assert!(parse(&lex("let xs: array<number> = [1, 2]").unwrap()).is_ok());
         assert!(parse(&lex("let r: Result<string> = Ok(\"x\")").unwrap()).is_ok());
         assert!(parse(&lex("let u: number | nil = nil").unwrap()).is_ok());
@@ -1570,7 +1841,12 @@ mod tests {
     fn parses_async_fn_decl() {
         let stmts = parse(&lex("async fn fetch(x) { return x }").unwrap()).unwrap();
         match &stmts[0] {
-            Stmt::Fn { name, is_async, is_generator, .. } => {
+            Stmt::Fn {
+                name,
+                is_async,
+                is_generator,
+                ..
+            } => {
                 assert_eq!(name, "fetch");
                 assert!(is_async);
                 assert!(!is_generator);
@@ -1583,7 +1859,12 @@ mod tests {
     fn parses_generator_fn_decl() {
         let stmts = parse(&lex("fn* count() { yield 1 }").unwrap()).unwrap();
         match &stmts[0] {
-            Stmt::Fn { name, is_async, is_generator, .. } => {
+            Stmt::Fn {
+                name,
+                is_async,
+                is_generator,
+                ..
+            } => {
                 assert_eq!(name, "count");
                 assert!(!is_async);
                 assert!(is_generator);
@@ -1596,7 +1877,11 @@ mod tests {
     fn parses_async_generator_fn_decl() {
         let stmts = parse(&lex("async fn* g() { yield 1 }").unwrap()).unwrap();
         match &stmts[0] {
-            Stmt::Fn { is_async, is_generator, .. } => {
+            Stmt::Fn {
+                is_async,
+                is_generator,
+                ..
+            } => {
                 assert!(is_async);
                 assert!(is_generator);
             }
@@ -1627,7 +1912,9 @@ mod tests {
         let stmts = parse(&lex("fn* g() { yield\nlet x = 1 }").unwrap()).unwrap();
         match &stmts[0] {
             Stmt::Fn { body, .. } => {
-                assert!(matches!(&body[0], Stmt::Expr(e) if matches!(e.kind, ExprKind::Yield(None))));
+                assert!(
+                    matches!(&body[0], Stmt::Expr(e) if matches!(e.kind, ExprKind::Yield(None)))
+                );
                 assert!(matches!(&body[1], Stmt::Let { .. }));
             }
             other => panic!("expected fn body, got {other:?}"),
@@ -1704,7 +1991,11 @@ mod tests {
     fn optional_type_in_param_and_return() {
         let stmts = parse(&lex("fn f(a: string?): number? { return nil }").unwrap()).unwrap();
         match &stmts[0] {
-            Stmt::Fn { params, ret: Some(r), .. } => {
+            Stmt::Fn {
+                params,
+                ret: Some(r),
+                ..
+            } => {
                 assert_eq!(params[0].ty.as_ref().unwrap().to_string(), "string?");
                 assert_eq!(r.to_string(), "number?");
             }
@@ -1717,7 +2008,9 @@ mod tests {
         let src = "class U {\n  id: number\n  nick: string?\n  avatar?: string\n  role: string = \"guest\"\n  fn init() {}\n}";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         match &stmts[0] {
-            Stmt::Class { fields, methods, .. } => {
+            Stmt::Class {
+                fields, methods, ..
+            } => {
                 assert_eq!(fields.len(), 4);
                 assert_eq!(fields[0].name, "id");
                 assert_eq!(fields[0].ty.to_string(), "number");
@@ -1791,7 +2084,8 @@ mod tests {
         }
         assert!(parse(&lex("class C { fn a() {}; fn b() {}; }").unwrap()).is_ok());
         assert!(parse(&lex("class M { n: number; fn get() { return self.n } }").unwrap()).is_ok());
-        assert!(parse(&lex("class N {\n  a: number\n  b: number\n}").unwrap()).is_ok()); // no regression
+        assert!(parse(&lex("class N {\n  a: number\n  b: number\n}").unwrap()).is_ok());
+        // no regression
     }
 
     #[test]
@@ -1807,6 +2101,9 @@ mod tests {
     fn class_with_semicolons_formats_to_newlines() {
         let out = crate::fmt::format_source("class P { x: number; y: number }").unwrap();
         assert!(out.contains("x: number\n"), "got: {out}");
-        assert!(!out.contains(';'), "formatter should not emit semicolons: {out}");
+        assert!(
+            !out.contains(';'),
+            "formatter should not emit semicolons: {out}"
+        );
     }
 }

@@ -190,6 +190,105 @@ Concatenate `n` copies of a string. The count is truncated toward zero.
 string.repeat("ab", 3)   // "ababab"
 ```
 
+### string.startsWith
+
+Test whether a string begins with a given prefix.
+
+- `s: string` — the source string
+- `prefix: string` — the prefix to test
+- Returns: `bool`
+
+```ascript
+string.startsWith("hello", "he")   // true
+string.startsWith("hello", "lo")   // false
+```
+
+### string.endsWith
+
+Test whether a string ends with a given suffix.
+
+- `s: string` — the source string
+- `suffix: string` — the suffix to test
+- Returns: `bool`
+
+```ascript
+string.endsWith("hello", "lo")   // true
+string.endsWith("hello", "he")   // false
+```
+
+### string.contains
+
+Test whether a string contains a substring.
+
+- `s: string` — the source string
+- `sub: string` — the substring to search for
+- Returns: `bool`
+
+```ascript
+string.contains("hello world", "lo wo")   // true
+string.contains("hello world", "xyz")     // false
+```
+
+### string.chars
+
+Split a string into an array of individual characters (Unicode scalar values).
+
+- `s: string` — the source string
+- Returns: `array` of single-character `string`
+
+```ascript
+string.chars("abc")   // ["a", "b", "c"]
+```
+
+### string.lines
+
+Split a string into an array of lines. A trailing newline does not produce an extra empty element.
+
+- `s: string` — the source string
+- Returns: `array` of `string`
+
+```ascript
+string.lines("one\ntwo\nthree")   // ["one", "two", "three"]
+```
+
+### string.reverse
+
+Return a string with its characters in reverse order.
+
+- `s: string` — the source string
+- Returns: `string`
+
+```ascript
+string.reverse("abc")   // "cba"
+```
+
+### string.count
+
+Count the non-overlapping occurrences of a substring.
+
+- `s: string` — the source string
+- `sub: string` — the substring to count
+- Returns: `number`
+
+```ascript
+string.count("banana", "a")   // 3
+string.count("hello", "x")    // 0
+```
+
+### string.splitN
+
+Split a string on a separator, returning at most `n` parts. The last part contains the remainder of the string unsplit.
+
+- `s: string` — the source string
+- `sep: string` — the separator
+- `n: number` — maximum number of parts
+- Returns: `array` of `string`
+
+```ascript
+string.splitN("a:b:c:d", ":", 2)   // ["a", "b:c:d"]
+string.splitN("a:b:c:d", ":", 3)   // ["a", "b", "c:d"]
+```
+
 ## std/array
 
 Array operations. The callback-taking functions (`map`, `filter`, `reduce`, `sort`) invoke user functions you supply.
@@ -313,6 +412,235 @@ array.get([10, 20], 0)    // 10
 array.get([10, 20], 9)    // nil
 ```
 
+### array.find
+
+Return the first element for which the predicate returns truthy. Returns `nil` if nothing matches.
+
+- `arr: array` — the source array
+- `f: function` — predicate called as `f(item)`
+- Returns: the matching element, or `nil`
+
+```ascript
+array.find([3, 1, 2, 4], x => x > 2)    // 3
+array.find([1, 2, 3], x => x > 10)      // nil
+```
+
+### array.findIndex
+
+Return the index of the first element for which the predicate returns truthy. Returns `-1` if nothing matches.
+
+- `arr: array` — the source array
+- `f: function` — predicate called as `f(item)`
+- Returns: `number` — the index, or `-1`
+
+```ascript
+array.findIndex([3, 1, 2], x => x == 2)   // 2
+array.findIndex([1, 2, 3], x => x > 10)   // -1
+```
+
+### array.some
+
+Return `true` if the predicate returns truthy for at least one element.
+
+- `arr: array` — the source array
+- `f: function` — predicate called as `f(item)`
+- Returns: `bool`
+
+```ascript
+array.some([1, 2, 3], x => x > 2)   // true
+array.some([1, 2, 3], x => x > 9)   // false
+```
+
+### array.every
+
+Return `true` if the predicate returns truthy for every element. Returns `true` for an empty array (vacuously true).
+
+- `arr: array` — the source array
+- `f: function` — predicate called as `f(item)`
+- Returns: `bool`
+
+```ascript
+array.every([1, 2, 3], x => x > 0)   // true
+array.every([1, 2, 3], x => x > 1)   // false
+array.every([], x => false)           // true (vacuous)
+```
+
+### array.indexOf
+
+Return the index of the first element equal to `needle` (structural equality). Returns `-1` if not found.
+
+- `arr: array` — the source array
+- `needle` — the value to search for
+- Returns: `number` — the index, or `-1`
+
+```ascript
+array.indexOf([10, 20, 30], 20)   // 1
+array.indexOf([10, 20, 30], 99)   // -1
+```
+
+### array.flat
+
+Flatten nested arrays by `depth` levels (default 1).
+
+- `arr: array` — the source array
+- `depth: number` (optional) — how many levels to flatten; defaults to `1`
+- Returns: a new `array`
+
+```ascript
+array.flat([[1], [2, 3], [4]])        // [1, 2, 3, 4]
+array.flat([[1, [2, 3]], [4]], 2)     // [1, 2, 3, 4]
+```
+
+### array.flatMap
+
+Apply `f` to every element and flatten the result one level, equivalent to `array.flat(array.map(arr, f))`.
+
+- `arr: array` — the source array
+- `f: function` — called as `f(item)`, must return an array
+- Returns: a new `array`
+
+```ascript
+array.flatMap([1, 2, 3], x => [x, x * 10])   // [1, 10, 2, 20, 3, 30]
+```
+
+### array.reverse
+
+Return a new array with the elements in reversed order. Does not mutate the original.
+
+- `arr: array` — the source array
+- Returns: a new `array`
+
+```ascript
+array.reverse([1, 2, 3])   // [3, 2, 1]
+```
+
+### array.concat
+
+Concatenate any number of arrays into a single new array.
+
+- `...arrays: array` — the arrays to concatenate
+- Returns: a new `array`
+
+```ascript
+array.concat([1, 2], [3, 4], [5])   // [1, 2, 3, 4, 5]
+```
+
+### array.first
+
+Return the first element of the array, or `nil` if the array is empty.
+
+- `arr: array` — the source array
+- Returns: the first element, or `nil`
+
+```ascript
+array.first([10, 20, 30])   // 10
+array.first([])              // nil
+```
+
+### array.last
+
+Return the last element of the array, or `nil` if the array is empty.
+
+- `arr: array` — the source array
+- Returns: the last element, or `nil`
+
+```ascript
+array.last([10, 20, 30])   // 30
+array.last([])              // nil
+```
+
+### array.unique
+
+Return a new array with duplicate elements removed, preserving the first occurrence order.
+
+- `arr: array` — the source array
+- Returns: a new `array`
+
+```ascript
+array.unique([3, 1, 2, 1, 4])   // [3, 1, 2, 4]
+```
+
+### array.take
+
+Return the first `n` elements. If `n` exceeds the length, returns the whole array.
+
+- `arr: array` — the source array
+- `n: number` — number of elements to take
+- Returns: a new `array`
+
+```ascript
+array.take([1, 2, 3, 4], 2)   // [1, 2]
+array.take([1, 2], 10)         // [1, 2]
+```
+
+### array.drop
+
+Return all elements after skipping the first `n`. If `n` exceeds the length, returns an empty array.
+
+- `arr: array` — the source array
+- `n: number` — number of elements to skip
+- Returns: a new `array`
+
+```ascript
+array.drop([1, 2, 3, 4], 2)   // [3, 4]
+```
+
+### array.chunk
+
+Split an array into consecutive chunks of size `size`. The last chunk may be smaller if the array does not divide evenly.
+
+- `arr: array` — the source array
+- `size: number` — chunk size (positive integer)
+- Returns: `array` of `array`
+
+> [!TIER2] Panics if `size` is not a positive integer.
+
+```ascript
+array.chunk([1, 2, 3, 4, 5], 2)   // [[1, 2], [3, 4], [5]]
+```
+
+### array.zip
+
+Interleave two arrays element by element into an array of `[a, b]` pairs. Truncates to the shorter length.
+
+- `a: array` — the first array
+- `b: array` — the second array
+- Returns: `array` of two-element `array` pairs
+
+```ascript
+array.zip([1, 2, 3], ["a", "b", "c"])   // [[1, "a"], [2, "b"], [3, "c"]]
+array.zip([1, 2], ["a", "b", "c"])      // [[1, "a"], [2, "b"]]  (truncated)
+```
+
+### array.groupBy
+
+Group elements by the return value of a key function. Returns a `map` whose keys are the distinct key values and whose values are arrays of matching elements.
+
+- `arr: array` — the source array
+- `f: function` — key function called as `f(item)`, must return a hashable value (`nil`, `bool`, `number`, or `string`)
+- Returns: `map` — keys are the distinct key values; values are `array`
+
+> [!TIER2] Panics if the key function returns a non-hashable value.
+
+```ascript
+import * as map from "std/map"
+let groups = array.groupBy([1, 2, 3, 4, 5], x => x % 2)
+map.get(groups, 1)   // [1, 3, 5]  (odd)
+map.get(groups, 0)   // [2, 4]     (even)
+```
+
+### array.partition
+
+Split an array into two arrays: elements that pass the predicate and elements that do not. Returns `[pass, fail]`.
+
+- `arr: array` — the source array
+- `f: function` — predicate called as `f(item)`
+- Returns: `[array, array]` — `[pass, fail]`
+
+```ascript
+array.partition([1, 2, 3, 4, 5], x => x > 2)   // [[3, 4, 5], [1, 2]]
+```
+
 ## std/object
 
 Operations on objects (string-keyed maps). Key iteration preserves insertion order.
@@ -387,6 +715,82 @@ Merge any number of objects left to right into a **new** object; later keys over
 
 ```ascript
 object.merge({a: 1, b: 2}, {b: 9, c: 3})   // {a: 1, b: 9, c: 3}
+```
+
+### object.fromEntries
+
+Construct an object from an array of `[key, value]` pairs. Later pairs overwrite earlier ones for duplicate keys.
+
+- `pairs: array` — array of `[string, value]` pairs
+- Returns: a new `object`
+
+> [!TIER2] Panics if any pair is not a two-element array, or if any key is not a string.
+
+```ascript
+object.fromEntries([["a", 1], ["b", 2]])   // {a: 1, b: 2}
+```
+
+### object.pick
+
+Return a new object containing only the specified keys.
+
+- `o: object` — the source object
+- `keys: array` — array of `string` keys to keep
+- Returns: a new `object`
+
+```ascript
+object.pick({a: 1, b: 2, c: 3}, ["a", "c"])   // {a: 1, c: 3}
+```
+
+### object.omit
+
+Return a new object with the specified keys removed.
+
+- `o: object` — the source object
+- `keys: array` — array of `string` keys to remove
+- Returns: a new `object`
+
+```ascript
+object.omit({a: 1, b: 2, c: 3}, ["b"])   // {a: 1, c: 3}
+```
+
+### object.mapValues
+
+Return a new object with each value transformed by `f`. The callback receives both the value and the key.
+
+- `o: object` — the source object
+- `f: function` — called as `f(value, key)`, returns the new value
+- Returns: a new `object`
+
+```ascript
+object.mapValues({a: 1, b: 2}, (v, k) => v * 10)   // {a: 10, b: 20}
+object.mapValues({x: 1}, (v, k) => k)               // {x: "x"}
+```
+
+### object.deepClone
+
+Recursively clone an object (and any nested objects, arrays, or maps) into a fully independent copy.
+
+- `o: object` — the source object
+- Returns: a new deep copy
+
+```ascript
+let orig = {a: 1, b: {c: [1, 2]}}
+let copy = object.deepClone(orig)
+copy.b.c[0] = 99   // does not affect orig
+```
+
+### object.deepEqual
+
+Recursively compare two values for structural equality. Two values are deeply equal if all nested structures and primitive values are equal.
+
+- `a` — first value
+- `b` — second value
+- Returns: `bool`
+
+```ascript
+object.deepEqual({a: 1, b: [1, 2]}, {a: 1, b: [1, 2]})   // true
+object.deepEqual({a: 1}, {a: 2})                           // false
 ```
 
 ## std/map
@@ -615,6 +1019,328 @@ Return a pseudo-random number in the half-open range `[0, 1)`. The generator is 
 ```ascript
 math.random()   // e.g. 0.7421…
 ```
+
+### math.sin
+
+Sine of an angle in radians.
+
+- `x: number` — angle in radians
+- Returns: `number`
+
+```ascript
+math.sin(0)          // 0
+math.sin(math.pi)    // ≈ 0 (floating-point rounding)
+```
+
+### math.cos
+
+Cosine of an angle in radians.
+
+- `x: number` — angle in radians
+- Returns: `number`
+
+```ascript
+math.cos(0)   // 1
+```
+
+### math.tan
+
+Tangent of an angle in radians.
+
+- `x: number` — angle in radians
+- Returns: `number`
+
+```ascript
+math.tan(0)   // 0
+```
+
+### math.asin
+
+Arc-sine (inverse sine). Returns a value in `[-π/2, π/2]`.
+
+- `x: number` — value in `[-1, 1]`
+- Returns: `number` — angle in radians
+
+```ascript
+math.asin(0)   // 0
+math.asin(1)   // π/2 ≈ 1.5708
+```
+
+### math.acos
+
+Arc-cosine (inverse cosine). Returns a value in `[0, π]`.
+
+- `x: number` — value in `[-1, 1]`
+- Returns: `number` — angle in radians
+
+```ascript
+math.acos(1)   // 0
+math.acos(0)   // π/2 ≈ 1.5708
+```
+
+### math.atan
+
+Arc-tangent (inverse tangent). Returns a value in `(-π/2, π/2)`.
+
+- `x: number`
+- Returns: `number` — angle in radians
+
+```ascript
+math.atan(0)   // 0
+math.atan(1)   // π/4 ≈ 0.7854
+```
+
+### math.atan2
+
+Two-argument arc-tangent. Returns the angle in radians between the positive x-axis and the point `(x, y)`, in `(-π, π]`.
+
+- `y: number`
+- `x: number`
+- Returns: `number` — angle in radians
+
+```ascript
+math.atan2(1, 1)    // π/4 ≈ 0.7854
+math.atan2(0, -1)   // π ≈ 3.1416
+```
+
+### math.exp
+
+Euler's number raised to the power `x` (eˣ).
+
+- `x: number`
+- Returns: `number`
+
+```ascript
+math.exp(0)   // 1
+math.exp(1)   // e ≈ 2.7183
+```
+
+### math.ln
+
+Natural logarithm (base e).
+
+- `x: number` — positive value
+- Returns: `number`
+
+```ascript
+math.ln(1)          // 0
+math.ln(math.e)     // 1
+```
+
+### math.log2
+
+Base-2 logarithm.
+
+- `x: number` — positive value
+- Returns: `number`
+
+```ascript
+math.log2(8)    // 3
+math.log2(1)    // 0
+```
+
+### math.log10
+
+Base-10 logarithm.
+
+- `x: number` — positive value
+- Returns: `number`
+
+```ascript
+math.log10(1000)   // 3
+math.log10(1)      // 0
+```
+
+### math.sign
+
+Return `-1`, `0`, or `1` depending on the sign of `x`.
+
+- `x: number`
+- Returns: `number`
+
+```ascript
+math.sign(-5)   // -1
+math.sign(0)    // 0
+math.sign(3)    // 1
+```
+
+### math.trunc
+
+Truncate toward zero (drop the fractional part).
+
+- `x: number`
+- Returns: `number`
+
+```ascript
+math.trunc(3.9)    // 3
+math.trunc(-3.9)   // -3
+```
+
+### math.clamp
+
+Clamp `x` to the closed interval `[lo, hi]`.
+
+- `x: number`
+- `lo: number` — lower bound
+- `hi: number` — upper bound
+- Returns: `number`
+
+```ascript
+math.clamp(5, 0, 3)    // 3  (above hi)
+math.clamp(-1, 0, 3)   // 0  (below lo)
+math.clamp(2, 0, 3)    // 2  (in range)
+```
+
+### math.hypot
+
+Euclidean distance — square root of the sum of squares. Numerically stable for large values.
+
+- `a: number`
+- `b: number`
+- Returns: `number`
+
+```ascript
+math.hypot(3, 4)   // 5
+```
+
+### math.gcd
+
+Greatest common divisor of two non-negative integers.
+
+- `a: number` — non-negative integer
+- `b: number` — non-negative integer
+- Returns: `number`
+
+> [!TIER2] Panics if either argument is not a finite integer.
+
+```ascript
+math.gcd(12, 8)   // 4
+math.gcd(7, 0)    // 7
+```
+
+### math.lcm
+
+Least common multiple of two non-negative integers.
+
+- `a: number` — non-negative integer
+- `b: number` — non-negative integer
+- Returns: `number`
+
+> [!TIER2] Panics if either argument is not a finite integer.
+
+```ascript
+math.lcm(4, 6)    // 12
+math.lcm(5, 0)    // 0
+```
+
+### math.sum
+
+Sum all elements of a numeric array. Returns `0` for an empty array.
+
+- `arr: array` — array of `number`
+- Returns: `number`
+
+> [!TIER2] Panics if any element is not a number.
+
+```ascript
+math.sum([1, 2, 3, 4])   // 10
+math.sum([])              // 0
+```
+
+### math.mean
+
+Arithmetic mean of a numeric array.
+
+- `arr: array` — non-empty array of `number`
+- Returns: `number`
+
+> [!TIER2] Panics on an empty array or non-number elements.
+
+```ascript
+math.mean([1, 2, 3, 4])   // 2.5
+```
+
+### math.median
+
+Median of a numeric array. For even-length arrays returns the mean of the two middle values.
+
+- `arr: array` — non-empty array of `number`
+- Returns: `number`
+
+> [!TIER2] Panics on an empty array or non-number elements.
+
+```ascript
+math.median([3, 1, 2])      // 2
+math.median([1, 2, 3, 4])   // 2.5
+```
+
+### math.variance
+
+Population or sample variance of a numeric array. Pass `true` as the second argument for sample variance (Bessel's correction, denominator `n-1`); omit or pass a falsy value for population variance (denominator `n`).
+
+- `arr: array` — array of `number`
+- `sample: bool` (optional) — use sample variance; defaults to `false` (population)
+- Returns: `number`
+
+> [!TIER2] Panics on an empty array; panics for sample variance if the array has fewer than two elements.
+
+```ascript
+math.variance([2, 4, 4, 4, 5, 5, 7, 9])        // 4  (population)
+math.variance([2, 4, 4, 4, 5, 5, 7, 9], true)   // 4.571…  (sample)
+```
+
+### math.stddev
+
+Population or sample standard deviation. Same signature as `math.variance`; returns the square root of the variance.
+
+- `arr: array` — array of `number`
+- `sample: bool` (optional) — use sample stddev; defaults to `false` (population)
+- Returns: `number`
+
+> [!TIER2] Panics on an empty array; panics for sample stddev if the array has fewer than two elements.
+
+```ascript
+math.stddev([2, 4, 4, 4, 5, 5, 7, 9])   // 2  (population)
+```
+
+### math.randomInt
+
+Return a uniformly distributed random integer in the **inclusive** range `[min, max]`.
+
+- `min: number` — minimum value (integer)
+- `max: number` — maximum value (integer, must be ≥ `min`)
+- Returns: `number`
+
+> [!TIER2] Panics if `min > max` or if either argument is not a finite integer.
+
+```ascript
+math.randomInt(1, 6)   // e.g. 4  (like rolling a die)
+math.randomInt(5, 5)   // always 5
+```
+
+### math.shuffle
+
+Return a new array with the elements in a random order (Fisher-Yates). Does not mutate the original.
+
+- `arr: array` — the source array
+- Returns: a new `array`
+
+```ascript
+math.shuffle([1, 2, 3, 4, 5])   // e.g. [3, 1, 5, 2, 4]
+```
+
+### math.choice
+
+Return a uniformly random element from a non-empty array. Returns `nil` for an empty array.
+
+- `arr: array` — the source array
+- Returns: a random element, or `nil`
+
+```ascript
+math.choice(["rock", "paper", "scissors"])   // e.g. "paper"
+```
+
+> **Tip — `min`/`max` with arrays:** `math.min` and `math.max` are variadic (positional arguments), not array-taking. To find the min or max of an array use spread: `math.min(...arr)`, `math.max(...arr)`.
 
 ## std/convert
 

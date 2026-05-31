@@ -52,7 +52,10 @@ impl Capture {
             "null" => Capture::Null,
             other => {
                 return Err(AsError::at(
-                    format!("process capture must be \"string\"/\"bytes\"/\"inherit\"/\"null\", got {:?}", other),
+                    format!(
+                    "process capture must be \"string\"/\"bytes\"/\"inherit\"/\"null\", got {:?}",
+                    other
+                ),
                     span,
                 )
                 .into())
@@ -157,7 +160,11 @@ fn data_to_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
         Value::Str(s) => Ok(s.as_bytes().to_vec()),
         Value::Bytes(b) => Ok(b.borrow().clone()),
         other => Err(AsError::at(
-            format!("{} expects a string or bytes, got {}", ctx, crate::interp::type_name(other)),
+            format!(
+                "{} expects a string or bytes, got {}",
+                ctx,
+                crate::interp::type_name(other)
+            ),
             span,
         )
         .into()),
@@ -171,7 +178,10 @@ fn parse_opts(v: Option<&Value>, span: Span) -> Result<Opts, Control> {
         Some(Value::Object(o)) => o.clone(),
         Some(other) => {
             return Err(AsError::at(
-                format!("process options must be an object, got {}", crate::interp::type_name(other)),
+                format!(
+                    "process options must be an object, got {}",
+                    crate::interp::type_name(other)
+                ),
                 span,
             )
             .into())
@@ -180,7 +190,9 @@ fn parse_opts(v: Option<&Value>, span: Span) -> Result<Opts, Control> {
     for (k, val) in map.borrow().iter() {
         match k.as_str() {
             "cwd" => opts.cwd = Some(want_string(val, span, "process cwd")?.to_string()),
-            "capture" => opts.capture = Capture::parse(&want_string(val, span, "process capture")?, span)?,
+            "capture" => {
+                opts.capture = Capture::parse(&want_string(val, span, "process capture")?, span)?
+            }
             "shell" => opts.shell = val.is_truthy(),
             "clearEnv" => opts.clear_env = val.is_truthy(),
             "check" => opts.check = val.is_truthy(),
@@ -198,7 +210,9 @@ fn parse_opts(v: Option<&Value>, span: Span) -> Result<Opts, Control> {
                     match ev {
                         // A nil-valued key UNSETS the variable.
                         Value::Nil => opts.env.push((ek.clone(), None)),
-                        other => opts.env.push((ek.clone(), Some(value_as_env_string(other, span)?))),
+                        other => opts
+                            .env
+                            .push((ek.clone(), Some(value_as_env_string(other, span)?))),
                     }
                 }
             }
@@ -215,7 +229,10 @@ fn value_as_env_string(v: &Value, span: Span) -> Result<String, Control> {
         Value::Str(s) => Ok(s.to_string()),
         Value::Number(_) | Value::Bool(_) => Ok(v.to_string()),
         other => Err(AsError::at(
-            format!("process env values must be strings, got {}", crate::interp::type_name(other)),
+            format!(
+                "process env values must be strings, got {}",
+                crate::interp::type_name(other)
+            ),
             span,
         )
         .into()),
@@ -361,7 +378,10 @@ impl Interp {
             Value::Array(a) => a.borrow().clone(),
             other => {
                 return Err(AsError::at(
-                    format!("process.run args must be an array, got {}", crate::interp::type_name(&other)),
+                    format!(
+                        "process.run args must be an array, got {}",
+                        crate::interp::type_name(&other)
+                    ),
                     span,
                 )
                 .into())
@@ -373,12 +393,21 @@ impl Interp {
         // stdout/stderr stdio per capture; stdin piped only if we have input to send.
         command.stdout(opts.capture.stdio());
         command.stderr(opts.capture.stdio());
-        command.stdin(if opts.stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+        command.stdin(if opts.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
         let mut child = match command.spawn() {
             Ok(c) => c,
             // SPAWN FAILURE (binary not found / permission) → the err.
-            Err(e) => return Ok(err_pair(format!("process.run failed to spawn '{}': {}", cmd, e))),
+            Err(e) => {
+                return Ok(err_pair(format!(
+                    "process.run failed to spawn '{}': {}",
+                    cmd, e
+                )))
+            }
         };
 
         // Write stdin (then drop to close), if provided.
@@ -451,7 +480,10 @@ impl Interp {
             Value::Array(a) => a.borrow().clone(),
             other => {
                 return Err(AsError::at(
-                    format!("process.spawn args must be an array, got {}", crate::interp::type_name(&other)),
+                    format!(
+                        "process.spawn args must be an array, got {}",
+                        crate::interp::type_name(&other)
+                    ),
                     span,
                 )
                 .into())
@@ -467,7 +499,12 @@ impl Interp {
 
         let mut child = match command.spawn() {
             Ok(c) => c,
-            Err(e) => return Ok(err_pair(format!("process.spawn failed to spawn '{}': {}", cmd, e))),
+            Err(e) => {
+                return Ok(err_pair(format!(
+                    "process.spawn failed to spawn '{}': {}",
+                    cmd, e
+                )))
+            }
         };
         let pid = child.id();
 
@@ -476,25 +513,38 @@ impl Interp {
         // hand back the matching handle. Taking them off the child also means the
         // child handle holds only the process itself.
         let stdin_id = child.stdin.take().map(|w| {
-            self.register_resource(NativeKind::Writer, indexmap::IndexMap::new(), ResourceState::Writer(w))
+            self.register_resource(
+                NativeKind::Writer,
+                indexmap::IndexMap::new(),
+                ResourceState::Writer(w),
+            )
         });
         let stdout_id = child.stdout.take().map(|r| {
             self.register_resource(
                 NativeKind::Reader,
                 indexmap::IndexMap::new(),
-                ResourceState::Reader { reader: ProcReader::Out(BufReader::new(r)), capture },
+                ResourceState::Reader {
+                    reader: ProcReader::Out(BufReader::new(r)),
+                    capture,
+                },
             )
         });
         let stderr_id = child.stderr.take().map(|r| {
             self.register_resource(
                 NativeKind::Reader,
                 indexmap::IndexMap::new(),
-                ResourceState::Reader { reader: ProcReader::Err(BufReader::new(r)), capture },
+                ResourceState::Reader {
+                    reader: ProcReader::Err(BufReader::new(r)),
+                    capture,
+                },
             )
         });
 
         let mut fields = indexmap::IndexMap::new();
-        fields.insert("pid".to_string(), pid.map(|p| Value::Number(p as f64)).unwrap_or(Value::Nil));
+        fields.insert(
+            "pid".to_string(),
+            pid.map(|p| Value::Number(p as f64)).unwrap_or(Value::Nil),
+        );
         // Stash the child-stream handles so `child.stdin`/`stdout`/`stderr` return them.
         if let Some(h) = stdin_id {
             fields.insert("stdin".to_string(), h);
@@ -506,7 +556,11 @@ impl Interp {
             fields.insert("stderr".to_string(), h);
         }
 
-        let handle = self.register_resource(NativeKind::ChildProcess, fields, ResourceState::ChildProcess(child));
+        let handle = self.register_resource(
+            NativeKind::ChildProcess,
+            fields,
+            ResourceState::ChildProcess(child),
+        );
         Ok(make_pair(handle, Value::Nil))
     }
 
@@ -523,7 +577,9 @@ impl Interp {
             NativeKind::ChildProcess => self.child_method(m, &args, span).await,
             NativeKind::Reader => self.reader_method(id, &m.method, &args, span).await,
             NativeKind::Writer => self.writer_method(id, &m.method, &args, span).await,
-            _ => Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into()),
+            _ => {
+                Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
+            }
         }
     }
 
@@ -537,9 +593,12 @@ impl Interp {
         match m.method.as_str() {
             // `stdin`/`stdout`/`stderr` are accessor methods returning the stream
             // handle recorded in fields at spawn (nil if that stream wasn't piped).
-            "stdin" | "stdout" | "stderr" => {
-                Ok(m.receiver.fields.get(m.method.as_str()).cloned().unwrap_or(Value::Nil))
-            }
+            "stdin" | "stdout" | "stderr" => Ok(m
+                .receiver
+                .fields
+                .get(m.method.as_str())
+                .cloned()
+                .unwrap_or(Value::Nil)),
             "wait" => {
                 // `wait` consumes the child: take it so the resource is gone afterward.
                 let mut child = match self.take_resource(id) {
@@ -583,7 +642,9 @@ impl Interp {
                 res?;
                 Ok(Value::Nil)
             }
-            other => Err(AsError::at(format!("childProcess has no method '{}'", other), span).into()),
+            other => {
+                Err(AsError::at(format!("childProcess has no method '{}'", other), span).into())
+            }
         }
     }
 
@@ -601,7 +662,9 @@ impl Interp {
                     Some(v) => {
                         let n = super::want_number(v, span, "reader.read")?;
                         if n < 0.0 {
-                            return Err(AsError::at("reader.read n must be non-negative", span).into());
+                            return Err(
+                                AsError::at("reader.read n must be non-negative", span).into()
+                            );
                         }
                         n as usize
                     }
@@ -625,7 +688,9 @@ impl Interp {
                 let (mut reader, capture) = match self.take_resource(id) {
                     Some(ResourceState::Reader { reader, capture }) => (reader, capture),
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(Value::Nil);
                     }
                 };
@@ -643,7 +708,9 @@ impl Interp {
                 let (mut reader, capture) = match self.take_resource(id) {
                     Some(ResourceState::Reader { reader, capture }) => (reader, capture),
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(Value::Nil); // gone → EOF
                     }
                 };
@@ -661,7 +728,9 @@ impl Interp {
                         self.return_resource(id, ResourceState::Reader { reader, capture });
                         Ok(captured_value(buf, capture))
                     }
-                    Err(e) => Err(AsError::at(format!("reader.readLine failed: {}", e), span).into()),
+                    Err(e) => {
+                        Err(AsError::at(format!("reader.readLine failed: {}", e), span).into())
+                    }
                 }
             }
             "readToEnd" => {
@@ -672,7 +741,9 @@ impl Interp {
                 let (mut reader, capture) = match self.take_resource(id) {
                     Some(ResourceState::Reader { reader, capture }) => (reader, capture),
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(Value::Nil); // gone → EOF
                     }
                 };
@@ -680,7 +751,9 @@ impl Interp {
                 // readToEnd consumes the whole stream; we drop the reader either way.
                 match reader.read_to_end_bytes(&mut buf).await {
                     Ok(_) => Ok(captured_value(buf, capture)),
-                    Err(e) => Err(AsError::at(format!("reader.readToEnd failed: {}", e), span).into()),
+                    Err(e) => {
+                        Err(AsError::at(format!("reader.readToEnd failed: {}", e), span).into())
+                    }
                 }
             }
             other => Err(AsError::at(format!("reader has no method '{}'", other), span).into()),
@@ -700,7 +773,9 @@ impl Interp {
                 let mut writer = match self.take_resource(id) {
                     Some(ResourceState::Writer(w)) => w,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Err(use_after_close(span));
                     }
                 };
@@ -739,7 +814,10 @@ fn kill_child(child: &mut tokio::process::Child, sig: &str, span: Span) -> Resul
             "HUP" => 1,
             other => {
                 return Err(AsError::at(
-                    format!("child.kill: unknown signal {:?} (use KILL/TERM/INT/HUP)", other),
+                    format!(
+                        "child.kill: unknown signal {:?} (use KILL/TERM/INT/HUP)",
+                        other
+                    ),
                     span,
                 )
                 .into())
@@ -799,7 +877,8 @@ print(err)
 print(result.stdout)
 print(result.success)
 print(result.code)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\nhi\n\ntrue\n0\n");
     }
 
@@ -811,7 +890,8 @@ let [result, err] = run("sh", ["-c", "exit 3"])
 print(err)
 print(result.success)
 print(result.code)
-"#).await;
+"#)
+        .await;
         // err is nil; a non-zero exit is a normal result with success=false.
         assert_eq!(out, "nil\nfalse\n3\n");
     }
@@ -823,7 +903,8 @@ import { run } from "std/process"
 let [result, err] = run("sh", ["-c", "exit 1"], { check: true })
 print(result)
 print(err != nil)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\ntrue\n");
     }
 
@@ -834,7 +915,8 @@ import { run } from "std/process"
 let [result, err] = run("definitely-not-a-real-binary-xyz", [])
 print(result)
 print(err != nil)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\ntrue\n");
     }
 
@@ -845,7 +927,8 @@ import { run } from "std/process"
 let [result, err] = run("cat", [], { stdin: "piped input" })
 print(err)
 print(result.stdout)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\npiped input\n");
     }
 
@@ -857,7 +940,8 @@ let [result, err] = run("echo", ["x"], { capture: "bytes" })
 print(err)
 print(type(result.stdout))
 print(len(result.stdout))
-"#).await;
+"#)
+        .await;
         // "x\n" → 2 bytes
         assert_eq!(out, "nil\nbytes\n2\n");
     }
@@ -869,7 +953,8 @@ import { run } from "std/process"
 let [result, err] = run("sleep", ["5"], { timeout: 50 })
 print(result)
 print(err != nil)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\ntrue\n");
     }
 
@@ -880,7 +965,8 @@ import { run } from "std/process"
 let [result, err] = run("sh", ["-c", "echo $FOO"], { env: { FOO: "bar" } })
 print(err)
 print(result.stdout)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\nbar\n\n");
     }
 
@@ -892,7 +978,8 @@ let [r0, _] = run("sh", ["-c", "echo [$FOO]"], { env: { FOO: "bar" } })
 print(r0.stdout)
 let [r1, _e1] = run("sh", ["-c", "echo [$FOO]"], { env: { FOO: nil } })
 print(r1.stdout)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "[bar]\n\n[]\n\n");
     }
 
@@ -911,7 +998,8 @@ let eof = await child.stdout.readLine()
 print(eof)
 let status = await child.wait()
 print(status.success)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\nchildProcess\nline1\nnil\ntrue\n");
     }
 
@@ -929,7 +1017,8 @@ print(l2)
 print(l3)
 let status = await child.wait()
 print(status.success)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\na\nb\nnil\ntrue\n");
     }
 
@@ -945,7 +1034,8 @@ let status = await child.wait()
 print(status.success)
 print(status.code)
 print(status.signal)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "nil\ntrue\nfalse\nnil\nSIGTERM\n");
     }
 
@@ -957,7 +1047,8 @@ let [child, _] = spawn("sh", ["-c", "printf 'abc'"])
 let all = await child.stdout.readToEnd()
 print(all)
 await child.wait()
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "abc\n");
     }
 
@@ -973,7 +1064,8 @@ print(len(empty))
 let rest = await child.stdout.readToEnd()
 print(rest)
 await child.wait()
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "0\nabc\n");
     }
 
@@ -988,7 +1080,8 @@ let status = await child.wait()
 print(status.success)
 let after = await child.stdout.readLine()
 print(after)
-"#).await;
+"#)
+        .await;
         assert_eq!(out, "true\nnil\n");
     }
 

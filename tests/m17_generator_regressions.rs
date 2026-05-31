@@ -41,14 +41,20 @@ fn inspecting_uniterated_generator_is_graceful_and_terminates() {
          print(type(g))\n\
          print(\"end\")\n",
     );
-    assert!(out.contains("generator"), "expected type generator, got: {out:?}");
+    assert!(
+        out.contains("generator"),
+        "expected type generator, got: {out:?}"
+    );
     assert!(out.contains("end"), "got: {out:?}");
 }
 
 #[test]
 fn never_iterated_generator_terminates() {
     // Creating a generator and never iterating it must not hang exit.
-    let out = run_ok("never", "fn* g() { yield 1\n yield 2 }\ng()\nprint(\"ok\")\n");
+    let out = run_ok(
+        "never",
+        "fn* g() { yield 1\n yield 2 }\ng()\nprint(\"ok\")\n",
+    );
     assert!(out.contains("ok"), "got: {out:?}");
 }
 

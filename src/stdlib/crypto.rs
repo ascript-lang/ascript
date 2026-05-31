@@ -294,7 +294,12 @@ mod tests {
     #[test]
     fn verify_password_malformed_is_false() {
         assert_eq!(
-            call("verifyPassword", &[s("secret"), s("not-a-phc-string")], sp()).unwrap(),
+            call(
+                "verifyPassword",
+                &[s("secret"), s("not-a-phc-string")],
+                sp()
+            )
+            .unwrap(),
             Value::Bool(false)
         );
     }

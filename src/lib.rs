@@ -66,7 +66,10 @@ pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
 
 /// Lex → parse → evaluate in a fresh global environment. Returns captured output.
 pub async fn run_source(src: &str) -> Result<String, AsError> {
-    let src_info = Rc::new(SourceInfo { path: "<input>".to_string(), text: src.to_string() });
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
     let tokens = lexer::lex(src).map_err(|e| e.with_source(src_info.clone()))?;
     let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
     let interp = Rc::new(Interp::new());

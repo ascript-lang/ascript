@@ -49,7 +49,10 @@ fn deep_equal_inner(
                 return true;
             }
             let (x, y) = (x.borrow(), y.borrow());
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| deep_equal_inner(p, q, seen))
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|(p, q)| deep_equal_inner(p, q, seen))
         }
         (Value::Object(x), Value::Object(y)) => {
             if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
@@ -57,7 +60,8 @@ fn deep_equal_inner(
             }
             let (x, y) = (x.borrow(), y.borrow());
             x.len() == y.len()
-                && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
         }
         (Value::Map(x), Value::Map(y)) => {
             if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
@@ -65,7 +69,8 @@ fn deep_equal_inner(
             }
             let (x, y) = (x.borrow(), y.borrow());
             x.len() == y.len()
-                && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
         }
         (Value::Bytes(x), Value::Bytes(y)) => *x.borrow() == *y.borrow(),
         (Value::Instance(x), Value::Instance(y)) => {
@@ -75,9 +80,11 @@ fn deep_equal_inner(
             let (x, y) = (x.borrow(), y.borrow());
             Rc::ptr_eq(&x.class, &y.class)
                 && x.fields.len() == y.fields.len()
-                && x.fields
-                    .iter()
-                    .all(|(k, v)| y.fields.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
+                && x.fields.iter().all(|(k, v)| {
+                    y.fields
+                        .get(k)
+                        .is_some_and(|w| deep_equal_inner(v, w, seen))
+                })
         }
         // Identity equality for regex/native/enum/function/future/generator/etc.
         // (two structurally-equal Regex objects compare unequal here — acceptable.)
@@ -177,7 +184,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         "keys" => {
             let o = want_object(&arg(args, 0), span, &ctx("keys"))?;
-            let keys: Vec<Value> = o.borrow().keys().map(|k| Value::Str(k.as_str().into())).collect();
+            let keys: Vec<Value> = o
+                .borrow()
+                .keys()
+                .map(|k| Value::Str(k.as_str().into()))
+                .collect();
             Ok(arr(keys))
         }
         "values" => {
@@ -328,22 +339,54 @@ mod tests {
     #[test]
     fn keys_values_entries() {
         let o = obj_ref(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
-        assert_eq!(call("keys", std::slice::from_ref(&o), sp()).unwrap().to_string(), "[\"a\", \"b\"]");
-        assert_eq!(call("values", std::slice::from_ref(&o), sp()).unwrap().to_string(), "[1, 2]");
-        assert_eq!(call("entries", std::slice::from_ref(&o), sp()).unwrap().to_string(), "[[\"a\", 1], [\"b\", 2]]");
+        assert_eq!(
+            call("keys", std::slice::from_ref(&o), sp())
+                .unwrap()
+                .to_string(),
+            "[\"a\", \"b\"]"
+        );
+        assert_eq!(
+            call("values", std::slice::from_ref(&o), sp())
+                .unwrap()
+                .to_string(),
+            "[1, 2]"
+        );
+        assert_eq!(
+            call("entries", std::slice::from_ref(&o), sp())
+                .unwrap()
+                .to_string(),
+            "[[\"a\", 1], [\"b\", 2]]"
+        );
     }
 
     #[test]
     fn has_delete_merge() {
         let o = obj_ref(&[("a", Value::Number(1.0))]);
-        assert_eq!(call("has", &[o.clone(), Value::Str("a".into())], sp()).unwrap(), Value::Bool(true));
-        assert_eq!(call("has", &[o.clone(), Value::Str("z".into())], sp()).unwrap(), Value::Bool(false));
-        assert_eq!(call("delete", &[o.clone(), Value::Str("a".into())], sp()).unwrap(), Value::Bool(true));
-        assert_eq!(call("has", &[o, Value::Str("a".into())], sp()).unwrap(), Value::Bool(false));
-        let merged = call("merge", &[
-            obj_ref(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]),
-            obj_ref(&[("b", Value::Number(9.0)), ("c", Value::Number(3.0))]),
-        ], sp()).unwrap();
+        assert_eq!(
+            call("has", &[o.clone(), Value::Str("a".into())], sp()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call("has", &[o.clone(), Value::Str("z".into())], sp()).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            call("delete", &[o.clone(), Value::Str("a".into())], sp()).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call("has", &[o, Value::Str("a".into())], sp()).unwrap(),
+            Value::Bool(false)
+        );
+        let merged = call(
+            "merge",
+            &[
+                obj_ref(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]),
+                obj_ref(&[("b", Value::Number(9.0)), ("c", Value::Number(3.0))]),
+            ],
+            sp(),
+        )
+        .unwrap();
         assert_eq!(merged.to_string(), "{a: 1, b: 9, c: 3}");
     }
 
@@ -352,7 +395,10 @@ mod tests {
         let sp = sp();
         // delete of a non-existent key → false
         let o = obj_ref(&[("a", Value::Number(1.0))]);
-        assert_eq!(call("delete", &[o, Value::Str("nope".into())], sp).unwrap(), Value::Bool(false));
+        assert_eq!(
+            call("delete", &[o, Value::Str("nope".into())], sp).unwrap(),
+            Value::Bool(false)
+        );
         // merge with zero args → empty object
         assert_eq!(call("merge", &[], sp).unwrap().to_string(), "{}");
         // merge with one arg → a copy (independent of the input)
@@ -361,7 +407,12 @@ mod tests {
         assert_eq!(copy.to_string(), "{a: 1}");
         // mutating the copy via delete does NOT affect the source (independence)
         call("delete", &[copy, Value::Str("a".into())], sp).unwrap();
-        assert_eq!(call("keys", std::slice::from_ref(&src), sp).unwrap().to_string(), "[\"a\"]");
+        assert_eq!(
+            call("keys", std::slice::from_ref(&src), sp)
+                .unwrap()
+                .to_string(),
+            "[\"a\"]"
+        );
     }
 
     #[test]
@@ -373,7 +424,9 @@ mod tests {
         ]);
         let keys = arr(vec![s("a"), s("c")]);
         assert_eq!(
-            call("pick", &[o.clone(), keys.clone()], sp()).unwrap().to_string(),
+            call("pick", &[o.clone(), keys.clone()], sp())
+                .unwrap()
+                .to_string(),
             obj(vec![("a", Value::Number(1.0)), ("c", Value::Number(3.0))]).to_string()
         );
         assert_eq!(
@@ -430,17 +483,27 @@ mod tests {
         // deep_clone terminates and yields a distinct (by identity) container
         let mut seen = std::collections::HashMap::new();
         let cloned = deep_clone(&arr_a, &mut seen);
-        assert!(!matches!((&cloned, &arr_a), (Value::Array(c), Value::Array(o)) if Rc::ptr_eq(c, o)));
+        assert!(
+            !matches!((&cloned, &arr_a), (Value::Array(c), Value::Array(o)) if Rc::ptr_eq(c, o))
+        );
         // deep_equal on the cyclic structure vs itself terminates and is true
-        assert!(call("deepEqual", &[arr_a.clone(), arr_a.clone()], sp()).unwrap() == Value::Bool(true));
+        assert!(
+            call("deepEqual", &[arr_a.clone(), arr_a.clone()], sp()).unwrap() == Value::Bool(true)
+        );
     }
 
     #[test]
     fn pick_follows_keylist_order() {
-        let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0)), ("c", Value::Number(3.0))]);
+        let o = obj(vec![
+            ("a", Value::Number(1.0)),
+            ("b", Value::Number(2.0)),
+            ("c", Value::Number(3.0)),
+        ]);
         let keys = arr(vec![s("c"), s("a")]);
-        assert_eq!(call("pick", &[o, keys], sp()).unwrap().to_string(),
-                   obj(vec![("c", Value::Number(3.0)), ("a", Value::Number(1.0))]).to_string());
+        assert_eq!(
+            call("pick", &[o, keys], sp()).unwrap().to_string(),
+            obj(vec![("c", Value::Number(3.0)), ("a", Value::Number(1.0))]).to_string()
+        );
     }
 
     /// Compile a single AScript expression to a runtime `Value` (callback helper).
@@ -460,7 +523,9 @@ mod tests {
         let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
         // A non-callable callback must produce a Tier-2 panic — proves that
         // call_object routing reaches call_value rather than "unknown function".
-        let r = interp.call_object("mapValues", &[o, Value::Number(0.0)], sp()).await;
+        let r = interp
+            .call_object("mapValues", &[o, Value::Number(0.0)], sp())
+            .await;
         assert!(matches!(r, Err(Control::Panic(_))));
     }
 
@@ -470,7 +535,10 @@ mod tests {
         // callback: (v, k) => v * 2
         let f = val(&interp, "(v, k) => v * 2").await;
         let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
-        let result = interp.call_object("mapValues", &[o, f], sp()).await.unwrap();
+        let result = interp
+            .call_object("mapValues", &[o, f], sp())
+            .await
+            .unwrap();
         assert_eq!(result.to_string(), "{a: 2, b: 4}");
     }
 
@@ -480,7 +548,10 @@ mod tests {
         // callback: (v, k) => k — maps every value to its own key name
         let f = val(&interp, "(v, k) => k").await;
         let o = obj(vec![("x", Value::Number(99.0))]);
-        let result = interp.call_object("mapValues", &[o, f], sp()).await.unwrap();
+        let result = interp
+            .call_object("mapValues", &[o, f], sp())
+            .await
+            .unwrap();
         assert_eq!(result.to_string(), "{x: \"x\"}");
     }
 
@@ -489,7 +560,10 @@ mod tests {
         let interp = Interp::new();
         let f = val(&interp, "(v) => v").await;
         let o = obj(vec![]);
-        let result = interp.call_object("mapValues", &[o, f], sp()).await.unwrap();
+        let result = interp
+            .call_object("mapValues", &[o, f], sp())
+            .await
+            .unwrap();
         assert_eq!(result.to_string(), "{}");
     }
 
@@ -498,9 +572,15 @@ mod tests {
         let interp = Interp::new();
         let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
         // keys/values/entries etc. must still work through call_object
-        let keys = interp.call_object("keys", std::slice::from_ref(&o), sp()).await.unwrap();
+        let keys = interp
+            .call_object("keys", std::slice::from_ref(&o), sp())
+            .await
+            .unwrap();
         assert_eq!(keys.to_string(), "[\"a\", \"b\"]");
-        let vals = interp.call_object("values", std::slice::from_ref(&o), sp()).await.unwrap();
+        let vals = interp
+            .call_object("values", std::slice::from_ref(&o), sp())
+            .await
+            .unwrap();
         assert_eq!(vals.to_string(), "[1, 2]");
         // unknown function still panics
         assert!(matches!(

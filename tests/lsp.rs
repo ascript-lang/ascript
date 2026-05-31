@@ -36,7 +36,11 @@ impl LspClient {
             .expect("failed to spawn `ascript lsp`");
         let stdin = Some(child.stdin.take().expect("child stdin"));
         let stdout = BufReader::new(child.stdout.take().expect("child stdout"));
-        LspClient { child, stdin, stdout }
+        LspClient {
+            child,
+            stdin,
+            stdout,
+        }
     }
 
     /// Write a single `Content-Length`-framed JSON-RPC message.
@@ -107,9 +111,15 @@ impl LspClient {
     /// any notifications (which have no `id`) that interleave. Bounded by `deadline`.
     fn read_response(&mut self, id: i64, deadline: Instant) -> Value {
         loop {
-            assert!(Instant::now() < deadline, "timed out waiting for response id={id}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for response id={id}"
+            );
             let msg = self.read_message().unwrap_or_else(|| {
-                panic!("server closed stream before response id={id}{}", self.drain_stderr())
+                panic!(
+                    "server closed stream before response id={id}{}",
+                    self.drain_stderr()
+                )
             });
             if msg.get("id").and_then(Value::as_i64) == Some(id) {
                 return msg;
@@ -121,11 +131,18 @@ impl LspClient {
     /// Read messages until a notification with the given `method` arrives. Bounded.
     fn read_notification(&mut self, method: &str, deadline: Instant) -> Value {
         loop {
-            assert!(Instant::now() < deadline, "timed out waiting for `{method}` notification");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for `{method}` notification"
+            );
             let msg = self.read_message().unwrap_or_else(|| {
-                panic!("server closed stream before `{method}`{}", self.drain_stderr())
+                panic!(
+                    "server closed stream before `{method}`{}",
+                    self.drain_stderr()
+                )
             });
-            if msg.get("id").is_none() && msg.get("method").and_then(Value::as_str) == Some(method) {
+            if msg.get("id").is_none() && msg.get("method").and_then(Value::as_str) == Some(method)
+            {
                 return msg;
             }
         }
@@ -184,11 +201,26 @@ fn lsp_protocol_end_to_end() {
     );
     let resp = client.read_response(1, overall);
     let caps = &resp["result"]["capabilities"];
-    assert!(!caps["textDocumentSync"].is_null(), "missing textDocumentSync: {resp}");
-    assert!(!caps["completionProvider"].is_null(), "missing completionProvider: {resp}");
-    assert!(!caps["hoverProvider"].is_null(), "missing hoverProvider: {resp}");
-    assert!(!caps["definitionProvider"].is_null(), "missing definitionProvider: {resp}");
-    assert!(!caps["documentSymbolProvider"].is_null(), "missing documentSymbolProvider: {resp}");
+    assert!(
+        !caps["textDocumentSync"].is_null(),
+        "missing textDocumentSync: {resp}"
+    );
+    assert!(
+        !caps["completionProvider"].is_null(),
+        "missing completionProvider: {resp}"
+    );
+    assert!(
+        !caps["hoverProvider"].is_null(),
+        "missing hoverProvider: {resp}"
+    );
+    assert!(
+        !caps["definitionProvider"].is_null(),
+        "missing definitionProvider: {resp}"
+    );
+    assert!(
+        !caps["documentSymbolProvider"].is_null(),
+        "missing documentSymbolProvider: {resp}"
+    );
 
     // 2. initialized notification.
     client.notify("initialized", json!({}));
@@ -207,11 +239,23 @@ fn lsp_protocol_end_to_end() {
         }),
     );
     let note = client.read_notification("textDocument/publishDiagnostics", overall);
-    assert_eq!(note["params"]["uri"], uri, "diagnostics for the wrong uri: {note}");
-    let diags = note["params"]["diagnostics"].as_array().expect("diagnostics array");
-    assert!(!diags.is_empty(), "expected >=1 diagnostic for a parse error: {note}");
+    assert_eq!(
+        note["params"]["uri"], uri,
+        "diagnostics for the wrong uri: {note}"
+    );
+    let diags = note["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert!(
+        !diags.is_empty(),
+        "expected >=1 diagnostic for a parse error: {note}"
+    );
     let first = &diags[0];
-    assert_eq!(first["severity"].as_i64(), Some(1), "expected Error severity (1): {first}");
+    assert_eq!(
+        first["severity"].as_i64(),
+        Some(1),
+        "expected Error severity (1): {first}"
+    );
     assert!(
         first["message"].as_str().is_some_and(|m| !m.is_empty()),
         "diagnostic should carry a message: {first}"
@@ -239,11 +283,18 @@ fn lsp_protocol_end_to_end() {
         json!({ "textDocument": { "uri": sym_uri } }),
     );
     let sym_resp = client.read_response(2, overall);
-    let symbols = sym_resp["result"].as_array().expect("documentSymbol array result");
-    let names: Vec<&str> =
-        symbols.iter().filter_map(|s| s["name"].as_str()).collect();
-    assert!(names.contains(&"greet"), "expected `greet` in symbols: {names:?}");
-    assert!(names.contains(&"Point"), "expected `Point` in symbols: {names:?}");
+    let symbols = sym_resp["result"]
+        .as_array()
+        .expect("documentSymbol array result");
+    let names: Vec<&str> = symbols.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(
+        names.contains(&"greet"),
+        "expected `greet` in symbols: {names:?}"
+    );
+    assert!(
+        names.contains(&"Point"),
+        "expected `Point` in symbols: {names:?}"
+    );
 
     // Declared class fields are emitted as PROPERTY (kind 7) children, before methods.
     let point = symbols
@@ -258,9 +309,21 @@ fn lsp_protocol_end_to_end() {
         "expected fields before methods: {child_names:?}"
     );
     // `x` and `label` are PROPERTY (SymbolKind::PROPERTY == 7); `init` is METHOD (6).
-    assert_eq!(children[0]["kind"].as_i64(), Some(7), "x should be PROPERTY");
-    assert_eq!(children[1]["kind"].as_i64(), Some(7), "label should be PROPERTY");
-    assert_eq!(children[2]["kind"].as_i64(), Some(6), "init should be METHOD");
+    assert_eq!(
+        children[0]["kind"].as_i64(),
+        Some(7),
+        "x should be PROPERTY"
+    );
+    assert_eq!(
+        children[1]["kind"].as_i64(),
+        Some(7),
+        "label should be PROPERTY"
+    );
+    assert_eq!(
+        children[2]["kind"].as_i64(),
+        Some(6),
+        "init should be METHOD"
+    );
 
     // 5. hover over the `greet` identifier (line 0, char 3) -> a sensible result.
     client.request(
@@ -273,7 +336,10 @@ fn lsp_protocol_end_to_end() {
     );
     let hover_resp = client.read_response(3, overall);
     // Hover may be null for some positions, but it must be a well-formed response.
-    assert!(hover_resp.get("result").is_some(), "hover response missing result: {hover_resp}");
+    assert!(
+        hover_resp.get("result").is_some(),
+        "hover response missing result: {hover_resp}"
+    );
 
     // 6. shutdown -> result; exit -> clean exit.
     client.request_no_params(4, "shutdown");

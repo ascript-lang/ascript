@@ -34,7 +34,9 @@ pub struct TcpStreamState {
 
 impl TcpStreamState {
     fn new(stream: TcpStream) -> Self {
-        TcpStreamState { reader: BufReader::new(stream) }
+        TcpStreamState {
+            reader: BufReader::new(stream),
+        }
     }
 
     async fn read_upto(&mut self, n: usize, buf: &mut Vec<u8>) -> std::io::Result<usize> {
@@ -63,7 +65,10 @@ impl TcpStreamState {
 }
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("connect", bi("net_tcp.connect")), ("listen", bi("net_tcp.listen"))]
+    vec![
+        ("connect", bi("net_tcp.connect")),
+        ("listen", bi("net_tcp.listen")),
+    ]
 }
 
 fn err_pair(msg: String) -> Value {
@@ -80,7 +85,11 @@ fn data_to_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
         Value::Str(s) => Ok(s.as_bytes().to_vec()),
         Value::Bytes(b) => Ok(b.borrow().clone()),
         other => Err(AsError::at(
-            format!("{} expects a string or bytes, got {}", ctx, crate::interp::type_name(other)),
+            format!(
+                "{} expects a string or bytes, got {}",
+                ctx,
+                crate::interp::type_name(other)
+            ),
             span,
         )
         .into()),
@@ -123,7 +132,10 @@ impl Interp {
                 );
                 Ok(make_pair(handle, Value::Nil))
             }
-            Err(e) => Ok(err_pair(format!("net/tcp.connect to {} failed: {}", addr, e))),
+            Err(e) => Ok(err_pair(format!(
+                "net/tcp.connect to {} failed: {}",
+                addr, e
+            ))),
         }
     }
 
@@ -143,7 +155,10 @@ impl Interp {
                 );
                 Ok(make_pair(handle, Value::Nil))
             }
-            Err(e) => Ok(err_pair(format!("net/tcp.listen on {} failed: {}", addr, e))),
+            Err(e) => Ok(err_pair(format!(
+                "net/tcp.listen on {} failed: {}",
+                addr, e
+            ))),
         }
     }
 
@@ -159,7 +174,9 @@ impl Interp {
         match m.receiver.kind {
             NativeKind::TcpStream => self.tcp_stream_method(id, &m.method, &args, span).await,
             NativeKind::TcpListener => self.tcp_listener_method(id, &m.method, &args, span).await,
-            _ => Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into()),
+            _ => {
+                Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
+            }
         }
     }
 
@@ -177,7 +194,9 @@ impl Interp {
                     Some(v) => {
                         let n = super::want_number(v, span, "stream.read")?;
                         if n < 0.0 {
-                            return Err(AsError::at("stream.read n must be non-negative", span).into());
+                            return Err(
+                                AsError::at("stream.read n must be non-negative", span).into()
+                            );
                         }
                         n as usize
                     }
@@ -193,7 +212,9 @@ impl Interp {
                 let mut stream = match self.take_resource(id) {
                     Some(ResourceState::TcpStream(s)) => s,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(Value::Nil);
                     }
                 };
@@ -214,7 +235,9 @@ impl Interp {
                 let mut stream = match self.take_resource(id) {
                     Some(ResourceState::TcpStream(s)) => s,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(Value::Nil); // gone → EOF
                     }
                 };
@@ -233,9 +256,13 @@ impl Interp {
                                 buf.pop();
                             }
                         }
-                        Ok(Value::Str(String::from_utf8_lossy(&buf).into_owned().into()))
+                        Ok(Value::Str(
+                            String::from_utf8_lossy(&buf).into_owned().into(),
+                        ))
                     }
-                    Err(e) => Err(AsError::at(format!("stream.readLine failed: {}", e), span).into()),
+                    Err(e) => {
+                        Err(AsError::at(format!("stream.readLine failed: {}", e), span).into())
+                    }
                 }
             }
             "readToEnd" => {
@@ -244,7 +271,9 @@ impl Interp {
                 let mut stream = match self.take_resource(id) {
                     Some(ResourceState::TcpStream(s)) => s,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(bytes_value(Vec::new())); // gone → empty bytes
                     }
                 };
@@ -252,7 +281,9 @@ impl Interp {
                 // readToEnd consumes the whole stream; we drop it either way.
                 match stream.read_to_end_bytes(&mut buf).await {
                     Ok(_) => Ok(bytes_value(buf)),
-                    Err(e) => Err(AsError::at(format!("stream.readToEnd failed: {}", e), span).into()),
+                    Err(e) => {
+                        Err(AsError::at(format!("stream.readToEnd failed: {}", e), span).into())
+                    }
                 }
             }
             "write" => {
@@ -260,7 +291,9 @@ impl Interp {
                 let mut stream = match self.take_resource(id) {
                     Some(ResourceState::TcpStream(s)) => s,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(err_pair("stream.write: stream is closed".to_string()));
                     }
                 };
@@ -292,7 +325,9 @@ impl Interp {
                 let listener = match self.take_resource(id) {
                     Some(ResourceState::TcpListener(l)) => l,
                     other => {
-                        if let Some(o) = other { self.return_resource(id, o); }
+                        if let Some(o) = other {
+                            self.return_resource(id, o);
+                        }
                         return Ok(err_pair("listener.accept: listener is closed".to_string()));
                     }
                 };
@@ -316,7 +351,9 @@ impl Interp {
                 self.take_resource(id);
                 Ok(Value::Nil)
             }
-            other => Err(AsError::at(format!("tcpListener has no method '{}'", other), span).into()),
+            other => {
+                Err(AsError::at(format!("tcpListener has no method '{}'", other), span).into())
+            }
         }
     }
 }
@@ -509,15 +546,13 @@ server.close()
 
     #[tokio::test]
     async fn listen_port_zero_assigns_real_port() {
-        let out = run(
-            r#"
+        let out = run(r#"
 import { listen } from "std/net/tcp"
 let [server, err] = listen("127.0.0.1", 0)
 print(err)
 print(server.port > 0)
 server.close()
-"#,
-        )
+"#)
         .await;
         assert_eq!(out, "nil\ntrue\n");
     }
@@ -553,6 +588,10 @@ stream.close()
 "#
         );
         run_on(&interp, &src).await;
-        assert_eq!(interp.resource_count(), baseline, "stream should be reclaimed on close");
+        assert_eq!(
+            interp.resource_count(),
+            baseline,
+            "stream should be reclaimed on close"
+        );
     }
 }

@@ -43,7 +43,12 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 impl Interp {
-    pub(crate) async fn call_array(&self, func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+    pub(crate) async fn call_array(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
         let ctx = |f: &str| format!("array.{}", f);
         match func {
             "map" => {
@@ -101,7 +106,11 @@ impl Interp {
                     None | Some(Value::Nil) => len,
                     Some(v) => clamp_index(want_number(v, span, &ctx("slice"))?, len),
                 };
-                let out: Vec<Value> = if start < end { b[start..end].to_vec() } else { Vec::new() };
+                let out: Vec<Value> = if start < end {
+                    b[start..end].to_vec()
+                } else {
+                    Vec::new()
+                };
                 Ok(Value::Array(Rc::new(RefCell::new(out))))
             }
             "contains" => {
@@ -138,15 +147,29 @@ impl Interp {
                         for item in items.into_iter() {
                             let mut lo = 0usize;
                             while lo < sorted.len() {
-                                let r = self.call_value(f.clone(), vec![item.clone(), sorted[lo].clone()], span).await?;
+                                let r = self
+                                    .call_value(
+                                        f.clone(),
+                                        vec![item.clone(), sorted[lo].clone()],
+                                        span,
+                                    )
+                                    .await?;
                                 let n = match r {
                                     Value::Number(n) => n,
-                                    other => return Err(AsError::at(
-                                        format!("array.sort comparator must return a number, got {}", crate::interp::type_name(&other)),
-                                        span,
-                                    ).into()),
+                                    other => {
+                                        return Err(AsError::at(
+                                            format!(
+                                            "array.sort comparator must return a number, got {}",
+                                            crate::interp::type_name(&other)
+                                        ),
+                                            span,
+                                        )
+                                        .into())
+                                    }
                                 };
-                                if n < 0.0 { break; }
+                                if n < 0.0 {
+                                    break;
+                                }
                                 lo += 1;
                             }
                             sorted.insert(lo, item);
@@ -161,7 +184,11 @@ impl Interp {
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
                 for item in items.into_iter() {
-                    if self.call_value(f.clone(), vec![item.clone()], span).await?.is_truthy() {
+                    if self
+                        .call_value(f.clone(), vec![item.clone()], span)
+                        .await?
+                        .is_truthy()
+                    {
                         return Ok(item);
                     }
                 }
@@ -172,7 +199,11 @@ impl Interp {
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
                 for (i, item) in items.into_iter().enumerate() {
-                    if self.call_value(f.clone(), vec![item], span).await?.is_truthy() {
+                    if self
+                        .call_value(f.clone(), vec![item], span)
+                        .await?
+                        .is_truthy()
+                    {
                         return Ok(Value::Number(i as f64));
                     }
                 }
@@ -183,7 +214,11 @@ impl Interp {
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
                 for item in items.into_iter() {
-                    if self.call_value(f.clone(), vec![item], span).await?.is_truthy() {
+                    if self
+                        .call_value(f.clone(), vec![item], span)
+                        .await?
+                        .is_truthy()
+                    {
                         return Ok(Value::Bool(true));
                     }
                 }
@@ -194,7 +229,11 @@ impl Interp {
                 let f = arg(args, 1);
                 let items = a.borrow().clone();
                 for item in items.into_iter() {
-                    if !self.call_value(f.clone(), vec![item], span).await?.is_truthy() {
+                    if !self
+                        .call_value(f.clone(), vec![item], span)
+                        .await?
+                        .is_truthy()
+                    {
                         return Ok(Value::Bool(false));
                     }
                 }
@@ -213,7 +252,11 @@ impl Interp {
                     Some(v) => {
                         let d = want_number(v, span, &ctx("flat"))?;
                         if d < 0.0 || d.fract() != 0.0 {
-                            return Err(AsError::at("array.flat depth must be a non-negative integer", span).into());
+                            return Err(AsError::at(
+                                "array.flat depth must be a non-negative integer",
+                                span,
+                            )
+                            .into());
                         }
                         d as usize
                     }
@@ -274,14 +317,22 @@ impl Interp {
             "take" => {
                 let a = want_array(&arg(args, 0), span, &ctx("take"))?;
                 let nf = want_number(&arg(args, 1), span, &ctx("take"))?;
-                let k = if nf < 0.0 { 0 } else { (nf as usize).min(a.borrow().len()) };
+                let k = if nf < 0.0 {
+                    0
+                } else {
+                    (nf as usize).min(a.borrow().len())
+                };
                 let out = a.borrow()[..k].to_vec();
                 Ok(Value::Array(Rc::new(RefCell::new(out))))
             }
             "drop" => {
                 let a = want_array(&arg(args, 0), span, &ctx("drop"))?;
                 let nf = want_number(&arg(args, 1), span, &ctx("drop"))?;
-                let k = if nf < 0.0 { 0 } else { (nf as usize).min(a.borrow().len()) };
+                let k = if nf < 0.0 {
+                    0
+                } else {
+                    (nf as usize).min(a.borrow().len())
+                };
                 let out = a.borrow()[k..].to_vec();
                 Ok(Value::Array(Rc::new(RefCell::new(out))))
             }
@@ -289,10 +340,13 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("chunk"))?;
                 let nf = want_number(&arg(args, 1), span, &ctx("chunk"))?;
                 if nf < 1.0 || nf.fract() != 0.0 {
-                    return Err(AsError::at("array.chunk size must be a positive integer", span).into());
+                    return Err(
+                        AsError::at("array.chunk size must be a positive integer", span).into(),
+                    );
                 }
                 let n = nf as usize;
-                let out: Vec<Value> = a.borrow()
+                let out: Vec<Value> = a
+                    .borrow()
                     .chunks(n)
                     .map(|c| Value::Array(Rc::new(RefCell::new(c.to_vec()))))
                     .collect();
@@ -304,7 +358,11 @@ impl Interp {
                 }
                 let mut cols: Vec<Vec<Value>> = Vec::with_capacity(args.len());
                 for (i, v) in args.iter().enumerate() {
-                    cols.push(want_array(v, span, &format!("array.zip arg {}", i))?.borrow().clone());
+                    cols.push(
+                        want_array(v, span, &format!("array.zip arg {}", i))?
+                            .borrow()
+                            .clone(),
+                    );
                 }
                 let len = cols.iter().map(|c| c.len()).min().unwrap_or(0);
                 let mut out = Vec::with_capacity(len);
@@ -322,7 +380,8 @@ impl Interp {
                 for item in items.into_iter() {
                     let key = self.call_value(f.clone(), vec![item.clone()], span).await?;
                     let mk = MapKey::from_value(&key).ok_or_else(|| -> Control {
-                        AsError::at("array.groupBy key must be a string, number, or bool", span).into()
+                        AsError::at("array.groupBy key must be a string, number, or bool", span)
+                            .into()
                     })?;
                     groups.entry(mk).or_default().push(item);
                 }
@@ -338,7 +397,11 @@ impl Interp {
                 let items = a.borrow().clone();
                 let (mut pass, mut fail) = (Vec::new(), Vec::new());
                 for item in items.into_iter() {
-                    if self.call_value(f.clone(), vec![item.clone()], span).await?.is_truthy() {
+                    if self
+                        .call_value(f.clone(), vec![item.clone()], span)
+                        .await?
+                        .is_truthy()
+                    {
                         pass.push(item);
                     } else {
                         fail.push(item);
@@ -370,7 +433,9 @@ fn sort_default(items: &mut [Value], span: Span) -> Result<(), Control> {
     let all_strings = items.iter().all(|v| matches!(v, Value::Str(_)));
     if all_numbers {
         items.sort_by(|a, b| match (a, b) {
-            (Value::Number(x), Value::Number(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+            (Value::Number(x), Value::Number(y)) => {
+                x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
+            }
             _ => std::cmp::Ordering::Equal,
         });
         Ok(())
@@ -381,7 +446,11 @@ fn sort_default(items: &mut [Value], span: Span) -> Result<(), Control> {
         });
         Ok(())
     } else {
-        Err(AsError::at("array.sort without a comparator requires a homogeneous array of numbers or strings", span).into())
+        Err(AsError::at(
+            "array.sort without a comparator requires a homogeneous array of numbers or strings",
+            span,
+        )
+        .into())
     }
 }
 
@@ -417,7 +486,10 @@ mod tests {
     async fn push_mutates_and_returns_len() {
         let interp = Interp::new();
         let a = arr(vec![n(1.0), n(2.0)]);
-        let len = interp.call_array("push", &[a.clone(), n(3.0)], sp()).await.unwrap();
+        let len = interp
+            .call_array("push", &[a.clone(), n(3.0)], sp())
+            .await
+            .unwrap();
         assert_eq!(len, n(3.0));
         assert_eq!(a.to_string(), "[1, 2, 3]");
     }
@@ -426,68 +498,175 @@ mod tests {
     async fn pop_returns_last_then_nil() {
         let interp = Interp::new();
         let a = arr(vec![n(1.0)]);
-        assert_eq!(interp.call_array("pop", std::slice::from_ref(&a), sp()).await.unwrap(), n(1.0));
-        assert_eq!(interp.call_array("pop", std::slice::from_ref(&a), sp()).await.unwrap(), Value::Nil);
+        assert_eq!(
+            interp
+                .call_array("pop", std::slice::from_ref(&a), sp())
+                .await
+                .unwrap(),
+            n(1.0)
+        );
+        assert_eq!(
+            interp
+                .call_array("pop", std::slice::from_ref(&a), sp())
+                .await
+                .unwrap(),
+            Value::Nil
+        );
     }
 
     #[tokio::test]
     async fn get_handles_oob_negative_and_fractional() {
         let interp = Interp::new();
         let a = arr(vec![n(10.0), n(20.0)]);
-        assert_eq!(interp.call_array("get", &[a.clone(), n(0.0)], sp()).await.unwrap(), n(10.0));
-        assert_eq!(interp.call_array("get", &[a.clone(), n(9.0)], sp()).await.unwrap(), Value::Nil);
-        assert_eq!(interp.call_array("get", &[a.clone(), n(-1.0)], sp()).await.unwrap(), Value::Nil);
-        assert_eq!(interp.call_array("get", &[a.clone(), n(1.5)], sp()).await.unwrap(), Value::Nil);
+        assert_eq!(
+            interp
+                .call_array("get", &[a.clone(), n(0.0)], sp())
+                .await
+                .unwrap(),
+            n(10.0)
+        );
+        assert_eq!(
+            interp
+                .call_array("get", &[a.clone(), n(9.0)], sp())
+                .await
+                .unwrap(),
+            Value::Nil
+        );
+        assert_eq!(
+            interp
+                .call_array("get", &[a.clone(), n(-1.0)], sp())
+                .await
+                .unwrap(),
+            Value::Nil
+        );
+        assert_eq!(
+            interp
+                .call_array("get", &[a.clone(), n(1.5)], sp())
+                .await
+                .unwrap(),
+            Value::Nil
+        );
     }
 
     #[tokio::test]
     async fn contains_uses_structural_eq() {
         let interp = Interp::new();
         let a = arr(vec![n(1.0), n(2.0)]);
-        assert_eq!(interp.call_array("contains", &[a.clone(), n(2.0)], sp()).await.unwrap(), Value::Bool(true));
-        assert_eq!(interp.call_array("contains", &[a.clone(), n(5.0)], sp()).await.unwrap(), Value::Bool(false));
+        assert_eq!(
+            interp
+                .call_array("contains", &[a.clone(), n(2.0)], sp())
+                .await
+                .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            interp
+                .call_array("contains", &[a.clone(), n(5.0)], sp())
+                .await
+                .unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[tokio::test]
     async fn slice_supports_negatives_and_default_end() {
         let interp = Interp::new();
         let a = arr(vec![n(10.0), n(20.0), n(30.0), n(40.0)]);
-        assert_eq!(interp.call_array("slice", &[a.clone(), n(1.0), n(3.0)], sp()).await.unwrap().to_string(), "[20, 30]");
-        assert_eq!(interp.call_array("slice", &[a.clone(), n(-2.0)], sp()).await.unwrap().to_string(), "[30, 40]");
+        assert_eq!(
+            interp
+                .call_array("slice", &[a.clone(), n(1.0), n(3.0)], sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[20, 30]"
+        );
+        assert_eq!(
+            interp
+                .call_array("slice", &[a.clone(), n(-2.0)], sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[30, 40]"
+        );
         // start >= end → empty
-        assert_eq!(interp.call_array("slice", &[a.clone(), n(3.0), n(1.0)], sp()).await.unwrap().to_string(), "[]");
+        assert_eq!(
+            interp
+                .call_array("slice", &[a.clone(), n(3.0), n(1.0)], sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[]"
+        );
     }
 
     #[tokio::test]
     async fn sort_default_rejects_mixed() {
         let interp = Interp::new();
         let a = arr(vec![n(1.0), Value::Str("x".into())]);
-        assert!(matches!(interp.call_array("sort", &[a], sp()).await, Err(Control::Panic(_))));
+        assert!(matches!(
+            interp.call_array("sort", &[a], sp()).await,
+            Err(Control::Panic(_))
+        ));
     }
 
     #[tokio::test]
     async fn misuse_panics() {
         let interp = Interp::new();
-        assert!(matches!(interp.call_array("push", &[n(1.0), n(2.0)], sp()).await, Err(Control::Panic(_))));
-        assert!(matches!(interp.call_array("nope", &[arr(vec![])], sp()).await, Err(Control::Panic(_))));
+        assert!(matches!(
+            interp.call_array("push", &[n(1.0), n(2.0)], sp()).await,
+            Err(Control::Panic(_))
+        ));
+        assert!(matches!(
+            interp.call_array("nope", &[arr(vec![])], sp()).await,
+            Err(Control::Panic(_))
+        ));
     }
 
     #[tokio::test]
     async fn array_predicates_and_indexof() {
         let interp = Interp::new();
         let a = arr(vec![n(1.0), n(2.0), n(3.0)]);
-        assert_eq!(interp.call_array("indexOf", &[a.clone(), n(2.0)], sp()).await.unwrap(), n(1.0));
-        assert_eq!(interp.call_array("indexOf", &[a.clone(), n(9.0)], sp()).await.unwrap(), n(-1.0));
+        assert_eq!(
+            interp
+                .call_array("indexOf", &[a.clone(), n(2.0)], sp())
+                .await
+                .unwrap(),
+            n(1.0)
+        );
+        assert_eq!(
+            interp
+                .call_array("indexOf", &[a.clone(), n(9.0)], sp())
+                .await
+                .unwrap(),
+            n(-1.0)
+        );
     }
 
     #[tokio::test]
     async fn array_grouping() {
         let interp = Interp::new();
         let a = arr(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
-        assert_eq!(interp.call_array("chunk", &[a.clone(), n(2.0)], sp()).await.unwrap().to_string(), "[[1, 2], [3, 4], [5]]");
+        assert_eq!(
+            interp
+                .call_array("chunk", &[a.clone(), n(2.0)], sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[[1, 2], [3, 4], [5]]"
+        );
         let b = arr(vec![n(10.0), n(20.0)]);
-        assert_eq!(interp.call_array("zip", &[a.clone(), b], sp()).await.unwrap().to_string(), "[[1, 10], [2, 20]]");
-        assert!(matches!(interp.call_array("chunk", &[a.clone(), n(0.0)], sp()).await, Err(Control::Panic(_))));
+        assert_eq!(
+            interp
+                .call_array("zip", &[a.clone(), b], sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[[1, 10], [2, 20]]"
+        );
+        assert!(matches!(
+            interp.call_array("chunk", &[a.clone(), n(0.0)], sp()).await,
+            Err(Control::Panic(_))
+        ));
     }
 
     #[tokio::test]
@@ -502,11 +681,24 @@ mod tests {
             other => panic!("expected map, got {}", other),
         };
         assert_eq!(map.len(), 2);
-        assert_eq!(map.get(&MapKey::from_value(&Value::Str("odd".into())).unwrap()).unwrap().to_string(), "[1, 3, 5]");
-        assert_eq!(map.get(&MapKey::from_value(&Value::Str("even".into())).unwrap()).unwrap().to_string(), "[2, 4]");
+        assert_eq!(
+            map.get(&MapKey::from_value(&Value::Str("odd".into())).unwrap())
+                .unwrap()
+                .to_string(),
+            "[1, 3, 5]"
+        );
+        assert_eq!(
+            map.get(&MapKey::from_value(&Value::Str("even".into())).unwrap())
+                .unwrap()
+                .to_string(),
+            "[2, 4]"
+        );
         // Full stringification confirms insertion order.
         drop(map);
-        assert_eq!(result.to_string(), r#"map {"odd": [1, 3, 5], "even": [2, 4]}"#);
+        assert_eq!(
+            result.to_string(),
+            r#"map {"odd": [1, 3, 5], "even": [2, 4]}"#
+        );
     }
 
     #[tokio::test]
@@ -515,7 +707,10 @@ mod tests {
         let a = arr(vec![n(1.0)]);
         // A callback returning an array yields a non-hashable key → Tier-2 panic.
         let f = val(&interp, "(x) => [x]").await;
-        assert!(matches!(interp.call_array("groupBy", &[a, f], sp()).await, Err(Control::Panic(_))));
+        assert!(matches!(
+            interp.call_array("groupBy", &[a, f], sp()).await,
+            Err(Control::Panic(_))
+        ));
     }
 
     #[tokio::test]
@@ -524,12 +719,20 @@ mod tests {
         let a = arr(vec![n(1.0), n(2.0), n(3.0), n(4.0), n(5.0)]);
         let even = val(&interp, "(x) => x % 2 == 0").await;
         assert_eq!(
-            interp.call_array("partition", &[a, even.clone()], sp()).await.unwrap().to_string(),
+            interp
+                .call_array("partition", &[a, even.clone()], sp())
+                .await
+                .unwrap()
+                .to_string(),
             "[[2, 4], [1, 3, 5]]"
         );
         // Empty input → two empty partitions.
         assert_eq!(
-            interp.call_array("partition", &[arr(vec![]), even], sp()).await.unwrap().to_string(),
+            interp
+                .call_array("partition", &[arr(vec![]), even], sp())
+                .await
+                .unwrap()
+                .to_string(),
             "[[], []]"
         );
     }
@@ -538,16 +741,76 @@ mod tests {
     async fn array_structural() {
         let interp = Interp::new();
         let a = arr(vec![n(1.0), n(2.0), n(2.0), n(3.0)]);
-        assert_eq!(interp.call_array("reverse", std::slice::from_ref(&a), sp()).await.unwrap().to_string(), "[3, 2, 2, 1]");
-        assert_eq!(interp.call_array("unique", std::slice::from_ref(&a), sp()).await.unwrap().to_string(), "[1, 2, 3]");
-        assert_eq!(interp.call_array("first", std::slice::from_ref(&a), sp()).await.unwrap(), n(1.0));
-        assert_eq!(interp.call_array("last", std::slice::from_ref(&a), sp()).await.unwrap(), n(3.0));
-        assert_eq!(interp.call_array("first", &[arr(vec![])], sp()).await.unwrap(), Value::Nil);
-        assert_eq!(interp.call_array("take", &[a.clone(), n(2.0)], sp()).await.unwrap().to_string(), "[1, 2]");
-        assert_eq!(interp.call_array("drop", &[a.clone(), n(2.0)], sp()).await.unwrap().to_string(), "[2, 3]");
+        assert_eq!(
+            interp
+                .call_array("reverse", std::slice::from_ref(&a), sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[3, 2, 2, 1]"
+        );
+        assert_eq!(
+            interp
+                .call_array("unique", std::slice::from_ref(&a), sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[1, 2, 3]"
+        );
+        assert_eq!(
+            interp
+                .call_array("first", std::slice::from_ref(&a), sp())
+                .await
+                .unwrap(),
+            n(1.0)
+        );
+        assert_eq!(
+            interp
+                .call_array("last", std::slice::from_ref(&a), sp())
+                .await
+                .unwrap(),
+            n(3.0)
+        );
+        assert_eq!(
+            interp
+                .call_array("first", &[arr(vec![])], sp())
+                .await
+                .unwrap(),
+            Value::Nil
+        );
+        assert_eq!(
+            interp
+                .call_array("take", &[a.clone(), n(2.0)], sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[1, 2]"
+        );
+        assert_eq!(
+            interp
+                .call_array("drop", &[a.clone(), n(2.0)], sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[2, 3]"
+        );
         let nested = arr(vec![arr(vec![n(1.0)]), arr(vec![n(2.0), n(3.0)])]);
-        assert_eq!(interp.call_array("flat", std::slice::from_ref(&nested), sp()).await.unwrap().to_string(), "[1, 2, 3]");
+        assert_eq!(
+            interp
+                .call_array("flat", std::slice::from_ref(&nested), sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[1, 2, 3]"
+        );
         let b = arr(vec![n(4.0)]);
-        assert_eq!(interp.call_array("concat", &[arr(vec![n(1.0)]), b], sp()).await.unwrap().to_string(), "[1, 4]");
+        assert_eq!(
+            interp
+                .call_array("concat", &[arr(vec![n(1.0)]), b], sp())
+                .await
+                .unwrap()
+                .to_string(),
+            "[1, 4]"
+        );
     }
 }

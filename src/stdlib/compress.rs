@@ -57,8 +57,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         "gzip" => {
             let src = source_bytes(&arg(args, 0), span, &ctx("gzip"))?;
-            let mut enc =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             enc.write_all(&src)
                 .and_then(|_| enc.finish())
                 .map(bytes_val)
@@ -106,7 +105,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let src = want_bytes(&arg(args, 0), span, &ctx("zipExtract"))?;
             let raw = src.borrow().clone();
             match extract_zip(&raw) {
-                Ok(arr) => Ok(make_pair(Value::Array(Rc::new(RefCell::new(arr))), Value::Nil)),
+                Ok(arr) => Ok(make_pair(
+                    Value::Array(Rc::new(RefCell::new(arr))),
+                    Value::Nil,
+                )),
                 Err(msg) => Ok(err_pair(msg)),
             }
         }
@@ -325,7 +327,10 @@ mod tests {
         assert_eq!(get(&arr[0], "name"), s("a.txt"));
         assert_eq!(as_bytes(&get(&arr[0], "data")), b"hello".to_vec());
         assert_eq!(get(&arr[1], "name"), s("b.bin"));
-        assert_eq!(as_bytes(&get(&arr[1], "data")), vec![0x00, 0xFF, 0x10, 0x42]);
+        assert_eq!(
+            as_bytes(&get(&arr[1], "data")),
+            vec![0x00, 0xFF, 0x10, 0x42]
+        );
     }
 
     #[test]

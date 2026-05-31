@@ -81,11 +81,21 @@ fn want_number_vec(v: &Value, span: Span, ctx: &str) -> Result<Vec<f64>, Control
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     let ctx = |f: &str| format!("math.{}", f);
     match func {
-        "abs" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("abs"))?.abs())),
-        "floor" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("floor"))?.floor())),
-        "ceil" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("ceil"))?.ceil())),
-        "round" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("round"))?.round())),
-        "sqrt" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("sqrt"))?.sqrt())),
+        "abs" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("abs"))?.abs(),
+        )),
+        "floor" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("floor"))?.floor(),
+        )),
+        "ceil" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("ceil"))?.ceil(),
+        )),
+        "round" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("round"))?.round(),
+        )),
+        "sqrt" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("sqrt"))?.sqrt(),
+        )),
         "pow" => {
             let b = want_number(&arg(args, 0), span, &ctx("pow"))?;
             let e = want_number(&arg(args, 1), span, &ctx("pow"))?;
@@ -93,10 +103,16 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "min" | "max" => {
             if args.is_empty() {
-                return Err(AsError::at(format!("math.{} requires at least one argument", func), span).into());
+                return Err(AsError::at(
+                    format!("math.{} requires at least one argument", func),
+                    span,
+                )
+                .into());
             }
-            let nums: Result<Vec<f64>, Control> =
-                args.iter().map(|v| want_number(v, span, &ctx(func))).collect();
+            let nums: Result<Vec<f64>, Control> = args
+                .iter()
+                .map(|v| want_number(v, span, &ctx(func)))
+                .collect();
             let nums = nums?;
             let acc = if func == "min" {
                 nums.iter().copied().fold(f64::INFINITY, f64::min)
@@ -106,21 +122,41 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             Ok(Value::Number(acc))
         }
         "random" => Ok(Value::Number(next_random())),
-        "sin" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("sin"))?.sin())),
-        "cos" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("cos"))?.cos())),
-        "tan" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("tan"))?.tan())),
-        "asin" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("asin"))?.asin())),
-        "acos" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("acos"))?.acos())),
-        "atan" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("atan"))?.atan())),
+        "sin" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("sin"))?.sin(),
+        )),
+        "cos" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("cos"))?.cos(),
+        )),
+        "tan" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("tan"))?.tan(),
+        )),
+        "asin" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("asin"))?.asin(),
+        )),
+        "acos" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("acos"))?.acos(),
+        )),
+        "atan" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("atan"))?.atan(),
+        )),
         "atan2" => {
             let y = want_number(&arg(args, 0), span, &ctx("atan2"))?;
             let x = want_number(&arg(args, 1), span, &ctx("atan2"))?;
             Ok(Value::Number(y.atan2(x)))
         }
-        "exp" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("exp"))?.exp())),
-        "ln" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("ln"))?.ln())),
-        "log2" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("log2"))?.log2())),
-        "log10" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("log10"))?.log10())),
+        "exp" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("exp"))?.exp(),
+        )),
+        "ln" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("ln"))?.ln(),
+        )),
+        "log2" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("log2"))?.log2(),
+        )),
+        "log10" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("log10"))?.log10(),
+        )),
         "sign" => {
             let x = want_number(&arg(args, 0), span, &ctx("sign"))?;
             let r = if x.is_nan() {
@@ -134,7 +170,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             };
             Ok(Value::Number(r))
         }
-        "trunc" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("trunc"))?.trunc())),
+        "trunc" => Ok(Value::Number(
+            want_number(&arg(args, 0), span, &ctx("trunc"))?.trunc(),
+        )),
         "clamp" => {
             let x = want_number(&arg(args, 0), span, &ctx("clamp"))?;
             let lo = want_number(&arg(args, 1), span, &ctx("clamp"))?;
@@ -150,13 +188,29 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             Ok(Value::Number(x.hypot(y)))
         }
         "gcd" => {
-            let a = want_int(want_number(&arg(args, 0), span, &ctx("gcd"))?, span, "math.gcd")?;
-            let b = want_int(want_number(&arg(args, 1), span, &ctx("gcd"))?, span, "math.gcd")?;
+            let a = want_int(
+                want_number(&arg(args, 0), span, &ctx("gcd"))?,
+                span,
+                "math.gcd",
+            )?;
+            let b = want_int(
+                want_number(&arg(args, 1), span, &ctx("gcd"))?,
+                span,
+                "math.gcd",
+            )?;
             Ok(Value::Number(gcd_i64(a, b) as f64))
         }
         "lcm" => {
-            let a = want_int(want_number(&arg(args, 0), span, &ctx("lcm"))?, span, "math.lcm")?;
-            let b = want_int(want_number(&arg(args, 1), span, &ctx("lcm"))?, span, "math.lcm")?;
+            let a = want_int(
+                want_number(&arg(args, 0), span, &ctx("lcm"))?,
+                span,
+                "math.lcm",
+            )?;
+            let b = want_int(
+                want_number(&arg(args, 1), span, &ctx("lcm"))?,
+                span,
+                "math.lcm",
+            )?;
             let g = gcd_i64(a, b);
             let r = if g == 0 {
                 0i64
@@ -188,7 +242,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             }
             xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let m = xs.len() / 2;
-            let med = if xs.len() % 2 == 1 { xs[m] } else { (xs[m - 1] + xs[m]) / 2.0 };
+            let med = if xs.len() % 2 == 1 {
+                xs[m]
+            } else {
+                (xs[m - 1] + xs[m]) / 2.0
+            };
             Ok(Value::Number(med))
         }
         "variance" | "stddev" => {
@@ -198,17 +256,37 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 return Err(AsError::at(format!("math.{} of empty array", func), span).into());
             }
             if sample && xs.len() < 2 {
-                return Err(AsError::at(format!("math.{} (sample) requires at least 2 values", func), span).into());
+                return Err(AsError::at(
+                    format!("math.{} (sample) requires at least 2 values", func),
+                    span,
+                )
+                .into());
             }
             let mean = xs.iter().sum::<f64>() / xs.len() as f64;
             let ss: f64 = xs.iter().map(|x| (x - mean).powi(2)).sum();
-            let denom = if sample { xs.len() as f64 - 1.0 } else { xs.len() as f64 };
+            let denom = if sample {
+                xs.len() as f64 - 1.0
+            } else {
+                xs.len() as f64
+            };
             let var = ss / denom;
-            Ok(Value::Number(if func == "stddev" { var.sqrt() } else { var }))
+            Ok(Value::Number(if func == "stddev" {
+                var.sqrt()
+            } else {
+                var
+            }))
         }
         "randomInt" => {
-            let min = want_int(want_number(&arg(args, 0), span, &ctx("randomInt"))?, span, "math.randomInt")?;
-            let max = want_int(want_number(&arg(args, 1), span, &ctx("randomInt"))?, span, "math.randomInt")?;
+            let min = want_int(
+                want_number(&arg(args, 0), span, &ctx("randomInt"))?,
+                span,
+                "math.randomInt",
+            )?;
+            let max = want_int(
+                want_number(&arg(args, 1), span, &ctx("randomInt"))?,
+                span,
+                "math.randomInt",
+            )?;
             if min > max {
                 return Err(AsError::at("math.randomInt requires min <= max", span).into());
             }
@@ -295,11 +373,36 @@ mod tests {
     #[test]
     fn basics() {
         let sp = Span::new(0, 0);
-        assert_eq!(call("abs", &[Value::Number(-3.0)], sp).unwrap(), Value::Number(3.0));
-        assert_eq!(call("floor", &[Value::Number(2.9)], sp).unwrap(), Value::Number(2.0));
-        assert_eq!(call("pow", &[Value::Number(2.0), Value::Number(10.0)], sp).unwrap(), Value::Number(1024.0));
-        assert_eq!(call("max", &[Value::Number(1.0), Value::Number(9.0), Value::Number(4.0)], sp).unwrap(), Value::Number(9.0));
-        assert_eq!(call("min", &[Value::Number(1.0), Value::Number(9.0), Value::Number(4.0)], sp).unwrap(), Value::Number(1.0));
+        assert_eq!(
+            call("abs", &[Value::Number(-3.0)], sp).unwrap(),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            call("floor", &[Value::Number(2.9)], sp).unwrap(),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            call("pow", &[Value::Number(2.0), Value::Number(10.0)], sp).unwrap(),
+            Value::Number(1024.0)
+        );
+        assert_eq!(
+            call(
+                "max",
+                &[Value::Number(1.0), Value::Number(9.0), Value::Number(4.0)],
+                sp
+            )
+            .unwrap(),
+            Value::Number(9.0)
+        );
+        assert_eq!(
+            call(
+                "min",
+                &[Value::Number(1.0), Value::Number(9.0), Value::Number(4.0)],
+                sp
+            )
+            .unwrap(),
+            Value::Number(1.0)
+        );
     }
 
     #[test]
@@ -325,63 +428,137 @@ mod tests {
 
     #[test]
     fn math_stats() {
-        let a = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![n(1.0), n(2.0), n(3.0), n(4.0)])));
-        assert_eq!(call("sum", std::slice::from_ref(&a), sp()).unwrap(), n(10.0));
-        assert_eq!(call("mean", std::slice::from_ref(&a), sp()).unwrap(), n(2.5));
-        assert_eq!(call("median", std::slice::from_ref(&a), sp()).unwrap(), n(2.5));
-        assert_eq!(call("variance", std::slice::from_ref(&a), sp()).unwrap(), n(1.25));
+        let a = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+            n(1.0),
+            n(2.0),
+            n(3.0),
+            n(4.0),
+        ])));
+        assert_eq!(
+            call("sum", std::slice::from_ref(&a), sp()).unwrap(),
+            n(10.0)
+        );
+        assert_eq!(
+            call("mean", std::slice::from_ref(&a), sp()).unwrap(),
+            n(2.5)
+        );
+        assert_eq!(
+            call("median", std::slice::from_ref(&a), sp()).unwrap(),
+            n(2.5)
+        );
+        assert_eq!(
+            call("variance", std::slice::from_ref(&a), sp()).unwrap(),
+            n(1.25)
+        );
         let sv = call("variance", &[a.clone(), Value::Bool(true)], sp()).unwrap();
         assert!(matches!(sv, Value::Number(x) if (x - 5.0/3.0).abs() < 1e-12));
         // stddev returns sqrt(population variance)
-        assert!(matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Number(x) if (x - 1.25f64.sqrt()).abs() < 1e-12));
+        assert!(
+            matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Number(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
+        );
         let empty = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![])));
-        assert_eq!(call("sum", std::slice::from_ref(&empty), sp()).unwrap(), n(0.0));
-        assert!(matches!(call("mean", std::slice::from_ref(&empty), sp()), Err(Control::Panic(_))));
+        assert_eq!(
+            call("sum", std::slice::from_ref(&empty), sp()).unwrap(),
+            n(0.0)
+        );
+        assert!(matches!(
+            call("mean", std::slice::from_ref(&empty), sp()),
+            Err(Control::Panic(_))
+        ));
         // median of empty array panics
-        assert!(matches!(call("median", std::slice::from_ref(&empty), sp()), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("median", std::slice::from_ref(&empty), sp()),
+            Err(Control::Panic(_))
+        ));
         // sample variance needs >= 2 elements
         let one = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![n(5.0)])));
-        assert!(matches!(call("variance", &[one, Value::Bool(true)], sp()), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("variance", &[one, Value::Bool(true)], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 
     #[test]
     fn math_random_helpers() {
         for _ in 0..100 {
             let r = call("randomInt", &[n(1.0), n(6.0)], sp()).unwrap();
-            if let Value::Number(x) = r { assert!((1.0..=6.0).contains(&x) && x.fract() == 0.0); } else { panic!() }
+            if let Value::Number(x) = r {
+                assert!((1.0..=6.0).contains(&x) && x.fract() == 0.0);
+            } else {
+                panic!()
+            }
         }
         assert_eq!(call("randomInt", &[n(5.0), n(5.0)], sp()).unwrap(), n(5.0));
-        assert!(matches!(call("randomInt", &[n(6.0), n(1.0)], sp()), Err(Control::Panic(_))));
-        let a = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![n(1.0), n(2.0), n(3.0)])));
+        assert!(matches!(
+            call("randomInt", &[n(6.0), n(1.0)], sp()),
+            Err(Control::Panic(_))
+        ));
+        let a = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+            n(1.0),
+            n(2.0),
+            n(3.0),
+        ])));
         let sh = call("shuffle", std::slice::from_ref(&a), sp()).unwrap();
-        if let Value::Array(v) = sh { assert_eq!(v.borrow().len(), 3); } else { panic!() }
+        if let Value::Array(v) = sh {
+            assert_eq!(v.borrow().len(), 3);
+        } else {
+            panic!()
+        }
         // shuffle is non-mutating: original unchanged length & content set
-        if let Value::Array(orig) = &a { assert_eq!(orig.borrow().len(), 3); }
+        if let Value::Array(orig) = &a {
+            assert_eq!(orig.borrow().len(), 3);
+        }
         // choice returns an element actually in the array
         let elem = call("choice", std::slice::from_ref(&a), sp()).unwrap();
         assert!([n(1.0), n(2.0), n(3.0)].contains(&elem));
         // shuffle preserves the multiset of elements (sorted equal to original)
         let sh2 = call("shuffle", std::slice::from_ref(&a), sp()).unwrap();
         if let Value::Array(v) = sh2 {
-            let mut got: Vec<f64> = v.borrow().iter().map(|x| if let Value::Number(n) = x { *n } else { f64::NAN }).collect();
+            let mut got: Vec<f64> = v
+                .borrow()
+                .iter()
+                .map(|x| {
+                    if let Value::Number(n) = x {
+                        *n
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect();
             got.sort_by(|x, y| x.partial_cmp(y).unwrap());
             assert_eq!(got, vec![1.0, 2.0, 3.0]);
-        } else { panic!() }
+        } else {
+            panic!()
+        }
         let empty = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![])));
-        assert_eq!(call("choice", std::slice::from_ref(&empty), sp()).unwrap(), Value::Nil);
+        assert_eq!(
+            call("choice", std::slice::from_ref(&empty), sp()).unwrap(),
+            Value::Nil
+        );
     }
 
     #[test]
     fn math_scalar_helpers() {
         assert_eq!(call("sign", &[n(-3.0)], sp()).unwrap(), n(-1.0));
         assert_eq!(call("sign", &[n(0.0)], sp()).unwrap(), n(0.0));
-        assert!(matches!(call("sign", &[n(f64::NAN)], sp()).unwrap(), Value::Number(x) if x.is_nan()));
+        assert!(
+            matches!(call("sign", &[n(f64::NAN)], sp()).unwrap(), Value::Number(x) if x.is_nan())
+        );
         assert_eq!(call("trunc", &[n(3.7)], sp()).unwrap(), n(3.0));
-        assert_eq!(call("clamp", &[n(5.0), n(0.0), n(3.0)], sp()).unwrap(), n(3.0));
+        assert_eq!(
+            call("clamp", &[n(5.0), n(0.0), n(3.0)], sp()).unwrap(),
+            n(3.0)
+        );
         assert_eq!(call("hypot", &[n(3.0), n(4.0)], sp()).unwrap(), n(5.0));
         assert_eq!(call("gcd", &[n(12.0), n(8.0)], sp()).unwrap(), n(4.0));
         assert_eq!(call("lcm", &[n(4.0), n(6.0)], sp()).unwrap(), n(12.0));
-        assert!(matches!(call("clamp", &[n(1.0), n(3.0), n(0.0)], sp()), Err(Control::Panic(_))));
-        assert!(matches!(call("gcd", &[n(1.5), n(2.0)], sp()), Err(Control::Panic(_))));
+        assert!(matches!(
+            call("clamp", &[n(1.0), n(3.0), n(0.0)], sp()),
+            Err(Control::Panic(_))
+        ));
+        assert!(matches!(
+            call("gcd", &[n(1.5), n(2.0)], sp()),
+            Err(Control::Panic(_))
+        ));
     }
 }
