@@ -43,6 +43,7 @@ pub enum Tok {
     Else,
     While,
     DotDot,
+    DotDotDot,
     For,
     In,
     Return,
