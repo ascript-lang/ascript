@@ -418,32 +418,49 @@ impl Interp {
                 if lvl < self.log_level.get() {
                     return Ok(Value::Nil);
                 }
-                let (msg, field_args): (String, &[Value]) = match args.first() {
-                    Some(Value::Function(_)) | Some(Value::Builtin(_)) => {
-                        let r = self.call_value(args[0].clone(), vec![], span).await?;
-                        (r.to_string(), &args[1..])
-                    }
-                    Some(v) => (v.to_string(), &args[1..]),
-                    None => (String::new(), &args[..0]),
-                };
+                let mut parts: Vec<String> = Vec::new();
                 let mut fields = serde_json::Map::new();
-                for a in field_args {
-                    if let Value::Object(o) = a {
-                        for (k, val) in o.borrow().iter() {
-                            fields.insert(k.clone(), crate::stdlib::json::to_json_lossy(val, &mut Vec::new()));
+                let mut iter = args.iter();
+                // A thunk is only honored as the FIRST arg. It is invoked lazily
+                // (after the level filter above) so a filtered call is free.
+                if matches!(args.first(), Some(Value::Function(_)) | Some(Value::Builtin(_))) {
+                    let r = self.call_value(args[0].clone(), vec![], span).await?;
+                    // An `async fn` thunk returns a `Value::Future`; drive it to
+                    // completion using the same mechanism as `await` (M17).
+                    let r = match r {
+                        Value::Future(f) => f.get().await?,
+                        other => other,
+                    };
+                    parts.push(r.to_string());
+                    iter.next(); // consume index 0
+                }
+                for a in iter {
+                    match a {
+                        Value::Object(o) => {
+                            for (k, val) in o.borrow().iter() {
+                                fields.insert(k.clone(), crate::stdlib::json::to_json_lossy(val, &mut Vec::new()));
+                            }
                         }
+                        other => parts.push(other.to_string()),
                     }
                 }
+                let msg = parts.join(" ");
                 let line = match self.log_format.get() {
                     LogFormat::Json => {
                         let mut rec = serde_json::Map::new();
+                        // User fields FIRST, then reserved keys, so a user field
+                        // named `level`/`msg` can never clobber the authoritative ones.
+                        for (k, v) in fields { rec.insert(k, v); }
                         rec.insert("level".into(), serde_json::Value::String(func.into()));
                         rec.insert("msg".into(), serde_json::Value::String(msg));
-                        for (k, v) in fields { rec.insert(k, v); }
                         serde_json::Value::Object(rec).to_string()
                     }
                     LogFormat::Human => {
-                        let mut s = format!("[{}] {}", func.to_uppercase(), msg);
+                        let mut s = if msg.is_empty() {
+                            format!("[{}]", func.to_uppercase())
+                        } else {
+                            format!("[{}] {}", func.to_uppercase(), msg)
+                        };
                         for (k, v) in &fields {
                             let vs = match v {
                                 serde_json::Value::String(s) => s.clone(),
@@ -2589,6 +2606,33 @@ log.debug(() => "expensive")
 "#).await;
         assert!(logs.contains("\"level\":\"info\"") && logs.contains("\"msg\":\"saved\"") && logs.contains("\"userId\":5"));
         assert!(!logs.contains("expensive"));
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_reserved_keys_win_and_no_silent_drop() {
+        let logs = run_logs(r#"
+import * as log from "std/log"
+log.setFormat("json")
+log.info("saved", {level: "HACK", userId: 5})
+"#).await;
+        assert!(logs.contains("\"level\":\"info\""), "auto level must win: {logs}");
+        assert!(logs.contains("\"userId\":5"));
+        assert!(!logs.contains("HACK"));
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_non_object_args_append_to_msg() {
+        let logs = run_logs("import * as log from \"std/log\"\nlog.info(\"a\", \"b\", 3)").await;
+        assert!(logs.contains("[INFO] a b 3"), "got: {logs}");
+    }
+
+    #[cfg(feature = "log")]
+    #[tokio::test]
+    async fn log_empty_msg_no_trailing_space() {
+        let logs = run_logs("import * as log from \"std/log\"\nlog.warn()").await;
+        assert!(logs.lines().any(|l| l == "[WARN]"), "got: {logs:?}");
     }
 
     #[tokio::test]
