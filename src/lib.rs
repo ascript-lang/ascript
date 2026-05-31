@@ -27,19 +27,19 @@ use std::rc::Rc;
 /// The program runs inside a `tokio::task::LocalSet` so it (and, from M17 Phase 2
 /// on, any tasks it spawns) lives on the current-thread runtime. After the root
 /// future completes we drive the LocalSet to drain spawned tasks — a no-op today.
-pub async fn run_file(path: &Path) -> Result<String, AsError> {
+pub async fn run_file(path: &Path) -> Result<(), AsError> {
     // CLI `run` streams `print` output live to stdout (so it appears immediately
-    // and survives a later panic). `output()` is empty under `Live`, so the
-    // returned string is empty on success — the caller does not re-print it.
+    // and survives a later panic). Under `Live` there is no captured string, so
+    // the success contract is `()` — the caller does not re-print anything.
     let interp = Rc::new(Interp::new_live());
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(interp.load_module(path)).await;
     local.await; // drain spawned tasks (structured join) — no-op until Phase 2
     match result {
-        Ok(_) => Ok(interp.output()),
+        Ok(_) => Ok(()),
         Err(crate::interp::Control::Panic(e)) => Err(e),
-        Err(crate::interp::Control::Propagate(_)) => Ok(interp.output()),
+        Err(crate::interp::Control::Propagate(_)) => Ok(()),
     }
 }
 
