@@ -18,6 +18,17 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("min", bi("math.min")),
         ("max", bi("math.max")),
         ("random", bi("math.random")),
+        ("sin", bi("math.sin")),
+        ("cos", bi("math.cos")),
+        ("tan", bi("math.tan")),
+        ("asin", bi("math.asin")),
+        ("acos", bi("math.acos")),
+        ("atan", bi("math.atan")),
+        ("atan2", bi("math.atan2")),
+        ("exp", bi("math.exp")),
+        ("ln", bi("math.ln")),
+        ("log2", bi("math.log2")),
+        ("log10", bi("math.log10")),
         ("pi", Value::Number(std::f64::consts::PI)),
         ("e", Value::Number(std::f64::consts::E)),
     ]
@@ -51,6 +62,21 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             Ok(Value::Number(acc))
         }
         "random" => Ok(Value::Number(next_random())),
+        "sin" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("sin"))?.sin())),
+        "cos" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("cos"))?.cos())),
+        "tan" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("tan"))?.tan())),
+        "asin" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("asin"))?.asin())),
+        "acos" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("acos"))?.acos())),
+        "atan" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("atan"))?.atan())),
+        "atan2" => {
+            let y = want_number(&arg(args, 0), span, &ctx("atan2"))?;
+            let x = want_number(&arg(args, 1), span, &ctx("atan2"))?;
+            Ok(Value::Number(y.atan2(x)))
+        }
+        "exp" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("exp"))?.exp())),
+        "ln" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("ln"))?.ln())),
+        "log2" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("log2"))?.log2())),
+        "log10" => Ok(Value::Number(want_number(&arg(args, 0), span, &ctx("log10"))?.log10())),
         _ => Err(AsError::at(format!("std/math has no function '{}'", func), span).into()),
     }
 }
@@ -88,6 +114,25 @@ fn next_random() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn n(x: f64) -> Value {
+        Value::Number(x)
+    }
+
+    fn sp() -> Span {
+        Span::new(0, 0)
+    }
+
+    #[test]
+    fn math_trig_exp() {
+        assert_eq!(call("sin", &[n(0.0)], sp()).unwrap(), n(0.0));
+        assert_eq!(call("cos", &[n(0.0)], sp()).unwrap(), n(1.0));
+        assert_eq!(call("exp", &[n(0.0)], sp()).unwrap(), n(1.0));
+        assert_eq!(call("ln", &[n(1.0)], sp()).unwrap(), n(0.0));
+        assert_eq!(call("log2", &[n(8.0)], sp()).unwrap(), n(3.0));
+        assert_eq!(call("log10", &[n(1000.0)], sp()).unwrap(), n(3.0));
+        assert_eq!(call("atan2", &[n(0.0), n(1.0)], sp()).unwrap(), n(0.0));
+    }
 
     #[test]
     fn basics() {
