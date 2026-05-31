@@ -18,6 +18,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("lower", bi("string.lower")),
         ("find", bi("string.find")),
         ("replace", bi("string.replace")),
+        ("replaceAll", bi("string.replaceAll")),
         ("format", bi("string.format")),
         ("padStart", bi("string.padStart")),
         ("padEnd", bi("string.padEnd")),
@@ -75,6 +76,13 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let s = want_string(&arg(args, 0), span, &ctx("replace"))?;
             let from = want_string(&arg(args, 1), span, &ctx("replace"))?;
             let to = want_string(&arg(args, 2), span, &ctx("replace"))?;
+            let result = if from.is_empty() { s.to_string() } else { s.replacen(from.as_ref(), to.as_ref(), 1) };
+            Ok(str_val(result))
+        }
+        "replaceAll" => {
+            let s = want_string(&arg(args, 0), span, &ctx("replaceAll"))?;
+            let from = want_string(&arg(args, 1), span, &ctx("replaceAll"))?;
+            let to = want_string(&arg(args, 2), span, &ctx("replaceAll"))?;
             let result = if from.is_empty() { s.to_string() } else { s.replace(from.as_ref(), to.as_ref()) };
             Ok(str_val(result))
         }
@@ -170,7 +178,10 @@ mod tests {
     fn find_replace_format_pad_repeat() {
         assert_eq!(call("find", &[s("hello"), s("ll")], sp()).unwrap(), Value::Number(2.0));
         assert_eq!(call("find", &[s("hello"), s("z")], sp()).unwrap(), Value::Number(-1.0));
-        assert_eq!(call("replace", &[s("a.b.c"), s("."), s("-")], sp()).unwrap(), s("a-b-c"));
+        // replace = FIRST occurrence only
+        assert_eq!(call("replace", &[s("a.b.c"), s("."), s("-")], sp()).unwrap(), s("a-b.c"));
+        // replaceAll = all occurrences
+        assert_eq!(call("replaceAll", &[s("a.b.c"), s("."), s("-")], sp()).unwrap(), s("a-b-c"));
         assert_eq!(call("format", &[s("{} + {} = {}"), Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)], sp()).unwrap(), s("1 + 2 = 3"));
         assert_eq!(call("format", &[s("{{literal}}")], sp()).unwrap(), s("{literal}"));
         assert_eq!(call("padStart", &[s("7"), Value::Number(3.0), s("0")], sp()).unwrap(), s("007"));
@@ -187,8 +198,9 @@ mod tests {
         assert_eq!(call("padStart", &[s("hello"), Value::Number(3.0), s("0")], sp).unwrap(), s("hello"));
         // slice start >= end → empty
         assert_eq!(call("slice", &[s("hello"), Value::Number(4.0), Value::Number(2.0)], sp).unwrap(), s(""));
-        // empty `from` in replace returns input unchanged
+        // empty `from` leaves input unchanged for both
         assert_eq!(call("replace", &[s("abc"), s(""), s("X")], sp).unwrap(), s("abc"));
+        assert_eq!(call("replaceAll", &[s("abc"), s(""), s("X")], sp).unwrap(), s("abc"));
         // negative repeat count → panic
         assert!(matches!(call("repeat", &[s("a"), Value::Number(-1.0)], sp), Err(Control::Panic(_))));
         // standalone }} escape

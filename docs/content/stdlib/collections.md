@@ -110,6 +110,20 @@ string.find("hello", "z")    // -1
 
 ### string.replace
 
+Replace the **first** occurrence of a substring. An empty `from` returns the input unchanged.
+
+- `s: string` — the source string
+- `from: string` — the substring to replace
+- `to: string` — the replacement
+- Returns: `string`
+
+```ascript
+string.replace("a.b.c", ".", "-")      // "a-b.c"  (first only)
+string.replaceAll("a.b.c", ".", "-")   // "a-b-c"  (all)
+```
+
+### string.replaceAll
+
 Replace **all** occurrences of a substring. An empty `from` returns the input unchanged.
 
 - `s: string` — the source string
@@ -118,7 +132,7 @@ Replace **all** occurrences of a substring. An empty `from` returns the input un
 - Returns: `string`
 
 ```ascript
-string.replace("a.b.c", ".", "-")   // "a-b-c"
+string.replaceAll("a.b.c", ".", "-")   // "a-b-c"  (every occurrence)
 ```
 
 ### string.format
