@@ -75,6 +75,12 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > `Instance` (`Stmt::LetDestructureObject`); missing keys bind `nil`. Keys are `Ident | Str` (quote
 > non-identifier keys); rename with the soft keyword `as`. Object-rest is plumbed but inactive until
 > a later phase.
+>
+> **Spread `...`** (`Tok::DotDotDot`): valid in array literals, object literals, and call args via
+> typed-element AST (`ArrayElem`/`ObjEntry`/`CallArg`), so spread is unrepresentable elsewhere.
+> Strict: spreading the wrong container is a Tier-2 panic; object-spread is later-value-wins with
+> `IndexMap` keeping a key's first-seen position. After grammar changes, regen `parser.c` with
+> `tree-sitter generate --abi 14`.
 
 ## Commands
 

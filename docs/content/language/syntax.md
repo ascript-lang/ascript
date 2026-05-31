@@ -58,6 +58,32 @@ let p = Point.from({x: 3, y: 4})
 let {x, y} = p                     // x = 3, y = 4
 ```
 
+### Spread
+
+`...expr` expands a collection inline in three contexts — array literals, object literals, and call
+arguments:
+
+```ascript
+let base = [1, 2, 3]
+let more = [0, ...base, 4]         // [0, 1, 2, 3, 4]
+
+let defaults = {host: "local", port: 80}
+let config = {...defaults, port: 443}  // {host: "local", port: 443}
+
+fn sum3(a, b, c) { return a + b + c }
+let nums = [10, 20, 30]
+print(sum3(...nums))               // 60
+```
+
+Spread is **strict**: an array spread (`[...x]` or `f(...x)`) requires `x` to be an array, and an
+object spread (`{...x}`) requires `x` to be an object — there is no array↔object coercion, and
+spreading the wrong container kind is a runtime panic.
+
+In an object literal, spread is **later-value-wins**: a key written after a `...` overrides the
+spread-in value, and a `...` after an explicit entry overrides that. A key keeps its **first-seen
+position** in the result (so `{...a, k: v}` updates `k` in place if `a` already had it, rather than
+moving it to the end).
+
 ## Operators
 
 ```text
