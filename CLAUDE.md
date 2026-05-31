@@ -34,8 +34,8 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > (incl. strings containing `}`/`{`/`${` and nested templates) — see the `template_interpolation_*`
 > tests.
 >
-> **`?` is overloaded** and parsed in two places: postfix Result-propagation (`expr?`, in
-> `postfix()`) and the ternary `cond ? then : els` (in `ternary()`, just above assignment). They're
+> **`?` is overloaded** and parsed in two places: postfix Result-propagation (`expr?`, `ExprKind::Try`)
+> and the ternary `cond ? then : els` (in `ternary()`, just above assignment). They're
 > disambiguated by `is_ternary_question()` — a `?` is a ternary only when a `:` follows at
 > bracket-depth 0 before the statement ends; otherwise it's a `Try`. So `a ? -b : c` is a ternary
 > but `f()? - 1` is propagate-then-subtract. The tree-sitter grammar mirrors this via a declared GLR
@@ -43,6 +43,33 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > `tree-sitter generate --abi 14`** after any grammar change. When touching `ExprKind`, the
 > exhaustive matches in `interp.rs` (eval), `fmt.rs` (`write_expr_inner`), and `ast.rs` (`Display`)
 > must each get an arm.
+>
+> **Unwrap `!` and the `?`/`!` precedence tier (class-shape-validation feature).** Postfix `!` is
+> `ExprKind::Unwrap(Box<Expr>)` (force-unwrap of a `[value, err]` pair — yields `value`, or a
+> *recoverable* panic carrying the original error message). Both `?` (`Try`) and `!` (`Unwrap`) live
+> in `unwrap_tier()` in `parser.rs` — a precedence level **between `exponent()` and `unary()`**, i.e.
+> **looser than `await` and prefix unary `!x`/`-x`** — so `await x!` parses as `(await x)!` and
+> `await x?` as `(await x)?` with no parens. Mirror this tier in `fmt.rs` (`expr_prec`: a `PREC_TRY`
+> level so the formatter does NOT wrongly parenthesize `await x?`/`await x!`). In the **tree-sitter
+> grammar**, `unwrap_expression`/`propagate_expression` are deliberately **precedence-LESS** and
+> resolved via declared GLR conflicts — **do NOT give them a `prec`, it breaks the ternary**.
+> `ExprKind::Unwrap` needs arms in `interp.rs` (eval), `fmt.rs` (`write_expr_inner`), and `ast.rs`
+> (`Display`).
+>
+> **Nullable suffix + typed class fields + `.from` validation (same feature).** `T?` is the nullable
+> suffix (sugar for `T | nil`), parsed as `Type::Optional(Box<Type>)`, valid in EVERY type position
+> (let/const/param/return/field) and rendered canonically as `T?`. A class body now allows
+> `field_declaration` (grammar) — required (`id: number`), optional (BOTH `name: T?` and the marker
+> `name?: T`, which lower to the SAME `Type::Optional` node; the formatter normalizes to `name: T?`,
+> fields-before-methods), and defaulted (`role: string = "guest"`). Declared field types are checked
+> on assignment (incl. inside `init`); see `Stmt::Class.fields` (`FieldDecl`) / runtime
+> `FieldSchema`. `ClassName.from(obj, strict=false)` is a `Value::ClassMethod` that calls
+> `validate_into` in `interp.rs` (recurses into nested class / `array<Class>` / `map<K,Class>` fields,
+> applies defaults, recoverable field-path panic on mismatch, does NOT run `init`); it includes an
+> **Object→Map boundary coercion** so a raw JSON dictionary `{...}` validates into a `map<K,Class>`
+> field. The same `validate_into` core powers typed parse: `json.parse(text, Class)` and
+> `resp.json(Class)` fuse a parse/decode failure and a shape mismatch into ONE Tier-1 `[value, err]`
+> pair (no panic); the class is an ordinary value argument (no generics).
 
 ## Commands
 

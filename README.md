@@ -33,8 +33,9 @@ does the heavy lifting, because Rust's crate ecosystem makes high-quality batter
 Design priorities, in strict order: **simplicity → safety → familiarity → performance**.
 
 - **Familiar syntax** — braces, `fn`, arrows, template strings, `for…of`. If you read JavaScript, you read AScript.
-- **Gradual type contracts** — optional annotations, checked at runtime as contracts, never erased.
-- **Errors as values** — no exceptions; fallible calls return `[value, err]` and the `?` operator propagates. Bugs panic, loudly.
+- **Gradual type contracts** — optional annotations, checked at runtime as contracts, never erased. Includes the nullable suffix `T?` (≡ `T | nil`) and typed class fields (required, optional, defaulted) checked on assignment.
+- **Errors as values** — no exceptions; fallible calls return `[value, err]`; the `?` operator propagates and the `!` force-unwrap asserts success (panicking, recoverably, with the original message). Bugs panic, loudly.
+- **Shape validation** — turn untrusted data into checked instances: `ClassName.from(obj)` validates a raw object (recursing into nested classes, `array<Class>`, and `map<K, Class>`), and the typed parse `json.parse(text, Class)` / `resp.json(Class)` fuses decode + validation into one result — `let user = await resp.json(User)?`.
 - **Single-threaded async & concurrency** — `await` any I/O on a cooperative event loop; `future<T>` and `std/task` (`spawn`/`gather`/`race`/`timeout`); structured concurrency with cancel-on-drop (un-awaited work is cancelled, `task.spawn` detaches); the HTTP server serves connections concurrently. No data races.
 - **Generators & coroutines** — `fn*`/`async fn*` with `yield`, bidirectional `gen.next(v)`, `gen.close()`, and `for await` over generators and native streams (composable async pipelines).
 - **Batteries included** — JSON, regex, SQLite, crypto, compression, a modern HTTP client, WebSockets, and a TUI.
