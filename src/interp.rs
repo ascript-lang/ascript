@@ -1726,6 +1726,23 @@ impl Interp {
                     }
                     Ok(Value::Map(out))
                 }
+                // A raw Object (e.g. a JSON dictionary) coerces into a Map at the
+                // `.from` boundary: each string key becomes a `MapKey::Str` and
+                // each value is recursively coerced through the declared value
+                // type. Insertion order is preserved. This closes the gap where a
+                // parsed-JSON `map<K, Class>` field would otherwise be an Object
+                // and fail the `map<K,V>` contract.
+                Value::Object(o) => {
+                    let entries: Vec<(String, Value)> =
+                        o.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
+                    for (k, v) in entries {
+                        let p = format!("{}[{}]", path, k);
+                        let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
+                        out.borrow_mut().insert(crate::value::MapKey::Str(k.as_str().into()), cv);
+                    }
+                    Ok(Value::Map(out))
+                }
                 _ => Ok(val),
             },
             _ => Ok(val),
@@ -3014,6 +3031,32 @@ print(r[1])
                    let u = U.from({ tags: raw })\nprint(map.get(u.tags, \"b\").v)";
         let out = run(src).await;
         assert!(out.contains("2"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_coerces_object_into_map_of_class() {
+        // A raw JSON-shaped Object validates into a `map<string, Tag>` field, with
+        // each nested object validated into a Tag instance.
+        let src = "import * as map from \"std/map\"\n\
+                   class Tag { v: number }\nclass W { byId: map<string, Tag> }\n\
+                   let w = W.from({ byId: { \"1\": { v: 10 }, \"2\": { v: 20 } } })\n\
+                   print(map.get(w.byId, \"1\").v)\nprint(map.get(w.byId, \"2\").v)";
+        let out = run(src).await;
+        assert!(out.contains("10") && out.contains("20"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_object_map_nested_path_in_error() {
+        // A bad nested value inside an Object-sourced map reports a path like
+        // `w.byId[1].v` — only the root class name is lowercased; field names
+        // and Object map keys keep their original casing.
+        let src = "class Tag { v: number }\nclass W { byId: map<string, Tag> }\n\
+                   let r = recover(() => W.from({ byId: { \"1\": { v: \"oops\" } } }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(
+            out.contains("w.byId[1].v") && out.contains("type contract violated"),
+            "got: {out}"
+        );
     }
 
     #[tokio::test]
