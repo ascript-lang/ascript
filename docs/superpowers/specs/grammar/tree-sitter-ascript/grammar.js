@@ -347,7 +347,12 @@ module.exports = grammar({
       field('function', $._postfix_expression),
       field('arguments', $.arguments),
     )),
-    arguments: $ => seq('(', commaSep($._expression), optional(','), ')'),
+    arguments: $ => seq('(', commaSep(choice($._expression, $.spread_element)), optional(','), ')'),
+
+    // ...expr — spread into an array literal, object literal, or call args
+    // (typed-element AST in the interpreter; strict: spreading the wrong
+    // container kind is a runtime panic).
+    spread_element: $ => seq('...', $._expression),
 
     member_expression: $ => prec(PREC.postfix, seq(
       field('object', $._postfix_expression),
@@ -419,10 +424,10 @@ module.exports = grammar({
 
     parenthesized_expression: $ => seq('(', $._expression, ')'),
 
-    array_literal: $ => seq('[', commaSep($._expression), optional(','), ']'),
+    array_literal: $ => seq('[', commaSep(choice($._expression, $.spread_element)), optional(','), ']'),
 
     object_literal: $ => prec(PREC.primary, seq(
-      '{', commaSep($.object_entry), optional(','), '}',
+      '{', commaSep(choice($.object_entry, $.spread_element)), optional(','), '}',
     )),
     object_entry: $ => seq(
       field('key', choice($.identifier, $.string)),
