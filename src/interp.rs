@@ -1183,6 +1183,13 @@ impl Interp {
                     span,
                 )),
             },
+            Value::Class(c) => match name {
+                "from" => Ok(Value::ClassMethod(c.clone(), "from")),
+                other => Err(AsError::at(
+                    format!("class {} has no static member '{}'", c.name, other),
+                    span,
+                )),
+            },
             Value::Nil => Err(AsError::at(format!("cannot read property '{}' of nil", name), span)),
             _ => Err(AsError::at(format!("cannot read property '{}' of this value", name), span)),
         }
@@ -1200,6 +1207,18 @@ impl Interp {
             Value::GeneratorMethod(g, method) => {
                 self.call_generator_method(&g, method, args, span).await
             }
+            Value::ClassMethod(c, "from") => {
+                let obj = args.first().cloned().unwrap_or(Value::Nil);
+                let strict = matches!(args.get(1), Some(Value::Bool(true)));
+                self.validate_into(&c, &obj, strict, "", span)
+                    .await
+                    .map_err(Control::from)
+            }
+            Value::ClassMethod(c, other) => Err(AsError::at(
+                format!("class {} has no static member '{}'", c.name, other),
+                span,
+            )
+            .into()),
             _ => Err(AsError::at("value is not callable", span).into()),
         }
     }
@@ -2032,6 +2051,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Future(_) => "future",
         Value::Generator(_) => "generator",
         Value::GeneratorMethod(..) => "function",
+        Value::ClassMethod(..) => "function",
     }
 }
 
@@ -2932,6 +2952,80 @@ print(r[1])
         let src = "let r = recover(() => 5!)\nprint(r[1] != nil)";
         let out = run(src).await;
         assert!(out.contains("true"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_builds_validated_instance() {
+        let src = "class U { id: number\n name: string }\n\
+                   let o = { id: 1, name: \"Ada\" }\n\
+                   let u = U.from(o)\nprint(u.id)\nprint(u.name)";
+        let out = run(src).await;
+        assert!(out.contains("1") && out.contains("Ada"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_rejects_wrong_type_with_field_path() {
+        let src = "class U { id: number\n name: string }\n\
+                   let r = recover(() => U.from({ id: \"x\", name: \"Ada\" }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("u.id") && out.contains("type contract violated"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_optional_and_default() {
+        let src = "class U { id: number\n nick: string?\n role: string = \"guest\" }\n\
+                   let u = U.from({ id: 2 })\nprint(u.nick == nil)\nprint(u.role)";
+        let out = run(src).await;
+        assert!(out.contains("true") && out.contains("guest"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_recurses_into_nested_class() {
+        let src = "class Addr { zip: number }\nclass U { id: number\n addr: Addr }\n\
+                   let u = U.from({ id: 1, addr: { zip: 90210 } })\nprint(u.addr.zip)";
+        let out = run(src).await;
+        assert!(out.contains("90210"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_nested_path_in_error() {
+        let src = "class Addr { zip: number }\nclass U { id: number\n addr: Addr }\n\
+                   let r = recover(() => U.from({ id: 1, addr: { zip: \"x\" } }))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("u.addr.zip"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_recurses_into_array_of_class() {
+        let src = "class Tag { v: number }\nclass U { tags: array<Tag> }\n\
+                   let u = U.from({ tags: [{ v: 1 }, { v: 2 }] })\nprint(u.tags[1].v)";
+        let out = run(src).await;
+        assert!(out.contains("2"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_recurses_into_map_of_class() {
+        // A `map<K, Class>` field whose values are raw objects validates each
+        // value into the class. (Maps are a distinct value kind from objects, so
+        // the raw map is built with `map.new` from [key, value] pairs.)
+        let src = "import * as map from \"std/map\"\n\
+                   class Tag { v: number }\nclass U { tags: map<string, Tag> }\n\
+                   let raw = map.new([[\"a\", { v: 1 }], [\"b\", { v: 2 }]])\n\
+                   let u = U.from({ tags: raw })\nprint(map.get(u.tags, \"b\").v)";
+        let out = run(src).await;
+        assert!(out.contains("2"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn from_strict_rejects_extra_keys() {
+        let src = "class U { id: number }\n\
+                   let r = recover(() => U.from({ id: 1, extra: true }, true))\nprint(r[1].message)";
+        let out = run(src).await;
+        assert!(out.contains("unexpected key 'extra'"), "got: {out}");
+        // Lenient (default) ignores extras:
+        let src2 = "class U { id: number }\nlet u = U.from({ id: 1, extra: true })\nprint(u.id)";
+        let out2 = run(src2).await;
+        assert!(out2.contains("1"), "got: {out2}");
     }
 
     #[tokio::test]

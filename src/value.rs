@@ -254,6 +254,8 @@ pub enum Value {
     /// async `call_generator_method`. Generators have no `NativeObject`, so they
     /// can't reuse `NativeMethod`; this is the parallel binding for them.
     GeneratorMethod(Rc<crate::coro::GeneratorHandle>, &'static str),
+    /// A class associated function bound to its class, e.g. `User.from`.
+    ClassMethod(Rc<Class>, &'static str),
 }
 
 impl Value {
@@ -299,6 +301,9 @@ impl PartialEq for Value {
             (Value::GeneratorMethod(a, an), Value::GeneratorMethod(b, bn)) => {
                 Rc::ptr_eq(a, b) && an == bn
             }
+            (Value::ClassMethod(a, an), Value::ClassMethod(b, bn)) => {
+                Rc::ptr_eq(a, b) && an == bn
+            }
             _ => false,
         }
     }
@@ -332,6 +337,7 @@ impl fmt::Debug for Value {
             Value::Future(_) => write!(f, "Future"),
             Value::Generator(_) => write!(f, "Generator"),
             Value::GeneratorMethod(_, m) => write!(f, "GeneratorMethod({})", m),
+            Value::ClassMethod(c, m) => write!(f, "ClassMethod({}.{})", c.name, m),
         }
     }
 }
@@ -423,6 +429,7 @@ impl Value {
             Value::Future(_) => write!(f, "<future>"),
             Value::Generator(_) => write!(f, "<generator>"),
             Value::GeneratorMethod(_, m) => write!(f, "<generator method {}>", m),
+            Value::ClassMethod(c, m) => write!(f, "<class method {}.{}>", c.name, m),
         }
     }
 
