@@ -28,9 +28,12 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
   fs, process, datetime, tui, plus HTTP/WebSocket/SSE client+server pairs). Verify with
   `target/release/ascript run <file>`.
 
-> Language notes worth knowing when writing `.as` code or docs: `print` output is **buffered and
-> flushed at program exit** (a forever-looping server won't stream logs live — use
-> `serve({maxRequests:N})`). Template `${…}` interpolation fully supports nested string literals
+> Language notes worth knowing when writing `.as` code or docs: under the CLI `run` command, `print`
+> **streams live to stdout** (`OutputSink::Live`) and output is retained even if the program later
+> panics; `run_source`/REPL/tests **capture** it instead (`OutputSink::Capture`), and async tasks in
+> tests buffer via that capture path. `serve({maxRequests:N})` still gives a forever-looping server a
+> graceful shutdown but is no longer needed just to *see* its `print` output. Template `${…}`
+> interpolation fully supports nested string literals
 > (incl. strings containing `}`/`{`/`${` and nested templates) — see the `template_interpolation_*`
 > tests.
 >
