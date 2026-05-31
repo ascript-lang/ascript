@@ -178,8 +178,22 @@ pub enum OutputSink {
 
 /// std/log severity, ordered debug<info<warn<error for level filtering.
 #[cfg(feature = "log")]
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum LogLevel { Debug = 0, Info = 1, Warn = 2, Error = 3 }
+
+/// Parse the initial std/log level from the `ASCRIPT_LOG` env value
+/// (case-insensitive `debug`/`info`/`warn`/`error`). Defaults to `Info` when
+/// unset or unrecognized. Pure (no env access) so it's race-free to unit-test.
+#[cfg(feature = "log")]
+fn log_level_from_env_str(v: Option<&str>) -> LogLevel {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("debug") => LogLevel::Debug,
+        Some("info") => LogLevel::Info,
+        Some("warn") => LogLevel::Warn,
+        Some("error") => LogLevel::Error,
+        _ => LogLevel::Info,
+    }
+}
 /// std/log output format: `human` (`[WARN] msg key=val`) or `json` (one object/line).
 #[cfg(feature = "log")]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -279,7 +293,7 @@ impl Interp {
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
             #[cfg(feature = "log")]
-            log_level: Cell::new(LogLevel::Info),
+            log_level: Cell::new(log_level_from_env_str(std::env::var("ASCRIPT_LOG").ok().as_deref())),
             #[cfg(feature = "log")]
             log_format: Cell::new(LogFormat::Human),
             #[cfg(feature = "log")]
@@ -2606,6 +2620,15 @@ log.debug(() => "expensive")
 "#).await;
         assert!(logs.contains("\"level\":\"info\"") && logs.contains("\"msg\":\"saved\"") && logs.contains("\"userId\":5"));
         assert!(!logs.contains("expensive"));
+    }
+
+    #[cfg(feature = "log")]
+    #[test]
+    fn log_level_from_env_parsing() {
+        assert_eq!(log_level_from_env_str(Some("warn")), LogLevel::Warn);
+        assert_eq!(log_level_from_env_str(Some("DEBUG")), LogLevel::Debug);
+        assert_eq!(log_level_from_env_str(None), LogLevel::Info);
+        assert_eq!(log_level_from_env_str(Some("nonsense")), LogLevel::Info);
     }
 
     #[cfg(feature = "log")]
