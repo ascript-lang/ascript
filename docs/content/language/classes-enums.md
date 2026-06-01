@@ -286,8 +286,9 @@ match event {
 
 #### Alternatives `|`
 
-Separate multiple patterns with `|`. The arm fires if **any** pattern matches. Bindings must be
-consistent across alternatives (each must bind the same names).
+Separate multiple patterns with `|`. The arm fires if **any** pattern matches. Alternatives are
+typically literals or value patterns that bind nothing; only the matched alternative's bindings are
+in scope in the guard/body, so keep alternatives uniform (bind the same names) if you do bind.
 
 ```ascript
 match day { "sat" | "sun" => "weekend", _ => "weekday" }

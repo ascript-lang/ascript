@@ -116,7 +116,7 @@ order, and is `{}` when nothing is left over.
 =  += -= *= /=           assignment (and compound)
 ?                        postfix Result propagation (see Errors)
 ..                       range (exclusive)
-..=                      inclusive range — used in match patterns and for loops
+..=                      inclusive range — used in match range patterns
 ```
 
 **Precedence**, highest to lowest:
