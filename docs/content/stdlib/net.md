@@ -467,8 +467,8 @@ server.put(path, schema, handler)
 server.route("POST", path, schema, handler)
 ```
 
-- If the body is not valid JSON → **400** `{error: "validation", path: "", message: "body is not valid JSON"}` — handler not called.
-- If the decoded value does not match the schema → **400** `{error: "validation", path, message}` — handler not called.
+- If the body is not valid JSON → **400** `{error: "validation failed", path: "", message: "body is not valid JSON"}` — handler not called.
+- If the decoded value does not match the schema → **400** `{error: "validation failed", path, message}` — handler not called.
 - On success → `req.body` is the **validated value** (type-coerced per the schema) and `req.rawBody` holds the **original JSON string**. The handler runs normally.
 
 Requires the `data` Cargo feature (enabled by default). On a `--no-default-features` build, `schema` validation is silently skipped and `req.body` is the raw string as usual.
