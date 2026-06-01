@@ -56,6 +56,7 @@ http = { version = "1", optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
 crossterm = { version = "0.28", optional = true }
+hostname = { version = "0.4", optional = true }
 tower-lsp = { version = "0.20", optional = true }
 
 [build-dependencies]
@@ -75,7 +76,7 @@ datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
 # Task 2 wires `dotenvy` for std/env; Task 3 (fs) adds walkdir/ignore/regex; Task 7
 # (process, std/process) adds tokio's process + io-util plumbing for subprocesses.
-sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "tokio/process", "tokio/io-util"]
+sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "dep:hostname", "tokio/process", "tokio/io-util"]
 crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex", "dep:crc32fast", "dep:xxhash-rust"]
 compress = ["dep:flate2", "dep:zip"]
 sql = ["dep:rusqlite"]

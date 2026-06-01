@@ -24,6 +24,8 @@ pub mod encoding;
 pub mod env;
 #[cfg(feature = "sys")]
 pub mod fs;
+#[cfg(feature = "sys")]
+pub mod os;
 #[cfg(feature = "net")]
 pub mod http_server;
 #[cfg(feature = "intl")]
@@ -117,6 +119,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/env" => env::exports(),
         #[cfg(feature = "sys")]
         "std/fs" => fs::exports(),
+        #[cfg(feature = "sys")]
+        "std/os" => os::exports(),
         #[cfg(feature = "sys")]
         "std/io" => io::exports(),
         #[cfg(feature = "sys")]
@@ -231,6 +235,8 @@ impl Interp {
             }
             #[cfg(feature = "sys")]
             "fs" => fs::call(func, args, span),
+            #[cfg(feature = "sys")]
+            "os" => os::call(func, args, span),
             #[cfg(feature = "sys")]
             "io" => self.call_io(func, args, span).await,
             #[cfg(feature = "sys")]
