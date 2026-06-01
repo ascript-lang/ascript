@@ -165,6 +165,8 @@ pub enum NativeKind {
     Terminal,
     // std/sync: a FIFO channel (VecDeque + Rc<Notify>). Not feature-gated.
     Channel,
+    // std/sync: a counting semaphore (RefCell<usize> + Rc<Notify>). Not feature-gated.
+    Semaphore,
 }
 
 impl NativeKind {
@@ -187,6 +189,7 @@ impl NativeKind {
             NativeKind::WsListener => "wsListener",
             NativeKind::Terminal => "terminal",
             NativeKind::Channel => "channel",
+            NativeKind::Semaphore => "semaphore",
         }
     }
 }

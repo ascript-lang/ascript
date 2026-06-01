@@ -183,6 +183,11 @@ pub(crate) enum ResourceState {
     // struct holds the queue inside a RefCell and the Notify handles as separate
     // Rcs so callers can clone them out before awaiting without holding a borrow.
     Channel(crate::stdlib::sync::Channel),
+    // std/sync: a counting semaphore backed by RefCell<usize> + Rc<Notify>. Always
+    // present (no feature gate). acquire uses the same enable()-before-recheck
+    // lost-wakeup-safe park pattern as Channel::recv. The Semaphore struct holds
+    // the counter inside a RefCell and the Notify as a separate Rc.
+    Semaphore(crate::stdlib::sync::Semaphore),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]

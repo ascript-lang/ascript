@@ -1,4 +1,4 @@
-//! `std/sync` — FIFO channels for passing values between `task.spawn`ed tasks.
+//! `std/sync` — FIFO channels and semaphores for coordinating between tasks.
 //!
 //! NOT feature-gated: tokio (with `sync`) is core infrastructure already present
 //! under `--no-default-features`.
@@ -13,14 +13,25 @@
 //!   `[nil, false]` cannot distinguish empty-open from closed-drained.
 //! - `sync.close(ch)`    → nil                           — close the sending side
 //!
+//! - `sync.semaphore(permits)` → semaphore handle (permits must be a positive integer)
+//! - `sync.acquire(s)`   → nil  — async; awaits until a permit is available, takes one
+//! - `sync.release(s)`   → nil  — return one permit to the semaphore
+//! - `sync.withPermit(s, fn)` → value — async; acquire → await fn() → release on ALL
+//!   paths (including fn panics); returns fn's result, re-raises its panic after release
+//! - `sync.available(s)` → number — current free permits
+//!
 //! **Backing:** `VecDeque<Value>` + two `Rc<tokio::sync::Notify>` (not_empty /
 //! not_full). Using `tokio::sync::mpsc` would require `T: Send`, which `Value`
 //! cannot satisfy (it uses `Rc` internally). The `Rc`-based design is safe because
 //! the single-thread runtime (`current_thread` / `LocalSet`) guarantees no data
 //! races.
 //!
+//! **Semaphore backing:** `RefCell<usize>` (available count) + `Rc<tokio::sync::Notify>`.
+//! acquire loops: enable() notified() future BEFORE re-checking count (same lost-wakeup-
+//! safe pattern as the channel WaitEmpty loop). No RefCell borrow is held across .await.
+//!
 //! **Borrow discipline:** The `Notify` handles are stored as separate `Rc<Notify>`
-//! fields *outside* the `RefCell`-guarded queue, so we can clone them before
+//! fields *outside* the `RefCell`-guarded state, so we can clone them before
 //! releasing the borrow and then await outside any borrow — no unsafe required.
 
 use super::{arg, bi, want_number};
@@ -31,6 +42,32 @@ use crate::value::{NativeKind, Value};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+
+// ── Semaphore data structures ─────────────────────────────────────────────────
+
+/// A counting semaphore: an available-permits counter behind a `RefCell` plus an
+/// `Rc<Notify>` for wakeups (stored *outside* the `RefCell` so it can be cloned
+/// and awaited without holding a borrow — identical discipline to `Channel`).
+pub struct Semaphore {
+    /// Current free permits (>= 0, <= `max`).
+    available: Rc<RefCell<usize>>,
+    /// Fires when a permit is released — wakes parked `acquire` callers.
+    permit_available: Rc<tokio::sync::Notify>,
+    /// The initial permit count. `release` is capped at this so the pool can never
+    /// inflate past its declared size (a `release` with no matching `acquire` is a
+    /// no-op rather than silently growing the concurrency limit).
+    max: usize,
+}
+
+impl Semaphore {
+    fn new(permits: usize) -> Self {
+        Semaphore {
+            available: Rc::new(RefCell::new(permits)),
+            permit_available: Rc::new(tokio::sync::Notify::new()),
+            max: permits,
+        }
+    }
+}
 
 // ── Channel data structures ───────────────────────────────────────────────────
 
@@ -78,6 +115,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("recv", bi("sync.recv")),
         ("tryRecv", bi("sync.tryRecv")),
         ("close", bi("sync.close")),
+        ("semaphore", bi("sync.semaphore")),
+        ("acquire", bi("sync.acquire")),
+        ("release", bi("sync.release")),
+        ("withPermit", bi("sync.withPermit")),
+        ("available", bi("sync.available")),
     ]
 }
 
@@ -107,6 +149,19 @@ fn get_channel(interp: &Interp, id: u64) -> Option<Channel> {
     })
 }
 
+/// Extract the `Semaphore` from the resource table by cloning both `Rc`s.
+/// Returns `None` when the id is absent or maps to a non-Semaphore resource.
+fn get_semaphore(interp: &Interp, id: u64) -> Option<Semaphore> {
+    interp.with_resource(id, |r| match r {
+        Some(ResourceState::Semaphore(s)) => Some(Semaphore {
+            available: s.available.clone(),
+            permit_available: s.permit_available.clone(),
+            max: s.max,
+        }),
+        _ => None,
+    })
+}
+
 // ── Interp impl ───────────────────────────────────────────────────────────────
 
 impl Interp {
@@ -123,6 +178,11 @@ impl Interp {
             "recv" => self.sync_recv(args, span).await,
             "tryRecv" => self.sync_try_recv(args, span),
             "close" => self.sync_close(args, span),
+            "semaphore" => self.sync_semaphore(args, span),
+            "acquire" => self.sync_acquire(args, span).await,
+            "release" => self.sync_release(args, span),
+            "withPermit" => self.sync_with_permit(args, span).await,
+            "available" => self.sync_available(args, span),
             _ => Err(AsError::at(format!("std/sync has no function '{}'", func), span).into()),
         }
     }
@@ -344,6 +404,144 @@ impl Interp {
             }
         }
     }
+
+    // ── sync.semaphore ───────────────────────────────────────────────────────
+
+    fn sync_semaphore(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let n = want_number(&arg(args, 0), span, "sync.semaphore permits")?;
+        if n < 1.0 || n.fract() != 0.0 {
+            return Err(AsError::at(
+                "sync.semaphore: permits must be a positive integer",
+                span,
+            )
+            .into());
+        }
+        let sem = Semaphore::new(n as usize);
+        let handle = self.register_resource(
+            NativeKind::Semaphore,
+            indexmap::IndexMap::new(),
+            ResourceState::Semaphore(sem),
+        );
+        Ok(handle)
+    }
+
+    // ── sync.acquire ─────────────────────────────────────────────────────────
+
+    async fn sync_acquire(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let id = require_semaphore_id(&arg(args, 0), span, "sync.acquire")?;
+
+        loop {
+            // Clone the Rc<Notify> out before the borrow so we can await later
+            // without holding any RefCell borrow.
+            let sem = match get_semaphore(self, id) {
+                Some(s) => s,
+                None => {
+                    return Err(
+                        AsError::at("sync.acquire: first argument is not a semaphore", span)
+                            .into(),
+                    );
+                }
+            };
+
+            // Check (and decrement) under a short borrow.
+            {
+                let mut avail = sem.available.borrow_mut();
+                if *avail > 0 {
+                    *avail -= 1;
+                    return Ok(Value::Nil);
+                }
+            } // borrow released
+
+            // No permits available — park until one is released.
+            //
+            // Lost-wakeup avoidance (mirrors channel WaitEmpty): create + enable()
+            // the notified() future (registering the waiter NOW) *before* the
+            // re-check, so any release() + notify_one() that races between our check
+            // and our await is captured rather than dropped.
+            let notified = sem.permit_available.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable(); // register waiter before re-check
+
+            {
+                // Short synchronous borrow — no .await held across it.
+                let avail = sem.available.borrow();
+                if *avail > 0 {
+                    // State changed under us: loop to decrement without parking.
+                    continue;
+                }
+            }
+            // Any notify_one() after enable() is now guaranteed observed.
+            notified.await;
+            // Re-loop to recheck (competing acquirers / spurious wakeup).
+        }
+    }
+
+    // ── sync.release ─────────────────────────────────────────────────────────
+
+    fn sync_release(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let id = require_semaphore_id(&arg(args, 0), span, "sync.release")?;
+
+        match get_semaphore(self, id) {
+            None => {
+                Err(AsError::at("sync.release: first argument is not a semaphore", span).into())
+            }
+            Some(sem) => {
+                let grew = {
+                    let mut avail = sem.available.borrow_mut();
+                    // Cap at the initial permit count: a release with no matching
+                    // acquire is a no-op, never inflating the concurrency limit.
+                    if *avail < sem.max {
+                        *avail += 1;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                // Wake one parked acquire (only if a permit actually became free).
+                if grew {
+                    sem.permit_available.notify_one();
+                }
+                Ok(Value::Nil)
+            }
+        }
+    }
+
+    // ── sync.withPermit ───────────────────────────────────────────────────────
+
+    async fn sync_with_permit(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        // Validate that arg[0] is a semaphore (Tier-2 panic if not).
+        let sem_val = arg(args, 0);
+        require_semaphore_id(&sem_val, span, "sync.withPermit")?;
+        let func = arg(args, 1);
+
+        // Acquire one permit (async, may park).
+        self.sync_acquire(std::slice::from_ref(&sem_val), span).await?;
+
+        // Call fn() and capture the result — OK or Control (Panic/Propagate).
+        let call_result = self.call_value(func, vec![], span).await;
+
+        // Release the permit on ALL paths before returning or re-raising.
+        // (sync, never fails — only increments the counter and notify_one)
+        let _ = self.sync_release(std::slice::from_ref(&sem_val), span);
+
+        call_result
+    }
+
+    // ── sync.available ────────────────────────────────────────────────────────
+
+    fn sync_available(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let id = require_semaphore_id(&arg(args, 0), span, "sync.available")?;
+
+        match get_semaphore(self, id) {
+            None => {
+                Err(AsError::at("sync.available: first argument is not a semaphore", span).into())
+            }
+            Some(sem) => {
+                let count = *sem.available.borrow() as f64;
+                Ok(Value::Number(count))
+            }
+        }
+    }
 }
 
 // ── argument helpers ──────────────────────────────────────────────────────────
@@ -355,6 +553,22 @@ fn require_channel_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> 
         other => Err(AsError::at(
             format!(
                 "{} expects a channel, got {}",
+                ctx,
+                crate::interp::type_name(other)
+            ),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// Extract the handle `id` from a `Value::Native(Semaphore)` argument.
+fn require_semaphore_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
+    match v {
+        Value::Native(obj) if obj.kind == NativeKind::Semaphore => Ok(obj.id),
+        other => Err(AsError::at(
+            format!(
+                "{} expects a semaphore, got {}",
                 ctx,
                 crate::interp::type_name(other)
             ),
@@ -605,5 +819,183 @@ await send(42, "oops")
 "#)
         .await;
         assert!(result.is_err(), "expected Tier-2 panic, got: {:?}", result);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Semaphore tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── semaphore: basic available() after create / acquire / release ─────────
+
+    #[tokio::test]
+    async fn semaphore_available_tracks_permits() {
+        let out = run(r#"
+import { semaphore, acquire, release, available } from "std/sync"
+let s = semaphore(2)
+print(available(s))   // 2
+await acquire(s)
+print(available(s))   // 1
+await acquire(s)
+print(available(s))   // 0
+release(s)
+print(available(s))   // 1
+release(s)
+print(available(s))   // 2
+"#)
+        .await;
+        assert_eq!(out, "2\n1\n0\n1\n2\n");
+    }
+
+    // ── semaphore: 3rd acquire blocks until a release (ordering proof) ────────
+    // Two permits are immediately acquired; a 3rd acquire in a spawned task must
+    // BLOCK until the main task releases one.  We prove the ordering via a signal
+    // channel: the spawned task sends "acquired" AFTER the 3rd acquire succeeds;
+    // the main task sends a release, then drains the signal.  If the 3rd acquire
+    // had not blocked, the "acquired" signal would arrive BEFORE the release
+    // (deadlock would reveal the bug instead of a wrong order).
+
+    #[tokio::test]
+    async fn semaphore_third_acquire_blocks_until_release() {
+        let out = run(r#"
+import { semaphore, acquire, release, available } from "std/sync"
+import { channel, send, recv } from "std/sync"
+import { spawn } from "std/task"
+
+let s = semaphore(2)
+let sig = channel()
+
+await acquire(s)
+await acquire(s)
+print(available(s))   // 0
+
+// This task will block on acquire until main releases a permit.
+let waiter = spawn(async () => {
+    await acquire(s)
+    await send(sig, "acquired")
+})
+
+// Release one permit — this unblocks the waiter.
+release(s)
+let msg = await recv(sig)
+print(msg)
+print(available(s))   // 0 (waiter holds it)
+release(s)            // clean up
+await waiter
+"#)
+        .await;
+        assert_eq!(out, "0\nacquired\n0\n");
+    }
+
+    // ── withPermit: returns fn result and restores available() ────────────────
+
+    #[tokio::test]
+    async fn with_permit_returns_result_and_releases() {
+        let out = run(r#"
+import { semaphore, withPermit, available } from "std/sync"
+let s = semaphore(1)
+print(available(s))   // 1
+let result = await withPermit(s, async () => {
+    return 42
+})
+print(result)         // 42
+print(available(s))   // 1 — permit was released
+"#)
+        .await;
+        assert_eq!(out, "1\n42\n1\n");
+    }
+
+    // ── withPermit: permit is released even when fn panics ────────────────────
+    // The fn panics; withPermit must release the permit BEFORE propagating the
+    // panic.  We drive the panicking withPermit to completion in a spawned task,
+    // then `await` it inside a (synchronous) `recover` closure so `recover` runs
+    // the await, the worker's panic propagates out of `withPermit`, and `recover`
+    // catches it into `[nil, err]`.  We then assert (a) the panic propagated
+    // (`err != nil`) and (b) `available()` is back to 1 — proving the permit was
+    // released on the panic path.  (An `async` closure passed to `recover` would
+    // NOT work: `recover` wraps the returned future without driving it, so the
+    // panic would never run before the assert — the bug the reviewer caught.)
+
+    #[tokio::test]
+    async fn with_permit_releases_on_fn_panic() {
+        let out = run(r#"
+import { semaphore, withPermit, available } from "std/sync"
+import { spawn } from "std/task"
+
+let s = semaphore(1)
+let worker = spawn(async () => {
+    await withPermit(s, async () => {
+        assert(false, "oops from fn")
+    })
+})
+// Synchronous recover closure: the `await` runs inside recover, so the worker's
+// panic propagates out of withPermit and is caught here.
+let [_v, err] = recover(() => {
+    await worker
+    return nil
+})
+print(err != nil)     // true  — panic propagated out of withPermit
+print(available(s))   // 1     — permit was released despite the panic
+"#)
+        .await;
+        assert_eq!(out, "true\n1\n");
+    }
+
+    // ── release is capped at the initial permit count ─────────────────────────
+    // An extra `release` with no matching `acquire` must NOT inflate the pool past
+    // its declared size (otherwise the concurrency limit silently grows).
+
+    #[tokio::test]
+    async fn release_capped_at_initial_permits() {
+        let out = run(r#"
+import { semaphore, acquire, release, available } from "std/sync"
+let s = semaphore(2)
+print(available(s))   // 2
+release(s)            // no matching acquire → capped, stays 2
+print(available(s))   // 2
+await acquire(s)
+print(available(s))   // 1
+release(s)            // back to 2
+print(available(s))   // 2
+release(s)            // capped again
+print(available(s))   // 2
+"#)
+        .await;
+        assert_eq!(out, "2\n2\n1\n2\n2\n");
+    }
+
+    // ── semaphore(0) → Tier-2 panic ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn semaphore_zero_permits_panics() {
+        let result = crate::run_source(r#"
+import { semaphore } from "std/sync"
+let s = semaphore(0)
+"#)
+        .await;
+        assert!(result.is_err(), "expected Tier-2 panic for 0 permits, got: {:?}", result);
+    }
+
+    // ── semaphore(negative) → Tier-2 panic ───────────────────────────────────
+
+    #[tokio::test]
+    async fn semaphore_negative_permits_panics() {
+        let result = crate::run_source(r#"
+import { semaphore } from "std/sync"
+let s = semaphore(-3)
+"#)
+        .await;
+        assert!(result.is_err(), "expected Tier-2 panic for negative permits, got: {:?}", result);
+    }
+
+    // ── non-semaphore arg to acquire → Tier-2 panic ──────────────────────────
+
+    #[tokio::test]
+    async fn acquire_non_semaphore_panics() {
+        let result = crate::run_source(r#"
+import { acquire } from "std/sync"
+await acquire(42)
+"#)
+        .await;
+        assert!(result.is_err(), "expected Tier-2 panic for non-semaphore arg, got: {:?}", result);
     }
 }
