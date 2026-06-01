@@ -6,6 +6,7 @@
 
 pub mod array;
 pub mod assert_mod;
+pub mod bench;
 pub mod bytes;
 pub mod cli;
 pub mod color;
@@ -91,6 +92,7 @@ pub(crate) fn bi(qualified: &str) -> Value {
 pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
         "std/assert" => assert_mod::exports(),
+        "std/bench" => bench::exports(),
         "std/cli" => cli::exports(),
         "std/color" => color::exports(),
         "std/decimal" => decimal::exports(),
@@ -247,6 +249,7 @@ impl Interp {
         }
         match module {
             "assert" => self.call_assert(func, args, span).await,
+            "bench" => self.call_bench(func, args, span).await,
             "cli" => self.call_cli(func, args, span).await,
             "color" => color::call(func, args, span),
             "decimal" => decimal::call(func, args, span),

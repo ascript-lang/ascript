@@ -21,9 +21,64 @@ use crate::stdlib::object::deep_equal;
 use crate::value::Value;
 use rust_decimal::prelude::ToPrimitive;
 
+// ── snapshot_impl (sys-gated; testable pure helper) ──────────────────────────
+
+/// Core snapshot logic, parameterized by `dir` (base dir for `__snapshots__/`),
+/// `name` (snapshot name), `serialized` (the value already stringified to JSON),
+/// and `update` (whether to overwrite an existing snapshot).
+///
+/// Returns `Ok(())` on pass (first-run write, match, or update-mode write) or
+/// `Err(message)` on mismatch.
+///
+/// Gated behind `cfg(all(feature = "sys", feature = "data"))`: requires `sys`
+/// (filesystem I/O) and `data` (serde_json for pretty serialization).
+#[cfg(all(feature = "sys", feature = "data"))]
+pub(crate) fn snapshot_impl(
+    dir: &std::path::Path,
+    name: &str,
+    serialized: &str,
+    update: bool,
+) -> Result<(), String> {
+    // Sanitize the snapshot name: replace filesystem-unsafe chars with `_`.
+    let safe_name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let snap_dir = dir.join("__snapshots__");
+    let snap_file = snap_dir.join(format!("{}.snap", safe_name));
+
+    if snap_file.exists() && !update {
+        // Compare with stored snapshot.
+        let stored = std::fs::read_to_string(&snap_file)
+            .map_err(|e| format!("assert.snapshot: could not read snapshot file: {}", e))?;
+        if stored != serialized {
+            return Err(format!(
+                "assert.snapshot '{}' mismatch:\n--- stored ---\n{}\n--- new ---\n{}",
+                name, stored, serialized
+            ));
+        }
+        Ok(())
+    } else {
+        // First run (file absent) or update mode: write the snapshot.
+        std::fs::create_dir_all(&snap_dir)
+            .map_err(|e| format!("assert.snapshot: could not create __snapshots__ dir: {}", e))?;
+        std::fs::write(&snap_file, serialized)
+            .map_err(|e| format!("assert.snapshot: could not write snapshot file: {}", e))?;
+        Ok(())
+    }
+}
+
 pub fn exports() -> Vec<(&'static str, Value)> {
     use super::bi;
-    vec![
+    #[allow(unused_mut)]
+    let mut v = vec![
         ("eq", bi("assert.eq")),
         ("ne", bi("assert.ne")),
         ("isTrue", bi("assert.isTrue")),
@@ -37,7 +92,12 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("contains", bi("assert.contains")),
         ("approxEq", bi("assert.approxEq")),
         ("throws", bi("assert.throws")),
-    ]
+    ];
+    // assert.snapshot requires both `sys` (filesystem I/O) and `data` (JSON
+    // serialization via serde_json).
+    #[cfg(all(feature = "sys", feature = "data"))]
+    v.push(("snapshot", bi("assert.snapshot")));
+    v
 }
 
 /// Helper: format a panic error with an optional user message prefix.
@@ -301,6 +361,70 @@ impl Interp {
                         )
                         .into())
                     }
+                }
+            }
+            // ── assert.snapshot(name, value) ─────────────────────────────────
+            //
+            // Gated behind `cfg(all(feature = "sys", feature = "data"))`: both
+            // sys (fs I/O) and data (serde_json) are required. Under
+            // --no-default-features the name falls through to the `_` catch-all
+            // → "assert has no function 'snapshot'" (correct behaviour).
+            #[cfg(all(feature = "sys", feature = "data"))]
+            "snapshot" => {
+                let name_val = arg(args, 0);
+                let name = match &name_val {
+                    Value::Str(s) => s.to_string(),
+                    _ => {
+                        return Err(AsError::at(
+                            format!(
+                                "assert.snapshot: name must be a string, got {}",
+                                crate::interp::type_name(&name_val)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                let value = arg(args, 1);
+
+                // Serialize the value to a stable pretty-JSON string.
+                // We call json::from_ascript directly (no std/json needed at runtime).
+                let serialized = match crate::stdlib::json::from_ascript(&value, &mut Vec::new()) {
+                    Ok(jv) => match serde_json::to_string_pretty(&jv) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Err(AsError::at(
+                                format!("assert.snapshot: cannot serialize value: {}", e),
+                                span,
+                            )
+                            .into())
+                        }
+                    },
+                    Err(msg) => {
+                        return Err(AsError::at(
+                            format!("assert.snapshot: cannot serialize value: {}", msg),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+
+                // Check env var for update mode (non-empty string → update).
+                let update = std::env::var("ASCRIPT_UPDATE_SNAPSHOTS")
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false);
+
+                // Resolve snapshot dir relative to cwd.
+                let cwd = std::env::current_dir().map_err(|e| {
+                    AsError::at(
+                        format!("assert.snapshot: cannot determine cwd: {}", e),
+                        span,
+                    )
+                })?;
+
+                match snapshot_impl(&cwd, &name, &serialized, update) {
+                    Ok(()) => Ok(Value::Nil),
+                    Err(msg) => Err(AsError::at(msg, span).into()),
                 }
             }
             _ => Err(AsError::at(
@@ -829,5 +953,80 @@ A.eq(1, 1)
         // Verify run_err captures panic messages (using out-of-bounds index).
         let msg = run_err("let _ = [][0]").await;
         assert!(!msg.is_empty(), "expected a non-empty error message");
+    }
+
+    // ── assert.snapshot ───────────────────────────────────────────────────────
+    // These tests operate on the snapshot_impl helper directly to avoid any
+    // global cwd/env-var pollution between parallel tests.
+
+    #[cfg(all(feature = "sys", feature = "data"))]
+    mod snapshot_tests {
+        use super::super::snapshot_impl;
+        use std::path::PathBuf;
+
+        fn tmp_dir(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("ascript_snap_test_{}", name));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn first_run_writes_and_passes() {
+            let dir = tmp_dir("first_run");
+            // First call: file absent → write + pass (Ok)
+            let r = snapshot_impl(&dir, "my_snap", "42", false);
+            assert!(r.is_ok(), "first run should pass: {:?}", r);
+            let snap_file = dir.join("__snapshots__").join("my_snap.snap");
+            assert!(snap_file.exists(), "snapshot file should be created");
+            assert_eq!(std::fs::read_to_string(&snap_file).unwrap(), "42");
+        }
+
+        #[test]
+        fn second_run_same_value_passes() {
+            let dir = tmp_dir("second_run");
+            snapshot_impl(&dir, "my_snap", "hello", false).unwrap();
+            let r = snapshot_impl(&dir, "my_snap", "hello", false);
+            assert!(r.is_ok(), "matching second run should pass: {:?}", r);
+        }
+
+        #[test]
+        fn mismatch_returns_error() {
+            let dir = tmp_dir("mismatch");
+            snapshot_impl(&dir, "my_snap", "stored_value", false).unwrap();
+            let r = snapshot_impl(&dir, "my_snap", "different_value", false);
+            assert!(r.is_err(), "mismatch should fail");
+            let msg = r.unwrap_err();
+            assert!(msg.contains("stored_value"), "error should show stored: {msg}");
+            assert!(msg.contains("different_value"), "error should show new: {msg}");
+        }
+
+        #[test]
+        fn update_flag_overwrites() {
+            let dir = tmp_dir("update_flag");
+            snapshot_impl(&dir, "my_snap", "original", false).unwrap();
+            // update=true → overwrite + pass
+            let r = snapshot_impl(&dir, "my_snap", "updated", true);
+            assert!(r.is_ok(), "update mode should pass: {:?}", r);
+            let snap_file = dir.join("__snapshots__").join("my_snap.snap");
+            assert_eq!(std::fs::read_to_string(&snap_file).unwrap(), "updated");
+        }
+
+        #[test]
+        fn unsafe_name_chars_are_sanitized() {
+            let dir = tmp_dir("sanitize");
+            // Name with path-separator chars and spaces should be sanitized
+            snapshot_impl(&dir, "a/b\\c d", "val", false).unwrap();
+            let snap_dir = dir.join("__snapshots__");
+            let entries: Vec<_> = std::fs::read_dir(&snap_dir).unwrap().collect();
+            assert_eq!(entries.len(), 1, "should create exactly one file");
+            let name = entries[0]
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .into_string()
+                .unwrap();
+            assert!(!name.contains('/') && !name.contains('\\') && !name.contains(' '));
+        }
     }
 }
