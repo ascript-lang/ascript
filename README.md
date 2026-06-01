@@ -91,7 +91,7 @@ ascript run hello.as
 | Host & OS | `std/os` (pid · platform · arch · cpuCount · hostname · tempDir; live metrics via `sysinfo` feature: memory · swap · cpuUsage · loadAvg · disks · uptime · networkInterfaces · localIp) |
 | CLI & terminal | `std/cli` (declarative arg parser) · `std/color` (ANSI colors & styles, NO_COLOR-aware) |
 | Time & locale | `std/time` (wall clock, sleep, `interval` · `debounce` · `throttle`) · `std/date` · `std/intl` |
-| Networking | `std/net` (DNS: `lookup` · `lookupOne`) · `std/net/tcp` · `std/net/udp` (datagram sockets) · `std/net/http` · `std/http/server` · `std/net/ws` |
+| Networking | `std/net` (DNS: `lookup` · `lookupOne`) · `std/net/tcp` · `std/net/udp` (datagram sockets) · `std/net/http` · `std/http/server` (verb methods: `get`/`post`/`put`/`patch`/`delete`/`head`/`options`; schema-validated typed routes) · `std/net/ws` |
 | Concurrency | `std/task` (`spawn` · `gather` · `race` · `timeout` · `retry` over `future<T>`) · `std/sync` (FIFO channels · counting semaphore · token-bucket rate limiter) |
 | Logging | `std/log` (`debug` · `info` · `warn` · `error`; human/json, structured fields) |
 | Terminal UI | `std/tui` |
@@ -125,6 +125,9 @@ ascript run examples/advanced/crypto_and_compress.as
 # A JSON API + client (two terminals — see examples/advanced/):
 ascript run examples/advanced/http_server.as       # terminal 1
 ascript run examples/advanced/http_client.as       # terminal 2
+
+# Phase-7 HTTP framework: verb methods + schema-validated typed routes (self-contained):
+ascript run examples/advanced/typed_api.as
 ```
 
 See the [Examples page](docs/content/examples.md) for the full catalog.
