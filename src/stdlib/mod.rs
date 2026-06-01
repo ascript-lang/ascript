@@ -53,6 +53,7 @@ pub mod os;
 pub mod process;
 #[cfg(feature = "data")]
 pub mod regex;
+pub mod schema;
 pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
@@ -95,6 +96,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/array" => array::exports(),
         "std/object" => object::exports(),
         "std/map" => map::exports(),
+        "std/schema" => schema::exports(),
         "std/set" => set::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
@@ -204,6 +206,7 @@ impl Interp {
             "array" => self.call_array(func, args, span).await,
             "object" => self.call_object(func, args, span).await,
             "map" => map::call(func, args, span),
+            "schema" => self.call_schema(func, args, span).await,
             "set" => set::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
