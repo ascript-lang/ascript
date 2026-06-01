@@ -327,6 +327,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         span: Span::new(start, start + 3),
                     });
                     i += 3;
+                } else if i + 2 < chars.len() && chars[i + 1] == '.' && chars[i + 2] == '=' {
+                    // `..=` — inclusive range (used in match range patterns).
+                    tokens.push(Token {
+                        tok: Tok::DotDotEq,
+                        span: Span::new(start, start + 3),
+                    });
+                    i += 3;
                 } else if i + 1 < chars.len() && chars[i + 1] == '.' {
                     tokens.push(Token {
                         tok: Tok::DotDot,

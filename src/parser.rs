@@ -1207,6 +1207,133 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// Parse a single `match`-arm pattern (one alternative of a `|` group),
+    /// Phase 8a. Does NOT consume `|`/`if`/`=>` (the arm loop handles those).
+    fn parse_pattern(&mut self) -> Result<crate::ast::Pattern, AsError> {
+        use crate::ast::{ObjPatEntry, Pattern};
+        // `_` wildcard (lexes as Ident("_")).
+        if matches!(self.peek(), Tok::Ident(s) if s == "_") {
+            self.advance();
+            return Ok(Pattern::Wildcard);
+        }
+        // Array pattern `[p, ..., (...name | ...)?]`.
+        if *self.peek() == Tok::LBracket {
+            self.advance();
+            let mut pats = Vec::new();
+            let mut rest: Option<Option<std::rc::Rc<str>>> = None;
+            if *self.peek() != Tok::RBracket {
+                loop {
+                    if *self.peek() == Tok::DotDotDot {
+                        rest = Some(self.parse_pattern_rest()?);
+                        break;
+                    }
+                    pats.push(self.parse_pattern()?);
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                        if *self.peek() == Tok::RBracket {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.eat(&Tok::RBracket)?;
+            return Ok(Pattern::Array(pats, rest));
+        }
+        // Object pattern `{key, key2: subpat, ..., (...name)?}`.
+        if *self.peek() == Tok::LBrace {
+            self.advance();
+            let mut entries = Vec::new();
+            let mut rest: Option<Option<std::rc::Rc<str>>> = None;
+            if *self.peek() != Tok::RBrace {
+                loop {
+                    if *self.peek() == Tok::DotDotDot {
+                        rest = Some(self.parse_pattern_rest()?);
+                        break;
+                    }
+                    let key: std::rc::Rc<str> = match self.advance() {
+                        Tok::Ident(n) => n.into(),
+                        Tok::Str(s) => s.into(),
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected a key in object pattern, found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    };
+                    let pat = if *self.peek() == Tok::Colon {
+                        self.advance();
+                        Some(self.parse_pattern()?)
+                    } else {
+                        None
+                    };
+                    entries.push(ObjPatEntry { key, pat });
+                    if *self.peek() == Tok::Comma {
+                        self.advance();
+                        if *self.peek() == Tok::RBrace {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.eat(&Tok::RBrace)?;
+            return Ok(Pattern::Object(entries, rest));
+        }
+        // Otherwise parse a value-expression (at the match precedence level —
+        // `coalesce` excludes `|`, `if`, `=>`) and classify it.
+        let start = self.coalesce()?;
+        // Inclusive range `a..=b`: the expression parser stops before `..=`.
+        if *self.peek() == Tok::DotDotEq {
+            self.advance();
+            let end = self.coalesce()?;
+            return Ok(Pattern::Range {
+                start: Box::new(start),
+                end: Box::new(end),
+                inclusive: true,
+            });
+        }
+        // Exclusive range `a..b` parses as a `BinOp::Range` binary expression.
+        if let ExprKind::Binary {
+            op: BinOp::Range,
+            lhs,
+            rhs,
+        } = start.kind
+        {
+            return Ok(Pattern::Range {
+                start: lhs,
+                end: rhs,
+                inclusive: false,
+            });
+        }
+        // A lone identifier → Option-C resolved at match time.
+        if let ExprKind::Ident(name) = &start.kind {
+            return Ok(Pattern::Ident(name.as_str().into()));
+        }
+        Ok(Pattern::Value(Box::new(start)))
+    }
+
+    /// Parse a trailing rest in an array/object pattern: assumes the current token
+    /// is `...`. Returns `None` for `...` (ignore) or `Some(name)` for `...name`.
+    /// A rest must be last (no trailing comma).
+    fn parse_pattern_rest(&mut self) -> Result<Option<std::rc::Rc<str>>, AsError> {
+        let rspan = self.span();
+        self.advance(); // consume `...`
+        let rest = if let Tok::Ident(n) = self.peek() {
+            let n = n.clone();
+            self.advance();
+            Some(n.into())
+        } else {
+            None
+        };
+        if *self.peek() == Tok::Comma {
+            return Err(AsError::at("a rest element must be last", rspan));
+        }
+        Ok(rest)
+    }
+
     fn additive(&mut self) -> Result<Expr, AsError> {
         let mut left = self.multiplicative()?;
         loop {
@@ -1533,23 +1660,25 @@ impl<'a> Parser<'a> {
                 self.eat(&Tok::LBrace)?;
                 let mut arms = Vec::new();
                 while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
-                    // pattern: `_` (wildcard) or expr ( `|` expr )*
-                    // The identifier `_` lexes as `Tok::Ident("_")`.
-                    let is_wildcard = matches!(self.peek(), Tok::Ident(s) if s == "_");
-                    let patterns = if is_wildcard {
+                    // `|`-separated patterns, then optional `if <guard>`, then `=> body`.
+                    let mut patterns = vec![self.parse_pattern()?];
+                    while *self.peek() == Tok::Pipe {
                         self.advance();
-                        None
+                        patterns.push(self.parse_pattern()?);
+                    }
+                    let guard = if *self.peek() == Tok::If {
+                        self.advance();
+                        Some(self.expr()?)
                     } else {
-                        let mut pats = vec![self.coalesce()?];
-                        while *self.peek() == Tok::Pipe {
-                            self.advance();
-                            pats.push(self.coalesce()?);
-                        }
-                        Some(pats)
+                        None
                     };
                     self.eat(&Tok::FatArrow)?;
                     let body = self.expr()?;
-                    arms.push(crate::ast::MatchArm { patterns, body });
+                    arms.push(crate::ast::MatchArm {
+                        patterns,
+                        guard,
+                        body,
+                    });
                     if *self.peek() == Tok::Comma {
                         self.advance();
                     } else {

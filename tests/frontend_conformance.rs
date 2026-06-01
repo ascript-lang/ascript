@@ -79,6 +79,13 @@ fn interpreter_parses_each_grammar_construct() {
         // --- match statement form ---
         "let m = match a { 1 => \"one\", 2 | 3 => \"few\", _ => \"many\" }",
         "let m2 = match a { x => 1, _ => 2 }",
+        // --- match patterns (Phase 8): array / object / range / guard ---
+        "let m3 = match a { [x] => x, [first, ...rest] => first, [] => 0 }",
+        "let m4 = match a { [u, nil] => u, [_, e] => e, _ => 0 }",
+        "let m5 = match a { {method, path} => path, _ => \"?\" }",
+        "let m6 = match a { {role: \"admin\"} => 1, {role: r, ...rest} => 2, _ => 0 }",
+        "let m7 = match a { 1..=9 => \"lo\", 10..100 => \"hi\", _ => \"x\" }",
+        "let m8 = match a { _ if a < 0 => \"neg\", 0 => \"z\", n if n > 0 => \"pos\" }",
         // --- classes / inheritance / enums ---
         "class C extends B { fn init() { super() } }",
         "class D { fn m(x) { return x } }",

@@ -37,6 +37,7 @@ Design priorities, in strict order: **simplicity → safety → familiarity → 
 - **Errors as values** — no exceptions; fallible calls return `[value, err]`; the `?` operator propagates and the `!` force-unwrap asserts success (panicking, recoverably, with the original message). Bugs panic, loudly.
 - **Shape validation** — turn untrusted data into checked instances: `ClassName.from(obj)` validates a raw object (recursing into nested classes, `array<Class>`, and `map<K, Class>`), and the typed parse `json.parse(text, Class)` / `resp.json(Class)` fuses decode + validation into one result — `let user = await resp.json(User)?`.
 - **Composable schema validation** — `std/schema` lets you build and compose schemas independently of any class: `schema.object({name: schema.minLength(schema.string(), 1), age: schema.min(schema.number(), 0)})`, with `min`/`max`, `minLength`/`maxLength`, `pattern`, `refine` (custom async predicates), `default`, `optional`, `union`, `oneOf`, and coercion (`{coerce: true}`). `schema.fromClass(Class)` derives a schema from class field declarations. Pass a schema to `json.parse(text, schema)` to fuse JSON decoding and validation into one Tier-1 pair.
+- **Pattern matching** — `match` is an expression with structural patterns: wildcard `_`, ranges (`1..=9`, `0..10`), array destructuring (`[a, b, ...rest]`), object destructuring (`{key, role: "admin", ...rest}`), `|` alternatives, and `if` guards. Bare identifiers use **Option C**: a name already defined in scope is compared (`==`); an undefined name binds the subject. The `[value, err]` idiom (`[v, nil] => …`) and enum variants work naturally. See [the docs](docs/content/language/classes-enums.md).
 - **Destructuring** — pull fields out of an object or instance by key with `let {a, b as local, "k" as v} = obj`; missing keys bind `nil`.
 - **Spread** — expand a collection inline with `...` in array literals, object literals, and call arguments (`[0, ...xs]`, `{...defaults, k: v}`, `f(...args)`); strict about container kind, object-spread is later-value-wins.
 - **Rest** — collect what's left over with a trailing `...name`: a rest parameter gathers extra arguments into an array (`fn sum(...nums: array<number>)`, per-element typed), and rest destructuring takes the tail/leftover keys (`let [head, ...tail] = xs`, `let {id, ...meta} = obj`).
@@ -118,6 +119,7 @@ Runnable programs live in [`examples/`](examples/) (introductory) and
 [`examples/advanced/`](examples/advanced/) (production-shaped, fully error-handled). Highlights:
 
 ```bash
+ascript run examples/pattern_matching.as           # pattern matching: ranges, arrays, objects, Option C
 ascript run examples/advanced/data_pipeline.as     # CSV → JSON/YAML pipeline
 ascript run examples/advanced/sqlite_crud.as       # SQLite with prepared statements & a transaction
 ascript run examples/advanced/crypto_and_compress.as

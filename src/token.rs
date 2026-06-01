@@ -43,6 +43,8 @@ pub enum Tok {
     Else,
     While,
     DotDot,
+    /// `..=` — inclusive range, used only in match range patterns (Phase 8a).
+    DotDotEq,
     DotDotDot,
     For,
     In,

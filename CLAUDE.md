@@ -102,6 +102,29 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > functions→`"<function>"`, NaN→null — never panics). Non-object args join into `msg`; object args
 > merge as fields; reserved `level`/`msg` always win; a thunk first-arg (incl. `async fn`, awaited)
 > defers message work past the level filter. Default level from `ASCRIPT_LOG`.
+>
+> **Phase 8 — match pattern extensions.** `MatchArm` (in `ast.rs`) holds `patterns: Vec<Pattern>` (the
+> `|`-alternatives) and `guard: Option<Expr>` (the `if` guard). The `Pattern` enum has these variants:
+> `Wildcard` (`_`), `Ident(Rc<str>)`, `Value(Box<Expr>)`, `Range { start, end, inclusive }`,
+> `Array(Vec<Pattern>, Option<Option<Rc<str>>>)`, and `Object(Vec<ObjPatEntry>, Option<Option<Rc<str>>>)`.
+> The rest field is `None` = no rest, `Some(None)` = `...` (discard), `Some(Some(name))` = `...name`
+> (bind). `ObjPatEntry { key, pat: Option<Pattern> }` — `pat: None` is the shorthand `{key}` form.
+>
+> **Option C runtime resolution (bare identifiers in patterns):** at match time, `Ident(name)` is
+> looked up in the current scope: if **defined** → compare subject `== value` (switch-like); if
+> **undefined** → bind/capture the subject into `name` for the arm body. This is non-breaking because
+> all pre-Phase-8 patterns used value expressions (not bare identifiers). **Object shorthand `{key}`
+> is always a bind** (documented exception to Option C — `pat: None` in `ObjPatEntry`); shorthand is
+> unambiguously destructuring.
+>
+> **`..=` token**: `Tok::DotDotEq` — lexed as the inclusive-range operator, used ONLY in match
+> `Pattern::Range { inclusive: true }`. It is distinct from `Tok::DotDot` (`..`, exclusive).
+>
+> **Changes touching match/pattern:** `ast.rs` (`MatchArm`, `Pattern`, `ObjPatEntry`, `Display`
+> impl), `parser.rs` (`parse_match_arm`, `parse_pattern`), `interp.rs` (the pattern matcher in
+> `match_pattern`), `fmt.rs` (`write_pattern`, `write_match_arm`), `token.rs` (`DotDotEq`),
+> `lexer.rs` (lex `..=`), tree-sitter grammar + `parser.c` (regen with
+> `tree-sitter generate --abi 14`), LSP (recognizes pattern bindings as definitions).
 
 ## Commands
 

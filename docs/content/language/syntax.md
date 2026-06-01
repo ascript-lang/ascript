@@ -115,7 +115,8 @@ order, and is `{}` when nothing is left over.
 ?  :                     conditional (ternary)  — cond ? then : else
 =  += -= *= /=           assignment (and compound)
 ?                        postfix Result propagation (see Errors)
-..                       range
+..                       range (exclusive)
+..=                      inclusive range — used in match range patterns
 ```
 
 **Precedence**, highest to lowest:

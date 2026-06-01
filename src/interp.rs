@@ -1584,21 +1584,24 @@ impl Interp {
             ExprKind::Match { subject, arms } => {
                 let subj = self.eval_expr(subject, env).await?;
                 for arm in arms {
-                    let matched = match &arm.patterns {
-                        None => true, // wildcard
-                        Some(pats) => {
-                            let mut hit = false;
-                            for p in pats {
-                                if self.eval_expr(p, env).await? == subj {
-                                    hit = true;
-                                    break;
+                    for pat in &arm.patterns {
+                        let mut bindings: Vec<(Rc<str>, Value)> = Vec::new();
+                        if self.match_pattern(pat, &subj, &mut bindings, env).await? {
+                            // Bindings (and the guard) live in a fresh child scope.
+                            let arm_env = env.child();
+                            for (name, val) in bindings {
+                                // A pattern may bind the same name once; ignore a
+                                // redefine error defensively.
+                                let _ = arm_env.define(&name, val, false);
+                            }
+                            if let Some(guard) = &arm.guard {
+                                let g = self.eval_expr(guard, &arm_env).await?;
+                                if !g.is_truthy() {
+                                    continue;
                                 }
                             }
-                            hit
+                            return self.eval_expr(&arm.body, &arm_env).await;
                         }
-                    };
-                    if matched {
-                        return self.eval_expr(&arm.body, env).await;
                     }
                 }
                 Err(AsError::at("no matching arm in match expression", expr.span).into())
@@ -1690,6 +1693,126 @@ impl Interp {
             | ExprKind::Call { .. } => {
                 let (v, _) = self.eval_chain(expr, env).await?;
                 Ok(v)
+            }
+        }
+    }
+
+    /// Try to match `pat` against `subject` (Phase 8a). On success returns `true`
+    /// and pushes any captured names onto `bindings`; on a structural mismatch
+    /// returns `false` (bindings may be partially filled and must be discarded).
+    /// `env` is the enclosing scope, used for Option-C identifier resolution.
+    #[async_recursion(?Send)]
+    async fn match_pattern(
+        &self,
+        pat: &crate::ast::Pattern,
+        subject: &Value,
+        bindings: &mut Vec<(Rc<str>, Value)>,
+        env: &Environment,
+    ) -> Result<bool, Control> {
+        use crate::ast::Pattern;
+        match pat {
+            Pattern::Wildcard => Ok(true),
+            Pattern::Ident(name) => {
+                // Option C: defined name → value compare; undefined → bind.
+                if let Some(v) = env.get(name) {
+                    Ok(v == *subject)
+                } else {
+                    bindings.push((name.clone(), subject.clone()));
+                    Ok(true)
+                }
+            }
+            Pattern::Value(e) => {
+                let v = self.eval_expr(e, env).await?;
+                Ok(v == *subject)
+            }
+            Pattern::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let n = match subject {
+                    Value::Number(n) => *n,
+                    _ => return Ok(false),
+                };
+                let lo = match self.eval_expr(start, env).await? {
+                    Value::Number(x) => x,
+                    _ => return Ok(false),
+                };
+                let hi = match self.eval_expr(end, env).await? {
+                    Value::Number(x) => x,
+                    _ => return Ok(false),
+                };
+                Ok(n >= lo && if *inclusive { n <= hi } else { n < hi })
+            }
+            Pattern::Array(pats, rest) => {
+                // Snapshot the subject array (do not hold a borrow across awaits).
+                let items: Vec<Value> = match subject {
+                    Value::Array(a) => a.borrow().iter().cloned().collect(),
+                    _ => return Ok(false),
+                };
+                match rest {
+                    None => {
+                        if items.len() != pats.len() {
+                            return Ok(false);
+                        }
+                    }
+                    Some(_) => {
+                        if items.len() < pats.len() {
+                            return Ok(false);
+                        }
+                    }
+                }
+                for (p, item) in pats.iter().zip(items.iter()) {
+                    if !self.match_pattern(p, item, bindings, env).await? {
+                        return Ok(false);
+                    }
+                }
+                if let Some(Some(rest_name)) = rest {
+                    let remainder: Vec<Value> = items[pats.len()..].to_vec();
+                    bindings.push((
+                        rest_name.clone(),
+                        Value::Array(Rc::new(RefCell::new(remainder))),
+                    ));
+                }
+                Ok(true)
+            }
+            Pattern::Object(entries, rest) => {
+                // Snapshot the subject's fields (Object or Instance).
+                let fields: indexmap::IndexMap<String, Value> = match subject {
+                    Value::Object(o) => o.borrow().clone(),
+                    Value::Instance(i) => i.borrow().fields.clone(),
+                    _ => return Ok(false),
+                };
+                for entry in entries {
+                    let field = match fields.get(entry.key.as_ref()) {
+                        Some(v) => v.clone(),
+                        None => return Ok(false),
+                    };
+                    match &entry.pat {
+                        // `{key}` shorthand ALWAYS binds (documented Option-C exception).
+                        None => bindings.push((entry.key.clone(), field)),
+                        Some(p) => {
+                            if !self.match_pattern(p, &field, bindings, env).await? {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                if let Some(Some(rest_name)) = rest {
+                    let named: std::collections::HashSet<&str> =
+                        entries.iter().map(|e| e.key.as_ref()).collect();
+                    let mut remaining = indexmap::IndexMap::new();
+                    for (k, v) in fields.iter() {
+                        if !named.contains(k.as_str()) {
+                            remaining.insert(k.clone(), v.clone());
+                        }
+                    }
+                    bindings.push((
+                        rest_name.clone(),
+                        Value::Object(Rc::new(RefCell::new(remaining))),
+                    ));
+                }
+                Ok(true)
             }
         }
     }
@@ -3841,6 +3964,117 @@ print(y)
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output(), "hit\nmiss\nplus\n");
+    }
+
+    // ----- Phase 8a: pattern matching (Option C) -----
+
+    async fn run_out(src: &str) -> String {
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        interp.output()
+    }
+
+    #[tokio::test]
+    async fn pat_regression_literals() {
+        assert_eq!(
+            run_out("print(match 0 {0=>\"z\",1|2=>\"s\",_=>\"m\"})\nprint(match 2 {0=>\"z\",1|2=>\"s\",_=>\"m\"})\nprint(match 9 {0=>\"z\",1|2=>\"s\",_=>\"m\"})").await,
+            "z\ns\nm\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_regression_enum_ref() {
+        assert_eq!(
+            run_out("enum Color { Red, Green }\nprint(match Color.Red {Color.Red=>true,_=>false})")
+                .await,
+            "true\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_regression_defined_var_compare() {
+        assert_eq!(
+            run_out("let k=2\nprint(match 2 { k => \"eq\", _ => \"no\" })\nprint(match 3 { k => \"eq\", _ => \"no\" })").await,
+            "eq\nno\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_option_c_bind() {
+        // x is undefined -> binds the subject.
+        assert_eq!(run_out("print(match 42 { x => x })").await, "42\n");
+    }
+
+    #[tokio::test]
+    async fn pat_const_compare_footgun_avoided() {
+        // target is defined -> value compare, not bind.
+        assert_eq!(
+            run_out("const target=5\nprint(match 5 { target => \"m\", _ => \"n\" })\nprint(match 6 { target => \"m\", _ => \"n\" })").await,
+            "m\nn\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_array_result_pair() {
+        let src = "fn f(u, e) { return match [u, e] { [u, nil] => u, [nil, e] => \"err\" } }\nprint(f(\"alice\", nil))\nprint(f(nil, \"boom\"))";
+        assert_eq!(run_out(src).await, "alice\nerr\n");
+    }
+
+    #[tokio::test]
+    async fn pat_array_rest() {
+        assert_eq!(
+            run_out("print(match [1,2,3] { [first, ...rest] => first + len(rest) })").await,
+            "3\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_object_keyval_and_shorthand() {
+        assert_eq!(
+            run_out("print(match {method:\"GET\",path:\"/x\"} { {method:\"GET\", path} => path })")
+                .await,
+            "/x\n"
+        );
+        assert_eq!(
+            run_out("print(match {a:1,b:2} { {a,b} => a+b })").await,
+            "3\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_range() {
+        assert_eq!(
+            run_out("print(match 5 {1..=9=>\"d\",_=>\"big\"})").await,
+            "d\n"
+        );
+        assert_eq!(
+            run_out("print(match 12 {1..=9=>\"d\",_=>\"big\"})").await,
+            "big\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pat_guard() {
+        let src = "fn g(n) { return match n {_ if n<0=>\"neg\",0=>\"zero\",_=>\"pos\"} }\nprint(g(-3))\nprint(g(0))\nprint(g(7))";
+        assert_eq!(run_out(src).await, "neg\nzero\npos\n");
+    }
+
+    #[tokio::test]
+    async fn pat_guard_with_binding() {
+        let src = "fn g(v, e) { return match [v,e] {[x,nil] if x>10=>\"big\",[x,nil]=>\"small\",_=>\"err\"} }\nprint(g(20,nil))\nprint(g(3,nil))\nprint(g(0,\"e\"))";
+        assert_eq!(run_out(src).await, "big\nsmall\nerr\n");
+    }
+
+    #[tokio::test]
+    async fn pat_no_arm_still_panics() {
+        let src = "match 5 { 1 => \"a\" }";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(err.message.contains("no matching arm"));
     }
 
     #[tokio::test]

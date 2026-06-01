@@ -7,7 +7,7 @@
 
 use crate::ast::{
     ArrayElem, ArrowBody, BinOp, CallArg, EnumVariantDecl, Expr, ExprKind, FieldDecl, ImportNames,
-    MatchArm, MethodDecl, ObjEntry, Param, Stmt, TemplatePart, Type, UnOp,
+    MatchArm, MethodDecl, ObjEntry, Param, Pattern, Stmt, TemplatePart, Type, UnOp,
 };
 use crate::error::AsError;
 
@@ -635,19 +635,83 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
 }
 
 fn write_match_arm(out: &mut String, arm: &MatchArm) {
-    match &arm.patterns {
-        None => out.push('_'),
-        Some(pats) => {
-            for (i, p) in pats.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(" | ");
-                }
-                write_expr(out, p, PREC_ASSIGN);
-            }
+    // Minimal-but-source-faithful pattern render (Phase 8a). Value/Range sub-
+    // expressions go through the formatter's own `write_expr` (NOT the AST debug
+    // `Display`) so the output reparses. A fully idempotent pass is Phase 8c.
+    for (i, p) in arm.patterns.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" | ");
         }
+        write_pattern(out, p);
+    }
+    if let Some(guard) = &arm.guard {
+        out.push_str(" if ");
+        write_expr(out, guard, PREC_ASSIGN);
     }
     out.push_str(" => ");
     write_expr(out, &arm.body, PREC_ASSIGN);
+}
+
+fn write_pattern(out: &mut String, pat: &Pattern) {
+    match pat {
+        Pattern::Wildcard => out.push('_'),
+        Pattern::Ident(n) => out.push_str(n),
+        Pattern::Value(e) => write_expr(out, e, PREC_ASSIGN),
+        Pattern::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            write_expr(out, start, PREC_ASSIGN);
+            out.push_str(if *inclusive { "..=" } else { ".." });
+            write_expr(out, end, PREC_ASSIGN);
+        }
+        Pattern::Array(pats, rest) => {
+            out.push('[');
+            for (i, p) in pats.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_pattern(out, p);
+            }
+            write_pattern_rest(out, rest, !pats.is_empty());
+            out.push(']');
+        }
+        Pattern::Object(entries, rest) => {
+            out.push('{');
+            for (i, e) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&object_key(e.key.as_ref()));
+                if let Some(p) = &e.pat {
+                    out.push_str(": ");
+                    write_pattern(out, p);
+                }
+            }
+            write_pattern_rest(out, rest, !entries.is_empty());
+            out.push('}');
+        }
+    }
+}
+
+fn write_pattern_rest(
+    out: &mut String,
+    rest: &Option<Option<std::rc::Rc<str>>>,
+    needs_comma: bool,
+) {
+    match rest {
+        None => {}
+        Some(name) => {
+            if needs_comma {
+                out.push_str(", ");
+            }
+            out.push_str("...");
+            if let Some(n) = name {
+                out.push_str(n);
+            }
+        }
+    }
 }
 
 fn op_str(op: UnOp) -> String {
@@ -961,5 +1025,140 @@ mod tests {
         assert_eq!(format_source(src2).unwrap(), src2);
         let src3 = "let f = (a, ...rest) => rest\n";
         assert_eq!(format_source(src3).unwrap(), src3);
+    }
+
+    // ---- Phase 8c: match-pattern idempotence tests ----
+
+    /// Helper: assert `format_source(src)` produces `expected`, is idempotent,
+    /// and the output re-parses without error.
+    fn assert_fmt_idempotent(src: &str, expected: &str) {
+        let once = format_source(src).unwrap_or_else(|e| panic!("fmt failed on {:?}: {e}", src));
+        assert_eq!(once, expected, "wrong output for: {src}");
+        let twice =
+            format_source(&once).unwrap_or_else(|e| panic!("re-fmt failed on {:?}: {e}", &once));
+        assert_eq!(once, twice, "fmt not idempotent for: {src}");
+        // formatted output re-parses
+        let tokens = crate::lexer::lex(&once)
+            .unwrap_or_else(|e| panic!("lex failed on formatted {:?}: {e}", &once));
+        assert!(
+            crate::parser::parse(&tokens).is_ok(),
+            "formatted output does not re-parse: {:?}",
+            &once
+        );
+    }
+
+    #[test]
+    fn match_wildcard_and_value_are_idempotent() {
+        // Wildcard `_` and bare value patterns format canonically and re-parse.
+        assert_fmt_idempotent("match n { _ => 0 }", "match n { _ => 0 }\n");
+        assert_fmt_idempotent(
+            "match n { 0 => \"zero\", 1 => \"one\", _ => \"other\" }",
+            "match n { 0 => \"zero\", 1 => \"one\", _ => \"other\" }\n",
+        );
+    }
+
+    #[test]
+    fn match_bare_ident_binding_is_idempotent() {
+        // A bare-ident pattern (Option-C binding) formats as just the identifier.
+        assert_fmt_idempotent("match x { other => other }", "match x { other => other }\n");
+    }
+
+    #[test]
+    fn match_range_patterns_are_idempotent() {
+        // Inclusive `..=` and exclusive `..` range patterns.
+        assert_fmt_idempotent(
+            "match n { 1..=9 => \"single\", 10..100 => \"double\", _ => \"big\" }",
+            "match n { 1..=9 => \"single\", 10..100 => \"double\", _ => \"big\" }\n",
+        );
+    }
+
+    #[test]
+    fn match_array_patterns_are_idempotent() {
+        // Fixed-arity, rest, binding mixed with value pattern.
+        assert_fmt_idempotent(
+            "match xs { [] => \"empty\", [x] => x, [first, ...rest] => first }",
+            "match xs { [] => \"empty\", [x] => x, [first, ...rest] => first }\n",
+        );
+        // Explicit nil value inside array pattern.
+        assert_fmt_idempotent(
+            "match pair { [u, nil] => u, [_, e] => e }",
+            "match pair { [u, nil] => u, [_, e] => e }\n",
+        );
+        // Ignore-rest `...` with no name.
+        assert_fmt_idempotent(
+            "match xs { [h, ...] => h, _ => nil }",
+            "match xs { [h, ...] => h, _ => nil }\n",
+        );
+    }
+
+    #[test]
+    fn match_object_patterns_are_idempotent() {
+        // Shorthand binding `{key}` and sub-pattern `{key: pat}`.
+        assert_fmt_idempotent(
+            "match req { {method, path} => method, _ => \"?\" }",
+            "match req { {method, path} => method, _ => \"?\" }\n",
+        );
+        assert_fmt_idempotent(
+            "match user { {role: \"admin\"} => true, {role: r} => false }",
+            "match user { {role: \"admin\"} => true, {role: r} => false }\n",
+        );
+        // Object rest `...name`.
+        assert_fmt_idempotent(
+            "match obj { {a, ...rest} => rest, _ => nil }",
+            "match obj { {a, ...rest} => rest, _ => nil }\n",
+        );
+        // Object ignore-rest `...`.
+        assert_fmt_idempotent(
+            "match obj { {x, ...} => x, _ => nil }",
+            "match obj { {x, ...} => x, _ => nil }\n",
+        );
+    }
+
+    #[test]
+    fn match_guard_is_idempotent() {
+        // `_ if <guard>` — guard expression survives formatting and round-trips.
+        assert_fmt_idempotent(
+            "match n { _ if n < 0 => \"neg\", _ => \"pos\" }",
+            "match n { _ if n < 0 => \"neg\", _ => \"pos\" }\n",
+        );
+        // Guard on a binding pattern.
+        assert_fmt_idempotent(
+            "match n { x if x > 10 => x, _ => 0 }",
+            "match n { x if x > 10 => x, _ => 0 }\n",
+        );
+    }
+
+    #[test]
+    fn match_or_patterns_are_idempotent() {
+        // `|` alternatives in a single arm.
+        assert_fmt_idempotent(
+            "match day { \"sat\" | \"sun\" => true, _ => false }",
+            "match day { \"sat\" | \"sun\" => true, _ => false }\n",
+        );
+    }
+
+    #[test]
+    fn match_nested_in_fn_is_idempotent() {
+        // A full match expression inside a function body — verifies the fmt pass
+        // handles statement+block nesting alongside match.
+        let src = "fn classify(n) {\n  return match n {\n    _ if n < 0 => \"negative\",\n    0 => \"zero\",\n    1..=9 => \"single digit\",\n    10..100 => \"double digit\",\n    _ => \"big\",\n  }\n}\n";
+        // Canonical output (the example file's shape).
+        let once = format_source(src).unwrap();
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice, "fmt not idempotent for match-in-fn");
+        assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn match_pattern_matching_example_is_idempotent() {
+        // The committed pattern_matching.as example must round-trip through the
+        // formatter (the `all_examples_format_idempotently_and_reparse` test covers
+        // this too, but having it here makes the failure message explicit).
+        let src = std::fs::read_to_string("examples/pattern_matching.as")
+            .expect("examples/pattern_matching.as should exist");
+        let once = format_source(&src).unwrap();
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice, "pattern_matching.as fmt is not idempotent");
+        assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
     }
 }
