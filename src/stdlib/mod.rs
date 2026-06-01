@@ -51,8 +51,10 @@ pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
 pub mod string;
+pub mod sync;
 pub mod task_mod;
 pub mod time;
+pub mod time_timers;
 #[cfg(feature = "data")]
 pub mod toml;
 #[cfg(feature = "tui")]
@@ -92,6 +94,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/convert" => convert::exports(),
         "std/task" => task_mod::exports(),
         "std/time" => time::exports(),
+        "std/sync" => sync::exports(),
         #[cfg(feature = "datetime")]
         "std/date" => date::exports(),
         #[cfg(feature = "intl")]
@@ -194,6 +197,7 @@ impl Interp {
             "convert" => convert::call(func, args, span),
             "task" => self.call_task(func, args, span).await,
             "time" => self.call_time(func, args, span).await,
+            "sync" => self.call_sync(func, args, span).await,
             #[cfg(feature = "datetime")]
             "date" => date::call(func, args, span),
             #[cfg(feature = "intl")]
@@ -269,6 +273,15 @@ impl Interp {
             // sleeps for 20 whole milliseconds.
             tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
             return Ok(Value::Nil);
+        }
+        if func == "interval" {
+            return time_timers::create_interval(self, args, span);
+        }
+        if func == "debounce" {
+            return time_timers::create_debounce(self, args, span);
+        }
+        if func == "throttle" {
+            return time_timers::create_throttle(self, args, span);
         }
         time::call(func, args, span)
     }

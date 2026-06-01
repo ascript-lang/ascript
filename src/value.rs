@@ -163,6 +163,21 @@ pub enum NativeKind {
     // (setCell/text/hline/vline/box/fill)/flush/pollEvent/readEvent/restore/close.
     // Registered only under feature `tui`.
     Terminal,
+    // std/sync: a FIFO channel (VecDeque + Rc<Notify>). Not feature-gated.
+    Channel,
+    // std/sync: a counting semaphore (RefCell<usize> + Rc<Notify>). Not feature-gated.
+    Semaphore,
+    // std/time: a repeating timer handle. `.tick()` awaits the next tick.
+    // Not feature-gated (tokio timers are always available).
+    Interval,
+    // std/time: a debounce wrapper (trailing-edge). Callable as `wrapper(args)`.
+    DebounceWrapper,
+    // std/time: a throttle wrapper (leading-edge). Callable as `wrapper(args)`.
+    ThrottleWrapper,
+    // std/sync: a token-bucket rate limiter. `.acquire()` awaits a token; the
+    // bucket refills `count` tokens every `window_ms` milliseconds (monotonic
+    // clock — no background task). Not feature-gated.
+    RateLimiter,
 }
 
 impl NativeKind {
@@ -184,6 +199,12 @@ impl NativeKind {
             NativeKind::WsConnection => "wsConnection",
             NativeKind::WsListener => "wsListener",
             NativeKind::Terminal => "terminal",
+            NativeKind::Channel => "channel",
+            NativeKind::Semaphore => "semaphore",
+            NativeKind::Interval => "interval",
+            NativeKind::DebounceWrapper => "debounce",
+            NativeKind::ThrottleWrapper => "throttle",
+            NativeKind::RateLimiter => "rateLimiter",
         }
     }
 }

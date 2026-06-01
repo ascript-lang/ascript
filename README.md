@@ -39,7 +39,7 @@ Design priorities, in strict order: **simplicity → safety → familiarity → 
 - **Destructuring** — pull fields out of an object or instance by key with `let {a, b as local, "k" as v} = obj`; missing keys bind `nil`.
 - **Spread** — expand a collection inline with `...` in array literals, object literals, and call arguments (`[0, ...xs]`, `{...defaults, k: v}`, `f(...args)`); strict about container kind, object-spread is later-value-wins.
 - **Rest** — collect what's left over with a trailing `...name`: a rest parameter gathers extra arguments into an array (`fn sum(...nums: array<number>)`, per-element typed), and rest destructuring takes the tail/leftover keys (`let [head, ...tail] = xs`, `let {id, ...meta} = obj`).
-- **Single-threaded async & concurrency** — `await` any I/O on a cooperative event loop; `future<T>` and `std/task` (`spawn`/`gather`/`race`/`timeout`); structured concurrency with cancel-on-drop (un-awaited work is cancelled, `task.spawn` detaches); the HTTP server serves connections concurrently. No data races.
+- **Single-threaded async & concurrency** — `await` any I/O on a cooperative event loop; `future<T>` and `std/task` (`spawn`/`gather`/`race`/`timeout`/`retry`); structured concurrency with cancel-on-drop; `std/sync` for channels, semaphores, and rate limiters; `std/time` `interval`/`debounce`/`throttle` timer utilities. No data races.
 - **Generators & coroutines** — `fn*`/`async fn*` with `yield`, bidirectional `gen.next(v)`, `gen.close()`, and `for await` over generators and native streams (composable async pipelines).
 - **Batteries included** — JSON, regex, SQLite, crypto, compression, a modern HTTP client, WebSockets, a TUI, and now: `std/url` (RFC-3986 URL parsing/building/query helpers), `std/cli` (declarative arg parsing with flags/options/subcommands), `std/color` (ANSI colors + NO_COLOR), `std/io` (stdin reading), `std/set` (insertion-ordered hash set with union/intersection/difference), `std/decimal` (exact 96-bit decimal arithmetic — `0.1 + 0.2 == 0.3`), `env.args()` (script arguments), and the global `exit(code?)` builtin.
 - **Real tooling** — a runner, REPL, formatter, test runner, and language server, all in one binary.
@@ -87,9 +87,9 @@ ascript run hello.as
 | Data & serialization | `std/json` · `std/csv` · `std/toml` · `std/yaml` · `std/encoding` · `std/regex` · `std/uuid` · `std/url` · `std/decimal` (exact 96-bit decimal arithmetic) |
 | System & files | `std/fs` · `std/env` · `std/io` · `std/process` · `std/crypto` · `std/compress` · `std/sqlite` |
 | CLI & terminal | `std/cli` (declarative arg parser) · `std/color` (ANSI colors & styles, NO_COLOR-aware) |
-| Time & locale | `std/time` · `std/date` · `std/intl` |
+| Time & locale | `std/time` (wall clock, sleep, `interval` · `debounce` · `throttle`) · `std/date` · `std/intl` |
 | Networking | `std/net/tcp` · `std/net/http` · `std/http/server` · `std/net/ws` |
-| Concurrency | `std/task` (`spawn` · `gather` · `race` · `timeout` over `future<T>`) |
+| Concurrency | `std/task` (`spawn` · `gather` · `race` · `timeout` · `retry` over `future<T>`) · `std/sync` (FIFO channels · counting semaphore · token-bucket rate limiter) |
 | Logging | `std/log` (`debug` · `info` · `warn` · `error`; human/json, structured fields) |
 | Terminal UI | `std/tui` |
 

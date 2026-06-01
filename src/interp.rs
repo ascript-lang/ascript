@@ -95,7 +95,10 @@ pub(crate) enum ResourceState {
     // `Connection::prepare_cached` on each `run`/`all` (rusqlite caches the parsed
     // statement internally, so there's no re-parse cost). See std/sqlite.
     #[cfg(feature = "sql")]
-    SqliteStatement { conn_id: u64, sql: String },
+    SqliteStatement {
+        conn_id: u64,
+        sql: String,
+    },
     // The process child handle requires tokio's `process` feature, which `sys`
     // enables (M13 Task 7, `std/process`). `spawn` registers the live child plus
     // its piped stdout/stderr (as `Reader`s) and stdin (as a `Writer`).
@@ -178,6 +181,32 @@ pub(crate) enum ResourceState {
     // across calls without scanning the table.
     #[cfg(feature = "sys")]
     StdinReader(Box<tokio::io::BufReader<tokio::io::Stdin>>),
+    // std/time: a repeating interval handle. `tick()` (async) drives the
+    // tokio Interval to the next tick. Boxed to keep the enum compact (the
+    // tokio Interval future is sizeable).
+    Interval(Box<tokio::time::Interval>),
+    // std/time: a debounce wrapper state. Holds the wrapped function, the
+    // window in ms, and an optional AbortHandle for the pending delayed call.
+    // Explicitly aborting that AbortHandle on each new call (and in the state's
+    // Drop) implements trailing-edge collapse + cancel-on-drop. Mutated via the
+    // take-out-across-await pattern (take_resource → mutate → return_resource).
+    DebounceWrapper(crate::stdlib::time_timers::DebounceState),
+    // std/time: a throttle wrapper state. Holds the wrapped function, the
+    // window in ms, and the Instant of the last successful fire.
+    ThrottleWrapper(crate::stdlib::time_timers::ThrottleState),
+    // std/sync: a FIFO channel backed by VecDeque + Rc<Notify>. Always present
+    // (no feature gate) because tokio::sync is core infrastructure. The Channel
+    // struct holds the queue inside a RefCell and the Notify handles as separate
+    // Rcs so callers can clone them out before awaiting without holding a borrow.
+    Channel(crate::stdlib::sync::Channel),
+    // std/sync: a counting semaphore backed by RefCell<usize> + Rc<Notify>. Always
+    // present (no feature gate). acquire uses the same enable()-before-recheck
+    // lost-wakeup-safe park pattern as Channel::recv. The Semaphore struct holds
+    // the counter inside a RefCell and the Notify as a separate Rc.
+    Semaphore(crate::stdlib::sync::Semaphore),
+    // std/sync: a token-bucket rate limiter. count tokens per window_ms ms.
+    // Available tokens + window_start live in RefCells; Notify for wakeups.
+    RateLimiter(crate::stdlib::sync::RateLimiterState),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -623,15 +652,15 @@ impl Interp {
     }
 
     /// Return a resource to the table after a take-out across an `.await`. Pairs
-    /// with `take_resource`.
-    #[allow(dead_code)] // Only used by feature-gated I/O modules.
+    /// with `take_resource`. Used unconditionally by std/time timers, plus the
+    /// feature-gated I/O modules.
     pub(crate) fn return_resource(&self, id: u64, state: ResourceState) {
         self.resources.borrow_mut().insert(id, state);
     }
 
     /// Register an OS `state` behind a fresh `Value::Native` handle of `kind`,
-    /// carrying the plain readable `fields`.
-    #[allow(dead_code)] // Only called by feature-gated modules (sqlite/process) for now.
+    /// carrying the plain readable `fields`. Used unconditionally by std/time
+    /// timers, plus the feature-gated modules (sqlite/process/net/...).
     pub(crate) fn register_resource(
         &self,
         kind: crate::value::NativeKind,
@@ -649,8 +678,8 @@ impl Interp {
 
     /// Remove and return the resource for `id` (used by `close`/`kill`/EOF, and to
     /// own a resource across an `.await` without holding the table borrow — pair
-    /// with `return_resource`).
-    #[allow(dead_code)] // Only used by feature-gated modules (sqlite/process) for now.
+    /// with `return_resource`). Used unconditionally by std/time timers, plus the
+    /// feature-gated modules (sqlite/process/net/...).
     pub(crate) fn take_resource(&self, id: u64) -> Option<ResourceState> {
         self.resources.borrow_mut().remove(&id)
     }
@@ -1979,6 +2008,21 @@ impl Interp {
         {
             if matches!(m.receiver.kind, crate::value::NativeKind::Terminal) {
                 return self.call_terminal_method(&m, args, span).await;
+            }
+        }
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, Interval) {
+                return self.call_interval_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, DebounceWrapper) {
+                return self.call_debounce_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, ThrottleWrapper) {
+                return self.call_throttle_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, RateLimiter) {
+                return self.call_rate_limiter_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
@@ -5322,6 +5366,154 @@ print(r[1])
                        print(b > a)")
         .await;
         assert_eq!(out, "true\n");
+    }
+
+    // ─── time.interval ───────────────────────────────────────────────────────
+
+    /// interval: call tick() N times, assert N ticks completed and elapsed is
+    /// at least (N-1)*interval_ms (loose lower bound to avoid flakiness).
+    #[tokio::test]
+    async fn std_time_interval_ticks() {
+        let out = run(r#"
+import * as time from "std/time"
+let iv = time.interval(5)
+let start = time.monotonic()
+let i = 0
+while (i < 4) {
+    await iv.tick()
+    i = i + 1
+}
+let elapsed = time.monotonic() - start
+print(i)
+print(elapsed >= 10)
+"#)
+        .await;
+        assert_eq!(out, "4\ntrue\n");
+    }
+
+    // ─── time.debounce ───────────────────────────────────────────────────────
+
+    /// debounce: call the wrapper 5 times in rapid succession; after waiting
+    /// longer than the debounce window the underlying fn should have run exactly
+    /// once (trailing-edge collapse).
+    #[tokio::test]
+    async fn std_time_debounce_collapses_rapid_calls() {
+        let out = run(r#"
+import * as time from "std/time"
+import * as task from "std/task"
+let counter = [0]
+let fn_inc = () => { counter[0] = counter[0] + 1 }
+let debounced = time.debounce(fn_inc, 20)
+debounced()
+debounced()
+debounced()
+debounced()
+debounced()
+await time.sleep(60)
+print(counter[0])
+"#)
+        .await;
+        assert_eq!(out, "1\n");
+    }
+
+    // ─── time.throttle ───────────────────────────────────────────────────────
+
+    /// throttle: burst-call the wrapper many times within the window; the
+    /// underlying fn should have fired exactly once (leading-edge).
+    #[tokio::test]
+    async fn std_time_throttle_leading_edge_once_per_window() {
+        let out = run(r#"
+import * as time from "std/time"
+let counter = [0]
+let fn_inc = () => { counter[0] = counter[0] + 1 }
+let throttled = time.throttle(fn_inc, 50)
+throttled()
+throttled()
+throttled()
+throttled()
+print(counter[0])
+"#)
+        .await;
+        assert_eq!(out, "1\n");
+    }
+
+    /// interval: a sub-1ms duration (truncates to 0) and an outright 0 must be a
+    /// catchable Tier-2 panic (Control::Panic), NOT a raw Rust panic crashing the
+    /// process inside tokio ("period must be non-zero").
+    #[tokio::test]
+    async fn std_time_interval_sub_millisecond_is_tier2_panic() {
+        for src in [
+            "import * as time from \"std/time\"\ntime.interval(0.5)",
+            "import * as time from \"std/time\"\ntime.interval(0)",
+        ] {
+            let result = crate::run_source(src).await;
+            assert!(
+                result.is_err(),
+                "interval with a zero-rounding ms must be a Tier-2 panic, got: {result:?}"
+            );
+        }
+    }
+
+    /// debounce: a later call within the window cancels the earlier pending
+    /// fire, so only the LAST call fires once. This exercises the per-call
+    /// `.abort()` of the previous AbortHandle (the live cancellation path that
+    /// trailing-edge collapse depends on). NOTE: GC-on-drop of an unreachable
+    /// wrapper is NOT script-observable — resources live in the table until the
+    /// interp tears down; `DebounceState::Drop`'s `.abort()` is unit-tested
+    /// directly in `time_timers.rs` (`drop_aborts_pending_task`).
+    #[tokio::test]
+    async fn std_time_debounce_later_call_cancels_earlier() {
+        let out = run(r#"
+import * as time from "std/time"
+let last = ["none"]
+let count = [0]
+let debounced = time.debounce((tag) => { last[0] = tag; count[0] = count[0] + 1 }, 25)
+debounced("a")
+await time.sleep(10)   // within the 25ms window → "a" still pending
+debounced("b")         // cancels "a", reschedules for "b"
+await time.sleep(60)   // let "b" fire
+print(count[0])        // 1 — "a" was cancelled, only "b" fired
+print(last[0])         // "b"
+"#)
+        .await;
+        assert_eq!(out, "1\nb\n");
+    }
+
+    /// debounce with an ASYNC callback: the deferred task must DRIVE the inner
+    /// future to completion (calling an `async fn` returns a Future without
+    /// running the body). Async callbacks are the primary debounce use case
+    /// (debounced save), so the body must actually run.
+    #[tokio::test]
+    async fn std_time_debounce_drives_async_callback() {
+        let out = run(r#"
+import * as time from "std/time"
+let c = [0]
+let d = time.debounce(async () => { c[0] = c[0] + 1 }, 15)
+d()
+d()
+d()
+await time.sleep(50)
+print(c[0])   // 1 — the async body ran exactly once (trailing edge)
+"#)
+        .await;
+        assert_eq!(out, "1\n");
+    }
+
+    /// throttle with an ASYNC callback: the leading-edge call must drive the
+    /// inner future to completion so the async body actually runs.
+    #[tokio::test]
+    async fn std_time_throttle_drives_async_callback() {
+        let out = run(r#"
+import * as time from "std/time"
+let t = [0]
+let th = time.throttle(async () => { t[0] = t[0] + 1 }, 50)
+th()
+th()
+await time.sleep(5)
+print(t[0])   // 1 — the async body ran once on the leading edge
+"#)
+        .await;
+        assert_eq!(out, "1\n");
     }
 
     #[cfg(feature = "datetime")]

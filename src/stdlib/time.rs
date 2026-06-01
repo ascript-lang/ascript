@@ -16,6 +16,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("seconds", bi("time.seconds")),
         ("minutes", bi("time.minutes")),
         ("hours", bi("time.hours")),
+        ("interval", bi("time.interval")),
+        ("debounce", bi("time.debounce")),
+        ("throttle", bi("time.throttle")),
     ]
 }
 
@@ -56,6 +59,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             want_number(&arg(args, 0), span, &ctx("hours"))? * 3_600_000.0,
         )),
         "sleep" => unreachable!("time.sleep is dispatched async in call_time"),
+        "interval" | "debounce" | "throttle" => {
+            unreachable!("time.{} is dispatched in call_time", func)
+        }
         _ => Err(AsError::at(format!("std/time has no function '{}'", func), span).into()),
     }
 }
