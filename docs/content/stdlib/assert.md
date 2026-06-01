@@ -183,7 +183,7 @@ files are overwritten and the run passes.
 
 > [!NOTE] `assert.snapshot` is not exported under `--no-default-features`
 > (the `sys` and `data` features are both required). Under a stripped build the
-> name falls through to `"assert has no function 'snapshot'"` — a Tier-2 panic.
+> `snapshot` is simply absent from the module's exports (so calling it is a "value is not callable" Tier-2 panic).
 
 ---
 

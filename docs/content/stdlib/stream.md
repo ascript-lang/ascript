@@ -23,8 +23,8 @@ from the source and threads it through every stage in order. Only items the
 terminal actually requests are ever produced. This means:
 
 ```ascript
-// Despite a 1 000 000-element source, only 10 items are ever read from it
-// (filter reads items 0..9 to find the 5 even ones; map runs exactly 5 times).
+// Despite a 1 000 000-element source, only 9 items are ever read from it
+// (filter reads items 0..8 to find the 5 even ones; map runs exactly 5 times).
 let s = stream.take(
   stream.map(stream.filter(stream.range(0, 1000000), x => x % 2 == 0), x => x * 3),
   5
