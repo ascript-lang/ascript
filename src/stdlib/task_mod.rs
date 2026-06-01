@@ -294,9 +294,7 @@ impl Interp {
                         // Add up to +50% jitter.
                         let frac = retry_rand_f64();
                         delay = delay.saturating_add(
-                            (delay / 2)
-                                .saturating_mul((frac * 1000.0) as u64)
-                                / 1000,
+                            (delay / 2).saturating_mul((frac * 1000.0) as u64) / 1000,
                         );
                     }
                     if delay > 0 {

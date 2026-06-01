@@ -99,6 +99,65 @@ Converts hours to milliseconds.
 let d = time.hours(1)   // 3600000
 ```
 
+### interval
+
+Creates a repeating timer. The returned handle has one method: `iv.tick()`, which is `async` and resolves on each period boundary.
+
+- **Parameters:** `ms` (number) — period in milliseconds; must be `>= 1`.
+- **Returns:** native interval handle.
+
+Tokio fires the first tick immediately (at period 0); subsequent ticks fire one period later each time. Drop the handle to stop the timer.
+
+```ascript
+let iv = time.interval(50)
+let i = 0
+while (i < 3) {
+  await iv.tick()   // 0 ms, 50 ms, 100 ms
+  i = i + 1
+}
+```
+
+### debounce
+
+Wraps a function with trailing-edge debouncing. Each call to the wrapper resets the timer; the underlying function is called only if `ms` milliseconds pass with no further calls.
+
+- **Parameters:** `fn` (function); `ms` (number) — debounce window in milliseconds (must be positive).
+- **Returns:** a callable wrapper. Calling it is synchronous (the delayed fire is fire-and-forget). The wrapper accepts any arguments and forwards them to `fn`.
+
+> **Note:** `debounce` works with synchronous `fn`. The wrapped function runs from a detached task after the window; its return value is discarded.
+
+```ascript
+import * as array from "std/array"
+let log = []
+let dSave = time.debounce(v => { array.push(log, v) }, 50)
+
+dSave(1)
+dSave(2)
+dSave(3)                // only this call survives the 50ms window
+await time.sleep(100)
+print(log[0])           // 3
+```
+
+### throttle
+
+Wraps a function with leading-edge throttling. The first call in any `ms`-millisecond window invokes `fn` immediately; subsequent calls within the window are dropped silently.
+
+- **Parameters:** `fn` (function); `ms` (number) — throttle window in milliseconds (must be positive).
+- **Returns:** a callable wrapper. Calling it is synchronous. The wrapper accepts any arguments and forwards them to `fn` on the leading edge.
+
+```ascript
+import * as array from "std/array"
+let log = []
+let tLog = time.throttle(v => { array.push(log, v) }, 100)
+
+tLog(10)   // fires immediately (leading edge)
+tLog(20)   // dropped (within window)
+tLog(30)   // dropped (within window)
+await time.sleep(150)
+tLog(40)   // fires again (new window)
+// log == [10, 40]
+```
+
 ## std/date
 
 Civil dates over the UTC epoch, backed by chrono. The central data type is the **instant** — a plain object snapshot of a moment in time. Its `epochMs` field is canonical: all arithmetic operates on it, and the other fields are derived (UTC) views.

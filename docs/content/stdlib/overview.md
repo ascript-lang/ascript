@@ -69,8 +69,9 @@ json, crypto, …) need no `await`.
 | [Data & serialization](data) | `json` · `csv` · `toml` · `yaml` · `encoding` · `regex` · `uuid` · `url` |
 | [System & files](system) | `fs` · `env` · `io` · `process` · `crypto` · `compress` · `sqlite` |
 | [CLI & terminal](cli) | `cli` · `color` |
-| [Time & locale](time) | `time` · `date` · `intl` |
+| [Time & locale](time) | `time` (+ `interval`/`debounce`/`throttle`) · `date` · `intl` |
 | [Networking & HTTP](net) | `net/tcp` · `net/http` · `http/server` · `net/ws` |
+| [Async & concurrency](async) | `task` (+ `retry`) · `sync` (channels · semaphore · rateLimiter) |
 | [Logging](log) | `log` |
 | [Terminal UI](tui) | `tui` |
 

@@ -189,9 +189,7 @@ impl Interp {
         let mut iv = match self.take_resource(id) {
             Some(ResourceState::Interval(iv)) => iv,
             _ => {
-                return Err(
-                    AsError::at("interval.tick: handle was already closed", span).into(),
-                );
+                return Err(AsError::at("interval.tick: handle was already closed", span).into());
             }
         };
         // Await the next tick outside any borrow.
@@ -214,7 +212,10 @@ impl Interp {
     ) -> Result<Value, Control> {
         if m.method != "call" {
             return Err(AsError::at(
-                format!("debounce wrapper has no method '{}' (call it as a function)", m.method),
+                format!(
+                    "debounce wrapper has no method '{}' (call it as a function)",
+                    m.method
+                ),
                 span,
             )
             .into());
@@ -272,7 +273,10 @@ impl Interp {
     ) -> Result<Value, Control> {
         if m.method != "call" {
             return Err(AsError::at(
-                format!("throttle wrapper has no method '{}' (call it as a function)", m.method),
+                format!(
+                    "throttle wrapper has no method '{}' (call it as a function)",
+                    m.method
+                ),
                 span,
             )
             .into());

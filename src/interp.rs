@@ -95,7 +95,10 @@ pub(crate) enum ResourceState {
     // `Connection::prepare_cached` on each `run`/`all` (rusqlite caches the parsed
     // statement internally, so there's no re-parse cost). See std/sqlite.
     #[cfg(feature = "sql")]
-    SqliteStatement { conn_id: u64, sql: String },
+    SqliteStatement {
+        conn_id: u64,
+        sql: String,
+    },
     // The process child handle requires tokio's `process` feature, which `sys`
     // enables (M13 Task 7, `std/process`). `spawn` registers the live child plus
     // its piped stdout/stderr (as `Reader`s) and stdin (as a `Writer`).

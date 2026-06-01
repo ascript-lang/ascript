@@ -321,8 +321,7 @@ impl Interp {
                     {
                         // Short synchronous borrow — no .await held across it.
                         let inner = ch.queue.borrow();
-                        let still_full =
-                            inner.capacity > 0 && inner.queue.len() >= inner.capacity;
+                        let still_full = inner.capacity > 0 && inner.queue.len() >= inner.capacity;
                         if inner.closed || !still_full {
                             // State changed under us: loop to re-handle without parking.
                             continue;
@@ -425,9 +424,7 @@ impl Interp {
         let id = require_channel_id(&arg(args, 0), span, "sync.tryRecv")?;
 
         match get_channel(self, id) {
-            None => {
-                Err(AsError::at("sync.tryRecv: first argument is not a channel", span).into())
-            }
+            None => Err(AsError::at("sync.tryRecv: first argument is not a channel", span).into()),
             Some(ch) => {
                 let mut inner = ch.queue.borrow_mut();
                 match inner.queue.pop_front() {
@@ -468,11 +465,9 @@ impl Interp {
     fn sync_semaphore(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let n = want_number(&arg(args, 0), span, "sync.semaphore permits")?;
         if n < 1.0 || n.fract() != 0.0 {
-            return Err(AsError::at(
-                "sync.semaphore: permits must be a positive integer",
-                span,
-            )
-            .into());
+            return Err(
+                AsError::at("sync.semaphore: permits must be a positive integer", span).into(),
+            );
         }
         let sem = Semaphore::new(n as usize);
         let handle = self.register_resource(
@@ -494,10 +489,11 @@ impl Interp {
             let sem = match get_semaphore(self, id) {
                 Some(s) => s,
                 None => {
-                    return Err(
-                        AsError::at("sync.acquire: first argument is not a semaphore", span)
-                            .into(),
-                    );
+                    return Err(AsError::at(
+                        "sync.acquire: first argument is not a semaphore",
+                        span,
+                    )
+                    .into());
                 }
             };
 
@@ -573,7 +569,8 @@ impl Interp {
         let func = arg(args, 1);
 
         // Acquire one permit (async, may park).
-        self.sync_acquire(std::slice::from_ref(&sem_val), span).await?;
+        self.sync_acquire(std::slice::from_ref(&sem_val), span)
+            .await?;
 
         // Call fn() and capture the result — OK or Control (Panic/Propagate).
         let call_result = self.call_value(func, vec![], span).await;
@@ -674,11 +671,9 @@ impl Interp {
     ) -> Result<Value, Control> {
         match m.method.as_str() {
             "acquire" => self.rate_limiter_acquire(m.receiver.id, span).await,
-            other => Err(AsError::at(
-                format!("rateLimiter has no method '{}'", other),
-                span,
-            )
-            .into()),
+            other => {
+                Err(AsError::at(format!("rateLimiter has no method '{}'", other), span).into())
+            }
         }
     }
 
@@ -698,9 +693,7 @@ impl Interp {
             let rl = match get_rate_limiter(self, id) {
                 Some(r) => r,
                 None => {
-                    return Err(
-                        AsError::at("rateLimiter.acquire: handle is invalid", span).into(),
-                    );
+                    return Err(AsError::at("rateLimiter.acquire: handle is invalid", span).into());
                 }
             };
 
@@ -1034,10 +1027,12 @@ print(okb)
 
     #[tokio::test]
     async fn send_non_channel_panics() {
-        let result = crate::run_source(r#"
+        let result = crate::run_source(
+            r#"
 import { send } from "std/sync"
 await send(42, "oops")
-"#)
+"#,
+        )
         .await;
         assert!(result.is_err(), "expected Tier-2 panic, got: {:?}", result);
     }
@@ -1188,36 +1183,54 @@ print(available(s))   // 2
 
     #[tokio::test]
     async fn semaphore_zero_permits_panics() {
-        let result = crate::run_source(r#"
+        let result = crate::run_source(
+            r#"
 import { semaphore } from "std/sync"
 let s = semaphore(0)
-"#)
+"#,
+        )
         .await;
-        assert!(result.is_err(), "expected Tier-2 panic for 0 permits, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected Tier-2 panic for 0 permits, got: {:?}",
+            result
+        );
     }
 
     // ── semaphore(negative) → Tier-2 panic ───────────────────────────────────
 
     #[tokio::test]
     async fn semaphore_negative_permits_panics() {
-        let result = crate::run_source(r#"
+        let result = crate::run_source(
+            r#"
 import { semaphore } from "std/sync"
 let s = semaphore(-3)
-"#)
+"#,
+        )
         .await;
-        assert!(result.is_err(), "expected Tier-2 panic for negative permits, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected Tier-2 panic for negative permits, got: {:?}",
+            result
+        );
     }
 
     // ── non-semaphore arg to acquire → Tier-2 panic ──────────────────────────
 
     #[tokio::test]
     async fn acquire_non_semaphore_panics() {
-        let result = crate::run_source(r#"
+        let result = crate::run_source(
+            r#"
 import { acquire } from "std/sync"
 await acquire(42)
-"#)
+"#,
+        )
         .await;
-        assert!(result.is_err(), "expected Tier-2 panic for non-semaphore arg, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected Tier-2 panic for non-semaphore arg, got: {:?}",
+            result
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════

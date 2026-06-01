@@ -50,8 +50,8 @@ pub mod regex;
 pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
-pub mod sync;
 pub mod string;
+pub mod sync;
 pub mod task_mod;
 pub mod time;
 pub mod time_timers;
