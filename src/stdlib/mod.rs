@@ -37,6 +37,8 @@ pub mod log;
 pub mod map;
 pub mod math;
 #[cfg(feature = "net")]
+pub mod net_host;
+#[cfg(feature = "net")]
 pub mod net_http;
 #[cfg(feature = "net")]
 pub mod net_tcp;
@@ -117,6 +119,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/io" => io::exports(),
         #[cfg(feature = "sys")]
         "std/process" => process::exports(),
+        #[cfg(feature = "net")]
+        "std/net" => net_host::exports(),
         #[cfg(feature = "net")]
         "std/net/tcp" => net_tcp::exports(),
         #[cfg(feature = "net")]
@@ -227,6 +231,8 @@ impl Interp {
             "io" => self.call_io(func, args, span).await,
             #[cfg(feature = "sys")]
             "process" => self.call_process(func, args, span).await,
+            #[cfg(feature = "net")]
+            "net" => self.call_net(func, args, span).await,
             #[cfg(feature = "net")]
             "net_tcp" => self.call_net_tcp(func, args, span).await,
             #[cfg(feature = "net")]
