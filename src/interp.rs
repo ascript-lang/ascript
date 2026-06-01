@@ -5781,4 +5781,201 @@ print(type(d))
         .await;
         assert_eq!(out.trim(), "decimal");
     }
+
+    // ── 6d: json.parse(text, schema) ─────────────────────────────────────────
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_with_schema_ok() {
+        // json.parse(validJson, schema) → [value, nil]
+        let src = r#"
+import * as json from "std/json"
+import * as schema from "std/schema"
+let s = schema.object({name: schema.string(), age: schema.number()})
+let [v, err] = json.parse("{\"name\":\"Ada\",\"age\":30}", s)
+print(err == nil)
+print(v.name)
+print(v.age)
+"#;
+        let out = run(src).await;
+        assert!(
+            out.contains("true") && out.contains("Ada") && out.contains("30"),
+            "got: {out}"
+        );
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_with_schema_bad_shape() {
+        // json.parse(validJson but wrong shape, schema) → [nil, {path, message}]
+        let src = r#"
+import * as json from "std/json"
+import * as schema from "std/schema"
+let s = schema.object({id: schema.number()})
+let [v, err] = json.parse("{\"id\":\"not-a-number\"}", s)
+print(v == nil)
+print(err != nil)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("true"), "got: {out}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_with_schema_malformed_json() {
+        // json.parse(malformedJson, schema) → [nil, err]  (parse failure fused)
+        let src = r#"
+import * as json from "std/json"
+import * as schema from "std/schema"
+let s = schema.object({id: schema.number()})
+let [v, err] = json.parse("{not json", s)
+print(v == nil)
+print(err != nil)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("true"), "got: {out}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_schema_regression_1arg() {
+        // REGRESSION: json.parse(text) with no second arg still works.
+        let src = r#"
+import * as json from "std/json"
+let [v, err] = json.parse("{\"x\":1}")
+print(err == nil)
+print(v.x)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("true") && out.contains('1'), "got: {out}");
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn json_parse_schema_regression_class() {
+        // REGRESSION: json.parse(text, Class) still validates into the class.
+        let src = r#"
+import * as json from "std/json"
+class P { id: number }
+let [v, err] = json.parse("{\"id\":42}", P)
+print(err == nil)
+print(v.id)
+"#;
+        let out = run(src).await;
+        assert!(out.contains("true") && out.contains("42"), "got: {out}");
+    }
+
+    // ── 6d: schema.fromClass ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn schema_from_class_ok() {
+        // schema.fromClass(SomeClass) → derived schema that validates objects
+        // matching the class's declared fields.
+        let src = "import * as schema from \"std/schema\"\n\
+                   class User {\n  id: number\n  name: string\n}\n\
+                   let s = schema.fromClass(User)\n\
+                   let [v, err] = schema.parse(s, {id: 1, name: \"Alice\"})\n\
+                   print(err == nil)\n\
+                   print(v.id)\n\
+                   print(v.name)";
+        let out = run(src).await;
+        assert!(
+            out.contains("true") && out.contains('1') && out.contains("Alice"),
+            "got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_from_class_mismatch() {
+        // A wrong-typed field via fromClass schema → [nil, errObj] (Tier-1).
+        let src = "import * as schema from \"std/schema\"\n\
+                   class User {\n  id: number\n  name: string\n}\n\
+                   let s = schema.fromClass(User)\n\
+                   let [v, err] = schema.parse(s, {id: \"oops\", name: \"Alice\"})\n\
+                   print(v == nil)\n\
+                   print(err != nil)";
+        let out = run(src).await;
+        assert!(out.contains("true"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn schema_from_class_nested_recurses() {
+        // A nested class field (addr: Address) recurses into a nested object
+        // schema — so a deep field is fully validated, not silently accepted.
+        let prelude = "import * as schema from \"std/schema\"\n\
+                       class Address {\n  city: string\n  zip: number\n}\n\
+                       class User {\n  name: string\n  addr: Address\n}\n\
+                       let s = schema.fromClass(User)\n";
+
+        // 1. a fully-matching nested object → ok.
+        let ok_src = format!(
+            "{}let [v, err] = schema.parse(s, {{name: \"a\", addr: {{city: \"x\", zip: 1}}}})\n\
+             print(err == nil)\nprint(v.addr.city)\nprint(v.addr.zip)",
+            prelude
+        );
+        let out = run(&ok_src).await;
+        assert!(
+            out.contains("true") && out.contains('x') && out.contains('1'),
+            "ok case got: {out}"
+        );
+
+        // 2. a wrong-typed DEEP field (addr.zip is a string) → Tier-1 err whose
+        //    path points into the nested field and message mentions number.
+        let bad_src = format!(
+            "{}let [v, err] = schema.parse(s, {{name: \"a\", addr: {{city: \"x\", zip: \"bad\"}}}})\n\
+             print(v == nil)\nprint(err.path)\nprint(err.message)",
+            prelude
+        );
+        let out2 = run(&bad_src).await;
+        assert!(out2.contains("true"), "deep mismatch not rejected: {out2}");
+        assert!(
+            out2.contains("addr.zip"),
+            "err.path should point into nested field, got: {out2}"
+        );
+        assert!(
+            out2.contains("number"),
+            "err.message should mention number, got: {out2}"
+        );
+
+        // 3. a NON-OBJECT nested value (addr: 42) → rejected (must be an object),
+        //    NOT silently accepted as `any`.
+        let nonobj_src = format!(
+            "{}let [v, err] = schema.parse(s, {{name: \"a\", addr: 42}})\n\
+             print(v == nil)\nprint(err != nil)\nprint(err.path)",
+            prelude
+        );
+        let out3 = run(&nonobj_src).await;
+        assert!(
+            out3.contains("true"),
+            "non-object nested value should be rejected, got: {out3}"
+        );
+        assert!(
+            out3.contains("addr"),
+            "err.path should mention addr, got: {out3}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_from_class_includes_inherited_fields() {
+        // fromClass walks the superclass chain (merged_field_schema): a base-class
+        // field is included in the derived schema and validated.
+        let src = "import * as schema from \"std/schema\"\n\
+                   class Animal {\n  legs: number\n}\n\
+                   class Dog extends Animal {\n  name: string\n}\n\
+                   let s = schema.fromClass(Dog)\n\
+                   let [v, err] = schema.parse(s, {legs: 4, name: \"Rex\"})\n\
+                   print(err == nil)\nprint(v.legs)\nprint(v.name)\n\
+                   let [v2, err2] = schema.parse(s, {legs: \"four\", name: \"Rex\"})\n\
+                   print(v2 == nil)\nprint(err2.path)";
+        let out = run(src).await;
+        assert!(
+            out.contains("true") && out.contains('4') && out.contains("Rex"),
+            "inherited-field ok case got: {out}"
+        );
+        // The inherited base field is also type-checked.
+        assert!(
+            out.contains("legs"),
+            "inherited field mismatch should report path 'legs', got: {out}"
+        );
+    }
 }

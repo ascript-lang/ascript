@@ -89,6 +89,10 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("pattern", bi("schema.pattern")),
         ("refine", bi("schema.refine")),
         ("default", bi("schema.default")),
+        // ── 6d bridge ────────────────────────────────────────────────────────
+        // `schema.fromClass(Class)` derives a schema from the class's declared
+        // fields; uses the same Type→schema mapping as `validate_into`.
+        ("fromClass", bi("schema.fromClass")),
     ]
 }
 
@@ -104,8 +108,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// - `Control` wraps a `Control` that emerged from a `refine` user-function call
 ///   (panic or propagate). The parse boundary re-raises it as-is so refine-fn
 ///   panics are genuine Tier-2 panics, not validation mismatches.
+///
+/// `pub(crate)` so that `mod.rs` can pattern-match on `ParseFail` variants when
+/// bridging `json.parse(text, schema)` and `resp.json(schema)`.
 #[derive(Debug)]
-enum ParseFail {
+pub(crate) enum ParseFail {
     Mismatch(Value),
     InvalidSchema(String),
     Control(Control),
@@ -136,7 +143,10 @@ fn err_obj(path: &str, message: String) -> Value {
 
 /// Extract the `__kind` field from a schema Object, or return `None` if the
 /// value is not an Object or has no `__kind` string.
-fn schema_kind(schema: &Value) -> Option<Rc<str>> {
+///
+/// `pub(crate)` so that `mod.rs` can detect a schema value as the 2nd arg of
+/// `json.parse(text, schema)` without importing the entire engine.
+pub(crate) fn schema_kind(schema: &Value) -> Option<Rc<str>> {
     match schema {
         Value::Object(o) => match o.borrow().get("__kind") {
             Some(Value::Str(s)) => Some(s.clone()),
@@ -152,6 +162,181 @@ fn obj_field(obj: &Value, key: &str) -> Option<Value> {
         Value::Object(o) => o.borrow().get(key).cloned(),
         _ => None,
     }
+}
+
+// ── Type → schema conversion (used by fromClass) ─────────────────────────────
+
+/// Convert an AScript `Type` annotation to its schema-tagged Object equivalent.
+///
+/// ## Coverage
+/// | Type                  | Schema                           |
+/// |-----------------------|----------------------------------|
+/// | `number`              | `{__kind:"number"}`              |
+/// | `string`              | `{__kind:"string"}`              |
+/// | `bool`                | `{__kind:"bool"}`                |
+/// | `nil`                 | `{__kind:"nil"}`                 |
+/// | `any`                 | `{__kind:"any"}`                 |
+/// | `T?` (Optional)       | `{__kind:"optional", inner:T}`   |
+/// | `array<T>`            | `{__kind:"array", elem:T}`       |
+/// | `map<K,V>`            | `{__kind:"map", key:K, val:V}`   |
+/// | `Named(ClassName)`    | nested object schema (recurse) — see note |
+/// | `Union(A,B)`          | `{__kind:"union", options:[A,B]}`|
+/// | `fn`/`object`/`error` | `{__kind:"any"}` (permissive)   |
+/// | `Result<T>`/`Tuple`/`Future` | `{__kind:"any"}` (permissive) |
+///
+/// ## Named class types — recurse, never silent accept-all
+/// A `Named` type refers to a class by name (e.g. a field `addr: Address`).
+/// It is resolved in `def_env` — the declaring class's definition environment,
+/// the same scope `validate_into` uses for nested-class coercion. When the name
+/// resolves to a `Value::Class`, we recurse via `class_to_object_schema_inner`
+/// to build the nested `{__kind:"object", fields:{...}}` schema — so a nested
+/// field is fully validated.
+///
+/// `visited` guards against self-referential / mutually-recursive classes: a
+/// name already on the stack (or one that does not resolve to a class in
+/// `def_env`) falls back to a **bare object schema `{__kind:"object",
+/// fields:{}}`** — which accepts any *object* but **rejects non-objects /
+/// primitives**. This preserves the object-shape requirement (a non-object
+/// nested value is a Tier-1 error) without infinite recursion and without ever
+/// silently accepting non-object values.
+fn type_to_schema(
+    ty: &crate::ast::Type,
+    def_env: &crate::env::Environment,
+    visited: &mut std::collections::HashSet<String>,
+) -> Value {
+    use crate::ast::Type;
+    match ty {
+        Type::Number => make_schema("number"),
+        Type::String => make_schema("string"),
+        Type::Bool => make_schema("bool"),
+        Type::Nil => make_schema("nil"),
+        // any, fn, object, error — accept-all
+        Type::Any | Type::Fn | Type::Object | Type::Error => make_schema("any"),
+        // T? → {__kind:"optional", inner: type_to_schema(T)}
+        Type::Optional(inner) => {
+            let inner_schema = type_to_schema(inner, def_env, visited);
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("__kind".to_string(), Value::Str("optional".into()));
+            m.insert("inner".to_string(), inner_schema);
+            Value::Object(Rc::new(RefCell::new(m)))
+        }
+        // array<T> → {__kind:"array", elem: type_to_schema(T)}
+        Type::Array(elem) => {
+            let elem_schema = type_to_schema(elem, def_env, visited);
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("__kind".to_string(), Value::Str("array".into()));
+            m.insert("elem".to_string(), elem_schema);
+            Value::Object(Rc::new(RefCell::new(m)))
+        }
+        // map<K,V> → {__kind:"map", key: type_to_schema(K), val: type_to_schema(V)}
+        Type::Map(k, v) => {
+            let key_schema = type_to_schema(k, def_env, visited);
+            let val_schema = type_to_schema(v, def_env, visited);
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("__kind".to_string(), Value::Str("map".into()));
+            m.insert("key".to_string(), key_schema);
+            m.insert("val".to_string(), val_schema);
+            Value::Object(Rc::new(RefCell::new(m)))
+        }
+        // Union(A, B) → {__kind:"union", options:[schema_A, schema_B]}
+        // Flattened so nested Union(Union(A,B),C) → options:[A,B,C].
+        Type::Union(a, b) => {
+            fn collect_union_arms(
+                t: &crate::ast::Type,
+                def_env: &crate::env::Environment,
+                visited: &mut std::collections::HashSet<String>,
+                out: &mut Vec<Value>,
+            ) {
+                if let crate::ast::Type::Union(a, b) = t {
+                    collect_union_arms(a, def_env, visited, out);
+                    collect_union_arms(b, def_env, visited, out);
+                } else {
+                    out.push(type_to_schema(t, def_env, visited));
+                }
+            }
+            let mut opts: Vec<Value> = Vec::new();
+            collect_union_arms(
+                &Type::Union(a.clone(), b.clone()),
+                def_env,
+                visited,
+                &mut opts,
+            );
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("__kind".to_string(), Value::Str("union".into()));
+            m.insert(
+                "options".to_string(),
+                Value::Array(Rc::new(RefCell::new(opts))),
+            );
+            Value::Object(Rc::new(RefCell::new(m)))
+        }
+        // Named class type: a field declared `fieldName: SomeClass`. Resolve the
+        // class in `def_env` and recurse to a nested object schema. On a cycle
+        // (name already being expanded) or an unresolvable name, fall back to a
+        // bare object schema — accepts any object, rejects primitives — NEVER
+        // `any()` (see fn-level doc).
+        Type::Named(name) => match def_env.get(name) {
+            Some(Value::Class(c)) if !visited.contains(name) => {
+                visited.insert(name.clone());
+                let nested = class_to_object_schema_inner(&c, visited);
+                visited.remove(name); // siblings of the same type still resolve
+                nested
+            }
+            // Cycle (already in `visited`) or not a class in scope → object-shape
+            // requirement only (rejects non-objects), never silent accept-all.
+            _ => {
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("__kind".to_string(), Value::Str("object".into()));
+                m.insert(
+                    "fields".to_string(),
+                    Value::Object(Rc::new(RefCell::new(IndexMap::new()))),
+                );
+                m.insert("strict".to_string(), Value::Bool(false));
+                Value::Object(Rc::new(RefCell::new(m)))
+            }
+        },
+        // Result<T>, Tuple, Future — accept-all (no clean schema mapping)
+        Type::Result(_) | Type::Tuple(_) | Type::Future(_) => make_schema("any"),
+    }
+}
+
+/// Build an `{__kind:"object", fields:{...}, strict:false}` schema from a
+/// class's merged field schema. Each declared field is converted via
+/// `type_to_schema`, resolving nested class names in that field's *declaring*
+/// class def env (the same scoping `validate_into` uses), with `visited`
+/// carried through to guard against recursive class graphs.
+fn class_to_object_schema_inner(
+    class: &std::rc::Rc<crate::value::Class>,
+    visited: &mut std::collections::HashSet<String>,
+) -> Value {
+    use crate::value::merged_field_schema;
+    let fields_map = merged_field_schema(class);
+
+    let mut fields: IndexMap<String, Value> = IndexMap::new();
+    for (name, (fs, defining_class)) in &fields_map {
+        // Nested class names resolve in the env of the class that DECLARED the
+        // field (matches validate_into's per-field def_class.def_env scoping).
+        fields.insert(
+            name.clone(),
+            type_to_schema(&fs.ty, &defining_class.def_env, visited),
+        );
+    }
+
+    let fields_obj = Value::Object(Rc::new(RefCell::new(fields)));
+    let mut m: IndexMap<String, Value> = IndexMap::new();
+    m.insert("__kind".to_string(), Value::Str("object".into()));
+    m.insert("fields".to_string(), fields_obj);
+    m.insert("strict".to_string(), Value::Bool(false));
+    Value::Object(Rc::new(RefCell::new(m)))
+}
+
+/// Build an object schema from a class's merged field schema (the `fromClass`
+/// entry point). Seeds the cycle-guard with the class's own name so a directly
+/// self-referential field falls back to the bare-object schema rather than
+/// recursing forever.
+fn class_to_object_schema(class: &std::rc::Rc<crate::value::Class>) -> Value {
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(class.name.clone());
+    class_to_object_schema_inner(class, &mut visited)
 }
 
 // ── Interp dispatch + parse engine (async, on &self for 6b/6c) ──────────────────
@@ -178,7 +363,7 @@ impl Interp {
     /// take no borrow across a yield; the `refine` arm clones the fn value out
     /// before awaiting `call_value`.
     #[async_recursion::async_recursion(?Send)]
-    async fn parse_value(
+    pub(crate) async fn parse_value(
         &self,
         schema: &Value,
         value: &Value,
@@ -977,6 +1162,39 @@ impl Interp {
                     Err(ParseFail::InvalidSchema(msg)) => Err(AsError::at(msg, span).into()),
                     // A panic/propagate from inside a refine fn — re-raise unchanged.
                     Err(ParseFail::Control(c)) => Err(c),
+                }
+            }
+
+            // ── 6d: schema.fromClass(Class) → object schema ───────────────────
+            //
+            // Derives a `{__kind:"object", fields:{...}, strict:false}` schema
+            // from the class's declared fields, recursively via `type_to_schema`.
+            //
+            // Type→schema mapping:
+            //   number → schema.number()
+            //   string → schema.string()
+            //   bool   → schema.bool()
+            //   nil    → schema.nilType()
+            //   any/fn/object/error → schema.any()
+            //   T?     → schema.optional(inner)
+            //   array<T> → schema.array(inner)
+            //   map<K,V> → schema.map(key, val)
+            //   Union(A,B) → schema.union([A,B]) (flattened)
+            //   Named(ClassName) → schema.any()  (see module doc for rationale)
+            //   Result/Tuple/Future → schema.any()
+            //
+            // Misuse (non-class argument) → Tier-2 panic.
+            "fromClass" => {
+                match arg(args, 0) {
+                    Value::Class(c) => Ok(class_to_object_schema(&c)),
+                    other => Err(AsError::at(
+                        format!(
+                            "schema.fromClass: expected a class, got {}",
+                            crate::interp::type_name(&other)
+                        ),
+                        span,
+                    )
+                    .into()),
                 }
             }
 
