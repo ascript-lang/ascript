@@ -212,6 +212,10 @@ pub(crate) enum ResourceState {
     // std/sync: a token-bucket rate limiter. count tokens per window_ms ms.
     // Available tokens + window_start live in RefCells; Notify for wakeups.
     RateLimiter(crate::stdlib::sync::RateLimiterState),
+    // std/stream: a lazy pull-based stream (a source + a chain of combinator
+    // stages), driven by `Interp::pull_next`. Always present (core). Boxed to keep
+    // the enum compact (a StreamState carries a Vec of stages + a source).
+    Stream(Box<crate::stdlib::stream::StreamState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]

@@ -75,9 +75,12 @@ json, crypto, …) need no `await`.
 | [Async & concurrency](async) | `task` (+ `retry`) · `sync` (channels · semaphore · rateLimiter) |
 | [Logging](log) | `log` |
 | [Terminal UI](tui) | `tui` |
+| [Lazy streams](stream) | `stream` (lazy pull engine: sources, combinators, terminals) |
+| [Test assertions](assert) | `assert` (deep eq, comparisons, contains, approxEq, throws, snapshot) |
+| [Benchmarking](bench) | `bench` (measure · compare) |
 
 ## Feature flags
 
 Every module is behind a Cargo feature, all enabled by `default`. A build with
 `--no-default-features` exposes only the gateless core (`string`, `array`, `object`, `map`, `math`,
-`convert`, `time`, `cli`, `color`). See [Getting started](../getting-started#feature-flags) for the full mapping.
+`convert`, `time`, `cli`, `color`, `stream`, `bench`, and `assert` without snapshot). See [Getting started](../getting-started#feature-flags) for the full mapping.

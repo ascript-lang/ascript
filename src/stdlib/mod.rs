@@ -5,6 +5,8 @@
 //! are ordinary `function` values; argument-type misuse is a Tier-2 panic.
 
 pub mod array;
+pub mod assert_mod;
+pub mod bench;
 pub mod bytes;
 pub mod cli;
 pub mod color;
@@ -57,6 +59,7 @@ pub mod schema;
 pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
+pub mod stream;
 pub mod string;
 pub mod sync;
 pub mod task_mod;
@@ -88,6 +91,8 @@ pub(crate) fn bi(qualified: &str) -> Value {
 /// if `path` is not a known stdlib module.
 pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
+        "std/assert" => assert_mod::exports(),
+        "std/bench" => bench::exports(),
         "std/cli" => cli::exports(),
         "std/color" => color::exports(),
         "std/decimal" => decimal::exports(),
@@ -103,6 +108,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/task" => task_mod::exports(),
         "std/time" => time::exports(),
         "std/sync" => sync::exports(),
+        "std/stream" => stream::exports(),
         #[cfg(feature = "datetime")]
         "std/date" => date::exports(),
         #[cfg(feature = "intl")]
@@ -242,6 +248,8 @@ impl Interp {
             }
         }
         match module {
+            "assert" => self.call_assert(func, args, span).await,
+            "bench" => self.call_bench(func, args, span).await,
             "cli" => self.call_cli(func, args, span).await,
             "color" => color::call(func, args, span),
             "decimal" => decimal::call(func, args, span),
@@ -257,6 +265,7 @@ impl Interp {
             "task" => self.call_task(func, args, span).await,
             "time" => self.call_time(func, args, span).await,
             "sync" => self.call_sync(func, args, span).await,
+            "stream" => self.call_stream(func, args, span).await,
             #[cfg(feature = "datetime")]
             "date" => date::call(func, args, span),
             #[cfg(feature = "intl")]
