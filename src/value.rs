@@ -174,6 +174,10 @@ pub enum NativeKind {
     DebounceWrapper,
     // std/time: a throttle wrapper (leading-edge). Callable as `wrapper(args)`.
     ThrottleWrapper,
+    // std/sync: a token-bucket rate limiter. `.acquire()` awaits a token; the
+    // bucket refills `count` tokens every `window_ms` milliseconds (monotonic
+    // clock — no background task). Not feature-gated.
+    RateLimiter,
 }
 
 impl NativeKind {
@@ -200,6 +204,7 @@ impl NativeKind {
             NativeKind::Interval => "interval",
             NativeKind::DebounceWrapper => "debounce",
             NativeKind::ThrottleWrapper => "throttle",
+            NativeKind::RateLimiter => "rateLimiter",
         }
     }
 }

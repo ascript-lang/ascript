@@ -69,6 +69,47 @@ impl Semaphore {
     }
 }
 
+// ── RateLimiter data structures ───────────────────────────────────────────────
+
+/// A token-bucket rate limiter: `count` tokens per `window_ms` milliseconds.
+///
+/// Uses a monotonic-clock bucket: each `.acquire()` call checks whether the
+/// window has elapsed (refilling if so) then decrements. If no tokens are
+/// available the caller parks on `token_available` until a spawned one-shot
+/// timer fires after the next window boundary and calls `notify_waiters()`.
+///
+/// State layout mirrors `Semaphore`: `Rc` fields are cloned out before any
+/// `.await` so no `RefCell` borrow is held across an await (borrow discipline).
+pub struct RateLimiterState {
+    /// Tokens per window.
+    pub count: usize,
+    /// Window size in milliseconds.
+    pub window_ms: u64,
+    /// Currently available tokens (0 ..= count). Behind a `RefCell` because
+    /// multiple acquire futures may observe/mutate it concurrently on the
+    /// single-thread runtime.
+    pub available: Rc<RefCell<usize>>,
+    /// When the current window started. `Instant` is `Copy` so we can snapshot
+    /// it without holding the borrow.
+    pub window_start: Rc<RefCell<std::time::Instant>>,
+    /// Fires when tokens become available (after a refill by the timer task).
+    /// Stored *outside* any RefCell so it can be cloned and awaited without
+    /// holding a borrow.
+    pub token_available: Rc<tokio::sync::Notify>,
+}
+
+impl RateLimiterState {
+    pub fn new(count: usize, window_ms: u64) -> Self {
+        RateLimiterState {
+            count,
+            window_ms,
+            available: Rc::new(RefCell::new(count)),
+            window_start: Rc::new(RefCell::new(std::time::Instant::now())),
+            token_available: Rc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
 // ── Channel data structures ───────────────────────────────────────────────────
 
 /// The queue and metadata for a channel (inside a `RefCell` so mutation is shared).
@@ -120,6 +161,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("release", bi("sync.release")),
         ("withPermit", bi("sync.withPermit")),
         ("available", bi("sync.available")),
+        ("rateLimiter", bi("sync.rateLimiter")),
     ]
 }
 
@@ -162,6 +204,21 @@ fn get_semaphore(interp: &Interp, id: u64) -> Option<Semaphore> {
     })
 }
 
+/// Extract the `RateLimiterState` from the resource table by cloning all Rcs.
+/// Returns `None` when the id is absent or maps to a non-RateLimiter resource.
+fn get_rate_limiter(interp: &Interp, id: u64) -> Option<RateLimiterState> {
+    interp.with_resource(id, |r| match r {
+        Some(ResourceState::RateLimiter(rl)) => Some(RateLimiterState {
+            count: rl.count,
+            window_ms: rl.window_ms,
+            available: rl.available.clone(),
+            window_start: rl.window_start.clone(),
+            token_available: rl.token_available.clone(),
+        }),
+        _ => None,
+    })
+}
+
 // ── Interp impl ───────────────────────────────────────────────────────────────
 
 impl Interp {
@@ -183,6 +240,7 @@ impl Interp {
             "release" => self.sync_release(args, span),
             "withPermit" => self.sync_with_permit(args, span).await,
             "available" => self.sync_available(args, span),
+            "rateLimiter" => self.sync_rate_limiter(args, span),
             _ => Err(AsError::at(format!("std/sync has no function '{}'", func), span).into()),
         }
     }
@@ -539,6 +597,169 @@ impl Interp {
             Some(sem) => {
                 let count = *sem.available.borrow() as f64;
                 Ok(Value::Number(count))
+            }
+        }
+    }
+
+    // ── sync.rateLimiter ──────────────────────────────────────────────────────
+
+    /// `rateLimiter({perSecond: N} | {count: N, windowMs: M}) -> handle`
+    ///
+    /// Creates a token-bucket rate limiter. The returned native handle supports
+    /// one method: `limiter.acquire()` — async, awaits until a token is available.
+    fn sync_rate_limiter(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let opts = arg(args, 0);
+        let (count, window_ms) = match &opts {
+            Value::Object(obj) => {
+                let o = obj.borrow();
+                if let Some(ps) = o.get("perSecond") {
+                    let n = want_number(ps, span, "sync.rateLimiter perSecond")?;
+                    if n < 1.0 || n.fract() != 0.0 {
+                        return Err(AsError::at(
+                            "sync.rateLimiter: perSecond must be a positive integer",
+                            span,
+                        )
+                        .into());
+                    }
+                    (n as usize, 1000u64)
+                } else {
+                    let count_v = o.get("count").cloned().unwrap_or(Value::Nil);
+                    let window_v = o.get("windowMs").cloned().unwrap_or(Value::Nil);
+                    let c = want_number(&count_v, span, "sync.rateLimiter count")?;
+                    let w = want_number(&window_v, span, "sync.rateLimiter windowMs")?;
+                    if c < 1.0 || c.fract() != 0.0 {
+                        return Err(AsError::at(
+                            "sync.rateLimiter: count must be a positive integer",
+                            span,
+                        )
+                        .into());
+                    }
+                    if w < 1.0 || w.fract() != 0.0 {
+                        return Err(AsError::at(
+                            "sync.rateLimiter: windowMs must be a positive integer",
+                            span,
+                        )
+                        .into());
+                    }
+                    (c as usize, w as u64)
+                }
+            }
+            other => {
+                return Err(AsError::at(
+                    format!(
+                        "sync.rateLimiter expects an options object, got {}",
+                        crate::interp::type_name(other)
+                    ),
+                    span,
+                )
+                .into());
+            }
+        };
+        let state = RateLimiterState::new(count, window_ms);
+        let handle = self.register_resource(
+            NativeKind::RateLimiter,
+            indexmap::IndexMap::new(),
+            ResourceState::RateLimiter(state),
+        );
+        Ok(handle)
+    }
+
+    /// Dispatch methods on a `RateLimiter` native handle.
+    /// Currently only `.acquire()` is supported.
+    pub(crate) async fn call_rate_limiter_method(
+        &self,
+        m: &std::rc::Rc<crate::value::NativeMethod>,
+        _args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match m.method.as_str() {
+            "acquire" => self.rate_limiter_acquire(m.receiver.id, span).await,
+            other => Err(AsError::at(
+                format!("rateLimiter has no method '{}'", other),
+                span,
+            )
+            .into()),
+        }
+    }
+
+    /// `limiter.acquire()` — await a token from the bucket.
+    ///
+    /// Token-bucket algorithm (monotonic clock, no background task):
+    /// 1. Check if the window has elapsed → refill to `count`, reset `window_start`.
+    /// 2. If tokens available, take one and return.
+    /// 3. Otherwise park: create a `notified()` future + `enable()` it (lost-wakeup
+    ///    safe), spawn a `spawn_local` timer that sleeps until the next window boundary
+    ///    then calls `notify_waiters()`, then await the notification.
+    /// 4. Loop to recheck (spurious wakeup / competing acquirers).
+    ///
+    /// Borrow discipline: Rc handles are cloned out; no RefCell borrow crosses .await.
+    async fn rate_limiter_acquire(&self, id: u64, span: Span) -> Result<Value, Control> {
+        loop {
+            let rl = match get_rate_limiter(self, id) {
+                Some(r) => r,
+                None => {
+                    return Err(
+                        AsError::at("rateLimiter.acquire: handle is invalid", span).into(),
+                    );
+                }
+            };
+
+            // Step 1 & 2: check for refill + take token under a short borrow.
+            enum Action {
+                Took,
+                Wait { sleep_ms: u64 },
+            }
+            let action = {
+                let mut avail = rl.available.borrow_mut();
+                let mut ws = rl.window_start.borrow_mut();
+                let elapsed = ws.elapsed().as_millis() as u64;
+                if elapsed >= rl.window_ms {
+                    // Window expired — refill.
+                    *avail = rl.count;
+                    *ws = std::time::Instant::now();
+                }
+                if *avail > 0 {
+                    *avail -= 1;
+                    Action::Took
+                } else {
+                    // Compute how long until next window resets.
+                    let wait = rl.window_ms.saturating_sub(elapsed).max(1);
+                    Action::Wait { sleep_ms: wait }
+                }
+            }; // borrows released
+
+            match action {
+                Action::Took => return Ok(Value::Nil),
+                Action::Wait { sleep_ms } => {
+                    // Lost-wakeup-safe park (mirrors semaphore acquire):
+                    // enable() the notified() future (registering the waiter NOW)
+                    // *before* the re-check, so any notify issued between the check
+                    // and our await is captured rather than dropped.
+                    let notified = rl.token_available.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable(); // register waiter before re-check
+
+                    // Re-check under short borrow — if state changed, loop without park.
+                    {
+                        let avail = rl.available.borrow();
+                        let ws = rl.window_start.borrow();
+                        let elapsed = ws.elapsed().as_millis() as u64;
+                        if *avail > 0 || elapsed >= rl.window_ms {
+                            continue;
+                        }
+                    }
+
+                    // Spawn a one-shot timer that notifies after the window resets.
+                    // This wakes all parked acquirers so they each re-check.
+                    let notify = rl.token_available.clone();
+                    tokio::task::spawn_local(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        notify.notify_waiters();
+                    });
+
+                    notified.await;
+                    // Re-loop to recheck (refill + take token).
+                }
             }
         }
     }
@@ -997,5 +1218,47 @@ await acquire(42)
 "#)
         .await;
         assert!(result.is_err(), "expected Tier-2 panic for non-semaphore arg, got: {:?}", result);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // rateLimiter tests
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── basic: two acquires succeed immediately, 3rd waits for window refill ─
+    // {count:2, windowMs:50}: first two acquires are instant; the 3rd must wait
+    // until the 50ms window resets.  We assert ordering via a timestamp check
+    // (elapsed >= ~40ms, tolerant) and a printed sequence.
+
+    #[tokio::test]
+    async fn rate_limiter_basic_count_window() {
+        let out = run(r#"
+import { rateLimiter } from "std/sync"
+import * as time from "std/time"
+
+let lim = rateLimiter({count: 2, windowMs: 50})
+await lim.acquire()
+await lim.acquire()
+let before = time.now()
+await lim.acquire()          // must wait for window reset
+let elapsed = time.now() - before
+print(elapsed >= 30)         // tolerant: at least 30ms
+"#)
+        .await;
+        assert_eq!(out, "true\n");
+    }
+
+    // ── perSecond sugar: {perSecond:N} is {count:N, windowMs:1000} ────────────
+
+    #[tokio::test]
+    async fn rate_limiter_per_second_alias() {
+        let out = run(r#"
+import { rateLimiter } from "std/sync"
+// N=1000 perSecond so the window fills quickly; just test it returns a handle
+let lim = rateLimiter({perSecond: 1000})
+await lim.acquire()
+print("ok")
+"#)
+        .await;
+        assert_eq!(out, "ok\n");
     }
 }

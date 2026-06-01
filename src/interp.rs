@@ -201,6 +201,9 @@ pub(crate) enum ResourceState {
     // lost-wakeup-safe park pattern as Channel::recv. The Semaphore struct holds
     // the counter inside a RefCell and the Notify as a separate Rc.
     Semaphore(crate::stdlib::sync::Semaphore),
+    // std/sync: a token-bucket rate limiter. count tokens per window_ms ms.
+    // Available tokens + window_start live in RefCells; Notify for wakeups.
+    RateLimiter(crate::stdlib::sync::RateLimiterState),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -2014,6 +2017,9 @@ impl Interp {
             }
             if matches!(m.receiver.kind, ThrottleWrapper) {
                 return self.call_throttle_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, RateLimiter) {
+                return self.call_rate_limiter_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
