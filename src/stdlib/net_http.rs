@@ -1453,9 +1453,11 @@ impl Interp {
                                             Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
                                                 Ok(make_pair(Value::Nil, e))
                                             }
-                                            Err(crate::stdlib::schema::ParseFail::InvalidSchema(
-                                                msg,
-                                            )) => Err(crate::error::AsError::at(msg, span).into()),
+                                            Err(
+                                                crate::stdlib::schema::ParseFail::InvalidSchema(
+                                                    msg,
+                                                ),
+                                            ) => Err(crate::error::AsError::at(msg, span).into()),
                                             Err(crate::stdlib::schema::ParseFail::Control(c)) => {
                                                 Err(c)
                                             }

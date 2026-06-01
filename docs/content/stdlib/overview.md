@@ -67,6 +67,7 @@ json, crypto, …) need no `await`.
 |---|---|
 | [Core & collections](collections) | `string` · `array` · `object` · `map` · `math` · `convert` · `bytes` |
 | [Data & serialization](data) | `json` · `csv` · `toml` · `yaml` · `encoding` · `regex` · `uuid` · `url` |
+| [Validation & schema](schema) | `schema` (composable validators, constraints, refine, coerce, fromClass) |
 | [System & files](system) | `fs` · `env` · `io` · `process` · `crypto` · `compress` · `sqlite` |
 | [CLI & terminal](cli) | `cli` · `color` |
 | [Time & locale](time) | `time` (+ `interval`/`debounce`/`throttle`) · `date` · `intl` |

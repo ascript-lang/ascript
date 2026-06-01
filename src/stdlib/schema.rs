@@ -409,18 +409,12 @@ impl Interp {
         //   Str("false") → "bool"   : Bool(false)
         let coerced: Option<Value> = if coerce {
             match (kind.as_ref(), value) {
-                ("number", Value::Str(s)) => {
-                    s.parse::<f64>().ok().map(Value::Number)
-                }
+                ("number", Value::Str(s)) => s.parse::<f64>().ok().map(Value::Number),
                 ("string", Value::Number(n)) => {
                     Some(Value::Str(Value::Number(*n).to_string().into()))
                 }
-                ("bool", Value::Str(s)) if s.as_ref() == "true" => {
-                    Some(Value::Bool(true))
-                }
-                ("bool", Value::Str(s)) if s.as_ref() == "false" => {
-                    Some(Value::Bool(false))
-                }
+                ("bool", Value::Str(s)) if s.as_ref() == "true" => Some(Value::Bool(true)),
+                ("bool", Value::Str(s)) if s.as_ref() == "false" => Some(Value::Bool(false)),
                 _ => None,
             }
         } else {
@@ -525,10 +519,7 @@ impl Interp {
                             if *n < min {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
-                                    format!(
-                                        "expected number >= {} (min), got {}",
-                                        min, n
-                                    ),
+                                    format!("expected number >= {} (min), got {}", min, n),
                                 )));
                             }
                         }
@@ -537,10 +528,7 @@ impl Interp {
                             if *n > max {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
-                                    format!(
-                                        "expected number <= {} (max), got {}",
-                                        max, n
-                                    ),
+                                    format!("expected number <= {} (max), got {}", max, n),
                                 )));
                             }
                         }
@@ -659,19 +647,18 @@ impl Interp {
                 match value {
                     Value::Object(val_obj) => {
                         // Collect declared field names and schemas
-                        let field_pairs: Vec<(String, Value)> =
-                            match &fields_schema {
-                                Value::Object(fs) => fs
-                                    .borrow()
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect(),
-                                _ => {
-                                    return Err(ParseFail::InvalidSchema(
-                                        "schema.parse: 'fields' must be an Object".into(),
-                                    ))
-                                }
-                            };
+                        let field_pairs: Vec<(String, Value)> = match &fields_schema {
+                            Value::Object(fs) => fs
+                                .borrow()
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                            _ => {
+                                return Err(ParseFail::InvalidSchema(
+                                    "schema.parse: 'fields' must be an Object".into(),
+                                ))
+                            }
+                        };
 
                         // strict: reject extra keys
                         if is_strict {
@@ -687,10 +674,7 @@ impl Interp {
                                     };
                                     return Err(ParseFail::Mismatch(err_obj(
                                         &key_path,
-                                        format!(
-                                            "unknown key '{}' not allowed in strict object",
-                                            k
-                                        ),
+                                        format!("unknown key '{}' not allowed in strict object", k),
                                     )));
                                 }
                             }
@@ -763,10 +747,12 @@ impl Interp {
                     // entry (e.g. `cfg[port] (key)`).
                     let val_path = format!("{}[{}]", path, raw_key);
                     let key_path = format!("{} (key)", val_path);
-                    let parsed_key =
-                        self.parse_value(&key_schema, &raw_key, &key_path, coerce, span).await?;
-                    let parsed_val =
-                        self.parse_value(&val_schema, &raw_val, &val_path, coerce, span).await?;
+                    let parsed_key = self
+                        .parse_value(&key_schema, &raw_key, &key_path, coerce, span)
+                        .await?;
+                    let parsed_val = self
+                        .parse_value(&val_schema, &raw_val, &val_path, coerce, span)
+                        .await?;
                     let map_key = MapKey::from_value(&parsed_key).ok_or_else(|| {
                         ParseFail::Mismatch(err_obj(
                             &key_path,
@@ -823,16 +809,18 @@ impl Interp {
                 }
                 return Err(ParseFail::Mismatch(err_obj(
                     path,
-                    format!("expected one of [{}], got {}", kinds.join(", "), type_name(value)),
+                    format!(
+                        "expected one of [{}], got {}",
+                        kinds.join(", "),
+                        type_name(value)
+                    ),
                 )));
             }
 
             // ── 6b: oneOf (enum-like, `enum` is a keyword) ───────────────────
             "oneOf" => {
                 let values_field = obj_field(schema, "values").ok_or_else(|| {
-                    ParseFail::InvalidSchema(
-                        "schema.parse: 'oneOf' schema missing 'values'".into(),
-                    )
+                    ParseFail::InvalidSchema("schema.parse: 'oneOf' schema missing 'values'".into())
                 })?;
                 let allowed: Vec<Value> = match &values_field {
                     Value::Array(a) => a.borrow().clone(),
@@ -850,11 +838,7 @@ impl Interp {
                 let listed: Vec<String> = allowed.iter().map(|v| format!("{}", v)).collect();
                 return Err(ParseFail::Mismatch(err_obj(
                     path,
-                    format!(
-                        "expected one of [{}], got {}",
-                        listed.join(", "),
-                        value
-                    ),
+                    format!("expected one of [{}], got {}", listed.join(", "), value),
                 )));
             }
 
@@ -947,11 +931,10 @@ impl Interp {
                             _ => unreachable!(),
                         }
                     }
-                    _ => Err(AsError::at(
-                        "schema.strict: argument must be an object schema",
-                        span,
-                    )
-                    .into()),
+                    _ => Err(
+                        AsError::at("schema.strict: argument must be an object schema", span)
+                            .into(),
+                    ),
                 }
             }
 
@@ -1147,10 +1130,9 @@ impl Interp {
                 // `{coerce: true}` enables conservative coercions before the
                 // base-kind check (see parse_value coercion table in module doc).
                 let coerce = match args.get(2) {
-                    Some(Value::Object(o)) => matches!(
-                        o.borrow().get("coerce"),
-                        Some(Value::Bool(true))
-                    ),
+                    Some(Value::Object(o)) => {
+                        matches!(o.borrow().get("coerce"), Some(Value::Bool(true)))
+                    }
                     _ => false,
                 };
 
@@ -1184,25 +1166,19 @@ impl Interp {
             //   Result/Tuple/Future → schema.any()
             //
             // Misuse (non-class argument) → Tier-2 panic.
-            "fromClass" => {
-                match arg(args, 0) {
-                    Value::Class(c) => Ok(class_to_object_schema(&c)),
-                    other => Err(AsError::at(
-                        format!(
-                            "schema.fromClass: expected a class, got {}",
-                            crate::interp::type_name(&other)
-                        ),
-                        span,
-                    )
-                    .into()),
-                }
-            }
+            "fromClass" => match arg(args, 0) {
+                Value::Class(c) => Ok(class_to_object_schema(&c)),
+                other => Err(AsError::at(
+                    format!(
+                        "schema.fromClass: expected a class, got {}",
+                        crate::interp::type_name(&other)
+                    ),
+                    span,
+                )
+                .into()),
+            },
 
-            _ => Err(AsError::at(
-                format!("std/schema has no function '{}'", func),
-                span,
-            )
-            .into()),
+            _ => Err(AsError::at(format!("std/schema has no function '{}'", func), span).into()),
         }
     }
 }
@@ -1247,10 +1223,7 @@ mod tests {
     #[test]
     fn constructor_string_kind() {
         let s = make_schema("string");
-        assert_eq!(
-            schema_kind(&s).as_deref(),
-            Some("string")
-        );
+        assert_eq!(schema_kind(&s).as_deref(), Some("string"));
     }
 
     #[test]
@@ -1305,7 +1278,9 @@ mod tests {
     async fn parse_nil_ok() {
         let interp = crate::interp::Interp::new();
         let schema = make_schema("nil");
-        let result = interp.parse_value(&schema, &Value::Nil, "", false, sp()).await;
+        let result = interp
+            .parse_value(&schema, &Value::Nil, "", false, sp())
+            .await;
         assert_eq!(result.unwrap(), Value::Nil);
     }
 
@@ -1328,7 +1303,10 @@ mod tests {
             Value::Str("x".into())
         );
         assert_eq!(
-            interp.parse_value(&schema, &Value::Nil, "", false, sp()).await.unwrap(),
+            interp
+                .parse_value(&schema, &Value::Nil, "", false, sp())
+                .await
+                .unwrap(),
             Value::Nil
         );
     }
@@ -1340,7 +1318,9 @@ mod tests {
         m.insert("__kind".to_string(), Value::Str("literal".into()));
         m.insert("value".to_string(), Value::Number(5.0));
         let lit = Value::Object(Rc::new(RefCell::new(m)));
-        let result = interp.parse_value(&lit, &Value::Number(5.0), "", false, sp()).await;
+        let result = interp
+            .parse_value(&lit, &Value::Number(5.0), "", false, sp())
+            .await;
         assert_eq!(result.unwrap(), Value::Number(5.0));
     }
 
@@ -1351,7 +1331,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let schema = make_schema("string");
         let v = Value::Str("x".into()); // correct type for string — won't fail
-        // Test mismatch: pass a number to a string schema
+                                        // Test mismatch: pass a number to a string schema
         let err = mismatch(
             interp
                 .parse_value(&schema, &Value::Number(1.0), "", false, sp())
@@ -1368,7 +1348,10 @@ mod tests {
             _ => panic!("message was not a string: {:?}", msg),
         }
         // The success case
-        let ok = interp.parse_value(&schema, &v, "", false, sp()).await.unwrap();
+        let ok = interp
+            .parse_value(&schema, &v, "", false, sp())
+            .await
+            .unwrap();
         assert_eq!(ok, Value::Str("x".into()));
     }
 
@@ -1419,7 +1402,10 @@ mod tests {
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("a".to_string(), Value::Number(1.0));
         let bad = Value::Object(Rc::new(RefCell::new(m)));
-        let err = interp.parse_value(&bad, &Value::Nil, "", false, sp()).await.unwrap_err();
+        let err = interp
+            .parse_value(&bad, &Value::Nil, "", false, sp())
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ParseFail::InvalidSchema(_)),
             "expected InvalidSchema, got Mismatch"
@@ -1445,11 +1431,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let schema = make_schema("number");
         let pair = interp
-            .call_schema(
-                "parse",
-                &[schema, Value::Str("x".into())],
-                sp(),
-            )
+            .call_schema("parse", &[schema, Value::Str("x".into())], sp())
             .await
             .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
@@ -1542,11 +1524,7 @@ mod tests {
         assert_eq!(ok_val(&p1), Value::Number(1.0));
         // string
         let p2 = interp
-            .call_schema(
-                "parse",
-                &[schema, Value::Str("x".into())],
-                sp(),
-            )
+            .call_schema("parse", &[schema, Value::Str("x".into())], sp())
             .await
             .unwrap();
         assert_eq!(ok_val(&p2), Value::Str("x".into()));
@@ -1667,18 +1645,9 @@ mod tests {
     #[tokio::test]
     async fn object_schema_ok() {
         let interp = crate::interp::Interp::new();
-        let fields = make_fields_obj(&[
-            ("a", make_schema("number")),
-            ("b", make_schema("string")),
-        ]);
-        let obj_schema = interp
-            .call_schema("object", &[fields], sp())
-            .await
-            .unwrap();
-        let value = make_value_obj(&[
-            ("a", Value::Number(1.0)),
-            ("b", Value::Str("x".into())),
-        ]);
+        let fields = make_fields_obj(&[("a", make_schema("number")), ("b", make_schema("string"))]);
+        let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
+        let value = make_value_obj(&[("a", Value::Number(1.0)), ("b", Value::Str("x".into()))]);
         let pair = interp
             .call_schema("parse", &[obj_schema, value], sp())
             .await
@@ -1689,19 +1658,10 @@ mod tests {
     #[tokio::test]
     async fn object_schema_err_path_at_root() {
         let interp = crate::interp::Interp::new();
-        let fields = make_fields_obj(&[
-            ("a", make_schema("number")),
-            ("b", make_schema("string")),
-        ]);
-        let obj_schema = interp
-            .call_schema("object", &[fields], sp())
-            .await
-            .unwrap();
+        let fields = make_fields_obj(&[("a", make_schema("number")), ("b", make_schema("string"))]);
+        let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
         // b is a number but schema expects string
-        let value = make_value_obj(&[
-            ("a", Value::Number(1.0)),
-            ("b", Value::Number(2.0)),
-        ]);
+        let value = make_value_obj(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
         let pair = interp
             .call_schema("parse", &[obj_schema, value], sp())
             .await
@@ -1742,15 +1702,9 @@ mod tests {
     async fn object_schema_ignores_extra_keys() {
         let interp = crate::interp::Interp::new();
         let fields = make_fields_obj(&[("a", make_schema("number"))]);
-        let obj_schema = interp
-            .call_schema("object", &[fields], sp())
-            .await
-            .unwrap();
+        let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
         // extra key "b" should be ignored
-        let value = make_value_obj(&[
-            ("a", Value::Number(1.0)),
-            ("b", Value::Str("extra".into())),
-        ]);
+        let value = make_value_obj(&[("a", Value::Number(1.0)), ("b", Value::Str("extra".into()))]);
         let pair = interp
             .call_schema("parse", &[obj_schema, value], sp())
             .await
@@ -1762,10 +1716,7 @@ mod tests {
     async fn object_schema_not_object() {
         let interp = crate::interp::Interp::new();
         let fields = make_fields_obj(&[("a", make_schema("number"))]);
-        let obj_schema = interp
-            .call_schema("object", &[fields], sp())
-            .await
-            .unwrap();
+        let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
         let pair = interp
             .call_schema("parse", &[obj_schema, Value::Number(5.0)], sp())
             .await
@@ -1784,19 +1735,13 @@ mod tests {
     async fn strict_object_rejects_extra_keys() {
         let interp = crate::interp::Interp::new();
         let fields = make_fields_obj(&[("a", make_schema("number"))]);
-        let obj_schema = interp
-            .call_schema("object", &[fields], sp())
-            .await
-            .unwrap();
+        let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
         let strict_schema = interp
             .call_schema("strict", &[obj_schema], sp())
             .await
             .unwrap();
         // a=1 and b=2 (extra) → error
-        let value = make_value_obj(&[
-            ("a", Value::Number(1.0)),
-            ("b", Value::Number(2.0)),
-        ]);
+        let value = make_value_obj(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
         let pair = interp
             .call_schema("parse", &[strict_schema, value], sp())
             .await
@@ -1806,17 +1751,18 @@ mod tests {
             Value::Str(s) => s,
             other => panic!("{:?}", other),
         };
-        assert!(msg.contains("unknown key") || msg.contains("unexpected key"), "msg: {}", msg);
+        assert!(
+            msg.contains("unknown key") || msg.contains("unexpected key"),
+            "msg: {}",
+            msg
+        );
     }
 
     #[tokio::test]
     async fn strict_object_ok_no_extra() {
         let interp = crate::interp::Interp::new();
         let fields = make_fields_obj(&[("a", make_schema("number"))]);
-        let obj_schema = interp
-            .call_schema("object", &[fields], sp())
-            .await
-            .unwrap();
+        let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
         let strict_schema = interp
             .call_schema("strict", &[obj_schema], sp())
             .await
@@ -1890,13 +1836,14 @@ mod tests {
     async fn union_accepts_first_match() {
         let interp = crate::interp::Interp::new();
         let options = make_array_val(vec![make_schema("string"), make_schema("number")]);
-        let union_schema = interp
-            .call_schema("union", &[options], sp())
-            .await
-            .unwrap();
+        let union_schema = interp.call_schema("union", &[options], sp()).await.unwrap();
         // string "x" matches first option
         let pair = interp
-            .call_schema("parse", &[union_schema.clone(), Value::Str("x".into())], sp())
+            .call_schema(
+                "parse",
+                &[union_schema.clone(), Value::Str("x".into())],
+                sp(),
+            )
             .await
             .unwrap();
         assert_eq!(ok_val(&pair), Value::Str("x".into()));
@@ -1907,10 +1854,7 @@ mod tests {
     async fn union_accepts_second_match() {
         let interp = crate::interp::Interp::new();
         let options = make_array_val(vec![make_schema("string"), make_schema("number")]);
-        let union_schema = interp
-            .call_schema("union", &[options], sp())
-            .await
-            .unwrap();
+        let union_schema = interp.call_schema("union", &[options], sp()).await.unwrap();
         // number 5 matches second option
         let pair = interp
             .call_schema("parse", &[union_schema, Value::Number(5.0)], sp())
@@ -1924,10 +1868,7 @@ mod tests {
     async fn union_rejects_none_match() {
         let interp = crate::interp::Interp::new();
         let options = make_array_val(vec![make_schema("string"), make_schema("number")]);
-        let union_schema = interp
-            .call_schema("union", &[options], sp())
-            .await
-            .unwrap();
+        let union_schema = interp.call_schema("union", &[options], sp()).await.unwrap();
         // bool true doesn't match string or number
         let pair = interp
             .call_schema("parse", &[union_schema, Value::Bool(true)], sp())
@@ -1942,10 +1883,7 @@ mod tests {
     #[tokio::test]
     async fn one_of_accepts_listed_value() {
         let interp = crate::interp::Interp::new();
-        let vals = make_array_val(vec![
-            Value::Str("a".into()),
-            Value::Str("b".into()),
-        ]);
+        let vals = make_array_val(vec![Value::Str("a".into()), Value::Str("b".into())]);
         let schema = interp.call_schema("oneOf", &[vals], sp()).await.unwrap();
         let pair = interp
             .call_schema("parse", &[schema, Value::Str("a".into())], sp())
@@ -1958,10 +1896,7 @@ mod tests {
     #[tokio::test]
     async fn one_of_rejects_unlisted_value() {
         let interp = crate::interp::Interp::new();
-        let vals = make_array_val(vec![
-            Value::Str("a".into()),
-            Value::Str("b".into()),
-        ]);
+        let vals = make_array_val(vec![Value::Str("a".into()), Value::Str("b".into())]);
         let schema = interp.call_schema("oneOf", &[vals], sp()).await.unwrap();
         let pair = interp
             .call_schema("parse", &[schema, Value::Str("c".into())], sp())
@@ -1981,11 +1916,7 @@ mod tests {
     async fn map_schema_from_object_ok() {
         let interp = crate::interp::Interp::new();
         let map_schema = interp
-            .call_schema(
-                "map",
-                &[make_schema("string"), make_schema("number")],
-                sp(),
-            )
+            .call_schema("map", &[make_schema("string"), make_schema("number")], sp())
             .await
             .unwrap();
         // Object {"k": 1} → coerced to map at boundary
@@ -2001,11 +1932,7 @@ mod tests {
     async fn map_schema_value_mismatch() {
         let interp = crate::interp::Interp::new();
         let map_schema = interp
-            .call_schema(
-                "map",
-                &[make_schema("string"), make_schema("number")],
-                sp(),
-            )
+            .call_schema("map", &[make_schema("string"), make_schema("number")], sp())
             .await
             .unwrap();
         // value is string instead of number
@@ -2025,11 +1952,7 @@ mod tests {
         // so the KEY validation fails — its err.path must carry the "(key)" marker
         // to distinguish it from a value-validation error at the same entry.
         let map_schema = interp
-            .call_schema(
-                "map",
-                &[make_schema("number"), make_schema("number")],
-                sp(),
-            )
+            .call_schema("map", &[make_schema("number"), make_schema("number")], sp())
             .await
             .unwrap();
         let value = make_value_obj(&[("k", Value::Number(1.0))]);
@@ -2043,7 +1966,11 @@ mod tests {
             Value::Str(s) => s,
             other => panic!("{:?}", other),
         };
-        assert!(path.contains("(key)"), "key error path should carry marker: {}", path);
+        assert!(
+            path.contains("(key)"),
+            "key error path should carry marker: {}",
+            path
+        );
         // sanity: the message is the key-mismatch one, not a value mismatch
         let msg = match field(&err, "message") {
             Value::Str(s) => s,
@@ -2062,10 +1989,7 @@ mod tests {
         // which surfaces at the parse boundary as a Tier-2 Control::Panic.
         let bad_sub = make_value_obj(&[("foo", Value::Number(1.0))]); // no __kind
         let options = make_array_val(vec![bad_sub, make_schema("number")]);
-        let union_schema = interp
-            .call_schema("union", &[options], sp())
-            .await
-            .unwrap();
+        let union_schema = interp.call_schema("union", &[options], sp()).await.unwrap();
         let result = interp
             .call_schema("parse", &[union_schema, Value::Str("x".into())], sp())
             .await;
@@ -2087,8 +2011,14 @@ mod tests {
         let interp = crate::interp::Interp::new();
         // schema.min(schema.number(), 5.0) — value 10 is >= 5
         let num = make_schema("number");
-        let s = interp.call_schema("min", &[num, Value::Number(5.0)], sp()).await.unwrap();
-        let pair = interp.call_schema("parse", &[s, Value::Number(10.0)], sp()).await.unwrap();
+        let s = interp
+            .call_schema("min", &[num, Value::Number(5.0)], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Number(10.0)], sp())
+            .await
+            .unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
         assert_eq!(ok_val(&pair), Value::Number(10.0));
     }
@@ -2097,23 +2027,39 @@ mod tests {
     async fn min_fail() {
         let interp = crate::interp::Interp::new();
         let num = make_schema("number");
-        let s = interp.call_schema("min", &[num, Value::Number(5.0)], sp()).await.unwrap();
-        let pair = interp.call_schema("parse", &[s, Value::Number(3.0)], sp()).await.unwrap();
+        let s = interp
+            .call_schema("min", &[num, Value::Number(5.0)], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Number(3.0)], sp())
+            .await
+            .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
         let msg = match field(&err_val(&pair), "message") {
             Value::Str(s) => s,
             other => panic!("{:?}", other),
         };
         assert!(msg.contains("min"), "message should mention 'min': {}", msg);
-        assert!(msg.contains("5"), "message should mention the bound 5: {}", msg);
+        assert!(
+            msg.contains("5"),
+            "message should mention the bound 5: {}",
+            msg
+        );
     }
 
     #[tokio::test]
     async fn max_ok() {
         let interp = crate::interp::Interp::new();
         let num = make_schema("number");
-        let s = interp.call_schema("max", &[num, Value::Number(10.0)], sp()).await.unwrap();
-        let pair = interp.call_schema("parse", &[s, Value::Number(7.0)], sp()).await.unwrap();
+        let s = interp
+            .call_schema("max", &[num, Value::Number(10.0)], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Number(7.0)], sp())
+            .await
+            .unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
     }
 
@@ -2121,8 +2067,14 @@ mod tests {
     async fn max_fail() {
         let interp = crate::interp::Interp::new();
         let num = make_schema("number");
-        let s = interp.call_schema("max", &[num, Value::Number(10.0)], sp()).await.unwrap();
-        let pair = interp.call_schema("parse", &[s, Value::Number(15.0)], sp()).await.unwrap();
+        let s = interp
+            .call_schema("max", &[num, Value::Number(10.0)], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Number(15.0)], sp())
+            .await
+            .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
         let msg = match field(&err_val(&pair), "message") {
             Value::Str(m) => m,
@@ -2138,8 +2090,14 @@ mod tests {
     async fn min_length_string_ok() {
         let interp = crate::interp::Interp::new();
         let str_s = make_schema("string");
-        let s = interp.call_schema("minLength", &[str_s, Value::Number(3.0)], sp()).await.unwrap();
-        let pair = interp.call_schema("parse", &[s, Value::Str("hello".into())], sp()).await.unwrap();
+        let s = interp
+            .call_schema("minLength", &[str_s, Value::Number(3.0)], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Str("hello".into())], sp())
+            .await
+            .unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
     }
 
@@ -2147,14 +2105,24 @@ mod tests {
     async fn min_length_string_fail() {
         let interp = crate::interp::Interp::new();
         let str_s = make_schema("string");
-        let s = interp.call_schema("minLength", &[str_s, Value::Number(5.0)], sp()).await.unwrap();
-        let pair = interp.call_schema("parse", &[s, Value::Str("hi".into())], sp()).await.unwrap();
+        let s = interp
+            .call_schema("minLength", &[str_s, Value::Number(5.0)], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Str("hi".into())], sp())
+            .await
+            .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
         let msg = match field(&err_val(&pair), "message") {
             Value::Str(m) => m,
             other => panic!("{:?}", other),
         };
-        assert!(msg.contains("minLength") || msg.contains("min length"), "msg: {}", msg);
+        assert!(
+            msg.contains("minLength") || msg.contains("min length"),
+            "msg: {}",
+            msg
+        );
         assert!(msg.contains("5"), "msg: {}", msg);
     }
 
@@ -2162,14 +2130,24 @@ mod tests {
     async fn max_length_string_fail() {
         let interp = crate::interp::Interp::new();
         let str_s = make_schema("string");
-        let s = interp.call_schema("maxLength", &[str_s, Value::Number(3.0)], sp()).await.unwrap();
-        let pair = interp.call_schema("parse", &[s, Value::Str("hello".into())], sp()).await.unwrap();
+        let s = interp
+            .call_schema("maxLength", &[str_s, Value::Number(3.0)], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Str("hello".into())], sp())
+            .await
+            .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
         let msg = match field(&err_val(&pair), "message") {
             Value::Str(m) => m,
             other => panic!("{:?}", other),
         };
-        assert!(msg.contains("maxLength") || msg.contains("max length"), "msg: {}", msg);
+        assert!(
+            msg.contains("maxLength") || msg.contains("max length"),
+            "msg: {}",
+            msg
+        );
         assert!(msg.contains("3"), "msg: {}", msg);
     }
 
@@ -2178,9 +2156,18 @@ mod tests {
     #[tokio::test]
     async fn min_length_array_ok() {
         let interp = crate::interp::Interp::new();
-        let arr_s = interp.call_schema("array", &[make_schema("number")], sp()).await.unwrap();
-        let s = interp.call_schema("minLength", &[arr_s, Value::Number(2.0)], sp()).await.unwrap();
-        let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0), Value::Number(2.0)])));
+        let arr_s = interp
+            .call_schema("array", &[make_schema("number")], sp())
+            .await
+            .unwrap();
+        let s = interp
+            .call_schema("minLength", &[arr_s, Value::Number(2.0)], sp())
+            .await
+            .unwrap();
+        let arr = Value::Array(Rc::new(RefCell::new(vec![
+            Value::Number(1.0),
+            Value::Number(2.0),
+        ])));
         let pair = interp.call_schema("parse", &[s, arr], sp()).await.unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
     }
@@ -2188,8 +2175,14 @@ mod tests {
     #[tokio::test]
     async fn min_length_array_fail() {
         let interp = crate::interp::Interp::new();
-        let arr_s = interp.call_schema("array", &[make_schema("number")], sp()).await.unwrap();
-        let s = interp.call_schema("minLength", &[arr_s, Value::Number(3.0)], sp()).await.unwrap();
+        let arr_s = interp
+            .call_schema("array", &[make_schema("number")], sp())
+            .await
+            .unwrap();
+        let s = interp
+            .call_schema("minLength", &[arr_s, Value::Number(3.0)], sp())
+            .await
+            .unwrap();
         let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])));
         let pair = interp.call_schema("parse", &[s, arr], sp()).await.unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
@@ -2197,7 +2190,11 @@ mod tests {
             Value::Str(m) => m,
             other => panic!("{:?}", other),
         };
-        assert!(msg.contains("minLength") || msg.contains("min length"), "msg: {}", msg);
+        assert!(
+            msg.contains("minLength") || msg.contains("min length"),
+            "msg: {}",
+            msg
+        );
         assert!(msg.contains("3"), "msg: {}", msg);
     }
 
@@ -2272,11 +2269,18 @@ mod tests {
             is_generator: false,
         };
         // Suppress unused import warning on CallArg
-        let _ = CallArg::Pos(Expr { kind: ExprKind::Nil, span: S::new(0, 0) });
+        let _ = CallArg::Pos(Expr {
+            kind: ExprKind::Nil,
+            span: S::new(0, 0),
+        });
         let fn_val = Value::Function(std::rc::Rc::new(func));
 
         let s = interp
-            .call_schema("refine", &[num_s, fn_val, Value::Str("must pass".into())], sp())
+            .call_schema(
+                "refine",
+                &[num_s, fn_val, Value::Str("must pass".into())],
+                sp(),
+            )
             .await
             .unwrap();
         let pair = interp

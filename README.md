@@ -36,6 +36,7 @@ Design priorities, in strict order: **simplicity → safety → familiarity → 
 - **Gradual type contracts** — optional annotations, checked at runtime as contracts, never erased. Includes the nullable suffix `T?` (≡ `T | nil`) and typed class fields (required, optional, defaulted) checked on assignment.
 - **Errors as values** — no exceptions; fallible calls return `[value, err]`; the `?` operator propagates and the `!` force-unwrap asserts success (panicking, recoverably, with the original message). Bugs panic, loudly.
 - **Shape validation** — turn untrusted data into checked instances: `ClassName.from(obj)` validates a raw object (recursing into nested classes, `array<Class>`, and `map<K, Class>`), and the typed parse `json.parse(text, Class)` / `resp.json(Class)` fuses decode + validation into one result — `let user = await resp.json(User)?`.
+- **Composable schema validation** — `std/schema` lets you build and compose schemas independently of any class: `schema.object({name: schema.minLength(schema.string(), 1), age: schema.min(schema.number(), 0)})`, with `min`/`max`, `minLength`/`maxLength`, `pattern`, `refine` (custom async predicates), `default`, `optional`, `union`, `oneOf`, and coercion (`{coerce: true}`). `schema.fromClass(Class)` derives a schema from class field declarations. Pass a schema to `json.parse(text, schema)` to fuse JSON decoding and validation into one Tier-1 pair.
 - **Destructuring** — pull fields out of an object or instance by key with `let {a, b as local, "k" as v} = obj`; missing keys bind `nil`.
 - **Spread** — expand a collection inline with `...` in array literals, object literals, and call arguments (`[0, ...xs]`, `{...defaults, k: v}`, `f(...args)`); strict about container kind, object-spread is later-value-wins.
 - **Rest** — collect what's left over with a trailing `...name`: a rest parameter gathers extra arguments into an array (`fn sum(...nums: array<number>)`, per-element typed), and rest destructuring takes the tail/leftover keys (`let [head, ...tail] = xs`, `let {id, ...meta} = obj`).
@@ -85,6 +86,7 @@ ascript run hello.as
 |---|---|
 | Core & collections | `std/string` · `std/array` · `std/object` · `std/map` · `std/set` (insertion-ordered hash set) · `std/math` · `std/convert` · `std/bytes` |
 | Data & serialization | `std/json` · `std/csv` · `std/toml` · `std/yaml` · `std/encoding` · `std/regex` · `std/uuid` · `std/url` · `std/decimal` (exact 96-bit decimal arithmetic) |
+| Validation & schema | `std/schema` (composable validators: object/array/map/union/oneOf/optional, constraints, refine, coerce, fromClass) |
 | System & files | `std/fs` · `std/env` · `std/io` · `std/process` · `std/crypto` · `std/compress` · `std/sqlite` |
 | Host & OS | `std/os` (pid · platform · arch · cpuCount · hostname · tempDir; live metrics via `sysinfo` feature: memory · swap · cpuUsage · loadAvg · disks · uptime · networkInterfaces · localIp) |
 | CLI & terminal | `std/cli` (declarative arg parser) · `std/color` (ANSI colors & styles, NO_COLOR-aware) |
