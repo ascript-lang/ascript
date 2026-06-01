@@ -58,6 +58,7 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 crossterm = { version = "0.28", optional = true }
 hostname = { version = "0.4", optional = true }
 tower-lsp = { version = "0.20", optional = true }
+sysinfo = { version = "0.31", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -66,7 +67,7 @@ cc = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding", "dep:url"]
 # std/log: leveled structured logging. Reuses json's total `to_json_lossy`
 # serializer (behind `data`), so it pulls in `data`. Default-on; cfg's out
@@ -95,6 +96,7 @@ tui = ["dep:crossterm"]
 # completion/hover/goto-def); never runs the interpreter, so it avoids the !Send
 # Rc/RefCell runtime. tower-lsp bundles lsp-types + tower + JSON-RPC over stdio.
 lsp = ["dep:tower-lsp", "tokio/io-std"]
+sysinfo = ["dep:sysinfo"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"
