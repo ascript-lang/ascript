@@ -54,6 +54,7 @@ pub mod sync;
 pub mod string;
 pub mod task_mod;
 pub mod time;
+pub mod time_timers;
 #[cfg(feature = "data")]
 pub mod toml;
 #[cfg(feature = "tui")]
@@ -272,6 +273,15 @@ impl Interp {
             // sleeps for 20 whole milliseconds.
             tokio::time::sleep(std::time::Duration::from_millis(ms as u64)).await;
             return Ok(Value::Nil);
+        }
+        if func == "interval" {
+            return time_timers::create_interval(self, args, span);
+        }
+        if func == "debounce" {
+            return time_timers::create_debounce(self, args, span);
+        }
+        if func == "throttle" {
+            return time_timers::create_throttle(self, args, span);
         }
         time::call(func, args, span)
     }

@@ -167,6 +167,13 @@ pub enum NativeKind {
     Channel,
     // std/sync: a counting semaphore (RefCell<usize> + Rc<Notify>). Not feature-gated.
     Semaphore,
+    // std/time: a repeating timer handle. `.tick()` awaits the next tick.
+    // Not feature-gated (tokio timers are always available).
+    Interval,
+    // std/time: a debounce wrapper (trailing-edge). Callable as `wrapper(args)`.
+    DebounceWrapper,
+    // std/time: a throttle wrapper (leading-edge). Callable as `wrapper(args)`.
+    ThrottleWrapper,
 }
 
 impl NativeKind {
@@ -190,6 +197,9 @@ impl NativeKind {
             NativeKind::Terminal => "terminal",
             NativeKind::Channel => "channel",
             NativeKind::Semaphore => "semaphore",
+            NativeKind::Interval => "interval",
+            NativeKind::DebounceWrapper => "debounce",
+            NativeKind::ThrottleWrapper => "throttle",
         }
     }
 }
