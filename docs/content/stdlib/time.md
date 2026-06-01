@@ -124,7 +124,7 @@ Wraps a function with trailing-edge debouncing. Each call to the wrapper resets 
 - **Parameters:** `fn` (function); `ms` (number) — debounce window in milliseconds (must be positive).
 - **Returns:** a callable wrapper. Calling it is synchronous (the delayed fire is fire-and-forget). The wrapper accepts any arguments and forwards them to `fn`.
 
-> **Note:** `debounce` works with synchronous `fn`. The wrapped function runs from a detached task after the window; its return value is discarded.
+> **Note:** `debounce` works with both synchronous and `async fn` callbacks — an `async` body is driven to completion. The wrapped function runs from a detached task after the window; its return value (and any panic) is discarded (fire-and-forget).
 
 ```ascript
 import * as array from "std/array"
@@ -143,7 +143,7 @@ print(log[0])           // 3
 Wraps a function with leading-edge throttling. The first call in any `ms`-millisecond window invokes `fn` immediately; subsequent calls within the window are dropped silently.
 
 - **Parameters:** `fn` (function); `ms` (number) — throttle window in milliseconds (must be positive).
-- **Returns:** a callable wrapper. Calling it is synchronous. The wrapper accepts any arguments and forwards them to `fn` on the leading edge.
+- **Returns:** a callable wrapper. Calling it is synchronous. The wrapper accepts any arguments and forwards them to `fn` on the leading edge. Works with both synchronous and `async fn` callbacks (an `async` body is driven to completion; its return value is discarded).
 
 ```ascript
 import * as array from "std/array"
