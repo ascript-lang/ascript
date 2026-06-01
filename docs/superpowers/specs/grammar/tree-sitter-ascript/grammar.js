@@ -62,6 +62,24 @@ module.exports = grammar({
     // ambiguity is resolved by GLR rather than a precedence the runtime may
     // interpret differently across tree-sitter versions.
     [$._expression, $.unwrap_expression],
+    // ----- Match-arm pattern vs expression (Phase 8) ----------------------
+    // A match-arm pattern shares its surface syntax with ordinary expressions,
+    // so the parser cannot decide pattern-vs-expression until the arm's `=>`
+    // (or a following `|`/`if`) is seen. These are settled by GLR, NOT by
+    // precedence (a precedence here would distort the ternary `?`/`:`, the
+    // `?`-propagation, and the range operator). Each entry keeps the two
+    // interpretations alive until the lookahead disambiguates:
+    //   - `[ ... ]` as an `array_pattern_match` vs an `array_literal` expr,
+    [$.array_pattern_match, $.array_literal],
+    //   - a value pattern (`_match_subject`) vs an `_expression` when both are
+    //     reachable as an element of a `[…]` (array-pattern element vs
+    //     array-literal element) or as an arm body operand.
+    [$._expression, $._match_subject],
+    //   - `...name` as a pattern `rest_element` vs a `spread_element` whose
+    //     operand is an `identifier` (array/object-literal spread). Both share
+    //     the `... identifier` prefix until the container is resolved as a
+    //     pattern or a literal.
+    [$.rest_element, $._primary_expression],
   ],
 
   rules: {
@@ -343,21 +361,85 @@ module.exports = grammar({
       optional(','),
       '}',
     )),
+    // An arm: one or more `|`-separated patterns, an optional `if <cond>` guard
+    // evaluated after a structural match, then `=> <expr>` (Phase 8). The guard
+    // and body expressions are full `_expression`s.
     match_arm: $ => seq(
       field('pattern', $._match_pattern),
+      optional(seq('if', field('guard', $._expression))),
       '=>',
       field('value', $._expression),
     ),
     _match_pattern: $ => choice(
-      $.wildcard_pattern,
       $.or_pattern,
-      $._match_subject, // literal / enum-variant / identifier pattern
+      $._match_pattern_single,
+    ),
+    // `p0 | p1 | …` — alternatives; the arm fires when ANY matches.
+    or_pattern: $ => prec.left(seq(
+      $._match_pattern_single,
+      repeat1(seq('|', $._match_pattern_single)),
+    )),
+    // A single (non-alternative) pattern. Order matters only for readability;
+    // genuine ambiguities are resolved by the declared GLR `conflicts` above.
+    _match_pattern_single: $ => choice(
+      $.wildcard_pattern,
+      $.array_pattern_match,
+      $.object_pattern_match,
+      $.range_pattern,
+      $.identifier_pattern,
+      $._match_subject, // literal / enum-variant / member / call value pattern
     ),
     wildcard_pattern: _ => '_',
-    or_pattern: $ => prec.left(seq(
-      $._match_subject,
-      repeat1(seq('|', $._match_subject)),
+    // A bare identifier pattern (Option C: compare-if-defined / bind-if-new,
+    // resolved at match time by the interpreter). `name => body` in arm-pattern
+    // position shares its surface with a single-param `arrow_function`; an arm
+    // pattern must win that shift/reduce. The hand parser gets this for free by
+    // parsing the pattern at coalesce precedence (no arrow). Here a precedence
+    // ABOVE the arrow tier (`PREC.assign`) makes the `identifier → pattern`
+    // reduction win over shifting into an arrow `=>`. This rule is reachable
+    // ONLY in match-pattern position, so it does NOT affect arrow functions,
+    // the ternary `?`/`:`, propagation, or ranges anywhere else.
+    identifier_pattern: $ => prec(PREC.unary, $.identifier),
+    // Inclusive range `a..=b` — subject is a Number in `[a, b]`. The EXCLUSIVE
+    // range `a..b` is intentionally NOT a `range_pattern`: it parses as a `..`
+    // `binary_expression` reached through the `_match_subject` value-pattern
+    // branch (exactly how the hand-written parser recovers it — it inspects the
+    // value expression for a `BinOp::Range`). Only `..=` needs a dedicated rule
+    // because the `..=` token appears nowhere else in the grammar. Bounds are
+    // `_match_subject`s (value expressions, no object literal). Precedence-less
+    // and left-associative so it never perturbs the `..` binary operator or the
+    // ternary `?`/`:`.
+    range_pattern: $ => prec.left(seq(
+      field('start', $._match_subject),
+      '..=',
+      field('end', $._match_subject),
     )),
+    // `[p0, p1, …, (...name | ...)?]` — array pattern with nested sub-patterns
+    // and an optional trailing rest collector. Distinct from `array_pattern`
+    // (destructuring), whose elements are plain identifiers; here each element
+    // is itself a full `_match_pattern_single`.
+    array_pattern_match: $ => seq(
+      '[',
+      optional(choice(
+        $.rest_element,
+        seq(commaSep1($._match_pattern_single), optional(seq(',', $.rest_element)), optional(',')),
+      )),
+      ']',
+    ),
+    // `{key, key2: subpat, …, (...name)?}` — object pattern. `{key}` is the
+    // binding shorthand; `{key: subpat}` matches the field against a sub-pattern.
+    object_pattern_match: $ => seq(
+      '{',
+      optional(choice(
+        $.rest_element,
+        seq(commaSep1($.object_pattern_match_entry), optional(seq(',', $.rest_element)), optional(',')),
+      )),
+      '}',
+    ),
+    object_pattern_match_entry: $ => seq(
+      field('key', choice($.identifier, $.string)),
+      optional(seq(':', field('pattern', $._match_pattern_single))),
+    ),
 
     arrow_function: $ => prec(PREC.assign, seq(
       optional('async'),
