@@ -436,6 +436,61 @@ let server = create()
 - `await server.listen(host, port, opts?)` → `bind` + `serve` for the common case.
 - `server.close()` — synchronous; drops the server.
 
+#### Verb shorthand methods
+
+Each of the seven standard verbs has a named shorthand — sugar over `server.route(METHOD, path, handler)`:
+
+```ascript
+server.get(path, handler)
+server.post(path, handler)
+server.put(path, handler)
+server.patch(path, handler)
+server.delete(path, handler)
+server.head(path, handler)
+server.options(path, handler)
+```
+
+All are synchronous, chainable, and accept the same `path`/`handler` form as `route`. HEAD responses automatically suppress the body bytes while preserving the `Content-Length` header (RFC 9110 §9.3.2).
+
+#### Schema-validated routes
+
+A three-argument verb call (or four-argument `route`) attaches a [std/schema](schema) validator to the route. When a request arrives, the body is JSON-decoded and validated **before** the handler runs:
+
+```ascript
+import * as schema from "std/schema"
+
+// 3-arg verb form:
+server.post(path, schema, handler)
+server.put(path, schema, handler)
+
+// 4-arg route form:
+server.route("POST", path, schema, handler)
+```
+
+- If the body is not valid JSON → **400** `{error: "validation", path: "", message: "body is not valid JSON"}` — handler not called.
+- If the decoded value does not match the schema → **400** `{error: "validation", path, message}` — handler not called.
+- On success → `req.body` is the **validated value** (type-coerced per the schema) and `req.rawBody` holds the **original JSON string**. The handler runs normally.
+
+Requires the `data` Cargo feature (enabled by default). On a `--no-default-features` build, `schema` validation is silently skipped and `req.body` is the raw string as usual.
+
+```ascript
+import { create } from "std/http/server"
+import * as schema from "std/schema"
+
+let server = create()
+
+const userSchema = schema.object({
+  name: schema.string(),
+  age: schema.number(),
+})
+
+server.post("/users", userSchema, req => {
+  // req.body.name and req.body.age are type-checked values.
+  // req.rawBody is the original JSON string.
+  return { status: 201, body: "created " + req.body.name }
+})
+```
+
 ### The request object
 
 Handlers and middleware receive a request object:
@@ -447,7 +502,8 @@ Handlers and middleware receive a request object:
 | `query` | object | parsed query string (`?a=1&b=2` → `{a:"1", b:"2"}`), percent-decoded. |
 | `headers` | object | request headers, **keys lowercased**. |
 | `params` | object | captured `:name` path params, percent-decoded. |
-| `body` | string | the request body (UTF-8-lossy). |
+| `body` | string or validated value | the request body: a raw UTF-8-lossy string for plain routes; the schema-validated value for typed routes. |
+| `rawBody` | string | **only on typed routes** — the original JSON string before schema validation. |
 
 ### Handler return conventions
 

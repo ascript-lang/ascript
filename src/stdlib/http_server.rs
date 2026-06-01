@@ -486,7 +486,11 @@ fn error_message(err: &Value) -> String {
 /// Serialize an `HttpResponse` into HTTP/1.1 wire bytes. The connection is always
 /// closed after one request (v1 serves one request per connection), so a
 /// `connection: close` header is emitted unless the handler set one explicitly.
-fn serialize_response(resp: &HttpResponse) -> Vec<u8> {
+///
+/// RFC 9110 §9.3.2: a HEAD response MUST NOT include a message body, but the
+/// headers (including `Content-Length`) must be identical to what a GET would
+/// return.  `is_head` suppresses body bytes while preserving the length header.
+fn serialize_response(resp: &HttpResponse, is_head: bool) -> Vec<u8> {
     let mut out = format!("HTTP/1.1 {} {}\r\n", resp.status, reason(resp.status)).into_bytes();
     let mut wrote_cl = false;
     let mut wrote_conn = false;
@@ -506,7 +510,10 @@ fn serialize_response(resp: &HttpResponse) -> Vec<u8> {
         out.extend_from_slice(b"connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&resp.body);
+    // HEAD: headers identical to GET, body suppressed (RFC 9110 §9.3.2).
+    if !is_head {
+        out.extend_from_slice(&resp.body);
+    }
     out
 }
 
@@ -561,7 +568,10 @@ impl Interp {
     ) -> Result<Value, Control> {
         if !is_callable(&handler) {
             return Err(AsError::at(
-                format!("server.{} handler must be a function", method.to_lowercase()),
+                format!(
+                    "server.{} handler must be a function",
+                    method.to_lowercase()
+                ),
                 span,
             )
             .into());
@@ -613,7 +623,8 @@ impl Interp {
             // Schema detection requires the `data` feature (serde_json + schema engine).
             "get" | "post" | "put" | "patch" | "delete" | "head" | "options" => {
                 let verb = m.method.to_uppercase();
-                let path = want_string(&arg(&args, 0), span, &format!("server.{} path", m.method))?.to_string();
+                let path = want_string(&arg(&args, 0), span, &format!("server.{} path", m.method))?
+                    .to_string();
                 #[cfg(feature = "data")]
                 let (schema, handler) = {
                     let second = arg(&args, 1);
@@ -834,8 +845,12 @@ impl Interp {
             read_request(&mut stream, max_body),
         )
         .await;
+        // Track whether this is a HEAD request so we can suppress the body in
+        // the serialized response while keeping Content-Length correct (RFC 9110).
+        let mut is_head = false;
         let resp: Option<HttpResponse> = match read {
             Ok(Ok(Some(req))) => {
+                is_head = req.method.eq_ignore_ascii_case("HEAD");
                 // `dispatch_request` is infallible w.r.t. handler errors (it converts
                 // panics/propagation to 500). A genuine internal `Control` should not
                 // occur here, but if it does, convert it to a 500 rather than letting
@@ -870,7 +885,7 @@ impl Interp {
         if let Some(resp) = resp {
             // One request per connection then close, so the response always
             // advertises `connection: close`.
-            let bytes = serialize_response(&resp);
+            let bytes = serialize_response(&resp, is_head);
             let _ = stream.write_all(&bytes).await;
             let _ = stream.flush().await;
             // Half-close our side so the client's read terminates promptly.
@@ -931,10 +946,7 @@ impl Interp {
         req_obj.insert("query".to_string(), query);
         req_obj.insert("headers".to_string(), obj(headers_obj));
         req_obj.insert("params".to_string(), obj(params));
-        req_obj.insert(
-            "body".to_string(),
-            Value::Str(raw_body.clone().into()),
-        );
+        req_obj.insert("body".to_string(), Value::Str(raw_body.clone().into()));
         let request = obj(req_obj);
 
         // Schema validation (Phase-6 typed routes): if the matched route carries a
@@ -1847,8 +1859,46 @@ await s.serve({{ maxRequests: 4 }})
         let ((s1, b1), (s2, b2), (s3, b3), (s4, b4)) = results;
         assert_eq!((s1.as_str(), b1.as_str()), ("HTTP/1.1 200 OK", "put-ok"));
         assert_eq!((s2.as_str(), b2.as_str()), ("HTTP/1.1 200 OK", "patch-ok"));
-        assert_eq!((s3.as_str(), b3.as_str()), ("HTTP/1.1 200 OK", "head-ok"));
-        assert_eq!((s4.as_str(), b4.as_str()), ("HTTP/1.1 200 OK", "options-ok"));
+        // HEAD responses must have an empty body (RFC 9110 §9.3.2).
+        assert_eq!((s3.as_str(), b3.as_str()), ("HTTP/1.1 200 OK", ""));
+        assert_eq!(
+            (s4.as_str(), b4.as_str()),
+            ("HTTP/1.1 200 OK", "options-ok")
+        );
+    }
+
+    /// HEAD response: Content-Length header reflects the would-be body length but
+    /// the body bytes are suppressed (RFC 9110 §9.3.2).
+    #[tokio::test]
+    async fn head_response_has_content_length_but_no_body() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.head("/h", (req) => "xyz")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/h");
+        // Use client_request_raw to inspect headers.
+        let (status, raw) = with_server(&src, move || async move {
+            client_request_raw("HEAD", &url, None).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        // Content-Length must reflect the handler body ("xyz" = 3 bytes).
+        assert!(
+            raw.to_ascii_lowercase().contains("content-length: 3"),
+            "expected content-length: 3 in headers; got: {raw:?}"
+        );
+        // Body section after the blank line must be empty.
+        let body_after_headers = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        assert!(
+            body_after_headers.is_empty(),
+            "HEAD response body must be empty; got: {body_after_headers:?}"
+        );
     }
 
     // ── End verb-method tests ──────────────────────────────────────────────────
@@ -1946,7 +1996,10 @@ await s.serve({{ maxRequests: 1 }})
             "response should contain 'validation failed', got: {body}"
         );
         // The field path "age" should appear in the error details
-        assert!(body.contains("age"), "error path should mention 'age', got: {body}");
+        assert!(
+            body.contains("age"),
+            "error path should mention 'age', got: {body}"
+        );
         // Handler output must NOT appear
         assert!(
             !body.contains("ok:"),
@@ -1975,7 +2028,10 @@ await s.serve({{ maxRequests: 1 }})
             client_request("POST", &url, Some("{not json".to_string())).await
         })
         .await;
-        assert_eq!(status, "HTTP/1.1 400 Bad Request", "malformed JSON must 400");
+        assert_eq!(
+            status, "HTTP/1.1 400 Bad Request",
+            "malformed JSON must 400"
+        );
         assert!(
             !body.contains("ok:"),
             "handler must NOT run on bad JSON, got: {body}"
