@@ -57,6 +57,7 @@ pub mod schema;
 pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
+pub mod stream;
 pub mod string;
 pub mod sync;
 pub mod task_mod;
@@ -103,6 +104,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/task" => task_mod::exports(),
         "std/time" => time::exports(),
         "std/sync" => sync::exports(),
+        "std/stream" => stream::exports(),
         #[cfg(feature = "datetime")]
         "std/date" => date::exports(),
         #[cfg(feature = "intl")]
@@ -257,6 +259,7 @@ impl Interp {
             "task" => self.call_task(func, args, span).await,
             "time" => self.call_time(func, args, span).await,
             "sync" => self.call_sync(func, args, span).await,
+            "stream" => self.call_stream(func, args, span).await,
             #[cfg(feature = "datetime")]
             "date" => date::call(func, args, span),
             #[cfg(feature = "intl")]

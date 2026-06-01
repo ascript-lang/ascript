@@ -181,6 +181,9 @@ pub enum NativeKind {
     // std/net/udp: a bound UDP socket. Methods: send/recv/localAddr/close.
     // Registered only under feature `net`.
     UdpSocket,
+    // std/stream: a lazy pull-based stream (a source + a chain of combinator
+    // stages). Driven by terminals via `Interp::pull_next`. Not feature-gated.
+    Stream,
 }
 
 impl NativeKind {
@@ -209,6 +212,7 @@ impl NativeKind {
             NativeKind::ThrottleWrapper => "throttle",
             NativeKind::RateLimiter => "rateLimiter",
             NativeKind::UdpSocket => "udpSocket",
+            NativeKind::Stream => "stream",
         }
     }
 }
