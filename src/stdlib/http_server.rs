@@ -124,8 +124,10 @@ enum ReadError {
 
 /// Routes + middleware + the (optionally) bound listener for one server handle.
 pub struct HttpServerState {
-    /// `(method_uppercase, path_pattern, handler)`. Path may contain `:name` params.
-    pub routes: Vec<(String, String, Value)>,
+    /// `(method_uppercase, path_pattern, schema?, handler)`. Path may contain
+    /// `:name` params. `schema` is `Some(Value)` for typed routes (3-arg verb /
+    /// 4-arg `route`); `None` for plain 2-arg routes.
+    pub routes: Vec<(String, String, Option<Value>, Value)>,
     /// Middleware `(req, next) => resp`, run in registration order before the route.
     pub middleware: Vec<Value>,
     /// The bound listener, present after `bind`/`listen`. `serve` accepts on it.
@@ -362,6 +364,23 @@ fn simple_response(status: u16, body: &str) -> HttpResponse {
     }
 }
 
+/// Build a 400 JSON response for a schema validation failure.
+/// Body: `{"error":"validation failed","path":"<path>","message":"<msg>"}`.
+/// Only available when the `data` feature is enabled (requires `serde_json`).
+#[cfg(feature = "data")]
+fn validation_error_response(path: &str, message: &str) -> HttpResponse {
+    let body = format!(
+        r#"{{"error":"validation failed","path":{},"message":{}}}"#,
+        serde_json::to_string(path).unwrap_or_else(|_| "\"\"".to_string()),
+        serde_json::to_string(message).unwrap_or_else(|_| "\"validation failed\"".to_string()),
+    );
+    HttpResponse {
+        status: 400,
+        headers: vec![("content-type".into(), "application/json".into())],
+        body: body.into_bytes(),
+    }
+}
+
 /// Convert a handler's return value into an `HttpResponse`.
 /// - string → 200 text/plain
 /// - object `{status?, headers?, body?}` → as specified (defaults 200, body "")
@@ -525,12 +544,18 @@ impl Interp {
     /// Register a route with a fixed HTTP method string. Shared by `route` and the
     /// seven verb convenience methods (`get`, `post`, `put`, `patch`, `delete`,
     /// `head`, `options`) so each verb is a thin wrapper with no duplicated logic.
+    ///
+    /// `schema` is `Some(Value)` for a typed route (the Phase-6 schema object is
+    /// stored on the route entry so `dispatch_request` can validate the body before
+    /// calling the handler). `None` for a plain route (no validation).
+    #[allow(clippy::too_many_arguments)]
     fn register_route(
         &self,
         id: u64,
         server: Value,
         method: String,
         path: String,
+        schema: Option<Value>,
         handler: Value,
         span: Span,
     ) -> Result<Value, Control> {
@@ -542,7 +567,7 @@ impl Interp {
             .into());
         }
         match self.http_server_mut(id) {
-            Some(mut s) => s.routes.push((method, path, handler)),
+            Some(mut s) => s.routes.push((method, path, schema, handler)),
             None => {
                 return Err(AsError::at("server route: server is closed", span).into());
             }
@@ -566,15 +591,41 @@ impl Interp {
                 let method =
                     want_string(&arg(&args, 0), span, "server.route method")?.to_uppercase();
                 let path = want_string(&arg(&args, 1), span, "server.route path")?.to_string();
-                let handler = arg(&args, 2);
-                self.register_route(id, server, method, path, handler, span)
+                // 4-arg form: route(method, path, schema, handler) when args[2] is a
+                // schema tagged-object (`__kind`). 3-arg form: route(method, path, handler).
+                // Schema detection requires the `data` feature (serde_json + schema engine).
+                #[cfg(feature = "data")]
+                let (schema, handler) = {
+                    let third = arg(&args, 2);
+                    if crate::stdlib::schema::schema_kind(&third).is_some() {
+                        (Some(third), arg(&args, 3))
+                    } else {
+                        (None, third)
+                    }
+                };
+                #[cfg(not(feature = "data"))]
+                let (schema, handler) = (None::<Value>, arg(&args, 2));
+                self.register_route(id, server, method, path, schema, handler, span)
             }
             // Verb shortcuts — each is a thin wrapper over register_route.
+            // 3-arg form: verb(path, schema, handler) when args[1] is a schema.
+            // 2-arg form: verb(path, handler).
+            // Schema detection requires the `data` feature (serde_json + schema engine).
             "get" | "post" | "put" | "patch" | "delete" | "head" | "options" => {
                 let verb = m.method.to_uppercase();
                 let path = want_string(&arg(&args, 0), span, &format!("server.{} path", m.method))?.to_string();
-                let handler = arg(&args, 1);
-                self.register_route(id, server, verb, path, handler, span)
+                #[cfg(feature = "data")]
+                let (schema, handler) = {
+                    let second = arg(&args, 1);
+                    if crate::stdlib::schema::schema_kind(&second).is_some() {
+                        (Some(second), arg(&args, 2))
+                    } else {
+                        (None, second)
+                    }
+                };
+                #[cfg(not(feature = "data"))]
+                let (schema, handler) = (None::<Value>, arg(&args, 1));
+                self.register_route(id, server, verb, path, schema, handler, span)
             }
             "use" => {
                 let mw = arg(&args, 0);
@@ -827,6 +878,29 @@ impl Interp {
         }
     }
 
+    /// Find the route matching `method`+`path`, returning its handler, optional body
+    /// schema, and captured `:name` params. `(None, None, {})` if nothing matched.
+    fn match_route_for(
+        &self,
+        id: u64,
+        method: &str,
+        path: &str,
+    ) -> (Option<Value>, Option<Value>, IndexMap<String, Value>) {
+        let routes = match self.http_server_mut(id) {
+            Some(s) => s.routes.clone(),
+            None => Vec::new(),
+        };
+        for (rmethod, rpath, rschema, rhandler) in &routes {
+            if !rmethod.eq_ignore_ascii_case(method) {
+                continue;
+            }
+            if let Some(params) = match_route(rpath, path) {
+                return (Some(rhandler.clone()), rschema.clone(), params);
+            }
+        }
+        (None, None, IndexMap::new())
+    }
+
     /// Build the request object, run the middleware chain → matched handler, and
     /// convert the result into an `HttpResponse`.
     async fn dispatch_request(
@@ -837,29 +911,16 @@ impl Interp {
     ) -> Result<HttpResponse, Control> {
         let (path, query) = split_target(&req.target);
 
-        // Match a route to extract params (and find the handler).
-        let (handler, params) = {
-            let routes = match self.http_server_mut(id) {
-                Some(s) => s.routes.clone(),
-                None => Vec::new(),
-            };
-            let mut found: Option<(Value, IndexMap<String, Value>)> = None;
-            for (rmethod, rpath, rhandler) in &routes {
-                if !rmethod.eq_ignore_ascii_case(&req.method) {
-                    continue;
-                }
-                if let Some(params) = match_route(rpath, &path) {
-                    found = Some((rhandler.clone(), params));
-                    break;
-                }
-            }
-            match found {
-                Some((h, p)) => (Some(h), p),
-                None => (None, IndexMap::new()),
-            }
-        };
+        // Match a route to extract params (and find the handler + optional schema).
+        // `route_schema` is only consumed by the `data`-gated validation block below;
+        // under a net-without-data build it is unused, hence the `_`-prefixed name.
+        #[cfg(feature = "data")]
+        let (handler, route_schema, params) = self.match_route_for(id, &req.method, &path);
+        #[cfg(not(feature = "data"))]
+        let (handler, _route_schema, params) = self.match_route_for(id, &req.method, &path);
 
         // Build the request object passed to handlers/middleware.
+        let raw_body = String::from_utf8_lossy(&req.body).into_owned();
         let mut headers_obj = IndexMap::new();
         for (k, v) in &req.headers {
             headers_obj.insert(k.to_ascii_lowercase(), Value::Str(v.clone().into()));
@@ -872,9 +933,80 @@ impl Interp {
         req_obj.insert("params".to_string(), obj(params));
         req_obj.insert(
             "body".to_string(),
-            Value::Str(String::from_utf8_lossy(&req.body).into_owned().into()),
+            Value::Str(raw_body.clone().into()),
         );
         let request = obj(req_obj);
+
+        // Schema validation (Phase-6 typed routes): if the matched route carries a
+        // schema, JSON-decode the raw body and validate it BEFORE the handler runs.
+        //
+        // Approach: always-JSON decode for typed routes (the body schema implies
+        // a structured JSON payload; Content-Type is not checked — simpler, and a
+        // typed route is an explicit opt-in to structured input).
+        //
+        // - JSON parse failure → 400 (fused: body wasn't valid JSON).
+        // - Mismatch → 400 with JSON `{error, path, message}`.
+        // - InvalidSchema/Control → 500 (programmer error in the schema definition,
+        //   treated as a handler error via the existing panic→500 path).
+        // On success: replace `req.body` with the validated value and add `req.rawBody`
+        // with the original string, then fall through to the single dispatch site
+        // below (the `request` object is updated in place).
+        //
+        // Borrow discipline: schema and raw_body are cloned out before the await;
+        // no RefCell borrow is held across the parse_value call.
+        //
+        // Only compiled when `data` feature is enabled (serde_json + schema engine).
+        #[cfg(feature = "data")]
+        if let Some(schema) = route_schema {
+            // JSON-decode the raw body.
+            let decoded = match serde_json::from_str::<serde_json::Value>(&raw_body) {
+                Ok(jv) => crate::stdlib::json::to_ascript(&jv),
+                Err(_) => {
+                    // Malformed JSON → 400, handler not called.
+                    return Ok(validation_error_response("", "body is not valid JSON"));
+                }
+            };
+            // Run the Phase-6 validator. coerce=false (strict shape match).
+            match self.parse_value(&schema, &decoded, "", false, span).await {
+                Ok(validated) => {
+                    // Update req.body to the validated value and expose rawBody, then
+                    // fall through to the shared dispatch site below.
+                    if let Value::Object(ref ro) = request {
+                        let mut map = ro.borrow_mut();
+                        map.insert("body".to_string(), validated);
+                        map.insert("rawBody".to_string(), Value::Str(raw_body.into()));
+                    }
+                }
+                Err(crate::stdlib::schema::ParseFail::Mismatch(err_obj_val)) => {
+                    // Shape mismatch → 400 with JSON error details.
+                    let path = match &err_obj_val {
+                        Value::Object(o) => match o.borrow().get("path") {
+                            Some(Value::Str(s)) => s.to_string(),
+                            _ => String::new(),
+                        },
+                        _ => String::new(),
+                    };
+                    let message = match &err_obj_val {
+                        Value::Object(o) => match o.borrow().get("message") {
+                            Some(Value::Str(s)) => s.to_string(),
+                            _ => "validation failed".to_string(),
+                        },
+                        _ => "validation failed".to_string(),
+                    };
+                    return Ok(validation_error_response(&path, &message));
+                }
+                Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
+                    // Programmer error in the schema definition → 500.
+                    return Ok(simple_response(500, &format!("invalid schema: {}", msg)));
+                }
+                Err(crate::stdlib::schema::ParseFail::Control(c)) => {
+                    // A Control from within a `refine` fn in the schema → treat as
+                    // a handler error (500). Re-convert to Control so handle_connection
+                    // picks it up via the existing panic→500 path.
+                    return Err(c);
+                }
+            }
+        }
 
         // The terminal handler: the matched route, or a built-in 404.
         let handler = match handler {
@@ -887,6 +1019,25 @@ impl Interp {
             }
         };
 
+        // Single dispatch site: run the middleware chain → handler and convert the
+        // result to a response. Reached both by plain routes and by typed routes
+        // after successful body validation (which mutated `request` in place).
+        self.dispatch_handler(id, handler, request, span).await
+    }
+
+    /// Run the registered middleware chain → the terminal `handler` for one request,
+    /// settling any returned `Value::Future`, sweeping this dispatch's `next`
+    /// continuations, and converting the outcome to an `HttpResponse`.
+    ///
+    /// This is the SINGLE copy of the dispatch logic, shared by the plain (no-schema)
+    /// path and the post-validation path in `dispatch_request`.
+    async fn dispatch_handler(
+        &self,
+        id: u64,
+        handler: Value,
+        request: Value,
+        span: Span,
+    ) -> Result<HttpResponse, Control> {
         let middleware = match self.http_server_mut(id) {
             Some(s) => s.middleware.clone(),
             None => Vec::new(),
@@ -1701,6 +1852,186 @@ await s.serve({{ maxRequests: 4 }})
     }
 
     // ── End verb-method tests ──────────────────────────────────────────────────
+
+    // ── Schema-validated route tests (sub-phase 7b) ───────────────────────────
+
+    /// `s.post(path, schema, handler)` — valid body passes schema; handler gets
+    /// a validated `req.body` Object (not the raw string).
+    #[tokio::test]
+    async fn schema_route_valid_body_sets_req_body() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as schema from "std/schema"
+let s = create()
+let bodySchema = schema.object({{ name: schema.string(), age: schema.number() }})
+s.post("/users", bodySchema, (req) => "ok:" + req.body.name)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/users");
+        let (status, body) = with_server(&src, move || async move {
+            client_request(
+                "POST",
+                &url,
+                Some(r#"{"name":"alice","age":30}"#.to_string()),
+            )
+            .await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK", "valid body should reach handler");
+        assert_eq!(body, "ok:alice");
+    }
+
+    /// Valid body also exposes the raw JSON string at `req.rawBody`.
+    #[tokio::test]
+    async fn schema_route_valid_body_keeps_raw_body() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as schema from "std/schema"
+let s = create()
+let bodySchema = schema.object({{ name: schema.string() }})
+s.post("/raw", bodySchema, (req) => "raw:" + req.rawBody)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/raw");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("POST", &url, Some(r#"{"name":"bob"}"#.to_string())).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert!(body.starts_with("raw:"), "expected raw: prefix, got {body}");
+        assert!(body.contains("bob"), "rawBody should contain the raw JSON");
+    }
+
+    /// Schema mismatch → 400, handler is NOT called (no "ok:" prefix in body).
+    #[tokio::test]
+    async fn schema_route_invalid_body_returns_400() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as schema from "std/schema"
+let s = create()
+let bodySchema = schema.object({{ name: schema.string(), age: schema.number() }})
+s.post("/users", bodySchema, (req) => "ok:" + req.body.name)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/users");
+        let (status, body) = with_server(&src, move || async move {
+            // "age" is a string, not a number → mismatch
+            client_request(
+                "POST",
+                &url,
+                Some(r#"{"name":"alice","age":"not-a-number"}"#.to_string()),
+            )
+            .await
+        })
+        .await;
+        assert_eq!(
+            status, "HTTP/1.1 400 Bad Request",
+            "bad shape must yield 400"
+        );
+        // Response body should be JSON with validation error fields
+        assert!(
+            body.contains("validation failed"),
+            "response should contain 'validation failed', got: {body}"
+        );
+        // The field path "age" should appear in the error details
+        assert!(body.contains("age"), "error path should mention 'age', got: {body}");
+        // Handler output must NOT appear
+        assert!(
+            !body.contains("ok:"),
+            "handler must NOT run on bad shape, got: {body}"
+        );
+    }
+
+    /// Malformed JSON body (not valid JSON) → 400 (fused: invalid JSON = validation
+    /// failed, handler not called).
+    #[tokio::test]
+    async fn schema_route_malformed_json_returns_400() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as schema from "std/schema"
+let s = create()
+let bodySchema = schema.object({{ name: schema.string() }})
+s.post("/users", bodySchema, (req) => "ok:" + req.body.name)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/users");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("POST", &url, Some("{not json".to_string())).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "malformed JSON must 400");
+        assert!(
+            !body.contains("ok:"),
+            "handler must NOT run on bad JSON, got: {body}"
+        );
+    }
+
+    /// REGRESSION: plain 2-arg `s.post(path, handler)` (no schema) still works.
+    #[tokio::test]
+    async fn schema_route_plain_2arg_still_works() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.post("/plain", (req) => "p")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/plain");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("POST", &url, Some("anything".to_string())).await
+        })
+        .await;
+        assert_eq!(
+            status, "HTTP/1.1 200 OK",
+            "plain route (no schema) must still work"
+        );
+        assert_eq!(body, "p");
+    }
+
+    /// `s.route(method, path, schema, handler)` — 4-arg variant via `route()`.
+    #[tokio::test]
+    async fn schema_route_via_route_method_valid() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import * as schema from "std/schema"
+let s = create()
+let bodySchema = schema.object({{ x: schema.number() }})
+s.route("POST", "/add", bodySchema, (req) => `x:${{req.body.x}}`)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/add");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("POST", &url, Some(r#"{"x":42}"#.to_string())).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, "x:42");
+    }
+
+    // ── End schema-validated route tests ──────────────────────────────────────
 
     /// Like `client_request` but returns the FULL raw response text (head + body)
     /// so tests can assert on headers.
