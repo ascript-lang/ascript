@@ -1026,4 +1026,146 @@ mod tests {
         let src3 = "let f = (a, ...rest) => rest\n";
         assert_eq!(format_source(src3).unwrap(), src3);
     }
+
+    // ---- Phase 8c: match-pattern idempotence tests ----
+
+    /// Helper: assert `format_source(src)` produces `expected`, is idempotent,
+    /// and the output re-parses without error.
+    fn assert_fmt_idempotent(src: &str, expected: &str) {
+        let once = format_source(src)
+            .unwrap_or_else(|e| panic!("fmt failed on {:?}: {e}", src));
+        assert_eq!(once, expected, "wrong output for: {src}");
+        let twice = format_source(&once)
+            .unwrap_or_else(|e| panic!("re-fmt failed on {:?}: {e}", &once));
+        assert_eq!(once, twice, "fmt not idempotent for: {src}");
+        // formatted output re-parses
+        let tokens = crate::lexer::lex(&once)
+            .unwrap_or_else(|e| panic!("lex failed on formatted {:?}: {e}", &once));
+        assert!(
+            crate::parser::parse(&tokens).is_ok(),
+            "formatted output does not re-parse: {:?}",
+            &once
+        );
+    }
+
+    #[test]
+    fn match_wildcard_and_value_are_idempotent() {
+        // Wildcard `_` and bare value patterns format canonically and re-parse.
+        assert_fmt_idempotent(
+            "match n { _ => 0 }",
+            "match n { _ => 0 }\n",
+        );
+        assert_fmt_idempotent(
+            "match n { 0 => \"zero\", 1 => \"one\", _ => \"other\" }",
+            "match n { 0 => \"zero\", 1 => \"one\", _ => \"other\" }\n",
+        );
+    }
+
+    #[test]
+    fn match_bare_ident_binding_is_idempotent() {
+        // A bare-ident pattern (Option-C binding) formats as just the identifier.
+        assert_fmt_idempotent(
+            "match x { other => other }",
+            "match x { other => other }\n",
+        );
+    }
+
+    #[test]
+    fn match_range_patterns_are_idempotent() {
+        // Inclusive `..=` and exclusive `..` range patterns.
+        assert_fmt_idempotent(
+            "match n { 1..=9 => \"single\", 10..100 => \"double\", _ => \"big\" }",
+            "match n { 1..=9 => \"single\", 10..100 => \"double\", _ => \"big\" }\n",
+        );
+    }
+
+    #[test]
+    fn match_array_patterns_are_idempotent() {
+        // Fixed-arity, rest, binding mixed with value pattern.
+        assert_fmt_idempotent(
+            "match xs { [] => \"empty\", [x] => x, [first, ...rest] => first }",
+            "match xs { [] => \"empty\", [x] => x, [first, ...rest] => first }\n",
+        );
+        // Explicit nil value inside array pattern.
+        assert_fmt_idempotent(
+            "match pair { [u, nil] => u, [_, e] => e }",
+            "match pair { [u, nil] => u, [_, e] => e }\n",
+        );
+        // Ignore-rest `...` with no name.
+        assert_fmt_idempotent(
+            "match xs { [h, ...] => h, _ => nil }",
+            "match xs { [h, ...] => h, _ => nil }\n",
+        );
+    }
+
+    #[test]
+    fn match_object_patterns_are_idempotent() {
+        // Shorthand binding `{key}` and sub-pattern `{key: pat}`.
+        assert_fmt_idempotent(
+            "match req { {method, path} => method, _ => \"?\" }",
+            "match req { {method, path} => method, _ => \"?\" }\n",
+        );
+        assert_fmt_idempotent(
+            "match user { {role: \"admin\"} => true, {role: r} => false }",
+            "match user { {role: \"admin\"} => true, {role: r} => false }\n",
+        );
+        // Object rest `...name`.
+        assert_fmt_idempotent(
+            "match obj { {a, ...rest} => rest, _ => nil }",
+            "match obj { {a, ...rest} => rest, _ => nil }\n",
+        );
+        // Object ignore-rest `...`.
+        assert_fmt_idempotent(
+            "match obj { {x, ...} => x, _ => nil }",
+            "match obj { {x, ...} => x, _ => nil }\n",
+        );
+    }
+
+    #[test]
+    fn match_guard_is_idempotent() {
+        // `_ if <guard>` — guard expression survives formatting and round-trips.
+        assert_fmt_idempotent(
+            "match n { _ if n < 0 => \"neg\", _ => \"pos\" }",
+            "match n { _ if n < 0 => \"neg\", _ => \"pos\" }\n",
+        );
+        // Guard on a binding pattern.
+        assert_fmt_idempotent(
+            "match n { x if x > 10 => x, _ => 0 }",
+            "match n { x if x > 10 => x, _ => 0 }\n",
+        );
+    }
+
+    #[test]
+    fn match_or_patterns_are_idempotent() {
+        // `|` alternatives in a single arm.
+        assert_fmt_idempotent(
+            "match day { \"sat\" | \"sun\" => true, _ => false }",
+            "match day { \"sat\" | \"sun\" => true, _ => false }\n",
+        );
+    }
+
+    #[test]
+    fn match_nested_in_fn_is_idempotent() {
+        // A full match expression inside a function body — verifies the fmt pass
+        // handles statement+block nesting alongside match.
+        let src = "fn classify(n) {\n  return match n {\n    _ if n < 0 => \"negative\",\n    0 => \"zero\",\n    1..=9 => \"single digit\",\n    10..100 => \"double digit\",\n    _ => \"big\",\n  }\n}\n";
+        // Canonical output (the example file's shape).
+        let once = format_source(src).unwrap();
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice, "fmt not idempotent for match-in-fn");
+        assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn match_pattern_matching_example_is_idempotent() {
+        // The committed pattern_matching.as example must round-trip through the
+        // formatter (the `all_examples_format_idempotently_and_reparse` test covers
+        // this too, but having it here makes the failure message explicit).
+        let src = std::fs::read_to_string("examples/pattern_matching.as")
+            .expect("examples/pattern_matching.as should exist");
+        let once = format_source(&src).unwrap();
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice, "pattern_matching.as fmt is not idempotent");
+        assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+    }
 }

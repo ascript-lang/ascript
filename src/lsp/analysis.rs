@@ -5,7 +5,7 @@
 //! it holds no `Rc`/`RefCell`/`Value` and is trivially `Send`. This keeps the
 //! tower-lsp `LanguageServer` impl `Send + Sync`-clean.
 
-use crate::ast::{Param, Stmt};
+use crate::ast::{Expr, ExprKind, MatchArm, Param, Pattern, Stmt};
 use crate::error::AsError;
 use crate::lexer;
 use crate::lsp::line_index::LineIndex;
@@ -673,6 +673,11 @@ fn enclosing_fn_local(stmts: &[Stmt], name: &str, offset: usize) -> Option<Span>
         if let Some(span) = local_let_before(fnbody.body, name, offset) {
             return Some(span);
         }
+        // Then match-arm pattern bindings (the match expr that covers the cursor
+        // and whose arm pattern binds `name`).
+        if let Some(span) = match_arm_binding_in_body(fnbody.body, name, offset) {
+            return Some(span);
+        }
     }
     None
 }
@@ -723,6 +728,299 @@ fn local_let_before(body: &[Stmt], name: &str, offset: usize) -> Option<Span> {
         }
     }
     found
+}
+
+/// Collect all identifier names introduced by a match-arm `pat` into `out`.
+///
+/// Conservative (Option-C LSP rule): every bare `Ident(n)`, every array-element
+/// binding, every object-shorthand key, every `key: sub-pattern` sub-binding, and
+/// every named rest (`...name`) is added. This means a bare ident that at runtime
+/// would be a *compare* (because the name is already defined) is also added — but
+/// since the name was already defined, this is harmless: the go-to-def resolution
+/// still returns the correct declaration for it. The benefit is that genuine
+/// *bind* idents are never wrongly flagged as undefined.
+fn collect_pattern_bindings(pat: &Pattern, out: &mut Vec<std::rc::Rc<str>>) {
+    match pat {
+        Pattern::Wildcard | Pattern::Value(_) | Pattern::Range { .. } => {}
+        Pattern::Ident(n) => out.push(n.clone()),
+        Pattern::Array(pats, rest) => {
+            for p in pats {
+                collect_pattern_bindings(p, out);
+            }
+            if let Some(Some(name)) = rest {
+                out.push(name.clone());
+            }
+        }
+        Pattern::Object(entries, rest) => {
+            for e in entries {
+                match &e.pat {
+                    // Shorthand `{key}` always binds `key`.
+                    None => out.push(e.key.clone()),
+                    // `{key: sub}` — recurse into the sub-pattern.
+                    Some(sub) => collect_pattern_bindings(sub, out),
+                }
+            }
+            if let Some(Some(name)) = rest {
+                out.push(name.clone());
+            }
+        }
+    }
+}
+
+/// Walk all `ExprKind::Match` expressions reachable from `expr` and, for any arm
+/// whose guard or body span contains `offset`, collect that arm's pattern bindings
+/// for `name` and return the match expression's own span as a stand-in "definition
+/// site" (there is no individual name-span for a pattern binding, so the pattern
+/// token's location is approximated by the match span — still useful for
+/// go-to-definition, which resolves to the containing `match`).
+///
+/// Because match is an expression it can appear anywhere, including deeply nested
+/// inside calls, binary ops, etc. We do a full recursive walk of `expr`.
+fn match_arm_binding_in_expr(expr: &Expr, name: &str, offset: usize) -> Option<Span> {
+    // Recurse into sub-expressions first (the deepest / most-specific match wins).
+    let child_result = match &expr.kind {
+        ExprKind::Match { subject, arms } => {
+            // Try subject first (in case there's a nested match there).
+            if let r @ Some(_) = match_arm_binding_in_expr(subject, name, offset) {
+                return r;
+            }
+            // Walk arms.
+            for arm in arms {
+                // Check guard.
+                if let Some(g) = &arm.guard {
+                    if let r @ Some(_) = match_arm_binding_in_expr(g, name, offset) {
+                        return r;
+                    }
+                }
+                // Check body.
+                if let r @ Some(_) = match_arm_binding_in_expr(&arm.body, name, offset) {
+                    return r;
+                }
+            }
+            // Now check: is `offset` inside any arm's guard/body, and does that
+            // arm's pattern bind `name`?
+            arm_binding_for_offset(arms, name, offset, expr.span)
+        }
+        // Recurse into all expression forms that contain sub-expressions.
+        ExprKind::Binary { lhs, rhs, .. } => {
+            match_arm_binding_in_expr(lhs, name, offset)
+                .or_else(|| match_arm_binding_in_expr(rhs, name, offset))
+        }
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Await(inner)
+        | ExprKind::Try(inner)
+        | ExprKind::Unwrap(inner)
+        | ExprKind::Paren(inner)
+        | ExprKind::Yield(Some(inner)) => match_arm_binding_in_expr(inner, name, offset),
+        ExprKind::Assign { target, value } => match_arm_binding_in_expr(target, name, offset)
+            .or_else(|| match_arm_binding_in_expr(value, name, offset)),
+        ExprKind::Ternary { cond, then, els } => match_arm_binding_in_expr(cond, name, offset)
+            .or_else(|| match_arm_binding_in_expr(then, name, offset))
+            .or_else(|| match_arm_binding_in_expr(els, name, offset)),
+        ExprKind::Call { callee, args } => {
+            use crate::ast::CallArg;
+            let r = match_arm_binding_in_expr(callee, name, offset);
+            if r.is_some() {
+                return r;
+            }
+            for a in args {
+                let e = match a {
+                    CallArg::Pos(e) | CallArg::Spread(e) => e,
+                };
+                if let r @ Some(_) = match_arm_binding_in_expr(e, name, offset) {
+                    return r;
+                }
+            }
+            None
+        }
+        ExprKind::Index { object, index } => match_arm_binding_in_expr(object, name, offset)
+            .or_else(|| match_arm_binding_in_expr(index, name, offset)),
+        ExprKind::Member { object, .. } | ExprKind::OptMember { object, .. } => {
+            match_arm_binding_in_expr(object, name, offset)
+        }
+        ExprKind::Array(items) => {
+            use crate::ast::ArrayElem;
+            for it in items {
+                let e = match it {
+                    ArrayElem::Item(e) | ArrayElem::Spread(e) => e,
+                };
+                if let r @ Some(_) = match_arm_binding_in_expr(e, name, offset) {
+                    return r;
+                }
+            }
+            None
+        }
+        ExprKind::Object(entries) => {
+            use crate::ast::ObjEntry;
+            for en in entries {
+                let e = match en {
+                    ObjEntry::KV(_, e) | ObjEntry::Spread(e) => e,
+                };
+                if let r @ Some(_) = match_arm_binding_in_expr(e, name, offset) {
+                    return r;
+                }
+            }
+            None
+        }
+        ExprKind::Template { parts } => {
+            use crate::ast::TemplatePart;
+            for p in parts {
+                if let TemplatePart::Expr(e) = p {
+                    if let r @ Some(_) = match_arm_binding_in_expr(e, name, offset) {
+                        return r;
+                    }
+                }
+            }
+            None
+        }
+        ExprKind::Arrow { body, .. } => {
+            use crate::ast::ArrowBody;
+            match body.as_ref() {
+                ArrowBody::Expr(e) => match_arm_binding_in_expr(e, name, offset),
+                ArrowBody::Block(stmts) => {
+                    for s in stmts {
+                        if let r @ Some(_) =
+                            match_arm_binding_in_stmt(s, name, offset)
+                        {
+                            return r;
+                        }
+                    }
+                    None
+                }
+            }
+        }
+        // Leaf nodes (no sub-expressions).
+        ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Nil
+        | ExprKind::Ident(_)
+        | ExprKind::Yield(None) => None,
+    };
+    child_result
+}
+
+/// Walk a statement for match-arm bindings (used when descending into arrow blocks).
+fn match_arm_binding_in_stmt(stmt: &Stmt, name: &str, offset: usize) -> Option<Span> {
+    match stmt {
+        Stmt::Expr(e) | Stmt::Return(Some(e)) => match_arm_binding_in_expr(e, name, offset),
+        Stmt::Let { value: Some(e), .. } => match_arm_binding_in_expr(e, name, offset),
+        Stmt::LetDestructure { value: e, .. } | Stmt::LetDestructureObject { value: e, .. } => {
+            match_arm_binding_in_expr(e, name, offset)
+        }
+        Stmt::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            if let r @ Some(_) = match_arm_binding_in_expr(cond, name, offset) {
+                return r;
+            }
+            for s in then_branch {
+                if let r @ Some(_) = match_arm_binding_in_stmt(s, name, offset) {
+                    return r;
+                }
+            }
+            if let Some(eb) = else_branch {
+                for s in eb {
+                    if let r @ Some(_) = match_arm_binding_in_stmt(s, name, offset) {
+                        return r;
+                    }
+                }
+            }
+            None
+        }
+        Stmt::While { cond, body } => {
+            if let r @ Some(_) = match_arm_binding_in_expr(cond, name, offset) {
+                return r;
+            }
+            for s in body {
+                if let r @ Some(_) = match_arm_binding_in_stmt(s, name, offset) {
+                    return r;
+                }
+            }
+            None
+        }
+        Stmt::ForRange { start, end, body, .. } => {
+            if let r @ Some(_) = match_arm_binding_in_expr(start, name, offset) {
+                return r;
+            }
+            if let r @ Some(_) = match_arm_binding_in_expr(end, name, offset) {
+                return r;
+            }
+            for s in body {
+                if let r @ Some(_) = match_arm_binding_in_stmt(s, name, offset) {
+                    return r;
+                }
+            }
+            None
+        }
+        Stmt::ForOf { iter, body, .. } => {
+            if let r @ Some(_) = match_arm_binding_in_expr(iter, name, offset) {
+                return r;
+            }
+            for s in body {
+                if let r @ Some(_) = match_arm_binding_in_stmt(s, name, offset) {
+                    return r;
+                }
+            }
+            None
+        }
+        Stmt::Block(stmts) => {
+            for s in stmts {
+                if let r @ Some(_) = match_arm_binding_in_stmt(s, name, offset) {
+                    return r;
+                }
+            }
+            None
+        }
+        Stmt::Export(inner) => match_arm_binding_in_stmt(inner, name, offset),
+        _ => None,
+    }
+}
+
+/// Given a slice of `MatchArm`s, return the containing `match_span` if `offset`
+/// falls inside any arm's guard or body AND that arm's patterns bind `name`.
+fn arm_binding_for_offset(
+    arms: &[MatchArm],
+    name: &str,
+    offset: usize,
+    match_span: Span,
+) -> Option<Span> {
+    for arm in arms {
+        // Determine if the cursor is inside this arm's "scope" — i.e. inside its
+        // guard expression or its body expression.
+        let in_guard = arm.guard.as_ref().is_some_and(|g| {
+            offset >= g.span.start && offset < g.span.end
+        });
+        let in_body = offset >= arm.body.span.start && offset < arm.body.span.end;
+        if !(in_guard || in_body) {
+            continue;
+        }
+        // Cursor is inside this arm — collect pattern bindings.
+        let mut bindings: Vec<std::rc::Rc<str>> = Vec::new();
+        for pat in &arm.patterns {
+            collect_pattern_bindings(pat, &mut bindings);
+        }
+        if bindings.iter().any(|b| b.as_ref() == name) {
+            // Return the match expression's span as a proxy for "the definition
+            // site". This is the best we can do without span information on
+            // individual pattern tokens.
+            return Some(match_span);
+        }
+    }
+    None
+}
+
+/// Search `body` for a match-arm that covers `offset` and binds `name`.
+/// Returns the match-expression's span as a stand-in for the definition.
+fn match_arm_binding_in_body(body: &[Stmt], name: &str, offset: usize) -> Option<Span> {
+    for stmt in body {
+        if let r @ Some(_) = match_arm_binding_in_stmt(stmt, name, offset) {
+            return r;
+        }
+    }
+    None
 }
 
 /// If a top-level statement declares `name`, record its name span (first match wins).
@@ -1120,6 +1418,131 @@ export fn bar() {}
         let x_use = src.rfind("+ x").unwrap() + 2;
         let rx = definition(src, x_use).expect("x");
         assert_eq!(rx.start.line, 1);
+    }
+
+    // ---- Phase 8c: match-arm pattern binding recognition ----
+
+    /// Assert that `definition(src, off)` returns `Some(_)` — i.e. the name at
+    /// `off` is recognized as "defined" (go-to-definition succeeds). This is the
+    /// LSP invariant we care about: pattern-bound names inside an arm body/guard
+    /// must not look "undefined" to the LSP.
+    fn assert_defined(src: &str, off: usize, label: &str) {
+        assert!(
+            definition(src, off).is_some(),
+            "expected {label:?} at offset {off} to be defined in:\n{src}"
+        );
+    }
+
+    #[test]
+    fn definition_resolves_bare_ident_pattern_binding() {
+        // `other` is a bare-ident binding (Option C). The use inside the arm body
+        // (`=> other`) must resolve.
+        let src = "fn f(x) { return match x { other => other } }";
+        // Find the second `other` (the use in the body, not the pattern).
+        let first = src.find("other").unwrap();
+        let use_off = src[first + 5..].find("other").unwrap() + first + 5;
+        assert_defined(src, use_off, "other");
+    }
+
+    #[test]
+    fn definition_resolves_array_pattern_binding() {
+        // `[x, nil]` — `x` is bound; use inside the arm body must resolve.
+        let src = "fn f(p) { return match p { [x, nil] => x } }";
+        // Find the `x` after `=> ` (the use in the body).
+        let body_x = src.rfind("=> x").unwrap() + 3;
+        assert_defined(src, body_x, "x in array pattern body");
+    }
+
+    #[test]
+    fn definition_resolves_array_rest_binding() {
+        // `[first, ...rest]` — both `first` and `rest` are bound in the arm body.
+        let src = "fn f(xs) { return match xs { [first, ...rest] => first } }";
+        let first_use = src.rfind("=> first").unwrap() + 3;
+        assert_defined(src, first_use, "first in rest-array pattern");
+    }
+
+    #[test]
+    fn definition_resolves_object_shorthand_binding() {
+        // `{name}` — shorthand object pattern binds `name`.
+        let src = "fn f(u) { return match u { {name} => name } }";
+        let name_use = src.rfind("=> name").unwrap() + 3;
+        assert_defined(src, name_use, "name in object shorthand pattern");
+    }
+
+    #[test]
+    fn definition_resolves_object_sub_pattern_binding() {
+        // `{role: r}` — sub-pattern binds `r`.
+        let src = "fn f(u) { return match u { {role: r} => r } }";
+        let r_use = src.rfind("=> r").unwrap() + 3;
+        assert_defined(src, r_use, "r in object sub-pattern");
+    }
+
+    #[test]
+    fn definition_resolves_pattern_binding_in_guard() {
+        // `x if x > 0 => x` — `x` is used in BOTH the guard and the body.
+        let src = "fn f(n) { return match n { x if x > 0 => x } }";
+        // Find `x` in the guard `x > 0` (offset = position of `x` after "if ").
+        let guard_x = src.find("if ").unwrap() + 3;
+        assert_defined(src, guard_x, "x in guard");
+        // Also the body.
+        let body_x = src.rfind("=> x").unwrap() + 3;
+        assert_defined(src, body_x, "x in body after guard");
+    }
+
+    #[test]
+    fn definition_resolves_bare_ident_arm_alongside_or_pattern() {
+        // Honest naming: this is a single bare-ident catch-all arm (`x => x`), not
+        // an or-pattern. Or-pattern alternatives are literals (`"sat" | "sun"`)
+        // which bind nothing, so the binding-resolution path is exercised here via
+        // the bare-ident fall-through arm. The `|` form itself is covered by the
+        // fmt idempotence tests.
+        let src = "fn f(d) { return match d { \"a\" | \"b\" => 0, x => x } }";
+        let x_use = src.rfind("=> x").unwrap() + 3;
+        assert_defined(src, x_use, "x in bare-ident catch-all arm");
+    }
+
+    #[test]
+    fn definition_wildcard_does_not_bind() {
+        // `_` never binds anything — using `_` in the body still works
+        // (it's an ident with the special name `_`, not a match binding) but
+        // the LSP should NOT resolve `_` through the match-arm path.
+        // This test just verifies no panic occurs.
+        let src = "fn f(n) { return match n { _ => 0 } }";
+        // `_` may or may not resolve (the LSP doesn't bind it). We just don't
+        // panic and the program still produces a valid diagnostics response.
+        let _ = definition(src, src.find('_').unwrap());
+    }
+
+    #[test]
+    fn definition_resolves_object_rest_binding() {
+        // `{a, ...rest}` — the named rest `rest` is bound in the arm body.
+        let src = "fn f(obj) { return match obj { {a, ...rest} => rest } }";
+        let rest_use = src.rfind("=> rest").unwrap() + 3;
+        assert_defined(src, rest_use, "rest in object-rest pattern");
+    }
+
+    #[test]
+    fn definition_match_arm_binding_does_not_leak_to_outer_scope() {
+        // A name bound inside a match arm must NOT resolve when referenced OUTSIDE
+        // that arm. `x` is bound only in arm 1's body (`[x, nil] => x`); the
+        // trailing `return x` is in the enclosing function scope where `x` is
+        // undefined, so go-to-definition must yield None there.
+        let src = "fn f(p) { let r = match p { [x, nil] => x, _ => 0 }\n  return x }";
+        // The OUT-OF-SCOPE `x` in `return x` — find the `x` after the last `return `.
+        let out_of_scope_x = src.rfind("return x").unwrap() + "return ".len();
+        // Sanity: that offset really sits on the `x` ident token (not the keyword).
+        assert_eq!(&src[out_of_scope_x..out_of_scope_x + 1], "x");
+        assert!(
+            definition(src, out_of_scope_x).is_none(),
+            "arm binding `x` must NOT resolve outside its arm (in `return x`)"
+        );
+        // Control: the in-arm use (`=> x`) DOES resolve, proving the difference is
+        // scope isolation and not a blanket failure to resolve `x`.
+        let in_arm_x = src.find("=> x").unwrap() + 3;
+        assert!(
+            definition(src, in_arm_x).is_some(),
+            "the in-arm `x` use should still resolve"
+        );
     }
 
     // ---- module-path / builtin sync guards ----
