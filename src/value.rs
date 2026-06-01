@@ -1,10 +1,10 @@
 //! Runtime values. Kinds: nil, bool, number, string, builtin, function, array,
-//! object, map, enum, enum-variant, class, instance, bound-method, super-ref,
+//! object, map, set, enum, enum-variant, class, instance, bound-method, super-ref,
 //! future.
 
 use crate::ast::Stmt;
 use crate::env::Environment;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
@@ -249,6 +249,10 @@ pub enum Value {
     // IndexMap (not HashMap) is deliberate: insertion order is required for
     // deterministic keys/values/entries/display and to match `Object`.
     Map(Rc<RefCell<IndexMap<MapKey, Value>>>),
+    /// An insertion-ordered hash set of hashable values (spec §11.2).
+    /// Elements use the same `MapKey` type as Map keys.
+    /// Identity equality (like Array/Map/Bytes).
+    Set(Rc<RefCell<IndexSet<MapKey>>>),
     /// A mutable byte buffer (spec §11.2). Identity equality, like Array/Map.
     Bytes(Rc<RefCell<Vec<u8>>>),
     /// A compiled regular expression (spec §11.2). Identity equality.
@@ -302,6 +306,7 @@ impl PartialEq for Value {
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             (Value::Map(a), Value::Map(b)) => Rc::ptr_eq(a, b),
+            (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
             #[cfg(feature = "data")]
             (Value::Regex(a), Value::Regex(b)) => Rc::ptr_eq(a, b),
@@ -347,6 +352,7 @@ impl fmt::Debug for Value {
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
             Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
             Value::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
+            Value::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
             Value::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
             #[cfg(feature = "data")]
             Value::Regex(r) => write!(f, "Regex({:?})", r.source),
@@ -439,6 +445,23 @@ impl Value {
                     k.to_value().write_element(f, seen)?;
                     write!(f, ": ")?;
                     v.write_element(f, seen)?;
+                }
+                write!(f, "}}")?;
+                seen.pop();
+                Ok(())
+            }
+            Value::Set(s) => {
+                let ptr = Rc::as_ptr(s) as usize;
+                if seen.contains(&ptr) {
+                    return write!(f, "set {{...}}");
+                }
+                seen.push(ptr);
+                write!(f, "set {{")?;
+                for (i, k) in s.borrow().iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    k.to_value().write_element(f, seen)?;
                 }
                 write!(f, "}}")?;
                 seen.pop();

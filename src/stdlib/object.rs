@@ -72,6 +72,14 @@ fn deep_equal_inner(
                 && x.iter()
                     .all(|(k, v)| y.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
         }
+        (Value::Set(x), Value::Set(y)) => {
+            if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+                return true;
+            }
+            // Order-independent: same size and every element of x is in y.
+            let (x, y) = (x.borrow(), y.borrow());
+            x.len() == y.len() && x.iter().all(|k| y.contains(k))
+        }
         (Value::Bytes(x), Value::Bytes(y)) => *x.borrow() == *y.borrow(),
         (Value::Instance(x), Value::Instance(y)) => {
             if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
@@ -146,6 +154,16 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
                 }
             }
             cloned
+        }
+        Value::Set(rc) => {
+            let key = Rc::as_ptr(rc) as usize;
+            if let Some(c) = seen.get(&key) {
+                return c.clone();
+            }
+            let cloned_set = rc.borrow().clone();
+            let out = Value::Set(Rc::new(RefCell::new(cloned_set)));
+            seen.insert(key, out.clone());
+            out
         }
         Value::Bytes(rc) => Value::Bytes(Rc::new(RefCell::new(rc.borrow().clone()))),
         Value::Instance(rc) => {

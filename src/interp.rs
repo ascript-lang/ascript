@@ -2594,11 +2594,12 @@ impl Interp {
                     Value::Array(a) => a.borrow().len(),
                     Value::Object(o) => o.borrow().len(),
                     Value::Map(m) => m.borrow().len(),
+                    Value::Set(s) => s.borrow().len(),
                     Value::Bytes(b) => b.borrow().len(),
                     _ => {
                         return Err(AsError::at(
                             format!(
-                                "len() expects a string, array, object, map, or bytes, got {}",
+                                "len() expects a string, array, object, map, set, or bytes, got {}",
                                 type_name(&v)
                             ),
                             span,
@@ -2801,6 +2802,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
         Value::Map(_) => "map",
+        Value::Set(_) => "set",
         Value::Bytes(_) => "bytes",
         #[cfg(feature = "data")]
         Value::Regex(_) => "regex",
@@ -3571,6 +3573,18 @@ print(y)
     async fn len_of_wrong_type_panics() {
         let err = run_err("len(5)").await;
         assert!(err.message.contains("len() expects"));
+    }
+
+    #[tokio::test]
+    async fn len_accepts_set() {
+        assert_eq!(
+            run("import * as set from \"std/set\"\nprint(len(set.from([1,2,3])))").await,
+            "3\n"
+        );
+        assert_eq!(
+            run("import * as set from \"std/set\"\nprint(len(set.new()))").await,
+            "0\n"
+        );
     }
 
     #[tokio::test]

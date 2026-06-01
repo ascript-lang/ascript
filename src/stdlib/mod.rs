@@ -35,6 +35,7 @@ pub mod json;
 pub mod log;
 pub mod map;
 pub mod math;
+pub mod set;
 #[cfg(feature = "net")]
 pub mod net_http;
 #[cfg(feature = "net")]
@@ -84,6 +85,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/array" => array::exports(),
         "std/object" => object::exports(),
         "std/map" => map::exports(),
+        "std/set" => set::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
         "std/task" => task_mod::exports(),
@@ -184,6 +186,7 @@ impl Interp {
             "array" => self.call_array(func, args, span).await,
             "object" => self.call_object(func, args, span).await,
             "map" => map::call(func, args, span),
+            "set" => set::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
             "task" => self.call_task(func, args, span).await,

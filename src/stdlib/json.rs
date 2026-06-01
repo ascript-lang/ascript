@@ -150,6 +150,20 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             seen.pop();
             Ok(serde_json::Value::Object(map))
         }
+        Value::Set(s) => {
+            // A Set serializes as a JSON array of its values (insertion order).
+            let ptr = Rc::as_ptr(s) as usize;
+            if seen.contains(&ptr) {
+                return Err("cannot serialize a cyclic structure to JSON".into());
+            }
+            seen.push(ptr);
+            let mut out = Vec::new();
+            for k in s.borrow().iter() {
+                out.push(from_ascript(&k.to_value(), seen)?);
+            }
+            seen.pop();
+            Ok(serde_json::Value::Array(out))
+        }
         other => Err(format!(
             "cannot serialize a value of type {} to JSON",
             crate::interp::type_name(other)
@@ -230,6 +244,20 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             }
             seen.pop();
             J::Object(m)
+        }
+        Value::Set(s) => {
+            let ptr = Rc::as_ptr(s) as usize;
+            if seen.contains(&ptr) {
+                return J::String("[Circular]".into());
+            }
+            seen.push(ptr);
+            let out = s
+                .borrow()
+                .iter()
+                .map(|k| to_json_lossy(&k.to_value(), seen))
+                .collect();
+            seen.pop();
+            J::Array(out)
         }
         Value::Function(_) | Value::Builtin(_) => J::String("<function>".into()),
         other => J::String(format!("<{}>", crate::interp::type_name(other))),
