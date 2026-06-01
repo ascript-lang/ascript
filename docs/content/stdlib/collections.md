@@ -2,7 +2,7 @@
 
 # Core & collections
 
-The core and collection modules — `string`, `array`, `object`, `map`, `math`, `convert`, and `bytes` — are imported like any other standard module and called in **qualified form**. The collection or value you operate on is always the **first argument**:
+The core and collection modules — `string`, `array`, `object`, `map`, `math`, `convert`, `bytes`, and `set` — are imported like any other standard module and called in **qualified form**. The collection or value you operate on is always the **first argument**:
 
 ```ascript
 import * as array from "std/array"
@@ -1601,4 +1601,150 @@ Write a signed integer of `n` bytes at an offset, using the given endianness. Mu
 ```ascript
 let b = bytes.alloc(2)
 bytes.writeInt(b, 0, -1, 2, "be")   // b is now [255, 255]
+```
+
+## std/set
+
+An insertion-ordered hash set of **hashable** values (`nil`, `bool`, `number`, or `string`). Like `std/map`, there is no constructor syntax — the module functions are the only entry points. All operations are module-qualified.
+
+> [!NOTE] Set elements must be hashable. Attempting to add an array, object, map, or other non-hashable value **panics (Tier-2)**.
+
+```ascript
+import * as set from "std/set"
+```
+
+### set.new
+
+Create an empty set.
+
+- Returns: a new `set`
+
+```ascript
+set.new()   // set {}
+```
+
+### set.from
+
+Build a set from an array, deduplicating elements. Preserves the first occurrence order.
+
+- `arr: array` — the source array; each element must be hashable
+- Returns: a new `set`
+
+> [!TIER2] Panics if `arr` is not an array or if any element is not hashable.
+
+```ascript
+import * as set from "std/set"
+
+let s = set.from([1, 1, 2, 3])   // set {1, 2, 3}  — deduped, size 3
+```
+
+### set.add
+
+Insert a value into the set. If the value is already present, this is a no-op. Returns the set itself for chaining.
+
+- `s: set` — the set to mutate
+- `value` — a hashable value
+- Returns: `s`
+
+> [!TIER2] Panics if `value` is not hashable.
+
+```ascript
+set.add(s, 42)   // returns s; s now contains 42
+```
+
+### set.has
+
+Test whether a value is in the set.
+
+- `s: set` — the set to query
+- `value` — a hashable value
+- Returns: `bool`
+
+> [!TIER2] Panics if `value` is not hashable.
+
+```ascript
+set.has(set.from([1, 2, 3]), 2)   // true
+set.has(set.from([1, 2, 3]), 9)   // false
+```
+
+### set.delete
+
+Remove a value from the set, mutating it in place. Returns whether the value existed.
+
+- `s: set` — the set to mutate
+- `value` — a hashable value
+- Returns: `bool` — `true` if the value existed and was removed
+
+> [!TIER2] Panics if `value` is not hashable.
+
+```ascript
+let s = set.from([1, 2, 3])
+set.delete(s, 2)   // true  (removed)
+set.delete(s, 9)   // false (not present)
+```
+
+### set.size
+
+Return the number of elements in the set. The built-in `len(s)` function also works on sets.
+
+- `s: set` — the source set
+- Returns: `number`
+
+```ascript
+set.size(set.from([1, 2, 3]))   // 3
+len(set.from([1, 2, 3]))        // 3  (len works too)
+```
+
+### set.values
+
+Return an array of the set's elements, in insertion order.
+
+- `s: set` — the source set
+- Returns: `array`
+
+```ascript
+let s = set.from(["c", "a", "b"])
+set.values(s)   // ["c", "a", "b"]  — insertion order preserved
+```
+
+### set.union
+
+Return a **new** set containing all elements from `a` and all elements from `b` not already in `a`. Preserves `a`'s element order first, then `b`'s new elements.
+
+- `a: set` — first operand
+- `b: set` — second operand
+- Returns: a new `set`
+
+```ascript
+let a = set.from([1, 2, 3])
+let b = set.from([2, 3, 4])
+set.union(a, b)   // set {1, 2, 3, 4}
+```
+
+### set.intersection
+
+Return a **new** set of elements that appear in **both** `a` and `b`. Preserves `a`'s element order.
+
+- `a: set` — first operand
+- `b: set` — second operand
+- Returns: a new `set`
+
+```ascript
+let a = set.from([1, 2, 3])
+let b = set.from([2, 3, 4])
+set.intersection(a, b)   // set {2, 3}
+```
+
+### set.difference
+
+Return a **new** set of elements that are in `a` but **not** in `b` (set subtraction: `a − b`). Preserves `a`'s element order.
+
+- `a: set` — first operand
+- `b: set` — second operand
+- Returns: a new `set`
+
+```ascript
+let a = set.from([1, 2, 3])
+let b = set.from([2, 3, 4])
+set.difference(a, b)   // set {1}
 ```

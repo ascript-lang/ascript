@@ -11,13 +11,13 @@ pub mod color;
 #[cfg(feature = "compress")]
 pub mod compress;
 pub mod convert;
-pub mod decimal;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "datetime")]
 pub mod date;
+pub mod decimal;
 #[cfg(feature = "data")]
 pub mod encoding;
 #[cfg(feature = "sys")]
@@ -36,7 +36,6 @@ pub mod json;
 pub mod log;
 pub mod map;
 pub mod math;
-pub mod set;
 #[cfg(feature = "net")]
 pub mod net_http;
 #[cfg(feature = "net")]
@@ -48,6 +47,7 @@ pub mod object;
 pub mod process;
 #[cfg(feature = "data")]
 pub mod regex;
+pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
 pub mod string;

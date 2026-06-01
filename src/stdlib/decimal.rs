@@ -51,19 +51,15 @@ pub(crate) fn coerce_to_decimal(v: &Value, span: Span) -> Result<Option<Decimal>
         Value::Decimal(d) => Ok(Some(*d)),
         Value::Number(n) => {
             if !n.is_finite() {
-                return Err(AsError::at(
-                    "cannot convert non-finite number to decimal",
-                    span,
-                )
-                .into());
+                return Err(
+                    AsError::at("cannot convert non-finite number to decimal", span).into(),
+                );
             }
             match Decimal::from_f64(*n) {
                 Some(d) => Ok(Some(d)),
-                None => Err(AsError::at(
-                    "cannot convert number to decimal (out of range)",
-                    span,
-                )
-                .into()),
+                None => {
+                    Err(AsError::at("cannot convert number to decimal (out of range)", span).into())
+                }
             }
         }
         _ => Ok(None),
@@ -83,15 +79,15 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let v = arg(args, 0);
             match &v {
                 Value::Decimal(d) => Ok(Value::Decimal(*d)),
-                Value::Str(s) => {
-                    Decimal::from_str(s.as_ref()).map(Value::Decimal).map_err(|_| {
+                Value::Str(s) => Decimal::from_str(s.as_ref())
+                    .map(Value::Decimal)
+                    .map_err(|_| {
                         AsError::at(
                             format!("decimal.from: invalid decimal string {:?}", s.as_ref()),
                             span,
                         )
                         .into()
-                    })
-                }
+                    }),
                 Value::Number(n) => {
                     if !n.is_finite() {
                         return Err(AsError::at(
@@ -105,15 +101,13 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         Ok(Value::Decimal(Decimal::from(*n as i64)))
                     } else {
                         // Non-integer: use shortest round-trip via from_f64.
-                        Decimal::from_f64(*n)
-                            .map(Value::Decimal)
-                            .ok_or_else(|| {
-                                AsError::at(
-                                    "decimal.from: cannot convert number to decimal (out of range)",
-                                    span,
-                                )
-                                .into()
-                            })
+                        Decimal::from_f64(*n).map(Value::Decimal).ok_or_else(|| {
+                            AsError::at(
+                                "decimal.from: cannot convert number to decimal (out of range)",
+                                span,
+                            )
+                            .into()
+                        })
                     }
                 }
                 _ => Err(AsError::at(
@@ -134,9 +128,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 Ok(d) => Ok(make_pair(Value::Decimal(d), Value::Nil)),
                 Err(e) => Ok(make_pair(
                     Value::Nil,
-                    make_error(Value::Str(
-                        format!("invalid decimal: {}", e).into(),
-                    )),
+                    make_error(Value::Str(format!("invalid decimal: {}", e).into())),
                 )),
             }
         }
@@ -168,13 +160,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     *n as u32
                 }
                 Some(Value::Nil) | None => 0,
-                _ => {
-                    return Err(AsError::at(
-                        "decimal.round: places must be a number",
-                        span,
-                    )
-                    .into())
-                }
+                _ => return Err(AsError::at("decimal.round: places must be a number", span).into()),
             };
             Ok(Value::Decimal(d.round_dp_with_strategy(
                 places,
@@ -206,11 +192,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             Ok(Value::Decimal(d.trunc()))
         }
 
-        _ => Err(AsError::at(
-            format!("std/decimal has no function '{}'", func),
-            span,
-        )
-        .into()),
+        _ => Err(AsError::at(format!("std/decimal has no function '{}'", func), span).into()),
     }
 }
 
@@ -270,9 +252,11 @@ mod tests {
         // decimal.from(1.1) must equal decimal.parse("1.1")
         let via_number = call("from", &[Value::Number(1.1)], sp()).unwrap();
         let via_string = call("from", &[Value::Str("1.1".into())], sp()).unwrap();
-        assert_eq!(via_number, via_string,
+        assert_eq!(
+            via_number, via_string,
             "from(1.1) should equal from(\"1.1\"): got {} vs {}",
-            via_number, via_string);
+            via_number, via_string
+        );
     }
 
     #[test]

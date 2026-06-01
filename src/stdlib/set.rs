@@ -25,11 +25,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     ]
 }
 
-fn want_set(
-    v: &Value,
-    span: Span,
-    ctx: &str,
-) -> Result<Rc<RefCell<IndexSet<MapKey>>>, Control> {
+fn want_set(v: &Value, span: Span, ctx: &str) -> Result<Rc<RefCell<IndexSet<MapKey>>>, Control> {
     match v {
         Value::Set(s) => Ok(s.clone()),
         _ => Err(AsError::at(
@@ -237,12 +233,7 @@ mod tests {
     fn add_has_delete_size() {
         let s = call("new", &[], sp()).unwrap();
         // add "hello"
-        call(
-            "add",
-            &[s.clone(), Value::Str("hello".into())],
-            sp(),
-        )
-        .unwrap();
+        call("add", &[s.clone(), Value::Str("hello".into())], sp()).unwrap();
         // add 42
         call("add", &[s.clone(), Value::Number(42.0)], sp()).unwrap();
 

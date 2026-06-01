@@ -15,6 +15,8 @@ AScript has a small, fixed set of value kinds. `type(v)` returns the kind name a
 | Array | `array` | `[1, 2, 3]` | `[1, "two"]` |
 | Object | `object` | `{ key: value, "quoted": 1 }` | `{a: 1, b: "x"}` |
 | Map | `map` | *(constructed via `std/map`)* | `map {"a": 1}` |
+| Set | `set` | *(constructed via `std/set`)* | `set {1, "two"}` |
+| Decimal | `decimal` | *(constructed via `std/decimal`)* | `1.50`, `42` |
 | Bytes | `bytes` | *(via `std/bytes`)* | `<bytes len N>` |
 | Regex | `regex` | *(via `std/regex`)* | `<regex SOURCE>` |
 | Function | `function` | `fn` / arrow / builtin | `<function name>` |
@@ -92,4 +94,33 @@ print(point.x)                  // 1
 import * as map from "std/map"
 let scores = map.new()
 map.set(scores, 42, "the answer")   // numeric key — needs a map, not an object
+```
+
+## Sets
+
+A **set** (from [`std/set`](../stdlib/collections#stdset)) is an insertion-ordered collection of **unique hashable values** (`nil`, `bool`, `number`, or `string`). There is no set literal — construct via `set.new()` or `set.from(array)`. The built-in `len(s)` function works on sets.
+
+```ascript
+import * as set from "std/set"
+
+let s = set.from([1, 1, 2, 3])   // deduplicates: set {1, 2, 3}
+set.add(s, 4)
+set.has(s, 2)                    // true
+len(s)                           // 4
+set.values(s)                    // [1, 2, 3, 4]  (insertion order)
+```
+
+## Exact decimal numbers
+
+A **decimal** (from [`std/decimal`](../stdlib/data#stddecimal)) is a 96-bit scaled-integer decimal value for exact arithmetic. There is no decimal literal — use `decimal.from(x)` or `decimal.parse(s)`. Once constructed, the standard `+`, `-`, `*`, `/`, `%`, and comparison operators work, with automatic coercion of `number` operands.
+
+```ascript
+import * as decimal from "std/decimal"
+
+// floating-point cannot represent this — decimal can:
+decimal.from("0.1") + decimal.from("0.2") == decimal.from("0.3")   // true
+
+let price = decimal.from("9.99")
+let tax   = decimal.from("0.08") * price
+decimal.toString(decimal.round(tax, 2))   // "0.80"
 ```

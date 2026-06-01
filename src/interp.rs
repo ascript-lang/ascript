@@ -2843,10 +2843,9 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
                 return Ok(false);
             }
             use rust_decimal::prelude::FromPrimitive;
-            let b = rust_decimal::Decimal::from_f64(*n)
-                .ok_or_else(|| {
-                    AsError::at("cannot convert number to decimal for comparison", span)
-                })?;
+            let b = rust_decimal::Decimal::from_f64(*n).ok_or_else(|| {
+                AsError::at("cannot convert number to decimal for comparison", span)
+            })?;
             Ok(*a == b)
         }
         // All other pairs: generic structural equality.
@@ -5427,7 +5426,8 @@ print(r[1])
 import * as decimal from "std/decimal"
 let result = decimal.from("0.1") + decimal.from("0.2") == decimal.from("0.3")
 print(result)
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "true");
     }
 
@@ -5440,7 +5440,8 @@ let b = decimal.from("2.50")
 print(a + b)
 print(b - a)
 print(a * b)
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "4.00\n1.00\n3.7500");
     }
 
@@ -5451,7 +5452,8 @@ print(a * b)
 import * as decimal from "std/decimal"
 let d = decimal.from(2) * 3
 print(d)
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "6");
     }
 
@@ -5465,17 +5467,25 @@ print(a < b)
 print(a > b)
 print(a <= decimal.from("1.0"))
 print(a >= decimal.from("1.0"))
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "true\nfalse\ntrue\ntrue");
     }
 
     #[tokio::test]
     async fn decimal_division_by_zero_panics() {
-        let err = run_err(r#"
+        let err = run_err(
+            r#"
 import * as decimal from "std/decimal"
 let _ = decimal.from(1) / decimal.from(0)
-"#).await;
-        assert!(err.message.contains("zero"), "expected 'zero' in: {}", err.message);
+"#,
+        )
+        .await;
+        assert!(
+            err.message.contains("zero"),
+            "expected 'zero' in: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -5487,7 +5497,8 @@ let d = decimal.from("1.5")
 print(d == 1.5)
 print(1.5 == d)
 print(d != 1.5)
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "true\ntrue\nfalse");
     }
 
@@ -5499,7 +5510,8 @@ import * as decimal from "std/decimal"
 let d = -decimal.from("2")
 print(d)
 print(d == decimal.from("-2"))
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "-2\ntrue");
     }
 
@@ -5510,17 +5522,25 @@ import * as decimal from "std/decimal"
 let a = decimal.from("10")
 let b = decimal.from("3")
 print(a % b)
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "1");
     }
 
     #[tokio::test]
     async fn decimal_modulo_by_zero_panics() {
-        let err = run_err(r#"
+        let err = run_err(
+            r#"
 import * as decimal from "std/decimal"
 let _ = decimal.from(1) % decimal.from(0)
-"#).await;
-        assert!(err.message.contains("zero"), "expected 'zero' in: {}", err.message);
+"#,
+        )
+        .await;
+        assert!(
+            err.message.contains("zero"),
+            "expected 'zero' in: {}",
+            err.message
+        );
     }
 
     /// Regression: normal number arithmetic must be unaffected.
@@ -5545,7 +5565,8 @@ let _ = decimal.from(1) % decimal.from(0)
 import * as decimal from "std/decimal"
 let z = decimal.from("0")
 if (z) { print("truthy") } else { print("falsy") }
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "truthy");
     }
 
@@ -5556,7 +5577,8 @@ if (z) { print("truthy") } else { print("falsy") }
 import * as decimal from "std/decimal"
 let d = decimal.from("1.5")
 print(type(d))
-"#).await;
+"#)
+        .await;
         assert_eq!(out.trim(), "decimal");
     }
 }

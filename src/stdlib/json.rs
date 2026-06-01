@@ -189,9 +189,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
         Value::Nil => J::Null,
         Value::Bool(b) => J::Bool(*b),
         // Decimal: emit as a JSON number from the canonical string (always finite).
-        Value::Decimal(d) => {
-            serde_json::from_str::<J>(&d.to_string()).unwrap_or(J::Null)
-        }
+        Value::Decimal(d) => serde_json::from_str::<J>(&d.to_string()).unwrap_or(J::Null),
         Value::Number(n) => {
             if !n.is_finite() {
                 return J::Null;
