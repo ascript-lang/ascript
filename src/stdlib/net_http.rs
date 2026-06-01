@@ -1426,16 +1426,45 @@ impl Interp {
                         Ok(b) => match serde_json::from_slice::<serde_json::Value>(&b) {
                             Ok(jv) => {
                                 let val = crate::stdlib::json::to_ascript(&jv);
-                                // Typed parse: resp.json(Class) validates the decoded
-                                // body against the class, fusing a decode failure and a
-                                // shape mismatch into one Tier-1 [val, err] pair. With no
-                                // class argument the raw decoded value is returned.
+                                // Typed parse — dispatch on the first argument:
+                                //
+                                //   resp.json(Class, strict?)  → validate_into (class path)
+                                //   resp.json(schema)          → schema.parse_value (schema path)
+                                //   resp.json()                → raw decoded value
+                                //
+                                // Disambiguation is unambiguous: Value::Class vs
+                                // tagged-Object (Object with __kind) vs absent.
                                 if let Some(Value::Class(c)) = args.first() {
-                                    // `resp.json(Class, strict?)` — optional trailing bool.
+                                    // Class path: validate_into.
                                     let strict = matches!(args.get(1), Some(Value::Bool(true)));
                                     match self.validate_into(c, &val, strict, "", span).await {
                                         Ok(inst) => Ok(make_pair(inst, Value::Nil)),
                                         Err(e) => Ok(err_pair(e.message)),
+                                    }
+                                } else if let Some(schema_val) = args.first() {
+                                    // Schema path: tagged-Object with __kind.
+                                    if crate::stdlib::schema::schema_kind(schema_val).is_some() {
+                                        let schema_val = schema_val.clone();
+                                        match self
+                                            .parse_value(&schema_val, &val, "", false, span)
+                                            .await
+                                        {
+                                            Ok(v) => Ok(make_pair(v, Value::Nil)),
+                                            Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
+                                                Ok(make_pair(Value::Nil, e))
+                                            }
+                                            Err(
+                                                crate::stdlib::schema::ParseFail::InvalidSchema(
+                                                    msg,
+                                                ),
+                                            ) => Err(crate::error::AsError::at(msg, span).into()),
+                                            Err(crate::stdlib::schema::ParseFail::Control(c)) => {
+                                                Err(c)
+                                            }
+                                        }
+                                    } else {
+                                        // Non-schema non-class first arg: return raw value.
+                                        Ok(make_pair(val, Value::Nil))
                                     }
                                 } else {
                                     Ok(make_pair(val, Value::Nil))

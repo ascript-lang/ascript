@@ -53,6 +53,7 @@ pub mod os;
 pub mod process;
 #[cfg(feature = "data")]
 pub mod regex;
+pub mod schema;
 pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
@@ -95,6 +96,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/array" => array::exports(),
         "std/object" => object::exports(),
         "std/map" => map::exports(),
+        "std/schema" => schema::exports(),
         "std/set" => set::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
@@ -167,10 +169,23 @@ impl Interp {
         args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
-        // Typed parse: json.parse(text, Class) — parse, then validate against the
-        // class, fusing a parse failure and a shape mismatch into one Tier-1
-        // [val, err] pair. With no class argument this falls through to the normal
-        // 1-arg parse below (unchanged behavior).
+        // Typed parse: json.parse(text, Class|schema) — parse JSON text, then
+        // validate the result against the 2nd argument. Two dispatch paths:
+        //
+        //   1. `Value::Class` → existing validate_into path (unchanged).
+        //   2. Tagged-Object schema (Object with `__kind` field) → run
+        //      `Interp::parse_value` on the decoded JSON value, fusing a JSON
+        //      parse failure and a schema mismatch into one Tier-1 [val, err].
+        //
+        // Disambiguation is unambiguous:
+        //   - absent / `Value::Bool` → plain parse (or Bool → strict flag in
+        //     the Class path — not a valid schema).
+        //   - `Value::Class` → Class path (validate_into).
+        //   - `Value::Object` with `__kind` → schema path (parse_value).
+        //   - `Value::Object` without `__kind` → fall through to plain parse
+        //     (a raw object is not a valid 2nd arg but also not a schema).
+        //
+        // With no 2nd arg this falls through to the normal 1-arg parse below.
         #[cfg(feature = "data")]
         if module == "json" && func == "parse" {
             if let Some(Value::Class(c)) = args.get(1) {
@@ -194,6 +209,37 @@ impl Interp {
                     };
                 }
             }
+            // Schema path: 2nd arg is a tagged-Object schema (has __kind).
+            if let Some(second) = args.get(1) {
+                if schema::schema_kind(second).is_some() {
+                    let schema_val = second.clone();
+                    // Step 1: parse JSON text (1-arg call).
+                    let parsed = json::call(func, &args[..1], span)?; // [val, err]
+                    if let Value::Array(a) = &parsed {
+                        let (val, err) = {
+                            let b = a.borrow();
+                            (b[0].clone(), b[1].clone())
+                        };
+                        // JSON parse failure → fuse as-is into Tier-1 err channel.
+                        if err != Value::Nil {
+                            return Ok(parsed);
+                        }
+                        // Step 2: validate the decoded value against the schema.
+                        return match self.parse_value(&schema_val, &val, "", false, span).await {
+                            Ok(v) => Ok(crate::interp::make_pair(v, Value::Nil)),
+                            Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
+                                Ok(crate::interp::make_pair(Value::Nil, e))
+                            }
+                            // Tier-2 programmer error (malformed schema) → panic.
+                            Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
+                                Err(crate::error::AsError::at(msg, span).into())
+                            }
+                            // A panic/propagate from a refine fn — re-raise unchanged.
+                            Err(crate::stdlib::schema::ParseFail::Control(c)) => Err(c),
+                        };
+                    }
+                }
+            }
         }
         match module {
             "cli" => self.call_cli(func, args, span).await,
@@ -204,6 +250,7 @@ impl Interp {
             "array" => self.call_array(func, args, span).await,
             "object" => self.call_object(func, args, span).await,
             "map" => map::call(func, args, span),
+            "schema" => self.call_schema(func, args, span).await,
             "set" => set::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
