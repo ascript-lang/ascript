@@ -5,6 +5,7 @@
 //! are ordinary `function` values; argument-type misuse is a Tier-2 panic.
 
 pub mod array;
+pub mod assert_mod;
 pub mod bytes;
 pub mod cli;
 pub mod color;
@@ -89,6 +90,7 @@ pub(crate) fn bi(qualified: &str) -> Value {
 /// if `path` is not a known stdlib module.
 pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
+        "std/assert" => assert_mod::exports(),
         "std/cli" => cli::exports(),
         "std/color" => color::exports(),
         "std/decimal" => decimal::exports(),
@@ -244,6 +246,7 @@ impl Interp {
             }
         }
         match module {
+            "assert" => self.call_assert(func, args, span).await,
             "cli" => self.call_cli(func, args, span).await,
             "color" => color::call(func, args, span),
             "decimal" => decimal::call(func, args, span),
