@@ -85,6 +85,29 @@ ok. 2 passed; 0 failed
 
 A non-zero exit status indicates at least one failure, which makes `ascript test` suitable for CI.
 
+### Rich assertions with std/assert
+
+For test bodies that need deep equality, container membership, approximate equality, or panic
+capture, import [`std/assert`](stdlib/assert):
+
+```ascript
+import * as assert from "std/assert"
+
+test("deep array equality", () => {
+  assert.eq([1, [2, 3]], [1, [2, 3]])         // deep structural equality
+  assert.contains("hello world", "world")      // substring check
+  assert.approxEq(0.1 + 0.2, 0.3)             // float tolerance (1e-9)
+})
+
+test("expected error is thrown", () => {
+  let e = assert.throws(() => assert.eq(1, 99))
+  assert.contains(e.message, "assert.eq failed")
+})
+```
+
+`std/assert` is distinct from the global `assert(cond, msg?)` builtin — both work in test bodies,
+and they can coexist (import under a different alias if needed: `import * as A from "std/assert"`).
+
 ## `ascript lsp`
 
 Run the language server over stdio (the LSP protocol). Point your editor's generic LSP client at

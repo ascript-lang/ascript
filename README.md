@@ -43,7 +43,7 @@ Design priorities, in strict order: **simplicity → safety → familiarity → 
 - **Rest** — collect what's left over with a trailing `...name`: a rest parameter gathers extra arguments into an array (`fn sum(...nums: array<number>)`, per-element typed), and rest destructuring takes the tail/leftover keys (`let [head, ...tail] = xs`, `let {id, ...meta} = obj`).
 - **Single-threaded async & concurrency** — `await` any I/O on a cooperative event loop; `future<T>` and `std/task` (`spawn`/`gather`/`race`/`timeout`/`retry`); structured concurrency with cancel-on-drop; `std/sync` for channels, semaphores, and rate limiters; `std/time` `interval`/`debounce`/`throttle` timer utilities. No data races.
 - **Generators & coroutines** — `fn*`/`async fn*` with `yield`, bidirectional `gen.next(v)`, `gen.close()`, and `for await` over generators and native streams (composable async pipelines).
-- **Batteries included** — JSON, regex, SQLite, crypto, compression, a modern HTTP client, WebSockets, a TUI, and now: `std/url` (RFC-3986 URL parsing/building/query helpers), `std/cli` (declarative arg parsing with flags/options/subcommands), `std/color` (ANSI colors + NO_COLOR), `std/io` (stdin reading), `std/set` (insertion-ordered hash set with union/intersection/difference), `std/decimal` (exact 96-bit decimal arithmetic — `0.1 + 0.2 == 0.3`), `env.args()` (script arguments), `std/os` (host facts + live system metrics via the `sysinfo` feature), DNS resolution (`std/net`), UDP datagram sockets (`std/net/udp`), and the global `exit(code?)` builtin.
+- **Batteries included** — JSON, regex, SQLite, crypto, compression, a modern HTTP client, WebSockets, a TUI, and now: `std/url` (RFC-3986 URL parsing/building/query helpers), `std/cli` (declarative arg parsing with flags/options/subcommands), `std/color` (ANSI colors + NO_COLOR), `std/io` (stdin reading), `std/set` (insertion-ordered hash set with union/intersection/difference), `std/decimal` (exact 96-bit decimal arithmetic — `0.1 + 0.2 == 0.3`), `env.args()` (script arguments), `std/os` (host facts + live system metrics via the `sysinfo` feature), DNS resolution (`std/net`), UDP datagram sockets (`std/net/udp`), `std/stream` (lazy pull-based streams — sources, combinators, terminals — with short-circuiting; a 1M-range `filter+map+take(5)` touches only 10 items), `std/assert` (rich test assertions: deep `eq`, `contains`, `approxEq`, `throws`), `std/bench` (micro-benchmarking: `measure` + `compare`), and the global `exit(code?)` builtin.
 - **Real tooling** — a runner, REPL, formatter, test runner, and language server, all in one binary.
 
 ## Install
@@ -96,6 +96,9 @@ ascript run hello.as
 | Concurrency | `std/task` (`spawn` · `gather` · `race` · `timeout` · `retry` over `future<T>`) · `std/sync` (FIFO channels · counting semaphore · token-bucket rate limiter) |
 | Logging | `std/log` (`debug` · `info` · `warn` · `error`; human/json, structured fields) |
 | Terminal UI | `std/tui` |
+| Lazy streams | `std/stream` (lazy pull engine: `range` · `from` sources; `map` · `filter` · `take` · `drop` · `flatMap` · `enumerate` · `zip` combinators; `collect` · `reduce` · `count` · `find` · `first` · `forEach` terminals) |
+| Test assertions | `std/assert` (deep `eq`/`ne`, `isTrue`/`isFalse`/`isNil`/`notNil`, `gt`/`gte`/`lt`/`lte`, `contains`, `approxEq`, `throws`, `snapshot`) |
+| Benchmarking | `std/bench` (`measure` · `compare`) |
 
 ## Documentation
 
@@ -120,6 +123,8 @@ Runnable programs live in [`examples/`](examples/) (introductory) and
 
 ```bash
 ascript run examples/pattern_matching.as           # pattern matching: ranges, arrays, objects, Option C
+ascript run examples/streams_and_testing.as        # lazy streams + std/assert + std/bench
+ascript test examples/streams_and_testing.as       # run the test() blocks in the same file
 ascript run examples/advanced/data_pipeline.as     # CSV → JSON/YAML pipeline
 ascript run examples/advanced/sqlite_crud.as       # SQLite with prepared statements & a transaction
 ascript run examples/advanced/crypto_and_compress.as

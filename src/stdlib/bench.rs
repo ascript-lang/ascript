@@ -166,7 +166,9 @@ impl Interp {
 #[cfg(test)]
 mod tests {
     async fn run(src: &str) -> String {
-        crate::run_source(src).await.expect("program should succeed")
+        crate::run_source(src)
+            .await
+            .expect("program should succeed")
     }
 
     #[tokio::test]

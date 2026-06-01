@@ -204,13 +204,7 @@ impl Interp {
                 };
                 if !ok {
                     return Err(fail(
-                        format!(
-                            "assert.{} failed: {} {} {}",
-                            func,
-                            a,
-                            cmp_op(func),
-                            b
-                        ),
+                        format!("assert.{} failed: {} {} {}", func, a, cmp_op(func), b),
                         None,
                         span,
                     ));
@@ -427,11 +421,7 @@ impl Interp {
                     Err(msg) => Err(AsError::at(msg, span).into()),
                 }
             }
-            _ => Err(AsError::at(
-                format!("assert has no function '{}'", func),
-                span,
-            )
-            .into()),
+            _ => Err(AsError::at(format!("assert has no function '{}'", func), span).into()),
         }
     }
 }
@@ -448,12 +438,7 @@ fn opt_str(args: &[Value], i: usize) -> Option<String> {
 }
 
 /// Unwrap both values as numbers; panics with a clear message if either is not.
-fn numeric_pair(
-    a: &Value,
-    b: &Value,
-    func: &str,
-    span: Span,
-) -> Result<(f64, f64), Control> {
+fn numeric_pair(a: &Value, b: &Value, func: &str, span: Span) -> Result<(f64, f64), Control> {
     let an = match a {
         Value::Number(n) => *n,
         Value::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
@@ -502,7 +487,9 @@ fn cmp_op(func: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     async fn run(src: &str) -> String {
-        crate::run_source(src).await.expect("program should succeed")
+        crate::run_source(src)
+            .await
+            .expect("program should succeed")
     }
 
     async fn run_err(src: &str) -> String {
@@ -554,8 +541,14 @@ print(r[1] != nil)
 print(r[1].message)
 "#;
         let out = run(src).await;
-        assert!(out.starts_with("true\n"), "expected 'true' first line, got: {out}");
-        assert!(out.contains("assert.eq failed"), "expected 'assert.eq failed' in: {out}");
+        assert!(
+            out.starts_with("true\n"),
+            "expected 'true' first line, got: {out}"
+        );
+        assert!(
+            out.contains("assert.eq failed"),
+            "expected 'assert.eq failed' in: {out}"
+        );
     }
 
     #[tokio::test]
@@ -903,7 +896,10 @@ let e = await assert.throws(boom)
 print(e.message)
 "#)
         .await;
-        assert!(!out.trim().is_empty(), "expected a non-empty error message, got: {out}");
+        assert!(
+            !out.trim().is_empty(),
+            "expected a non-empty error message, got: {out}"
+        );
     }
 
     #[tokio::test]
@@ -997,8 +993,14 @@ A.eq(1, 1)
             let r = snapshot_impl(&dir, "my_snap", "different_value", false);
             assert!(r.is_err(), "mismatch should fail");
             let msg = r.unwrap_err();
-            assert!(msg.contains("stored_value"), "error should show stored: {msg}");
-            assert!(msg.contains("different_value"), "error should show new: {msg}");
+            assert!(
+                msg.contains("stored_value"),
+                "error should show stored: {msg}"
+            );
+            assert!(
+                msg.contains("different_value"),
+                "error should show new: {msg}"
+            );
         }
 
         #[test]

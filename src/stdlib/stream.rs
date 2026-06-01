@@ -82,7 +82,10 @@ pub enum Stage {
     /// skip the next `remaining` items, then pass through.
     Drop { remaining: usize },
     /// `fn(value) -> array`; `buffer` holds the expansion not yet served.
-    FlatMap { func: Value, buffer: VecDeque<Value> },
+    FlatMap {
+        func: Value,
+        buffer: VecDeque<Value>,
+    },
     /// wrap each item as `[index, value]`, `index` starting at 0.
     Enumerate { index: f64 },
     /// pair each item with the next item pulled from stream `other_id`; ends when
@@ -323,12 +326,19 @@ impl Interp {
         span: Span,
         is_take: bool,
     ) -> Result<Value, Control> {
-        let ctx = if is_take { "stream.take" } else { "stream.drop" };
+        let ctx = if is_take {
+            "stream.take"
+        } else {
+            "stream.drop"
+        };
         let id = require_stream_id(&arg(args, 0), span, ctx)?;
         let n = want_number(&arg(args, 1), span, ctx)?;
         if n < 0.0 || n.fract() != 0.0 {
-            return Err(AsError::at(format!("{} count must be a non-negative integer", ctx), span)
-                .into());
+            return Err(AsError::at(
+                format!("{} count must be a non-negative integer", ctx),
+                span,
+            )
+            .into());
         }
         let n = n as usize;
         let (source, mut stages) = self.snapshot_stream(id, span, ctx)?;
@@ -401,11 +411,7 @@ impl Interp {
     /// across an await. `zip`'s nested `pull_next(other_id)` operates on a different
     /// id while this stream's state is on the stack, so there is no re-entrancy clash.
     #[async_recursion(?Send)]
-    pub(crate) async fn pull_next(
-        &self,
-        id: u64,
-        span: Span,
-    ) -> Result<Option<Value>, Control> {
+    pub(crate) async fn pull_next(&self, id: u64, span: Span) -> Result<Option<Value>, Control> {
         // Take the whole state out so nothing is borrowed across the awaits below.
         let mut state = match self.take_resource(id) {
             Some(ResourceState::Stream(s)) => s,
@@ -430,11 +436,7 @@ impl Interp {
     /// The core pull loop, operating on an owned `StreamState`. Separated from
     /// `pull_next` so the state is restored by the caller on every exit path.
     #[async_recursion(?Send)]
-    async fn drive(
-        &self,
-        state: &mut StreamState,
-        span: Span,
-    ) -> Result<Option<Value>, Control> {
+    async fn drive(&self, state: &mut StreamState, span: Span) -> Result<Option<Value>, Control> {
         'outer: loop {
             // 0) Short-circuit: if any Take stage is exhausted the stream is over.
             //    Checked BEFORE pulling/serving an item so upstream work (the source,
@@ -454,7 +456,10 @@ impl Interp {
             //    *downstream* stages on it). If a FlatMap has a non-empty buffer we
             //    must not pull a fresh source item yet.
             if let Some((flat_idx, value)) = take_buffered(state) {
-                match self.run_stages_from(state, flat_idx + 1, value, span).await? {
+                match self
+                    .run_stages_from(state, flat_idx + 1, value, span)
+                    .await?
+                {
                     StageOutcome::Emit(v) => return Ok(Some(v)),
                     StageOutcome::Skip => continue 'outer,
                     StageOutcome::End => return Ok(None),
@@ -495,7 +500,11 @@ impl Interp {
                 }
             }
             StreamSource::Range { cur, end, step } => {
-                let more = if *step > 0.0 { *cur < *end } else { *cur > *end };
+                let more = if *step > 0.0 {
+                    *cur < *end
+                } else {
+                    *cur > *end
+                };
                 if more {
                     let v = *cur;
                     *cur += *step;
