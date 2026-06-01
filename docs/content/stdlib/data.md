@@ -590,3 +590,168 @@ import * as url from "std/url"
 let [s, err] = url.decode("a%20b%26c")
 // s == "a b&c", err == nil
 ```
+
+## std/decimal
+
+Exact decimal arithmetic backed by a 96-bit scaled integer (`rust_decimal`). Use it wherever floating-point rounding is unacceptable: money, pricing, financial totals, or any domain where `0.1 + 0.2 == 0.3` must hold.
+
+```ascript
+import * as decimal from "std/decimal"
+```
+
+There is **no decimal literal** — construction is always explicit via `decimal.from` or `decimal.parse`. Once you have a decimal value, the standard arithmetic operators (`+`, `-`, `*`, `/`, `%`) and comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) work directly. A `Number` on either side of such an operator is **automatically coerced** to decimal (non-finite numbers panic).
+
+> [!NOTE] `decimal.from(number)` converts a floating-point number to the nearest decimal using the number's shortest round-trip string. `decimal.from("0.1")` is exact; `decimal.from(0.1)` is the decimal closest to the IEEE-754 value, which equals `decimal.from("0.1")` for most short decimal fractions.
+
+> [!NOTE] JSON serialization (`std/json`) emits a decimal as a JSON number. The `serde_json` layer re-canonicalizes the value, so **trailing-zero scale is not preserved in JSON** — `decimal.from("1.50")` serializes to `1.5`. Use `decimal.toString(d)` to round-trip the exact scale as text.
+
+### decimal.from
+
+Construct a decimal from a string or number. Panics on invalid input.
+
+- `x: string | number | decimal` — value to convert
+  - `string`: parsed exactly (`"0.10"` has scale 2); invalid string → Tier-2 panic
+  - `number`: integer or finite float; non-finite → Tier-2 panic
+  - `decimal`: identity (returned as-is)
+- Returns: `decimal`
+
+> [!TIER2] Panics on invalid string, non-finite number, or wrong-type argument. Use `decimal.parse` for safe string conversion.
+
+```ascript
+decimal.from("0.1")     // decimal 0.1  — exact
+decimal.from("1.50")    // decimal 1.50 — scale preserved
+decimal.from(42)        // decimal 42
+
+// Headline: exact arithmetic
+decimal.from("0.1") + decimal.from("0.2") == decimal.from("0.3")   // true
+```
+
+### decimal.parse
+
+Safely parse a string into a decimal. Returns a `[decimal, err]` pair — does not panic on invalid input.
+
+- `s: string` — the string to parse
+- Returns: `[decimal, nil]` on success, `[nil, err]` on failure
+
+> [!TIER1] Returns `[nil, err]` instead of panicking.
+
+```ascript
+let [d, err] = decimal.parse("3.14")
+// d == decimal 3.14, err == nil
+
+let [bad, e] = decimal.parse("not-a-number")
+// bad == nil, e.message describes the failure
+```
+
+### decimal.toString
+
+Convert a decimal to its string representation, **preserving scale** (trailing zeros included).
+
+- `d: decimal` — the decimal to format
+- Returns: `string`
+
+```ascript
+decimal.toString(decimal.from("1.50"))   // "1.50"  — trailing zero kept
+decimal.toString(decimal.from("42"))     // "42"
+```
+
+### decimal.toNumber
+
+Convert a decimal to a floating-point `number`. This is a **lossy** conversion — the result is the nearest IEEE-754 double.
+
+- `d: decimal` — the decimal to convert
+- Returns: `number`
+
+```ascript
+decimal.toNumber(decimal.from("1.5"))   // 1.5
+```
+
+### decimal.round
+
+Round a decimal to a given number of decimal places using **half-away-from-zero** (conventional school-math rounding: `1.5 → 2`, `2.5 → 3`, `−1.5 → −2`).
+
+- `d: decimal` — the decimal to round
+- `places: number` (optional, default `0`) — number of decimal places
+- Returns: `decimal`
+
+```ascript
+decimal.round(decimal.from("1.5"))         // decimal 2   (half-away-from-zero)
+decimal.round(decimal.from("-1.5"))        // decimal -2
+decimal.round(decimal.from("1.456"), 2)    // decimal 1.46
+```
+
+### decimal.abs
+
+Return the absolute value.
+
+- `d: decimal` — the source decimal
+- Returns: `decimal`
+
+```ascript
+decimal.abs(decimal.from("-3.7"))   // decimal 3.7
+```
+
+### decimal.floor
+
+Return the largest integer decimal that is ≤ `d`.
+
+- `d: decimal` — the source decimal
+- Returns: `decimal`
+
+```ascript
+decimal.floor(decimal.from("1.9"))    // decimal 1
+decimal.floor(decimal.from("-1.1"))   // decimal -2
+```
+
+### decimal.ceil
+
+Return the smallest integer decimal that is ≥ `d`.
+
+- `d: decimal` — the source decimal
+- Returns: `decimal`
+
+```ascript
+decimal.ceil(decimal.from("1.1"))    // decimal 2
+decimal.ceil(decimal.from("-1.9"))   // decimal -1
+```
+
+### decimal.trunc
+
+Return the integer part of `d`, truncating toward zero.
+
+- `d: decimal` — the source decimal
+- Returns: `decimal`
+
+```ascript
+decimal.trunc(decimal.from("1.9"))    // decimal 1
+decimal.trunc(decimal.from("-1.9"))   // decimal -1
+```
+
+### Operator overloading
+
+Once you have decimal values, use normal operators:
+
+```ascript
+import * as decimal from "std/decimal"
+
+let a = decimal.from("10.00")
+let b = decimal.from("3.50")
+
+a + b           // decimal 13.50
+a - b           // decimal 6.50
+a * b           // decimal 35.0000
+a / decimal.from("2")   // decimal 5.00
+
+// Number on either side is coerced automatically:
+a * 2           // decimal 20.00
+
+// Comparisons return bool:
+a > b           // true
+a == decimal.from("10.00")   // true
+
+// Decimal / Number cross-type equality:
+decimal.from("5") == 5    // true
+
+// Exact: the headline property
+decimal.from("0.1") + decimal.from("0.2") == decimal.from("0.3")   // true (not true with number!)
+```

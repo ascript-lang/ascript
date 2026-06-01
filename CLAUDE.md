@@ -9,7 +9,7 @@ syntax, optional runtime-checked type contracts, and a batteries-included standa
 implemented as a single Rust binary `ascript` containing an async tree-walking interpreter.
 
 The design goal is **"Lua-simple language, Go/Deno-class standard library"**: the core stays tiny
-(~8 value kinds, gradual contracts, no hidden control flow) while the stdlib is deliberately rich.
+(~10 value kinds, gradual contracts, no hidden control flow) while the stdlib is deliberately rich.
 The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md` — the entire spec
 (§§2–16) is implemented. `docs/superpowers/roadmap.md` is the milestone-by-milestone record.
 

@@ -1,22 +1,25 @@
-//! Runtime values. Kinds: nil, bool, number, string, builtin, function, array,
-//! object, map, enum, enum-variant, class, instance, bound-method, super-ref,
-//! future.
+//! Runtime values. Kinds: nil, bool, number, decimal, string, builtin, function,
+//! array, object, map, set, enum, enum-variant, class, instance, bound-method,
+//! super-ref, future.
 
 use crate::ast::Stmt;
 use crate::env::Environment;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
+use rust_decimal::Decimal;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
-/// A hashable map key. Maps key on `nil`/`bool`/`number`/`string` (spec §11.2);
-/// other value kinds are not hashable and panic at insertion time.
+/// A hashable map key. Maps key on `nil`/`bool`/`number`/`decimal`/`string`
+/// (spec §11.2 + decimal extension). Number and Decimal are distinct key kinds.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub enum MapKey {
     Nil,
     Bool(bool),
     Num(u64), // canonicalized f64 bits (−0.0→+0.0, all NaNs→one canonical NaN)
     Str(Rc<str>),
+    /// Exact decimal key. Distinct from `Num` — `Decimal("0.1")` ≠ `Num(0.1f64)`.
+    Decimal(Decimal),
 }
 
 impl MapKey {
@@ -36,6 +39,7 @@ impl MapKey {
                 Some(MapKey::Num(canon))
             }
             Value::Str(s) => Some(MapKey::Str(s.clone())),
+            Value::Decimal(d) => Some(MapKey::Decimal(*d)),
             _ => None,
         }
     }
@@ -47,6 +51,7 @@ impl MapKey {
             MapKey::Bool(b) => Value::Bool(*b),
             MapKey::Num(bits) => Value::Number(f64::from_bits(*bits)),
             MapKey::Str(s) => Value::Str(s.clone()),
+            MapKey::Decimal(d) => Value::Decimal(*d),
         }
     }
 }
@@ -239,6 +244,10 @@ pub enum Value {
     Nil,
     Bool(bool),
     Number(f64),
+    /// Exact decimal arithmetic (96-bit scaled integer via `rust_decimal`).
+    /// `Copy` — no heap allocation; `Hash + Eq + Ord` via the inner type.
+    /// Participates in operator overloading with `Number` via coercion.
+    Decimal(Decimal),
     Str(Rc<str>),
     /// A native built-in function, dispatched by name in the interpreter.
     Builtin(Rc<str>),
@@ -249,6 +258,10 @@ pub enum Value {
     // IndexMap (not HashMap) is deliberate: insertion order is required for
     // deterministic keys/values/entries/display and to match `Object`.
     Map(Rc<RefCell<IndexMap<MapKey, Value>>>),
+    /// An insertion-ordered hash set of hashable values (spec §11.2).
+    /// Elements use the same `MapKey` type as Map keys.
+    /// Identity equality (like Array/Map/Bytes).
+    Set(Rc<RefCell<IndexSet<MapKey>>>),
     /// A mutable byte buffer (spec §11.2). Identity equality, like Array/Map.
     Bytes(Rc<RefCell<Vec<u8>>>),
     /// A compiled regular expression (spec §11.2). Identity equality.
@@ -294,6 +307,10 @@ impl PartialEq for Value {
             (Value::Nil, Value::Nil) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Number(a), Value::Number(b)) => a == b,
+            // Decimal: same-type value equality by the Decimal's own PartialEq.
+            // Cross-type Number↔Decimal equality is handled in the evaluator's
+            // Eq/Ne path, not here.
+            (Value::Decimal(a), Value::Decimal(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             // Built-ins are equal iff they name the same function.
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
@@ -302,6 +319,7 @@ impl PartialEq for Value {
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             (Value::Map(a), Value::Map(b)) => Rc::ptr_eq(a, b),
+            (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
             #[cfg(feature = "data")]
             (Value::Regex(a), Value::Regex(b)) => Rc::ptr_eq(a, b),
@@ -335,6 +353,7 @@ impl fmt::Debug for Value {
             Value::Nil => write!(f, "Nil"),
             Value::Bool(b) => write!(f, "Bool({})", b),
             Value::Number(n) => write!(f, "Number({})", n),
+            Value::Decimal(d) => write!(f, "Decimal({})", d),
             Value::Str(s) => write!(f, "Str({:?})", s),
             Value::Builtin(name) => write!(f, "Builtin({:?})", name),
             Value::Function(func) => {
@@ -347,6 +366,7 @@ impl fmt::Debug for Value {
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
             Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
             Value::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
+            Value::Set(s) => write!(f, "Set(len {})", s.borrow().len()),
             Value::Bytes(b) => write!(f, "Bytes(len {})", b.borrow().len()),
             #[cfg(feature = "data")]
             Value::Regex(r) => write!(f, "Regex({:?})", r.source),
@@ -384,6 +404,8 @@ impl Value {
             Value::Bool(b) => write!(f, "{}", b),
             // Rust's f64 Display already prints 7.0 as "7" and 2.5 as "2.5".
             Value::Number(n) => write!(f, "{}", n),
+            // Decimal: print the canonical string (scale preserved, e.g. "1.50").
+            Value::Decimal(d) => write!(f, "{}", d),
             Value::Str(s) => write!(f, "{}", s),
             Value::Builtin(name) => write!(f, "<builtin {}>", name),
             Value::Function(func) => match &func.name {
@@ -439,6 +461,23 @@ impl Value {
                     k.to_value().write_element(f, seen)?;
                     write!(f, ": ")?;
                     v.write_element(f, seen)?;
+                }
+                write!(f, "}}")?;
+                seen.pop();
+                Ok(())
+            }
+            Value::Set(s) => {
+                let ptr = Rc::as_ptr(s) as usize;
+                if seen.contains(&ptr) {
+                    return write!(f, "set {{...}}");
+                }
+                seen.push(ptr);
+                write!(f, "set {{")?;
+                for (i, k) in s.borrow().iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    k.to_value().write_element(f, seen)?;
                 }
                 write!(f, "}}")?;
                 seen.pop();
@@ -544,6 +583,27 @@ mod tests {
         assert!(map.is_truthy());
         assert!(MapKey::from_value(&Value::Number(0.0)).is_some());
         assert!(MapKey::from_value(&Value::Array(Rc::new(RefCell::new(vec![])))).is_none());
+    }
+
+    #[test]
+    fn mapkey_number_and_decimal_are_distinct() {
+        use rust_decimal::Decimal;
+        // Number 1 and Decimal 1 must produce DIFFERENT map keys, so they index
+        // distinct slots in a Map/Set. This pins the MapKey::Decimal claim directly.
+        // (MapKey intentionally has no Debug derive, so compare via bool to avoid
+        // requiring it in assert_eq!/assert_ne!.)
+        let num_key = MapKey::from_value(&Value::Number(1.0)).expect("number is hashable");
+        let dec_key =
+            MapKey::from_value(&Value::Decimal(Decimal::from(1))).expect("decimal is hashable");
+        assert!(
+            num_key != dec_key,
+            "number 1 and decimal 1 must be distinct map keys"
+        );
+        // Two equal Decimals produce the same key (round-trips through to_value).
+        let a = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
+        let b = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
+        assert!(a == b);
+        assert_eq!(dec_key.to_value(), Value::Decimal(Decimal::from(1)));
     }
 
     #[test]

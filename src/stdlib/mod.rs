@@ -17,6 +17,7 @@ pub mod crypto;
 pub mod csv;
 #[cfg(feature = "datetime")]
 pub mod date;
+pub mod decimal;
 #[cfg(feature = "data")]
 pub mod encoding;
 #[cfg(feature = "sys")]
@@ -46,6 +47,7 @@ pub mod object;
 pub mod process;
 #[cfg(feature = "data")]
 pub mod regex;
+pub mod set;
 #[cfg(feature = "sql")]
 pub mod sqlite;
 pub mod string;
@@ -79,11 +81,13 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
         "std/cli" => cli::exports(),
         "std/color" => color::exports(),
+        "std/decimal" => decimal::exports(),
         "std/math" => math::exports(),
         "std/string" => string::exports(),
         "std/array" => array::exports(),
         "std/object" => object::exports(),
         "std/map" => map::exports(),
+        "std/set" => set::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
         "std/task" => task_mod::exports(),
@@ -179,11 +183,13 @@ impl Interp {
         match module {
             "cli" => self.call_cli(func, args, span).await,
             "color" => color::call(func, args, span),
+            "decimal" => decimal::call(func, args, span),
             "math" => math::call(func, args, span),
             "string" => string::call(func, args, span),
             "array" => self.call_array(func, args, span).await,
             "object" => self.call_object(func, args, span).await,
             "map" => map::call(func, args, span),
+            "set" => set::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
             "task" => self.call_task(func, args, span).await,
