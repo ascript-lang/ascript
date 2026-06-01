@@ -1871,37 +1871,91 @@ impl Interp {
                 Ok((v?, false))
             }
             ExprKind::Call { callee, args } => {
+                // Fluent schema method-chaining hook: a Call whose callee is a
+                // plain `Member { object, name }` (NOT `OptMember`) where the
+                // evaluated `object` is a schema value and `name` is a schema
+                // method → route to `call_schema(name, [recv, ...args])` (the
+                // SAME ops as the free functions). Otherwise fall back to the
+                // EXACT pre-existing behavior: `read_member(recv, name)` then
+                // `call_value`. `object` and the args are each evaluated ONCE.
+                //
+                // This is call-position only: bare `s.minLength` (member
+                // access, no call) still reads the stored constraint field via
+                // `read_member` — never a bound method (see schema design doc,
+                // "Known limitation").
+                if let ExprKind::Member { object, name } = &callee.kind {
+                    let (recv, sc) = self.eval_chain(object, env).await?;
+                    if sc {
+                        return Ok((Value::Nil, true));
+                    }
+                    if crate::stdlib::schema::is_schema_value(&recv)
+                        && crate::stdlib::schema::is_schema_method(name)
+                    {
+                        // Schema path: there is no `read_member` here, so the
+                        // args may be evaluated after the schema check — receiver
+                        // first, then the call args, into `call_schema`.
+                        let values = self.eval_call_args(args, env).await?;
+                        let mut sargs = Vec::with_capacity(values.len() + 1);
+                        sargs.push(recv);
+                        sargs.extend(values);
+                        return Ok((self.call_schema(name, &sargs, expr.span).await?, false));
+                    }
+                    // Fallback — byte-for-byte with the prior
+                    // `eval_chain(callee) → eval_args → call_value` path: read
+                    // the member FIRST (which can error — nil receiver, bad
+                    // enum-variant prop, …), and only THEN evaluate the args, so
+                    // a member-read error preempts arg evaluation / side effects.
+                    let callee_v = self.read_member(&recv, name, object.span)?;
+                    let values = self.eval_call_args(args, env).await?;
+                    let v = self.call_value(callee_v, values, expr.span).await;
+                    return Ok((v?, false));
+                }
+
                 let (callee_v, sc) = self.eval_chain(callee, env).await?;
                 if sc {
                     return Ok((Value::Nil, true));
                 }
-                let mut values = Vec::new();
-                for a in args {
-                    match a {
-                        crate::ast::CallArg::Pos(x) => values.push(self.eval_expr(x, env).await?),
-                        crate::ast::CallArg::Spread(x) => {
-                            let v = self.eval_expr(x, env).await?;
-                            match v {
-                                Value::Array(arr) => values.extend(arr.borrow().iter().cloned()),
-                                other => {
-                                    return Err(AsError::at(
-                                        format!(
-                                            "can only spread an array as call arguments, got {}",
-                                            type_name(&other)
-                                        ),
-                                        x.span,
-                                    )
-                                    .into())
-                                }
-                            }
-                        }
-                    }
-                }
+                let values = self.eval_call_args(args, env).await?;
                 let v = self.call_value(callee_v, values, expr.span).await;
                 Ok((v?, false))
             }
             _ => Ok((self.eval_expr(expr, env).await?, false)),
         }
+    }
+
+    /// Evaluate a call-argument list, flattening `...spread` of an array into
+    /// positional values. Each argument expression is evaluated exactly once,
+    /// left to right (same semantics as the prior inline loop in the `Call`
+    /// arm of `eval_chain`).
+    #[async_recursion(?Send)]
+    async fn eval_call_args(
+        &self,
+        args: &[crate::ast::CallArg],
+        env: &Environment,
+    ) -> Result<Vec<Value>, Control> {
+        let mut values = Vec::new();
+        for a in args {
+            match a {
+                crate::ast::CallArg::Pos(x) => values.push(self.eval_expr(x, env).await?),
+                crate::ast::CallArg::Spread(x) => {
+                    let v = self.eval_expr(x, env).await?;
+                    match v {
+                        Value::Array(arr) => values.extend(arr.borrow().iter().cloned()),
+                        other => {
+                            return Err(AsError::at(
+                                format!(
+                                    "can only spread an array as call arguments, got {}",
+                                    type_name(&other)
+                                ),
+                                x.span,
+                            )
+                            .into())
+                        }
+                    }
+                }
+            }
+        }
+        Ok(values)
     }
 
     fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
@@ -6215,5 +6269,239 @@ print(v.id)
             out.contains("legs"),
             "inherited field mismatch should report path 'legs', got: {out}"
         );
+    }
+
+    // ── fluent schema method chaining (call-site hook) ────────────────────────
+
+    /// A full fluent chain of refiners ending in `.parse(...)` — equivalent to
+    /// the nested free-function form, and ok / minLength-fail / pattern-fail
+    /// each routed through the same `call_schema` ops.
+    #[cfg(feature = "data")] // pattern enforcement needs `data` (regex)
+    #[tokio::test]
+    async fn schema_fluent_chain_parse() {
+        let src = r#"
+import * as schema from "std/schema"
+let s = schema.string().minLength(3).maxLength(12).pattern("^[a-z0-9_]+$")
+let [v, err] = s.parse("ada_lovelace")
+print(v)
+print(err == nil)
+let [v2, err2] = s.parse("ab")
+print(v2 == nil)
+print(err2.message)
+let [v3, err3] = s.parse("Ada!")
+print(v3 == nil)
+print(err3.message)
+"#;
+        let out = run(src).await;
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "ada_lovelace", "ok value: {out}");
+        assert_eq!(lines[1], "true", "ok err nil: {out}");
+        assert_eq!(lines[2], "true", "minLength fail value nil: {out}");
+        assert!(
+            lines[3].contains("minLength"),
+            "minLength fail message: {out}"
+        );
+        assert_eq!(lines[4], "true", "pattern fail value nil: {out}");
+        assert!(lines[5].contains("pattern"), "pattern fail message: {out}");
+    }
+
+    /// `s.parse(v)` must equal `schema.parse(s, v)` (method == free function).
+    #[tokio::test]
+    async fn schema_fluent_parse_equals_free_fn() {
+        let src = r#"
+import * as schema from "std/schema"
+let s = schema.number().min(1).max(10)
+let [a, ae] = s.parse(5)
+let [b, be] = schema.parse(s, 5)
+print(a == b)
+print(ae == nil)
+print(be == nil)
+let [c, ce] = s.parse(99)
+let [d, de] = schema.parse(s, 99)
+print(c == d)
+print(ce.message == de.message)
+"#;
+        assert_eq!(run(src).await, "true\ntrue\ntrue\ntrue\ntrue\n");
+    }
+
+    /// A fluent-built schema can be used with the free-function `parse`.
+    #[tokio::test]
+    async fn schema_fluent_built_used_with_free_parse() {
+        let src = r#"
+import * as schema from "std/schema"
+let [v, err] = schema.parse(schema.string().minLength(3), "ab")
+print(v == nil)
+print(err != nil)
+"#;
+        assert_eq!(run(src).await, "true\ntrue\n");
+    }
+
+    /// Re-refine / collision: `minLength(3).minLength(5)` — the second call
+    /// routes to call_schema even though the field is already set, overwriting
+    /// the constraint.
+    #[tokio::test]
+    async fn schema_fluent_re_refine_overwrites() {
+        let src = r#"
+import * as schema from "std/schema"
+let s = schema.string().minLength(3).minLength(5)
+let [v, err] = s.parse("abcd")
+print(v == nil)
+print(err != nil)
+let [v2, err2] = s.parse("abcde")
+print(v2)
+print(err2 == nil)
+"#;
+        assert_eq!(run(src).await, "true\ntrue\nabcde\ntrue\n");
+    }
+
+    /// Bare member access still reads the STORED constraint field (not a method).
+    #[tokio::test]
+    async fn schema_fluent_bare_access_reads_field() {
+        let src = r#"
+import * as schema from "std/schema"
+let s = schema.string().minLength(3)
+print(s.minLength)
+print(s.__kind)
+"#;
+        assert_eq!(run(src).await, "3\nstring\n");
+    }
+
+    /// `optional()` as a method wraps the receiver and accepts nil.
+    #[tokio::test]
+    async fn schema_fluent_optional_method() {
+        let src = r#"
+import * as schema from "std/schema"
+let s = schema.number().optional()
+let [v, err] = s.parse(nil)
+print(v == nil)
+print(err == nil)
+let [v2, err2] = s.parse(42)
+print(v2)
+print(err2 == nil)
+let [v3, err3] = s.parse("x")
+print(v3 == nil)
+print(err3 != nil)
+"#;
+        assert_eq!(run(src).await, "true\ntrue\n42\ntrue\ntrue\ntrue\n");
+    }
+
+    /// Object schema built via constructor, then `.parse(...)` as a method.
+    #[tokio::test]
+    async fn schema_fluent_object_parse_method() {
+        let src = r#"
+import * as schema from "std/schema"
+let s = schema.object({a: schema.number(), b: schema.string()})
+let [v, err] = s.parse({a: 1, b: "x"})
+print(err == nil)
+print(v.a)
+print(v.b)
+let [v2, err2] = s.parse({a: "no", b: "x"})
+print(v2 == nil)
+print(err2.path)
+"#;
+        assert_eq!(run(src).await, "true\n1\nx\ntrue\na\n");
+    }
+
+    // ── regression: the call-site hook must not change non-schema calls ───────
+
+    /// Module call (`math.abs(x)`) — a Member callee on a module-namespace
+    /// object whose fields are builtins. Must NOT be intercepted as a schema.
+    #[tokio::test]
+    async fn regression_module_call_after_hook() {
+        let src = r#"
+import * as math from "std/math"
+print(math.abs(-5))
+print(math.max(1, 2, 3))
+"#;
+        assert_eq!(run(src).await, "5\n3\n");
+    }
+
+    /// Instance method call still dispatches the bound method.
+    #[tokio::test]
+    async fn regression_instance_method_after_hook() {
+        let src = r#"
+class Counter {
+  n: number
+  fn init() { self.n = 0 }
+  fn inc() { self.n = self.n + 1; return self.n }
+}
+let c = Counter()
+print(c.inc())
+print(c.inc())
+"#;
+        assert_eq!(run(src).await, "1\n2\n");
+    }
+
+    /// Plain object field-fn call `o.f()` still works (object is not a schema).
+    #[tokio::test]
+    async fn regression_object_field_fn_after_hook() {
+        let src = r#"
+let o = {f: () => 1, g: (x) => x + 1}
+print(o.f())
+print(o.g(41))
+"#;
+        assert_eq!(run(src).await, "1\n42\n");
+    }
+
+    /// An object that merely HAS a `__kind` field but it is NOT a known schema
+    /// kind must fall through to the normal field-fn path, not be hijacked.
+    #[tokio::test]
+    async fn regression_object_with_bogus_kind_field() {
+        let src = r#"
+let o = {__kind: "widget", parse: (x) => x + 1}
+print(o.parse(41))
+"#;
+        assert_eq!(run(src).await, "42\n");
+    }
+
+    /// schema constructor call `schema.string()` (a module-fn call) still works.
+    #[tokio::test]
+    async fn regression_schema_constructor_call() {
+        let src = r#"
+import * as schema from "std/schema"
+let s = schema.string()
+print(s.__kind)
+"#;
+        assert_eq!(run(src).await, "string\n");
+    }
+
+    /// Fallback evaluation ORDER: on a non-schema Member callee, `read_member`
+    /// runs BEFORE the args. A member-read error (nil receiver) must preempt arg
+    /// evaluation, so a side-effecting arg is NEVER evaluated, and the surfaced
+    /// error is the member-read error — NOT an arg error.
+    #[tokio::test]
+    async fn regression_fallback_member_before_args() {
+        let src = r#"
+let calls = [0]
+fn sideEffect() { calls[0] = calls[0] + 1; return 1 }
+let n = nil
+let [v, err] = recover(() => n.foo(sideEffect()))
+print(v == nil)
+print(err.message)
+print(calls[0])   // 0 — the arg side effect must NOT have run
+"#;
+        let out = run(src).await;
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "true", "recover value nil: {out}");
+        assert!(
+            lines[1].contains("cannot read property 'foo' of nil"),
+            "expected member-read error, got: {out}"
+        );
+        assert_eq!(
+            lines[2], "0",
+            "arg side effect must not run when member-read errors: {out}"
+        );
+    }
+
+    /// Optional member call `o?.m()` still falls through the existing path.
+    #[tokio::test]
+    async fn regression_opt_member_call() {
+        let src = r#"
+let o = {m: () => 7}
+print(o?.m())
+let n = nil
+print(n?.m())
+"#;
+        assert_eq!(run(src).await, "7\nnil\n");
     }
 }

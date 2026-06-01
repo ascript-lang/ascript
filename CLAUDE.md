@@ -79,6 +79,21 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > `resp.json(Class)` fuse a parse/decode failure and a shape mismatch into ONE Tier-1 `[value, err]`
 > pair (no panic); the class is an ordinary value argument (no generics).
 >
+> **`std/schema` fluent method chaining (call-site hook, ADDITIVE).** Refiners + `parse` are callable
+> as methods on a schema value (`schema.string().minLength(3).pattern(p).parse(input)`) in addition to
+> the free functions. Schemas stay tagged Objects (`{__kind:"string", minLength:3, ...}`) — NO new
+> `Value` variant, NO representation change. The hook lives ONLY in the `Call` evaluator
+> (`eval_chain`, `ExprKind::Call`): when the callee is a `Member { object, name }` (NOT `OptMember`),
+> eval `object` and the args ONCE, and if `schema::is_schema_value(&recv) && schema::is_schema_method(name)`
+> route to `self.call_schema(name, [recv, ...args])` (the SAME ops as the free fns); ELSE fall back to
+> the **behavior-identical** `read_member(recv, name) → call_value` path (factored shared arg eval into
+> `eval_call_args`). It's **call-position only**: bare `s.minLength` (member access) still reads the
+> STORED constraint field — this avoids the field/method collision and is the deliberate limitation.
+> `is_schema_value` is NARROW (Object whose `__kind` is one of the known schema kinds — never a module
+> namespace or arbitrary user object). Method set = `call_schema` ops whose first arg is the receiver
+> schema: `minLength/maxLength/pattern/min/max/refine/default/optional/strict/parse` (EXCLUDES the
+> source constructors `string/number/bool/nilType/any/literal/object/array/union/oneOf/map/fromClass`).
+>
 > **Object destructuring**: `let {a, b as local, "k" as v} = obj` binds by key from an `Object` or
 > `Instance` (`Stmt::LetDestructureObject`); missing keys bind `nil`. Keys are `Ident | Str` (quote
 > non-identifier keys); rename with the soft keyword `as`. A trailing `...rest` collector is active
