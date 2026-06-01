@@ -7,7 +7,7 @@
 
 use crate::ast::{
     ArrayElem, ArrowBody, BinOp, CallArg, EnumVariantDecl, Expr, ExprKind, FieldDecl, ImportNames,
-    MatchArm, MethodDecl, ObjEntry, Param, Stmt, TemplatePart, Type, UnOp,
+    MatchArm, MethodDecl, ObjEntry, Param, Pattern, Stmt, TemplatePart, Type, UnOp,
 };
 use crate::error::AsError;
 
@@ -635,19 +635,83 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
 }
 
 fn write_match_arm(out: &mut String, arm: &MatchArm) {
-    match &arm.patterns {
-        None => out.push('_'),
-        Some(pats) => {
-            for (i, p) in pats.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(" | ");
-                }
-                write_expr(out, p, PREC_ASSIGN);
-            }
+    // Minimal-but-source-faithful pattern render (Phase 8a). Value/Range sub-
+    // expressions go through the formatter's own `write_expr` (NOT the AST debug
+    // `Display`) so the output reparses. A fully idempotent pass is Phase 8c.
+    for (i, p) in arm.patterns.iter().enumerate() {
+        if i > 0 {
+            out.push_str(" | ");
         }
+        write_pattern(out, p);
+    }
+    if let Some(guard) = &arm.guard {
+        out.push_str(" if ");
+        write_expr(out, guard, PREC_ASSIGN);
     }
     out.push_str(" => ");
     write_expr(out, &arm.body, PREC_ASSIGN);
+}
+
+fn write_pattern(out: &mut String, pat: &Pattern) {
+    match pat {
+        Pattern::Wildcard => out.push('_'),
+        Pattern::Ident(n) => out.push_str(n),
+        Pattern::Value(e) => write_expr(out, e, PREC_ASSIGN),
+        Pattern::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            write_expr(out, start, PREC_ASSIGN);
+            out.push_str(if *inclusive { "..=" } else { ".." });
+            write_expr(out, end, PREC_ASSIGN);
+        }
+        Pattern::Array(pats, rest) => {
+            out.push('[');
+            for (i, p) in pats.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_pattern(out, p);
+            }
+            write_pattern_rest(out, rest, !pats.is_empty());
+            out.push(']');
+        }
+        Pattern::Object(entries, rest) => {
+            out.push('{');
+            for (i, e) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&object_key(e.key.as_ref()));
+                if let Some(p) = &e.pat {
+                    out.push_str(": ");
+                    write_pattern(out, p);
+                }
+            }
+            write_pattern_rest(out, rest, !entries.is_empty());
+            out.push('}');
+        }
+    }
+}
+
+fn write_pattern_rest(
+    out: &mut String,
+    rest: &Option<Option<std::rc::Rc<str>>>,
+    needs_comma: bool,
+) {
+    match rest {
+        None => {}
+        Some(name) => {
+            if needs_comma {
+                out.push_str(", ");
+            }
+            out.push_str("...");
+            if let Some(n) = name {
+                out.push_str(n);
+            }
+        }
+    }
 }
 
 fn op_str(op: UnOp) -> String {

@@ -323,10 +323,120 @@ pub struct MethodDecl {
 
 #[derive(Clone, Debug)]
 pub struct MatchArm {
-    /// Patterns are value-expressions compared with `==`; `None` patterns list
-    /// means a wildcard `_`. Multiple patterns = an or-pattern.
-    pub patterns: Option<Vec<Expr>>,
+    /// One or more `|`-separated patterns (an or-pattern); the arm fires when ANY
+    /// matches. (A bare `_` is `Pattern::Wildcard`.)
+    pub patterns: Vec<Pattern>,
+    /// Optional `if <cond>` guard, evaluated in the arm scope (with bindings) after
+    /// the pattern structurally matches; a falsy guard rejects the arm.
+    pub guard: Option<Expr>,
     pub body: Expr,
+}
+
+/// A `match`-arm pattern (Phase 8a). Bare identifiers are resolved at match time
+/// (Option C): a name DEFINED in the enclosing scope is a value-compare, an
+/// UNDEFINED name binds the subject.
+#[derive(Clone, Debug)]
+pub enum Pattern {
+    /// `_` — matches anything, binds nothing.
+    Wildcard,
+    /// A bare identifier — Option-C resolved (compare if defined, bind if new).
+    Ident(std::rc::Rc<str>),
+    /// Any value expression (literal, enum ref, member access, call, `1+1`, …) —
+    /// evaluated then compared with `==`.
+    Value(Box<Expr>),
+    /// `a..b` (exclusive) / `a..=b` (inclusive) — subject is a Number in range.
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+    },
+    /// `[p0, p1, ...]` — subject is an array; exact arity unless a trailing rest.
+    /// The rest: `None` = no rest, `Some(None)` = `...` (ignore), `Some(Some(n))`
+    /// = `...n` (bind remainder as an array).
+    Array(Vec<Pattern>, Option<Option<std::rc::Rc<str>>>),
+    /// `{key, key2: subpat, ...}` — subject is an Object/Instance with the keys.
+    /// Rest as for `Array` but binds remaining keys into a new Object.
+    Object(Vec<ObjPatEntry>, Option<Option<std::rc::Rc<str>>>),
+}
+
+/// One entry in an object pattern. `pat: None` is the shorthand `{key}` which
+/// ALWAYS binds `key` to that field (documented exception to Option C);
+/// `pat: Some(p)` is `{key: p}` and matches the field against `p`.
+#[derive(Clone, Debug)]
+pub struct ObjPatEntry {
+    pub key: std::rc::Rc<str>,
+    pub pat: Option<Pattern>,
+}
+
+impl std::fmt::Display for Pattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Pattern::Wildcard => write!(f, "_"),
+            Pattern::Ident(n) => write!(f, "{}", n),
+            Pattern::Value(e) => write!(f, "{}", e),
+            Pattern::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                let op = if *inclusive { "..=" } else { ".." };
+                write!(f, "{}{}{}", start, op, end)
+            }
+            Pattern::Array(pats, rest) => {
+                write!(f, "[")?;
+                for (i, p) in pats.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", p)?;
+                }
+                match rest {
+                    None => {}
+                    Some(None) => {
+                        if !pats.is_empty() {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "...")?;
+                    }
+                    Some(Some(n)) => {
+                        if !pats.is_empty() {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "...{}", n)?;
+                    }
+                }
+                write!(f, "]")
+            }
+            Pattern::Object(entries, rest) => {
+                write!(f, "{{")?;
+                for (i, e) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    match &e.pat {
+                        None => write!(f, "{}", e.key)?,
+                        Some(p) => write!(f, "{}: {}", e.key, p)?,
+                    }
+                }
+                match rest {
+                    None => {}
+                    Some(None) => {
+                        if !entries.is_empty() {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "...")?;
+                    }
+                    Some(Some(n)) => {
+                        if !entries.is_empty() {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "...{}", n)?;
+                    }
+                }
+                write!(f, "}}")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
