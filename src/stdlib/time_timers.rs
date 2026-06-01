@@ -247,8 +247,14 @@ impl Interp {
         // the window expires (an AbortHandle's own Drop does NOT abort).
         let jh = tokio::task::spawn_local(async move {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-            // Ignore the result: trailing-edge fire-and-forget.
-            let _ = vm.call_value(func, args, Span::new(0, 0)).await;
+            // Calling an `async fn` returns Ok(Value::Future(..)) WITHOUT running
+            // the body — so we must drive that inner future to completion here,
+            // otherwise an async callback would silently never run. (Mirror of
+            // `task.retry`.) The driven future's result/panic is swallowed:
+            // a debounced fire is a deferred side-effect, not an awaited value.
+            if let Ok(Value::Future(f)) = vm.call_value(func, args, Span::new(0, 0)).await {
+                let _ = f.get().await;
+            }
         });
 
         // Store the new abort handle so the NEXT call (or Drop) can cancel it.
@@ -311,10 +317,13 @@ impl Interp {
         self.return_resource(id, ResourceState::ThrottleWrapper(state));
 
         if let Some(f) = func {
-            // Call synchronously on the leading edge; ignore the return value.
-            // (If the wrapped fn is async the caller can await the returned
-            // future themselves — but throttle itself is sync at the wrapper level.)
-            let _ = self.call_value(f, args, span).await;
+            // Fire on the leading edge; the return value is not surfaced.
+            // Calling an `async fn` returns Ok(Value::Future(..)) WITHOUT running
+            // the body, so drive that inner future to completion here — otherwise
+            // an async callback would silently never run. (Mirror of `task.retry`.)
+            if let Ok(Value::Future(fut)) = self.call_value(f, args, span).await {
+                let _ = fut.get().await;
+            }
         }
 
         Ok(Value::Nil)

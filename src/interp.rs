@@ -5479,6 +5479,43 @@ print(last[0])         // "b"
         assert_eq!(out, "1\nb\n");
     }
 
+    /// debounce with an ASYNC callback: the deferred task must DRIVE the inner
+    /// future to completion (calling an `async fn` returns a Future without
+    /// running the body). Async callbacks are the primary debounce use case
+    /// (debounced save), so the body must actually run.
+    #[tokio::test]
+    async fn std_time_debounce_drives_async_callback() {
+        let out = run(r#"
+import * as time from "std/time"
+let c = [0]
+let d = time.debounce(async () => { c[0] = c[0] + 1 }, 15)
+d()
+d()
+d()
+await time.sleep(50)
+print(c[0])   // 1 — the async body ran exactly once (trailing edge)
+"#)
+        .await;
+        assert_eq!(out, "1\n");
+    }
+
+    /// throttle with an ASYNC callback: the leading-edge call must drive the
+    /// inner future to completion so the async body actually runs.
+    #[tokio::test]
+    async fn std_time_throttle_drives_async_callback() {
+        let out = run(r#"
+import * as time from "std/time"
+let t = [0]
+let th = time.throttle(async () => { t[0] = t[0] + 1 }, 50)
+th()
+th()
+await time.sleep(5)
+print(t[0])   // 1 — the async body ran once on the leading edge
+"#)
+        .await;
+        assert_eq!(out, "1\n");
+    }
+
     #[cfg(feature = "datetime")]
     #[tokio::test]
     async fn std_date_end_to_end() {
