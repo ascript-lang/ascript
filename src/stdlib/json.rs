@@ -82,6 +82,15 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
     match v {
         Value::Nil => Ok(serde_json::Value::Null),
         Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        // Decimal: emit as a JSON number literal from the canonical string.
+        // `rust_decimal` always produces a valid JSON number string (no ±Inf/NaN),
+        // so `serde_json::from_str` never fails here.
+        Value::Decimal(d) => {
+            let s = d.to_string();
+            let raw: serde_json::Value = serde_json::from_str(&s)
+                .map_err(|_| format!("cannot serialize decimal {} to JSON", d))?;
+            Ok(raw)
+        }
         Value::Number(n) => {
             if !n.is_finite() {
                 return Err(format!("cannot serialize non-finite number {} to JSON", n));
@@ -179,6 +188,10 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
     match v {
         Value::Nil => J::Null,
         Value::Bool(b) => J::Bool(*b),
+        // Decimal: emit as a JSON number from the canonical string (always finite).
+        Value::Decimal(d) => {
+            serde_json::from_str::<J>(&d.to_string()).unwrap_or(J::Null)
+        }
         Value::Number(n) => {
             if !n.is_finite() {
                 return J::Null;

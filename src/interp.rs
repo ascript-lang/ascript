@@ -1280,6 +1280,7 @@ impl Interp {
                 match op {
                     UnOp::Neg => match v {
                         Value::Number(n) => Ok(Value::Number(-n)),
+                        Value::Decimal(d) => Ok(Value::Decimal(-d)),
                         _ => Err(AsError::at("cannot negate a non-number", operand.span).into()),
                     },
                     UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
@@ -1317,9 +1318,16 @@ impl Interp {
                 let l = self.eval_expr(lhs, env).await?;
                 let r = self.eval_expr(rhs, env).await?;
 
+                // Eq/Ne: cross-type Decimal↔Number comparison before generic `==`.
                 match op {
-                    BinOp::Eq => return Ok(Value::Bool(l == r)),
-                    BinOp::Ne => return Ok(Value::Bool(l != r)),
+                    BinOp::Eq => {
+                        let eq = decimal_cross_eq(&l, &r, expr.span)?;
+                        return Ok(Value::Bool(eq));
+                    }
+                    BinOp::Ne => {
+                        let eq = decimal_cross_eq(&l, &r, expr.span)?;
+                        return Ok(Value::Bool(!eq));
+                    }
                     _ => {}
                 }
 
@@ -1352,9 +1360,76 @@ impl Interp {
                     }
                 }
 
+                // Decimal arithmetic/comparison: triggered when either operand is
+                // Decimal. The other side is coerced (Number→Decimal; non-finite→
+                // Tier-2 panic; non-number/non-decimal → fall through to error).
+                if matches!((&l, &r), (Value::Decimal(_), _) | (_, Value::Decimal(_))) {
+                    use crate::stdlib::decimal::coerce_to_decimal;
+                    let da = coerce_to_decimal(&l, expr.span)?;
+                    let db = coerce_to_decimal(&r, expr.span)?;
+                    if let (Some(a), Some(b)) = (da, db) {
+                        let result = match op {
+                            BinOp::Add => Value::Decimal(a + b),
+                            BinOp::Sub => Value::Decimal(a - b),
+                            BinOp::Mul => Value::Decimal(a * b),
+                            BinOp::Div => {
+                                if b.is_zero() {
+                                    return Err(AsError::at(
+                                        "decimal division by zero",
+                                        expr.span,
+                                    )
+                                    .into());
+                                }
+                                Value::Decimal(a / b)
+                            }
+                            BinOp::Mod => {
+                                if b.is_zero() {
+                                    return Err(AsError::at(
+                                        "decimal remainder by zero",
+                                        expr.span,
+                                    )
+                                    .into());
+                                }
+                                Value::Decimal(a % b)
+                            }
+                            // Ordering: both operands are already finite Decimals
+                            // here (coerce_to_decimal above Tier-2-panics on a
+                            // non-finite Number). This is the INTENTIONAL asymmetry
+                            // vs equality: `decimal == Infinity` is a lenient `false`
+                            // (decimal_cross_eq), but `decimal < Infinity` panics —
+                            // there is no sensible order. See decimal_cross_eq's doc.
+                            BinOp::Lt => Value::Bool(a < b),
+                            BinOp::Le => Value::Bool(a <= b),
+                            BinOp::Gt => Value::Bool(a > b),
+                            BinOp::Ge => Value::Bool(a >= b),
+                            // Pow: not defined for Decimal — fall through to error.
+                            BinOp::Pow => {
+                                return Err(AsError::at(
+                                    "exponentiation (**) is not supported for decimal; use math.pow or convert to number",
+                                    expr.span,
+                                )
+                                .into())
+                            }
+                            BinOp::Eq
+                            | BinOp::Ne
+                            | BinOp::And
+                            | BinOp::Or
+                            | BinOp::Coalesce
+                            | BinOp::Range => unreachable!("handled above"),
+                        };
+                        return Ok(result);
+                    }
+                    // One operand was not a number or decimal — fall through to the
+                    // generic "operator requires two numbers or decimals" error.
+                }
+
                 let (a, b) = match (&l, &r) {
                     (Value::Number(a), Value::Number(b)) => (*a, *b),
-                    _ => return Err(AsError::at("operator requires two numbers", expr.span).into()),
+                    _ => return Err(AsError::at(
+                        "operator requires two numbers (or two decimals, or number and decimal)",
+                        expr.span,
+                    )
+                    .into()),
                 };
                 let result = match op {
                     BinOp::Add => Value::Number(a + b),
@@ -2746,6 +2821,39 @@ impl Interp {
 }
 
 /// Validate that a value is a usable array index (a non-negative integer).
+/// Equality comparison that handles cross-type Decimal↔Number cases.
+/// For all other pairs falls back to Value's PartialEq.
+///
+/// INTENTIONAL ASYMMETRY vs non-finite numbers: `decimal == Infinity`/`NaN`
+/// returns `false` (lenient — a finite decimal simply isn't equal to it), but
+/// `decimal < Infinity` (the ordering arm in the Binary evaluator) Tier-2 panics
+/// because there is no sensible total order between a finite decimal and ±Inf/NaN.
+/// Do not "unify" these: equality has a well-defined `false` answer; ordering does
+/// not. (Mirrors IEEE-754, where NaN compares false for `==` and `<` alike, but we
+/// additionally choose to hard-error on the nonsensical ordering.)
+fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
+    match (l, r) {
+        // Decimal vs Decimal: use the inner value's own equality.
+        (Value::Decimal(a), Value::Decimal(b)) => Ok(a == b),
+        // Decimal vs Number (or vice-versa): coerce the number to decimal.
+        (Value::Decimal(a), Value::Number(n)) | (Value::Number(n), Value::Decimal(a)) => {
+            if !n.is_finite() {
+                // A non-finite float can never equal a finite decimal (lenient
+                // false; the ordering path panics instead — see fn doc comment).
+                return Ok(false);
+            }
+            use rust_decimal::prelude::FromPrimitive;
+            let b = rust_decimal::Decimal::from_f64(*n)
+                .ok_or_else(|| {
+                    AsError::at("cannot convert number to decimal for comparison", span)
+                })?;
+            Ok(*a == b)
+        }
+        // All other pairs: generic structural equality.
+        _ => Ok(l == r),
+    }
+}
+
 fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
     match v {
         Value::Number(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
@@ -2797,6 +2905,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Nil => "nil",
         Value::Bool(_) => "bool",
         Value::Number(_) => "number",
+        Value::Decimal(_) => "decimal",
         Value::Str(_) => "string",
         Value::Builtin(_) | Value::Function(_) => "function",
         Value::Array(_) => "array",
@@ -5307,5 +5416,147 @@ print(r[1])
             }
             other => panic!("expected Control::Panic for exit(300), got {other:?}"),
         }
+    }
+
+    // ---- decimal operator overloading tests ----
+
+    /// THE HEADLINE: 0.1 + 0.2 == 0.3 is exact with decimals (unlike f64).
+    #[tokio::test]
+    async fn decimal_headline_exactness() {
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let result = decimal.from("0.1") + decimal.from("0.2") == decimal.from("0.3")
+print(result)
+"#).await;
+        assert_eq!(out.trim(), "true");
+    }
+
+    #[tokio::test]
+    async fn decimal_arithmetic_basic() {
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let a = decimal.from("1.50")
+let b = decimal.from("2.50")
+print(a + b)
+print(b - a)
+print(a * b)
+"#).await;
+        assert_eq!(out.trim(), "4.00\n1.00\n3.7500");
+    }
+
+    #[tokio::test]
+    async fn decimal_times_number() {
+        // decimal.from(2) * 3  == decimal 6
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let d = decimal.from(2) * 3
+print(d)
+"#).await;
+        assert_eq!(out.trim(), "6");
+    }
+
+    #[tokio::test]
+    async fn decimal_comparisons() {
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let a = decimal.from("1.0")
+let b = decimal.from("2.0")
+print(a < b)
+print(a > b)
+print(a <= decimal.from("1.0"))
+print(a >= decimal.from("1.0"))
+"#).await;
+        assert_eq!(out.trim(), "true\nfalse\ntrue\ntrue");
+    }
+
+    #[tokio::test]
+    async fn decimal_division_by_zero_panics() {
+        let err = run_err(r#"
+import * as decimal from "std/decimal"
+let _ = decimal.from(1) / decimal.from(0)
+"#).await;
+        assert!(err.message.contains("zero"), "expected 'zero' in: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn decimal_cross_type_eq_number() {
+        // decimal.from("1.5") == 1.5  (cross-type Number eq) → true
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let d = decimal.from("1.5")
+print(d == 1.5)
+print(1.5 == d)
+print(d != 1.5)
+"#).await;
+        assert_eq!(out.trim(), "true\ntrue\nfalse");
+    }
+
+    #[tokio::test]
+    async fn decimal_unary_minus() {
+        // -decimal.from("2") == decimal -2
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let d = -decimal.from("2")
+print(d)
+print(d == decimal.from("-2"))
+"#).await;
+        assert_eq!(out.trim(), "-2\ntrue");
+    }
+
+    #[tokio::test]
+    async fn decimal_modulo() {
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let a = decimal.from("10")
+let b = decimal.from("3")
+print(a % b)
+"#).await;
+        assert_eq!(out.trim(), "1");
+    }
+
+    #[tokio::test]
+    async fn decimal_modulo_by_zero_panics() {
+        let err = run_err(r#"
+import * as decimal from "std/decimal"
+let _ = decimal.from(1) % decimal.from(0)
+"#).await;
+        assert!(err.message.contains("zero"), "expected 'zero' in: {}", err.message);
+    }
+
+    /// Regression: normal number arithmetic must be unaffected.
+    #[tokio::test]
+    async fn regression_number_arithmetic_unaffected() {
+        let out = run("print(2 + 3 == 5)").await;
+        assert_eq!(out.trim(), "true");
+    }
+
+    /// Regression: string concatenation must be unaffected.
+    #[tokio::test]
+    async fn regression_string_concat_unaffected() {
+        let out = run(r#"print("a" + "b" == "ab")"#).await;
+        assert_eq!(out.trim(), "true");
+    }
+
+    #[tokio::test]
+    async fn decimal_is_truthy_regardless_of_zero() {
+        // spec §4: only nil and false are falsy — Decimal(0) is truthy.
+        // Use `if (z)` since AScript requires parens around the condition.
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let z = decimal.from("0")
+if (z) { print("truthy") } else { print("falsy") }
+"#).await;
+        assert_eq!(out.trim(), "truthy");
+    }
+
+    #[tokio::test]
+    async fn decimal_type_name() {
+        // `type` is the AScript builtin for runtime type name (not `typeOf`).
+        let out = run(r#"
+import * as decimal from "std/decimal"
+let d = decimal.from("1.5")
+print(type(d))
+"#).await;
+        assert_eq!(out.trim(), "decimal");
     }
 }

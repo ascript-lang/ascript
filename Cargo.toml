@@ -12,6 +12,7 @@ name = "ascript"
 path = "src/main.rs"
 
 [dependencies]
+rust_decimal = { version = "1", features = ["maths"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 async-recursion = "1"
 indexmap = "2"
