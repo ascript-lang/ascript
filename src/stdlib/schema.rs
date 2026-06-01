@@ -34,6 +34,16 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("nilType", bi("schema.nilType")),
         ("any", bi("schema.any")),
         ("literal", bi("schema.literal")),
+        // ── 6b composites ────────────────────────────────────────────────────
+        ("array", bi("schema.array")),
+        ("object", bi("schema.object")),
+        ("strict", bi("schema.strict")),
+        ("map", bi("schema.map")),
+        ("optional", bi("schema.optional")),
+        ("union", bi("schema.union")),
+        // `enum` is a reserved keyword (Tok::Enum) → use `oneOf`.
+        // `schema.enum` is a parse error; the internal `__kind` tag is "oneOf".
+        ("oneOf", bi("schema.oneOf")),
         ("parse", bi("schema.parse")),
     ]
 }
@@ -189,6 +199,239 @@ impl Interp {
                     )))
                 }
             }
+            // ── 6b: array ─────────────────────────────────────────────────────
+            "array" => {
+                let elem_schema = obj_field(schema, "elem").ok_or_else(|| {
+                    SchemaErr::InvalidSchema("schema.parse: 'array' schema missing 'elem'".into())
+                })?;
+                match value {
+                    Value::Array(arr) => {
+                        let items: Vec<Value> = arr.borrow().clone();
+                        let mut out = Vec::with_capacity(items.len());
+                        for (i, item) in items.iter().enumerate() {
+                            let item_path = format!("{}[{}]", path, i);
+                            let v = self
+                                .parse_value(&elem_schema, item, &item_path)
+                                .await?;
+                            out.push(v);
+                        }
+                        Ok(Value::Array(Rc::new(RefCell::new(out))))
+                    }
+                    _ => Err(SchemaErr::Mismatch(err_obj(
+                        path,
+                        format!("expected array, got {}", type_name(value)),
+                    ))),
+                }
+            }
+
+            // ── 6b: object ────────────────────────────────────────────────────
+            "object" => {
+                let fields_schema = obj_field(schema, "fields").ok_or_else(|| {
+                    SchemaErr::InvalidSchema(
+                        "schema.parse: 'object' schema missing 'fields'".into(),
+                    )
+                })?;
+                let is_strict = matches!(obj_field(schema, "strict"), Some(Value::Bool(true)));
+
+                match value {
+                    Value::Object(val_obj) => {
+                        // Collect declared field names and schemas
+                        let field_pairs: Vec<(String, Value)> =
+                            match &fields_schema {
+                                Value::Object(fs) => fs
+                                    .borrow()
+                                    .iter()
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect(),
+                                _ => {
+                                    return Err(SchemaErr::InvalidSchema(
+                                        "schema.parse: 'fields' must be an Object".into(),
+                                    ))
+                                }
+                            };
+
+                        // strict: reject extra keys
+                        if is_strict {
+                            let declared: std::collections::HashSet<&str> =
+                                field_pairs.iter().map(|(k, _)| k.as_str()).collect();
+                            let val_borrow = val_obj.borrow();
+                            for k in val_borrow.keys() {
+                                if !declared.contains(k.as_str()) {
+                                    let key_path = if path.is_empty() {
+                                        k.clone()
+                                    } else {
+                                        format!("{}.{}", path, k)
+                                    };
+                                    return Err(SchemaErr::Mismatch(err_obj(
+                                        &key_path,
+                                        format!(
+                                            "unknown key '{}' not allowed in strict object",
+                                            k
+                                        ),
+                                    )));
+                                }
+                            }
+                        }
+
+                        // Validate declared fields
+                        let mut out: IndexMap<String, Value> = IndexMap::new();
+                        for (field_name, field_schema) in &field_pairs {
+                            let field_val = val_obj
+                                .borrow()
+                                .get(field_name)
+                                .cloned()
+                                .unwrap_or(Value::Nil);
+                            let field_path = if path.is_empty() {
+                                field_name.clone()
+                            } else {
+                                format!("{}.{}", path, field_name)
+                            };
+                            let parsed = self
+                                .parse_value(field_schema, &field_val, &field_path)
+                                .await?;
+                            out.insert(field_name.clone(), parsed);
+                        }
+                        Ok(Value::Object(Rc::new(RefCell::new(out))))
+                    }
+                    _ => Err(SchemaErr::Mismatch(err_obj(
+                        path,
+                        format!("expected object, got {}", type_name(value)),
+                    ))),
+                }
+            }
+
+            // ── 6b: map ───────────────────────────────────────────────────────
+            "map" => {
+                use crate::value::MapKey;
+                let key_schema = obj_field(schema, "key").ok_or_else(|| {
+                    SchemaErr::InvalidSchema("schema.parse: 'map' schema missing 'key'".into())
+                })?;
+                let val_schema = obj_field(schema, "val").ok_or_else(|| {
+                    SchemaErr::InvalidSchema("schema.parse: 'map' schema missing 'val'".into())
+                })?;
+
+                // Collect entries from either Map or Object (coerce Object→Map).
+                let entries: Vec<(Value, Value)> = match value {
+                    Value::Map(m) => m
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.to_value(), v.clone()))
+                        .collect(),
+                    Value::Object(o) => o
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (Value::Str(k.as_str().into()), v.clone()))
+                        .collect(),
+                    _ => {
+                        return Err(SchemaErr::Mismatch(err_obj(
+                            path,
+                            format!("expected map or object, got {}", type_name(value)),
+                        )))
+                    }
+                };
+
+                let mut out: IndexMap<MapKey, Value> = IndexMap::new();
+                for (raw_key, raw_val) in entries {
+                    // Value path: "<path>[<key>]" (e.g. `cfg[port]`).
+                    // Key path appends a "(key)" marker so a key-validation error
+                    // is distinguishable from a value-validation error at the same
+                    // entry (e.g. `cfg[port] (key)`).
+                    let val_path = format!("{}[{}]", path, raw_key);
+                    let key_path = format!("{} (key)", val_path);
+                    let parsed_key =
+                        self.parse_value(&key_schema, &raw_key, &key_path).await?;
+                    let parsed_val =
+                        self.parse_value(&val_schema, &raw_val, &val_path).await?;
+                    let map_key = MapKey::from_value(&parsed_key).ok_or_else(|| {
+                        SchemaErr::Mismatch(err_obj(
+                            &key_path,
+                            format!("map key type {} is not hashable", type_name(&parsed_key)),
+                        ))
+                    })?;
+                    out.insert(map_key, parsed_val);
+                }
+                Ok(Value::Map(Rc::new(RefCell::new(out))))
+            }
+
+            // ── 6b: optional ──────────────────────────────────────────────────
+            "optional" => {
+                if matches!(value, Value::Nil) {
+                    return Ok(Value::Nil);
+                }
+                let inner = obj_field(schema, "inner").ok_or_else(|| {
+                    SchemaErr::InvalidSchema(
+                        "schema.parse: 'optional' schema missing 'inner'".into(),
+                    )
+                })?;
+                self.parse_value(&inner, value, path).await
+            }
+
+            // ── 6b: union ─────────────────────────────────────────────────────
+            "union" => {
+                let options = obj_field(schema, "options").ok_or_else(|| {
+                    SchemaErr::InvalidSchema(
+                        "schema.parse: 'union' schema missing 'options'".into(),
+                    )
+                })?;
+                let opts: Vec<Value> = match &options {
+                    Value::Array(a) => a.borrow().clone(),
+                    _ => {
+                        return Err(SchemaErr::InvalidSchema(
+                            "schema.parse: 'union' options must be an Array".into(),
+                        ))
+                    }
+                };
+                let mut kinds: Vec<String> = Vec::new();
+                for opt in &opts {
+                    match self.parse_value(opt, value, path).await {
+                        Ok(v) => return Ok(v),
+                        Err(SchemaErr::Mismatch(_)) => {
+                            kinds.push(
+                                schema_kind(opt)
+                                    .map(|k| k.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                            );
+                        }
+                        Err(e @ SchemaErr::InvalidSchema(_)) => return Err(e),
+                    }
+                }
+                Err(SchemaErr::Mismatch(err_obj(
+                    path,
+                    format!("expected one of [{}], got {}", kinds.join(", "), type_name(value)),
+                )))
+            }
+
+            // ── 6b: oneOf (enum-like, `enum` is a keyword) ───────────────────
+            "oneOf" => {
+                let values_field = obj_field(schema, "values").ok_or_else(|| {
+                    SchemaErr::InvalidSchema(
+                        "schema.parse: 'oneOf' schema missing 'values'".into(),
+                    )
+                })?;
+                let allowed: Vec<Value> = match &values_field {
+                    Value::Array(a) => a.borrow().clone(),
+                    _ => {
+                        return Err(SchemaErr::InvalidSchema(
+                            "schema.parse: 'oneOf' values must be an Array".into(),
+                        ))
+                    }
+                };
+                for v in &allowed {
+                    if value == v {
+                        return Ok(value.clone());
+                    }
+                }
+                let listed: Vec<String> = allowed.iter().map(|v| format!("{}", v)).collect();
+                Err(SchemaErr::Mismatch(err_obj(
+                    path,
+                    format!(
+                        "expected one of [{}], got {}",
+                        listed.join(", "),
+                        value
+                    ),
+                )))
+            }
+
             other => Err(SchemaErr::InvalidSchema(format!(
                 "schema.parse: unknown schema kind '{}'",
                 other
@@ -215,6 +458,90 @@ impl Interp {
                 let mut m: IndexMap<String, Value> = IndexMap::new();
                 m.insert("__kind".to_string(), Value::Str("literal".into()));
                 m.insert("value".to_string(), v);
+                Ok(Value::Object(Rc::new(RefCell::new(m))))
+            }
+
+            // ── 6b composite constructors ─────────────────────────────────────
+
+            // schema.array(elemSchema) → {__kind:"array", elem}
+            "array" => {
+                let elem = arg(args, 0);
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("__kind".to_string(), Value::Str("array".into()));
+                m.insert("elem".to_string(), elem);
+                Ok(Value::Object(Rc::new(RefCell::new(m))))
+            }
+
+            // schema.object(fieldsObj) → {__kind:"object", fields, strict:false}
+            "object" => {
+                let fields = arg(args, 0);
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("__kind".to_string(), Value::Str("object".into()));
+                m.insert("fields".to_string(), fields);
+                m.insert("strict".to_string(), Value::Bool(false));
+                Ok(Value::Object(Rc::new(RefCell::new(m))))
+            }
+
+            // schema.strict(objSchema) → clone with strict:true
+            "strict" => {
+                let obj_schema = arg(args, 0);
+                // Verify it's an object schema
+                match schema_kind(&obj_schema).as_deref() {
+                    Some("object") => {
+                        // Clone the fields, set strict:true
+                        match &obj_schema {
+                            Value::Object(o) => {
+                                let mut m: IndexMap<String, Value> = o.borrow().clone();
+                                m.insert("strict".to_string(), Value::Bool(true));
+                                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => Err(AsError::at(
+                        "schema.strict: argument must be an object schema",
+                        span,
+                    )
+                    .into()),
+                }
+            }
+
+            // schema.map(keySchema, valSchema) → {__kind:"map", key, val}
+            "map" => {
+                let key = arg(args, 0);
+                let val = arg(args, 1);
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("__kind".to_string(), Value::Str("map".into()));
+                m.insert("key".to_string(), key);
+                m.insert("val".to_string(), val);
+                Ok(Value::Object(Rc::new(RefCell::new(m))))
+            }
+
+            // schema.optional(innerSchema) → {__kind:"optional", inner}
+            "optional" => {
+                let inner = arg(args, 0);
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("__kind".to_string(), Value::Str("optional".into()));
+                m.insert("inner".to_string(), inner);
+                Ok(Value::Object(Rc::new(RefCell::new(m))))
+            }
+
+            // schema.union(list) → {__kind:"union", options:[...]}
+            "union" => {
+                let options = arg(args, 0);
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("__kind".to_string(), Value::Str("union".into()));
+                m.insert("options".to_string(), options);
+                Ok(Value::Object(Rc::new(RefCell::new(m))))
+            }
+
+            // schema.oneOf(list) → {__kind:"oneOf", values:[...]}
+            // (`enum` is a reserved keyword in AScript, so `oneOf` is the exported name.)
+            "oneOf" => {
+                let values = arg(args, 0);
+                let mut m: IndexMap<String, Value> = IndexMap::new();
+                m.insert("__kind".to_string(), Value::Str("oneOf".into()));
+                m.insert("values".to_string(), values);
                 Ok(Value::Object(Rc::new(RefCell::new(m))))
             }
 
@@ -612,5 +939,500 @@ mod tests {
                 result
             );
         }
+    }
+
+    // ── 6b composite: schema.array ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn array_schema_ok() {
+        let interp = crate::interp::Interp::new();
+        // Build array(number()) schema
+        let num_schema = make_schema("number");
+        let arr_schema = interp
+            .call_schema("array", &[num_schema], sp())
+            .await
+            .unwrap();
+        // [1, 2] → ok
+        let arr = Value::Array(Rc::new(RefCell::new(vec![
+            Value::Number(1.0),
+            Value::Number(2.0),
+        ])));
+        let pair = interp
+            .call_schema("parse", &[arr_schema, arr], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn array_schema_err_path() {
+        let interp = crate::interp::Interp::new();
+        let num_schema = make_schema("number");
+        let arr_schema = interp
+            .call_schema("array", &[num_schema], sp())
+            .await
+            .unwrap();
+        // [1, "x"] → err path "[1]"
+        let arr = Value::Array(Rc::new(RefCell::new(vec![
+            Value::Number(1.0),
+            Value::Str("x".into()),
+        ])));
+        let pair = interp
+            .call_schema("parse", &[arr_schema, arr], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let err = err_val(&pair);
+        assert_eq!(field(&err, "path"), Value::Str("[1]".into()));
+    }
+
+    #[tokio::test]
+    async fn array_schema_not_array() {
+        let interp = crate::interp::Interp::new();
+        let num_schema = make_schema("number");
+        let arr_schema = interp
+            .call_schema("array", &[num_schema], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[arr_schema, Value::Str("x".into())], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(s) => s,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("expected array"), "msg: {}", msg);
+    }
+
+    // ── 6b composite: schema.object ───────────────────────────────────────────
+
+    fn make_fields_obj(pairs: &[(&str, Value)]) -> Value {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.clone());
+        }
+        Value::Object(Rc::new(RefCell::new(m)))
+    }
+
+    fn make_value_obj(pairs: &[(&str, Value)]) -> Value {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.clone());
+        }
+        Value::Object(Rc::new(RefCell::new(m)))
+    }
+
+    #[tokio::test]
+    async fn object_schema_ok() {
+        let interp = crate::interp::Interp::new();
+        let fields = make_fields_obj(&[
+            ("a", make_schema("number")),
+            ("b", make_schema("string")),
+        ]);
+        let obj_schema = interp
+            .call_schema("object", &[fields], sp())
+            .await
+            .unwrap();
+        let value = make_value_obj(&[
+            ("a", Value::Number(1.0)),
+            ("b", Value::Str("x".into())),
+        ]);
+        let pair = interp
+            .call_schema("parse", &[obj_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn object_schema_err_path_at_root() {
+        let interp = crate::interp::Interp::new();
+        let fields = make_fields_obj(&[
+            ("a", make_schema("number")),
+            ("b", make_schema("string")),
+        ]);
+        let obj_schema = interp
+            .call_schema("object", &[fields], sp())
+            .await
+            .unwrap();
+        // b is a number but schema expects string
+        let value = make_value_obj(&[
+            ("a", Value::Number(1.0)),
+            ("b", Value::Number(2.0)),
+        ]);
+        let pair = interp
+            .call_schema("parse", &[obj_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let err = err_val(&pair);
+        // at root, path is just "b"
+        assert_eq!(field(&err, "path"), Value::Str("b".into()));
+    }
+
+    #[tokio::test]
+    async fn object_schema_nested_err_path() {
+        let interp = crate::interp::Interp::new();
+        // object({user: object({name: string()})})
+        let name_fields = make_fields_obj(&[("name", make_schema("string"))]);
+        let inner_schema = interp
+            .call_schema("object", &[name_fields], sp())
+            .await
+            .unwrap();
+        let outer_fields = make_fields_obj(&[("user", inner_schema)]);
+        let outer_schema = interp
+            .call_schema("object", &[outer_fields], sp())
+            .await
+            .unwrap();
+        // user.name is a number (bad)
+        let inner_val = make_value_obj(&[("name", Value::Number(42.0))]);
+        let value = make_value_obj(&[("user", inner_val)]);
+        let pair = interp
+            .call_schema("parse", &[outer_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let err = err_val(&pair);
+        assert_eq!(field(&err, "path"), Value::Str("user.name".into()));
+    }
+
+    #[tokio::test]
+    async fn object_schema_ignores_extra_keys() {
+        let interp = crate::interp::Interp::new();
+        let fields = make_fields_obj(&[("a", make_schema("number"))]);
+        let obj_schema = interp
+            .call_schema("object", &[fields], sp())
+            .await
+            .unwrap();
+        // extra key "b" should be ignored
+        let value = make_value_obj(&[
+            ("a", Value::Number(1.0)),
+            ("b", Value::Str("extra".into())),
+        ]);
+        let pair = interp
+            .call_schema("parse", &[obj_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn object_schema_not_object() {
+        let interp = crate::interp::Interp::new();
+        let fields = make_fields_obj(&[("a", make_schema("number"))]);
+        let obj_schema = interp
+            .call_schema("object", &[fields], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[obj_schema, Value::Number(5.0)], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(s) => s,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("expected object"), "msg: {}", msg);
+    }
+
+    // ── 6b composite: schema.strict ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn strict_object_rejects_extra_keys() {
+        let interp = crate::interp::Interp::new();
+        let fields = make_fields_obj(&[("a", make_schema("number"))]);
+        let obj_schema = interp
+            .call_schema("object", &[fields], sp())
+            .await
+            .unwrap();
+        let strict_schema = interp
+            .call_schema("strict", &[obj_schema], sp())
+            .await
+            .unwrap();
+        // a=1 and b=2 (extra) → error
+        let value = make_value_obj(&[
+            ("a", Value::Number(1.0)),
+            ("b", Value::Number(2.0)),
+        ]);
+        let pair = interp
+            .call_schema("parse", &[strict_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(s) => s,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("unknown key") || msg.contains("unexpected key"), "msg: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn strict_object_ok_no_extra() {
+        let interp = crate::interp::Interp::new();
+        let fields = make_fields_obj(&[("a", make_schema("number"))]);
+        let obj_schema = interp
+            .call_schema("object", &[fields], sp())
+            .await
+            .unwrap();
+        let strict_schema = interp
+            .call_schema("strict", &[obj_schema], sp())
+            .await
+            .unwrap();
+        let value = make_value_obj(&[("a", Value::Number(1.0))]);
+        let pair = interp
+            .call_schema("parse", &[strict_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    // ── 6b composite: schema.optional ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn optional_nil_ok() {
+        let interp = crate::interp::Interp::new();
+        let num_schema = make_schema("number");
+        let opt_schema = interp
+            .call_schema("optional", &[num_schema], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[opt_schema, Value::Nil], sp())
+            .await
+            .unwrap();
+        // nil → ok with value nil
+        assert_eq!(ok_val(&pair), Value::Nil);
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn optional_value_passes_through() {
+        let interp = crate::interp::Interp::new();
+        let num_schema = make_schema("number");
+        let opt_schema = interp
+            .call_schema("optional", &[num_schema], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[opt_schema, Value::Number(5.0)], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Number(5.0));
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn optional_mismatch_err() {
+        let interp = crate::interp::Interp::new();
+        let num_schema = make_schema("number");
+        let opt_schema = interp
+            .call_schema("optional", &[num_schema], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[opt_schema, Value::Str("x".into())], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        assert!(matches!(err_val(&pair), Value::Object(_)));
+    }
+
+    // ── 6b composite: schema.union ───────────────────────────────────────────
+
+    fn make_array_val(items: Vec<Value>) -> Value {
+        Value::Array(Rc::new(RefCell::new(items)))
+    }
+
+    #[tokio::test]
+    async fn union_accepts_first_match() {
+        let interp = crate::interp::Interp::new();
+        let options = make_array_val(vec![make_schema("string"), make_schema("number")]);
+        let union_schema = interp
+            .call_schema("union", &[options], sp())
+            .await
+            .unwrap();
+        // string "x" matches first option
+        let pair = interp
+            .call_schema("parse", &[union_schema.clone(), Value::Str("x".into())], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Str("x".into()));
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn union_accepts_second_match() {
+        let interp = crate::interp::Interp::new();
+        let options = make_array_val(vec![make_schema("string"), make_schema("number")]);
+        let union_schema = interp
+            .call_schema("union", &[options], sp())
+            .await
+            .unwrap();
+        // number 5 matches second option
+        let pair = interp
+            .call_schema("parse", &[union_schema, Value::Number(5.0)], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Number(5.0));
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn union_rejects_none_match() {
+        let interp = crate::interp::Interp::new();
+        let options = make_array_val(vec![make_schema("string"), make_schema("number")]);
+        let union_schema = interp
+            .call_schema("union", &[options], sp())
+            .await
+            .unwrap();
+        // bool true doesn't match string or number
+        let pair = interp
+            .call_schema("parse", &[union_schema, Value::Bool(true)], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        assert!(matches!(err_val(&pair), Value::Object(_)));
+    }
+
+    // ── 6b composite: schema.oneOf (enum-like) ───────────────────────────────
+
+    #[tokio::test]
+    async fn one_of_accepts_listed_value() {
+        let interp = crate::interp::Interp::new();
+        let vals = make_array_val(vec![
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+        ]);
+        let schema = interp.call_schema("oneOf", &[vals], sp()).await.unwrap();
+        let pair = interp
+            .call_schema("parse", &[schema, Value::Str("a".into())], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Str("a".into()));
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn one_of_rejects_unlisted_value() {
+        let interp = crate::interp::Interp::new();
+        let vals = make_array_val(vec![
+            Value::Str("a".into()),
+            Value::Str("b".into()),
+        ]);
+        let schema = interp.call_schema("oneOf", &[vals], sp()).await.unwrap();
+        let pair = interp
+            .call_schema("parse", &[schema, Value::Str("c".into())], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(s) => s,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("expected one of"), "msg: {}", msg);
+    }
+
+    // ── 6b composite: schema.map ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn map_schema_from_object_ok() {
+        let interp = crate::interp::Interp::new();
+        let map_schema = interp
+            .call_schema(
+                "map",
+                &[make_schema("string"), make_schema("number")],
+                sp(),
+            )
+            .await
+            .unwrap();
+        // Object {"k": 1} → coerced to map at boundary
+        let value = make_value_obj(&[("k", Value::Number(1.0))]);
+        let pair = interp
+            .call_schema("parse", &[map_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn map_schema_value_mismatch() {
+        let interp = crate::interp::Interp::new();
+        let map_schema = interp
+            .call_schema(
+                "map",
+                &[make_schema("string"), make_schema("number")],
+                sp(),
+            )
+            .await
+            .unwrap();
+        // value is string instead of number
+        let value = make_value_obj(&[("k", Value::Str("bad".into()))]);
+        let pair = interp
+            .call_schema("parse", &[map_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        assert!(matches!(err_val(&pair), Value::Object(_)));
+    }
+
+    #[tokio::test]
+    async fn map_schema_key_mismatch_has_key_marker() {
+        let interp = crate::interp::Interp::new();
+        // key must be a number, value a number; an Object always has string keys,
+        // so the KEY validation fails — its err.path must carry the "(key)" marker
+        // to distinguish it from a value-validation error at the same entry.
+        let map_schema = interp
+            .call_schema(
+                "map",
+                &[make_schema("number"), make_schema("number")],
+                sp(),
+            )
+            .await
+            .unwrap();
+        let value = make_value_obj(&[("k", Value::Number(1.0))]);
+        let pair = interp
+            .call_schema("parse", &[map_schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let err = err_val(&pair);
+        let path = match field(&err, "path") {
+            Value::Str(s) => s,
+            other => panic!("{:?}", other),
+        };
+        assert!(path.contains("(key)"), "key error path should carry marker: {}", path);
+        // sanity: the message is the key-mismatch one, not a value mismatch
+        let msg = match field(&err, "message") {
+            Value::Str(s) => s,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("expected number"), "msg: {}", msg);
+    }
+
+    // ── 6b composite: schema.union propagates InvalidSchema ───────────────────
+
+    #[tokio::test]
+    async fn union_propagates_invalid_schema_panic() {
+        let interp = crate::interp::Interp::new();
+        // First option is a malformed sub-schema (raw object, no __kind); union
+        // must NOT swallow it as a mismatch — it must propagate InvalidSchema,
+        // which surfaces at the parse boundary as a Tier-2 Control::Panic.
+        let bad_sub = make_value_obj(&[("foo", Value::Number(1.0))]); // no __kind
+        let options = make_array_val(vec![bad_sub, make_schema("number")]);
+        let union_schema = interp
+            .call_schema("union", &[options], sp())
+            .await
+            .unwrap();
+        let result = interp
+            .call_schema("parse", &[union_schema, Value::Str("x".into())], sp())
+            .await;
+        assert!(
+            matches!(result, Err(Control::Panic(_))),
+            "expected Tier-2 panic from malformed union option, got {:?}",
+            result
+        );
     }
 }
