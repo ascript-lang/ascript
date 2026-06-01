@@ -522,7 +522,36 @@ impl Interp {
         }
     }
 
-    /// Dispatch a method on an HTTP server handle (`route`/`use`/`bind`/`serve`/`listen`).
+    /// Register a route with a fixed HTTP method string. Shared by `route` and the
+    /// seven verb convenience methods (`get`, `post`, `put`, `patch`, `delete`,
+    /// `head`, `options`) so each verb is a thin wrapper with no duplicated logic.
+    fn register_route(
+        &self,
+        id: u64,
+        server: Value,
+        method: String,
+        path: String,
+        handler: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        if !is_callable(&handler) {
+            return Err(AsError::at(
+                format!("server.{} handler must be a function", method.to_lowercase()),
+                span,
+            )
+            .into());
+        }
+        match self.http_server_mut(id) {
+            Some(mut s) => s.routes.push((method, path, handler)),
+            None => {
+                return Err(AsError::at("server route: server is closed", span).into());
+            }
+        }
+        Ok(server)
+    }
+
+    /// Dispatch a method on an HTTP server handle (`route`/`use`/`bind`/`serve`/`listen`
+    /// and the seven verb shortcuts `get`/`post`/`put`/`patch`/`delete`/`head`/`options`).
     #[async_recursion::async_recursion(?Send)]
     pub(crate) async fn call_http_server_method(
         &self,
@@ -538,14 +567,14 @@ impl Interp {
                     want_string(&arg(&args, 0), span, "server.route method")?.to_uppercase();
                 let path = want_string(&arg(&args, 1), span, "server.route path")?.to_string();
                 let handler = arg(&args, 2);
-                if !is_callable(&handler) {
-                    return Err(AsError::at("server.route handler must be a function", span).into());
-                }
-                match self.http_server_mut(id) {
-                    Some(mut s) => s.routes.push((method, path, handler)),
-                    None => return Err(AsError::at("server.route: server is closed", span).into()),
-                }
-                Ok(server)
+                self.register_route(id, server, method, path, handler, span)
+            }
+            // Verb shortcuts — each is a thin wrapper over register_route.
+            "get" | "post" | "put" | "patch" | "delete" | "head" | "options" => {
+                let verb = m.method.to_uppercase();
+                let path = want_string(&arg(&args, 0), span, &format!("server.{} path", m.method))?.to_string();
+                let handler = arg(&args, 1);
+                self.register_route(id, server, verb, path, handler, span)
             }
             "use" => {
                 let mw = arg(&args, 0);
@@ -1567,6 +1596,111 @@ await s.serve({{ maxRequests: {n}, maxConcurrent: 2 }})
             assert_eq!(body, "done");
         }
     }
+
+    // ── Verb-method tests (sub-phase 7a) ──────────────────────────────────────
+
+    /// `s.get(path, handler)` is equivalent to `s.route("GET", path, handler)`.
+    #[tokio::test]
+    async fn verb_get_method_dispatches_correctly() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.get("/hello", (req) => "verb-world")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/hello");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("GET", &url, None).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, "verb-world");
+    }
+
+    /// `s.post(path, handler)` is equivalent to `s.route("POST", path, handler)`.
+    #[tokio::test]
+    async fn verb_post_method_echoes_body() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.post("/echo", (req) => "got:" + req.body)
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/echo");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("POST", &url, Some("hello".to_string())).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, "got:hello");
+    }
+
+    /// `s.delete(path, handler)` is reachable from AScript (delete is not a keyword).
+    #[tokio::test]
+    async fn verb_delete_method_dispatches_correctly() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.delete("/item", (req) => "deleted")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 1 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/item");
+        let (status, body) = with_server(&src, move || async move {
+            client_request("DELETE", &url, None).await
+        })
+        .await;
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        assert_eq!(body, "deleted");
+    }
+
+    /// Remaining verbs: put, patch, head, options — each thin-wraps route.
+    #[tokio::test]
+    async fn verb_put_patch_head_options_dispatch_correctly() {
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.put("/item", (req) => "put-ok")
+s.patch("/item", (req) => "patch-ok")
+s.head("/ping", (req) => "head-ok")
+s.options("/ping", (req) => "options-ok")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 4 }})
+"#
+        );
+        let put_url = format!("http://127.0.0.1:{port}/item");
+        let patch_url = format!("http://127.0.0.1:{port}/item");
+        let head_url = format!("http://127.0.0.1:{port}/ping");
+        let options_url = format!("http://127.0.0.1:{port}/ping");
+        let results = with_server(&src, move || async move {
+            let r1 = client_request("PUT", &put_url, None).await;
+            let r2 = client_request("PATCH", &patch_url, None).await;
+            let r3 = client_request("HEAD", &head_url, None).await;
+            let r4 = client_request("OPTIONS", &options_url, None).await;
+            (r1, r2, r3, r4)
+        })
+        .await;
+        let ((s1, b1), (s2, b2), (s3, b3), (s4, b4)) = results;
+        assert_eq!((s1.as_str(), b1.as_str()), ("HTTP/1.1 200 OK", "put-ok"));
+        assert_eq!((s2.as_str(), b2.as_str()), ("HTTP/1.1 200 OK", "patch-ok"));
+        assert_eq!((s3.as_str(), b3.as_str()), ("HTTP/1.1 200 OK", "head-ok"));
+        assert_eq!((s4.as_str(), b4.as_str()), ("HTTP/1.1 200 OK", "options-ok"));
+    }
+
+    // ── End verb-method tests ──────────────────────────────────────────────────
 
     /// Like `client_request` but returns the FULL raw response text (head + body)
     /// so tests can assert on headers.
