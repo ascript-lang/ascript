@@ -3987,7 +3987,8 @@ print(y)
     #[tokio::test]
     async fn pat_regression_enum_ref() {
         assert_eq!(
-            run_out("enum Color { Red, Green }\nprint(match Color.Red {Color.Red=>true,_=>false})").await,
+            run_out("enum Color { Red, Green }\nprint(match Color.Red {Color.Red=>true,_=>false})")
+                .await,
             "true\n"
         );
     }
@@ -4032,7 +4033,8 @@ print(y)
     #[tokio::test]
     async fn pat_object_keyval_and_shorthand() {
         assert_eq!(
-            run_out("print(match {method:\"GET\",path:\"/x\"} { {method:\"GET\", path} => path })").await,
+            run_out("print(match {method:\"GET\",path:\"/x\"} { {method:\"GET\", path} => path })")
+                .await,
             "/x\n"
         );
         assert_eq!(
@@ -4043,8 +4045,14 @@ print(y)
 
     #[tokio::test]
     async fn pat_range() {
-        assert_eq!(run_out("print(match 5 {1..=9=>\"d\",_=>\"big\"})").await, "d\n");
-        assert_eq!(run_out("print(match 12 {1..=9=>\"d\",_=>\"big\"})").await, "big\n");
+        assert_eq!(
+            run_out("print(match 5 {1..=9=>\"d\",_=>\"big\"})").await,
+            "d\n"
+        );
+        assert_eq!(
+            run_out("print(match 12 {1..=9=>\"d\",_=>\"big\"})").await,
+            "big\n"
+        );
     }
 
     #[tokio::test]

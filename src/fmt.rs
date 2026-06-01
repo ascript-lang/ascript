@@ -1032,11 +1032,10 @@ mod tests {
     /// Helper: assert `format_source(src)` produces `expected`, is idempotent,
     /// and the output re-parses without error.
     fn assert_fmt_idempotent(src: &str, expected: &str) {
-        let once = format_source(src)
-            .unwrap_or_else(|e| panic!("fmt failed on {:?}: {e}", src));
+        let once = format_source(src).unwrap_or_else(|e| panic!("fmt failed on {:?}: {e}", src));
         assert_eq!(once, expected, "wrong output for: {src}");
-        let twice = format_source(&once)
-            .unwrap_or_else(|e| panic!("re-fmt failed on {:?}: {e}", &once));
+        let twice =
+            format_source(&once).unwrap_or_else(|e| panic!("re-fmt failed on {:?}: {e}", &once));
         assert_eq!(once, twice, "fmt not idempotent for: {src}");
         // formatted output re-parses
         let tokens = crate::lexer::lex(&once)
@@ -1051,10 +1050,7 @@ mod tests {
     #[test]
     fn match_wildcard_and_value_are_idempotent() {
         // Wildcard `_` and bare value patterns format canonically and re-parse.
-        assert_fmt_idempotent(
-            "match n { _ => 0 }",
-            "match n { _ => 0 }\n",
-        );
+        assert_fmt_idempotent("match n { _ => 0 }", "match n { _ => 0 }\n");
         assert_fmt_idempotent(
             "match n { 0 => \"zero\", 1 => \"one\", _ => \"other\" }",
             "match n { 0 => \"zero\", 1 => \"one\", _ => \"other\" }\n",
@@ -1064,10 +1060,7 @@ mod tests {
     #[test]
     fn match_bare_ident_binding_is_idempotent() {
         // A bare-ident pattern (Option-C binding) formats as just the identifier.
-        assert_fmt_idempotent(
-            "match x { other => other }",
-            "match x { other => other }\n",
-        );
+        assert_fmt_idempotent("match x { other => other }", "match x { other => other }\n");
     }
 
     #[test]

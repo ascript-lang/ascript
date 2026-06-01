@@ -160,18 +160,165 @@ Status.Ok == 200          // false — a variant is not its backing number
 
 ## Match
 
-`match` is an **expression**: it evaluates to a value. Use `|` to match alternatives and `_` as the
-catch-all.
+`match` is an **expression**: it evaluates to a value and slots directly into a `return`, a `let`,
+or any larger expression — no temporary mutable variable required.
+
+Arms are tried top to bottom; the first match wins. Each arm is:
+
+```
+pattern (| pattern)* (if guard)? => body
+```
+
+### Pattern forms
+
+#### Wildcard `_`
+
+Matches anything and binds nothing. Usually the last arm.
 
 ```ascript
-const label = match count {
-  0     => "zero",
-  1 | 2 => "small",
-  _     => "many",
+match x { 0 => "zero", _ => "other" }
+```
+
+#### Value patterns
+
+A literal (`0`, `"admin"`, `true`) or any expression (enum reference, member access, arithmetic) is
+evaluated and compared with `==`.
+
+```ascript
+match status {
+  Status.Ok      => "ok",
+  Status.NotFound => "not found",
+  _               => "other",
 }
 ```
 
-It pairs naturally with enums:
+#### Bare identifiers — Option C (defined → compare, undefined → bind)
+
+A bare identifier in a pattern is resolved at match time using **Option C**:
+
+- **Defined in scope** (e.g. a `const`, a previously bound variable) → the identifier's value is
+  looked up and compared with `==`. Behaves like a value pattern.
+- **Undefined in scope** (a fresh name) → the subject is **captured** into that binding for the
+  arm body. Behaves like a binding.
+
+```ascript
+const NOT_FOUND = 404    // defined in scope
+
+fn label(status: number): string {
+  return match status {
+    NOT_FOUND => "not found",          // defined → compare (status == 404)
+    code if code >= 500 => `error ${code}`,  // undefined → bind, then guard uses it
+    other => `status ${other}`,       // undefined → bind as catch-all
+  }
+}
+```
+
+The distinction is determined at the match site, not the definition site — so a `const` imported
+from another module is still a comparison, while any name not yet in scope becomes a fresh binding.
+
+#### Ranges
+
+`start..=end` (inclusive) and `start..end` (exclusive) match a numeric subject in the range.
+
+```ascript
+match n {
+  1..=9   => "single digit",   // 1, 2, … 9
+  10..100 => "double digit",   // 10, 11, … 99
+  _       => "other",
+}
+```
+
+#### Array patterns
+
+`[p0, p1, …]` matches an array with exactly that many elements (unless a trailing rest is
+present). Each position is itself a pattern and may bind, compare, or wildcard.
+
+An optional `...name` rest at the end collects the remaining elements into a new array; `...`
+(unnamed) ignores them.
+
+```ascript
+match xs {
+  []              => "empty",
+  [x]             => `one: ${x}`,           // binds x
+  [first, ...rest] => `head ${first}, ${len(rest)} more`,  // binds first + rest
+}
+```
+
+#### The `[value, err]` idiom
+
+AScript's fallible calls return a `[value, err]` pair. Match on it directly:
+
+```ascript
+match pair {
+  [v, nil] => `ok: ${v}`,   // nil error → success; v is bound
+  [_, e]   => `err: ${e}`,  // any error → wildcard the value, bind the error
+}
+```
+
+#### Object patterns
+
+`{key, key2: subpat, …}` matches an object (or class instance) that contains the listed keys.
+
+- **Shorthand `{key}`** — always **binds** `key` to the field value, regardless of Option C.
+  Shorthand is unambiguously destructuring.
+- **`{key: pattern}`** — matches the field value against a nested pattern (compare, bind, range,
+  nested array/object, …).
+- **`...rest`** — collects the unclaimed keys into a new object.
+
+```ascript
+match req {
+  {method, path} => `${method} ${path}`,   // shorthand binds both
+  _ => "?",
+}
+
+match user {
+  {role: "admin"}      => "is admin",           // sub-pattern compare
+  {role: r, name: n}   => `${r} — ${n}`,        // bind r and n
+  {role: r}            => `role ${r}`,           // bind r; name not required
+  _                    => "no role",
+}
+
+match event {
+  {type: "click", x, y, ...extra} => `click at ${x},${y}`,  // rest in object
+  {type: t}                       => `event ${t}`,
+}
+```
+
+#### Alternatives `|`
+
+Separate multiple patterns with `|`. The arm fires if **any** pattern matches. Bindings must be
+consistent across alternatives (each must bind the same names).
+
+```ascript
+match day { "sat" | "sun" => "weekend", _ => "weekday" }
+match n    { 0 | 1        => "tiny",    _ => "bigger"  }
+```
+
+#### Guards `pattern if condition`
+
+An `if` guard is evaluated **after** the structural match, with any bound names in scope. A falsy
+guard rejects the arm and matching continues.
+
+```ascript
+match n {
+  x if x < 0   => "negative",
+  x if x == 0  => "zero",
+  x             => `positive ${x}`,
+}
+```
+
+Guards work with any pattern, including array and object patterns:
+
+```ascript
+match pair {
+  [a, b] if a == b => "equal",
+  [a, b]           => "different",
+}
+```
+
+### Enums and match
+
+`match` pairs naturally with enums:
 
 ```ascript
 fn describe(c: Color): string {
@@ -186,5 +333,5 @@ fn describe(c: Color): string {
 print(describe(Color.Green))   // cool
 ```
 
-Because `match` returns a value, it slots directly into a `return`, a `let`, or a larger expression —
-no temporary mutable variable required.
+Because a variant name like `Color.Red` is a member-access expression, it is always a **value
+pattern** (evaluated and compared with `==`), regardless of Option C.

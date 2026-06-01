@@ -802,10 +802,8 @@ fn match_arm_binding_in_expr(expr: &Expr, name: &str, offset: usize) -> Option<S
             arm_binding_for_offset(arms, name, offset, expr.span)
         }
         // Recurse into all expression forms that contain sub-expressions.
-        ExprKind::Binary { lhs, rhs, .. } => {
-            match_arm_binding_in_expr(lhs, name, offset)
-                .or_else(|| match_arm_binding_in_expr(rhs, name, offset))
-        }
+        ExprKind::Binary { lhs, rhs, .. } => match_arm_binding_in_expr(lhs, name, offset)
+            .or_else(|| match_arm_binding_in_expr(rhs, name, offset)),
         ExprKind::Unary { expr: inner, .. }
         | ExprKind::Await(inner)
         | ExprKind::Try(inner)
@@ -879,9 +877,7 @@ fn match_arm_binding_in_expr(expr: &Expr, name: &str, offset: usize) -> Option<S
                 ArrowBody::Expr(e) => match_arm_binding_in_expr(e, name, offset),
                 ArrowBody::Block(stmts) => {
                     for s in stmts {
-                        if let r @ Some(_) =
-                            match_arm_binding_in_stmt(s, name, offset)
-                        {
+                        if let r @ Some(_) = match_arm_binding_in_stmt(s, name, offset) {
                             return r;
                         }
                     }
@@ -941,7 +937,9 @@ fn match_arm_binding_in_stmt(stmt: &Stmt, name: &str, offset: usize) -> Option<S
             }
             None
         }
-        Stmt::ForRange { start, end, body, .. } => {
+        Stmt::ForRange {
+            start, end, body, ..
+        } => {
             if let r @ Some(_) = match_arm_binding_in_expr(start, name, offset) {
                 return r;
             }
@@ -990,9 +988,10 @@ fn arm_binding_for_offset(
     for arm in arms {
         // Determine if the cursor is inside this arm's "scope" — i.e. inside its
         // guard expression or its body expression.
-        let in_guard = arm.guard.as_ref().is_some_and(|g| {
-            offset >= g.span.start && offset < g.span.end
-        });
+        let in_guard = arm
+            .guard
+            .as_ref()
+            .is_some_and(|g| offset >= g.span.start && offset < g.span.end);
         let in_body = offset >= arm.body.span.start && offset < arm.body.span.end;
         if !(in_guard || in_body) {
             continue;
