@@ -102,16 +102,9 @@ impl Interp {
         match m.method.as_str() {
             "send" => {
                 // send(data, addr) -> [bytesSent, err]
-                let data = data_to_bytes(
-                    args.first().unwrap_or(&Value::Nil),
-                    span,
-                    "socket.send",
-                )?;
-                let addr = want_string(
-                    args.get(1).unwrap_or(&Value::Nil),
-                    span,
-                    "socket.send addr",
-                )?;
+                let data = data_to_bytes(args.first().unwrap_or(&Value::Nil), span, "socket.send")?;
+                let addr =
+                    want_string(args.get(1).unwrap_or(&Value::Nil), span, "socket.send addr")?;
                 let sock = match self.take_resource(id) {
                     Some(ResourceState::UdpSocket(s)) => s,
                     other => {
@@ -170,11 +163,7 @@ impl Interp {
                 self.take_resource(id);
                 Ok(Value::Nil)
             }
-            other => Err(AsError::at(
-                format!("udpSocket has no method '{}'", other),
-                span,
-            )
-            .into()),
+            other => Err(AsError::at(format!("udpSocket has no method '{}'", other), span).into()),
         }
     }
 }

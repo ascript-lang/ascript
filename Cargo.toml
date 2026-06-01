@@ -77,7 +77,7 @@ datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
 # Task 2 wires `dotenvy` for std/env; Task 3 (fs) adds walkdir/ignore/regex; Task 7
 # (process, std/process) adds tokio's process + io-util plumbing for subprocesses.
-sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "dep:hostname", "tokio/process", "tokio/io-util"]
+sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "dep:hostname", "tokio/process", "tokio/io-util", "tokio/io-std"]
 crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex", "dep:crc32fast", "dep:xxhash-rust"]
 compress = ["dep:flate2", "dep:zip"]
 sql = ["dep:rusqlite"]

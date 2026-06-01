@@ -24,8 +24,6 @@ pub mod encoding;
 pub mod env;
 #[cfg(feature = "sys")]
 pub mod fs;
-#[cfg(feature = "sys")]
-pub mod os;
 #[cfg(feature = "net")]
 pub mod http_server;
 #[cfg(feature = "intl")]
@@ -49,6 +47,8 @@ pub mod net_udp;
 #[cfg(feature = "net")]
 pub mod net_ws;
 pub mod object;
+#[cfg(feature = "sys")]
+pub mod os;
 #[cfg(feature = "sys")]
 pub mod process;
 #[cfg(feature = "data")]

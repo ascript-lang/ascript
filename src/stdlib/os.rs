@@ -99,9 +99,7 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
 
         // tempDir() -> string — OS temporary directory path
         "tempDir" => {
-            let path = std::env::temp_dir()
-                .to_string_lossy()
-                .into_owned();
+            let path = std::env::temp_dir().to_string_lossy().into_owned();
             Ok(Value::Str(path.into()))
         }
 
@@ -113,9 +111,9 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             Ok(make_obj(&[
-                ("total",     Value::Number(sys.total_memory()     as f64)),
-                ("used",      Value::Number(sys.used_memory()      as f64)),
-                ("free",      Value::Number(sys.free_memory()      as f64)),
+                ("total", Value::Number(sys.total_memory() as f64)),
+                ("used", Value::Number(sys.used_memory() as f64)),
+                ("free", Value::Number(sys.free_memory() as f64)),
                 ("available", Value::Number(sys.available_memory() as f64)),
             ]))
         }
@@ -127,8 +125,8 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
             sys.refresh_memory();
             Ok(make_obj(&[
                 ("total", Value::Number(sys.total_swap() as f64)),
-                ("used",  Value::Number(sys.used_swap()  as f64)),
-                ("free",  Value::Number(sys.free_swap()  as f64)),
+                ("used", Value::Number(sys.used_swap() as f64)),
+                ("free", Value::Number(sys.free_swap() as f64)),
             ]))
         }
 
@@ -137,8 +135,8 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
         "loadAvg" => {
             let la = sysinfo::System::load_average();
             Ok(make_obj(&[
-                ("one",     Value::Number(la.one)),
-                ("five",    Value::Number(la.five)),
+                ("one", Value::Number(la.one)),
+                ("five", Value::Number(la.five)),
                 ("fifteen", Value::Number(la.fifteen)),
             ]))
         }
@@ -154,9 +152,12 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                     // `free` and `available` are both available_space(): sysinfo
                     // 0.31's Disk has no separate free_space() accessor.
                     make_obj(&[
-                        ("mount",     Value::Str(d.mount_point().to_string_lossy().as_ref().into())),
-                        ("total",     Value::Number(d.total_space()     as f64)),
-                        ("free",      Value::Number(d.available_space() as f64)),
+                        (
+                            "mount",
+                            Value::Str(d.mount_point().to_string_lossy().as_ref().into()),
+                        ),
+                        ("total", Value::Number(d.total_space() as f64)),
+                        ("free", Value::Number(d.available_space() as f64)),
                         ("available", Value::Number(d.available_space() as f64)),
                     ])
                 })
@@ -183,7 +184,7 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                         .map(|ip| Value::Str(ip.addr.to_string().into()))
                         .collect();
                     make_obj(&[
-                        ("name",      Value::Str(name.as_str().into())),
+                        ("name", Value::Str(name.as_str().into())),
                         ("addresses", Value::Array(Rc::new(RefCell::new(addrs)))),
                     ])
                 })
@@ -210,13 +211,12 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                 }
             }
             match found {
-                Some(ip) => Ok(crate::interp::make_pair(
-                    Value::Str(ip.into()),
-                    Value::Nil,
-                )),
+                Some(ip) => Ok(crate::interp::make_pair(Value::Str(ip.into()), Value::Nil)),
                 None => Ok(crate::interp::make_pair(
                     Value::Nil,
-                    crate::interp::make_error(Value::Str("os.localIp: no non-loopback IPv4 found".into())),
+                    crate::interp::make_error(Value::Str(
+                        "os.localIp: no non-loopback IPv4 found".into(),
+                    )),
                 )),
             }
         }
@@ -319,7 +319,10 @@ mod tests {
                 );
                 // Check all four keys exist
                 assert!(map.contains_key("free"), "memory() missing 'free'");
-                assert!(map.contains_key("available"), "memory() missing 'available'");
+                assert!(
+                    map.contains_key("available"),
+                    "memory() missing 'available'"
+                );
             }
             other => panic!("memory() should return an Object, got {:?}", other),
         }
@@ -353,12 +356,9 @@ mod tests {
                 let map = o.borrow();
                 for key in &["one", "five", "fifteen"] {
                     match map.get(*key) {
-                        Some(Value::Number(n)) => assert!(
-                            *n >= 0.0,
-                            "loadAvg().{} should be >= 0, got {}",
-                            key,
-                            n
-                        ),
+                        Some(Value::Number(n)) => {
+                            assert!(*n >= 0.0, "loadAvg().{} should be >= 0, got {}", key, n)
+                        }
                         other => panic!("loadAvg().{} should be a Number, got {:?}", key, other),
                     }
                 }
@@ -379,10 +379,13 @@ mod tests {
                     match item {
                         Value::Object(o) => {
                             let map = o.borrow();
-                            assert!(map.contains_key("mount"),     "disk entry missing 'mount'");
-                            assert!(map.contains_key("total"),     "disk entry missing 'total'");
-                            assert!(map.contains_key("free"),      "disk entry missing 'free'");
-                            assert!(map.contains_key("available"), "disk entry missing 'available'");
+                            assert!(map.contains_key("mount"), "disk entry missing 'mount'");
+                            assert!(map.contains_key("total"), "disk entry missing 'total'");
+                            assert!(map.contains_key("free"), "disk entry missing 'free'");
+                            assert!(
+                                map.contains_key("available"),
+                                "disk entry missing 'available'"
+                            );
                         }
                         other => panic!("disks() array entry should be Object, got {:?}", other),
                     }
@@ -414,11 +417,16 @@ mod tests {
                     match item {
                         Value::Object(o) => {
                             let map = o.borrow();
-                            assert!(map.contains_key("name"),      "interface entry missing 'name'");
-                            assert!(map.contains_key("addresses"), "interface entry missing 'addresses'");
+                            assert!(map.contains_key("name"), "interface entry missing 'name'");
+                            assert!(
+                                map.contains_key("addresses"),
+                                "interface entry missing 'addresses'"
+                            );
                             match map.get("addresses") {
                                 Some(Value::Array(_)) => {}
-                                other => panic!("interface.addresses should be Array, got {:?}", other),
+                                other => {
+                                    panic!("interface.addresses should be Array, got {:?}", other)
+                                }
                             }
                         }
                         other => panic!(
@@ -428,7 +436,10 @@ mod tests {
                     }
                 }
             }
-            other => panic!("networkInterfaces() should return an Array, got {:?}", other),
+            other => panic!(
+                "networkInterfaces() should return an Array, got {:?}",
+                other
+            ),
         }
     }
 
@@ -436,13 +447,15 @@ mod tests {
     #[tokio::test]
     async fn cpu_usage_returns_percentage_in_range() {
         // cpuUsage is async (sleeps ~200ms); run via the interpreter.
-        let out = crate::run_source(r#"
+        let out = crate::run_source(
+            r#"
 import { cpuUsage } from "std/os"
 let pct = await cpuUsage()
 print(type(pct))
 print(pct >= 0)
 print(pct <= 100)
-"#)
+"#,
+        )
         .await
         .expect("cpuUsage program should run");
         assert_eq!(out, "number\ntrue\ntrue\n", "cpuUsage output: {}", out);
