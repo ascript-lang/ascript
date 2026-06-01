@@ -156,6 +156,59 @@ pub(crate) fn schema_kind(schema: &Value) -> Option<Rc<str>> {
     }
 }
 
+/// The set of known schema `__kind` tags. Used by `is_schema_value` to keep
+/// the fluent call-site hook NARROW — only objects tagged with one of these
+/// kinds are treated as schema receivers, so a module namespace or an
+/// unrelated user object (even one that happens to carry a `__kind` field) is
+/// never hijacked.
+const SCHEMA_KINDS: &[&str] = &[
+    "string", "number", "bool", "nil", "any", "literal", "array", "object", "map", "optional",
+    "union", "oneOf",
+];
+
+/// True iff `v` is a schema value: a `Value::Object` whose `__kind` field is a
+/// String equal to one of the known schema kinds (see `SCHEMA_KINDS`).
+///
+/// Deliberately narrow: it MUST NOT match a stdlib module namespace object or
+/// an arbitrary user object. This is the receiver test for the fluent
+/// method-chaining call-site hook in `interp.rs`.
+pub(crate) fn is_schema_value(v: &Value) -> bool {
+    match schema_kind(v) {
+        Some(k) => SCHEMA_KINDS.contains(&k.as_ref()),
+        None => false,
+    }
+}
+
+/// True iff `name` is a `call_schema` op whose FIRST parameter is the receiver
+/// schema, i.e. one that reads naturally as a method `s.<name>(...)` →
+/// `call_schema(name, [s, ...rest])`.
+///
+/// Included (refiners / receiver-wrapping composites / terminal):
+///   `minLength`, `maxLength`, `pattern`, `min`, `max`, `refine`, `default`,
+///   `optional`, `strict`, `parse`.
+///
+/// EXCLUDED — source constructors that do NOT take a receiver schema first and
+/// stay `schema.*(...)` module functions: `string`, `number`, `bool`,
+/// `nilType`, `any`, `literal`, `object`, `array`, `union`, `oneOf`,
+/// `fromClass`. Also EXCLUDED is `map` — although `schema.map(key, val)` takes
+/// schema args, it is a CONSTRUCTOR (builds a map schema from key+val), not a
+/// refiner of a receiver, so `s.map(...)` would not read as wrapping `s`.
+pub(crate) fn is_schema_method(name: &str) -> bool {
+    matches!(
+        name,
+        "minLength"
+            | "maxLength"
+            | "pattern"
+            | "min"
+            | "max"
+            | "refine"
+            | "default"
+            | "optional"
+            | "strict"
+            | "parse"
+    )
+}
+
 /// Get a field from a `Value::Object`.
 fn obj_field(obj: &Value, key: &str) -> Option<Value> {
     match obj {
@@ -1218,6 +1271,54 @@ mod tests {
 
     // The parse engine is `Interp::parse_value` (async on &self); tests drive it
     // through a fresh `Interp::new()` on the tokio runtime.
+
+    // ── fluent hook helper tests ──────────────────────────────────────────────
+
+    #[test]
+    fn is_schema_value_matches_known_kinds_only() {
+        // Every known kind is a schema value.
+        for k in SCHEMA_KINDS {
+            assert!(is_schema_value(&make_schema(k)), "kind {k} should match");
+        }
+        // An object tagged with a NON-schema __kind must NOT match (narrowness).
+        let bogus = {
+            let mut m: IndexMap<String, Value> = IndexMap::new();
+            m.insert("__kind".to_string(), Value::Str("widget".into()));
+            Value::Object(Rc::new(RefCell::new(m)))
+        };
+        assert!(!is_schema_value(&bogus));
+        // An object with no __kind, and non-object values, must NOT match.
+        let plain = Value::Object(Rc::new(RefCell::new(IndexMap::new())));
+        assert!(!is_schema_value(&plain));
+        assert!(!is_schema_value(&Value::Number(1.0)));
+        assert!(!is_schema_value(&Value::Str("string".into())));
+        assert!(!is_schema_value(&Value::Nil));
+    }
+
+    #[test]
+    fn is_schema_method_set() {
+        for m in [
+            "minLength",
+            "maxLength",
+            "pattern",
+            "min",
+            "max",
+            "refine",
+            "default",
+            "optional",
+            "strict",
+            "parse",
+        ] {
+            assert!(is_schema_method(m), "{m} should be a schema method");
+        }
+        // Source constructors are NOT methods.
+        for c in [
+            "string", "number", "bool", "nilType", "any", "literal", "object", "array", "union",
+            "oneOf", "map", "fromClass",
+        ] {
+            assert!(!is_schema_method(c), "{c} must NOT be a schema method");
+        }
+    }
 
     // ── constructor smoke tests ───────────────────────────────────────────────
 

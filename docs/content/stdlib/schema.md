@@ -127,10 +127,41 @@ let [r, e] = schema.parse(roleSchema, "admin")     // ok
 let [r, e] = schema.parse(roleSchema, "root")      // err
 ```
 
+## Fluent method chaining
+
+Refiners and `parse` can be called as **methods** on a schema value, in addition to the free
+functions — both forms are valid and produce identical results (the method is the same operation,
+just `s.op(...)` instead of `schema.op(s, ...)`):
+
+```ascript
+// Fluent: each call returns a new schema, so refiners chain.
+let username = schema.string().minLength(3).maxLength(12).pattern("^[a-z0-9_]+$")
+let [v, err] = username.parse("ada_lovelace")   // ["ada_lovelace", nil]
+let [v2, e2] = username.parse("ab")             // [nil, err]  (minLength)
+
+// Free-function form — exactly equivalent, still fully supported.
+let same = schema.pattern(schema.maxLength(schema.minLength(schema.string(), 3), 12), "^[a-z0-9_]+$")
+schema.parse(same, "ada_lovelace")              // same result
+```
+
+**Which ops are methods:** the refiners and composites whose first argument is the receiver
+schema, plus the terminal `parse` — `minLength`, `maxLength`, `pattern`, `min`, `max`, `refine`,
+`default`, `optional`, `strict`, `parse`. The **source constructors** (`string`, `number`, `bool`,
+`nilType`, `any`, `literal`, `object`, `array`, `union`, `oneOf`, `map`, `fromClass`) do not take a
+receiver schema, so they stay `schema.*(...)` module functions — they are the chain entry points.
+
+> [!NOTE] **Call position only.** A schema method works when called (`s.minLength(3)`).
+> Extract-then-call (`let f = s.minLength; f(3)`) is **not** supported: bare member access
+> `s.minLength` reads the *stored constraint value* (e.g. the number `3`), not a bound method. This
+> is the deliberate consequence of distinguishing call context from access context, which avoids a
+> collision between a refiner method and the constraint field it stores. Fluent chaining always uses
+> call position, so every intended use works.
+
 ## Constraints
 
 Constraints are chainable modifiers that clone the schema and add a check. They are applied
-**after** the base type check passes.
+**after** the base type check passes. Each is shown below as a free function; the equivalent
+[method form](#fluent-method-chaining) (`s.min(0)`, `s.minLength(1)`, …) is also available.
 
 ### schema.min(s, n) / schema.max(s, n)
 

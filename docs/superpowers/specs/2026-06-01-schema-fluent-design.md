@@ -29,11 +29,20 @@ the SAME operations as the free functions; we just route a method call on a sche
 
 - For `ExprKind::Call { callee: Member{ object, name }, args }`: evaluate `object` to `recv`. If
   `recv` is a **schema value** (a `Value::Object` whose `__kind` field is a known schema kind) AND
-  `name` is a **known schema method** → evaluate the args and dispatch
+  `name` is a **known schema method** → this is the **schema path**: there is no `read_member`, so
+  the args are evaluated **after** the schema check, then dispatch
   `self.call_schema(name, [recv, ...args], span)`. Return its result.
-- Otherwise → fall back to the EXISTING behavior (read the member off `recv`, then `call_value`) —
-  byte-for-byte the current instance/native/generator/module/object-field-fn dispatch. No
-  regression.
+- Otherwise → **fallback path**, byte-for-byte with the prior
+  `eval_chain(callee) → eval_args → call_value` behavior: `read_member(recv, name)` **first** (it can
+  error — nil receiver, bad enum-variant prop, …), and only **then** evaluate the args, then
+  `call_value`. This preserves the evaluation order `object → read_member → args → call`, so a
+  member-read error preempts arg evaluation / side effects. The fallback covers the current
+  instance/native/generator/module/object-field-fn dispatch. No regression.
+
+> **Evaluation order, precisely.** Schema path: `object → schema check → args → call_schema`.
+> Fallback path: `object → read_member → args → call_value`. The args are evaluated after the schema
+> check on the schema path (no `read_member` there), but after the member read on the fallback path —
+> byte-for-byte with prior behavior.
 
 **Why a call-site hook, not a method value:** a refined schema stores constraints as object
 fields, so `s.minLength` (bare member access) already resolves to the stored constraint value.
@@ -67,7 +76,8 @@ of that set.
 - `src/interp.rs` — ONE hook in the `ExprKind::Call` arm (must preserve all existing call
   behavior: instance/native/generator/class methods, module calls like `math.abs`/`schema.string`,
   plain object field-fn calls `o.f()`, optional `o?.m()` falls through). The fallback path must
-  replicate today's `eval_chain(callee) → call_value` exactly.
+  replicate today's `eval_chain(callee) → eval_args → call_value` exactly, INCLUDING the evaluation
+  order (read the member before the args, so a member-read error preempts arg side effects).
 - `src/stdlib/schema.rs` — add `is_schema_value` + `is_schema_method` helpers; no change to
   `parse_value` / constructors / dispatch.
 - NO change to: schema representation, `json.parse`/`resp.json` bridge, `fromClass`, tree-sitter,
