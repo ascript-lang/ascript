@@ -1162,7 +1162,8 @@ impl Interp {
             //   array<T> → schema.array(inner)
             //   map<K,V> → schema.map(key, val)
             //   Union(A,B) → schema.union([A,B]) (flattened)
-            //   Named(ClassName) → schema.any()  (see module doc for rationale)
+            //   Named(ClassName) → nested object schema (recurses via def_env;
+            //                       cycle/unresolved → bare object schema, never any())
             //   Result/Tuple/Future → schema.any()
             //
             // Misuse (non-class argument) → Tier-2 panic.
