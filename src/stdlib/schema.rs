@@ -6,11 +6,45 @@
 //! failure, or `nil` on success.
 //!
 //! The internal parse engine is the async method `Interp::parse_value(schema,
-//! value, path)` which returns `Result<Value, SchemaErr>`.  Future sub-phases
-//! (6b composites, 6c constraints/refine) extend it with new `__kind` arms
-//! without touching the public API: it is `async fn` on `&self` already so 6b
-//! recursion and 6c `refine` (which calls user fns via `self.call_value`) just
-//! add match arms.
+//! value, path, coerce, span)` which returns `Result<Value, ParseFail>`.
+//!
+//! ## Sub-phase 6c additions
+//!
+//! ### Constraint refiners (chainable)
+//! All refiners clone the incoming tagged schema Object and insert a constraint
+//! field; the base `__kind` is preserved unchanged.
+//!
+//! - `schema.min(s, n)` / `schema.max(s, n)` — numeric value bounds (applied
+//!   in the `"number"` arm after the base type check).
+//! - `schema.minLength(s, n)` / `schema.maxLength(s, n)` — character count for
+//!   strings, element count for arrays.
+//! - `schema.pattern(s, regexStr)` — string must match the regex.  The
+//!   constructor is always available; enforcement is `#[cfg(feature="data")]`
+//!   because `regex::Regex` is gated behind that feature.  Without `data`, a
+//!   stored `pattern` field causes `ParseFail::InvalidSchema` at parse time.
+//! - `schema.refine(s, fn, message)` — custom async predicate stored on the
+//!   schema; called via `call_value` after base validation succeeds.  A falsy
+//!   return → `ParseFail::Mismatch` with the user-supplied message; a
+//!   `Control::Panic` / `Control::Propagate` from the fn → `ParseFail::Control`
+//!   (re-raised as-is so refine-fn panics are genuine Tier-2 panics).
+//! - `schema.default(s, v)` — when the incoming value is `nil`, substitute `v`
+//!   and skip all further checks (trust the stored default).
+//!
+//! ### Coerce option
+//! `schema.parse(s, v, {coerce: true})` enables conservative coercions applied
+//! **before** base-kind dispatch:
+//!
+//! | Input           | Target kind | Coerced to            |
+//! |-----------------|-------------|---------------------- |
+//! | `Str(s)`        | `"number"`  | parse as f64; if ok   |
+//! | `Number(n)`     | `"string"`  | `n.to_string()`       |
+//! | `Str("true")`   | `"bool"`    | `Bool(true)`          |
+//! | `Str("false")`  | `"bool"`    | `Bool(false)`         |
+//!
+//! ### Error type
+//! `SchemaErr` is replaced by `ParseFail` which adds a `Control` variant so that
+//! panics originating inside a `refine` user-function propagate as real Tier-2
+//! errors rather than being swallowed as validation mismatches.
 
 use super::{arg, bi};
 use crate::error::AsError;
@@ -45,6 +79,16 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         // `schema.enum` is a parse error; the internal `__kind` tag is "oneOf".
         ("oneOf", bi("schema.oneOf")),
         ("parse", bi("schema.parse")),
+        // ── 6c constraints / refinements / coerce ────────────────────────────
+        ("min", bi("schema.min")),
+        ("max", bi("schema.max")),
+        ("minLength", bi("schema.minLength")),
+        ("maxLength", bi("schema.maxLength")),
+        // `pattern` constructor is always available; enforcement is
+        // feature-gated (see parse_value "string" arm).
+        ("pattern", bi("schema.pattern")),
+        ("refine", bi("schema.refine")),
+        ("default", bi("schema.default")),
     ]
 }
 
@@ -57,10 +101,20 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 /// - `InvalidSchema` is a Tier-2 programmer error (a malformed schema node, e.g.
 ///   a nested value with no `__kind`) — `call_schema` escalates it to a
 ///   `Control::Panic` so it is never silently swallowed as a validation error.
+/// - `Control` wraps a `Control` that emerged from a `refine` user-function call
+///   (panic or propagate). The parse boundary re-raises it as-is so refine-fn
+///   panics are genuine Tier-2 panics, not validation mismatches.
 #[derive(Debug)]
-enum SchemaErr {
+enum ParseFail {
     Mismatch(Value),
     InvalidSchema(String),
+    Control(Control),
+}
+
+impl From<Control> for ParseFail {
+    fn from(c: Control) -> Self {
+        ParseFail::Control(c)
+    }
 }
 
 // ── tagged-object helpers ─────────────────────────────────────────────────────
@@ -104,38 +158,40 @@ fn obj_field(obj: &Value, key: &str) -> Option<Value> {
 
 impl Interp {
     /// The recursive parse engine.  Accepts the schema node, the candidate
-    /// value, and the current dot-path string (empty at top level). Returns
-    /// `Ok(coerced_value)` on success or `Err(SchemaErr)` on mismatch / malformed
-    /// schema.
+    /// value, the current dot-path string (empty at top level), a `coerce`
+    /// flag (enables conservative type coercions before kind dispatch), and
+    /// the call `span` (used by `call_value` for `refine` fn invocations).
     ///
-    /// It is `async fn` on `&self` even though 6a primitives never `.await` —
-    /// 6b composites recurse into this method and 6c's `refine` calls user
-    /// functions via `self.call_value(...).await`, so the async/`&self` shape is
-    /// in place now and those sub-phases only add match arms.
+    /// Returns `Ok(coerced_value)` on success or `Err(ParseFail)` on mismatch,
+    /// malformed schema, or a panic/propagate from a `refine` user-function.
     ///
-    /// Extension points for 6b:
-    ///   "object"  → recursively parse each declared field, building a new Object
-    ///   "array"   → map over items, recursively calling parse_value
-    ///   "union"   → try each branch, return first success
-    ///   "tuple"   → positional parse_value per element
-    /// Extension point for 6c:
-    ///   "refine"  → run a user predicate via `self.call_value(...).await`.
+    /// ## Error variants
+    /// - `ParseFail::Mismatch(errObj)` — Tier-1 validation failure; the caller
+    ///   surfaces it as the `err` slot of `[nil, err]`.
+    /// - `ParseFail::InvalidSchema(msg)` — Tier-2 programmer error (malformed
+    ///   schema node); the caller escalates it to `Control::Panic`.
+    /// - `ParseFail::Control(c)` — a `Control::Panic` / `Control::Propagate`
+    ///   that emerged inside a `refine` user-function call; re-raised unchanged.
     ///
-    /// Invariant: never hold a `RefCell` borrow across an `.await` (the future
-    /// awaits in 6b/6c). The primitive arms below take no borrow across a yield.
+    /// ## Invariant
+    /// Never hold a `RefCell` borrow across an `.await`.  The primitive arms
+    /// take no borrow across a yield; the `refine` arm clones the fn value out
+    /// before awaiting `call_value`.
     #[async_recursion::async_recursion(?Send)]
     async fn parse_value(
         &self,
         schema: &Value,
         value: &Value,
         path: &str,
-    ) -> Result<Value, SchemaErr> {
+        coerce: bool,
+        span: Span,
+    ) -> Result<Value, ParseFail> {
         let kind = match schema_kind(schema) {
             Some(k) => k,
             // Not a schema object (no __kind) → Tier-2 (escalated to a panic by
             // the caller), never a silent validation failure.
             None => {
-                return Err(SchemaErr::InvalidSchema(format!(
+                return Err(ParseFail::InvalidSchema(format!(
                     "schema.parse: not a valid schema object (missing __kind){}",
                     if path.is_empty() {
                         String::new()
@@ -146,63 +202,218 @@ impl Interp {
             }
         };
 
-        match kind.as_ref() {
+        // ── default: substitute when value is nil and schema has a default ────
+        // Applied BEFORE coerce and kind dispatch.  We trust the stored default
+        // (no further validation) and return it immediately.
+        if matches!(value, Value::Nil) {
+            if let Some(default_val) = obj_field(schema, "default") {
+                return Ok(default_val);
+            }
+        }
+
+        // ── coerce: conservative value coercions before kind dispatch ─────────
+        // Each coercion is attempted conservatively: if it succeeds, replace
+        // `value` for the rest of validation; if it fails (e.g. a non-numeric
+        // string → number), fall through to the normal check which produces a
+        // Mismatch.
+        //
+        // Coercion table (only applied when `coerce` is true):
+        //   Str(s)       → "number" : parse s as f64; if ok → Number(n)
+        //   Number(n)    → "string" : n.to_string()           → Str
+        //   Str("true")  → "bool"   : Bool(true)
+        //   Str("false") → "bool"   : Bool(false)
+        let coerced: Option<Value> = if coerce {
+            match (kind.as_ref(), value) {
+                ("number", Value::Str(s)) => {
+                    s.parse::<f64>().ok().map(Value::Number)
+                }
+                ("string", Value::Number(n)) => {
+                    Some(Value::Str(Value::Number(*n).to_string().into()))
+                }
+                ("bool", Value::Str(s)) if s.as_ref() == "true" => {
+                    Some(Value::Bool(true))
+                }
+                ("bool", Value::Str(s)) if s.as_ref() == "false" => {
+                    Some(Value::Bool(false))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let value: &Value = coerced.as_ref().unwrap_or(value);
+
+        // ── dispatch on base kind, collecting the validated value ─────────────
+        //
+        // Primitive arms ("string", "number", "bool", "nil", "any", "literal")
+        // produce a `Value` on success, or `return Err(...)` early on failure.
+        // Constraint checks (min, max, minLength, maxLength, pattern) are
+        // inlined in the relevant primitive arms.
+        //
+        // Composite arms (array, object, map, optional, union, oneOf) handle
+        // their own recursion and `return Ok(...)` / `return Err(...)` directly,
+        // so they bypass the refine step below.  Refine on composite schemas is
+        // not tested; add it here if needed in a later sub-phase.
+        let validated: Value = match kind.as_ref() {
+            // ── "string" ──────────────────────────────────────────────────────
             "string" => {
-                if matches!(value, Value::Str(_)) {
-                    Ok(value.clone())
-                } else {
-                    Err(SchemaErr::Mismatch(err_obj(
-                        path,
-                        format!("expected string, got {}", type_name(value)),
-                    )))
+                match value {
+                    Value::Str(s) => {
+                        let char_len = s.chars().count();
+                        // minLength
+                        if let Some(Value::Number(min)) = obj_field(schema, "minLength") {
+                            if (char_len as f64) < min {
+                                return Err(ParseFail::Mismatch(err_obj(
+                                    path,
+                                    format!(
+                                        "expected string with minLength {}, got length {}",
+                                        min, char_len
+                                    ),
+                                )));
+                            }
+                        }
+                        // maxLength
+                        if let Some(Value::Number(max)) = obj_field(schema, "maxLength") {
+                            if (char_len as f64) > max {
+                                return Err(ParseFail::Mismatch(err_obj(
+                                    path,
+                                    format!(
+                                        "expected string with maxLength {}, got length {}",
+                                        max, char_len
+                                    ),
+                                )));
+                            }
+                        }
+                        // pattern (regex — gated on `data` feature)
+                        //
+                        // The `schema.pattern` constructor is always available; only
+                        // the regex enforcement is feature-gated.  Without `data`,
+                        // a stored pattern field triggers InvalidSchema so misuse is
+                        // caught at parse time rather than silently ignored.
+                        #[cfg(feature = "data")]
+                        if let Some(Value::Str(pat)) = obj_field(schema, "pattern") {
+                            match regex::Regex::new(&pat) {
+                                Ok(re) => {
+                                    if !re.is_match(s) {
+                                        return Err(ParseFail::Mismatch(err_obj(
+                                            path,
+                                            format!(
+                                                "expected string matching pattern /{}/, got \"{}\"",
+                                                pat, s
+                                            ),
+                                        )));
+                                    }
+                                }
+                                Err(e) => {
+                                    return Err(ParseFail::InvalidSchema(format!(
+                                        "schema.pattern: invalid regex '{}': {}",
+                                        pat, e
+                                    )));
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "data"))]
+                        if obj_field(schema, "pattern").is_some() {
+                            return Err(ParseFail::InvalidSchema(
+                                "schema.pattern requires the 'data' feature to enforce; \
+                                 rebuild with `--features data` (or use the default feature set)"
+                                    .into(),
+                            ));
+                        }
+                        value.clone()
+                    }
+                    _ => {
+                        return Err(ParseFail::Mismatch(err_obj(
+                            path,
+                            format!("expected string, got {}", type_name(value)),
+                        )))
+                    }
                 }
             }
+
+            // ── "number" ──────────────────────────────────────────────────────
             "number" => {
-                if matches!(value, Value::Number(_)) {
-                    Ok(value.clone())
-                } else {
-                    Err(SchemaErr::Mismatch(err_obj(
-                        path,
-                        format!("expected number, got {}", type_name(value)),
-                    )))
+                match value {
+                    Value::Number(n) => {
+                        // min constraint
+                        if let Some(Value::Number(min)) = obj_field(schema, "min") {
+                            if *n < min {
+                                return Err(ParseFail::Mismatch(err_obj(
+                                    path,
+                                    format!(
+                                        "expected number >= {} (min), got {}",
+                                        min, n
+                                    ),
+                                )));
+                            }
+                        }
+                        // max constraint
+                        if let Some(Value::Number(max)) = obj_field(schema, "max") {
+                            if *n > max {
+                                return Err(ParseFail::Mismatch(err_obj(
+                                    path,
+                                    format!(
+                                        "expected number <= {} (max), got {}",
+                                        max, n
+                                    ),
+                                )));
+                            }
+                        }
+                        value.clone()
+                    }
+                    _ => {
+                        return Err(ParseFail::Mismatch(err_obj(
+                            path,
+                            format!("expected number, got {}", type_name(value)),
+                        )))
+                    }
                 }
             }
+
+            // ── "bool" ────────────────────────────────────────────────────────
             "bool" => {
                 if matches!(value, Value::Bool(_)) {
-                    Ok(value.clone())
+                    value.clone()
                 } else {
-                    Err(SchemaErr::Mismatch(err_obj(
+                    return Err(ParseFail::Mismatch(err_obj(
                         path,
                         format!("expected bool, got {}", type_name(value)),
-                    )))
+                    )));
                 }
             }
+
+            // ── "nil" ─────────────────────────────────────────────────────────
             "nil" => {
                 if matches!(value, Value::Nil) {
-                    Ok(value.clone())
+                    value.clone()
                 } else {
-                    Err(SchemaErr::Mismatch(err_obj(
+                    return Err(ParseFail::Mismatch(err_obj(
                         path,
                         format!("expected nil, got {}", type_name(value)),
-                    )))
+                    )));
                 }
             }
-            "any" => Ok(value.clone()),
+
+            // ── "any" ─────────────────────────────────────────────────────────
+            "any" => value.clone(),
+
+            // ── "literal" ─────────────────────────────────────────────────────
             "literal" => {
                 let expected = obj_field(schema, "value").unwrap_or(Value::Nil);
                 if value == &expected {
-                    Ok(value.clone())
+                    value.clone()
                 } else {
-                    Err(SchemaErr::Mismatch(err_obj(
+                    return Err(ParseFail::Mismatch(err_obj(
                         path,
                         format!("expected literal {}, got {}", expected, value),
-                    )))
+                    )));
                 }
             }
+
             // ── 6b: array ─────────────────────────────────────────────────────
             "array" => {
                 let elem_schema = obj_field(schema, "elem").ok_or_else(|| {
-                    SchemaErr::InvalidSchema("schema.parse: 'array' schema missing 'elem'".into())
+                    ParseFail::InvalidSchema("schema.parse: 'array' schema missing 'elem'".into())
                 })?;
                 match value {
                     Value::Array(arr) => {
@@ -211,23 +422,50 @@ impl Interp {
                         for (i, item) in items.iter().enumerate() {
                             let item_path = format!("{}[{}]", path, i);
                             let v = self
-                                .parse_value(&elem_schema, item, &item_path)
+                                .parse_value(&elem_schema, item, &item_path, coerce, span)
                                 .await?;
                             out.push(v);
                         }
-                        Ok(Value::Array(Rc::new(RefCell::new(out))))
+                        // minLength / maxLength on the validated array
+                        if let Some(Value::Number(min)) = obj_field(schema, "minLength") {
+                            if (out.len() as f64) < min {
+                                return Err(ParseFail::Mismatch(err_obj(
+                                    path,
+                                    format!(
+                                        "expected array with minLength {}, got length {}",
+                                        min,
+                                        out.len()
+                                    ),
+                                )));
+                            }
+                        }
+                        if let Some(Value::Number(max)) = obj_field(schema, "maxLength") {
+                            if (out.len() as f64) > max {
+                                return Err(ParseFail::Mismatch(err_obj(
+                                    path,
+                                    format!(
+                                        "expected array with maxLength {}, got length {}",
+                                        max,
+                                        out.len()
+                                    ),
+                                )));
+                            }
+                        }
+                        return Ok(Value::Array(Rc::new(RefCell::new(out))));
                     }
-                    _ => Err(SchemaErr::Mismatch(err_obj(
-                        path,
-                        format!("expected array, got {}", type_name(value)),
-                    ))),
+                    _ => {
+                        return Err(ParseFail::Mismatch(err_obj(
+                            path,
+                            format!("expected array, got {}", type_name(value)),
+                        )))
+                    }
                 }
             }
 
             // ── 6b: object ────────────────────────────────────────────────────
             "object" => {
                 let fields_schema = obj_field(schema, "fields").ok_or_else(|| {
-                    SchemaErr::InvalidSchema(
+                    ParseFail::InvalidSchema(
                         "schema.parse: 'object' schema missing 'fields'".into(),
                     )
                 })?;
@@ -244,7 +482,7 @@ impl Interp {
                                     .map(|(k, v)| (k.clone(), v.clone()))
                                     .collect(),
                                 _ => {
-                                    return Err(SchemaErr::InvalidSchema(
+                                    return Err(ParseFail::InvalidSchema(
                                         "schema.parse: 'fields' must be an Object".into(),
                                     ))
                                 }
@@ -262,7 +500,7 @@ impl Interp {
                                     } else {
                                         format!("{}.{}", path, k)
                                     };
-                                    return Err(SchemaErr::Mismatch(err_obj(
+                                    return Err(ParseFail::Mismatch(err_obj(
                                         &key_path,
                                         format!(
                                             "unknown key '{}' not allowed in strict object",
@@ -287,16 +525,18 @@ impl Interp {
                                 format!("{}.{}", path, field_name)
                             };
                             let parsed = self
-                                .parse_value(field_schema, &field_val, &field_path)
+                                .parse_value(field_schema, &field_val, &field_path, coerce, span)
                                 .await?;
                             out.insert(field_name.clone(), parsed);
                         }
-                        Ok(Value::Object(Rc::new(RefCell::new(out))))
+                        return Ok(Value::Object(Rc::new(RefCell::new(out))));
                     }
-                    _ => Err(SchemaErr::Mismatch(err_obj(
-                        path,
-                        format!("expected object, got {}", type_name(value)),
-                    ))),
+                    _ => {
+                        return Err(ParseFail::Mismatch(err_obj(
+                            path,
+                            format!("expected object, got {}", type_name(value)),
+                        )))
+                    }
                 }
             }
 
@@ -304,10 +544,10 @@ impl Interp {
             "map" => {
                 use crate::value::MapKey;
                 let key_schema = obj_field(schema, "key").ok_or_else(|| {
-                    SchemaErr::InvalidSchema("schema.parse: 'map' schema missing 'key'".into())
+                    ParseFail::InvalidSchema("schema.parse: 'map' schema missing 'key'".into())
                 })?;
                 let val_schema = obj_field(schema, "val").ok_or_else(|| {
-                    SchemaErr::InvalidSchema("schema.parse: 'map' schema missing 'val'".into())
+                    ParseFail::InvalidSchema("schema.parse: 'map' schema missing 'val'".into())
                 })?;
 
                 // Collect entries from either Map or Object (coerce Object→Map).
@@ -323,7 +563,7 @@ impl Interp {
                         .map(|(k, v)| (Value::Str(k.as_str().into()), v.clone()))
                         .collect(),
                     _ => {
-                        return Err(SchemaErr::Mismatch(err_obj(
+                        return Err(ParseFail::Mismatch(err_obj(
                             path,
                             format!("expected map or object, got {}", type_name(value)),
                         )))
@@ -339,18 +579,18 @@ impl Interp {
                     let val_path = format!("{}[{}]", path, raw_key);
                     let key_path = format!("{} (key)", val_path);
                     let parsed_key =
-                        self.parse_value(&key_schema, &raw_key, &key_path).await?;
+                        self.parse_value(&key_schema, &raw_key, &key_path, coerce, span).await?;
                     let parsed_val =
-                        self.parse_value(&val_schema, &raw_val, &val_path).await?;
+                        self.parse_value(&val_schema, &raw_val, &val_path, coerce, span).await?;
                     let map_key = MapKey::from_value(&parsed_key).ok_or_else(|| {
-                        SchemaErr::Mismatch(err_obj(
+                        ParseFail::Mismatch(err_obj(
                             &key_path,
                             format!("map key type {} is not hashable", type_name(&parsed_key)),
                         ))
                     })?;
                     out.insert(map_key, parsed_val);
                 }
-                Ok(Value::Map(Rc::new(RefCell::new(out))))
+                return Ok(Value::Map(Rc::new(RefCell::new(out))));
             }
 
             // ── 6b: optional ──────────────────────────────────────────────────
@@ -359,59 +599,60 @@ impl Interp {
                     return Ok(Value::Nil);
                 }
                 let inner = obj_field(schema, "inner").ok_or_else(|| {
-                    SchemaErr::InvalidSchema(
+                    ParseFail::InvalidSchema(
                         "schema.parse: 'optional' schema missing 'inner'".into(),
                     )
                 })?;
-                self.parse_value(&inner, value, path).await
+                return self.parse_value(&inner, value, path, coerce, span).await;
             }
 
             // ── 6b: union ─────────────────────────────────────────────────────
             "union" => {
                 let options = obj_field(schema, "options").ok_or_else(|| {
-                    SchemaErr::InvalidSchema(
+                    ParseFail::InvalidSchema(
                         "schema.parse: 'union' schema missing 'options'".into(),
                     )
                 })?;
                 let opts: Vec<Value> = match &options {
                     Value::Array(a) => a.borrow().clone(),
                     _ => {
-                        return Err(SchemaErr::InvalidSchema(
+                        return Err(ParseFail::InvalidSchema(
                             "schema.parse: 'union' options must be an Array".into(),
                         ))
                     }
                 };
                 let mut kinds: Vec<String> = Vec::new();
                 for opt in &opts {
-                    match self.parse_value(opt, value, path).await {
+                    match self.parse_value(opt, value, path, coerce, span).await {
                         Ok(v) => return Ok(v),
-                        Err(SchemaErr::Mismatch(_)) => {
+                        Err(ParseFail::Mismatch(_)) => {
                             kinds.push(
                                 schema_kind(opt)
                                     .map(|k| k.to_string())
                                     .unwrap_or_else(|| "?".into()),
                             );
                         }
-                        Err(e @ SchemaErr::InvalidSchema(_)) => return Err(e),
+                        Err(e @ ParseFail::InvalidSchema(_)) => return Err(e),
+                        Err(e @ ParseFail::Control(_)) => return Err(e),
                     }
                 }
-                Err(SchemaErr::Mismatch(err_obj(
+                return Err(ParseFail::Mismatch(err_obj(
                     path,
                     format!("expected one of [{}], got {}", kinds.join(", "), type_name(value)),
-                )))
+                )));
             }
 
             // ── 6b: oneOf (enum-like, `enum` is a keyword) ───────────────────
             "oneOf" => {
                 let values_field = obj_field(schema, "values").ok_or_else(|| {
-                    SchemaErr::InvalidSchema(
+                    ParseFail::InvalidSchema(
                         "schema.parse: 'oneOf' schema missing 'values'".into(),
                     )
                 })?;
                 let allowed: Vec<Value> = match &values_field {
                     Value::Array(a) => a.borrow().clone(),
                     _ => {
-                        return Err(SchemaErr::InvalidSchema(
+                        return Err(ParseFail::InvalidSchema(
                             "schema.parse: 'oneOf' values must be an Array".into(),
                         ))
                     }
@@ -422,21 +663,44 @@ impl Interp {
                     }
                 }
                 let listed: Vec<String> = allowed.iter().map(|v| format!("{}", v)).collect();
-                Err(SchemaErr::Mismatch(err_obj(
+                return Err(ParseFail::Mismatch(err_obj(
                     path,
                     format!(
                         "expected one of [{}], got {}",
                         listed.join(", "),
                         value
                     ),
-                )))
+                )));
             }
 
-            other => Err(SchemaErr::InvalidSchema(format!(
-                "schema.parse: unknown schema kind '{}'",
-                other
-            ))),
+            other => {
+                return Err(ParseFail::InvalidSchema(format!(
+                    "schema.parse: unknown schema kind '{}'",
+                    other
+                )))
+            }
+        };
+        // ── reached only for primitive arms (string/number/bool/nil/any/literal)
+        // after the base kind check has passed and constraints have been applied.
+
+        // ── refine: invoke user predicate ─────────────────────────────────────
+        // Clone the fn and the validated value out before awaiting — no
+        // RefCell borrow held across the .await.
+        if let Some(refine_fn) = obj_field(schema, "refine") {
+            let ok = self
+                .call_value(refine_fn, vec![validated.clone()], span)
+                .await
+                .map_err(ParseFail::Control)?;
+            if !ok.is_truthy() {
+                let msg = match obj_field(schema, "refineMessage") {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _ => "value failed refinement check".to_string(),
+                };
+                return Err(ParseFail::Mismatch(err_obj(path, msg)));
+            }
         }
+
+        Ok(validated)
     }
 
     pub(crate) async fn call_schema(
@@ -545,17 +809,174 @@ impl Interp {
                 Ok(Value::Object(Rc::new(RefCell::new(m))))
             }
 
-            // ── schema.parse(schema, value) -> [value, err] ───────────────────
+            // ── 6c constraint refiners ────────────────────────────────────────
+            // All refiners clone the incoming tagged schema Object and insert a
+            // constraint field.  The base `__kind` is unchanged.
+
+            // schema.min(s, n) → clone schema + {min: n}
+            "min" => {
+                let s = arg(args, 0);
+                let n = arg(args, 1);
+                match &s {
+                    Value::Object(o) => {
+                        let mut m = o.borrow().clone();
+                        m.insert("min".to_string(), n);
+                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                    }
+                    _ => Err(AsError::at(
+                        "schema.min: first argument must be a schema object",
+                        span,
+                    )
+                    .into()),
+                }
+            }
+
+            // schema.max(s, n) → clone schema + {max: n}
+            "max" => {
+                let s = arg(args, 0);
+                let n = arg(args, 1);
+                match &s {
+                    Value::Object(o) => {
+                        let mut m = o.borrow().clone();
+                        m.insert("max".to_string(), n);
+                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                    }
+                    _ => Err(AsError::at(
+                        "schema.max: first argument must be a schema object",
+                        span,
+                    )
+                    .into()),
+                }
+            }
+
+            // schema.minLength(s, n) → clone schema + {minLength: n}
+            "minLength" => {
+                let s = arg(args, 0);
+                let n = arg(args, 1);
+                match &s {
+                    Value::Object(o) => {
+                        let mut m = o.borrow().clone();
+                        m.insert("minLength".to_string(), n);
+                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                    }
+                    _ => Err(AsError::at(
+                        "schema.minLength: first argument must be a schema object",
+                        span,
+                    )
+                    .into()),
+                }
+            }
+
+            // schema.maxLength(s, n) → clone schema + {maxLength: n}
+            "maxLength" => {
+                let s = arg(args, 0);
+                let n = arg(args, 1);
+                match &s {
+                    Value::Object(o) => {
+                        let mut m = o.borrow().clone();
+                        m.insert("maxLength".to_string(), n);
+                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                    }
+                    _ => Err(AsError::at(
+                        "schema.maxLength: first argument must be a schema object",
+                        span,
+                    )
+                    .into()),
+                }
+            }
+
+            // schema.pattern(s, regexStr) → clone schema + {pattern: regexStr}
+            //
+            // The constructor is unconditionally available; enforcement is gated
+            // on `#[cfg(feature="data")]` in parse_value because `regex::Regex`
+            // only exists with that feature.
+            "pattern" => {
+                let s = arg(args, 0);
+                let pat = arg(args, 1);
+                match &s {
+                    Value::Object(o) => {
+                        let mut m = o.borrow().clone();
+                        m.insert("pattern".to_string(), pat);
+                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                    }
+                    _ => Err(AsError::at(
+                        "schema.pattern: first argument must be a schema object",
+                        span,
+                    )
+                    .into()),
+                }
+            }
+
+            // schema.refine(s, fn, message) → clone schema + {refine: fn, refineMessage: msg}
+            //
+            // The user fn is stored as a `Value`.  It is called via
+            // `call_value` in parse_value after the base kind check succeeds.
+            // A falsy return → Mismatch with `message`.
+            // A Control::Panic / Control::Propagate from the fn → ParseFail::Control
+            // → re-raised at the parse boundary as a genuine Tier-2 panic.
+            "refine" => {
+                let s = arg(args, 0);
+                let f = arg(args, 1);
+                let msg = arg(args, 2);
+                match &s {
+                    Value::Object(o) => {
+                        let mut m = o.borrow().clone();
+                        m.insert("refine".to_string(), f);
+                        m.insert("refineMessage".to_string(), msg);
+                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                    }
+                    _ => Err(AsError::at(
+                        "schema.refine: first argument must be a schema object",
+                        span,
+                    )
+                    .into()),
+                }
+            }
+
+            // schema.default(s, value) → clone schema + {default: value}
+            //
+            // When the incoming value is nil and the schema has a `default`,
+            // the default is substituted and all further checks are skipped.
+            "default" => {
+                let s = arg(args, 0);
+                let v = arg(args, 1);
+                match &s {
+                    Value::Object(o) => {
+                        let mut m = o.borrow().clone();
+                        m.insert("default".to_string(), v);
+                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                    }
+                    _ => Err(AsError::at(
+                        "schema.default: first argument must be a schema object",
+                        span,
+                    )
+                    .into()),
+                }
+            }
+
+            // ── schema.parse(schema, value[, options]) → [value, err] ─────────
             "parse" => {
                 let schema = arg(args, 0);
                 let value = arg(args, 1);
+                // Optional third arg: options object with `coerce` field.
+                // `{coerce: true}` enables conservative coercions before the
+                // base-kind check (see parse_value coercion table in module doc).
+                let coerce = match args.get(2) {
+                    Some(Value::Object(o)) => matches!(
+                        o.borrow().get("coerce"),
+                        Some(Value::Bool(true))
+                    ),
+                    _ => false,
+                };
 
-                match self.parse_value(&schema, &value, "").await {
+                match self.parse_value(&schema, &value, "", coerce, span).await {
                     Ok(v) => Ok(make_pair(v, Value::Nil)),
                     // Tier-1 validation failure → [nil, errObj].
-                    Err(SchemaErr::Mismatch(err)) => Ok(make_pair(Value::Nil, err)),
+                    Err(ParseFail::Mismatch(err)) => Ok(make_pair(Value::Nil, err)),
                     // Tier-2 programmer error (malformed schema) → panic.
-                    Err(SchemaErr::InvalidSchema(msg)) => Err(AsError::at(msg, span).into()),
+                    Err(ParseFail::InvalidSchema(msg)) => Err(AsError::at(msg, span).into()),
+                    // A panic/propagate from inside a refine fn — re-raise unchanged.
+                    Err(ParseFail::Control(c)) => Err(c),
                 }
             }
 
@@ -624,11 +1045,12 @@ mod tests {
         assert_eq!(obj_field(&lit, "value"), Some(Value::Number(5.0)));
     }
 
-    /// Unwrap a `SchemaErr::Mismatch` err Object; panic on `InvalidSchema`.
-    fn mismatch(e: SchemaErr) -> Value {
+    /// Unwrap a `ParseFail::Mismatch` err Object; panic on other variants.
+    fn mismatch(e: ParseFail) -> Value {
         match e {
-            SchemaErr::Mismatch(v) => v,
-            SchemaErr::InvalidSchema(m) => panic!("expected Mismatch, got InvalidSchema: {}", m),
+            ParseFail::Mismatch(v) => v,
+            ParseFail::InvalidSchema(m) => panic!("expected Mismatch, got InvalidSchema: {}", m),
+            ParseFail::Control(c) => panic!("expected Mismatch, got Control: {:?}", c),
         }
     }
 
@@ -639,7 +1061,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let schema = make_schema("string");
         let v = Value::Str("hi".into());
-        let result = interp.parse_value(&schema, &v, "").await;
+        let result = interp.parse_value(&schema, &v, "", false, sp()).await;
         assert_eq!(result.unwrap(), Value::Str("hi".into()));
     }
 
@@ -648,7 +1070,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let schema = make_schema("number");
         let v = Value::Number(42.0);
-        let result = interp.parse_value(&schema, &v, "").await;
+        let result = interp.parse_value(&schema, &v, "", false, sp()).await;
         assert_eq!(result.unwrap(), Value::Number(42.0));
     }
 
@@ -657,7 +1079,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let schema = make_schema("bool");
         let v = Value::Bool(true);
-        let result = interp.parse_value(&schema, &v, "").await;
+        let result = interp.parse_value(&schema, &v, "", false, sp()).await;
         assert_eq!(result.unwrap(), Value::Bool(true));
     }
 
@@ -665,7 +1087,7 @@ mod tests {
     async fn parse_nil_ok() {
         let interp = crate::interp::Interp::new();
         let schema = make_schema("nil");
-        let result = interp.parse_value(&schema, &Value::Nil, "").await;
+        let result = interp.parse_value(&schema, &Value::Nil, "", false, sp()).await;
         assert_eq!(result.unwrap(), Value::Nil);
     }
 
@@ -675,20 +1097,20 @@ mod tests {
         let schema = make_schema("any");
         assert_eq!(
             interp
-                .parse_value(&schema, &Value::Number(1.0), "")
+                .parse_value(&schema, &Value::Number(1.0), "", false, sp())
                 .await
                 .unwrap(),
             Value::Number(1.0)
         );
         assert_eq!(
             interp
-                .parse_value(&schema, &Value::Str("x".into()), "")
+                .parse_value(&schema, &Value::Str("x".into()), "", false, sp())
                 .await
                 .unwrap(),
             Value::Str("x".into())
         );
         assert_eq!(
-            interp.parse_value(&schema, &Value::Nil, "").await.unwrap(),
+            interp.parse_value(&schema, &Value::Nil, "", false, sp()).await.unwrap(),
             Value::Nil
         );
     }
@@ -700,7 +1122,7 @@ mod tests {
         m.insert("__kind".to_string(), Value::Str("literal".into()));
         m.insert("value".to_string(), Value::Number(5.0));
         let lit = Value::Object(Rc::new(RefCell::new(m)));
-        let result = interp.parse_value(&lit, &Value::Number(5.0), "").await;
+        let result = interp.parse_value(&lit, &Value::Number(5.0), "", false, sp()).await;
         assert_eq!(result.unwrap(), Value::Number(5.0));
     }
 
@@ -714,7 +1136,7 @@ mod tests {
         // Test mismatch: pass a number to a string schema
         let err = mismatch(
             interp
-                .parse_value(&schema, &Value::Number(1.0), "")
+                .parse_value(&schema, &Value::Number(1.0), "", false, sp())
                 .await
                 .unwrap_err(),
         );
@@ -728,7 +1150,7 @@ mod tests {
             _ => panic!("message was not a string: {:?}", msg),
         }
         // The success case
-        let ok = interp.parse_value(&schema, &v, "").await.unwrap();
+        let ok = interp.parse_value(&schema, &v, "", false, sp()).await.unwrap();
         assert_eq!(ok, Value::Str("x".into()));
     }
 
@@ -738,7 +1160,7 @@ mod tests {
         let schema = make_schema("number");
         let err = mismatch(
             interp
-                .parse_value(&schema, &Value::Str("x".into()), "")
+                .parse_value(&schema, &Value::Str("x".into()), "", false, sp())
                 .await
                 .unwrap_err(),
         );
@@ -760,7 +1182,7 @@ mod tests {
         let lit = Value::Object(Rc::new(RefCell::new(m)));
         let err = mismatch(
             interp
-                .parse_value(&lit, &Value::Number(6.0), "")
+                .parse_value(&lit, &Value::Number(6.0), "", false, sp())
                 .await
                 .unwrap_err(),
         );
@@ -773,15 +1195,15 @@ mod tests {
 
     #[tokio::test]
     async fn no_kind_returns_invalid_schema() {
-        // An object without __kind yields SchemaErr::InvalidSchema (Tier-2),
+        // An object without __kind yields ParseFail::InvalidSchema (Tier-2),
         // NOT a Mismatch — so 6b recursion can't swallow it as validation error.
         let interp = crate::interp::Interp::new();
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("a".to_string(), Value::Number(1.0));
         let bad = Value::Object(Rc::new(RefCell::new(m)));
-        let err = interp.parse_value(&bad, &Value::Nil, "").await.unwrap_err();
+        let err = interp.parse_value(&bad, &Value::Nil, "", false, sp()).await.unwrap_err();
         assert!(
-            matches!(err, SchemaErr::InvalidSchema(_)),
+            matches!(err, ParseFail::InvalidSchema(_)),
             "expected InvalidSchema, got Mismatch"
         );
     }
@@ -1434,5 +1856,466 @@ mod tests {
             "expected Tier-2 panic from malformed union option, got {:?}",
             result
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 6c: constraints / refine / default / coerce tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── min / max numeric ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn min_ok() {
+        let interp = crate::interp::Interp::new();
+        // schema.min(schema.number(), 5.0) — value 10 is >= 5
+        let num = make_schema("number");
+        let s = interp.call_schema("min", &[num, Value::Number(5.0)], sp()).await.unwrap();
+        let pair = interp.call_schema("parse", &[s, Value::Number(10.0)], sp()).await.unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(ok_val(&pair), Value::Number(10.0));
+    }
+
+    #[tokio::test]
+    async fn min_fail() {
+        let interp = crate::interp::Interp::new();
+        let num = make_schema("number");
+        let s = interp.call_schema("min", &[num, Value::Number(5.0)], sp()).await.unwrap();
+        let pair = interp.call_schema("parse", &[s, Value::Number(3.0)], sp()).await.unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(s) => s,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("min"), "message should mention 'min': {}", msg);
+        assert!(msg.contains("5"), "message should mention the bound 5: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn max_ok() {
+        let interp = crate::interp::Interp::new();
+        let num = make_schema("number");
+        let s = interp.call_schema("max", &[num, Value::Number(10.0)], sp()).await.unwrap();
+        let pair = interp.call_schema("parse", &[s, Value::Number(7.0)], sp()).await.unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn max_fail() {
+        let interp = crate::interp::Interp::new();
+        let num = make_schema("number");
+        let s = interp.call_schema("max", &[num, Value::Number(10.0)], sp()).await.unwrap();
+        let pair = interp.call_schema("parse", &[s, Value::Number(15.0)], sp()).await.unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(m) => m,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("max"), "msg: {}", msg);
+        assert!(msg.contains("10"), "msg: {}", msg);
+    }
+
+    // ── minLength / maxLength on string ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn min_length_string_ok() {
+        let interp = crate::interp::Interp::new();
+        let str_s = make_schema("string");
+        let s = interp.call_schema("minLength", &[str_s, Value::Number(3.0)], sp()).await.unwrap();
+        let pair = interp.call_schema("parse", &[s, Value::Str("hello".into())], sp()).await.unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn min_length_string_fail() {
+        let interp = crate::interp::Interp::new();
+        let str_s = make_schema("string");
+        let s = interp.call_schema("minLength", &[str_s, Value::Number(5.0)], sp()).await.unwrap();
+        let pair = interp.call_schema("parse", &[s, Value::Str("hi".into())], sp()).await.unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(m) => m,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("minLength") || msg.contains("min length"), "msg: {}", msg);
+        assert!(msg.contains("5"), "msg: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn max_length_string_fail() {
+        let interp = crate::interp::Interp::new();
+        let str_s = make_schema("string");
+        let s = interp.call_schema("maxLength", &[str_s, Value::Number(3.0)], sp()).await.unwrap();
+        let pair = interp.call_schema("parse", &[s, Value::Str("hello".into())], sp()).await.unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(m) => m,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("maxLength") || msg.contains("max length"), "msg: {}", msg);
+        assert!(msg.contains("3"), "msg: {}", msg);
+    }
+
+    // ── minLength / maxLength on array ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn min_length_array_ok() {
+        let interp = crate::interp::Interp::new();
+        let arr_s = interp.call_schema("array", &[make_schema("number")], sp()).await.unwrap();
+        let s = interp.call_schema("minLength", &[arr_s, Value::Number(2.0)], sp()).await.unwrap();
+        let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0), Value::Number(2.0)])));
+        let pair = interp.call_schema("parse", &[s, arr], sp()).await.unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[tokio::test]
+    async fn min_length_array_fail() {
+        let interp = crate::interp::Interp::new();
+        let arr_s = interp.call_schema("array", &[make_schema("number")], sp()).await.unwrap();
+        let s = interp.call_schema("minLength", &[arr_s, Value::Number(3.0)], sp()).await.unwrap();
+        let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])));
+        let pair = interp.call_schema("parse", &[s, arr], sp()).await.unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(m) => m,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("minLength") || msg.contains("min length"), "msg: {}", msg);
+        assert!(msg.contains("3"), "msg: {}", msg);
+    }
+
+    // ── pattern (regex, gated on "data") ─────────────────────────────────────
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn pattern_match_ok() {
+        let interp = crate::interp::Interp::new();
+        let str_s = make_schema("string");
+        let s = interp
+            .call_schema("pattern", &[str_s, Value::Str(r"^\d+$".into())], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Str("123".into())], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+    }
+
+    #[cfg(feature = "data")]
+    #[tokio::test]
+    async fn pattern_mismatch_err() {
+        let interp = crate::interp::Interp::new();
+        let str_s = make_schema("string");
+        let s = interp
+            .call_schema("pattern", &[str_s, Value::Str(r"^\d+$".into())], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Str("abc".into())], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(m) => m,
+            other => panic!("{:?}", other),
+        };
+        assert!(msg.contains("pattern"), "msg: {}", msg);
+    }
+
+    // ── refine: truthy pass / falsy fail / fn-panic propagates ───────────────
+
+    #[tokio::test]
+    async fn refine_pass() {
+        // Build a trivial AScript fn `fn(x) { return true }` by constructing
+        // an AST Function node, then call refine with it.
+        use crate::ast::{CallArg, Expr, ExprKind, Param, Stmt};
+        use crate::span::Span as S;
+
+        let interp = crate::interp::Interp::new();
+        let num_s = make_schema("number");
+
+        // fn(x) { return true }
+        let body = vec![Stmt::Return(Some(Expr {
+            kind: ExprKind::Bool(true),
+            span: S::new(0, 0),
+        }))];
+        let func = crate::value::Function {
+            name: Some("truePred".into()),
+            params: vec![Param {
+                name: "x".into(),
+                ty: None,
+                name_span: S::new(0, 0),
+                rest: false,
+            }],
+            ret: None,
+            body,
+            closure: crate::interp::global_env(),
+            is_async: false,
+            is_generator: false,
+        };
+        // Suppress unused import warning on CallArg
+        let _ = CallArg::Pos(Expr { kind: ExprKind::Nil, span: S::new(0, 0) });
+        let fn_val = Value::Function(std::rc::Rc::new(func));
+
+        let s = interp
+            .call_schema("refine", &[num_s, fn_val, Value::Str("must pass".into())], sp())
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Number(5.0)], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(ok_val(&pair), Value::Number(5.0));
+    }
+
+    #[tokio::test]
+    async fn refine_fail_custom_message() {
+        use crate::ast::{Expr, ExprKind, Param, Stmt};
+        use crate::span::Span as S;
+
+        let interp = crate::interp::Interp::new();
+        let num_s = make_schema("number");
+
+        // fn(x) { return false } — always fails
+        let body = vec![Stmt::Return(Some(Expr {
+            kind: ExprKind::Bool(false),
+            span: S::new(0, 0),
+        }))];
+        let func = crate::value::Function {
+            name: Some("falsePred".into()),
+            params: vec![Param {
+                name: "x".into(),
+                ty: None,
+                name_span: S::new(0, 0),
+                rest: false,
+            }],
+            ret: None,
+            body,
+            closure: crate::interp::global_env(),
+            is_async: false,
+            is_generator: false,
+        };
+        let fn_val = Value::Function(std::rc::Rc::new(func));
+
+        let s = interp
+            .call_schema(
+                "refine",
+                &[num_s, fn_val, Value::Str("custom error".into())],
+                sp(),
+            )
+            .await
+            .unwrap();
+        let pair = interp
+            .call_schema("parse", &[s, Value::Number(5.0)], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let msg = match field(&err_val(&pair), "message") {
+            Value::Str(m) => m,
+            other => panic!("{:?}", other),
+        };
+        assert_eq!(&*msg, "custom error");
+    }
+
+    #[tokio::test]
+    async fn refine_fn_panic_propagates() {
+        // A refine fn that calls assert(false) should propagate as a Tier-2
+        // Control::Panic, not be caught as a validation Mismatch.
+        use crate::ast::{CallArg, Expr, ExprKind, Param, Stmt};
+        use crate::span::Span as S;
+
+        let interp = crate::interp::Interp::new();
+
+        // fn(x) { assert(false) } — panics
+        let assert_call = Expr {
+            kind: ExprKind::Call {
+                callee: Box::new(Expr {
+                    kind: ExprKind::Ident("assert".into()),
+                    span: S::new(0, 0),
+                }),
+                args: vec![CallArg::Pos(Expr {
+                    kind: ExprKind::Bool(false),
+                    span: S::new(0, 0),
+                })],
+            },
+            span: S::new(0, 0),
+        };
+        let body = vec![Stmt::Expr(assert_call)];
+        let func = crate::value::Function {
+            name: Some("panicPred".into()),
+            params: vec![Param {
+                name: "x".into(),
+                ty: None,
+                name_span: S::new(0, 0),
+                rest: false,
+            }],
+            ret: None,
+            body,
+            closure: crate::interp::global_env(),
+            is_async: false,
+            is_generator: false,
+        };
+        let fn_val = Value::Function(std::rc::Rc::new(func));
+
+        let num_s = make_schema("number");
+        let s = interp
+            .call_schema(
+                "refine",
+                &[num_s, fn_val, Value::Str("irrelevant".into())],
+                sp(),
+            )
+            .await
+            .unwrap();
+        // parse should return Err(Control::Panic(...)), not Ok([nil, err])
+        let result = interp
+            .call_schema("parse", &[s, Value::Number(5.0)], sp())
+            .await;
+        assert!(
+            matches!(result, Err(Control::Panic(_))),
+            "expected Tier-2 panic from refine fn assert(false), got {:?}",
+            result
+        );
+    }
+
+    // ── default fills an absent object field ──────────────────────────────────
+
+    #[tokio::test]
+    async fn default_fills_absent_object_field() {
+        let interp = crate::interp::Interp::new();
+        // object({ role: default(string(), "guest") })
+        let str_s = make_schema("string");
+        let with_default = interp
+            .call_schema("default", &[str_s, Value::Str("guest".into())], sp())
+            .await
+            .unwrap();
+        let fields = make_fields_obj(&[("role", with_default)]);
+        let obj_s = interp.call_schema("object", &[fields], sp()).await.unwrap();
+
+        // Parse an object that has no "role" key — should fill in "guest"
+        let value = make_value_obj(&[]);
+        let pair = interp
+            .call_schema("parse", &[obj_s, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        let out = ok_val(&pair);
+        assert_eq!(field(&out, "role"), Value::Str("guest".into()));
+    }
+
+    #[tokio::test]
+    async fn default_does_not_override_present_value() {
+        let interp = crate::interp::Interp::new();
+        let str_s = make_schema("string");
+        let with_default = interp
+            .call_schema("default", &[str_s, Value::Str("guest".into())], sp())
+            .await
+            .unwrap();
+        let fields = make_fields_obj(&[("role", with_default)]);
+        let obj_s = interp.call_schema("object", &[fields], sp()).await.unwrap();
+
+        // "admin" is present — must NOT be replaced by default
+        let value = make_value_obj(&[("role", Value::Str("admin".into()))]);
+        let pair = interp
+            .call_schema("parse", &[obj_s, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        let out = ok_val(&pair);
+        assert_eq!(field(&out, "role"), Value::Str("admin".into()));
+    }
+
+    // ── coerce option ─────────────────────────────────────────────────────────
+
+    fn make_options_obj(pairs: &[(&str, Value)]) -> Value {
+        let mut m: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v.clone());
+        }
+        Value::Object(Rc::new(RefCell::new(m)))
+    }
+
+    #[tokio::test]
+    async fn coerce_string_to_number_ok() {
+        let interp = crate::interp::Interp::new();
+        let num_s = make_schema("number");
+        let opts = make_options_obj(&[("coerce", Value::Bool(true))]);
+        // "42" with coerce → [42, nil]
+        let pair = interp
+            .call_schema("parse", &[num_s, Value::Str("42".into()), opts], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(ok_val(&pair), Value::Number(42.0));
+    }
+
+    #[tokio::test]
+    async fn no_coerce_string_to_number_fails() {
+        let interp = crate::interp::Interp::new();
+        let num_s = make_schema("number");
+        // Without coerce: "42" fails number schema
+        let pair = interp
+            .call_schema("parse", &[num_s, Value::Str("42".into())], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        assert!(matches!(err_val(&pair), Value::Object(_)));
+    }
+
+    #[tokio::test]
+    async fn coerce_number_to_string_ok() {
+        let interp = crate::interp::Interp::new();
+        let str_s = make_schema("string");
+        let opts = make_options_obj(&[("coerce", Value::Bool(true))]);
+        let pair = interp
+            .call_schema("parse", &[str_s, Value::Number(1.5), opts], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        // The coerced string should contain "1.5"
+        match ok_val(&pair) {
+            Value::Str(s) => assert!(s.contains("1.5"), "coerced string: {}", s),
+            other => panic!("expected Str, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn coerce_true_string_to_bool_ok() {
+        let interp = crate::interp::Interp::new();
+        let bool_s = make_schema("bool");
+        let opts = make_options_obj(&[("coerce", Value::Bool(true))]);
+        let pair = interp
+            .call_schema("parse", &[bool_s, Value::Str("true".into()), opts], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(ok_val(&pair), Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn coerce_false_string_to_bool_ok() {
+        let interp = crate::interp::Interp::new();
+        let bool_s = make_schema("bool");
+        let opts = make_options_obj(&[("coerce", Value::Bool(true))]);
+        let pair = interp
+            .call_schema("parse", &[bool_s, Value::Str("false".into()), opts], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        assert_eq!(ok_val(&pair), Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn coerce_non_parseable_string_still_fails() {
+        let interp = crate::interp::Interp::new();
+        let num_s = make_schema("number");
+        let opts = make_options_obj(&[("coerce", Value::Bool(true))]);
+        // "abc" can't be coerced to number → mismatch
+        let pair = interp
+            .call_schema("parse", &[num_s, Value::Str("abc".into()), opts], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        assert!(matches!(err_val(&pair), Value::Object(_)));
     }
 }
