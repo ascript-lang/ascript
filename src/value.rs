@@ -163,6 +163,8 @@ pub enum NativeKind {
     // (setCell/text/hline/vline/box/fill)/flush/pollEvent/readEvent/restore/close.
     // Registered only under feature `tui`.
     Terminal,
+    // std/sync: a FIFO channel (VecDeque + Rc<Notify>). Not feature-gated.
+    Channel,
 }
 
 impl NativeKind {
@@ -184,6 +186,7 @@ impl NativeKind {
             NativeKind::WsConnection => "wsConnection",
             NativeKind::WsListener => "wsListener",
             NativeKind::Terminal => "terminal",
+            NativeKind::Channel => "channel",
         }
     }
 }

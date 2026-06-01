@@ -178,6 +178,11 @@ pub(crate) enum ResourceState {
     // across calls without scanning the table.
     #[cfg(feature = "sys")]
     StdinReader(Box<tokio::io::BufReader<tokio::io::Stdin>>),
+    // std/sync: a FIFO channel backed by VecDeque + Rc<Notify>. Always present
+    // (no feature gate) because tokio::sync is core infrastructure. The Channel
+    // struct holds the queue inside a RefCell and the Notify handles as separate
+    // Rcs so callers can clone them out before awaiting without holding a borrow.
+    Channel(crate::stdlib::sync::Channel),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
