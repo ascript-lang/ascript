@@ -169,6 +169,11 @@ pub(crate) enum ResourceState {
     // `accept()` does the TCP accept + WebSocket handshake → WsConnection).
     #[cfg(feature = "net")]
     WsListener(tokio::net::TcpListener),
+    // std/net/udp: a bound UDP datagram socket. Supports send_to/recv_from over the
+    // take-out-across-await pattern (take_resource → await on owned socket →
+    // return_resource). UdpSocket methods take `&self` so no &mut is needed.
+    #[cfg(feature = "net")]
+    UdpSocket(tokio::net::UdpSocket),
     // M15 std/tui: a terminal handle's screen buffers + cursor + raw/alt flags.
     // Boxed to keep the `ResourceState` enum compact (the two buffers are sizeable).
     #[cfg(feature = "tui")]
@@ -2002,6 +2007,9 @@ impl Interp {
             }
             if matches!(m.receiver.kind, WsConnection | WsListener) {
                 return self.call_ws_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, UdpSocket) {
+                return self.call_udp_method(&m, args, span).await;
             }
         }
         #[cfg(feature = "tui")]

@@ -178,6 +178,9 @@ pub enum NativeKind {
     // bucket refills `count` tokens every `window_ms` milliseconds (monotonic
     // clock — no background task). Not feature-gated.
     RateLimiter,
+    // std/net/udp: a bound UDP socket. Methods: send/recv/localAddr/close.
+    // Registered only under feature `net`.
+    UdpSocket,
 }
 
 impl NativeKind {
@@ -205,6 +208,7 @@ impl NativeKind {
             NativeKind::DebounceWrapper => "debounce",
             NativeKind::ThrottleWrapper => "throttle",
             NativeKind::RateLimiter => "rateLimiter",
+            NativeKind::UdpSocket => "udpSocket",
         }
     }
 }

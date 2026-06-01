@@ -2,15 +2,113 @@
 
 # Networking & HTTP
 
-AScript's networking stack — raw TCP, a modern HTTP client, a small HTTP server, and WebSockets — lives in four modules: `std/net/tcp`, `std/net/http`, `std/http/server`, and `std/net/ws`. All four are provided by the `net` Cargo feature, which is **enabled by default**. If you build AScript with a custom feature set, include `net` to keep these modules available.
+AScript's networking stack — DNS resolution, raw TCP, UDP datagrams, a modern HTTP client, a small HTTP server, and WebSockets — lives in several modules under `std/net`. All are provided by the `net` Cargo feature, which is **enabled by default**. If you build AScript with a custom feature set, include `net` to keep these modules available.
 
-The interpreter is **single-threaded with an inline async model**: there is no background thread of execution, and almost every networking operation suspends the program until it completes. Consequently nearly every method on these modules is `await`ed — `connect`, `accept`, `read`, `write`, `send`, `recv`, the HTTP verbs, `serve`, and so on. The synchronous exceptions are the handle-teardown methods (`close()`) and the in-memory builders on the server handle (`route`, `use`).
+The interpreter is **single-threaded with an inline async model**: there is no background thread of execution, and almost every networking operation suspends the program until it completes. Consequently nearly every method on these modules is `await`ed — `lookup`, `connect`, `accept`, `read`, `write`, `send`, `recv`, the HTTP verbs, `serve`, and so on. The synchronous exceptions are the handle-teardown methods (`close()`) and the in-memory builders on the server handle (`route`, `use`).
 
 > [!NOTE] AScript has no task-spawn primitive. A self-contained TCP loopback works because `connect()` completes into the OS listen backlog before `accept()`. A full HTTP/WebSocket round-trip needs the server and client in **separate processes** (the handshake needs the server's accept loop running). See the examples page.
 
 Throughout these modules, fallible operations follow the **Tier-1** convention: they return a two-element `[value, err]` pair where `err` is `nil` on success. Misuse (wrong argument *types*, malformed options) is a **Tier-2** panic.
 
-> [!TIER1] Destructure every fallible call: `let [stream, err] = await connect(host, port)`. A connect/DNS/TLS/timeout failure surfaces as `[nil, err]`; success as `[value, nil]`.
+> [!TIER1] Destructure every fallible call: `let [ips, err] = await net.lookup(host)`. A connect/DNS/TLS/timeout failure surfaces as `[nil, err]`; success as `[value, nil]`.
+
+## std/net
+
+General networking utilities: DNS resolution.
+
+```ascript
+import * as net from "std/net"
+```
+
+### net.lookup
+
+Resolves a hostname to a de-duplicated list of IP-address strings. Async; returns `[array<string>, err]`.
+
+- `host` (string) — a hostname (e.g. `"localhost"`, `"example.com"`) or a `"host:port"` pair. A bare hostname without a port has `:0` appended internally before resolution. The returned strings contain only the IP address (port stripped).
+- Returns: `[ips, err]` — `ips` is an `array<string>` of resolved IPs in first-seen order, de-duplicated. On failure, `[nil, err]`.
+
+```ascript
+import * as net from "std/net"
+
+let [ips, err] = await net.lookup("localhost")
+if (err != nil) { print("DNS failed: " + err.message) }
+print(ips)   // e.g. ["127.0.0.1", "::1"]
+```
+
+### net.lookupOne
+
+Resolves a hostname and returns only the first IP address. Async; returns `[string, err]`.
+
+- `host` (string) — same form as `net.lookup`.
+- Returns: `[ip, err]` — the first resolved IP as a string, or `[nil, err]` if resolution fails or returns zero addresses.
+
+```ascript
+import * as net from "std/net"
+
+let [ip, err] = await net.lookupOne("example.com")
+if (err != nil) { print("DNS failed: " + err.message) }
+print(ip)   // e.g. "93.184.216.34"
+```
+
+## std/net/udp
+
+UDP datagram sockets. Bind an ephemeral port, send datagrams to any peer, and receive from any sender.
+
+```ascript
+import * as udp from "std/net/udp"
+```
+
+### udp.bind
+
+Binds a UDP socket to a local address. Returns `[socket, err]`.
+
+- `addr` (string) — a `"host:port"` string. Use port `0` for an OS-assigned ephemeral port; read the actual port back with `socket.localAddr()`.
+- Returns: `[socket, err]`.
+
+```ascript
+import * as udp from "std/net/udp"
+
+let [sock, err] = udp.bind("127.0.0.1:0")
+if (err != nil) { print(err.message) }
+print(sock.localAddr())   // e.g. "127.0.0.1:54321"
+```
+
+### Socket methods
+
+A bound socket handle exposes:
+
+- `await socket.send(data, addr)` — sends `data` (a string or bytes) to the peer at `"host:port"`. Returns `[bytesSent, err]`. Async.
+- `await socket.recv()` — waits for and returns the next incoming datagram as `[{data, from}, err]`. `data` is bytes (use `std/encoding`'s `utf8Decode` to decode as text); `from` is the sender's `"ip:port"` string. Async. Buffer cap: 65 507 bytes (max UDP payload over IPv4).
+- `socket.localAddr()` — returns the bound `"ip:port"` string. Synchronous.
+- `socket.close()` — releases the socket. Synchronous; idempotent. After `close()`, `send` and `recv` return Tier-1 errors rather than panicking.
+
+### UDP loopback echo
+
+Because `send()` deposits the datagram directly into the OS kernel queue before `recv()` runs, a single-process UDP echo works without deadlocking — the same guarantee that makes the TCP loopback example work:
+
+```ascript
+import * as udp from "std/net/udp"
+import * as encoding from "std/encoding"
+
+let [sockA, _eA] = udp.bind("127.0.0.1:0")
+let [sockB, _eB] = udp.bind("127.0.0.1:0")
+
+let addrB = sockB.localAddr()
+
+// send() deposits the datagram; no deadlock even without a concurrent receiver.
+let [sent, sendErr] = await sockA.send("hello udp", addrB)
+print(sendErr)    // nil
+print(sent)       // 9
+
+let [pkt, recvErr] = await sockB.recv()
+print(recvErr)    // nil
+let [text, _] = encoding.utf8Decode(pkt.data)
+print(text)       // hello udp
+print(pkt.from)   // 127.0.0.1:<port>
+
+sockA.close()
+sockB.close()
+```
 
 ## std/net/tcp
 

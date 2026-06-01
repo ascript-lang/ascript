@@ -37,12 +37,18 @@ pub mod log;
 pub mod map;
 pub mod math;
 #[cfg(feature = "net")]
+pub mod net_host;
+#[cfg(feature = "net")]
 pub mod net_http;
 #[cfg(feature = "net")]
 pub mod net_tcp;
 #[cfg(feature = "net")]
+pub mod net_udp;
+#[cfg(feature = "net")]
 pub mod net_ws;
 pub mod object;
+#[cfg(feature = "sys")]
+pub mod os;
 #[cfg(feature = "sys")]
 pub mod process;
 #[cfg(feature = "data")]
@@ -114,15 +120,21 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         #[cfg(feature = "sys")]
         "std/fs" => fs::exports(),
         #[cfg(feature = "sys")]
+        "std/os" => os::exports(),
+        #[cfg(feature = "sys")]
         "std/io" => io::exports(),
         #[cfg(feature = "sys")]
         "std/process" => process::exports(),
+        #[cfg(feature = "net")]
+        "std/net" => net_host::exports(),
         #[cfg(feature = "net")]
         "std/net/tcp" => net_tcp::exports(),
         #[cfg(feature = "net")]
         "std/net/http" => net_http::exports(),
         #[cfg(feature = "net")]
         "std/http/server" => http_server::exports(),
+        #[cfg(feature = "net")]
+        "std/net/udp" => net_udp::exports(),
         #[cfg(feature = "net")]
         "std/net/ws" => net_ws::exports(),
         #[cfg(feature = "data")]
@@ -224,15 +236,21 @@ impl Interp {
             #[cfg(feature = "sys")]
             "fs" => fs::call(func, args, span),
             #[cfg(feature = "sys")]
+            "os" => self.call_os(func, args, span).await,
+            #[cfg(feature = "sys")]
             "io" => self.call_io(func, args, span).await,
             #[cfg(feature = "sys")]
             "process" => self.call_process(func, args, span).await,
+            #[cfg(feature = "net")]
+            "net" => self.call_net(func, args, span).await,
             #[cfg(feature = "net")]
             "net_tcp" => self.call_net_tcp(func, args, span).await,
             #[cfg(feature = "net")]
             "net_http" => self.call_http(func, args, span).await,
             #[cfg(feature = "net")]
             "http_server" => self.call_http_server(func, args, span).await,
+            #[cfg(feature = "net")]
+            "net_udp" => self.call_net_udp(func, args, span).await,
             #[cfg(feature = "net")]
             "net_ws" => self.call_net_ws(func, args, span).await,
             #[cfg(feature = "data")]
@@ -284,6 +302,37 @@ impl Interp {
             return time_timers::create_throttle(self, args, span);
         }
         time::call(func, args, span)
+    }
+
+    /// `std/os` dispatch. Most functions are synchronous and delegate to
+    /// `os::call`. The `cpuUsage` function is async: it performs two
+    /// `refresh_cpu_usage` calls with `MINIMUM_CPU_UPDATE_INTERVAL` between
+    /// them (≈200 ms on most platforms) so sysinfo can compute a meaningful
+    /// utilisation delta. No resources or RefCell borrows are held across the
+    /// sleep; `sysinfo::System` lives entirely on the stack.
+    #[cfg(feature = "sys")]
+    pub(crate) async fn call_os(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        #[cfg(feature = "sysinfo")]
+        if func == "cpuUsage" {
+            use sysinfo::{CpuRefreshKind, RefreshKind, System, MINIMUM_CPU_UPDATE_INTERVAL};
+            let mut sys = System::new_with_specifics(
+                RefreshKind::new().with_cpu(CpuRefreshKind::new().with_cpu_usage()),
+            );
+            // First measurement (baseline).
+            sys.refresh_cpu_usage();
+            // Hold no borrow across the await; `sys` is a plain stack local.
+            tokio::time::sleep(MINIMUM_CPU_UPDATE_INTERVAL).await;
+            // Second measurement (delta).
+            sys.refresh_cpu_usage();
+            let pct = sys.global_cpu_usage() as f64;
+            return Ok(Value::Number(pct.clamp(0.0, 100.0)));
+        }
+        os::call(func, args, span)
     }
 }
 

@@ -2,13 +2,15 @@
 
 # System & files
 
-These modules give AScript programs access to the host system: the filesystem, the process environment, subprocesses, cryptography, compression, and an embedded SQLite database. Each module is imported by its path, for example `import { read, write } from "std/fs"`.
+These modules give AScript programs access to the host system: the filesystem, the process environment, subprocesses, host OS facts, live system metrics, cryptography, compression, and an embedded SQLite database. Each module is imported by its path, for example `import { read, write } from "std/fs"`.
 
 Most of these modules are gated behind Cargo features, all of which are **on by default**:
 
 | Modules | Cargo feature |
 | --- | --- |
 | `std/fs`, `std/env`, `std/process`, `std/io` | `sys` |
+| `std/os` (host facts: pid, platform, arch, cpuCount, hostname, tempDir) | `sys` |
+| `std/os` (live metrics: memory, swap, cpuUsage, loadAvg, disks, uptime, networkInterfaces, localIp) | `sysinfo` |
 | `std/crypto` | `crypto` |
 | `std/compress` | `compress` |
 | `std/sqlite` | `sql` |
@@ -18,6 +20,100 @@ Most of these modules are gated behind Cargo features, all of which are **on by 
 
 > [!TIER2]
 > Argument-type misuse (passing a number where a string is expected, an out-of-range length, and so on) is a **Tier-2 panic** that aborts the program. Tier-2 failures are programmer errors, not recoverable conditions — they are never returned through the `[value, err]` pair.
+
+## std/os
+
+Host OS facts and live system metrics.
+
+```ascript
+import * as os from "std/os"
+```
+
+The **host facts** (`pid`, `platform`, `arch`, `cpuCount`, `hostname`, `tempDir`) are always available under the `sys` Cargo feature (default-on). The **live metrics** (`memory`, `swap`, `cpuUsage`, `loadAvg`, `disks`, `uptime`, `networkInterfaces`, `localIp`) require the separate `sysinfo` Cargo feature (also default-on). Strip `sysinfo` from a custom build to remove the metric APIs and the `sysinfo` crate dependency.
+
+### Host facts
+
+All host-fact functions are **synchronous** and infallible (they never return a Tier-1 pair).
+
+- `os.pid()` → `number` — the current process ID.
+- `os.platform()` → `string` — the OS name: `"macos"`, `"linux"`, `"windows"`, etc.
+- `os.arch()` → `string` — the CPU architecture: `"aarch64"`, `"x86_64"`, etc.
+- `os.cpuCount()` → `number` — the number of logical CPUs available to the process (falls back to `1` if the OS does not report this).
+- `os.hostname()` → `string` — the machine hostname. Returns `"unknown"` if the OS call fails.
+- `os.tempDir()` → `string` — the OS temporary directory path.
+
+```ascript
+import * as os from "std/os"
+
+print(os.pid())        // e.g. 12345
+print(os.platform())   // "macos"
+print(os.arch())       // "aarch64"
+print(os.cpuCount())   // e.g. 10
+print(os.hostname())   // e.g. "my-machine.local"
+print(os.tempDir())    // "/tmp"
+```
+
+### Live system metrics (sysinfo feature)
+
+> [!NOTE]
+> These functions require the `sysinfo` Cargo feature (enabled by default). If you build with `--no-default-features` and omit `sysinfo`, these bindings are not available.
+
+**Memory and swap** — synchronous; snapshot the current allocation from the OS.
+
+- `os.memory()` → `{total, used, free, available}` — RAM in bytes.
+- `os.swap()` → `{total, used, free}` — swap space in bytes.
+
+```ascript
+let mem = os.memory()
+print(`${mem.used} / ${mem.total} bytes used`)
+```
+
+**CPU usage** — **async** (must be `await`ed); samples the CPU twice separated by `~200 ms` and returns the average utilization as a percentage (`0`–`100`). The sampling delay is unavoidable — do not call this in a tight loop.
+
+- `await os.cpuUsage()` → `number` — CPU utilization percentage.
+
+```ascript
+let pct = await os.cpuUsage()
+print(`CPU: ${pct}%`)
+```
+
+**Load average** — synchronous.
+
+- `os.loadAvg()` → `{one, five, fifteen}` — 1-, 5-, and 15-minute load averages. On **Windows** the underlying API is unavailable; all three fields return `0.0`.
+
+**Disk information** — synchronous.
+
+- `os.disks()` → `array<{mount, total, free, available}>` — one entry per disk. `free` and `available` report the same value (available space to the process); `sysinfo` 0.31 does not expose a separate "free" vs "available" distinction.
+
+**Uptime** — synchronous.
+
+- `os.uptime()` → `number` — system uptime in seconds.
+
+**Network interfaces** — synchronous.
+
+- `os.networkInterfaces()` → `array<{name, addresses}>` — one entry per network interface. `addresses` is an `array<string>` of IP addresses (both IPv4 and IPv6, without prefixes).
+
+**Best-effort local IP** — synchronous; Tier-1.
+
+- `os.localIp()` → `[string, err]` — the first non-loopback, non-link-local IPv4 address found across all interfaces. Returns `[nil, err]` if no such address is found (e.g. in an air-gapped sandbox or a network-less container).
+
+```ascript
+import * as os from "std/os"
+
+let mem  = os.memory()
+let load = os.loadAvg()
+let up   = os.uptime()
+let disks = os.disks()
+let ifaces = os.networkInterfaces()
+let [localIp, ipErr] = os.localIp()
+
+print(`RAM: ${mem.used}/${mem.total}`)
+print(`load: ${load.one} ${load.five} ${load.fifteen}`)
+print(`uptime: ${up}s`)
+print(`disks: ${len(disks)}`)
+print(`interfaces: ${len(ifaces)}`)
+print(ipErr == nil ? `local IP: ${localIp}` : "no routable IP found")
+```
 
 ## std/fs
 
