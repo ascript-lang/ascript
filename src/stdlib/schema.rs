@@ -1313,8 +1313,18 @@ mod tests {
         }
         // Source constructors are NOT methods.
         for c in [
-            "string", "number", "bool", "nilType", "any", "literal", "object", "array", "union",
-            "oneOf", "map", "fromClass",
+            "string",
+            "number",
+            "bool",
+            "nilType",
+            "any",
+            "literal",
+            "object",
+            "array",
+            "union",
+            "oneOf",
+            "map",
+            "fromClass",
         ] {
             assert!(!is_schema_method(c), "{c} must NOT be a schema method");
         }
