@@ -259,6 +259,90 @@ impl Vm {
                     }
                 }
 
+                Op::NewArray => {
+                    // Pop `n` elements (pushed in source order, so the last
+                    // pushed is on top) into a Vec preserving source order, then
+                    // push `Value::Array`. Matches the tree-walker's
+                    // `ExprKind::Array` construction (`Rc<RefCell<Vec>>`).
+                    let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mut values = vec![Value::Nil; n];
+                    for slot in values.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    fiber.push(Value::Array(Rc::new(RefCell::new(values))));
+                }
+
+                Op::NewObject => {
+                    // Pop `n` (key, value) pairs. Each pair was pushed key-first
+                    // then value, and the pairs were pushed in source order, so
+                    // the stack top-down is: vN, kN, …, v1, k1. Pop into a
+                    // source-order list, then insert into an `IndexMap` in source
+                    // order — a later duplicate key overwrites the value but keeps
+                    // the first-seen position (IndexMap semantics), byte-identical
+                    // to the tree-walker's `ExprKind::Object`.
+                    let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mut pairs: Vec<(Rc<str>, Value)> = vec![(Rc::from(""), Value::Nil); n];
+                    for slot in pairs.iter_mut().rev() {
+                        let value = fiber.pop();
+                        let key = match fiber.pop() {
+                            Value::Str(s) => s,
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("NEW_OBJECT key is not a string constant: {other:?}"),
+                                ))
+                            }
+                        };
+                        *slot = (key, value);
+                    }
+                    let mut map = indexmap::IndexMap::with_capacity(n);
+                    for (k, v) in pairs {
+                        map.insert(k.to_string(), v);
+                    }
+                    fiber.push(Value::Object(Rc::new(RefCell::new(map))));
+                }
+
+                Op::GetIndex => {
+                    // `obj idx -- obj[idx]`. The two operands were pushed
+                    // obj-then-idx, so pop idx first. The shared `index_get`
+                    // dispatch (with the tree-walker) anchors every panic at the
+                    // op's span; the VM has a single instruction span, so it is
+                    // passed for both the receiver-span and index-span parameters.
+                    let idx = fiber.pop();
+                    let obj = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::index_get(&obj, &idx, span, span)?;
+                    fiber.push(v);
+                }
+
+                Op::GetProp | Op::GetPropOpt => {
+                    // `obj -- obj.<name>` (the optional form short-circuits to
+                    // `nil` when the receiver is `nil`). `read_member` is the SAME
+                    // member-access dispatch the tree-walker runs (fields, methods
+                    // → BoundMethod, enum variants, native handles, nil-receiver
+                    // errors), so the two engines cannot drift.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("GET_PROP operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let obj = fiber.pop();
+                    if op == Op::GetPropOpt && obj == Value::Nil {
+                        fiber.push(Value::Nil);
+                    } else {
+                        let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                        let v = self.interp.read_member(&obj, &name, span)?;
+                        fiber.push(v);
+                    }
+                }
+
                 Op::Return => {
                     let result = fiber.pop();
                     return Ok(RunOutcome::Done(result));
@@ -825,6 +909,160 @@ mod tests {
         c.emit_u16(Op::Const, k2, s());
         c.emit(Op::Return, s());
         assert_eq!(expect_number(c), 2.0);
+    }
+
+    // ---- collections: literals + index/member read (V2-T4b) ---------------
+
+    #[test]
+    fn new_array_preserves_source_order() {
+        // CONST 1; CONST 2; CONST 3; NEW_ARRAY 3 → [1, 2, 3].
+        let mut c = Chunk::new();
+        for n in [1.0, 2.0, 3.0] {
+            let k = c.add_const(Value::Number(n));
+            c.emit_u16(Op::Const, k, s());
+        }
+        c.emit_u16(Op::NewArray, 3, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Array(a)) => {
+                let got: Vec<f64> = a
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Value::Number(n) => *n,
+                        other => panic!("non-number: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, vec![1.0, 2.0, 3.0]);
+            }
+            other => panic!("expected Done(Array), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_object_builds_indexmap_in_order() {
+        // CONST "a"; CONST 1; CONST "b"; CONST 2; NEW_OBJECT 2 → {a:1, b:2}.
+        let mut c = Chunk::new();
+        for (k, v) in [("a", 1.0), ("b", 2.0)] {
+            let ki = c.add_const(Value::Str(Rc::from(k)));
+            c.emit_u16(Op::Const, ki, s());
+            let vi = c.add_const(Value::Number(v));
+            c.emit_u16(Op::Const, vi, s());
+        }
+        c.emit_u16(Op::NewObject, 2, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Object(o)) => {
+                let b = o.borrow();
+                let keys: Vec<&str> = b.keys().map(|k| k.as_str()).collect();
+                assert_eq!(keys, vec!["a", "b"], "keys in insertion order");
+                assert_eq!(b.get("a"), Some(&Value::Number(1.0)));
+                assert_eq!(b.get("b"), Some(&Value::Number(2.0)));
+            }
+            other => panic!("expected Done(Object), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_index_array() {
+        // [10, 20, 30]; CONST 1; GET_INDEX → 20.
+        let mut c = Chunk::new();
+        for n in [10.0, 20.0, 30.0] {
+            let k = c.add_const(Value::Number(n));
+            c.emit_u16(Op::Const, k, s());
+        }
+        c.emit_u16(Op::NewArray, 3, s());
+        let i = c.add_const(Value::Number(1.0));
+        c.emit_u16(Op::Const, i, s());
+        c.emit(Op::GetIndex, s());
+        c.emit(Op::Return, s());
+        assert_eq!(expect_number(c), 20.0);
+    }
+
+    #[test]
+    fn get_index_out_of_bounds_panics() {
+        let mut c = Chunk::new();
+        let k = c.add_const(Value::Number(10.0));
+        c.emit_u16(Op::Const, k, s());
+        c.emit_u16(Op::NewArray, 1, s());
+        let i = c.add_const(Value::Number(5.0));
+        c.emit_u16(Op::Const, i, s());
+        c.emit(Op::GetIndex, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c) {
+            Err(Control::Panic(e)) => assert!(
+                e.message.contains("out of bounds"),
+                "msg: {}",
+                e.message
+            ),
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_index_object_missing_key_is_nil() {
+        // {a:1}["b"] → nil (missing object key is nil, not a panic).
+        let mut c = Chunk::new();
+        let ka = c.add_const(Value::Str(Rc::from("a")));
+        c.emit_u16(Op::Const, ka, s());
+        let v1 = c.add_const(Value::Number(1.0));
+        c.emit_u16(Op::Const, v1, s());
+        c.emit_u16(Op::NewObject, 1, s());
+        let kb = c.add_const(Value::Str(Rc::from("b")));
+        c.emit_u16(Op::Const, kb, s());
+        c.emit(Op::GetIndex, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Nil) => {}
+            other => panic!("expected Done(Nil), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_prop_object_field() {
+        // {a:1}.a → 1 via GET_PROP "a".
+        let mut c = Chunk::new();
+        let ka = c.add_const(Value::Str(Rc::from("a")));
+        c.emit_u16(Op::Const, ka, s());
+        let v1 = c.add_const(Value::Number(1.0));
+        c.emit_u16(Op::Const, v1, s());
+        c.emit_u16(Op::NewObject, 1, s());
+        let name = c.add_const(Value::Str(Rc::from("a")));
+        c.emit_u16(Op::GetProp, name, s());
+        c.emit(Op::Return, s());
+        assert_eq!(expect_number(c), 1.0);
+    }
+
+    #[test]
+    fn get_prop_opt_nil_receiver_is_nil() {
+        // nil?.a → nil (short-circuit, no read_member call).
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s());
+        let name = c.add_const(Value::Str(Rc::from("a")));
+        c.emit_u16(Op::GetPropOpt, name, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Nil) => {}
+            other => panic!("expected Done(Nil), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_prop_nil_receiver_panics() {
+        // nil.a → "cannot read property 'a' of nil" (NOT short-circuited).
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s());
+        let name = c.add_const(Value::Str(Rc::from("a")));
+        c.emit_u16(Op::GetProp, name, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c) {
+            Err(Control::Panic(e)) => assert!(
+                e.message.contains("cannot read property 'a' of nil"),
+                "msg: {}",
+                e.message
+            ),
+            other => panic!("expected Panic, got {other:?}"),
+        }
     }
 
     #[test]

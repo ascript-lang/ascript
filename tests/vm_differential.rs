@@ -438,6 +438,68 @@ async fn vm_short_circuit_does_not_evaluate_rhs() {
     }
 }
 
+// ----- V2-T4b: array/object literals + index/member read ----------------------
+
+#[tokio::test]
+async fn vm_array_object_literals_match_treewalker() {
+    // Literals render byte-identically (the `print` of a container uses the same
+    // `Value::Display`). Objects sit in expression position (a top-level `{...}`
+    // parses as a block) — printed through `print(...)`.
+    let cases = [
+        "print([1, 2, 3])",
+        "print([1, \"a\", true])",
+        "print([[1], [2]])",     // nested arrays
+        "print([])",             // empty array
+        "print({a: 1, b: 2})",
+        "print({\"k\": 5})",     // string key
+        "print({})",             // empty object
+        "print({a: 1, b: [2, 3], c: {d: 4}})", // nested
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_index_read_matches_treewalker() {
+    let cases = [
+        "print([10, 20, 30][1])",        // 20
+        "print({a: 1}[\"a\"])",          // 1 (object index by string key)
+        "print({a: 1}[\"missing\"])",    // nil (missing object key → nil)
+        "let a = [1, 2, 3]\nprint(a[0])\nprint(a[2])", // local-array index
+        "let o = {x: 9}\nprint(o[\"x\"])",
+        "print([[1, 2], [3, 4]][1][0])", // nested index → 3
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_member_read_matches_treewalker() {
+    let cases = [
+        "let o = {a: 1}\nprint(o.a)",          // 1
+        "print({a: 1, b: 2}.b)",               // 2
+        "let o = {a: 1}\nprint(o.missing)",    // nil (missing object key → nil)
+        "let o = {nested: {deep: 7}}\nprint(o.nested.deep)", // chained member
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_opt_member_read_matches_treewalker() {
+    let cases = [
+        "let o = nil\nprint(o?.a)",     // nil receiver → nil
+        "let o = {a: 1}\nprint(o?.a)",  // 1
+        "let o = {a: 1}\nprint(o?.missing)", // nil (present receiver, missing key)
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
 #[tokio::test]
 async fn vm_short_circuit_does_evaluate_rhs_when_needed() {
     // The complementary case: when NOT short-circuited the RHS print runs, so

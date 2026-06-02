@@ -1713,28 +1713,10 @@ impl Interp {
                     return Ok((Value::Nil, true));
                 }
                 let idx = self.eval_expr(index, env).await?;
-                let v = match obj {
-                    Value::Array(arr) => {
-                        let i = array_index(&idx, expr.span)?;
-                        let arr = arr.borrow();
-                        arr.get(i).cloned().ok_or_else(|| {
-                            AsError::at(
-                                format!("index {} out of bounds (len {})", i, arr.len()),
-                                expr.span,
-                            )
-                        })
-                    }
-                    Value::Object(map) => match idx {
-                        Value::Str(key) => Ok(map
-                            .borrow()
-                            .get(key.as_ref())
-                            .cloned()
-                            .unwrap_or(Value::Nil)),
-                        _ => Err(AsError::at("object index must be a string", expr.span)),
-                    },
-                    _ => Err(AsError::at("cannot index this value", object.span)),
-                };
-                Ok((v?, false))
+                // Shared with the bytecode VM (`Op::GetIndex`) so the two engines
+                // cannot drift on index-read semantics or panic messages.
+                let v = index_get(&obj, &idx, object.span, expr.span)?;
+                Ok((v, false))
             }
             ExprKind::Call { callee, args } => {
                 // Fluent schema method-chaining hook: a Call whose callee is a
@@ -1824,7 +1806,10 @@ impl Interp {
         Ok(values)
     }
 
-    fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
+    // pub(crate): shared with the bytecode VM (`Op::GetProp`/`Op::GetPropOpt`)
+    // so member-access semantics (fields, methods→BoundMethod, enum variants,
+    // native handles, nil-receiver errors) have ONE implementation.
+    pub(crate) fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
         match obj {
             Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
             Value::Enum(e) => e.variants.get(name).cloned().ok_or_else(|| {
@@ -3113,6 +3098,48 @@ fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
             span,
         )),
         _ => Err(AsError::at("array index must be a number", span)),
+    }
+}
+
+/// Pure index-read dispatch (`obj[idx]`) shared by the tree-walker
+/// (`ExprKind::Index` read path in `eval_chain`) and the bytecode VM
+/// (`Op::GetIndex`) so the two engines cannot drift on index semantics or panic
+/// messages. There is one implementation.
+///
+/// Semantics (mirroring the original inline `eval_chain` arm exactly):
+/// - `Array`: the index must be a non-negative integer `Number` (via
+///   [`array_index`], anchored at `index_span`); an out-of-bounds index is a
+///   Tier-2 panic (NOT nil), `"index {i} out of bounds (len {n})"` at `index_span`.
+/// - `Object`: the index must be a `Str` key; a missing key yields `nil` (never a
+///   panic); a non-string index panics `"object index must be a string"` at
+///   `index_span`.
+/// - anything else: `"cannot index this value"` at `obj_span`.
+///
+/// `obj_span` is the receiver's span (the tree-walker's `object.span`);
+/// `index_span` is the whole index-expression's span (the tree-walker's
+/// `expr.span`). The VM passes its single instruction span for both.
+pub(crate) fn index_get(
+    obj: &Value,
+    idx: &Value,
+    obj_span: Span,
+    index_span: Span,
+) -> Result<Value, AsError> {
+    match obj {
+        Value::Array(arr) => {
+            let i = array_index(idx, index_span)?;
+            let arr = arr.borrow();
+            arr.get(i).cloned().ok_or_else(|| {
+                AsError::at(
+                    format!("index {} out of bounds (len {})", i, arr.len()),
+                    index_span,
+                )
+            })
+        }
+        Value::Object(map) => match idx {
+            Value::Str(key) => Ok(map.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)),
+            _ => Err(AsError::at("object index must be a string", index_span)),
+        },
+        _ => Err(AsError::at("cannot index this value", obj_span)),
     }
 }
 

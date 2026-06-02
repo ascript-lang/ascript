@@ -10,8 +10,9 @@
 
 use crate::span::Span;
 use crate::syntax::ast::{
-    AssignExpr, AstNode, BinaryExpr, Block, CallExpr, Expr, LetStmt, Literal, NameRef, ParenExpr,
-    RangeExpr, SourceFile, Stmt, TemplateExpr, UnaryExpr,
+    ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, CallExpr, Expr, IndexExpr, LetStmt, Literal,
+    MemberExpr, NameRef, ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, SourceFile, Stmt,
+    TemplateExpr, UnaryExpr,
 };
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
@@ -178,6 +179,11 @@ impl Compiler {
             Expr::NameRef(name_ref) => self.compile_name_ref(name_ref),
             Expr::AssignExpr(assign) => self.compile_assign(assign),
             Expr::RangeExpr(range) => self.compile_range(range),
+            Expr::ArrayExpr(arr) => self.compile_array(arr),
+            Expr::ObjectExpr(obj) => self.compile_object(obj),
+            Expr::IndexExpr(ix) => self.compile_index(ix),
+            Expr::MemberExpr(m) => self.compile_member(m),
+            Expr::OptMemberExpr(m) => self.compile_opt_member(m),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
                 node_span(other),
@@ -568,6 +574,148 @@ impl Compiler {
         Ok(())
     }
 
+    /// Lower an array literal `[a, b, c]`: compile each element in source order,
+    /// then `NEW_ARRAY n` (which pops `n` values, preserving source order, into a
+    /// fresh `Value::Array`). Matches the tree-walker's `ExprKind::Array`.
+    ///
+    /// A spread element `[...a]` is a documented V10 deferral: the CST records it
+    /// as a `SpreadElem` child (NOT an `Expr`), so its presence is detected by a
+    /// `SpreadElem` child node and rejected with a clear `CompileError`.
+    fn compile_array(&mut self, arr: &ArrayExpr) -> Result<(), CompileError> {
+        let span = node_span(arr);
+        if arr
+            .syntax()
+            .children()
+            .any(|c| c.kind() == SyntaxKind::SpreadElem)
+        {
+            return Err(CompileError::new(
+                "spread in an array literal ([...a]) not yet supported (V10)",
+                span,
+            ));
+        }
+        let mut n: u16 = 0;
+        for elem in arr.exprs() {
+            self.compile_expr(&elem)?;
+            n = n
+                .checked_add(1)
+                .ok_or_else(|| CompileError::new("array literal has too many elements", span))?;
+        }
+        self.chunk.emit_u16(Op::NewArray, n, span);
+        Ok(())
+    }
+
+    /// Lower an object literal `{a: 1, "k": v}`: for each field, push the KEY (a
+    /// `Value::Str` const) then the VALUE expression, all in source order; then
+    /// `NEW_OBJECT n` (which pops `n` key/value pairs into an insertion-ordered
+    /// `IndexMap`). Matches the tree-walker's `ExprKind::Object` — a later
+    /// duplicate key overwrites the value but keeps the first-seen position
+    /// (IndexMap semantics).
+    ///
+    /// Keys mirror the tree-walker's `ObjEntry::KV` key text exactly: an `Ident`
+    /// key (`a:`) uses the identifier's raw text; a `Str` key (`"k":`) uses the
+    /// UNESCAPED string contents (the legacy lexer pre-decodes `Tok::Str`, so the
+    /// CST's raw quoted token must be unescaped here to agree). AScript object
+    /// literals have NO shorthand (`{x}`) — both parsers require `key: value` — so
+    /// there is no shorthand case to handle.
+    ///
+    /// Object-spread `{...o}` is a documented V10 deferral (a `SpreadElem` child).
+    fn compile_object(&mut self, obj: &ObjectExpr) -> Result<(), CompileError> {
+        let span = node_span(obj);
+        if obj
+            .syntax()
+            .children()
+            .any(|c| c.kind() == SyntaxKind::SpreadElem)
+        {
+            return Err(CompileError::new(
+                "spread in an object literal ({...o}) not yet supported (V10)",
+                span,
+            ));
+        }
+        let mut n: u16 = 0;
+        for field in obj.object_fields() {
+            let fspan = node_span(&field);
+            // The key token is an `Ident` or a `Str`; decode it to the same
+            // string the tree-walker keys by.
+            let key = object_field_key(&field)
+                .ok_or_else(|| CompileError::new("object field has no key", fspan))?;
+            let value = field
+                .value()
+                .ok_or_else(|| CompileError::new("object field has no value", fspan))?;
+            let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+            self.chunk.emit_u16(Op::Const, key_idx, fspan);
+            self.compile_expr(&value)?;
+            n = n
+                .checked_add(1)
+                .ok_or_else(|| CompileError::new("object literal has too many fields", span))?;
+        }
+        self.chunk.emit_u16(Op::NewObject, n, span);
+        Ok(())
+    }
+
+    /// Lower an index read `a[i]`: compile the receiver, compile the index, then
+    /// `GET_INDEX`. The op carries the whole `IndexExpr`'s span (the tree-walker's
+    /// `expr.span`, used for the array-index / out-of-bounds / non-string-key
+    /// panics). Index ASSIGNMENT (`a[i] = x`) is a V9 deferral handled in
+    /// `compile_assign` (its target is not a `NameRef`).
+    fn compile_index(&mut self, ix: &IndexExpr) -> Result<(), CompileError> {
+        let span = node_span(ix);
+        let base = ix
+            .base()
+            .ok_or_else(|| CompileError::new("index expression missing receiver", span))?;
+        let index = ix
+            .index()
+            .ok_or_else(|| CompileError::new("index expression missing index", span))?;
+        self.compile_expr(&base)?;
+        self.compile_expr(&index)?;
+        self.chunk.emit(Op::GetIndex, span);
+        Ok(())
+    }
+
+    /// Lower a member read `a.k`: compile the receiver, then `GET_PROP <name>`.
+    /// The op carries the RECEIVER's span (the tree-walker anchors `read_member`
+    /// panics — e.g. `cannot read property '<k>' of nil` — at `object.span`).
+    /// Member ASSIGNMENT (`a.k = x`) is a V9 deferral.
+    fn compile_member(&mut self, m: &MemberExpr) -> Result<(), CompileError> {
+        let span = node_span(m);
+        let object = m
+            .expr()
+            .ok_or_else(|| CompileError::new("member expression missing receiver", span))?;
+        let name = m
+            .ident_token()
+            .ok_or_else(|| CompileError::new("member expression missing property name", span))?
+            .text()
+            .to_string();
+        let obj_span = node_span(&object);
+        self.compile_expr(&object)?;
+        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
+        Ok(())
+    }
+
+    /// Lower an optional member read `a?.k`: compile the receiver, then
+    /// `GET_PROP_OPT <name>` (a `nil` receiver short-circuits to `nil`; otherwise
+    /// it behaves exactly like `GET_PROP`). Mirrors the tree-walker's
+    /// `ExprKind::OptMember` (nil receiver → nil, else `read_member`). The op
+    /// carries the receiver's span, like `GET_PROP`.
+    fn compile_opt_member(&mut self, m: &OptMemberExpr) -> Result<(), CompileError> {
+        let span = node_span(m);
+        let object = m
+            .expr()
+            .ok_or_else(|| CompileError::new("optional-member expression missing receiver", span))?;
+        let name = m
+            .ident_token()
+            .ok_or_else(|| {
+                CompileError::new("optional-member expression missing property name", span)
+            })?
+            .text()
+            .to_string();
+        let obj_span = node_span(&object);
+        self.compile_expr(&object)?;
+        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        self.chunk.emit_u16(Op::GetPropOpt, name_idx, obj_span);
+        Ok(())
+    }
+
     fn compile_unary(&mut self, un: &UnaryExpr) -> Result<(), CompileError> {
         let span = node_span(un);
         let operand = un
@@ -651,6 +799,25 @@ impl Compiler {
         }
         self.chunk.emit_u16(Op::Template, parts, span);
         Ok(())
+    }
+}
+
+/// Decode an object-literal field's key into the exact string the tree-walker
+/// keys by (`ObjEntry::KV` key). The key token is either an `Ident` (raw
+/// identifier text, used verbatim) or a `Str` (a quoted literal whose contents
+/// must be unescaped — the legacy lexer pre-decodes `Tok::Str`, so the CST's raw
+/// quoted token is unescaped here via [`unescape_string`] to agree). Returns
+/// `None` only on a malformed field with no key token (a parser/compiler bug).
+fn object_field_key(field: &crate::syntax::ast::ObjectField) -> Option<String> {
+    let tok = field
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| matches!(t.kind(), SyntaxKind::Ident | SyntaxKind::Str))?;
+    match tok.kind() {
+        SyntaxKind::Str => Some(unescape_string(tok.text())),
+        // Ident key: raw identifier text, used verbatim.
+        _ => Some(tok.text().to_string()),
     }
 }
 
@@ -1101,5 +1268,81 @@ mod tests {
     async fn block_shadowing_does_not_leak() {
         // After the block, the outer x is still 1.
         assert_eq!(eval_number("let x = 1\n{ let x = 2 }\nx").await, 1.0);
+    }
+
+    // ---- V2-T4b: array/object literals + index/member read ---------------
+
+    #[test]
+    fn array_literal_emits_new_array() {
+        let chunk = compile_source("[1, 2, 3]").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("NEW_ARRAY"), "missing NEW_ARRAY in:\n{text}");
+    }
+
+    #[test]
+    fn object_literal_emits_new_object() {
+        // A top-level `{...}` parses as a block, so the object literal must sit in
+        // an unambiguous expression position (an initializer here).
+        let chunk = compile_source("let o = {a: 1, b: 2}\no").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("NEW_OBJECT"), "missing NEW_OBJECT in:\n{text}");
+    }
+
+    #[test]
+    fn index_read_emits_get_index() {
+        let chunk = compile_source("[10, 20][1]").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("GET_INDEX"), "missing GET_INDEX in:\n{text}");
+    }
+
+    #[test]
+    fn member_read_emits_get_prop() {
+        let chunk = compile_source("let o = {a: 1}\no.a").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("GET_PROP") && !text.contains("GET_PROP_OPT"),
+            "missing GET_PROP in:\n{text}");
+    }
+
+    #[test]
+    fn opt_member_read_emits_get_prop_opt() {
+        let chunk = compile_source("let o = {a: 1}\no?.a").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("GET_PROP_OPT"), "missing GET_PROP_OPT in:\n{text}");
+    }
+
+    #[test]
+    fn array_spread_is_deferred() {
+        let err = compile_source("let a = [1]\nlet b = [...a]\nb").unwrap_err();
+        assert!(err.message.contains("spread in an array literal"), "got {err:?}");
+    }
+
+    #[test]
+    fn object_spread_is_deferred() {
+        let err = compile_source("let o = {a: 1}\nlet p = {...o}\np").unwrap_err();
+        assert!(err.message.contains("spread in an object literal"), "got {err:?}");
+    }
+
+    #[test]
+    fn index_assignment_is_deferred() {
+        // Index ASSIGNMENT routes through compile_assign (target is not a NameRef).
+        let err = compile_source("let a = [1]\na[0] = 9").unwrap_err();
+        assert!(err.message.contains("index/member"), "got {err:?}");
+    }
+
+    #[test]
+    fn member_assignment_is_deferred() {
+        let err = compile_source("let o = {a: 1}\no.a = 9").unwrap_err();
+        assert!(err.message.contains("index/member"), "got {err:?}");
+    }
+
+    #[test]
+    fn object_string_key_is_unescaped() {
+        // A quoted key with an escape must decode to the same key string the
+        // tree-walker uses (the legacy lexer pre-decodes `Tok::Str`).
+        let chunk = compile_source("let o = {\"a\\nb\": 1}\no").expect("compiles");
+        let text = disasm(&chunk);
+        // The key const should contain a real newline, rendered as the escaped
+        // form `a\nb` by the disassembler's `{:?}`-style string const printer.
+        assert!(text.contains("a\\nb"), "key not unescaped in:\n{text}");
     }
 }
