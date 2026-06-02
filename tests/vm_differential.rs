@@ -964,3 +964,43 @@ async fn vm_for_of_not_iterable_error_matches_treewalker() {
         }
     }
 }
+
+// ----- V3-T5: ternary expression ---------------------------------------------
+
+#[tokio::test]
+async fn vm_ternary_matches_treewalker() {
+    let cases = [
+        // literal conditions select the correct branch.
+        "print(true ? \"a\" : \"b\")",
+        "print(false ? \"a\" : \"b\")",
+        // computed condition.
+        "let x = 5\nprint(x > 3 ? \"big\" : \"small\")",
+        // nested / right-associative: `n == 1 ? "one" : (n == 2 ? "two" : "other")`.
+        "let n = 2\nprint(n == 1 ? \"one\" : n == 2 ? \"two\" : \"other\")",
+        // precedence form `a ? -b : c` — the `-1` is the then-branch.
+        "let f = true\nprint(f ? -1 : 2)",
+        // ternary as a sub-expression: the chosen value participates in `+`.
+        "print((true ? 1 : 2) + 10)",
+        // truthiness follows is_truthy (0 and "" are truthy; only nil/false falsy).
+        "print(0 ? \"t\" : \"f\")",
+        "print(nil ? \"t\" : \"f\")",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_ternary_only_chosen_branch_evaluates() {
+    // Side-effect proof: only the taken branch's `print` runs (the untaken branch
+    // must NOT evaluate). Both engines print exactly the chosen branch's effect.
+    let cases = [
+        // condition false → only the else-branch print runs (`n`).
+        "let x = 0\nlet r = x > 0 ? print(\"y\") : print(\"n\")",
+        // condition true → only the then-branch print runs (`y`).
+        "let x = 1\nlet r = x > 0 ? print(\"y\") : print(\"n\")",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}

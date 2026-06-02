@@ -13,7 +13,7 @@ use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, BreakStmt, CallExpr, ContinueStmt, Expr,
     ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef, ObjectExpr, OptMemberExpr,
-    ParenExpr, RangeExpr, SourceFile, Stmt, TemplateExpr, UnaryExpr, WhileStmt,
+    ParenExpr, RangeExpr, SourceFile, Stmt, TemplateExpr, TernaryExpr, UnaryExpr, WhileStmt,
 };
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
@@ -242,6 +242,7 @@ impl Compiler {
             Expr::IndexExpr(ix) => self.compile_index(ix),
             Expr::MemberExpr(m) => self.compile_member(m),
             Expr::OptMemberExpr(m) => self.compile_opt_member(m),
+            Expr::TernaryExpr(t) => self.compile_ternary(t),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
                 node_span(other),
@@ -421,6 +422,47 @@ impl Compiler {
             self.compile_block(&else_block)?;
         }
         // End: both the then-branch and the else branch converge here.
+        self.chunk.patch_jump(je);
+        Ok(())
+    }
+
+    /// Compile a ternary `cond ? then : els`. Unlike `if`, this is an
+    /// *expression*: it leaves exactly ONE value on the stack — the value of the
+    /// chosen branch. Mirrors the tree-walker's `ExprKind::Ternary`: evaluate the
+    /// condition, run the then-branch when truthy, else the else-branch.
+    ///
+    /// Lowering (same jump shape as `if`/`else`, but both arms are expressions):
+    /// ```text
+    ///   <cond>
+    ///   jf = JUMP_IF_FALSE   ; pops cond; jump to the else-branch when falsy
+    ///   <then>               ; pushes one value
+    ///   je = JUMP             ; skip the else-branch
+    ///   patch(jf)            ; else target
+    ///   <els>                ; pushes one value
+    ///   patch(je)            ; both branches converge here, one value on the stack
+    /// ```
+    /// `JUMP_IF_FALSE` pops the condition. The jumps route control so EXACTLY ONE
+    /// of the two branches runs, and each branch pushes exactly one value — so the
+    /// net stack effect is +1 regardless of which branch is taken, and the untaken
+    /// branch's side effects (e.g. a `print`) never run.
+    fn compile_ternary(&mut self, ternary: &TernaryExpr) -> Result<(), CompileError> {
+        let span = node_span(ternary);
+        let cond = ternary
+            .cond()
+            .ok_or_else(|| CompileError::new("ternary missing condition", span))?;
+        let then = ternary
+            .then()
+            .ok_or_else(|| CompileError::new("ternary missing then-branch", span))?;
+        let els = ternary
+            .els()
+            .ok_or_else(|| CompileError::new("ternary missing else-branch", span))?;
+
+        self.compile_expr(&cond)?;
+        let jf = self.chunk.emit_jump(Op::JumpIfFalse, span);
+        self.compile_expr(&then)?;
+        let je = self.chunk.emit_jump(Op::Jump, span);
+        self.chunk.patch_jump(jf);
+        self.compile_expr(&els)?;
         self.chunk.patch_jump(je);
         Ok(())
     }
