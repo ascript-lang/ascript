@@ -429,9 +429,10 @@ impl Compiler {
     /// (`GET_LOCAL`); a `Global(name)` that is a known builtin is a first-class
     /// builtin reference (`GET_GLOBAL`, yielding the `Value::Builtin` — e.g.
     /// `let p = print`, exactly as the tree-walker treats a bare builtin name);
-    /// `Upvalue` is a closure capture (V5) and a non-builtin `Global` is a
-    /// user-global reference, which does not exist at runtime (top-level `let`s
-    /// are frame-locals) so it is a documented V4 deferral.
+    /// `Upvalue` is a closure capture, emitted (V4-T3) as `GET_UPVALUE` reading
+    /// the captured cell by its index in this frame's upvalue plan; a non-builtin
+    /// `Global` is a user-global reference, which does not exist at runtime
+    /// (top-level `let`s are frame-locals) so it is a documented V4 deferral.
     fn compile_name_ref(&mut self, name_ref: &NameRef) -> Result<(), CompileError> {
         let span = node_span(name_ref);
         let key = name_ref.syntax().text_range();
@@ -854,12 +855,20 @@ impl Compiler {
     /// arrow EXPRESSION body (no Block) compiles the expression then `RETURN` (an
     /// implicit return of the expression value).
     ///
-    /// **V5 limitation (documented):** captures/upvalues are not yet wired. If the
-    /// resolver assigned this frame ANY upvalues (i.e. the body reads an
-    /// outer-scope local — which, notably, includes a `fn`'s reference to its OWN
-    /// name, since the name is declared in the ENCLOSING frame), this returns a
-    /// `CompileError` tagged `V5`. Functions using only their params, their own
-    /// locals, and globals/builtins compile today.
+    /// **Captures/upvalues (V4-T3, wired).** This frame's capture plan
+    /// (`frame.upvalues`) and its captured-local cell slots (`frame.cell_slots`)
+    /// come straight from the resolver. The upvalue plan is stored on the body
+    /// chunk (`body_chunk.upvalues`) so the enclosing frame's `Op::Closure`
+    /// materializes the `Value::Closure` with its upvalue cells wired at runtime,
+    /// and the cell slots drive both cell allocation at frame entry and the
+    /// compiler's cell-aware local opcodes. A body that reads an outer-scope local
+    /// (including a `fn`'s reference to its OWN name, declared in the ENCLOSING
+    /// frame) therefore compiles and captures correctly today.
+    ///
+    /// The REMAINING V5 work is optimization/correctness refinement, not "captures
+    /// don't work": capture-by-VALUE for never-reassigned bindings (avoiding a cell
+    /// where a snapshot would do) and per-iteration loop-variable freshness. These
+    /// refine an already-functioning capture path.
     fn compile_fn_proto(&mut self, fn_node: &ResolvedNode) -> Result<Rc<FnProto>, CompileError> {
         let span = range_span(fn_node);
         let fn_kind = fn_node.kind();

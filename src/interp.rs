@@ -3349,7 +3349,15 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         Type::Bool => matches!(value, Value::Bool(_)),
         Type::Nil => matches!(value, Value::Nil),
         Type::Object => matches!(value, Value::Object(_)),
-        Type::Fn => matches!(value, Value::Function(_) | Value::Builtin(_)),
+        // A VM-produced `Closure` is the bytecode analog of a tree-walker
+        // `Function`; both are first-class callables, so `: fn` typing accepts
+        // either. (The tree-walker never produces a `Closure`, so adding it here
+        // is behavior-preserving for the tree-walker and closes a real contract
+        // gap for the VM, which routes through this shared `check_type`.)
+        Type::Fn => matches!(
+            value,
+            Value::Function(_) | Value::Closure(_) | Value::Builtin(_)
+        ),
         Type::Error => matches!(value, Value::Object(_) | Value::Nil),
         Type::Array(elem) => match value {
             Value::Array(a) => a.borrow().iter().all(|v| check_type(v, elem)),
@@ -3964,6 +3972,36 @@ print(y)
             err.message,
             "type contract violated: expected future<number>, got number (5)"
         );
+    }
+
+    #[test]
+    fn check_type_fn_accepts_closure() {
+        use crate::ast::Type;
+        // The shared `check_type` is used by BOTH the tree-walker and the VM (via
+        // `check_call_args`). A `: fn` contract must accept every first-class
+        // callable: the tree-walker's `Function`/`Builtin` AND the VM's `Closure`
+        // (the bytecode analog of a `Function`). Before the fix the `Type::Fn` arm
+        // matched only `Function | Builtin`, so a VM-produced `Closure` passed to
+        // an `fn`-typed binding was WRONGLY rejected by the contract.
+        let proto = std::rc::Rc::new(crate::vm::chunk::FnProto {
+            chunk: crate::vm::chunk::Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            params: Vec::new(),
+            ret: None,
+        });
+        let closure = Value::Closure(crate::vm::value_ext::Closure::new(proto));
+        assert!(
+            check_type(&closure, &Type::Fn),
+            "a VM Closure must satisfy a `: fn` contract"
+        );
+        // The tree-walker callables still satisfy `: fn`.
+        assert!(check_type(&Value::Builtin("len".into()), &Type::Fn));
+        // A non-callable still fails the `: fn` contract (behavior preserved).
+        assert!(!check_type(&Value::Number(7.0), &Type::Fn));
+        assert!(!check_type(&Value::Str("x".into()), &Type::Fn));
     }
 
     #[tokio::test]
