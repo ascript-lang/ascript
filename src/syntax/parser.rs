@@ -404,6 +404,12 @@ fn primary(p: &mut Parser) -> CompletedMarker {
         }
         LBracket => array_expr(p),
         LBrace => object_expr(p),
+        TemplateStr => {
+            let m = p.start();
+            p.bump();
+            p.complete(m, TemplateExpr)
+        }
+        TemplateStart => template_expr(p),
         _ => {
             let m = p.start();
             p.error("expected expression");
@@ -539,6 +545,28 @@ fn object_expr(p: &mut Parser) -> CompletedMarker {
         p.error("expected '}' to close object");
     }
     p.complete(m, ObjectExpr)
+}
+
+/// Parse an interpolated template: TemplateStart (expr TemplateMiddle)* expr
+/// TemplateEnd. Each `${...}` slot holds a full expression.
+fn template_expr(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // TemplateStart  (`...${)
+    loop {
+        expr(p); // interpolated expression
+        if p.at(TemplateMiddle) {
+            p.bump(); // }...${  → another interpolation follows
+            continue;
+        }
+        if p.at(TemplateEnd) {
+            p.bump(); // }...`
+            break;
+        }
+        p.error("unterminated template interpolation");
+        break;
+    }
+    p.complete(m, TemplateExpr)
 }
 
 fn arg_list(p: &mut Parser) {
@@ -709,5 +737,25 @@ mod tests {
         assert!(shape.contains(&SyntaxKind::ObjectField));
         assert!(shape.contains(&SyntaxKind::SpreadElem));
         assert!(parse(r#"let o = { a: 1, "k": 2, ...rest }"#).errors.is_empty());
+    }
+
+    #[test]
+    fn plain_template() {
+        let shape = tree_shape("`hello`");
+        assert!(shape.contains(&SyntaxKind::TemplateExpr));
+        assert!(parse("`hello`").errors.is_empty());
+    }
+
+    #[test]
+    fn interpolated_template() {
+        let p = parse("`a${x}b${y}c`");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        assert!(tree_shape("`a${x}b${y}c`").contains(&SyntaxKind::TemplateExpr));
+    }
+
+    #[test]
+    fn nested_template() {
+        let p = parse("`a${ `b${z}` }c`");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
     }
 }
