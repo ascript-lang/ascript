@@ -1,4 +1,12 @@
 //! Lint configuration: per-code severity overrides and warning promotion.
+//!
+//! NOTE: `LintConfig`'s severity-override surface (`deny`/`warn`/`allow`/
+//! `effective`) is implemented and unit-tested but not yet wired into `analyze`
+//! or the CLI — it is staged for the future `--deny <rule>` / `--warn <rule>` /
+//! `--allow <rule>` / `ascript.toml` config flags (a recorded follow-up
+//! sub-project). Today only `deny_warnings` is consulted (by
+//! `ascript check --deny-warnings`, for exit-code purposes). Inline
+//! `// ascript-ignore[code]` suppression is fully active (see `analyze.rs`).
 
 use crate::check::diagnostic::Severity;
 use std::collections::HashMap;

@@ -33,6 +33,27 @@ fn syntax_error_exits_nonzero_and_reports() {
     assert!(combined.contains("syntax-error"), "should name the rule: {combined}");
 }
 #[test]
+fn warning_only_exits_zero_without_deny_but_one_with() {
+    // `let x = 1` (unused-binding, a Warning) — no syntax error.
+    let p = write_tmp("warnonly.as", "let x = 1\n");
+    let plain = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    assert!(
+        plain.status.success(),
+        "warning-only must exit 0 without --deny-warnings; stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let denied = Command::new(bin())
+        .arg("check")
+        .arg("--deny-warnings")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        !denied.status.success(),
+        "warning-only must exit non-zero WITH --deny-warnings"
+    );
+}
+#[test]
 fn json_output_is_a_json_array() {
     let p = write_tmp("bad2.as", "let = 1\n");
     let out = Command::new(bin())

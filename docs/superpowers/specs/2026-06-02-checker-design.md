@@ -148,7 +148,7 @@ The checker is the **tooling** consumer of the error-recovering parser (front-en
 
 - **Per-rule unit tests**: each rule module has `(source → expected diagnostics)` table tests (code + span + message), including **negative** cases (no false positives) — especially dense for `contract-mismatch`.
 - **Suppression tests**: `// ascript-ignore[code]` silences exactly that rule at that site and nowhere else.
-- **CLI integration tests** (`tests/check.rs`): exit codes, `--json` shape, `--deny-warnings`, multi-error output, `--fix` round-trip.
+- **CLI integration tests** (`tests/check.rs`): clean-exit (zero), syntax-error-exit (non-zero) with rule named, `--json` array shape, the corpus zero-false-positive guard, and `--deny-warnings` exit behavior (warning-only file exits 0 without it, non-zero with it). `--fix` autofix *application* and the `--deny <rule>`/`--warn <rule>`/`--allow <rule>` config flags are recorded future work (the diagnostic model already carries `fix` data and `LintConfig` already implements the severity overrides — neither is wired to the CLI yet).
 - **LSP parity test**: `check::analyze` and the LSP adapter agree (same diagnostics, mapped).
 - **Corpus smoke**: `ascript check examples/**/*.as` reports **zero** diagnostics on the (clean) example corpus — a regression guard that the checker doesn't false-positive on idiomatic code. (Any example that legitimately should warn gets a suppression or is fixed.)
 - **Clippy clean in both feature configs**; the core builds with `--no-default-features` (the whole point — checking without the `lsp`/stdlib features).
