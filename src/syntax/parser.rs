@@ -354,17 +354,73 @@ fn expr_bp(p: &mut Parser, min_bp: u8) {
     }
 }
 
-fn lhs(p: &mut Parser) -> CompletedMarker {
+/// Unary/primary layer: prefix `-`/`!x` (await/yield added in a later task),
+/// then a primary with its tight postfix chain (call/member/index/?.).
+fn unary(p: &mut Parser) -> CompletedMarker {
     use SyntaxKind::*;
     match p.current() {
         Minus | Bang => {
             let m = p.start();
             p.bump();
-            let _operand = lhs(p);
+            let _operand = unary(p);
             p.complete(m, UnaryExpr)
         }
         _ => primary(p),
     }
+}
+
+/// True if the `?` at the cursor is a ternary `?` (a `:` follows at bracket-depth
+/// 0 before the statement ends), false if it is a postfix propagate `?`.
+fn ternary_ahead(p: &Parser) -> bool {
+    use SyntaxKind::*;
+    let mut depth = 0i32;
+    let mut i = p.pos + 1; // scan AFTER the `?`
+    while i < p.nontrivia.len() {
+        match p.tokens[p.nontrivia[i]].kind {
+            LParen | LBracket | LBrace => depth += 1,
+            RParen | RBracket => depth -= 1,
+            RBrace => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            Semicolon if depth == 0 => return false,
+            Colon if depth == 0 => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The unwrap tier — looser than unary, tighter than binary. Applies postfix
+/// propagate `?` (when NOT a ternary) and force-unwrap `!` over the whole unary
+/// expression, so `await x!` parses as `(await x)!`.
+fn unwrap_tier(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
+    use SyntaxKind::*;
+    loop {
+        match p.current() {
+            Question if !ternary_ahead(p) => {
+                let m = p.precede(&cm);
+                p.bump(); // ?
+                cm = p.complete(m, TryExpr);
+            }
+            Bang => {
+                let m = p.precede(&cm);
+                p.bump(); // !
+                cm = p.complete(m, UnwrapExpr);
+            }
+            _ => break,
+        }
+    }
+    cm
+}
+
+/// Operand of the binary precedence-climb: unary, then the unwrap tier.
+fn lhs(p: &mut Parser) -> CompletedMarker {
+    let u = unary(p);
+    unwrap_tier(p, u)
 }
 
 fn primary(p: &mut Parser) -> CompletedMarker {
@@ -448,6 +504,16 @@ fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
                     p.error("expected ']'");
                 }
                 cm = p.complete(m, IndexExpr);
+            }
+            QuestionDot => {
+                let m = p.precede(&cm);
+                p.bump(); // ?.
+                if p.at(Ident) {
+                    p.bump();
+                } else {
+                    p.error("expected property name after '?.'");
+                }
+                cm = p.complete(m, OptMemberExpr);
             }
             _ => break,
         }
@@ -757,5 +823,20 @@ mod tests {
     fn nested_template() {
         let p = parse("`a${ `b${z}` }c`");
         assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+    }
+
+    #[test]
+    fn optional_member() {
+        let shape = tree_shape("a?.b");
+        assert!(shape.contains(&SyntaxKind::OptMemberExpr));
+        assert!(parse("a?.b").errors.is_empty());
+    }
+
+    #[test]
+    fn try_and_unwrap_postfix() {
+        assert!(tree_shape("f()?").contains(&SyntaxKind::TryExpr));
+        assert!(tree_shape("g()!").contains(&SyntaxKind::UnwrapExpr));
+        assert!(parse("f()?").errors.is_empty());
+        assert!(parse("g()!").errors.is_empty());
     }
 }
