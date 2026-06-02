@@ -515,9 +515,23 @@ async fn vm_run_sync_multi_feature_programs() {
 /// `print`. They must contain NO `fn`, control flow (`if`/`while`/`for`/`match`),
 /// `class`/`enum`, `import`, async/await, generators, `?`/`!`/recover, or
 /// destructuring/spread — those arrive in V3..V10.
+///
+/// V3 qualifiers (added now that the VM supports control flow): examples that
+/// also use `if`/`else`/`while`/`for (i in a..b)`/`for (x of …)`/ternary, but
+/// STILL contain NO `fn`, `match`, `class`/`enum`, `import`, async/await,
+/// generators, `?`/`!`/recover, destructuring/spread, compound assignment
+/// (`+=`/`-=`/`*=`/`/=`, deferred to V9), OR `for (x in name)` over a NAME bound
+/// to a range/array value (the VM's V3 for-range slice only compiles a LITERAL
+/// `a..b` range head; an iterator-based `for…in <value>` is the still-unsupported
+/// for-of path). Deliberately EXCLUDED for those reasons:
+///   - `factorial.as` — uses `*=`.
+///   - `data.as`      — uses `+=`.
+///   - `ranges.as`    — uses `for (i in r)` over a range VALUE (not a literal head).
 const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     "examples/hello.as",   // `print(1 + 2 * 3)` — literals + arithmetic + print.
     "examples/numbers.as", // numeric-literal forms bound to locals, then printed.
+    // V3 control-flow qualifier:
+    "examples/strings.as", // string literals + escapes through print.
 ];
 
 #[tokio::test]
@@ -986,6 +1000,51 @@ async fn vm_ternary_matches_treewalker() {
         "print(nil ? \"t\" : \"f\")",
     ];
     for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+// ----- V3-T6: control-flow multi-feature sync programs ------------------------
+//
+// These COMBINE the full V3 control-flow set (`if`/`else if`/`else`, `while` with
+// `break`/`continue`, `for (i in a..b)`, `for (x of …)`, ternary) with the V1+V2
+// base (locals, reassignment, arithmetic, arrays/objects, index/member, templates,
+// short-circuit, `print`). The single-feature tests above prove each construct in
+// isolation; these prove they compose correctly through the compiler + VM, byte-
+// for-byte against the tree-walker. This is the V3 sync-subset gate.
+
+#[tokio::test]
+async fn vm_run_control_flow_multi_feature_programs() {
+    let programs = [
+        // (a) sum the squares of a range with a for-range loop, then re-sum the
+        // same source array with a for-of loop — both must agree.
+        "let squares = 0\nfor (i in 0..5) { squares = squares + i * i }\nlet src = 0..5\nlet again = 0\nfor (x of src) { again = again + x }\nprint(squares)\nprint(again)\nprint(len(src))",
+        // (b) fizzbuzz-style: if / else if / else inside a for-range, with print.
+        "for (i in 1..16) { if (i % 15 == 0) { print(\"fizzbuzz\") } else if (i % 3 == 0) { print(\"fizz\") } else if (i % 5 == 0) { print(\"buzz\") } else { print(i) } }",
+        // (c) nested for-range building a flattened coordinate list via templates.
+        "for (i in 0..3) { for (j in 0..3) { if (i == j) { print(`diag ${i},${j}`) } } }",
+        // (d) while with break + continue accumulating into a local.
+        "let i = 0\nlet acc = 0\nwhile (true) { i = i + 1\n if (i > 10) { break }\n if (i % 2 == 0) { continue }\n acc = acc + i }\nprint(acc)",
+        // (e) ternary inside a loop selecting between two computed branches.
+        "for (n of [1, 2, 3, 4, 5]) { print(n % 2 == 0 ? `${n} even` : `${n} odd`) }",
+        // (f) for-of over an array of objects, member reads + arithmetic + a running max.
+        "let users = [{name: \"a\", age: 30}, {name: \"b\", age: 12}, {name: \"c\", age: 45}]\nlet oldest = users[0]\nfor (u of users) { if (u.age > oldest.age) { oldest = u } }\nprint(oldest.name)\nprint(oldest.age)",
+        // (g) nested if inside for-of with short-circuit guard + template.
+        "let words = [\"hi\", \"\", \"world\", \"\"]\nlet shown = 0\nfor (w of words) { if (len(w) > 0 && shown < 5) { shown = shown + 1\n print(`#${shown}: ${w}`) } }\nprint(`total ${shown}`)",
+        // (h) while loop computing a factorial, then an if on the result.
+        "let n = 6\nlet f = 1\nlet k = 1\nwhile (k <= n) { f = f * k\n k = k + 1 }\nif (f > 100) { print(`${n}! = ${f} (big)`) } else { print(`${n}! = ${f}`) }",
+        // (i) for-range over computed bounds with a ternary-driven step decision.
+        "let lo = 2\nlet hi = lo + 5\nlet evens = 0\nlet odds = 0\nfor (i in lo..hi) { if (i % 2 == 0) { evens = evens + 1 } else { odds = odds + 1 } }\nprint(`evens=${evens} odds=${odds}`)",
+        // (j) for-of over a string counting a class of chars, ternary in the print.
+        "let s = \"banana\"\nlet count = 0\nfor (c of s) { if (c == \"a\") { count = count + 1 } }\nprint(count > 0 ? `found ${count}` : \"none\")",
+        // (k) nested data: for-of over array of objects whose field is an array,
+        // inner for-of over that array, index/member throughout.
+        "let groups = [{tag: \"x\", vals: [1, 2]}, {tag: \"y\", vals: [3, 4, 5]}]\nfor (g of groups) { let s = 0\n for (v of g.vals) { s = s + v }\n print(`${g.tag}: ${s}`) }",
+        // (l) while loop computing a running total + iteration count, then a
+        // conditional summary via ternary on the count.
+        "let total = 0\nlet i = 0\nwhile (i < 4) { total = total + i * 10\n i = i + 1 }\nprint(total)\nprint(i == 4 ? \"ok\" : \"bad\")",
+    ];
+    for src in programs {
         assert_vm_run_matches_treewalker(src).await;
     }
 }
