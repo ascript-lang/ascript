@@ -103,8 +103,6 @@ impl Parser {
 
     /// True if the current token is an `Ident` whose text equals `kw` (a soft
     /// keyword like `as` / `extends` / `from`, which are not reserved).
-    // used in Plan 2b-ii T3/T7/T8
-    #[allow(dead_code)]
     fn at_kw(&self, kw: &str) -> bool {
         match self.nontrivia.get(self.pos) {
             Some(&ti) => {
@@ -196,10 +194,11 @@ fn let_stmt(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // let/const
-    if p.at(Ident) {
-        p.bump();
-    } else {
-        p.error("expected a name after let/const");
+    match p.current() {
+        LBracket => array_bind_pat(p),
+        LBrace => object_bind_pat(p),
+        Ident => p.bump(),
+        _ => p.error("expected a name or destructuring pattern after let/const"),
     }
     if p.at(Colon) {
         p.bump();
@@ -210,6 +209,86 @@ fn let_stmt(p: &mut Parser) {
         expr(p);
     }
     p.complete(m, LetStmt);
+}
+
+fn array_bind_pat(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // [
+    while !p.at(RBracket) && !p.at_end() {
+        if p.at(DotDotDot) {
+            rest_bind(p);
+        } else {
+            let e = p.start();
+            if p.at(Ident) {
+                p.bump();
+            } else {
+                p.error("expected a binding name");
+            }
+            p.complete(e, BindEntry);
+        }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RBracket) {
+        p.bump();
+    } else {
+        p.error("expected ']' to close destructuring pattern");
+    }
+    p.complete(m, ArrayBindPat);
+}
+
+fn object_bind_pat(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // {
+    while !p.at(RBrace) && !p.at_end() {
+        if p.at(DotDotDot) {
+            rest_bind(p);
+        } else {
+            let e = p.start();
+            if p.at(Ident) || p.at(Str) {
+                p.bump();
+            } else {
+                p.error("expected a key in object pattern");
+            }
+            if p.at_kw("as") {
+                p.bump(); // as
+                if p.at(Ident) {
+                    p.bump();
+                } else {
+                    p.error("expected a local name after 'as'");
+                }
+            }
+            p.complete(e, BindEntry);
+        }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close destructuring pattern");
+    }
+    p.complete(m, ObjectBindPat);
+}
+
+fn rest_bind(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // ...
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected a name after '...'");
+    }
+    p.complete(m, RestBind);
 }
 
 fn block(p: &mut Parser) -> CompletedMarker {
@@ -1029,6 +1108,25 @@ mod tests {
             assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
             assert!(tree_shape(src).contains(&SyntaxKind::AssignExpr), "no assign for {src}");
         }
+    }
+
+    #[test]
+    fn array_destructuring() {
+        let p = parse("let [a, b, ...rest] = xs");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape("let [a, b, ...rest] = xs");
+        assert!(s.contains(&SyntaxKind::ArrayBindPat));
+        assert!(s.contains(&SyntaxKind::RestBind));
+    }
+
+    #[test]
+    fn object_destructuring_with_rename() {
+        let p = parse("let {a, b as local, ...rest} = obj");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape("let {a, b as local, ...rest} = obj");
+        assert!(s.contains(&SyntaxKind::ObjectBindPat));
+        assert!(s.contains(&SyntaxKind::BindEntry));
+        assert!(s.contains(&SyntaxKind::RestBind));
     }
 
     #[test]
