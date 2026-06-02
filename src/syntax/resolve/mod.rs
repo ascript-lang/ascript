@@ -308,7 +308,7 @@ impl Resolver {
         } else if let Some(obj) = node.children().find(|c| c.kind() == ObjectBindPat) {
             self.declare_pattern_names(obj);
         } else if let Some(name) = ident_text(node) {
-            self.declare(&name, BindingKind::Let, node.text_range());
+            self.declare(&name, let_kind(node), node.text_range());
         }
     }
 
@@ -468,6 +468,13 @@ impl Resolver {
                 self.resolve_stmt(child);
             }
         }
+        // Expression-body arrow (no Block): resolve the direct expression child
+        // (the body) so its params/captures resolve correctly.
+        if node.children().find(|c| c.kind() == Block).is_none() {
+            for child in node.children().filter(|c| is_expr(c.kind())) {
+                self.resolve_expr(child);
+            }
+        }
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
         let cell_slots: Vec<u32> = frame
@@ -585,6 +592,19 @@ fn bare_ident_pattern(pat: &ResolvedNode) -> Option<String> {
         ident_text(first)
     } else {
         None
+    }
+}
+
+/// Determine whether a `LetStmt` node is a `const` or `let` binding.
+fn let_kind(node: &ResolvedNode) -> BindingKind {
+    let is_const = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == SyntaxKind::ConstKw);
+    if is_const {
+        BindingKind::Const
+    } else {
+        BindingKind::Let
     }
 }
 
@@ -746,6 +766,24 @@ mod tests {
         // print/len are builtins → Global, not diagnostics.
         let r = resolve(&parse_to_tree("print(len([1,2]))"));
         assert!(r.diagnostics.is_empty(), "builtins must not be flagged: {:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn arrow_expression_body_resolves_params() {
+        // x in the body of `x => x * 3` must be Local (the param), not Global.
+        let tree = parse_to_tree("let triple = x => x * 3\nprint(triple(2))");
+        let r = resolve(&tree);
+        let body_x = tree
+            .descendants()
+            .filter(|n| {
+                n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x")
+            })
+            .last()
+            .unwrap();
+        assert!(
+            matches!(r.uses.get(&body_x.text_range()), Some(Resolution::Local(_))),
+            "arrow expression-body param must resolve to Local"
+        );
     }
 
     #[test]
