@@ -125,9 +125,135 @@ pub fn parse(src: &str) -> Parse {
 }
 
 fn stmt(p: &mut Parser) {
+    use SyntaxKind::*;
+    match p.current() {
+        LetKw | ConstKw => let_stmt(p),
+        IfKw => if_stmt(p),
+        WhileKw => while_stmt(p),
+        ReturnKw => return_stmt(p),
+        FnKw => fn_decl(p),
+        LBrace => {
+            block(p);
+        }
+        _ => expr_stmt(p),
+    }
+}
+
+fn expr_stmt(p: &mut Parser) {
     let m = p.start();
-    expr(p);
+    let lhs_cm = expr_returning(p);
+    if p.at(SyntaxKind::Eq) {
+        let am = p.precede(&lhs_cm);
+        p.bump(); // =
+        expr(p);
+        p.complete(am, SyntaxKind::AssignExpr);
+    }
     p.complete(m, SyntaxKind::ExprStmt);
+}
+
+/// Like `expr` but returns the CompletedMarker so callers can wrap it (assignment).
+fn expr_returning(p: &mut Parser) -> CompletedMarker {
+    let cm = lhs(p);
+    let mut lhs_cm = cm;
+    loop {
+        let op = p.current();
+        let Some((_l_bp, r_bp)) = infix_binding_power(op) else { break };
+        let m = p.precede(&lhs_cm);
+        p.bump();
+        expr_bp(p, r_bp);
+        lhs_cm = p.complete(m, SyntaxKind::BinaryExpr);
+    }
+    lhs_cm
+}
+
+fn let_stmt(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // let/const
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected a name after let/const");
+    }
+    if p.at(Eq) {
+        p.bump();
+        expr(p);
+    }
+    p.complete(m, LetStmt);
+}
+
+fn block(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // {
+    while !p.at(RBrace) && !p.at_end() {
+        let before = p.pos;
+        stmt(p);
+        if p.pos == before {
+            p.error("unexpected token in block");
+            p.bump();
+        }
+    }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close block");
+    }
+    p.complete(m, Block)
+}
+
+fn if_stmt(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // if
+    expr(p); // condition
+    if p.at(LBrace) {
+        block(p);
+    } else {
+        p.error("expected '{' after if condition");
+    }
+    if p.at(ElseKw) {
+        p.bump();
+        if p.at(IfKw) {
+            if_stmt(p); // else if
+        } else if p.at(LBrace) {
+            block(p);
+        } else {
+            p.error("expected '{' or 'if' after else");
+        }
+    }
+    p.complete(m, IfStmt);
+}
+
+fn while_stmt(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // while
+    expr(p);
+    if p.at(LBrace) {
+        block(p);
+    } else {
+        p.error("expected '{' after while condition");
+    }
+    p.complete(m, WhileStmt);
+}
+
+fn return_stmt(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // return
+    if !p.at(RBrace) && !p.at_end() {
+        expr(p);
+    }
+    p.complete(m, ReturnStmt);
+}
+
+fn fn_decl(p: &mut Parser) {
+    // Full implementation in Task 8. Temporary: consume the `fn` token so the
+    // parser advances; the rest is handled as ordinary statements/expressions.
+    let m = p.start();
+    p.bump(); // fn
+    p.complete(m, SyntaxKind::FnDecl);
 }
 
 /// Infix binding powers (left, right). Higher binds tighter.
@@ -345,5 +471,35 @@ mod tests {
             tree_shape("x"),
             vec![SyntaxKind::SourceFile, SyntaxKind::ExprStmt, SyntaxKind::NameRef]
         );
+    }
+
+    #[test]
+    fn let_statement() {
+        assert_eq!(
+            tree_shape("let x = 1"),
+            vec![SyntaxKind::SourceFile, SyntaxKind::LetStmt, SyntaxKind::Literal]
+        );
+        assert!(parse("let x = 1").errors.is_empty());
+    }
+
+    #[test]
+    fn if_else_with_block() {
+        let p = parse("if x { return 1 } else { return 2 }");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let shape = tree_shape("if x { return 1 } else { return 2 }");
+        assert!(shape.contains(&SyntaxKind::IfStmt));
+        assert!(shape.contains(&SyntaxKind::Block));
+        assert!(shape.contains(&SyntaxKind::ReturnStmt));
+    }
+
+    #[test]
+    fn while_loop() {
+        assert!(parse("while x { x = 0 }").errors.is_empty());
+        assert!(tree_shape("while x { x = 0 }").contains(&SyntaxKind::WhileStmt));
+    }
+
+    #[test]
+    fn assignment_is_a_statement() {
+        assert!(tree_shape("x = 5").contains(&SyntaxKind::AssignExpr));
     }
 }
