@@ -249,11 +249,51 @@ fn return_stmt(p: &mut Parser) {
 }
 
 fn fn_decl(p: &mut Parser) {
-    // Full implementation in Task 8. Temporary: consume the `fn` token so the
-    // parser advances; the rest is handled as ordinary statements/expressions.
+    use SyntaxKind::*;
     let m = p.start();
     p.bump(); // fn
-    p.complete(m, SyntaxKind::FnDecl);
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected function name");
+    }
+    if p.at(LParen) {
+        param_list(p);
+    } else {
+        p.error("expected '(' after function name");
+    }
+    if p.at(LBrace) {
+        block(p);
+    } else {
+        p.error("expected '{' for function body");
+    }
+    p.complete(m, FnDecl);
+}
+
+fn param_list(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // (
+    while !p.at(RParen) && !p.at_end() {
+        let pm = p.start();
+        if p.at(Ident) {
+            p.bump();
+        } else {
+            p.error("expected parameter name");
+        }
+        p.complete(pm, Param);
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RParen) {
+        p.bump();
+    } else {
+        p.error("expected ')' to close parameters");
+    }
+    p.complete(m, ParamList);
 }
 
 /// Infix binding powers (left, right). Higher binds tighter.
@@ -316,6 +356,17 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.bump();
             p.complete(m, NameRef)
         }
+        LParen if is_arrow_ahead(p) => {
+            let m = p.start();
+            param_list(p);
+            p.bump(); // =>  (guaranteed by is_arrow_ahead)
+            if p.at(LBrace) {
+                block(p);
+            } else {
+                expr(p);
+            }
+            p.complete(m, ArrowExpr)
+        }
         LParen => {
             let m = p.start();
             p.bump(); // (
@@ -370,6 +421,31 @@ fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
         }
     }
     cm
+}
+
+/// True if the `(` at the cursor begins an arrow parameter list, i.e. the
+/// matching `)` is immediately followed by `=>`.
+fn is_arrow_ahead(p: &Parser) -> bool {
+    use SyntaxKind::*;
+    let mut depth = 0i32;
+    let mut i = p.pos;
+    while i < p.nontrivia.len() {
+        match p.tokens[p.nontrivia[i]].kind {
+            LParen => depth += 1,
+            RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return matches!(
+                        p.nontrivia.get(i + 1).map(|&ti| p.tokens[ti].kind),
+                        Some(FatArrow)
+                    );
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn arg_list(p: &mut Parser) {
@@ -501,5 +577,21 @@ mod tests {
     #[test]
     fn assignment_is_a_statement() {
         assert!(tree_shape("x = 5").contains(&SyntaxKind::AssignExpr));
+    }
+
+    #[test]
+    fn fn_declaration() {
+        let p = parse("fn add(a, b) { return a + b }");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let shape = tree_shape("fn add(a, b) { return a + b }");
+        assert!(shape.contains(&SyntaxKind::FnDecl));
+        assert!(shape.contains(&SyntaxKind::ParamList));
+        assert!(shape.contains(&SyntaxKind::Param));
+    }
+
+    #[test]
+    fn arrow_expression() {
+        assert!(parse("let f = (x) => x + 1").errors.is_empty());
+        assert!(tree_shape("let f = (x) => x + 1").contains(&SyntaxKind::ArrowExpr));
     }
 }
