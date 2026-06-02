@@ -142,9 +142,9 @@ fn stmt(p: &mut Parser) {
 fn expr_stmt(p: &mut Parser) {
     let m = p.start();
     let lhs_cm = expr_returning(p);
-    if p.at(SyntaxKind::Eq) {
+    if matches!(p.current(), SyntaxKind::Eq | SyntaxKind::PlusEq | SyntaxKind::MinusEq | SyntaxKind::StarEq | SyntaxKind::SlashEq) {
         let am = p.precede(&lhs_cm);
-        p.bump(); // =
+        p.bump(); // = or += etc.
         expr(p);
         p.complete(am, SyntaxKind::AssignExpr);
     }
@@ -334,16 +334,22 @@ fn param_list(p: &mut Parser) {
 }
 
 /// Infix binding powers (left, right). Higher binds tighter.
+///
+/// Precedence matches the legacy `src/parser.rs` chain (loosest → tightest):
+///   `??` < `||` < `&&` < equality < comparison < add/sub < mul/div/rem < `**`
+/// The legacy parser has `coalesce` call `logic_or`, confirming `??` is looser than `||`
+/// (verified by: `sexpr("a || b ?? c") == "(?? (|| a b) c)"`).
 fn infix_binding_power(kind: SyntaxKind) -> Option<(u8, u8)> {
     use SyntaxKind::*;
     Some(match kind {
-        PipePipe => (1, 2),
-        AmpAmp => (3, 4),
-        EqEq | BangEq => (5, 6),
-        Lt | Le | Gt | Ge => (7, 8),
-        Plus | Minus => (9, 10),
-        Star | Slash | Percent => (11, 12),
-        StarStar => (16, 15), // right-assoc
+        QuestionQuestion => (1, 2), // loosest binary; looser than ||
+        PipePipe => (3, 4),
+        AmpAmp => (5, 6),
+        EqEq | BangEq => (7, 8),
+        Lt | Le | Gt | Ge => (9, 10),
+        Plus | Minus => (11, 12),
+        Star | Slash | Percent => (13, 14),
+        StarStar => (18, 17), // right-assoc
         _ => return None,
     })
 }
@@ -914,5 +920,20 @@ mod tests {
     fn yield_expression() {
         assert!(tree_shape("yield x").contains(&SyntaxKind::YieldExpr));
         assert!(tree_shape("yield").contains(&SyntaxKind::YieldExpr));
+    }
+
+    #[test]
+    fn nullish_coalescing() {
+        assert!(tree_shape("a ?? b").contains(&SyntaxKind::BinaryExpr));
+        assert!(parse("a ?? b").errors.is_empty());
+    }
+
+    #[test]
+    fn compound_assignment() {
+        for src in ["x += 1", "x -= 1", "x *= 2", "x /= 2"] {
+            let p = parse(src);
+            assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
+            assert!(tree_shape(src).contains(&SyntaxKind::AssignExpr), "no assign for {src}");
+        }
     }
 }
