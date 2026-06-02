@@ -25,6 +25,19 @@ pub enum SyntaxKind {
     TemplateExpr, OptMemberExpr, TryExpr, UnwrapExpr, TernaryExpr,
     AwaitExpr, YieldExpr,
 
+    // --- declarations / control flow (Plan 2b-ii) ---
+    ForStmt, RangeExpr, BreakStmt, ContinueStmt,
+    EnumDecl, EnumVariant, ClassDecl, FieldDecl, MethodDecl,
+    ImportStmt, ExportStmt, ImportList,
+    // let-destructuring binding patterns
+    ArrayBindPat, ObjectBindPat, BindEntry, RestBind,
+    // match
+    MatchExpr, MatchArm, MatchGuard,
+    WildcardPat, IdentPat, LiteralPat, RangePat, ArrayPat, ObjectPat,
+    ObjPatEntry, OrPat, PatRest,
+    // types
+    NamedType, GenericType, OptionalType, UnionType, TupleType, TypeArgs, RetType,
+
     // --- trivia ---
     Whitespace,
     Newline,
@@ -147,6 +160,26 @@ mod tests {
             SyntaxKind::SpreadElem, SyntaxKind::TemplateExpr, SyntaxKind::OptMemberExpr,
             SyntaxKind::TryExpr, SyntaxKind::UnwrapExpr, SyntaxKind::TernaryExpr,
             SyntaxKind::AwaitExpr, SyntaxKind::YieldExpr,
+        ] {
+            assert!(!k.is_trivia(), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn declaration_node_kinds_exist() {
+        for k in [
+            SyntaxKind::ForStmt, SyntaxKind::RangeExpr, SyntaxKind::BreakStmt,
+            SyntaxKind::ContinueStmt, SyntaxKind::EnumDecl, SyntaxKind::EnumVariant,
+            SyntaxKind::ClassDecl, SyntaxKind::FieldDecl, SyntaxKind::MethodDecl,
+            SyntaxKind::ImportStmt, SyntaxKind::ExportStmt, SyntaxKind::ImportList,
+            SyntaxKind::ArrayBindPat, SyntaxKind::ObjectBindPat, SyntaxKind::BindEntry,
+            SyntaxKind::RestBind, SyntaxKind::MatchExpr, SyntaxKind::MatchArm,
+            SyntaxKind::MatchGuard, SyntaxKind::WildcardPat, SyntaxKind::IdentPat,
+            SyntaxKind::LiteralPat, SyntaxKind::RangePat, SyntaxKind::ArrayPat,
+            SyntaxKind::ObjectPat, SyntaxKind::ObjPatEntry, SyntaxKind::OrPat,
+            SyntaxKind::PatRest, SyntaxKind::NamedType, SyntaxKind::GenericType,
+            SyntaxKind::OptionalType, SyntaxKind::UnionType, SyntaxKind::TupleType,
+            SyntaxKind::TypeArgs, SyntaxKind::RetType,
         ] {
             assert!(!k.is_trivia(), "{k:?}");
         }

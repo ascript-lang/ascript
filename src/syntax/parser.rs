@@ -101,6 +101,19 @@ impl Parser {
         Marker { pos: new_pos, completed: false }
     }
 
+    /// True if the current token is an `Ident` whose text equals `kw` (a soft
+    /// keyword like `as` / `extends` / `from`, which are not reserved).
+    // used in Plan 2b-ii T3/T7/T8
+    #[allow(dead_code)]
+    fn at_kw(&self, kw: &str) -> bool {
+        match self.nontrivia.get(self.pos) {
+            Some(&ti) => {
+                self.tokens[ti].kind == SyntaxKind::Ident && self.tokens[ti].text == kw
+            }
+            None => false,
+        }
+    }
+
     fn error(&mut self, message: impl Into<String>) {
         let message = message.into();
         self.errors.push(ParseError { message: message.clone(), token_index: self.pos });

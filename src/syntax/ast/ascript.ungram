@@ -1,5 +1,8 @@
 SourceFile = Stmt*
-Stmt = LetStmt | ExprStmt | Block | IfStmt | WhileStmt | ReturnStmt | FnDecl
+Stmt =
+    LetStmt | ExprStmt | Block | IfStmt | WhileStmt | ReturnStmt | FnDecl
+  | ForStmt | BreakStmt | ContinueStmt | EnumDecl | ClassDecl
+  | ImportStmt | ExportStmt
 LetStmt = ('let' | 'const') 'ident' ('=' Expr)?
 ExprStmt = Expr
 Block = '{' Stmt* '}'
@@ -13,7 +16,7 @@ Expr =
     Literal | NameRef | UnaryExpr | BinaryExpr | ParenExpr | CallExpr
   | MemberExpr | IndexExpr | ArrowExpr | AssignExpr
   | ArrayExpr | ObjectExpr | TemplateExpr | OptMemberExpr
-  | TryExpr | UnwrapExpr | TernaryExpr | AwaitExpr | YieldExpr
+  | TryExpr | UnwrapExpr | TernaryExpr | AwaitExpr | YieldExpr | MatchExpr
 Literal = 'number' | 'string' | 'true' | 'false' | 'nil'
 NameRef = 'ident'
 UnaryExpr = op:('-' | '!') Expr
@@ -36,3 +39,39 @@ UnwrapExpr = Expr '!'
 TernaryExpr = cond:Expr '?' then:Expr ':' els:Expr
 AwaitExpr = 'await' Expr
 YieldExpr = 'yield' Expr?
+ForStmt = 'for' 'await'? '(' 'ident' ('in' | 'of') iter:Expr ('..' | '..=') end:Expr? ')' body:Block
+BreakStmt = 'break'
+ContinueStmt = 'continue'
+RangeExpr = start:Expr ('..' | '..=') end:Expr
+ArrayBindPat = '[' (BindEntry | RestBind)* ']'
+ObjectBindPat = '{' (BindEntry | RestBind)* '}'
+BindEntry = key:'ident' ('as' local:'ident')?
+RestBind = '...' 'ident'
+RetType = ':' Type
+EnumDecl = 'enum' 'ident' '{' EnumVariant* '}'
+EnumVariant = 'ident' ('=' Expr)?
+ClassDecl = 'class' 'ident' ('extends' 'ident')? '{' (FieldDecl | MethodDecl)* '}'
+FieldDecl = 'ident' '?'? ':' Type ('=' Expr)?
+MethodDecl = 'async'? 'fn' '*'? 'ident' ParamList RetType? Block
+ImportStmt = 'import' (ImportList | '*' 'as' 'ident') 'from' 'string'
+ImportList = '{' 'ident'* '}'
+ExportStmt = 'export' Stmt
+MatchExpr = 'match' subject:Expr '{' MatchArm* '}'
+MatchArm = Pat ('|' Pat)* MatchGuard? '=>' body:Expr
+MatchGuard = 'if' Expr
+Pat = WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat
+WildcardPat = '_'
+IdentPat = 'ident'
+LiteralPat = Expr
+RangePat = start:Expr ('..' | '..=') end:Expr
+ArrayPat = '[' (Pat | PatRest)* ']'
+ObjectPat = '{' (ObjPatEntry | PatRest)* '}'
+ObjPatEntry = key:'ident' (':' Pat)?
+PatRest = '...' 'ident'?
+Type = NamedType | GenericType | OptionalType | UnionType | TupleType
+NamedType = 'ident'
+GenericType = 'ident' TypeArgs
+TypeArgs = '<' Type* '>'
+OptionalType = Type '?'
+UnionType = Type '|' Type
+TupleType = '[' Type* ']'
