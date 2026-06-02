@@ -4,6 +4,7 @@ use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{Resolution, ResolveResult};
 
+pub mod contract;
 pub mod dead_recover;
 pub mod ignored_result;
 pub mod missing_return;
@@ -25,6 +26,7 @@ pub static ALL: &[Rule] = &[
     unawaited::check,
     ignored_result::check,
     dead_recover::check,
+    contract::check,
 ];
 
 /// The `CallExpr` directly dropped by an `ExprStmt` (result unused). `None` if the
