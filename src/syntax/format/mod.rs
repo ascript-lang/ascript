@@ -270,10 +270,23 @@ impl Printer<'_> {
     fn class_decl(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         self.out.text("class ");
-        if let Some(name) = first_ident_text(node) {
-            self.out.text(&name);
+        let idents: Vec<String> = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == Ident)
+            .map(|t| t.text().to_string())
+            .collect();
+        if let Some(name) = idents.first() {
+            self.out.text(name);
         }
-        // (extends clause is Plan 4b; 4a omits it — name only)
+        // Emit `extends SuperClass` if present.
+        // `extends` is a soft keyword parsed as Ident; idents = [ClassName, "extends", SuperName].
+        if let Some(p) = idents.iter().position(|s| s == "extends") {
+            if let Some(sup) = idents.get(p + 1) {
+                self.out.text(" extends ");
+                self.out.text(sup);
+            }
+        }
         self.out.text(" {");
         self.out.newline();
         self.out.indent();
@@ -282,9 +295,9 @@ impl Printer<'_> {
             .children()
             .filter(|c| matches!(c.kind(), FieldDecl | MethodDecl))
             .collect();
-        let fields = members.iter().copied().filter(|m| m.kind() == FieldDecl);
-        let methods = members.iter().copied().filter(|m| m.kind() == MethodDecl);
-        let ordered: Vec<&ResolvedNode> = fields.chain(methods).collect();
+        let ordered: Vec<&ResolvedNode> = members.iter().copied().filter(|m| m.kind() == FieldDecl)
+            .chain(members.iter().copied().filter(|m| m.kind() == MethodDecl))
+            .collect();
 
         for (i, m) in ordered.iter().enumerate() {
             if i > 0 {
@@ -306,33 +319,60 @@ impl Printer<'_> {
         use SyntaxKind::*;
         match node.kind() {
             FieldDecl => {
-                // `name: Type [= default]` — 4a emits the type/default portion
-                // verbatim (4b normalizes name?:T → name:T? and pretty-prints types).
                 if let Some(name) = first_ident_text(node) {
                     self.out.text(&name);
                 }
                 self.out.text(": ");
-                let ty = node
-                    .children()
-                    .find(|c| matches!(c.kind(), NamedType | GenericType | OptionalType | UnionType | TupleType))
-                    .map(|t| t.text().to_string())
-                    .unwrap_or_default();
-                self.out.text(ty.trim());
+                // `name?: T` and `name: T?` BOTH normalize to `name: T?`. If the
+                // field has the `?` marker token, append `?` to the printed type
+                // (unless the type is already OptionalType).
+                let has_marker = node
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .any(|t| t.kind() == Question);
+                if let Some(ty) = node.children().find(|c| is_type_kind(c.kind())) {
+                    self.type_ann(ty);
+                    if has_marker && ty.kind() != OptionalType {
+                        self.out.text("?");
+                    }
+                }
+                if let Some(def) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.out.text(" = ");
+                    self.expr(def);
+                }
                 self.out.newline();
             }
             MethodDecl => {
-                self.out.text("fn ");
+                let toks: Vec<SyntaxKind> = node
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .map(|t| t.kind())
+                    .collect();
+                if toks.contains(&AsyncKw) {
+                    self.out.text("async ");
+                }
+                self.out.text("fn");
+                if toks.contains(&Star) {
+                    self.out.text("*");
+                }
+                self.out.text(" ");
                 if let Some(name) = first_ident_text(node) {
                     self.out.text(&name);
                 }
                 self.params(node);
+                if let Some(rt) = node.children().find(|c| c.kind() == RetType) {
+                    self.out.text(": ");
+                    if let Some(ty) = rt.children().find(|c| is_type_kind(c.kind())) {
+                        self.type_ann(ty);
+                    }
+                }
                 self.out.text(" ");
                 if let Some(body) = node.children().find(|c| c.kind() == Block) {
                     self.block(body);
                 }
             }
             _ => {
-                self.out.text(&node.text().to_string());
+                self.out.text(node.text().to_string().trim());
                 self.out.newline();
             }
         }
@@ -992,6 +1032,19 @@ mod tests {
         assert_eq!(fmt("let h=async (x)=>x\n"), "let h = async (x) => x\n");
         assert_eq!(fmt(r#"let r=match n{0=>"z",_=>"o"}"#),
             "let r = match n {\n  0 => \"z\",\n  _ => \"o\",\n}\n");
+    }
+
+    #[test]
+    fn formats_full_class() {
+        // `name?: T` normalizes to `name: T?`; fields before methods; extends.
+        let src = "class Dog extends Animal{ fn greet(){return 1} nickname?:string id:number=0 }\n";
+        let out = fmt(src);
+        assert!(out.contains("class Dog extends Animal {"), "{out}");
+        assert!(out.contains("nickname: string?"), "name?: T -> name: T?:\n{out}");
+        assert!(out.contains("id: number = 0"), "{out}");
+        let id = out.find("id:").unwrap();
+        let greet = out.find("fn greet").unwrap();
+        assert!(id < greet, "fields before methods:\n{out}");
     }
 
     #[test]
