@@ -201,6 +201,10 @@ fn let_stmt(p: &mut Parser) {
     } else {
         p.error("expected a name after let/const");
     }
+    if p.at(Colon) {
+        p.bump();
+        type_ann(p);
+    }
     if p.at(Eq) {
         p.bump();
         expr(p);
@@ -692,6 +696,83 @@ fn template_expr(p: &mut Parser) -> CompletedMarker {
     p.complete(m, TemplateExpr)
 }
 
+/// Parse a type annotation. union (`|`), then postfix-`?` optional, then a
+/// primary (named/generic/tuple). Generics: `name<T, ...>`; tuples: `[T, ...]`.
+fn type_ann(p: &mut Parser) {
+    let cm = type_optional(p);
+    if p.at(SyntaxKind::Pipe) {
+        let m = p.precede(&cm);
+        while p.at(SyntaxKind::Pipe) {
+            p.bump(); // |
+            type_optional(p);
+        }
+        p.complete(m, SyntaxKind::UnionType);
+    }
+}
+
+fn type_optional(p: &mut Parser) -> CompletedMarker {
+    let cm = type_primary(p);
+    if p.at(SyntaxKind::Question) {
+        let m = p.precede(&cm);
+        p.bump(); // ?
+        return p.complete(m, SyntaxKind::OptionalType);
+    }
+    cm
+}
+
+fn type_primary(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    match p.current() {
+        Ident => {
+            let m = p.start();
+            p.bump(); // type name
+            if p.at(Lt) {
+                let args = p.start();
+                p.bump(); // <
+                while !p.at(Gt) && !p.at_end() {
+                    type_ann(p);
+                    if p.at(Comma) {
+                        p.bump();
+                    } else {
+                        break;
+                    }
+                }
+                if p.at(Gt) {
+                    p.bump();
+                } else {
+                    p.error("expected '>' to close type arguments");
+                }
+                p.complete(args, TypeArgs);
+                return p.complete(m, GenericType);
+            }
+            p.complete(m, NamedType)
+        }
+        LBracket => {
+            let m = p.start();
+            p.bump(); // [
+            while !p.at(RBracket) && !p.at_end() {
+                type_ann(p);
+                if p.at(Comma) {
+                    p.bump();
+                } else {
+                    break;
+                }
+            }
+            if p.at(RBracket) {
+                p.bump();
+            } else {
+                p.error("expected ']' to close tuple type");
+            }
+            p.complete(m, TupleType)
+        }
+        _ => {
+            let m = p.start();
+            p.error("expected a type");
+            p.complete(m, Error)
+        }
+    }
+}
+
 fn arg_list(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
@@ -947,6 +1028,22 @@ mod tests {
             let p = parse(src);
             assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
             assert!(tree_shape(src).contains(&SyntaxKind::AssignExpr), "no assign for {src}");
+        }
+    }
+
+    #[test]
+    fn type_annotations() {
+        for (src, kind) in [
+            ("let x: number = 1", SyntaxKind::NamedType),
+            ("let x: array<number> = []", SyntaxKind::GenericType),
+            ("let x: number? = nil", SyntaxKind::OptionalType),
+            ("let x: number | string = 1", SyntaxKind::UnionType),
+            ("let x: map<string, number> = m", SyntaxKind::GenericType),
+            ("let x: [number, string] = t", SyntaxKind::TupleType),
+        ] {
+            let p = parse(src);
+            assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
+            assert!(tree_shape(src).contains(&kind), "missing {kind:?} for {src}");
         }
     }
 }
