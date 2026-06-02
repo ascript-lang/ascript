@@ -39,7 +39,6 @@ impl Out {
     /// Emit ONE blank line. Precondition: buffer ends with a newline (every
     /// statement/comment emitter ends with `newline()`), so one extra '\n'
     /// yields exactly one blank line. Used by the blank-line rule.
-    #[allow(dead_code)]
     fn blank(&mut self) {
         debug_assert!(self.buf.ends_with('\n'));
         self.buf.push('\n');
@@ -49,6 +48,18 @@ impl Out {
     fn indent(&mut self) { self.indent += 1; }
     #[allow(dead_code)]
     fn dedent(&mut self) { self.indent = self.indent.saturating_sub(1); }
+
+    /// Append ` <comment>` at the end of the last non-empty line (before its
+    /// trailing newline). For same-line trailing comments.
+    fn append_to_prev_line(&mut self, comment: &str) {
+        while self.buf.ends_with('\n') {
+            self.buf.pop();
+        }
+        self.buf.push(' ');
+        self.buf.push_str(comment);
+        self.buf.push('\n');
+        self.at_line_start = true;
+    }
 }
 
 /// Format a parsed source tree into canonical text.
@@ -67,7 +78,6 @@ pub fn format(root: &ResolvedNode) -> String {
 
 struct Printer<'a> {
     out: &'a mut Out,
-    #[allow(dead_code)]
     comments: &'a comments::CommentMap,
 }
 
@@ -76,9 +86,36 @@ impl Printer<'_> {
         let stmts: Vec<&ResolvedNode> = node.children().collect();
         for (i, stmt) in stmts.iter().enumerate() {
             if i > 0 {
+                let lead = self.comments.leading.get(&stmt.text_range());
+                let want_blank = lead
+                    .and_then(|l| l.first())
+                    .map(|c| c.blank_before)
+                    .unwrap_or_else(|| blank_between_bare(stmt));
+                if want_blank {
+                    self.out.blank();
+                }
+            }
+            self.emit_leading(stmt);
+            self.stmt(stmt);
+            self.emit_trailing(stmt);
+        }
+    }
+
+    fn emit_leading(&mut self, node: &ResolvedNode) {
+        if let Some(comments) = self.comments.leading.get(&node.text_range()).cloned() {
+            for (i, c) in comments.iter().enumerate() {
+                if i > 0 && c.blank_before {
+                    self.out.blank();
+                }
+                self.out.text(&c.text);
                 self.out.newline();
             }
-            self.stmt(stmt);
+        }
+    }
+
+    fn emit_trailing(&mut self, node: &ResolvedNode) {
+        if let Some(c) = self.comments.trailing.get(&node.text_range()).cloned() {
+            self.out.append_to_prev_line(&c);
         }
     }
 
@@ -135,6 +172,28 @@ impl Printer<'_> {
     }
 }
 
+/// Blank-line preservation between two bare statements (no leading comment):
+/// preserve one blank when the source had ≥1 blank line (≥2 newlines) between
+/// them.
+///
+/// The tree builder flushes trivia (including newlines) as leading trivia of the
+/// NEXT token/node, so the newlines separating `prev` from `next` live at the
+/// very beginning of `next`'s range. We count consecutive leading Newline tokens
+/// in `next` (stopping at the first non-trivia token) to measure the gap.
+fn blank_between_bare(next: &ResolvedNode) -> bool {
+    let mut newlines = 0usize;
+    for el in next.descendants_with_tokens() {
+        if let Some(t) = el.into_token() {
+            match t.kind() {
+                SyntaxKind::Newline => newlines += 1,
+                SyntaxKind::Whitespace => {}
+                _ => break, // reached real content; stop
+            }
+        }
+    }
+    newlines >= 2
+}
+
 fn is_binary_op(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(kind, Plus | Minus | Star | Slash | Percent | StarStar | EqEq | BangEq
@@ -154,5 +213,22 @@ mod tests {
     fn canonicalizes_binary_spacing() {
         assert_eq!(fmt("1+2"), "1 + 2\n");
         assert_eq!(fmt("1   +    2"), "1 + 2\n");
+    }
+
+    #[test]
+    fn preserves_leading_comment() {
+        assert_eq!(fmt("// hi\nx\n"), "// hi\nx\n");
+    }
+
+    #[test]
+    fn preserves_trailing_comment() {
+        assert_eq!(fmt("x // tail\n"), "x // tail\n");
+    }
+
+    #[test]
+    fn blank_line_rule() {
+        assert_eq!(fmt("a\n\n\n\nb\n"), "a\n\nb\n"); // 2+ blanks collapse to 1
+        assert_eq!(fmt("a\n\nb\n"), "a\n\nb\n");       // one blank preserved
+        assert_eq!(fmt("a\nb\n"), "a\nb\n");           // none stays none
     }
 }
