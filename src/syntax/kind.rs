@@ -11,6 +11,15 @@ pub enum SyntaxKind {
     // --- nodes (only Root for now; the parser plan adds the rest) ---
     Root,
 
+    // --- nodes (Plan 2) ---
+    SourceFile,
+    // statements
+    LetStmt, ExprStmt, Block, IfStmt, WhileStmt, ReturnStmt, FnDecl,
+    ParamList, Param,
+    // expressions
+    Literal, NameRef, UnaryExpr, BinaryExpr, ParenExpr, CallExpr, ArgList,
+    MemberExpr, IndexExpr, ArrowExpr, AssignExpr,
+
     // --- trivia ---
     Whitespace,
     Newline,
@@ -121,5 +130,21 @@ mod tests {
         assert!(!SyntaxKind::Number.is_trivia());
         assert!(!SyntaxKind::Plus.is_trivia());
         assert!(!SyntaxKind::LetKw.is_trivia());
+    }
+
+    #[test]
+    fn node_kinds_exist_and_are_not_trivia() {
+        for k in [
+            SyntaxKind::SourceFile, SyntaxKind::LetStmt, SyntaxKind::ExprStmt,
+            SyntaxKind::BinaryExpr, SyntaxKind::UnaryExpr, SyntaxKind::ParenExpr,
+            SyntaxKind::CallExpr, SyntaxKind::ArgList, SyntaxKind::MemberExpr,
+            SyntaxKind::IndexExpr, SyntaxKind::Literal, SyntaxKind::NameRef,
+            SyntaxKind::Block, SyntaxKind::IfStmt, SyntaxKind::WhileStmt,
+            SyntaxKind::ReturnStmt, SyntaxKind::FnDecl, SyntaxKind::ParamList,
+            SyntaxKind::Param, SyntaxKind::ArrowExpr, SyntaxKind::AssignExpr,
+            SyntaxKind::Error,
+        ] {
+            assert!(!k.is_trivia(), "{k:?} must not be trivia");
+        }
     }
 }
