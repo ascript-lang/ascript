@@ -35,6 +35,8 @@ pub struct Binding {
     pub captured: bool,
     pub mutated: bool,
     pub use_count: u32,
+    /// If this binding shadows an outer binding, the outer's decl range.
+    pub shadows: Option<TextRange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

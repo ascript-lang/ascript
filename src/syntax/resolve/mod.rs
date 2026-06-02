@@ -86,6 +86,10 @@ impl Resolver {
         self.frames.last_mut().expect("a frame is open")
     }
 
+    fn frame_ref(&self) -> &Frame {
+        self.frames.last().expect("a frame is open")
+    }
+
     fn push_scope(&mut self) {
         self.scopes.push(Scope {
             names: HashMap::new(),
@@ -97,6 +101,13 @@ impl Resolver {
     }
 
     fn declare(&mut self, name: &str, kind: BindingKind, decl_range: TextRange) -> u32 {
+        let shadows = self.resolve_local(name).and_then(|outer_slot| {
+            self.frame_ref()
+                .bindings
+                .iter()
+                .find(|b| b.slot == outer_slot)
+                .map(|b| b.decl_range)
+        });
         let slot = self.frame().next_slot;
         self.frame().next_slot += 1;
         self.frame().bindings.push(Binding {
@@ -107,6 +118,7 @@ impl Resolver {
             captured: false,
             mutated: false,
             use_count: 0,
+            shadows,
         });
         self.scopes
             .last_mut()
@@ -162,12 +174,26 @@ impl Resolver {
                     self.declare(&name, BindingKind::Let, node.text_range());
                 }
             }
-            ExprStmt | Block | IfStmt | WhileStmt | ReturnStmt => {
+            Block => {
+                self.push_scope();
+                for child in node.children() {
+                    self.resolve_stmt(child);
+                }
+                self.pop_scope();
+            }
+            IfStmt | WhileStmt => {
                 for child in node.children() {
                     if is_expr(child.kind()) {
                         self.resolve_expr(child);
                     } else {
-                        self.resolve_stmt(child);
+                        self.resolve_stmt(child); // branch Blocks open their own scope
+                    }
+                }
+            }
+            ExprStmt | ReturnStmt => {
+                for child in node.children() {
+                    if is_expr(child.kind()) {
+                        self.resolve_expr(child);
                     }
                 }
             }
@@ -248,5 +274,20 @@ mod tests {
         }
         assert_eq!(locals, 1, "x should be Local");
         assert_eq!(globals, 1, "print should be Global");
+    }
+
+    #[test]
+    fn block_scoped_binding_does_not_leak() {
+        // x declared inside the block; the outer use of x is Global (undefined
+        // outside) — proves block scope pop. AScript blocks: `{ ... }`.
+        let tree = parse_to_tree("{ let x = 1\n print(x) }\nprint(x)");
+        let r = resolve(&tree);
+        let refs: Vec<_> = tree
+            .descendants()
+            .filter(|n: &&ResolvedNode| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x"))
+            .map(|n| r.uses.get(&n.text_range()).cloned())
+            .collect();
+        assert_eq!(refs[0], Some(Resolution::Local(0)), "inner x is Local");
+        assert_eq!(refs[1], Some(Resolution::Global("x".into())), "outer x is Global");
     }
 }
