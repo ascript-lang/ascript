@@ -1,8 +1,59 @@
-//! Differential oracle: for core-slice snippets, the new parser's "no errors"
-//! verdict must match the legacy parser's acceptance. Guards that the
-//! hand-written parser and the language's grammar stay in agreement as the parser
-//! grows. (Full-corpus differential testing arrives once grammar coverage is
-//! complete in a later plan.)
+//! Differential oracle: the new parser's "no errors" verdict must match the
+//! legacy parser's acceptance for core-slice snippets AND for the full
+//! examples/**/*.as corpus. Guards that the hand-written CST parser and the
+//! language grammar stay in lock-step.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn as_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.is_dir() {
+            as_files(&p, out);
+        } else if p.extension().and_then(|e| e.to_str()) == Some("as") {
+            out.push(p);
+        }
+    }
+}
+
+fn corpus() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    as_files(Path::new("examples"), &mut v);
+    v.sort();
+    assert!(!v.is_empty());
+    v
+}
+
+#[test]
+fn new_parser_accepts_entire_corpus() {
+    let mut failures = Vec::new();
+    for path in corpus() {
+        let src = fs::read_to_string(&path).unwrap();
+        let p = ascript::syntax::parser::parse(&src);
+        if !p.errors.is_empty() {
+            failures.push(format!("{}: {:?}", path.display(), p.errors));
+        }
+    }
+    assert!(failures.is_empty(), "new parser rejected files:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn new_parser_agrees_with_legacy_over_corpus() {
+    let mut failures = Vec::new();
+    for path in corpus() {
+        let src = fs::read_to_string(&path).unwrap();
+        let new_ok = ascript::syntax::parser::parse(&src).errors.is_empty();
+        let legacy_ok = match ascript::lexer::lex(&src) {
+            Ok(toks) => ascript::parser::parse(&toks).is_ok(),
+            Err(_) => false,
+        };
+        if new_ok != legacy_ok {
+            failures.push(format!("{}: new={new_ok} legacy={legacy_ok}", path.display()));
+        }
+    }
+    assert!(failures.is_empty(), "parser disagreements:\n{}", failures.join("\n"));
+}
 
 /// Snippets that BOTH parsers must accept (core slice only).
 const ACCEPT: &[&str] = &[

@@ -137,6 +137,11 @@ pub fn parse(src: &str) -> Parse {
 
 fn stmt(p: &mut Parser) {
     use SyntaxKind::*;
+    // Skip bare semicolons — they act as statement separators (no-op statements).
+    if p.at(Semicolon) {
+        p.bump();
+        return;
+    }
     match p.current() {
         LetKw | ConstKw => let_stmt(p),
         IfKw => if_stmt(p),
@@ -194,6 +199,16 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
         p.bump();
         expr_bp(p, r_bp);
         lhs_cm = p.complete(m, SyntaxKind::BinaryExpr);
+    }
+    // Range expression: `a..b` or `a..=b` (lower precedence than binary ops).
+    if p.at(SyntaxKind::DotDot) || p.at(SyntaxKind::DotDotEq) {
+        let m = p.precede(&lhs_cm);
+        p.bump(); // .. or ..=
+        // Optional right-hand side (a bare `..` is an open range).
+        if can_start_expr(p) {
+            expr_bp(p, 1); // parse rhs at lowest precedence
+        }
+        lhs_cm = p.complete(m, SyntaxKind::RangeExpr);
     }
     // Ternary tail: cond ? then : els  (right-assoc; then/els are full exprs).
     if p.at(SyntaxKind::Question) && ternary_ahead(p) {
@@ -637,6 +652,18 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.bump();
             p.complete(m, Literal)
         }
+        Ident if is_bare_arrow_ahead(p) => {
+            // Single-parameter arrow without parentheses: `x => expr`.
+            let m = p.start();
+            let pm = p.start();
+            let param_m = p.start();
+            p.bump(); // param name
+            p.complete(param_m, Param);
+            p.complete(pm, ParamList);
+            p.bump(); // =>
+            if p.at(LBrace) { block(p); } else { expr(p); }
+            p.complete(m, ArrowExpr)
+        }
         Ident => {
             let m = p.start();
             p.bump();
@@ -646,7 +673,16 @@ fn primary(p: &mut Parser) -> CompletedMarker {
         AsyncKw if is_async_arrow_ahead(p) => {
             let m = p.start();
             p.bump(); // async
-            param_list(p);
+            if p.at(Ident) {
+                // Bare single-param: `async x => ...`
+                let pm = p.start();
+                let param_m = p.start();
+                p.bump(); // param name
+                p.complete(param_m, Param);
+                p.complete(pm, ParamList);
+            } else {
+                param_list(p); // `async (params) => ...`
+            }
             p.bump(); // =>
             if p.at(LBrace) { block(p); } else { expr(p); }
             p.complete(m, ArrowExpr)
@@ -736,6 +772,15 @@ fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
     cm
 }
 
+/// True if the current token is an `Ident` immediately followed by `=>`,
+/// making it a bare single-parameter arrow `x => ...`.
+fn is_bare_arrow_ahead(p: &Parser) -> bool {
+    matches!(
+        p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
+        Some(SyntaxKind::FatArrow)
+    )
+}
+
 /// True if the `(` at the cursor begins an arrow parameter list, i.e. the
 /// matching `)` is immediately followed by `=>`.
 fn is_arrow_ahead(p: &Parser) -> bool {
@@ -761,11 +806,19 @@ fn is_arrow_ahead(p: &Parser) -> bool {
     false
 }
 
-/// True if `async (` ... `) =>` starts here (an async arrow).
+/// True if `async (` ... `) =>` OR `async ident =>` starts here (an async arrow).
 fn is_async_arrow_ahead(p: &Parser) -> bool {
     use SyntaxKind::*;
     match p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind) {
+        Some(Ident) => {
+            // `async ident =>` — bare single-param async arrow.
+            matches!(
+                p.nontrivia.get(p.pos + 2).map(|&ti| p.tokens[ti].kind),
+                Some(FatArrow)
+            )
+        }
         Some(LParen) => {
+            // `async (params) =>` — parenthesized async arrow.
             let mut depth = 0i32;
             let mut i = p.pos + 1;
             while i < p.nontrivia.len() {
@@ -1145,6 +1198,52 @@ fn match_arm(p: &mut Parser) {
     p.complete(m, MatchArm);
 }
 
+/// A version of `primary` that never interprets `Ident =>` as a bare arrow —
+/// used from pattern context where `x =>` is the match arm separator, not an arrow.
+fn primary_no_arrow(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let cm = match p.current() {
+        Number | Str | TrueKw | FalseKw | NilKw => {
+            let m = p.start();
+            p.bump();
+            p.complete(m, Literal)
+        }
+        Ident => {
+            let m = p.start();
+            p.bump();
+            p.complete(m, NameRef)
+        }
+        LParen => {
+            let m = p.start();
+            p.bump(); // (
+            expr(p);
+            if p.at(RParen) { p.bump(); } else { p.error("expected ')'"); }
+            p.complete(m, ParenExpr)
+        }
+        _ => {
+            let m = p.start();
+            p.error("expected pattern value");
+            p.complete(m, Error)
+        }
+    };
+    // Allow member access like `Shape.Circle` in patterns.
+    postfix(p, cm)
+}
+
+/// Like `lhs` but uses `primary_no_arrow` — safe to use from pattern context.
+fn lhs_for_pat(p: &mut Parser) -> CompletedMarker {
+    let u = match p.current() {
+        SyntaxKind::Minus | SyntaxKind::Bang => {
+            let m = p.start();
+            p.bump();
+            let _ = primary_no_arrow(p);
+            p.complete(m, SyntaxKind::UnaryExpr)
+        }
+        _ => primary_no_arrow(p),
+    };
+    unwrap_tier(p, u)
+}
+
 /// Parse a single match pattern. Returns the CompletedMarker so callers can
 /// wrap it (e.g. for OrPat). Bare identifiers are emitted as LiteralPat
 /// (Option-C: compare-vs-bind resolved later); wildcard `_` → WildcardPat.
@@ -1162,10 +1261,10 @@ fn pattern(p: &mut Parser) -> CompletedMarker {
             // value / ident / range: parse a primary-ish expression; a trailing
             // `..` / `..=` makes it a RangePat, else LiteralPat.
             let m = p.start();
-            let _ = lhs(p);
+            let _ = lhs_for_pat(p);
             if p.at(DotDot) || p.at(DotDotEq) {
                 p.bump();
-                let _ = lhs(p);
+                let _ = lhs_for_pat(p);
                 p.complete(m, RangePat)
             } else {
                 p.complete(m, LiteralPat)
