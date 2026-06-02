@@ -11,15 +11,17 @@
 use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_template_body};
 use crate::span::Span;
 use crate::syntax::ast::{
-    ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, BreakStmt, CallExpr, ContinueStmt, Expr,
-    ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef, ObjectExpr, OptMemberExpr,
-    ParenExpr, RangeExpr, SourceFile, Stmt, TemplateExpr, TernaryExpr, UnaryExpr, WhileStmt,
+    ArrayExpr, ArrowExpr, AssignExpr, AstNode, BinaryExpr, Block, BreakStmt, CallExpr,
+    ContinueStmt, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef,
+    ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, Stmt, TemplateExpr,
+    TernaryExpr, UnaryExpr, WhileStmt,
 };
+use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
 use crate::syntax::{parse_to_tree, resolve::resolve};
 use crate::value::Value;
-use crate::vm::chunk::Chunk;
+use crate::vm::chunk::{Chunk, FnProto};
 use crate::vm::opcode::Op;
 use cstree::text::TextRange;
 use std::rc::Rc;
@@ -243,6 +245,7 @@ impl Compiler {
             Expr::MemberExpr(m) => self.compile_member(m),
             Expr::OptMemberExpr(m) => self.compile_opt_member(m),
             Expr::TernaryExpr(t) => self.compile_ternary(t),
+            Expr::ArrowExpr(arrow) => self.compile_arrow(arrow),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
                 node_span(other),
@@ -370,6 +373,8 @@ impl Compiler {
             Stmt::ForStmt(for_stmt) => self.compile_for(for_stmt),
             Stmt::BreakStmt(break_stmt) => self.compile_break(break_stmt),
             Stmt::ContinueStmt(continue_stmt) => self.compile_continue(continue_stmt),
+            Stmt::FnDecl(fn_decl) => self.compile_fn_decl(fn_decl),
+            Stmt::ReturnStmt(ret) => self.compile_return(ret),
             other => Err(CompileError::new(
                 "statement kind not yet supported in V2",
                 stmt_span(other),
@@ -568,6 +573,236 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Compile a `return [expr]` statement: push the returned value (or `Nil` for a
+    /// bare `return`), then `RETURN`. Mirrors the tree-walker, whose `Stmt::Return`
+    /// yields the expression's value or `nil`. `RETURN` ends the current proto body;
+    /// the multi-frame CALL/RETURN frame machinery is wired in V4-T3.
+    fn compile_return(&mut self, ret: &ReturnStmt) -> Result<(), CompileError> {
+        let span = node_span(ret);
+        match ret.expr() {
+            Some(e) => self.compile_expr(&e)?,
+            None => self.chunk.emit(Op::Nil, span),
+        }
+        self.chunk.emit(Op::Return, span);
+        Ok(())
+    }
+
+    /// Compile a `fn name(params) { body }` declaration. The function body becomes
+    /// its own [`FnProto`] (see [`Self::compile_fn_proto`]); the enclosing frame
+    /// then builds a closure over that proto (`CLOSURE idx`) and binds it to the
+    /// function's name slot (`SET_LOCAL`, exactly like a `let name = <closure>`).
+    /// The name is a `BindingKind::Fn` binding in the ENCLOSING frame, so its slot
+    /// is looked up by the declaration node's `text_range()`, the same scheme
+    /// [`Self::let_slot`] uses.
+    fn compile_fn_decl(&mut self, fn_decl: &FnDecl) -> Result<(), CompileError> {
+        let span = node_span(fn_decl);
+        let proto = self.compile_fn_proto(fn_decl.syntax())?;
+        let idx = self.chunk.add_proto(proto);
+        self.chunk.emit_u16(Op::Closure, idx, span);
+
+        // Bind the closure to the fn name's slot in the enclosing frame.
+        let slot = self.fn_decl_slot(fn_decl)?;
+        self.chunk.emit_u16(Op::SetLocal, slot, span);
+        Ok(())
+    }
+
+    /// The enclosing-frame local slot for a `fn name` declaration. The resolver
+    /// records a `BindingKind::Fn` binding whose `decl_range` is the `FnDecl`
+    /// node's `text_range()` (see `resolve_stmt`'s `FnDecl` arm), so we match the
+    /// binding by that range — the same scheme [`Self::let_slot`] uses.
+    fn fn_decl_slot(&self, fn_decl: &FnDecl) -> Result<u16, CompileError> {
+        let span = node_span(fn_decl);
+        let decl_range: TextRange = fn_decl.syntax().text_range();
+        let binding = self
+            .resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == decl_range)
+            .ok_or_else(|| {
+                CompileError::new(
+                    "function declaration has no resolver binding (compiler bug)",
+                    span,
+                )
+            })?;
+        u16::try_from(binding.slot)
+            .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// Compile an arrow expression `(params) => body` (an EXPRESSION): build its
+    /// [`FnProto`], add it to the current chunk's proto table, and emit `CLOSURE
+    /// idx`, which leaves the resulting `Value::Closure` on the stack. The arrow has
+    /// no name, so nothing is bound.
+    fn compile_arrow(&mut self, arrow: &ArrowExpr) -> Result<(), CompileError> {
+        let span = node_span(arrow);
+        let proto = self.compile_fn_proto(arrow.syntax())?;
+        let idx = self.chunk.add_proto(proto);
+        self.chunk.emit_u16(Op::Closure, idx, span);
+        Ok(())
+    }
+
+    /// Compile a nested function body (a `FnDecl`, `ArrowExpr`, or — later —
+    /// `MethodDecl`) into its own [`FnProto`].
+    ///
+    /// A fresh sub-context is set up that shares the SAME whole-tree
+    /// [`ResolveResult`]: the current `chunk`, loop stack, and temp cursor are
+    /// swapped out (saved and restored) so all the existing `compile_*` methods —
+    /// which operate on `self.chunk` against `self.resolved` — compile the body
+    /// into a NEW chunk sized from the function's OWN resolver frame.
+    ///
+    /// Frame layout (verified against the resolver): the function's frame is keyed
+    /// `(fn_kind, fn_range)`; params are declared FIRST into a fresh frame whose
+    /// `next_slot` starts at 0, so they occupy slots `0..arity` in declaration
+    /// order — which is the CALL convention V4-T3 relies on (args land in those
+    /// slots). `arity` excludes a trailing `...rest` param; `has_rest` is whether
+    /// the last param is `...rest`. `is_async`/`is_generator` come from the fn's
+    /// `async`/`*` tokens.
+    ///
+    /// Body lowering mirrors the tree-walker: a `Block` body is compiled
+    /// statement-by-statement, then `NIL; RETURN` is appended so a function that
+    /// falls off the end returns `nil` (`Flow::Normal => Value::Nil` in
+    /// `run_body`); an explicit `return` inside still emits its own `RETURN`. An
+    /// arrow EXPRESSION body (no Block) compiles the expression then `RETURN` (an
+    /// implicit return of the expression value).
+    ///
+    /// **V5 limitation (documented):** captures/upvalues are not yet wired. If the
+    /// resolver assigned this frame ANY upvalues (i.e. the body reads an
+    /// outer-scope local — which, notably, includes a `fn`'s reference to its OWN
+    /// name, since the name is declared in the ENCLOSING frame), this returns a
+    /// `CompileError` tagged `V5`. Functions using only their params, their own
+    /// locals, and globals/builtins compile today.
+    fn compile_fn_proto(&mut self, fn_node: &ResolvedNode) -> Result<Rc<FnProto>, CompileError> {
+        let span = range_span(fn_node);
+        let fn_kind = fn_node.kind();
+        let fn_range = fn_node.text_range();
+
+        let frame = self
+            .resolved
+            .frames
+            .get(&(fn_kind, fn_range))
+            .ok_or_else(|| {
+                CompileError::new("function body has no resolver frame (compiler bug)", span)
+            })?;
+
+        // V5: closures capturing outer-scope variables are not yet supported. A
+        // non-empty upvalue plan means the body reads an outer local (or the fn's
+        // own name, for recursion) — defer with a clear, documented error.
+        if !frame.upvalues.is_empty() {
+            return Err(CompileError::new(
+                "closures capturing outer variables: V5",
+                span,
+            ));
+        }
+        let slot_count = u16::try_from(frame.slot_count).map_err(|_| {
+            CompileError::new("too many local slots in function frame (max 65535)", span)
+        })?;
+
+        // Calling-convention flags + params. `children()` borrows, so collect the
+        // param nodes as references (we only inspect them, never store them).
+        let params: Vec<&ResolvedNode> = fn_node
+            .children()
+            .find(|c| c.kind() == SyntaxKind::ParamList)
+            .map(|pl| {
+                pl.children()
+                    .filter(|c| c.kind() == SyntaxKind::Param)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let has_rest = params
+            .last()
+            .map(|p| {
+                p.children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .any(|t| t.kind() == SyntaxKind::DotDotDot)
+            })
+            .unwrap_or(false);
+        // `arity` is the count of NON-rest params (the rest param collects the tail
+        // into an array; it is not a positional argument).
+        let param_count = params.len();
+        let arity_usize = if has_rest {
+            param_count.saturating_sub(1)
+        } else {
+            param_count
+        };
+        let arity = u8::try_from(arity_usize)
+            .map_err(|_| CompileError::new("too many parameters (max 255)", span))?;
+
+        // `async fn` / `fn*` / `async fn*` flags, read from the fn's own tokens.
+        let mut is_async = false;
+        let mut is_generator = false;
+        for tok in fn_node.children_with_tokens().filter_map(|el| el.into_token()) {
+            match tok.kind() {
+                SyntaxKind::AsyncKw => is_async = true,
+                SyntaxKind::Star => is_generator = true,
+                _ => {}
+            }
+        }
+
+        // Build a fresh chunk for the body, sized from the function's own frame,
+        // and swap it (plus a fresh loop stack and temp cursor) into `self` so the
+        // existing compile_* methods emit into it. `self.resolved` (whole-tree) is
+        // left in place and shared.
+        let mut body_chunk = Chunk::new();
+        body_chunk.slot_count = slot_count;
+        body_chunk.name = fn_name_token_text(fn_node);
+
+        let saved_chunk = std::mem::replace(&mut self.chunk, body_chunk);
+        let saved_loops = std::mem::take(&mut self.loops);
+        let saved_next_temp = self.next_temp;
+        // Scratch temporaries in the body start ABOVE its own named-local window.
+        self.next_temp = slot_count;
+
+        // Compile the body. Restore the outer context on EVERY exit path (success
+        // or error) so a deferral mid-body cannot corrupt the enclosing compiler.
+        let result = self.compile_fn_body(fn_node, span);
+
+        let body_chunk = std::mem::replace(&mut self.chunk, saved_chunk);
+        self.loops = saved_loops;
+        self.next_temp = saved_next_temp;
+        result?;
+
+        Ok(Rc::new(FnProto {
+            chunk: body_chunk,
+            arity,
+            has_rest,
+            is_async,
+            is_generator,
+        }))
+    }
+
+    /// Emit the body instructions for a function/arrow into the (already swapped-in)
+    /// `self.chunk`. A `Block` body is its statements followed by a fall-off-end
+    /// `NIL; RETURN`; an arrow EXPRESSION body is the expression followed by
+    /// `RETURN`.
+    fn compile_fn_body(
+        &mut self,
+        fn_node: &ResolvedNode,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        if let Some(block_node) = fn_node.children().find(|c| c.kind() == SyntaxKind::Block) {
+            let block = Block::cast(block_node.clone())
+                .ok_or_else(|| CompileError::new("function body is not a block", span))?;
+            self.compile_block(&block)?;
+            // Fall-off-end: a function with no explicit trailing `return` returns
+            // `nil` (mirrors the tree-walker's `Flow::Normal => Value::Nil`).
+            self.chunk.emit(Op::Nil, span);
+            self.chunk.emit(Op::Return, span);
+            Ok(())
+        } else {
+            // Expression-body arrow: `(x) => expr` returns `expr`. The body is the
+            // direct child node that casts to an `Expr` (the ParamList is not an
+            // Expr, so it is skipped).
+            let expr = fn_node
+                .children()
+                .find_map(|c| Expr::cast(c.clone()))
+                .ok_or_else(|| {
+                    CompileError::new("arrow function has no body expression", span)
+                })?;
+            self.compile_expr(&expr)?;
+            self.chunk.emit(Op::Return, span);
+            Ok(())
+        }
     }
 
     /// Allocate a fresh anonymous scratch slot ABOVE the resolver's named-local
@@ -1378,6 +1613,18 @@ impl Compiler {
     }
 }
 
+/// The declared name of a function node, for the disassembler / traces. A
+/// `FnDecl` has its name as a direct `Ident` token child (after `fn`); an
+/// `ArrowExpr` is anonymous (no `Ident` child, since its params live in a nested
+/// `ParamList`), so this returns `None` there.
+fn fn_name_token_text(fn_node: &ResolvedNode) -> Option<String> {
+    fn_node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| t.text().to_string())
+}
+
 /// Decode an object-literal field's key into the exact string the tree-walker
 /// keys by (`ObjEntry::KV` key). The key token is either an `Ident` (raw
 /// identifier text, used verbatim) or a `Str` (a quoted literal whose contents
@@ -1892,5 +2139,97 @@ mod tests {
             eval_number("let sum = 0\nfor (i in 1..5) { sum = sum + i }\nsum").await,
             10.0
         );
+    }
+
+    // ---- V4-T2: functions / arrows → FnProto + CLOSURE -------------------
+
+    #[test]
+    fn fn_decl_emits_closure_and_set_local() {
+        // A `fn` declaration builds a nested proto, makes a closure over it
+        // (CLOSURE), and binds it to the name slot (SET_LOCAL). The proto's own
+        // body holds the function instructions (`CONST 1; RETURN`).
+        let chunk = compile_source("fn greet() { return 1 }\n").expect("compiles");
+        let text = disasm(&chunk);
+        // Top chunk: CLOSURE 0 referencing proto #0 (named greet) + SET_LOCAL.
+        assert!(text.contains("CLOSURE"), "missing CLOSURE in:\n{text}");
+        assert!(text.contains("proto #0 greet"), "missing named proto ref in:\n{text}");
+        assert!(text.contains("SET_LOCAL"), "missing SET_LOCAL (name bind) in:\n{text}");
+        // Nested proto header + its body.
+        assert!(
+            text.contains("== fn greet (proto #0) =="),
+            "missing nested proto header in:\n{text}"
+        );
+        assert!(
+            text.contains("CONST") && text.contains("; 1"),
+            "missing CONST 1 in proto body:\n{text}"
+        );
+        assert!(text.contains("RETURN"), "missing RETURN in proto body:\n{text}");
+    }
+
+    #[test]
+    fn arrow_emits_closure_with_param_local() {
+        // An arrow `(x) => x + 1` is an EXPRESSION: it builds a proto and leaves a
+        // CLOSURE on the stack (bound here via `let f`). The proto's param `x` is
+        // slot 0 (GET_LOCAL 0), and the implicit-return expression ends in RETURN.
+        let chunk = compile_source("let f = (x) => x + 1\n").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("CLOSURE"), "missing CLOSURE in:\n{text}");
+        assert!(text.contains("SET_LOCAL"), "missing SET_LOCAL f in:\n{text}");
+        // Proto body: GET_LOCAL 0 (x); CONST 1; ADD; RETURN.
+        assert!(text.contains("GET_LOCAL"), "missing GET_LOCAL (param x) in:\n{text}");
+        assert!(text.contains("ADD"), "missing ADD in proto body:\n{text}");
+        assert!(text.contains("RETURN"), "missing RETURN in proto body:\n{text}");
+    }
+
+    #[test]
+    fn arrow_proto_has_arity_one() {
+        // The arrow `(x) => x` has arity 1 (one positional param, no rest).
+        let chunk = compile_source("let f = (x) => x\n").expect("compiles");
+        let proto = chunk.protos.first().expect("one nested proto");
+        assert_eq!(proto.arity, 1);
+        assert!(!proto.has_rest);
+        assert!(!proto.is_async);
+        assert!(!proto.is_generator);
+    }
+
+    #[test]
+    fn empty_fn_body_returns_nil() {
+        // A function that falls off the end returns nil: the proto body is exactly
+        // `NIL; RETURN` (mirrors the tree-walker's `Flow::Normal => Value::Nil`).
+        let chunk = compile_source("fn noop() {}\n").expect("compiles");
+        let proto = chunk.protos.first().expect("one nested proto");
+        // The proto's code is exactly the two zero-operand ops NIL then RETURN.
+        assert_eq!(
+            proto.chunk.code,
+            vec![Op::Nil as u8, Op::Return as u8],
+            "empty fn body should compile to NIL; RETURN"
+        );
+    }
+
+    #[test]
+    fn fn_capturing_outer_local_is_deferred_to_v5() {
+        // A function reading an outer-scope local needs an upvalue capture (V5).
+        // The resolver marks the frame with a non-empty upvalue plan, so the
+        // compiler defers with a documented `V5` error.
+        let err = compile_source("let n = 1\nfn f() { return n }\nf").unwrap_err();
+        assert!(
+            err.message.contains("capturing outer variables: V5"),
+            "expected V5 capture deferral, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn fn_using_only_params_and_globals_compiles() {
+        // Params + builtins (globals) need no captures, so this compiles today.
+        let chunk = compile_source("fn add(a, b) { return a + b }\n").expect("compiles");
+        let proto = chunk.protos.first().expect("one nested proto");
+        assert_eq!(proto.arity, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn arrow_value_is_a_function() {
+        // The CLOSURE op materializes a Value::Closure; `type()` reports it as
+        // "function" (exercises CLOSURE exec + the type() builtin without CALL).
+        assert_eq!(eval_string("let f = (x) => x\ntype(f)").await, "function");
     }
 }

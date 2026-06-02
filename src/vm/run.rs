@@ -424,6 +424,17 @@ impl Vm {
                     }
                 }
 
+                Op::Closure => {
+                    // Build a closure over a nested proto and push it. Captures are
+                    // V5, so the closure has no upvalues for now (a body that reads
+                    // an outer local is rejected at compile time). CALLing the
+                    // closure is V4-T3 — this op only materializes the value.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let proto = fiber.frame().closure.proto.chunk.protos[idx].clone();
+                    let closure = crate::vm::value_ext::Closure::new(proto);
+                    fiber.push(Value::Closure(closure));
+                }
+
                 Op::Return => {
                     let result = fiber.pop();
                     return Ok(RunOutcome::Done(result));

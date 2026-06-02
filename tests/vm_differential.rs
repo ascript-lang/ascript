@@ -183,6 +183,27 @@ async fn vm_run_print_matches_treewalker() {
 }
 
 #[tokio::test]
+async fn vm_run_closures_match_treewalker() {
+    // V4-T2: functions/arrows compile to a nested FnProto + CLOSURE. Calling is
+    // V4-T3, but the closure VALUE is observable via `type(...)` (== "function")
+    // and a fn declaration binds its name. These must be byte-identical to the
+    // tree-walker.
+    let cases = [
+        // An arrow expression's value is a function.
+        "let f = (x) => x\nprint(type(f))",
+        // A multi-statement-body arrow likewise.
+        "let g = (a, b) => { return a + b }\nprint(type(g))",
+        // A fn declaration binds a function value to its name.
+        "fn greet() { return 1 }\nprint(type(greet))",
+        // A fn that uses only its params + builtins (no captures) compiles.
+        "fn add(a, b) { return a + b }\nprint(type(add))",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
 async fn vm_run_locals_match_treewalker() {
     let cases = [
         // let + local read + arithmetic
