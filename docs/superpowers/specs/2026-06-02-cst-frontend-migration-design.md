@@ -228,21 +228,21 @@ and is idempotent. The migration is not done until this is green.
     behavioral equivalence holds; resolver unit-tested.
   - **D — Cut over & delete:** point `main.rs`/`lib.rs`/`repl`/`lsp` at the new path, delete the old
     front-end. Gate: clippy clean in **both** feature configs, full suite green.
-- **Performance gate (from Tier discussion):** after A's vertical slice runs, benchmark new vs old
-  interpreter with `std/bench`. A regression beyond an agreed threshold triggers the binding-cache
-  work before proceeding — no perf wall discovered after the expensive rewrite.
+- **Performance gate:** after A's vertical slice runs, benchmark new vs old interpreter with
+  `std/bench`. **A regression of more than 5% is unacceptable** and triggers the binding-cache work
+  (and any further optimization) before proceeding — no perf wall discovered after the expensive
+  rewrite. 5% is a hard ceiling, not a target.
 - **Single merge to `main`** once all gates pass.
-- **Front-end freeze window:** given the project's high velocity (Phases 5–9 landed in days), avoid
-  grammar/parser/AST changes on `main` while the branch is in flight, and rebase the branch on
-  `main` regularly to limit drift.
+- **No drift management needed:** the project owner is holding `main` (no new features land) until
+  this work merges, so the branch cannot diverge. No freeze window or periodic rebase is required.
 
 ## Risks
 
 - **Effort, not design, is the dominant risk:** rewriting every `interp.rs` arm (6,507 lines) is the
   bulk of the work. Mitigated by the three-oracle net and arm-by-arm equivalence.
 - **Performance:** addressed by cstree's persistent red nodes + tier-1 caching, with the resolver/
-  binding-cache and an early benchmark as the backstop.
-- **Branch drift:** addressed by the freeze window + regular rebases.
+  binding-cache and an early benchmark as the backstop; **>5% regression is a hard fail.**
+- **Branch drift:** not a risk — `main` is frozen by the project owner until this lands.
 - **Trivia attachment subtleties** (esp. around reordering): addressed by the documented attachment
   rule + the enumerated formatter edge-case tests + lossless round-trip.
 
