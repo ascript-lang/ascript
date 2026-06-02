@@ -60,3 +60,47 @@ async fn vm_matches_treewalker_arithmetic_and_literals() {
         assert_vm_matches_treewalker(expr).await;
     }
 }
+
+/// Assert that running `src` (a full program, for side effects) on the VM
+/// produces byte-identical stdout to running it on the tree-walker. This is the
+/// V2 output-path differential: `print(...)` must agree exactly.
+async fn assert_vm_run_matches_treewalker(src: &str) {
+    let tw = ascript::run_source(src).await.expect("tree-walker ok");
+    let (vm_out, code) = ascript::vm_run_source(src).await.expect("vm ok");
+    assert_eq!(code, None, "no exit code expected for `{src}`");
+    assert_eq!(
+        tw, vm_out,
+        "VM stdout diverged from tree-walker for `{src}`\n  tree-walker: {tw:?}\n  vm:          {vm_out:?}"
+    );
+}
+
+#[tokio::test]
+async fn vm_run_print_exact_output() {
+    // Byte-exact against the spec's stated outputs.
+    assert_eq!(
+        ascript::vm_run_source("print(1 + 2)").await.expect("ok"),
+        ("3\n".to_string(), None)
+    );
+    assert_eq!(
+        ascript::vm_run_source("print(\"hi\")").await.expect("ok"),
+        ("hi\n".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn vm_run_print_matches_treewalker() {
+    let cases = [
+        "print(1+2)",
+        "print(\"hi\")",
+        "print(42)",
+        "print(true)",
+        "print(nil)",
+        "print(2 * 3 + 4)",
+        "print(10 / 4)",
+        // multiple leading print statements + a trailing expression.
+        "print(1)\nprint(2)\nprint(3)\n4",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}

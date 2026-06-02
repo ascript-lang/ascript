@@ -134,6 +134,49 @@ impl Vm {
                     fiber.push(Value::Bool(!a.is_truthy()));
                 }
 
+                Op::GetGlobal => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("GET_GLOBAL operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    // V2's globals are the bare builtins (the resolver guarantees
+                    // the compiler only emits GET_GLOBAL for builtin names).
+                    if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
+                        fiber.push(Value::Builtin(name));
+                    } else {
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("undefined global '{name}'"),
+                        ));
+                    }
+                }
+
+                Op::Call => {
+                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at) as usize;
+                    // Pop everything into owned locals BEFORE the await so no
+                    // borrow of `fiber` is held across the suspension point
+                    // (`await_holding_refcell_ref` stays clean).
+                    let mut args = vec![Value::Nil; argc];
+                    for slot in args.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let callee = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    // `call_value` dispatches Builtin/Function/Class/etc. The only
+                    // callee it cannot handle is `Value::Closure`, which the
+                    // compiler does not emit a call for until V4.
+                    let result = self.interp.call_value(callee, args, span).await?;
+                    fiber.push(result);
+                }
+
                 Op::Return => {
                     let result = fiber.pop();
                     return Ok(RunOutcome::Done(result));
@@ -425,6 +468,68 @@ mod tests {
                 "message was: {}",
                 e.message
             ),
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    /// Run a chunk and return the shared interp's captured output alongside the
+    /// outcome — for exercising the `print` builtin via `CALL`.
+    fn run_chunk_with_output(chunk: Chunk) -> (Result<RunOutcome, Control>, String) {
+        let proto = Rc::new(FnProto {
+            chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+        });
+        let closure = Closure::new(proto);
+        let mut fiber = Fiber::new(closure);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let local = LocalSet::new();
+        local.block_on(&rt, async move {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::new(interp.clone());
+            let outcome = vm.run(&mut fiber).await;
+            (outcome, interp.output())
+        })
+    }
+
+    #[test]
+    fn call_print_writes_to_shared_sink() {
+        // GET_GLOBAL print; CONST 42; CALL 1; RETURN (CALL leaves print's nil
+        // result, which RETURN pops).
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str(Rc::from("print")));
+        c.emit_u16(Op::GetGlobal, name, s());
+        let k = c.add_const(Value::Number(42.0));
+        c.emit_u16(Op::Const, k, s());
+        c.emit_u8(Op::Call, 1, s());
+        c.emit(Op::Return, s());
+        let (outcome, out) = run_chunk_with_output(c);
+        assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "ran ok");
+        assert_eq!(out, "42\n", "print wrote to the shared capture sink");
+    }
+
+    #[test]
+    fn get_global_undefined_panics() {
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str(Rc::from("not_a_builtin")));
+        let gg_span = Span::new(3, 16);
+        c.emit_u16(Op::GetGlobal, name, gg_span);
+        c.emit(Op::Return, s());
+        match run_chunk(c) {
+            Err(Control::Panic(e)) => {
+                assert!(
+                    e.message.contains("undefined global"),
+                    "message was: {}",
+                    e.message
+                );
+                assert_eq!(e.span, Some(gg_span));
+            }
             other => panic!("expected Panic, got {other:?}"),
         }
     }

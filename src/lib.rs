@@ -175,6 +175,56 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
     }
 }
 
+/// Compile `src` to bytecode and run it on the VM for its *side effects*,
+/// returning captured stdout plus any `exit(n)` code (VM plan V2).
+///
+/// This mirrors [`run_source_exit`] exactly for the bytecode pipeline: the shared
+/// [`Interp`] uses the Capture output sink, so `print` writes into a buffer that
+/// [`Interp::output`] returns. The `Control` channels map identically to the
+/// tree-walker: `Panic` → `Err`, `Propagate` → end the program (return captured
+/// output), `Exit(code)` → return output plus the code. It is `#[doc(hidden)]` —
+/// the production path remains the tree-walker.
+#[doc(hidden)]
+pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+    });
+    let closure = Closure::new(proto);
+
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let vm = Vm::new(interp.clone());
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await; // drain spawned tasks — no-op until later VM slices
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        // A panic aborts the program with its diagnostic.
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        // A top-level `?` propagation simply ends the program.
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
+        // exit(n) — return the captured output plus the exit code.
+        Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
 /// Map a VM [`crate::interp::Control`] outcome to an [`AsError`], mirroring how
 /// the tree-walker entry points treat each channel.
 fn control_to_aserror(c: crate::interp::Control) -> AsError {

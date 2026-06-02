@@ -9,8 +9,11 @@
 //! scientific numbers) land in V2+.
 
 use crate::span::Span;
-use crate::syntax::ast::{AstNode, BinaryExpr, Expr, Literal, ParenExpr, SourceFile, Stmt, UnaryExpr};
+use crate::syntax::ast::{
+    AstNode, BinaryExpr, CallExpr, Expr, Literal, ParenExpr, SourceFile, Stmt, UnaryExpr,
+};
 use crate::syntax::kind::SyntaxKind;
+use crate::syntax::resolve::types::{ResolveResult, Resolution};
 use crate::syntax::{parse_to_tree, resolve::resolve};
 use crate::value::Value;
 use crate::vm::chunk::Chunk;
@@ -55,15 +58,20 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     let file =
         SourceFile::cast(root.clone()).ok_or_else(|| CompileError::new("expected a source file", Span::new(0, src.len())))?;
 
-    // Run the resolver so the pipeline is wired end-to-end. V1 has no locals or
-    // globals to consult, so its result is intentionally unused for now.
-    let _ = resolve(&root);
+    // Run the resolver so the compiler can classify identifier uses (e.g. a bare
+    // builtin callee in a `print(...)` call resolves to `Resolution::Global`).
+    let resolved = resolve(&root);
 
-    let mut compiler = Compiler { chunk: Chunk::new() };
+    let mut compiler = Compiler {
+        chunk: Chunk::new(),
+        resolved,
+    };
 
-    // V1 supports a program that is a sequence of statements whose meaningful
-    // tail is an expression statement. Find the last `ExprStmt` and compile it;
-    // any other (leading) statement kinds are not yet supported.
+    // V2 supports a program that is a sequence of expression statements whose
+    // meaningful tail is an expression. Leading expression statements (e.g.
+    // `print(...)` calls) are compiled and their result discarded with `POP`; the
+    // trailing expression is left on the stack and `RETURN`ed. Other statement
+    // kinds (let/if/while/...) land in V3+.
     let stmts: Vec<Stmt> = file.stmts().collect();
     let trailing = stmts.iter().rev().find_map(|s| match s {
         Stmt::ExprStmt(e) => Some(e.clone()),
@@ -72,19 +80,35 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
 
     let Some(expr_stmt) = trailing else {
         return Err(CompileError::new(
-            "V1 compiler requires a trailing expression statement",
+            "V2 compiler requires a trailing expression statement",
             Span::new(0, src.len()),
         ));
     };
+    let trailing_node = expr_stmt.syntax().clone();
 
-    // Reject any non-expression statement in the file (V1 is expression-only).
+    // Reject any non-expression statement in the file (V2 is expression-only).
     for s in &stmts {
         if !matches!(s, Stmt::ExprStmt(_)) {
             return Err(CompileError::new(
-                "statement kind not yet supported in V1 (expression-only)",
+                "statement kind not yet supported in V2 (expression-only)",
                 stmt_span(s),
             ));
         }
+    }
+
+    // Compile each leading expression statement as a side-effecting expression
+    // whose result is discarded; the trailing one is the program's value.
+    for s in &stmts {
+        let Stmt::ExprStmt(es) = s else { continue };
+        let is_trailing = *es.syntax() == trailing_node;
+        if is_trailing {
+            continue;
+        }
+        let expr = es
+            .expr()
+            .ok_or_else(|| CompileError::new("empty expression statement", node_span(es)))?;
+        compiler.compile_expr(&expr)?;
+        compiler.chunk.emit(Op::Pop, node_span(es));
     }
 
     let expr = expr_stmt
@@ -120,6 +144,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
 
 struct Compiler {
     chunk: Chunk,
+    resolved: ResolveResult,
 }
 
 impl Compiler {
@@ -129,11 +154,66 @@ impl Compiler {
             Expr::BinaryExpr(bin) => self.compile_binary(bin),
             Expr::UnaryExpr(un) => self.compile_unary(un),
             Expr::ParenExpr(paren) => self.compile_paren(paren),
+            Expr::CallExpr(call) => self.compile_call(call),
             other => Err(CompileError::new(
-                "expression kind not yet supported in V1",
+                "expression kind not yet supported in V2",
                 node_span(other),
             )),
         }
+    }
+
+    /// Lower a call whose callee is a bare builtin name (`print`, `len`, `type`,
+    /// …): `GET_GLOBAL <name>`, then each argument, then `CALL argc`.
+    ///
+    /// V2 supports only calls to bare builtins. The callee is classified via the
+    /// resolver: a `NameRef` whose use resolves to `Resolution::Global(name)`
+    /// where `name` is a known builtin. Anything else (method calls, calls to
+    /// user functions/locals/upvalues) is a documented V4 deferral.
+    fn compile_call(&mut self, call: &CallExpr) -> Result<(), CompileError> {
+        let span = node_span(call);
+        let callee = call
+            .expr()
+            .ok_or_else(|| CompileError::new("call expression missing callee", span))?;
+
+        // Only a bare `NameRef` callee is supported in V2.
+        let Expr::NameRef(name_ref) = &callee else {
+            return Err(CompileError::new(
+                "calls to non-builtins not yet supported (V4)",
+                node_span(&callee),
+            ));
+        };
+
+        // Classify the callee via the resolver: it must be a Global builtin.
+        let key = name_ref.syntax().text_range();
+        let builtin_name = match self.resolved.uses.get(&key) {
+            Some(Resolution::Global(name)) if crate::interp::BUILTIN_NAMES.contains(&name.as_str()) => {
+                name.clone()
+            }
+            _ => {
+                return Err(CompileError::new(
+                    "calls to non-builtins not yet supported (V4)",
+                    node_span(&callee),
+                ));
+            }
+        };
+
+        // GET_GLOBAL <name-const>
+        let name_idx = self.chunk.add_const(Value::Str(Rc::from(builtin_name.as_str())));
+        self.chunk.emit_u16(Op::GetGlobal, name_idx, span);
+
+        // Compile each argument, left to right.
+        let mut argc: u8 = 0;
+        if let Some(arg_list) = call.arg_list() {
+            for arg in arg_list.exprs() {
+                self.compile_expr(&arg)?;
+                argc = argc.checked_add(1).ok_or_else(|| {
+                    CompileError::new("too many call arguments (max 255)", span)
+                })?;
+            }
+        }
+
+        self.chunk.emit_u8(Op::Call, argc, span);
+        Ok(())
     }
 
     fn compile_literal(&mut self, lit: &Literal) -> Result<(), CompileError> {
@@ -323,6 +403,41 @@ mod tests {
     fn rejects_unsupported_binary_operator() {
         let err = compile_source("1 == 2").unwrap_err();
         assert!(err.message.contains("not yet supported"), "got {err:?}");
+    }
+
+    #[test]
+    fn compile_print_emits_get_global_call() {
+        let chunk = compile_source("print(1 + 2)").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(
+            text.contains("GET_GLOBAL") && text.contains("print"),
+            "missing GET_GLOBAL print in:\n{text}"
+        );
+        assert!(text.contains("ADD"), "missing ADD in:\n{text}");
+        assert!(text.contains("CALL"), "missing CALL in:\n{text}");
+        assert!(text.contains("RETURN"), "missing RETURN in:\n{text}");
+    }
+
+    #[test]
+    fn leading_print_statement_is_popped() {
+        // A non-trailing print(...) compiles a CALL followed by POP; the trailing
+        // expression is RETURNed.
+        let chunk = compile_source("print(1)\n2").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("CALL"), "missing CALL in:\n{text}");
+        assert!(text.contains("POP"), "missing POP in:\n{text}");
+        assert!(text.contains("RETURN"), "missing RETURN in:\n{text}");
+    }
+
+    #[test]
+    fn rejects_call_to_non_builtin() {
+        // `foo` is not a builtin; resolver classifies it Global("foo") which is
+        // not in BUILTIN_NAMES → documented V4 deferral.
+        let err = compile_source("foo(1)").unwrap_err();
+        assert!(
+            err.message.contains("non-builtins not yet supported (V4)"),
+            "got {err:?}"
+        );
     }
 
     #[test]
