@@ -8,6 +8,7 @@
 //! flow, calls, and the richer literal grammar (templates, escapes, hex/binary/
 //! scientific numbers) land in V2+.
 
+use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_template_body};
 use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, CallExpr, Expr, IndexExpr, LetStmt, Literal,
@@ -452,14 +453,16 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("malformed literal (no token text)", span))?;
         let value = match kind {
             SyntaxKind::Number => {
-                let n = parse_number(&text).ok_or_else(|| {
+                let n = parse_number_text(&text).ok_or_else(|| {
                     // The lexer already validated the token, so this is a
                     // compiler bug rather than a user error if it ever fires.
                     CompileError::new(format!("malformed number literal {text:?}"), span)
                 })?;
                 Value::Number(n)
             }
-            SyntaxKind::Str => Value::Str(Rc::from(unescape_string(&text).as_str())),
+            SyntaxKind::Str => {
+                Value::Str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str()))
+            }
             SyntaxKind::TrueKw => Value::Bool(true),
             SyntaxKind::FalseKw => Value::Bool(false),
             SyntaxKind::NilKw => Value::Nil,
@@ -777,7 +780,7 @@ impl Compiler {
                     | SyntaxKind::TemplateStart
                     | SyntaxKind::TemplateMiddle
                     | SyntaxKind::TemplateEnd => {
-                        let chunk = unescape_template_chunk(tok.text());
+                        let chunk = unescape_template_body(strip_template_delims(tok.text()));
                         let idx = self.chunk.add_const(Value::Str(Rc::from(chunk.as_str())));
                         self.chunk.emit_u16(Op::Const, idx, span);
                     }
@@ -806,7 +809,8 @@ impl Compiler {
 /// keys by (`ObjEntry::KV` key). The key token is either an `Ident` (raw
 /// identifier text, used verbatim) or a `Str` (a quoted literal whose contents
 /// must be unescaped — the legacy lexer pre-decodes `Tok::Str`, so the CST's raw
-/// quoted token is unescaped here via [`unescape_string`] to agree). Returns
+/// quoted token is unescaped here via the shared [`unescape_str_body`] to agree).
+/// Returns
 /// `None` only on a malformed field with no key token (a parser/compiler bug).
 fn object_field_key(field: &crate::syntax::ast::ObjectField) -> Option<String> {
     let tok = field
@@ -815,7 +819,7 @@ fn object_field_key(field: &crate::syntax::ast::ObjectField) -> Option<String> {
         .filter_map(|e| e.into_token())
         .find(|t| matches!(t.kind(), SyntaxKind::Ident | SyntaxKind::Str))?;
     match tok.kind() {
-        SyntaxKind::Str => Some(unescape_string(tok.text())),
+        SyntaxKind::Str => Some(unescape_str_body(strip_quotes(tok.text()))),
         // Ident key: raw identifier text, used verbatim.
         _ => Some(tok.text().to_string()),
     }
@@ -838,94 +842,6 @@ fn literal_token_text(lit: &Literal) -> Option<String> {
             )
         })
         .map(|t| t.text().to_string())
-}
-
-/// Parse a numeric literal token into the exact `f64` the tree-walker produces.
-///
-/// This mirrors the legacy lexer's number scan (`src/lexer.rs`) byte-for-byte:
-/// hex (`0x..`/`0X..`) and binary (`0b..`/`0B..`) prefixes parse the digits via
-/// `u64::from_str_radix` then cast to `f64`; everything else (plain decimals,
-/// floats, scientific `1e9`) is parsed by `f64::parse`. Underscore digit
-/// separators are stripped first in all forms. The lexer has already validated
-/// the token's shape, so this only fails on a genuine compiler/lexer
-/// disagreement (→ `None`, surfaced as a `CompileError`).
-fn parse_number(text: &str) -> Option<f64> {
-    let bytes = text.as_bytes();
-    if bytes.len() >= 2 && bytes[0] == b'0' && matches!(bytes[1], b'x' | b'X' | b'b' | b'B') {
-        let radix = if matches!(bytes[1], b'x' | b'X') { 16 } else { 2 };
-        let digits: String = text[2..].chars().filter(|&c| c != '_').collect();
-        if digits.is_empty() {
-            return None;
-        }
-        return u64::from_str_radix(&digits, radix).ok().map(|n| n as f64);
-    }
-    let cleaned: String = text.chars().filter(|&c| c != '_').collect();
-    cleaned.parse::<f64>().ok()
-}
-
-/// Translate the character following a `\` into its escaped value. Mirrors the
-/// legacy lexer's `escape_char` (`src/lexer.rs`) EXACTLY: the known escapes plus
-/// a lenient passthrough for any other char (`\x` → `x`). AScript has NO
-/// `\u`/`\x`/numeric escapes, so they fall through to the passthrough — matching
-/// the tree-walker.
-fn escape_char(c: char) -> char {
-    match c {
-        'n' => '\n',
-        't' => '\t',
-        'r' => '\r',
-        '0' => '\0',
-        '\\' => '\\',
-        '"' => '"',
-        '\'' => '\'',
-        other => other,
-    }
-}
-
-/// Unescape a `"..."` / `'...'` string-literal token into its runtime value,
-/// mirroring the legacy lexer's `lex_quoted`. The raw token text includes the
-/// surrounding quotes; they are stripped, then backslash escapes are translated
-/// via [`escape_char`]. A trailing lone `\` (cannot occur for a lexer-accepted,
-/// terminated token) is kept verbatim, matching the legacy scan's behavior.
-fn unescape_string(raw: &str) -> String {
-    let inner = strip_quotes(raw);
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some(e) => out.push(escape_char(e)),
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Unescape a template literal *chunk* token (`TemplateStr`/`TemplateStart`/
-/// `TemplateMiddle`/`TemplateEnd`) into its literal string contents, mirroring
-/// the legacy lexer's `lex_template_chunk`. The raw token text carries its
-/// delimiters: a leading `` ` `` or `}`, and a trailing `` ` `` or `${`. We
-/// strip those, then apply the template escape set — `` \` `` → `` ` `` and
-/// `\$` → `$` are template-specific; everything else shares [`escape_char`].
-fn unescape_template_chunk(raw: &str) -> String {
-    let inner = strip_template_delims(raw);
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('`') => out.push('`'),
-                Some('$') => out.push('$'),
-                Some(other) => out.push(escape_char(other)),
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// Strip the leading delimiter (`` ` `` or `}`) and trailing delimiter
@@ -1134,51 +1050,35 @@ mod tests {
         assert_eq!(eval_number("2 ** 10").await, 1024.0);
     }
 
+    // Number/escape text→value parsing is exercised exhaustively in
+    // `crate::lex_literals` (the single shared source of truth). Here we only
+    // cover the compiler's CST delimiter-stripping path feeding those shared
+    // routines: quotes/backticks/`${`/`}` are stripped, then the shared
+    // unescape/parse runs.
     #[test]
-    fn parse_number_all_forms() {
-        assert_eq!(parse_number("0xff"), Some(255.0));
-        assert_eq!(parse_number("0XFF"), Some(255.0));
-        assert_eq!(parse_number("0b1010"), Some(10.0));
-        assert_eq!(parse_number("0B1111"), Some(15.0));
-        assert_eq!(parse_number("1e3"), Some(1000.0));
-        assert_eq!(parse_number("2.5e-2"), Some(0.025));
-        assert_eq!(parse_number("1_000"), Some(1000.0));
-        assert_eq!(parse_number("0xFF_FF"), Some(65535.0));
-        assert_eq!(parse_number("12.5"), Some(12.5));
-        assert_eq!(parse_number("0"), Some(0.0));
+    fn compiler_strips_quotes_then_unescapes() {
+        assert_eq!(unescape_str_body(strip_quotes(r#""a\nb""#)), "a\nb");
+        assert_eq!(unescape_str_body(strip_quotes(r#"'single'"#)), "single");
+        assert_eq!(unescape_str_body(strip_quotes(r#"'\'q\''"#)), "'q'");
+        assert_eq!(unescape_str_body(strip_quotes(r#""""#)), "");
     }
 
     #[test]
-    fn unescape_string_handles_full_escape_set() {
-        assert_eq!(unescape_string(r#""a\nb""#), "a\nb");
-        assert_eq!(unescape_string(r#""t\ta""#), "t\ta");
-        assert_eq!(unescape_string(r#""r\ra""#), "r\ra");
-        assert_eq!(unescape_string(r#""q\"x""#), "q\"x");
-        assert_eq!(unescape_string(r#""b\\s""#), "b\\s");
-        assert_eq!(unescape_string(r#""n\0e""#), "n\0e");
-        assert_eq!(unescape_string(r#"'single'"#), "single");
-        assert_eq!(unescape_string(r#"'\'q\''"#), "'q'");
-        // Unknown escape passes through leniently (\q -> q).
-        assert_eq!(unescape_string(r#""x\qy""#), "xqy");
-    }
-
-    #[test]
-    fn unescape_template_chunk_strips_delims_and_escapes() {
+    fn compiler_strips_template_delims_then_unescapes() {
         // Full template `` `...` ``.
-        assert_eq!(unescape_template_chunk("`plain`"), "plain");
+        assert_eq!(unescape_template_body(strip_template_delims("`plain`")), "plain");
         // Start chunk `` `a${ ``.
-        assert_eq!(unescape_template_chunk("`a${"), "a");
+        assert_eq!(unescape_template_body(strip_template_delims("`a${")), "a");
         // Middle chunk `}b${`.
-        assert_eq!(unescape_template_chunk("}b${"), "b");
+        assert_eq!(unescape_template_body(strip_template_delims("}b${")), "b");
         // End chunk `` }c` ``.
-        assert_eq!(unescape_template_chunk("}c`"), "c");
+        assert_eq!(unescape_template_body(strip_template_delims("}c`")), "c");
         // Empty leading/middle chunks.
-        assert_eq!(unescape_template_chunk("`${"), "");
-        assert_eq!(unescape_template_chunk("}${"), "");
-        // Template escapes: \` -> ` and \$ -> $, plus the shared set.
-        assert_eq!(unescape_template_chunk("`a\\`b`"), "a`b");
-        assert_eq!(unescape_template_chunk("`a\\$b`"), "a$b");
-        assert_eq!(unescape_template_chunk("`a\\nb`"), "a\nb");
+        assert_eq!(unescape_template_body(strip_template_delims("`${")), "");
+        assert_eq!(unescape_template_body(strip_template_delims("}${")), "");
+        // Template escapes survive the strip+unescape: \` -> ` and \$ -> $.
+        assert_eq!(unescape_template_body(strip_template_delims("`a\\`b`")), "a`b");
+        assert_eq!(unescape_template_body(strip_template_delims("`a\\$b`")), "a$b");
     }
 
     #[test]

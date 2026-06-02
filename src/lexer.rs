@@ -1,6 +1,7 @@
 //! Hand-written lexer. Produces tokens with char-offset spans.
 
 use crate::error::AsError;
+use crate::lex_literals::{escape_char, parse_number_text};
 use crate::span::Span;
 use crate::token::{Tok, Token};
 
@@ -15,25 +16,6 @@ pub const ERR_UNTERMINATED_TEMPLATE: &str = "unterminated template string";
 enum TemplateChunk {
     Full,  // `...`           (no interpolation)
     Start, // `...${          (more follows)
-}
-
-/// Translate the character following a `\` into its escaped value. Shared by
-/// all three string forms (`"..."`, `'...'`, and `` `...` ``). Unknown escapes
-/// pass through leniently (`\<other>` -> `<other>`), matching the original
-/// template behavior. Template-specific escapes (`` \` `` and `\$`) are
-/// handled by the caller before reaching here (they fall through to the
-/// lenient passthrough anyway, but listing them keeps intent explicit).
-fn escape_char(c: char) -> char {
-    match c {
-        'n' => '\n',
-        't' => '\t',
-        'r' => '\r',
-        '0' => '\0',
-        '\\' => '\\',
-        '"' => '"',
-        '\'' => '\'',
-        other => other,
-    }
 }
 
 /// Read a quoted string body starting just after the opening `quote`, scanning
@@ -432,26 +414,25 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B')
                 {
                     let radix_char = chars[i + 1];
-                    let (radix, is_digit): (u32, fn(char) -> bool) = match radix_char {
-                        'x' | 'X' => (16, |d| d.is_ascii_hexdigit()),
-                        _ => (2, |d| d == '0' || d == '1'),
+                    let is_digit: fn(char) -> bool = match radix_char {
+                        'x' | 'X' => |d| d.is_ascii_hexdigit(),
+                        _ => |d| d == '0' || d == '1',
                     };
                     j = i + 2;
                     while j < chars.len() && (is_digit(chars[j]) || chars[j] == '_') {
                         j += 1;
                     }
                     let span = Span::new(i, j);
-                    let digits: String = chars[i + 2..j].iter().filter(|&&ch| ch != '_').collect();
-                    let label = if radix == 16 {
+                    let label = if matches!(radix_char, 'x' | 'X') {
                         "invalid hex number literal"
                     } else {
                         "invalid binary number literal"
                     };
-                    if digits.is_empty() {
-                        return Err(AsError::at(label, span));
-                    }
-                    let n = u64::from_str_radix(&digits, radix)
-                        .map_err(|_| AsError::at(label, span))? as f64;
+                    // Pass the full token text (incl. `0x`/`0b` prefix) to the
+                    // shared parser; it strips underscores and dispatches on the
+                    // prefix. An empty/invalid radix body yields `None`.
+                    let text: String = chars[i..j].iter().collect();
+                    let n = parse_number_text(&text).ok_or_else(|| AsError::at(label, span))?;
                     tokens.push(Token {
                         tok: Tok::Number(n),
                         span,
@@ -492,10 +473,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         }
                     }
                     let span = Span::new(i, j);
-                    let text: String = chars[i..j].iter().filter(|&&ch| ch != '_').collect();
-                    let n: f64 = text
-                        .parse()
-                        .map_err(|_| AsError::at("invalid number", span))?;
+                    let text: String = chars[i..j].iter().collect();
+                    let n = parse_number_text(&text)
+                        .ok_or_else(|| AsError::at("invalid number", span))?;
                     tokens.push(Token {
                         tok: Tok::Number(n),
                         span,

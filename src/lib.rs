@@ -8,6 +8,7 @@ pub mod env;
 pub mod error;
 pub mod fmt;
 pub mod interp;
+pub(crate) mod lex_literals;
 pub mod lexer;
 #[cfg(feature = "lsp")]
 pub mod lsp;

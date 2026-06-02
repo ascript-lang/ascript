@@ -68,10 +68,13 @@ async fn vm_matches_treewalker_number_forms() {
     let cases = [
         "0xff",          // hex
         "0XFF",          // upper-case hex prefix + digits
+        "0X1F",          // upper-case hex, mixed digits/letters
         "0b1010",        // binary
         "0B1111",        // upper-case binary prefix
+        "0B11",          // short upper-case binary
         "1e3",           // scientific
         "1E3",           // upper-case exponent
+        "1.5e-3",        // float + signed negative exponent
         "2.5e-2",        // float + signed exponent
         "1_000",         // underscore digit separators
         "1_000_000",     // more separators
@@ -98,6 +101,7 @@ async fn vm_matches_treewalker_string_escapes() {
         r#""quote\"x""#,        // escaped double-quote
         r#""back\\slash""#,     // escaped backslash
         r#""nul\0end""#,        // NUL
+        r#""\t\r\0""#,          // adjacent control escapes (tab/CR/NUL)
         r#"'single'"#,          // single-quoted
         r#"'he said \'hi\''"#,  // escaped single-quote inside single quotes
         r#""unknown\qescape""#, // lenient passthrough: \q -> q
@@ -127,6 +131,7 @@ async fn vm_matches_treewalker_templates() {
         "`tab\tin\ttemplate`",       // escapes inside a template chunk
         "`escaped \\` backtick`",    // escaped backtick
         "`escaped \\${not} interp`", // escaped ${ (literal, not interpolation)
+        "`price \\$5`",              // escaped bare $ (\$ -> $)
     ];
     for expr in cases {
         assert_vm_matches_treewalker(expr).await;
