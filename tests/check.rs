@@ -42,6 +42,27 @@ fn nil_return_type_is_not_a_syntax_error() {
     );
 }
 #[test]
+fn fn_type_is_not_a_syntax_error() {
+    // `fn` is a valid type (Type::Fn); the CST type parser must accept it so the
+    // checker does not emit a false `syntax-error`. Regression for the missing
+    // `FnKw` arm in `type_primary`.
+    let p = write_tmp("fntype.as", "fn apply(g: fn, x) { return g(x) }\napply((n) => n, 1)\n");
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "`: fn` must not produce a syntax error; output: {combined}"
+    );
+    assert!(
+        !combined.contains("syntax-error"),
+        "no syntax-error expected for `: fn`; output: {combined}"
+    );
+}
+#[test]
 fn syntax_error_exits_nonzero_and_reports() {
     let p = write_tmp("bad.as", "let = 1\n");
     let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();

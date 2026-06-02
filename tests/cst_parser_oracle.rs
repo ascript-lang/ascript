@@ -91,6 +91,9 @@ const ACCEPT: &[&str] = &[
     "fn f(): nil {}",
     "let x: nil = nil",
     "fn g(): number | nil { return nil }",
+    // `fn` is a valid type (Type::Fn): let annotation + param annotation.
+    "let f: fn = x",
+    "fn apply(g: fn, x) { return g(x) }",
 ];
 
 #[test]

@@ -1404,6 +1404,25 @@ async fn vm_return_type_contract_matches_treewalker() {
     assert_vm_run_matches_treewalker("fn g(): number | nil { return nil }\nprint(g())").await;
 }
 
+#[tokio::test]
+async fn vm_fn_type_param_contract_matches_treewalker() {
+    // `: fn` parameter contract — a closure passed to a `: fn` param satisfies the
+    // contract (exercising the check_type Closure-accepts-`fn` fix end-to-end), and
+    // the result is byte-identical to the tree-walker. This is the proof that the
+    // CST type parser now lowers `fn` to Type::Fn AND that the VM contract check
+    // accepts a Closure for it.
+    assert_vm_run_matches_treewalker(
+        "fn apply(g: fn, x) { return g(x) }\nprint(apply((n) => n * 2, 5))",
+    )
+    .await;
+    // A NON-function passed to a `: fn` param is contract-rejected identically
+    // (same Tier-2 panic message + span on both engines).
+    assert_vm_run_error_matches_treewalker(
+        "fn apply(g: fn, x) { return g(x) }\nprint(apply(7, 5))",
+    )
+    .await;
+}
+
 // ---- call_value bridge: native code invokes a VM closure (V4-T5) ----------
 //
 // `recover(fn)` is the testable end-to-end surface for the `native → VM` bridge:

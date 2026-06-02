@@ -90,6 +90,26 @@ fn formats_nil_type_idempotently() {
 }
 
 #[test]
+fn formats_fn_type_idempotently() {
+    // `fn` as a type formats via the NamedType path (first non-trivia token text)
+    // and round-trips. Regression for the missing `FnKw` arm in the CST type parser.
+    for src in [
+        "let f: fn = g\n",
+        "fn apply(g: fn, x) {\n  return g(x)\n}\n",
+        "fn h(): fn {\n  return g\n}\n",
+    ] {
+        let once = ascript::syntax::format_tree(src);
+        assert!(once.contains("fn"), "lost `fn` type formatting {src:?} -> {once:?}");
+        let twice = ascript::syntax::format_tree(&once);
+        assert_eq!(once, twice, "not idempotent for {src:?}");
+        assert!(
+            ascript::syntax::parser::parse(&once).errors.is_empty(),
+            "formatted `fn`-type output does not reparse: {once:?}"
+        );
+    }
+}
+
+#[test]
 fn formatted_corpus_reparses_without_errors() {
     let mut failures = Vec::new();
     for path in corpus() {

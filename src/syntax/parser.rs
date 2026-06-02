@@ -1009,6 +1009,19 @@ fn type_primary(p: &mut Parser) -> CompletedMarker {
             p.bump(); // nil
             p.complete(m, NamedType)
         }
+        // `fn` is the function-type keyword (`Type::Fn` in the spec). Like `nil`
+        // it lexes as its own keyword (not an `Ident`), so it needs its own arm;
+        // wrap it in a `NamedType` (keyed on the node's first non-trivia token
+        // text) so `cst_type` (FnKw → Type::Fn) and the formatter treat it
+        // uniformly. Accepted by the legacy parser (`Tok::Fn => Type::Fn`) and the
+        // tree-sitter grammar (`primitive_type` lists `'fn'`). `nil` and `fn` are
+        // the ONLY two keyword-lexed types; all others (number/string/bool/any/
+        // object/error/array/map/...) lex as `Ident`.
+        FnKw => {
+            let m = p.start();
+            p.bump(); // fn
+            p.complete(m, NamedType)
+        }
         LBracket => {
             let m = p.start();
             p.bump(); // [
@@ -1715,6 +1728,9 @@ mod tests {
             ("let x: number = 1", SyntaxKind::NamedType),
             ("let x: nil = nil", SyntaxKind::NamedType),
             ("fn f(): nil {}", SyntaxKind::NamedType),
+            ("let f: fn = x", SyntaxKind::NamedType),
+            ("fn apply(g: fn, x) {}", SyntaxKind::NamedType),
+            ("fn h(): fn { return g }", SyntaxKind::NamedType),
             ("fn g(): number | nil { return nil }", SyntaxKind::NamedType),
             ("let x: array<number> = []", SyntaxKind::GenericType),
             ("let x: number? = nil", SyntaxKind::OptionalType),
