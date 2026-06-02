@@ -10,8 +10,8 @@
 
 use crate::span::Span;
 use crate::syntax::ast::{
-    AstNode, BinaryExpr, CallExpr, Expr, Literal, ParenExpr, SourceFile, Stmt, TemplateExpr,
-    UnaryExpr,
+    AssignExpr, AstNode, BinaryExpr, Block, CallExpr, Expr, LetStmt, Literal, NameRef, ParenExpr,
+    SourceFile, Stmt, TemplateExpr, UnaryExpr,
 };
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
@@ -19,6 +19,7 @@ use crate::syntax::{parse_to_tree, resolve::resolve};
 use crate::value::Value;
 use crate::vm::chunk::Chunk;
 use crate::vm::opcode::Op;
+use cstree::text::TextRange;
 use std::rc::Rc;
 
 /// A compile-time error: a message plus the source span that triggered it. The
@@ -63,60 +64,61 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     // builtin callee in a `print(...)` call resolves to `Resolution::Global`).
     let resolved = resolve(&root);
 
-    let mut compiler = Compiler {
-        chunk: Chunk::new(),
-        resolved,
-    };
+    // Size the top chunk's local-slot window from the resolver's top frame so
+    // `Fiber::new` reserves exactly enough Nil locals for every `let`/`const`
+    // (including block-scoped ones — slots are frame-flat, see `compile_block`).
+    let mut chunk = Chunk::new();
+    let top_key = (SyntaxKind::SourceFile, root.text_range());
+    let slot_count = resolved
+        .frames
+        .get(&top_key)
+        .map(|f| f.slot_count)
+        .unwrap_or(0);
+    chunk.slot_count = u16::try_from(slot_count).map_err(|_| {
+        CompileError::new(
+            "too many local slots in top-level frame (max 65535)",
+            Span::new(0, src.len()),
+        )
+    })?;
 
-    // V2 supports a program that is a sequence of expression statements whose
-    // meaningful tail is an expression. Leading expression statements (e.g.
-    // `print(...)` calls) are compiled and their result discarded with `POP`; the
-    // trailing expression is left on the stack and `RETURN`ed. Other statement
-    // kinds (let/if/while/...) land in V3+.
+    let mut compiler = Compiler { chunk, resolved };
+
+    // V2 supports a sequence of statements whose meaningful tail is an
+    // expression. Each statement is compiled in source order; a leading
+    // expression statement's result is discarded with `POP`. The trailing
+    // statement, if it is an expression statement, is left on the stack and
+    // `RETURN`ed (so `vm_eval_source` observes the program's value); otherwise
+    // the program returns `Nil`.
     let stmts: Vec<Stmt> = file.stmts().collect();
-    let trailing = stmts.iter().rev().find_map(|s| match s {
-        Stmt::ExprStmt(e) => Some(e.clone()),
+    let trailing_expr_node = stmts.last().and_then(|s| match s {
+        Stmt::ExprStmt(e) => Some(e.syntax().clone()),
         _ => None,
     });
 
-    let Some(expr_stmt) = trailing else {
-        return Err(CompileError::new(
-            "V2 compiler requires a trailing expression statement",
-            Span::new(0, src.len()),
-        ));
-    };
-    let trailing_node = expr_stmt.syntax().clone();
-
-    // Reject any non-expression statement in the file (V2 is expression-only).
     for s in &stmts {
-        if !matches!(s, Stmt::ExprStmt(_)) {
-            return Err(CompileError::new(
-                "statement kind not yet supported in V2 (expression-only)",
-                stmt_span(s),
-            ));
+        if let Stmt::ExprStmt(es) = s {
+            let is_trailing = trailing_expr_node.as_ref() == Some(es.syntax());
+            let expr = es
+                .expr()
+                .ok_or_else(|| CompileError::new("empty expression statement", node_span(es)))?;
+            compiler.compile_expr(&expr)?;
+            if is_trailing {
+                compiler.chunk.emit(Op::Return, node_span(es));
+            } else {
+                compiler.chunk.emit(Op::Pop, node_span(es));
+            }
+        } else {
+            compiler.compile_stmt(s)?;
         }
     }
 
-    // Compile each leading expression statement as a side-effecting expression
-    // whose result is discarded; the trailing one is the program's value.
-    for s in &stmts {
-        let Stmt::ExprStmt(es) = s else { continue };
-        let is_trailing = *es.syntax() == trailing_node;
-        if is_trailing {
-            continue;
-        }
-        let expr = es
-            .expr()
-            .ok_or_else(|| CompileError::new("empty expression statement", node_span(es)))?;
-        compiler.compile_expr(&expr)?;
-        compiler.chunk.emit(Op::Pop, node_span(es));
+    // If the program did not end in an expression statement, there is no value on
+    // the stack to return — push `Nil` and `RETURN` it so the run loop always
+    // terminates with a `Done` value.
+    if trailing_expr_node.is_none() {
+        compiler.chunk.emit(Op::Nil, Span::new(src.len(), src.len()));
+        compiler.chunk.emit(Op::Return, Span::new(src.len(), src.len()));
     }
-
-    let expr = expr_stmt
-        .expr()
-        .ok_or_else(|| CompileError::new("empty expression statement", node_span(&expr_stmt)))?;
-    compiler.compile_expr(&expr)?;
-    compiler.chunk.emit(Op::Return, node_span(&expr_stmt));
 
     Ok(compiler.chunk)
 }
@@ -157,11 +159,196 @@ impl Compiler {
             Expr::ParenExpr(paren) => self.compile_paren(paren),
             Expr::CallExpr(call) => self.compile_call(call),
             Expr::TemplateExpr(t) => self.compile_template(t),
+            Expr::NameRef(name_ref) => self.compile_name_ref(name_ref),
+            Expr::AssignExpr(assign) => self.compile_assign(assign),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
                 node_span(other),
             )),
         }
+    }
+
+    /// Lower a bare identifier reference (`NameRef`). The resolver classifies the
+    /// use via its `text_range()`: a `Local(slot)` reads the frame's slot
+    /// (`GET_LOCAL`); a `Global(name)` builtin is left for the call path / future
+    /// global support; `Upvalue` is a closure capture (V5) and `Unresolved` would
+    /// be an undefined name (the checker flags it, but we still emit a clear
+    /// compile error rather than mis-compile).
+    fn compile_name_ref(&mut self, name_ref: &NameRef) -> Result<(), CompileError> {
+        let span = node_span(name_ref);
+        let key = name_ref.syntax().text_range();
+        match self.resolved.uses.get(&key) {
+            Some(Resolution::Local(slot)) => {
+                let slot = u16::try_from(*slot).map_err(|_| {
+                    CompileError::new("local slot index exceeds 65535", span)
+                })?;
+                self.chunk.emit_u16(Op::GetLocal, slot, span);
+                Ok(())
+            }
+            Some(Resolution::Upvalue(_)) => Err(CompileError::new(
+                "upvalue (closure capture) reads not yet supported (V5)",
+                span,
+            )),
+            Some(Resolution::Global(name)) => Err(CompileError::new(
+                format!("bare global reference '{name}' not yet supported (V4)"),
+                span,
+            )),
+            Some(Resolution::Unresolved) | None => Err(CompileError::new(
+                "undefined name",
+                span,
+            )),
+        }
+    }
+
+    /// Lower an assignment expression `target = value`. V2 supports only a plain
+    /// `=` to a local-binding target (a `NameRef` resolving to `Local(slot)`).
+    ///
+    /// Stack convention: `SET_LOCAL` POPS the value and stores it (clean stack
+    /// discipline). Assignment is an *expression* that yields the assigned value,
+    /// so we compile the value, `DUP` it (leaving the result copy on the stack),
+    /// then `SET_LOCAL`. Used as a statement, the surrounding `POP` discards the
+    /// leftover copy. This mirrors the tree-walker's `ExprKind::Assign`, which
+    /// evaluates the value and returns it as the expression result.
+    ///
+    /// Compound assignment (`+=`/`-=`/`*=`/`/=`) and non-`NameRef` targets
+    /// (index/member) are later deferrals (V9+).
+    fn compile_assign(&mut self, assign: &AssignExpr) -> Result<(), CompileError> {
+        let span = node_span(assign);
+        // Only a plain `=` operator is supported; reject compound assignment.
+        let is_plain_eq = assign
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == SyntaxKind::Eq);
+        if !is_plain_eq {
+            return Err(CompileError::new(
+                "compound assignment (+=/-=/*=//=) not yet supported (V9)",
+                span,
+            ));
+        }
+
+        let target = assign
+            .target()
+            .ok_or_else(|| CompileError::new("assignment missing target", span))?;
+        let Expr::NameRef(name_ref) = &target else {
+            return Err(CompileError::new(
+                "assignment to non-identifier targets (index/member) not yet supported (V9)",
+                node_span(&target),
+            ));
+        };
+        let slot = match self.resolved.uses.get(&name_ref.syntax().text_range()) {
+            Some(Resolution::Local(slot)) => u16::try_from(*slot)
+                .map_err(|_| CompileError::new("local slot index exceeds 65535", span))?,
+            Some(Resolution::Upvalue(_)) => {
+                return Err(CompileError::new(
+                    "assignment to a captured upvalue not yet supported (V5)",
+                    node_span(&target),
+                ))
+            }
+            _ => {
+                return Err(CompileError::new(
+                    "assignment to a non-local target not yet supported (V4)",
+                    node_span(&target),
+                ))
+            }
+        };
+
+        let value = assign
+            .value()
+            .ok_or_else(|| CompileError::new("assignment missing value", span))?;
+        self.compile_expr(&value)?;
+        // Leave the assigned value as the expression's result, then store a copy.
+        self.chunk.emit(Op::Dup, span);
+        self.chunk.emit_u16(Op::SetLocal, slot, span);
+        Ok(())
+    }
+
+    /// Compile a non-expression statement. V2 supports `let`/`const`
+    /// declarations and lexical `Block`s; other statement kinds (if/while/for/
+    /// fn/class/...) are later deferrals.
+    fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
+        match stmt {
+            Stmt::LetStmt(let_stmt) => self.compile_let(let_stmt),
+            Stmt::Block(block) => self.compile_block(block),
+            other => Err(CompileError::new(
+                "statement kind not yet supported in V2",
+                stmt_span(other),
+            )),
+        }
+    }
+
+    /// Compile a `let`/`const` declaration: evaluate the initializer (or push
+    /// `Nil` for an initializer-less `let x`), then `SET_LOCAL` into the binding's
+    /// slot. `SET_LOCAL` pops the value (clean stack discipline), so no leftover
+    /// remains. `const` binds identically at runtime — immutability is enforced by
+    /// the resolver/checker, not the VM (the tree-walker's `Stmt::Let` likewise
+    /// just binds). Destructuring `let` (`let [..]`/`let {..}`) is V10.
+    fn compile_let(&mut self, let_stmt: &LetStmt) -> Result<(), CompileError> {
+        let span = node_span(let_stmt);
+
+        // A destructuring binder has an ArrayBindPat/ObjectBindPat child instead
+        // of a plain ident token; defer it to V10.
+        if let_stmt
+            .syntax()
+            .children()
+            .any(|c| matches!(c.kind(), SyntaxKind::ArrayBindPat | SyntaxKind::ObjectBindPat))
+        {
+            return Err(CompileError::new(
+                "destructuring let (array/object pattern) not yet supported (V10)",
+                span,
+            ));
+        }
+
+        let slot = self.let_slot(let_stmt)?;
+
+        match let_stmt.expr() {
+            Some(init) => self.compile_expr(&init)?,
+            // `let x` with no initializer binds nil (mirrors the tree-walker).
+            None => self.chunk.emit(Op::Nil, span),
+        }
+        self.chunk.emit_u16(Op::SetLocal, slot, span);
+        Ok(())
+    }
+
+    /// The local slot for a `let`/`const` declaration. The resolver records a
+    /// `Binding` whose `decl_range` is the declaration node's `text_range()`
+    /// (see `declare_let_bindings`), so we match the binding by that range.
+    fn let_slot(&self, let_stmt: &LetStmt) -> Result<u16, CompileError> {
+        let span = node_span(let_stmt);
+        let decl_range: TextRange = let_stmt.syntax().text_range();
+        let binding = self
+            .resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == decl_range)
+            .ok_or_else(|| {
+                CompileError::new("let declaration has no resolver binding (compiler bug)", span)
+            })?;
+        u16::try_from(binding.slot)
+            .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// Compile a lexical `Block` `{ ... }`. Blocks do NOT push a runtime scope:
+    /// the resolver allocates DISTINCT frame-flat slots for block-scoped bindings
+    /// (and for shadowing — an inner `let x` gets a different slot than the outer
+    /// one), so a block is just its statements compiled in order. A trailing
+    /// expression statement inside a block is NOT a value position here (V2 has no
+    /// block-expression value), so it is compiled and `POP`ped like any other
+    /// statement, matching the tree-walker, which discards block statement values.
+    fn compile_block(&mut self, block: &Block) -> Result<(), CompileError> {
+        for s in block.stmts() {
+            match &s {
+                Stmt::ExprStmt(es) => {
+                    let expr = es.expr().ok_or_else(|| {
+                        CompileError::new("empty expression statement", node_span(es))
+                    })?;
+                    self.compile_expr(&expr)?;
+                    self.chunk.emit(Op::Pop, node_span(es));
+                }
+                other => self.compile_stmt(other)?,
+            }
+        }
+        Ok(())
     }
 
     /// Lower a call whose callee is a bare builtin name (`print`, `len`, `type`,
@@ -676,5 +863,65 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn hex_literal_evaluates() {
         assert_eq!(eval_number("0xff").await, 255.0);
+    }
+
+    #[test]
+    fn let_emits_set_local_and_sizes_slots() {
+        let chunk = compile_source("let x = 1\nx").expect("compiles");
+        assert!(chunk.slot_count >= 1, "slot_count not sized: {}", chunk.slot_count);
+        let text = disasm(&chunk);
+        assert!(text.contains("SET_LOCAL"), "missing SET_LOCAL in:\n{text}");
+        assert!(text.contains("GET_LOCAL"), "missing GET_LOCAL in:\n{text}");
+    }
+
+    #[test]
+    fn assign_dups_then_set_local() {
+        // Assignment-as-expression: value, DUP (result stays), SET_LOCAL (stores).
+        let chunk = compile_source("let x = 1\nx = 2").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("DUP"), "missing DUP in:\n{text}");
+        assert!(text.contains("SET_LOCAL"), "missing SET_LOCAL in:\n{text}");
+    }
+
+    #[test]
+    fn block_shadowing_uses_distinct_slots() {
+        // Outer x and inner x are distinct slots → slot_count is at least 2.
+        let chunk = compile_source("let x = 1\n{ let x = 2\n print(x) }\nprint(x)").expect("compiles");
+        assert!(chunk.slot_count >= 2, "shadowing should allocate ≥2 slots, got {}", chunk.slot_count);
+    }
+
+    #[test]
+    fn rejects_destructuring_let() {
+        let err = compile_source("let [a, b] = arr").unwrap_err();
+        assert!(err.message.contains("destructuring let"), "got {err:?}");
+    }
+
+    #[test]
+    fn rejects_compound_assignment() {
+        let err = compile_source("let x = 1\nx += 2").unwrap_err();
+        assert!(err.message.contains("compound assignment"), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn let_and_local_read_evaluates() {
+        assert_eq!(eval_number("let x = 1\nlet y = x + 1\ny").await, 2.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reassignment_evaluates() {
+        assert_eq!(eval_number("let x = 1\nx = x + 5\nx").await, 6.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assignment_expression_yields_value() {
+        // The trailing `x = 5` is the program's value: assignment yields the
+        // assigned value.
+        assert_eq!(eval_number("let x = 1\nx = 5").await, 5.0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn block_shadowing_does_not_leak() {
+        // After the block, the outer x is still 1.
+        assert_eq!(eval_number("let x = 1\n{ let x = 2 }\nx").await, 1.0);
     }
 }

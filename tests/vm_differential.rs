@@ -176,3 +176,37 @@ async fn vm_run_print_matches_treewalker() {
         assert_vm_run_matches_treewalker(src).await;
     }
 }
+
+#[tokio::test]
+async fn vm_run_locals_match_treewalker() {
+    let cases = [
+        // let + local read + arithmetic
+        "let x = 1\nlet y = x + 1\nprint(y)",
+        // reassignment
+        "let x = 1\nx = x + 5\nprint(x)",
+        // block shadowing: inner x gets a distinct slot; outer is unchanged
+        "let x = 1\n{ let x = 2\n print(x) }\nprint(x)",
+        // const binds like let at runtime
+        "const c = 10\nprint(c * 2)",
+        // assignment is a statement that stores; the next read sees the new value.
+        // (Assignment-as-expression yielding its value — e.g. `print(x = 5)` — is
+        // exercised in the compiler unit tests via the trailing-value path; the
+        // CST front-end does not currently parse an assignment inside call args,
+        // a pre-existing parser limitation unrelated to locals, so it is not run
+        // through the `print(...)`-based differential harness here.)
+        "let x = 1\nx = 5\nprint(x)",
+        // let with no initializer binds nil
+        "let x\nprint(x)",
+        // string locals + template interpolation through a local
+        "let name = \"world\"\nprint(`hi ${name}!`)",
+        // multiple locals interacting
+        "let a = 2\nlet b = 3\nlet c = a * b + 1\nprint(c)",
+        // reassign then read inside and after a block (shared slot)
+        "let n = 0\nn = n + 10\n{ n = n + 5\n print(n) }\nprint(n)",
+        // block that declares a local used only within the block
+        "{ let z = 7\n print(z * z) }\nprint(\"done\")",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}

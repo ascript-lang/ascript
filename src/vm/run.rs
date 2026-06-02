@@ -134,6 +134,20 @@ impl Vm {
                     fiber.push(Value::Bool(!a.is_truthy()));
                 }
 
+                Op::GetLocal => {
+                    let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.local(slot).clone();
+                    fiber.push(v);
+                }
+                Op::SetLocal => {
+                    // Clean stack discipline: SET_LOCAL POPS the value and stores
+                    // it. Assignment-as-expression `DUP`s beforehand so a copy
+                    // remains as the expression's result (see `compile_assign`).
+                    let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.pop();
+                    fiber.set_local(slot, v);
+                }
+
                 Op::GetGlobal => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
