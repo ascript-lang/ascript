@@ -44,9 +44,7 @@ impl Out {
         self.buf.push('\n');
         self.at_line_start = true;
     }
-    #[allow(dead_code)]
     fn indent(&mut self) { self.indent += 1; }
-    #[allow(dead_code)]
     fn dedent(&mut self) { self.indent = self.indent.saturating_sub(1); }
 
     /// Append ` <comment>` at the end of the last non-empty line (before its
@@ -119,7 +117,7 @@ impl Printer<'_> {
         }
     }
 
-    /// Format a statement. 4a handles ExprStmt + a fallback; 4b completes it.
+    /// Format a statement. 4a handles ExprStmt/LetStmt/ReturnStmt/Block/FnDecl + a fallback.
     fn stmt(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         match node.kind() {
@@ -129,11 +127,97 @@ impl Printer<'_> {
                 }
                 self.out.newline();
             }
+            LetStmt => {
+                let kw = first_kw_text(node);
+                self.out.text(&kw);
+                self.out.text(" ");
+                if let Some(name) = first_ident_text(node) {
+                    self.out.text(&name);
+                }
+                if let Some(init) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.out.text(" = ");
+                    self.expr(init);
+                }
+                self.out.newline();
+            }
+            ReturnStmt => {
+                self.out.text("return");
+                if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.out.text(" ");
+                    self.expr(e);
+                }
+                self.out.newline();
+            }
+            Block => self.block(node),
+            FnDecl => self.fn_decl(node),
             _ => {
                 self.out.text(&node.text().to_string());
                 self.out.newline();
             }
         }
+    }
+
+    fn block(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("{");
+        self.out.newline();
+        self.out.indent();
+        let stmts: Vec<&ResolvedNode> = node
+            .children()
+            .filter(|c| c.kind() != Error && c.kind() != Tombstone)
+            .collect();
+        for (i, s) in stmts.iter().enumerate() {
+            if i > 0 {
+                let blank = self
+                    .comments
+                    .leading
+                    .get(&s.text_range())
+                    .and_then(|l| l.first())
+                    .map(|c| c.blank_before)
+                    .unwrap_or(false);
+                if blank {
+                    self.out.blank();
+                }
+            }
+            self.emit_leading(s);
+            self.stmt(s);
+            self.emit_trailing(s);
+        }
+        self.out.dedent();
+        self.out.text("}");
+        self.out.newline();
+    }
+
+    fn fn_decl(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        // 4a: plain `fn name(params) { body }` (async/*/ret-type are Plan 4b).
+        self.out.text("fn ");
+        if let Some(name) = first_ident_text(node) {
+            self.out.text(&name);
+        }
+        self.params(node);
+        self.out.text(" ");
+        if let Some(body) = node.children().find(|c| c.kind() == Block) {
+            self.block(body);
+        }
+    }
+
+    fn params(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("(");
+        if let Some(list) = node.children().find(|c| c.kind() == ParamList) {
+            let params: Vec<&ResolvedNode> =
+                list.children().filter(|c| c.kind() == Param).collect();
+            for (i, p) in params.iter().enumerate() {
+                if i > 0 {
+                    self.out.text(", ");
+                }
+                if let Some(name) = first_ident_text(p) {
+                    self.out.text(&name);
+                }
+            }
+        }
+        self.out.text(")");
     }
 
     /// Format an expression (representative subset for 4a).
@@ -194,6 +278,49 @@ fn blank_between_bare(next: &ResolvedNode) -> bool {
     newlines >= 2
 }
 
+fn first_kw_text(node: &ResolvedNode) -> String {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| matches!(t.kind(), SyntaxKind::LetKw | SyntaxKind::ConstKw))
+        .map(|t| t.text().to_string())
+        .unwrap_or_else(|| "let".to_string())
+}
+
+fn first_ident_text(node: &ResolvedNode) -> Option<String> {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| t.text().to_string())
+}
+
+fn is_expr_kind(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        kind,
+        Literal
+            | NameRef
+            | UnaryExpr
+            | BinaryExpr
+            | ParenExpr
+            | CallExpr
+            | MemberExpr
+            | IndexExpr
+            | ArrowExpr
+            | AssignExpr
+            | ArrayExpr
+            | ObjectExpr
+            | TemplateExpr
+            | OptMemberExpr
+            | TryExpr
+            | UnwrapExpr
+            | TernaryExpr
+            | AwaitExpr
+            | YieldExpr
+            | MatchExpr
+            | RangeExpr
+    )
+}
+
 fn is_binary_op(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(kind, Plus | Minus | Star | Slash | Percent | StarStar | EqEq | BangEq
@@ -230,5 +357,14 @@ mod tests {
         assert_eq!(fmt("a\n\n\n\nb\n"), "a\n\nb\n"); // 2+ blanks collapse to 1
         assert_eq!(fmt("a\n\nb\n"), "a\n\nb\n");       // one blank preserved
         assert_eq!(fmt("a\nb\n"), "a\nb\n");           // none stays none
+    }
+
+    #[test]
+    fn formats_let_and_fn() {
+        assert_eq!(fmt("let   x=1"), "let x = 1\n");
+        assert_eq!(
+            fmt("fn f(a,b){return a+b}"),
+            "fn f(a, b) {\n  return a + b\n}\n"
+        );
     }
 }
