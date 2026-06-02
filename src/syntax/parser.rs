@@ -163,6 +163,19 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
         expr_bp(p, r_bp);
         lhs_cm = p.complete(m, SyntaxKind::BinaryExpr);
     }
+    // Ternary tail: cond ? then : els  (right-assoc; then/els are full exprs).
+    if p.at(SyntaxKind::Question) && ternary_ahead(p) {
+        let m = p.precede(&lhs_cm);
+        p.bump(); // ?
+        expr(p); // then
+        if p.at(SyntaxKind::Colon) {
+            p.bump();
+            expr(p); // els
+        } else {
+            p.error("expected ':' in ternary");
+        }
+        lhs_cm = p.complete(m, SyntaxKind::TernaryExpr);
+    }
     lhs_cm
 }
 
@@ -336,7 +349,7 @@ fn infix_binding_power(kind: SyntaxKind) -> Option<(u8, u8)> {
 }
 
 fn expr(p: &mut Parser) {
-    expr_bp(p, 0);
+    let _ = expr_returning(p);
 }
 
 fn expr_bp(p: &mut Parser, min_bp: u8) {
@@ -838,5 +851,23 @@ mod tests {
         assert!(tree_shape("g()!").contains(&SyntaxKind::UnwrapExpr));
         assert!(parse("f()?").errors.is_empty());
         assert!(parse("g()!").errors.is_empty());
+    }
+
+    #[test]
+    fn ternary_basic() {
+        let shape = tree_shape("a ? b : c");
+        assert!(shape.contains(&SyntaxKind::TernaryExpr));
+        assert!(parse("a ? b : c").errors.is_empty());
+    }
+
+    #[test]
+    fn ternary_vs_propagate_disambiguation() {
+        // `f()? - 1` is propagate-then-subtract (NOT a ternary): no `:` follows.
+        let p = parse("f()? - 1");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        assert!(tree_shape("f()? - 1").contains(&SyntaxKind::TryExpr));
+        assert!(!tree_shape("f()? - 1").contains(&SyntaxKind::TernaryExpr));
+        // `a ? -b : c` IS a ternary.
+        assert!(tree_shape("a ? -b : c").contains(&SyntaxKind::TernaryExpr));
     }
 }
