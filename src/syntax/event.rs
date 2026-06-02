@@ -22,7 +22,7 @@ pub enum Event {
 
 /// Placeholder kind for a Start event not yet assigned a node kind, or abandoned.
 /// The builder skips Tombstone Start events.
-pub const TOMBSTONE: SyntaxKind = SyntaxKind::Error;
+pub const TOMBSTONE: SyntaxKind = SyntaxKind::Tombstone;
 
 #[cfg(test)]
 mod tests {

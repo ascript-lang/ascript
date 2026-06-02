@@ -80,3 +80,17 @@ fn nontrivia_token_count_matches_legacy() {
         );
     }
 }
+
+#[test]
+fn structured_tree_is_lossless_over_corpus() {
+    for path in corpus() {
+        let src = fs::read_to_string(&path).unwrap();
+        let node = ascript::syntax::parse_to_tree(&src);
+        assert_eq!(
+            node.text().to_string(),
+            src,
+            "structured tree not lossless for {}",
+            path.display()
+        );
+    }
+}

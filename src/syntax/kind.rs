@@ -102,6 +102,9 @@ pub enum SyntaxKind {
 
     // --- sentinel for unrecognized input ---
     Error,
+
+    // --- internal parser sentinel (never appears in a completed tree) ---
+    Tombstone,
 }
 
 impl SyntaxKind {
