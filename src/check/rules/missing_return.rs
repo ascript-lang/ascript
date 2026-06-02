@@ -4,7 +4,7 @@
 //! stmt is `return`, or an if/else where both branches definitely return, or
 //! ends in an expression statement that may be the value). Uncertain → silent.
 
-use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
+use crate::check::diagnostic::{AsDiagnostic, Severity};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::ResolveResult;
@@ -27,10 +27,11 @@ pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<
             continue;
         };
         if !definitely_returns(body) {
-            // point at the function's range for a clear location
-            let range = f.text_range();
+            // point at the function's first non-trivia token (the `fn`/`async`
+            // keyword), not at its leading trivia (which would land on the
+            // previous line).
             out.push(AsDiagnostic {
-                range: ByteSpan::from(range),
+                range: crate::check::rules::code_range(f),
                 severity: Severity::Warning,
                 code: "missing-return".to_string(),
                 message: "function with a declared return type may not return a value".to_string(),

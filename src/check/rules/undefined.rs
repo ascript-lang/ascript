@@ -1,7 +1,7 @@
 //! `undefined-variable`: a NameRef the resolver classifies `Global` whose name
 //! is neither a builtin, nor `self`/`super`, nor an imported/local binding.
 
-use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
+use crate::check::diagnostic::{AsDiagnostic, Severity};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{BindingKind, Resolution, ResolveResult};
@@ -28,7 +28,7 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         if let Some(Resolution::Global(name)) = resolved.uses.get(&n.text_range()) {
             if !is_allowed_global(name) && !hoisted.contains(name.as_str()) {
                 out.push(AsDiagnostic {
-                    range: ByteSpan::from(n.text_range()),
+                    range: crate::check::rules::code_range(n),
                     severity: Severity::Warning,
                     code: "undefined-variable".to_string(),
                     message: format!("`{name}` is not defined"),

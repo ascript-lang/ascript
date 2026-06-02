@@ -1,7 +1,7 @@
 //! `unreachable-code`: statements following a `return`/`break`/`continue` in the
 //! same block can never execute.
 
-use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
+use crate::check::diagnostic::{AsDiagnostic, Severity};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::ResolveResult;
@@ -19,7 +19,7 @@ pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<
             // statements after the FIRST terminator are unreachable.
             if let Some(first_dead) = stmts.get(term_idx + 1) {
                 out.push(AsDiagnostic {
-                    range: ByteSpan::from(first_dead.text_range()),
+                    range: crate::check::rules::code_range(first_dead),
                     severity: Severity::Warning,
                     code: "unreachable-code".to_string(),
                     message: "unreachable code".to_string(),
@@ -71,5 +71,43 @@ mod tests {
     #[test]
     fn no_unreachable_normal_flow() {
         assert!(!has("fn f() { print(1)\n return 2 }\nf()\n", "unreachable-code"));
+    }
+
+    /// Line attribution: the diagnostic must point at the dead statement itself,
+    /// NOT at the end of the previous (terminator) line. A CST node's range
+    /// includes its leading trivia (the newline/indent before it), so without
+    /// `code_range` the diagnostic's `range.start` lands on the `return 1` line.
+    #[test]
+    fn points_at_dead_statement_not_previous_line() {
+        let src = "fn f() {\n  return 1\n  print(2)\n}\nf()\n";
+        let diag = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "unreachable-code")
+            .expect("expected an unreachable-code diagnostic");
+        let print_off = src.find("print(2)").unwrap();
+        // The diagnostic must start exactly at (or after) `print(2)`, never on
+        // the preceding `return 1` line / its trailing newline.
+        assert!(
+            diag.range.start >= print_off,
+            "diagnostic start {} should be at/after `print(2)` offset {} (would be on the \
+             previous line if it included leading trivia)",
+            diag.range.start,
+            print_off
+        );
+        // And precisely at the `print` token, not somewhere later.
+        assert_eq!(diag.range.start, print_off, "should point at `print`");
+    }
+
+    /// With correct line attribution, an inline `ascript-ignore` on the dead line
+    /// suppresses the diagnostic. With the off-by-one-line bug the diagnostic
+    /// would be attributed to the `return 1` line and the suppression would miss.
+    #[test]
+    fn inline_suppression_on_dead_line_works() {
+        let src = "fn f() {\n  return 1\n  print(2) // ascript-ignore[unreachable-code]\n}\nf()\n";
+        assert!(
+            !has(src, "unreachable-code"),
+            "inline ascript-ignore on the dead-code line should suppress it"
+        );
     }
 }
