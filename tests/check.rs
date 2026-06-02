@@ -45,3 +45,54 @@ fn json_output_is_a_json_array() {
     assert!(stdout.trim_start().starts_with('['), "json output: {stdout}");
     assert!(stdout.contains("\"code\":\"syntax-error\""));
 }
+
+// The checker must NOT false-positive on idiomatic code: every example program
+// should produce zero diagnostics (or only ones a maintainer has suppressed in
+// the source). Any new false positive fails this and must be fixed (rule made
+// more conservative) or suppressed in the example with a reason.
+mod corpus {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn corpus() -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().and_then(|x| x.to_str()) == Some("as") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut v = Vec::new();
+        walk(Path::new("examples"), &mut v);
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn checker_is_clean_on_the_corpus() {
+        use ascript::check::Severity;
+        let mut offenders = Vec::new();
+        for path in corpus() {
+            let src = fs::read_to_string(&path).unwrap();
+            // The gate is about no false ERRORS/WARNINGS on idiomatic code. Advisory
+            // Hint/Info (e.g. `shadowing`) may legitimately appear and are allowed.
+            let actionable: Vec<_> = ascript::check::analyze(&src)
+                .diagnostics
+                .into_iter()
+                .filter(|d| matches!(d.severity, Severity::Error | Severity::Warning))
+                .map(|d| format!("{}@{}", d.code, d.range.start))
+                .collect();
+            if !actionable.is_empty() {
+                offenders.push(format!("{}: {:?}", path.display(), actionable));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "checker false-positived (error/warning) on idiomatic examples (make the rule conservative or suppress with a reason):\n{}",
+            offenders.join("\n")
+        );
+    }
+}

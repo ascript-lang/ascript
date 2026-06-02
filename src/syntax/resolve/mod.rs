@@ -152,6 +152,10 @@ impl Resolver {
         let parent = frame_idx - 1;
         if let Some(slot) = self.resolve_local_in(parent, name) {
             self.mark_captured(parent, slot);
+            // Count the capture as a use of the declaring binding so the
+            // `unused-binding`/`unused-import` lint does not flag bindings that
+            // are only read from a nested function.
+            self.bump_use_in(parent, slot);
             return Some(self.add_upvalue(frame_idx, UpvalueDescriptor::ParentLocal(slot)));
         }
         if let Some(idx) = self.resolve_upvalue(parent, name) {
@@ -445,6 +449,16 @@ impl Resolver {
     fn bump_use(&mut self, slot: u32) {
         if let Some(b) = self
             .frame()
+            .bindings
+            .iter_mut()
+            .find(|b| b.slot == slot)
+        {
+            b.use_count += 1;
+        }
+    }
+
+    fn bump_use_in(&mut self, frame_idx: usize, slot: u32) {
+        if let Some(b) = self.frames[frame_idx]
             .bindings
             .iter_mut()
             .find(|b| b.slot == slot)

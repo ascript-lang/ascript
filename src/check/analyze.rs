@@ -249,9 +249,16 @@ mod tests {
     #[test]
     fn unterminated_string_is_one_syntax_error() {
         let a = analyze("let s = \"oops\n");
-        assert_eq!(a.diagnostics.len(), 1, "got {:?}", a.diagnostics);
-        let d = &a.diagnostics[0];
-        assert_eq!(d.code, "syntax-error");
+        // Exactly one syntax-error (the unterminated string is not duplicated by
+        // the lexer); lint diagnostics for the surrounding code are not asserted
+        // here.
+        let syntax: Vec<_> = a
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "syntax-error")
+            .collect();
+        assert_eq!(syntax.len(), 1, "got {:?}", a.diagnostics);
+        let d = syntax[0];
         assert!(
             d.message.contains("unterminated"),
             "message: {}",

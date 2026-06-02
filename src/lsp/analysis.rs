@@ -1117,9 +1117,14 @@ mod tests {
     #[test]
     fn unterminated_string_is_one_error() {
         let diags = diagnostics("let s = \"oops");
-        assert_eq!(diags.len(), 1);
-        let d = &diags[0];
-        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        // Exactly one ERROR (the unterminated string), not duplicated by the
+        // lexer; lint warnings/hints for the surrounding code are not asserted.
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.severity == Some(DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(errors.len(), 1, "got {diags:?}");
+        let d = errors[0];
         assert_eq!(d.source.as_deref(), Some("ascript"));
         assert!(
             d.message.to_lowercase().contains("string"),

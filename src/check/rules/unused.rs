@@ -11,13 +11,20 @@ pub fn check(_tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<
         if b.use_count != 0 {
             continue;
         }
+        // An underscore-prefixed name (incl. bare `_`) is the conventional
+        // "intentionally unused" marker — never flag it.
+        if b.name.starts_with('_') {
+            continue;
+        }
         match b.kind {
             BindingKind::Param => {} // params are exempt
             BindingKind::Import => out.push(unused(b, "unused-import", "remove unused import")),
-            BindingKind::Let | BindingKind::Const | BindingKind::PatternBind => {
+            BindingKind::Let | BindingKind::Const => {
                 out.push(unused(b, "unused-binding", "remove unused binding"))
             }
-            // fn/class/enum/loop-var: skip (often public API / loop counters)
+            // PatternBind is exempt: destructuring a `[value, err]` Result pair (or
+            // an object/array) idiomatically binds slots that aren't all read.
+            // fn/class/enum/loop-var: skip (often public API / loop counters).
             _ => {}
         }
     }

@@ -4,7 +4,8 @@
 use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
-use crate::syntax::resolve::types::{Resolution, ResolveResult};
+use crate::syntax::resolve::types::{BindingKind, Resolution, ResolveResult};
+use std::collections::HashSet;
 
 /// Names always available even though the resolver marks them Global.
 fn is_allowed_global(name: &str) -> bool {
@@ -13,9 +14,19 @@ fn is_allowed_global(name: &str) -> bool {
 
 pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
     let mut out = Vec::new();
+    // Hoistable declarations (fn/class/enum) are visible before their textual
+    // position; the resolver records pre-declaration uses as Global. Treat any
+    // Global whose name matches such a declaration as defined (conservative — we
+    // never flag a name that IS declared somewhere as a hoistable item).
+    let hoisted: HashSet<&str> = resolved
+        .bindings
+        .iter()
+        .filter(|b| matches!(b.kind, BindingKind::Fn | BindingKind::Class | BindingKind::Enum))
+        .map(|b| b.name.as_str())
+        .collect();
     for n in tree.descendants().filter(|n| n.kind() == SyntaxKind::NameRef) {
         if let Some(Resolution::Global(name)) = resolved.uses.get(&n.text_range()) {
-            if !is_allowed_global(name) {
+            if !is_allowed_global(name) && !hoisted.contains(name.as_str()) {
                 out.push(AsDiagnostic {
                     range: ByteSpan::from(n.text_range()),
                     severity: Severity::Warning,
