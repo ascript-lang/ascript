@@ -544,10 +544,25 @@ async fn vm_run_sync_multi_feature_programs() {
 /// (`+=`/`-=`/`*=`/`/=`, deferred to V9). NOTE: `for (i in <value>)` over a NAME
 /// bound to a range/array value now qualifies — the VM routes `in` over a
 /// non-`RangeExpr` to the for-of path (matching the legacy parser's `in` overload),
-/// so a range-VALUE for-in iterates fine (V3-T4b). Deliberately EXCLUDED for those
-/// reasons:
-///   - `factorial.as` — uses `*=`.
-///   - `data.as`      — uses `+=`.
+/// so a range-VALUE for-in iterates fine (V3-T4b).
+///
+/// V4 qualifiers (added now that the VM supports user functions — definitions,
+/// calls, recursion, mutual/forward refs, closures, params/rest/contracts): an
+/// example that ALSO uses `fn`/arrows/calls now qualifies, provided it STILL
+/// contains none of V6..V12: `?`/`!` operators, recover-as-`?`, async/await,
+/// generators, `match`, `class`/`enum`, `import`, destructuring/spread, OR
+/// compound assignment (`+=`/`-=`/`*=`/`/=`, V9). The set of files that match
+/// byte-identically is established empirically (run both engines over each
+/// `examples/*.as` and keep only the ones that agree); see the audit note below
+/// each entry. Deliberately EXCLUDED, with the verified reason:
+///   - `functions.as` — uses `+=` (line 9; V9 compound assignment).
+///   - `factorial.as` — uses `*=` (V9 compound assignment).
+///   - `data.as`      — uses `+=` (V9 compound assignment).
+///   - `typed.as`     — uses `+=` (V9) and `recover`/await (V6/V7).
+///   - `result.as`    — uses the `?` propagation operator (V6).
+///   - every other function-heavy example uses `import` (V12), `match` (V10),
+///     `class`/`enum` (V9), async/generators (V7/V8), or `?`/`!` (V6) — none of
+///     which the VM compiles yet, so they error rather than diverge.
 const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     "examples/hello.as",   // `print(1 + 2 * 3)` — literals + arithmetic + print.
     "examples/numbers.as", // numeric-literal forms bound to locals, then printed.
@@ -556,6 +571,11 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     // V3-T4b: range/array VALUE for-in (`for (i in r)`) routes to for-of; also uses
     // `let` w/o initializer, typed decl, `len`, and a literal-range for-in.
     "examples/ranges.as",
+    // V4 function qualifier: typed locals with the `T?` nullable suffix, a `fn`
+    // with optional (`string?`) params + return type, calls, and `assert`. No
+    // `import`/compound-assign/`match`/`class`/`?`-operator — byte-identical
+    // (verified by running both engines over the file).
+    "examples/optional_types.as",
 ];
 
 #[tokio::test]
@@ -1451,4 +1471,75 @@ async fn vm_panic_through_closure_escapes_recover_message_matches_treewalker() {
         "panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
         tw.message, vm.message
     );
+}
+
+// ----- V4-T6: function-heavy multi-feature sync programs -----------------------
+//
+// These COMBINE the full V4 function set (definitions, calls, recursion,
+// mutual/forward refs, closures capturing + mutating state, functions returning
+// functions, rest params, typed params + contracts, the native→VM `recover`
+// bridge) with the V1..V3 base (locals, arithmetic, arrays/objects, index/member,
+// templates, short-circuit/`??`, `if`/`for`/`while`, ternary, `print`). The
+// single-feature function tests above prove each construct in isolation; these
+// prove they compose correctly through the compiler + VM, byte-for-byte against
+// the tree-walker. This is the V4 sync-subset gate. NEVER weaken the byte-
+// identical assertion: a divergence here is a real VM/compiler bug.
+//
+// NOTE on recursion depth: the tree-walker (the differential oracle) recurses on
+// the Rust stack and overflows at modest depth under the debug test thread's small
+// stack — a stack overflow aborts the WHOLE test process — so any recursion here
+// stays well within what the tree-walker survives (e.g. ackermann is kept to
+// `ack(2, 2)`; the heap-bounded deep-recursion proof is the VM-only test above).
+
+#[tokio::test]
+async fn vm_run_function_heavy_multi_feature_programs() {
+    let programs = [
+        // (a) classic recursion: fibonacci computed for 0..10, each printed.
+        "fn fib(n) { if (n < 2) { return n }\n return fib(n - 1) + fib(n - 2) }\n\
+         for (i in 0..10) { print(fib(i)) }",
+        // (b) recursion via the Euclidean algorithm (gcd), two cases.
+        "fn gcd(a, b) { if (b == 0) { return a }\n return gcd(b, a % b) }\n\
+         print(gcd(48, 36))\nprint(gcd(17, 5))",
+        // (c) ackermann — nested non-trivial recursion (kept SMALL: ack(2,2)=7 is
+        // well within the tree-walker's stack).
+        "fn ack(m, n) { if (m == 0) { return n + 1 }\n if (n == 0) { return ack(m - 1, 1) }\n\
+         return ack(m - 1, ack(m, n - 1)) }\nprint(ack(2, 2))",
+        // (d) mutual recursion (isEven/isOdd), printed via a template over a range.
+        "fn isEven(n) { if (n == 0) { return true }\n return isOdd(n - 1) }\n\
+         fn isOdd(n) { if (n == 0) { return false }\n return isEven(n - 1) }\n\
+         for (i in 0..6) { print(`${i} even=${isEven(i)}`) }",
+        // (e) higher-order via the native→VM `recover` bridge + closures calling
+        // closures (a closure returned by `make` invoked through another closure).
+        "fn make(base) { return (x) => base + x }\nlet add10 = make(10)\nlet add100 = make(100)\n\
+         print(recover(() => add10(5))[0])\nprint(add100(add10(1)))",
+        // (f) closure capturing + MUTATING shared state (an accumulator): each call
+        // mutates the captured `total` through the shared cell.
+        "fn acc() { let total = 0\n return (n) => { total = total + n\n return total } }\n\
+         let a = acc()\nprint(a(5))\nprint(a(10))\nprint(a(-3))",
+        // (g) function returning a function (adder factory), two independent closures.
+        "fn adder(x) { return (y) => x + y }\nlet inc = adder(1)\nlet plus5 = adder(5)\n\
+         print(inc(41))\nprint(plus5(plus5(0)))",
+        // (h) a fn computing over an array with a loop, returning an object summary.
+        "fn stats(xs) { let sum = 0\n let max = xs[0]\n for (x of xs) { sum = sum + x\n\
+         if (x > max) { max = x } }\n return { sum: sum, max: max, n: len(xs) } }\n\
+         let s = stats([3, 7, 2, 9, 4])\nprint(`sum=${s.sum} max=${s.max} n=${s.n}`)",
+        // (i) a fn computing over OBJECTS (member reads), called in a for-of loop.
+        "fn pointNorm(p) { return p.x * p.x + p.y * p.y }\n\
+         let pts = [{x: 3, y: 4}, {x: 1, y: 1}]\nfor (p of pts) { print(pointNorm(p)) }",
+        // (j) deeply NESTED closures (three levels), fully applied in one chain.
+        "fn outer(a) { return (b) => { return (c) => a + b + c } }\nprint(outer(1)(2)(3))",
+        // (k) a fn with REST params aggregating its trailing args via a loop.
+        "fn sumAll(...xs) { let t = 0\n for (x of xs) { t = t + x }\n return t }\n\
+         print(sumAll())\nprint(sumAll(1, 2, 3, 4, 5))",
+        // (l) TYPED params + an optional param with a `??` default (default-ish).
+        "fn greet(name: string, greeting: string?) { let g = greeting ?? \"Hello\"\n\
+         return `${g}, ${name}!` }\nprint(greet(\"Ada\", nil))\nprint(greet(\"Lin\", \"Hi\"))",
+        // (m) higher-order: functions passed as arguments and COMPOSED (f∘g), order
+        // matters, so both orders are printed.
+        "fn apply(f, g, x) { return f(g(x)) }\nfn dbl(n) { return n * 2 }\nfn inc(n) { return n + 1 }\n\
+         print(apply(dbl, inc, 10))\nprint(apply(inc, dbl, 10))",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
 }
