@@ -282,6 +282,10 @@ pub enum Value {
     Builtin(Rc<str>),
     /// A user-defined function carrying its closure environment.
     Function(Rc<Function>),
+    /// A bytecode-VM closure: a function prototype plus its captured upvalue
+    /// cells. Behaves like `Function` to the user (same `type()`/display);
+    /// identity equality. Produced by the VM (V4+); inert in the tree-walker.
+    Closure(Rc<crate::vm::value_ext::Closure>),
     Array(Rc<RefCell<Vec<Value>>>),
     Object(Rc<RefCell<IndexMap<String, Value>>>),
     // IndexMap (not HashMap) is deliberate: insertion order is required for
@@ -345,6 +349,7 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             // Functions compare by identity.
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
+            (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
             (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             (Value::Map(a), Value::Map(b)) => Rc::ptr_eq(a, b),
@@ -392,6 +397,7 @@ impl fmt::Debug for Value {
                     func.name.as_deref().unwrap_or("<anonymous>")
                 )
             }
+            Value::Closure(_) => write!(f, "Closure(<anonymous>)"),
             Value::Array(a) => write!(f, "Array(len {})", a.borrow().len()),
             Value::Object(o) => write!(f, "Object(len {})", o.borrow().len()),
             Value::Map(m) => write!(f, "Map(len {})", m.borrow().len()),
@@ -441,6 +447,9 @@ impl Value {
                 Some(n) => write!(f, "<function {}>", n),
                 None => write!(f, "<function>"),
             },
+            // A VM closure has no name on its proto, so it displays exactly like
+            // an anonymous `Function`. (Same concept to the user.)
+            Value::Closure(_) => write!(f, "<function>"),
             Value::Array(a) => {
                 let ptr = Rc::as_ptr(a) as usize;
                 if seen.contains(&ptr) {
@@ -633,6 +642,62 @@ mod tests {
         let b = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
         assert!(a == b);
         assert_eq!(dec_key.to_value(), Value::Decimal(Decimal::from(1)));
+    }
+
+    #[test]
+    fn closure_behaves_like_an_anonymous_function() {
+        use crate::vm::chunk::{Chunk, FnProto};
+        use crate::vm::value_ext::Closure;
+
+        let proto = Rc::new(FnProto {
+            chunk: Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+        });
+        let a = Closure::new(proto);
+        let cv = Value::Closure(a.clone());
+
+        // Display mirrors an anonymous Function exactly.
+        assert_eq!(cv.to_string(), "<function>");
+        assert_eq!(Value::Function(anon_function()).to_string(), "<function>");
+
+        // type() reports "function", like a Function.
+        assert_eq!(crate::interp::type_name(&cv), "function");
+        assert_eq!(
+            crate::interp::type_name(&Value::Function(anon_function())),
+            "function"
+        );
+
+        // Pointer identity: same Rc is equal; a distinct closure is not.
+        assert_eq!(Value::Closure(a.clone()), Value::Closure(a.clone()));
+        let b = Closure::new(Rc::new(FnProto {
+            chunk: Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+        }));
+        assert_ne!(Value::Closure(a), Value::Closure(b));
+
+        // Not a valid map key (mirrors Function).
+        assert!(MapKey::from_value(&cv).is_none());
+
+        // Truthy, like any callable.
+        assert!(cv.is_truthy());
+    }
+
+    fn anon_function() -> Rc<Function> {
+        Rc::new(Function {
+            name: None,
+            params: vec![],
+            ret: None,
+            body: vec![],
+            closure: Environment::global(),
+            is_async: false,
+            is_generator: false,
+        })
     }
 
     #[test]

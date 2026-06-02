@@ -3185,7 +3185,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Number(_) => "number",
         Value::Decimal(_) => "decimal",
         Value::Str(_) => "string",
-        Value::Builtin(_) | Value::Function(_) => "function",
+        Value::Builtin(_) | Value::Function(_) | Value::Closure(_) => "function",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
         Value::Map(_) => "map",
