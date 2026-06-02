@@ -1,7 +1,8 @@
 //! Lint rules. Each is `fn(&ResolvedNode, &ResolveResult, &str) -> Vec<AsDiagnostic>`.
 use crate::check::diagnostic::{AsDiagnostic, ByteSpan};
 use crate::syntax::cst::ResolvedNode;
-use crate::syntax::resolve::types::ResolveResult;
+use crate::syntax::kind::SyntaxKind;
+use crate::syntax::resolve::types::{Resolution, ResolveResult};
 
 pub mod dead_recover;
 pub mod ignored_result;
@@ -38,6 +39,37 @@ pub fn dropped_call(expr_stmt: &ResolvedNode) -> Option<ResolvedNode> {
         .children()
         .find(|c| c.kind() == SyntaxKind::CallExpr)
         .cloned()
+}
+
+/// The declared name of a `FnDecl` (its first `Ident` token), if any. Shared by
+/// the rules that collect a set of locally-declared function names (async fns for
+/// unawaited-future, Result-returning fns for ignored-result).
+pub fn fn_name(fn_decl: &ResolvedNode) -> Option<String> {
+    fn_decl
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| t.text().to_string())
+}
+
+/// If `expr_stmt` is a bare dropped call `name(...)` whose callee resolves to a
+/// LOCAL/UPVALUE binding, returns `(name, call_node)`. Used by unawaited-future
+/// and ignored-result to find a dropped call to a locally-declared function. The
+/// returned call node lets each rule compute `code_range(&call)` for its diagnostic.
+pub fn dropped_local_call(
+    expr_stmt: &ResolvedNode,
+    resolved: &ResolveResult,
+) -> Option<(String, ResolvedNode)> {
+    let call = dropped_call(expr_stmt)?;
+    let callee = call.children().find(|c| c.kind() == SyntaxKind::NameRef)?;
+    if !matches!(
+        resolved.uses.get(&callee.text_range()),
+        Some(Resolution::Local(_) | Resolution::Upvalue(_))
+    ) {
+        return None;
+    }
+    let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
+    Some((name, call))
 }
 
 /// Byte span of `node` starting at its first *non-trivia* token (a CST node's

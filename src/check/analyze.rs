@@ -133,8 +133,17 @@ fn parse_ignore(comment: &str) -> Option<(bool, Vec<String>)> {
         return Some((file_wide, vec!["*".to_string()]));
     }
 
-    // Parse `[a, b, c]`.
-    let inner = rest.trim_start_matches('[').trim_end_matches(']');
+    // Parse only the content between the first `[` and the next `]`, ignoring any
+    // trailing prose (e.g. `// ascript-ignore[code] because <reason>`). A body with
+    // no `[` at all is treated as bare (all codes).
+    let Some(open) = rest.find('[') else {
+        return Some((file_wide, vec!["*".to_string()]));
+    };
+    let after = &rest[open + 1..];
+    let inner = match after.find(']') {
+        Some(close) => &after[..close],
+        None => after,
+    };
     let codes: Vec<String> = inner
         .split(',')
         .map(|s| s.trim().to_string())
@@ -244,6 +253,50 @@ mod tests {
         assert!(!supp.suppressed_on_line(0, "some-other-code"));
         // End-to-end: the next-line `@` syntax error is suppressed.
         assert!(analyze(src).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ignore_with_trailing_reason_suppresses() {
+        let supp = suppressions("// ascript-ignore[syntax-error] because legacy\n@\n");
+        assert!(supp.suppressed_on_line(0, "syntax-error"));
+    }
+
+    #[test]
+    fn ignore_multi_code_with_reason() {
+        let supp = suppressions("// ascript-ignore[a, b] note\n@\n");
+        assert!(supp.suppressed_on_line(0, "a"));
+        assert!(supp.suppressed_on_line(0, "b"));
+        assert!(!supp.suppressed_on_line(0, "c"));
+    }
+
+    #[test]
+    fn bare_ignore_suppresses_all() {
+        let supp = suppressions("// ascript-ignore\n@\n");
+        assert!(supp.suppressed_on_line(0, "syntax-error"));
+        assert!(supp.suppressed_on_line(0, "any-code-at-all"));
+    }
+
+    #[test]
+    fn ignore_file_with_reason_suppresses_file_wide() {
+        let supp = suppressions("// ascript-ignore-file[syntax-error] legacy module\n@\n");
+        // file-wide: applies regardless of line
+        assert!(supp.suppressed_on_line(5, "syntax-error"));
+        assert!(!supp.suppressed_on_line(5, "other-code"));
+    }
+
+    #[test]
+    fn inline_reason_suppresses_unawaited_future_end_to_end() {
+        let src = "async fn work() { return 1 }\n\
+                   fn main() { work() // ascript-ignore[unawaited-future] deliberate\n }\n\
+                   main()\n";
+        assert!(
+            !analyze(src)
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "unawaited-future"),
+            "got {:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]

@@ -5,10 +5,10 @@
 //! async fns called by bare name (not methods, not stdlib detach like `task.spawn`).
 
 use crate::check::diagnostic::{AsDiagnostic, Severity};
-use crate::check::rules::{code_range, dropped_call};
+use crate::check::rules::{code_range, dropped_local_call, fn_name};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
-use crate::syntax::resolve::types::{Resolution, ResolveResult};
+use crate::syntax::resolve::types::ResolveResult;
 use std::collections::HashSet;
 
 pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
@@ -25,20 +25,12 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
 
     let mut out = Vec::new();
     for es in tree.descendants().filter(|n| n.kind() == ExprStmt) {
-        let Some(call) = dropped_call(es) else {
+        // a bare dropped call `name(...)` whose callee resolves to a local/upvalue
+        // binding (so a same-named global isn't mistaken) whose name is an async fn.
+        let Some((name, call)) = dropped_local_call(es, resolved) else {
             continue;
         };
-        // callee must be a bare NameRef that resolves to a local/upvalue binding
-        // (so a same-named global isn't mistaken) whose name is an async fn.
-        let Some(callee) = call.children().find(|c| c.kind() == NameRef) else {
-            continue;
-        };
-        let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
-        let is_local = matches!(
-            resolved.uses.get(&callee.text_range()),
-            Some(Resolution::Local(_) | Resolution::Upvalue(_))
-        );
-        if is_local && async_fns.contains(&name) {
+        if async_fns.contains(&name) {
             out.push(AsDiagnostic {
                 range: code_range(&call),
                 severity: Severity::Warning,
@@ -58,14 +50,6 @@ fn is_async(fn_decl: &ResolvedNode) -> bool {
         .children_with_tokens()
         .filter_map(|el| el.into_token())
         .any(|t| t.kind() == SyntaxKind::AsyncKw)
-}
-
-fn fn_name(fn_decl: &ResolvedNode) -> Option<String> {
-    fn_decl
-        .children_with_tokens()
-        .filter_map(|el| el.into_token())
-        .find(|t| t.kind() == SyntaxKind::Ident)
-        .map(|t| t.text().to_string())
 }
 
 #[cfg(test)]
