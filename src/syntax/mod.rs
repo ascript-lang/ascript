@@ -7,6 +7,7 @@ pub mod cst;
 pub mod event;
 pub mod kind;
 pub mod lexer;
+pub mod parser;
 
 pub use cst::{build_flat_tree, ResolvedNode, SyntaxNode, SyntaxToken};
 pub use kind::SyntaxKind;
