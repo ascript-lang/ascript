@@ -353,11 +353,18 @@ async fn vm_equality_matches_treewalker() {
     }
 }
 
-/// Assert both engines FAIL identically for `expr_src` (run as `print(expr)`):
-/// same Tier-2 panic message AND the same source span. A divergence here is a
-/// real diagnostics-parity bug, not something to normalize away.
+/// Assert both engines FAIL identically for `expr_src`: same Tier-2 panic message
+/// AND the same source span. A divergence here is a real diagnostics-parity bug,
+/// not something to normalize away.
+///
+/// The expression is run BARE (its own statement) — NOT wrapped in `print(...)`.
+/// Previously these were wrapped only to keep the panicking sub-expression off the
+/// statement start (a leading bare expression's CST node carries leading-newline
+/// trivia, which used to push the VM's span one byte early — the #132 off-by-one).
+/// Now that the compiler anchors every panicking op at the trivia-trimmed code
+/// span, the wrapper is unnecessary, so the bare form is the stronger test.
 async fn assert_vm_error_matches_treewalker(expr_src: &str) {
-    let src = format!("print({expr_src})");
+    let src = expr_src.to_string();
     let tw = ascript::run_source(&src).await;
     let vm = ascript::vm_run_source(&src).await;
     match (tw, vm) {
@@ -1823,4 +1830,163 @@ async fn vm_unwrap_inside_recover_matches_treewalker() {
     // The success path through recover round-trips the value as well.
     let ok = "fn g() { return [7, nil] }\nprint(recover(() => g()!))";
     assert_vm_run_matches_treewalker(ok).await;
+}
+
+// ===========================================================================
+// V6-T4: DIAGNOSTICS-PARITY GATE + #132 span audit
+// ===========================================================================
+//
+// Every Tier-2 panic the VM raises MUST be byte-identical to the tree-walker's
+// in BOTH message AND source span (start/end byte offsets, hence line/col). The
+// `assert_vm_run_error_matches_treewalker` helper asserts exactly that on a FULL,
+// UNWRAPPED program — no `print(...)` wrapper. Previously some of these forms
+// diverged because the compiler anchored an instruction at a CST node's RAW
+// `text_range()` (which includes leading whitespace/newline trivia), so a panic
+// from a bare leading statement (e.g. `f()`, `a[9]`, `a.foo`, `a + 1`) pointed
+// one byte early vs the tree-walker (which anchors at the trivia-trimmed code
+// span). The compiler now uses `node_code_span` for every PANICKING op
+// (CALL, GET_INDEX, GET_PROP/GET_PROP_OPT, arithmetic/comparison, NEG/NOT,
+// RANGE, PROPAGATE, UNWRAP, the for-range CHECK_NUMBERS, the for-of iterator),
+// closing the #132 off-by-one.
+
+/// The HEADLINE #132 case: a bare `f()` statement that PANICS (here an arity
+/// mismatch raised by the CALL instruction) must anchor at the CALL expression's
+/// trivia-trimmed code span, NOT at the leading newline. Before the fix the VM
+/// span started one byte early (on the `\n`).
+#[tokio::test]
+async fn vm_diag_bare_call_panic_span_matches_treewalker_132() {
+    // Bare call on line 2 — its CST node's raw range begins at the preceding '\n'.
+    assert_vm_run_error_matches_treewalker("fn f(a) { return a }\nf()").await;
+    // A blank line before the call widens the leading trivia further.
+    assert_vm_run_error_matches_treewalker("fn f(a) { return a }\n\nf()").await;
+    // Leading spaces before the call (indented bare statement).
+    assert_vm_run_error_matches_treewalker("fn f(a) { return a }\n   f()").await;
+    // The exact program from the V6 plan: a `!` deep in a function, called bare.
+    // (The panic here originates at the `!`, but the program is the canonical
+    // #132 repro shape and must still match byte-for-byte.)
+    assert_vm_run_error_matches_treewalker("fn f() { return [nil, \"e\"]! }\nf()").await;
+}
+
+/// Diagnostics parity for every PANICKING op, in its BARE (unwrapped) form — the
+/// forms that previously diverged on span because of leading-trivia anchoring.
+/// Each asserts identical message AND span on both engines.
+#[tokio::test]
+async fn vm_diagnostics_parity_bare_forms() {
+    let cases = [
+        // bad `?` — not a Result pair (PROPAGATE)
+        "5?",
+        "let x = 5?",
+        // bad `!` — not a Result pair (UNWRAP)
+        "5!",
+        "let x = 5!",
+        // index out of bounds (GET_INDEX), bare leading statement
+        "[1, 2][9]",
+        "let a = [1, 2]\na[9]",
+        // member read of nil (GET_PROP), bare leading statement
+        "let a = nil\na.foo",
+        // negate a non-number (NEG) — operand-anchored
+        "-(true)",
+        // binary type error (ADD/comparison), bare leading statement
+        "let a = true\na + 1",
+        "true + 1",
+        "1 < \"x\"",
+        // for-of over a non-iterable (the iterator-snapshot panic)
+        "for (x of 5) {}",
+        // for-range non-number bounds (CHECK_NUMBERS)
+        "for (i in 1..\"x\") {}",
+        // range value with a non-number bound (RANGE op)
+        "let a = \"x\"\nlet r = 1..a",
+    ];
+    for src in cases {
+        assert_vm_run_error_matches_treewalker(src).await;
+    }
+}
+
+// ----- Part A: panic unwinding + recover boundary ---------------------------
+
+/// An UNCAUGHT panic deep in a call chain unwinds every VM frame and surfaces at
+/// the driver byte-identically to the tree-walker (message + span). This proves
+/// the `Control::Panic` returned by an inner frame propagates out through every
+/// `Vm::run`/`return_from_frame` boundary (frames/cells dropped on the way) to
+/// `vm_run_source`, which maps it to the same `AsError` the tree-walker reports.
+#[tokio::test]
+async fn vm_uncaught_panic_deep_in_call_chain_matches_treewalker() {
+    // a → b → c, and `c` force-unwraps a failure pair: the recoverable panic is
+    // NOT recovered anywhere, so it unwinds all three frames to the driver.
+    let src = "fn c() { return [nil, \"deep\"]! }\n\
+               fn b() { return c() }\n\
+               fn a() { return b() }\n\
+               a()";
+    assert_vm_run_error_matches_treewalker(src).await;
+    // A type error deep in the chain (arithmetic on a non-number) unwinds too.
+    let src2 = "fn c(x) { return x + 1 }\n\
+                fn b(x) { return c(x) }\n\
+                fn a(x) { return b(x) }\n\
+                a(true)";
+    assert_vm_run_error_matches_treewalker(src2).await;
+}
+
+/// A panic deep in a call chain CAUGHT by an OUTER `recover` becomes `[nil, err]`
+/// — the recover boundary runs each callback on its OWN fresh Fiber (via the
+/// native→VM bridge), and a `Control::Panic` returned from that Fiber is turned
+/// into a Result pair. Byte-identical stdout on both engines.
+#[tokio::test]
+async fn vm_recover_catches_panic_deep_in_call_chain_matches_treewalker() {
+    // The unwrap panic in `c` unwinds b→a, but the whole chain runs inside a
+    // recover callback, so recover catches it and yields `[nil, {message:"deep"}]`.
+    let src = "fn c() { return [nil, \"deep\"]! }\n\
+               fn b() { return c() }\n\
+               fn a() { return b() }\n\
+               let r = recover(() => a())\n\
+               print(r[0])\n\
+               print(r[1].message)";
+    assert_vm_run_matches_treewalker(src).await;
+
+    // A non-unwrap Tier-2 panic (type error) caught by recover. The message comes
+    // from `error_message`/the panic's own message; both engines agree.
+    let src2 = "fn boom(x) { return x + 1 }\n\
+                let r = recover(() => boom(true))\n\
+                print(r[0])\n\
+                print(type(r[1]))";
+    assert_vm_run_matches_treewalker(src2).await;
+
+    // recover on a SUCCESS path round-trips the value as `[value, nil]`.
+    let ok = "fn a() { return 99 }\n\
+              let r = recover(() => a())\n\
+              print(r[0])\n\
+              print(r[1])";
+    assert_vm_run_matches_treewalker(ok).await;
+}
+
+/// A panic raised from inside a NATIVE higher-order callback (the callback is a
+/// VM closure the native builtin invokes via the native→VM bridge) must surface
+/// as the same `Control::Panic` on both engines. The reachable native HOF in the
+/// VM's compiled subset is `recover` itself (a bare-call builtin that re-enters
+/// the VM to run its closure argument on a fresh Fiber); method-style HOFs like
+/// `array.map(...)` are a V9 deferral and not yet compilable. Here a NESTED
+/// `recover` proves the bridge cleanly composes: the INNER recover's callback
+/// panics (an unrecoverable, NON-pair `?`/`!` is recoverable, so we use a real
+/// uncaught form) — the inner recover catches it into a pair, and the OUTER
+/// recover sees the inner one's success, so both engines print identically.
+#[tokio::test]
+async fn vm_panic_inside_native_hof_callback_matches_treewalker() {
+    // The inner recover's callback force-unwraps a failure pair (a RECOVERABLE
+    // panic raised from inside the native `recover` re-entering the VM). The inner
+    // recover catches it → `[nil, err]`; the outer recover wraps THAT success.
+    let src = "fn boom() { return [nil, \"inner\"]! }\n\
+               let outer = recover(() => recover(() => boom()))\n\
+               print(outer[0][0])\n\
+               print(outer[0][1].message)\n\
+               print(outer[1])";
+    assert_vm_run_matches_treewalker(src).await;
+
+    // A callback that itself calls another VM function which panics: the panic
+    // unwinds the inner function frame AND out of the native `recover` frame,
+    // caught by recover into a pair. Proves multi-frame unwind across the bridge.
+    let src2 = "fn deep() { return [nil, \"x\"]! }\n\
+                fn mid() { return deep() }\n\
+                let r = recover(() => mid())\n\
+                print(r[0])\n\
+                print(r[1].message)";
+    assert_vm_run_matches_treewalker(src2).await;
 }

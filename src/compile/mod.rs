@@ -1510,7 +1510,15 @@ impl Compiler {
     /// or a parenthesized arrow. Member calls (`a.m(...)`) and calls whose callee
     /// resolves to a non-builtin bare global are later deferrals (V9).
     fn compile_call(&mut self, call: &CallExpr) -> Result<(), CompileError> {
-        let span = node_span(call);
+        // The CALL instruction can PANIC at runtime (arity mismatch, per-param
+        // contract violation, non-callable callee, …). The tree-walker anchors
+        // those at the Call expression's `expr.span`, which (built from the first
+        // real token to the last) carries NO leading trivia. A CST node's raw
+        // `text_range()` begins at any leading whitespace/newline, so for a bare
+        // `f()` statement the raw span would point one byte early (the preceding
+        // newline) — the #132 off-by-one. Use the trivia-trimmed code span so the
+        // VM's CALL-site diagnostics are byte-identical to the tree-walker.
+        let span = node_code_span(call);
         let callee = call
             .expr()
             .ok_or_else(|| CompileError::new("call expression missing callee", span))?;
@@ -1583,7 +1591,14 @@ impl Compiler {
     }
 
     fn compile_binary(&mut self, bin: &BinaryExpr) -> Result<(), CompileError> {
-        let span = node_span(bin);
+        // An arithmetic/comparison op (Add/Sub/.../Lt/.../Range) can PANIC with a
+        // Tier-2 type error. The tree-walker anchors these at the BinaryExpr's
+        // `expr.span` (`apply_binop(.., expr.span)`), which carries no leading
+        // trivia. Use the trivia-trimmed code span so a bare `a + 1` statement's
+        // type panic matches the tree-walker byte-for-byte (#132). The
+        // short-circuit jumps reuse this span too, but they never panic, so the
+        // trimmed start is harmless there.
+        let span = node_code_span(bin);
         let lhs = bin
             .lhs()
             .ok_or_else(|| CompileError::new("binary expression missing left operand", span))?;
@@ -1653,7 +1668,11 @@ impl Compiler {
     /// in value position (the old parser produces `..=` only inside match
     /// patterns), so an inclusive `..=` range as a value is a documented deferral.
     fn compile_range(&mut self, range: &RangeExpr) -> Result<(), CompileError> {
-        let span = node_span(range);
+        // The RANGE op can PANIC (a non-number bound is a Tier-2 type error in
+        // `apply_binop`'s `BinOp::Range` arm). The tree-walker anchors it at the
+        // whole range expression's `expr.span`, which carries no leading trivia;
+        // use the trivia-trimmed code span for byte-identical diagnostics (#132).
+        let span = node_code_span(range);
         let start = range
             .start()
             .ok_or_else(|| CompileError::new("range expression missing start bound", span))?;
@@ -1765,7 +1784,12 @@ impl Compiler {
     /// panics). Index ASSIGNMENT (`a[i] = x`) is a V9 deferral handled in
     /// `compile_assign` (its target is not a `NameRef`).
     fn compile_index(&mut self, ix: &IndexExpr) -> Result<(), CompileError> {
-        let span = node_span(ix);
+        // GET_INDEX can PANIC (out-of-bounds, non-string object key, …). The
+        // tree-walker anchors these at the IndexExpr's `expr.span` (see
+        // `index_get(.., object.span, expr.span)`), which carries no leading
+        // trivia. Use the trivia-trimmed code span so a bare `a[9]` statement's
+        // OOB panic matches the tree-walker byte-for-byte (#132).
+        let span = node_code_span(ix);
         let base = ix
             .base()
             .ok_or_else(|| CompileError::new("index expression missing receiver", span))?;
@@ -1792,7 +1816,11 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("member expression missing property name", span))?
             .text()
             .to_string();
-        let obj_span = node_span(&object);
+        // GET_PROP panics ("cannot read property '<k>' of nil", …) are anchored by
+        // the tree-walker at the RECEIVER's `object.span` (`read_member(.., object.span)`),
+        // which carries no leading trivia. Use the trivia-trimmed code span so a
+        // bare `a.foo` statement's nil-receiver panic matches byte-for-byte (#132).
+        let obj_span = node_code_span(&object);
         self.compile_expr(&object)?;
         let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
         self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
@@ -1816,7 +1844,9 @@ impl Compiler {
             })?
             .text()
             .to_string();
-        let obj_span = node_span(&object);
+        // Same trivia-trimmed receiver span as GET_PROP — GET_PROP_OPT behaves
+        // identically on a non-nil receiver and anchors its panic at the receiver.
+        let obj_span = node_code_span(&object);
         self.compile_expr(&object)?;
         let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
         self.chunk.emit_u16(Op::GetPropOpt, name_idx, obj_span);
@@ -1834,8 +1864,10 @@ impl Compiler {
         // The tree-walker anchors a unary panic at the OPERAND's span
         // (`apply_unop(op, v, operand.span)` in `eval_expr`), e.g. `cannot negate a
         // non-number` points at the operand, not the `-`. Emit the op with the
-        // operand span so the VM's diagnostics are byte-identical.
-        let operand_span = node_span(&operand);
+        // operand span so the VM's diagnostics are byte-identical. The legacy
+        // `operand.span` carries no leading trivia, so use the trivia-trimmed code
+        // span (matters when the operand itself begins a bare statement, #132).
+        let operand_span = node_code_span(&operand);
         self.compile_expr(&operand)?;
         let bytecode = match op {
             SyntaxKind::Minus => Op::Neg,
