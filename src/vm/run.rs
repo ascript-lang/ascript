@@ -188,50 +188,52 @@ impl Vm {
                     let callee_idx = fiber.stack.len() - argc - 1;
                     match fiber.stack[callee_idx].clone() {
                         Value::Closure(callee) => {
-                            // Multi-frame call: the args already sit at
-                            // `stack[callee_idx + 1 ..]`, so the callee's slot_base
-                            // is `callee_idx + 1` and its params occupy slots
-                            // 0..argc. Overwrite the callee value's slot with the
-                            // first param (slot 0) by shifting: simplest is to drop
-                            // the callee value and let the args slide down by one.
-                            //
-                            // V4-T4 does full arity contracts; here we bind exactly
-                            // the slots the args fill and reserve the rest as Nil
-                            // (arity mismatch handling is deferred to T4).
-                            let slot_count =
-                                callee.proto.chunk.slot_count as usize;
-                            // Remove the callee value from beneath the args so the
-                            // args become the bottom of the new frame's window.
-                            fiber.stack.remove(callee_idx);
-                            let slot_base = callee_idx;
-                            // Reserve any locals beyond the passed args as Nil so the
-                            // frame window is fully sized (`slot_count` slots).
-                            // (If too few args were passed, missing params are Nil;
-                            // surplus args beyond slot_count would be a compiler/arity
-                            // bug — T4 enforces arity.)
-                            let have = fiber.stack.len() - slot_base;
-                            if have < slot_count {
-                                fiber
-                                    .stack
-                                    .resize(slot_base + slot_count, Value::Nil);
+                            // The call-site span anchors arity/contract/return
+                            // panics exactly where the tree-walker's do.
+                            let call_span =
+                                fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            // `what` mirrors the tree-walker's `func.name.as_deref()
+                            // .unwrap_or("function")` so the wording matches.
+                            let what = callee
+                                .proto
+                                .chunk
+                                .name
+                                .as_deref()
+                                .unwrap_or("function");
+                            // Pop the `argc` args into an owned vec (top of stack is
+                            // the LAST arg), then drop the callee value beneath them.
+                            let mut args = vec![Value::Nil; argc];
+                            for slot in args.iter_mut().rev() {
+                                *slot = fiber.pop();
                             }
-                            // Allocate the callee frame's cell slots and move any
-                            // arg that landed in a cell slot from the stack into its
-                            // cell (so cell-aware access sees the bound param).
+                            fiber.pop(); // the callee value at callee_idx
+                            // Arity + per-param contracts + rest collection, shared
+                            // verbatim with the tree-walker via `check_call_args`. On
+                            // a mismatch this returns a `Control::Panic` carrying the
+                            // identical message anchored at `call_span`.
+                            let bound = crate::interp::check_call_args(
+                                &callee.proto.params,
+                                args,
+                                call_span,
+                                what,
+                            )?;
+                            // The args/rest array are gone from the stack; the new
+                            // frame's window starts where the callee value was.
+                            let slot_base = callee_idx;
+                            let slot_count = callee.proto.chunk.slot_count as usize;
+                            // Allocate cells, then place each bound param into its
+                            // slot (cell slot → cell; plain slot → stack). Reserve
+                            // the remaining locals as Nil so the window is full.
                             let cells = super::fiber::alloc_cells(
                                 slot_count,
                                 &callee.proto.chunk.cell_slots,
                             );
-                            for (slot, cell) in cells.iter().enumerate() {
-                                if let Some(cell) = cell {
-                                    // Take the arg/Nil out of the stack slot into the
-                                    // cell; the stack slot keeps its (now stale) Nil
-                                    // copy — cell-slot access always goes via the cell.
-                                    let v = std::mem::replace(
-                                        &mut fiber.stack[slot_base + slot],
-                                        Value::Nil,
-                                    );
+                            fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                            for (slot, v) in bound.into_iter().enumerate() {
+                                if let Some(cell) = &cells[slot] {
                                     *cell.borrow_mut() = v;
+                                } else {
+                                    fiber.stack[slot_base + slot] = v;
                                 }
                             }
                             fiber.frames.push(super::fiber::CallFrame {
@@ -239,6 +241,7 @@ impl Vm {
                                 ip: 0,
                                 slot_base,
                                 cells,
+                                ret_span: call_span,
                             });
                             // Continue the loop in the new frame (the run loop reads
                             // `fiber.frame()` at the top of each iteration). RETURN
@@ -568,6 +571,19 @@ impl Vm {
                         .frames
                         .pop()
                         .expect("Op::Return with no active frame (VM bug)");
+                    // Return-type contract: if the callee declared `: T`, the
+                    // returned value is checked against it, panicking exactly as the
+                    // tree-walker's `run_body` does — anchored at the CALL-site span
+                    // (`frame.ret_span`), with the identical message.
+                    if let Some(ret_ty) = &frame.closure.proto.ret {
+                        if !crate::interp::check_type(&result, ret_ty) {
+                            return Err(crate::interp::contract_panic(
+                                ret_ty,
+                                &result,
+                                frame.ret_span,
+                            ));
+                        }
+                    }
                     fiber.stack.truncate(frame.slot_base);
                     if fiber.frames.is_empty() {
                         return Ok(RunOutcome::Done(result));
@@ -645,6 +661,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            params: Vec::new(),
+            ret: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);
@@ -994,6 +1012,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            params: Vec::new(),
+            ret: None,
         });
         let closure = Closure::new(proto);
         let mut fiber = Fiber::new(closure);

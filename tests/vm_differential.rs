@@ -1255,3 +1255,122 @@ async fn vm_deep_recursion_is_heap_bounded() {
     assert_eq!(code, None);
     assert_eq!(vm_out, "1250025000\n", "deep VM recursion result");
 }
+
+// ---- V4-T4: parameters — arity, rest, and type contracts ------------------
+//
+// These assert the VM enforces exact arity, rest collection, per-parameter type
+// contracts, the rest element type, and the return-type contract BYTE-IDENTICALLY
+// to the tree-walker — both the value path (matching stdout) AND the error path
+// (matching the Tier-2 panic message AND span). The shared `check_call_args` /
+// `check_type` / `contract_panic` core is the single source of truth, so a
+// divergence here would be a real frame-setup bug in the VM CALL/RETURN.
+
+/// Assert both engines FAIL identically for a FULL source program (not wrapped):
+/// same Tier-2 panic message AND the same source span.
+async fn assert_vm_run_error_matches_treewalker(src: &str) {
+    let tw = ascript::run_source(src).await;
+    let vm = ascript::vm_run_source(src).await;
+    match (tw, vm) {
+        (Err(tw_err), Err(vm_err)) => {
+            assert_eq!(
+                tw_err.message, vm_err.message,
+                "panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, vm_err.message
+            );
+            assert_eq!(
+                tw_err.span, vm_err.span,
+                "panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, tw_err.span, vm_err.span
+            );
+        }
+        (tw, vm) => panic!(
+            "expected BOTH engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn vm_param_arity_ok_matches_treewalker() {
+    assert_vm_run_matches_treewalker("fn f(a, b) { return a + b }\nprint(f(1, 2))").await;
+    assert_vm_run_matches_treewalker("fn f() { return 42 }\nprint(f())").await;
+    assert_vm_run_matches_treewalker("fn id(x) { return x }\nprint(id(\"hi\"))").await;
+}
+
+#[tokio::test]
+async fn vm_param_arity_errors_match_treewalker() {
+    // Too few / too many arguments — exact-arity panic, identical message + span.
+    assert_vm_run_error_matches_treewalker("fn f(a, b) { return a + b }\nprint(f(1))").await;
+    assert_vm_run_error_matches_treewalker("fn f(a, b) { return a + b }\nprint(f(1, 2, 3))").await;
+    assert_vm_run_error_matches_treewalker("fn f() { return 1 }\nprint(f(1))").await;
+    // The callee description in the message is the fn's name ("f"), not "function".
+    assert_vm_run_error_matches_treewalker("fn one(a) { return a }\nprint(one())").await;
+}
+
+#[tokio::test]
+async fn vm_rest_param_matches_treewalker() {
+    // Rest collects the trailing args into an array (empty when none are passed).
+    assert_vm_run_matches_treewalker("fn f(a, ...rest) { return a + len(rest) }\nprint(f(1))").await;
+    assert_vm_run_matches_treewalker(
+        "fn f(a, ...rest) { return a + len(rest) }\nprint(f(1, 2, 3))",
+    )
+    .await;
+    // A pure-rest function collects everything.
+    assert_vm_run_matches_treewalker("fn f(...xs) { return len(xs) }\nprint(f())").await;
+    assert_vm_run_matches_treewalker("fn f(...xs) { return len(xs) }\nprint(f(9, 8, 7))").await;
+    // The rest binding is a real array value.
+    assert_vm_run_matches_treewalker("fn f(...xs) { return xs }\nprint(f(1, 2, 3))").await;
+}
+
+#[tokio::test]
+async fn vm_rest_param_too_few_fixed_args_matches_treewalker() {
+    // Fewer than the fixed-param count → "expected at least N argument(s)".
+    assert_vm_run_error_matches_treewalker("fn f(a, b, ...rest) { return a }\nprint(f(1))").await;
+}
+
+#[tokio::test]
+async fn vm_typed_param_contracts_match_treewalker() {
+    // A satisfied contract passes; a violated one panics identically (msg + span).
+    assert_vm_run_matches_treewalker("fn f(n: number) { return n }\nprint(f(5))").await;
+    assert_vm_run_error_matches_treewalker("fn f(n: number) { return n }\nprint(f(\"x\"))").await;
+    // String / bool / optional contracts.
+    assert_vm_run_matches_treewalker("fn g(s: string) { return s }\nprint(g(\"hi\"))").await;
+    assert_vm_run_error_matches_treewalker("fn g(s: string) { return s }\nprint(g(1))").await;
+    assert_vm_run_matches_treewalker("fn h(x: number?) { return x }\nprint(h(nil))").await;
+    assert_vm_run_matches_treewalker("fn h(x: number?) { return x }\nprint(h(3))").await;
+    assert_vm_run_error_matches_treewalker("fn h(x: number?) { return x }\nprint(h(\"x\"))").await;
+}
+
+#[tokio::test]
+async fn vm_typed_rest_element_contract_matches_treewalker() {
+    // `...xs: array<number>` per-element checks each trailing arg; a wrong element
+    // raises the SAME contract panic on both engines.
+    assert_vm_run_matches_treewalker(
+        "fn f(...xs: array<number>) { return len(xs) }\nprint(f(1, 2, 3))",
+    )
+    .await;
+    assert_vm_run_error_matches_treewalker(
+        "fn f(...xs: array<number>) { return len(xs) }\nprint(f(1, \"x\"))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_return_type_contract_matches_treewalker() {
+    // A satisfied return contract passes; a violated one panics identically — and
+    // crucially at the CALL-site span (not the `return` statement's span).
+    assert_vm_run_matches_treewalker("fn f(): number { return 1 }\nprint(f())").await;
+    assert_vm_run_error_matches_treewalker("fn f(): number { return \"x\" }\nprint(f())").await;
+    // Falling off the end returns nil; a `: number` contract then fails
+    // identically — and crucially the panic is anchored at the CALL-site span
+    // (`f()`), exactly like the tree-walker's `run_body`, not the body's span.
+    assert_vm_run_error_matches_treewalker("fn f(): number { let x = 1 }\nprint(f())").await;
+    // A union return type accepts either arm.
+    assert_vm_run_matches_treewalker(
+        "fn f(b): number | string { if (b) { return 1 }\n return \"x\" }\nprint(f(true))",
+    )
+    .await;
+    assert_vm_run_matches_treewalker(
+        "fn f(b): number | string { if (b) { return 1 }\n return \"x\" }\nprint(f(false))",
+    )
+    .await;
+}

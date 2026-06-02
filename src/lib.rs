@@ -157,6 +157,8 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
         has_rest: false,
         is_async: false,
         is_generator: false,
+        params: Vec::new(),
+        ret: None,
     });
     let closure = Closure::new(proto);
 
@@ -203,6 +205,8 @@ pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> 
         has_rest: false,
         is_async: false,
         is_generator: false,
+        params: Vec::new(),
+        ret: None,
     });
     let closure = Closure::new(proto);
 

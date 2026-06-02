@@ -655,6 +655,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            params: Vec::new(),
+            ret: None,
         });
         let a = Closure::new(proto);
         let cv = Value::Closure(a.clone());
@@ -678,6 +680,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            params: Vec::new(),
+            ret: None,
         }));
         assert_ne!(Value::Closure(a), Value::Closure(b));
 

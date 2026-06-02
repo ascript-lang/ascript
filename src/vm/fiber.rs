@@ -7,6 +7,7 @@
 //! locals. When V4 adds CALL/RETURN, a callee frame's `slot_base` is set so the
 //! caller's pushed args land in the callee's first local slots.
 
+use crate::span::Span;
 use crate::value::Value;
 use crate::vm::value_ext::{Closure, FiberState};
 use std::cell::RefCell;
@@ -27,6 +28,12 @@ pub struct CallFrame {
     /// strong refs; any capturing closures keep theirs — correct by-reference
     /// semantics.
     pub cells: Vec<Option<Rc<RefCell<Value>>>>,
+    /// The CALL-site span this frame was invoked at. Used to anchor the
+    /// return-type contract panic at RETURN exactly where the tree-walker does
+    /// (`run_body` checks the return value against the CALL span, not the
+    /// `return` statement's span). For the bottom (script) frame this is unused
+    /// (the script body declares no return contract).
+    pub ret_span: Span,
 }
 
 /// Build the per-slot cell vector for a frame from its proto's `cell_slots`
@@ -66,6 +73,7 @@ impl Fiber {
             ip: 0,
             slot_base: 0,
             cells,
+            ret_span: Span::new(0, 0),
         };
         Fiber {
             frames: vec![frame],
@@ -188,6 +196,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            params: Vec::new(),
+            ret: None,
         });
         Closure::new(proto)
     }
@@ -202,6 +212,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            params: Vec::new(),
+            ret: None,
         });
         Closure::new(proto)
     }

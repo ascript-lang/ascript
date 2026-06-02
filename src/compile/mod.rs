@@ -74,6 +74,144 @@ fn node_code_span(node: &impl AstNode) -> Span {
     Span::new(start, full.end)
 }
 
+/// Convert a CST type-annotation node into the legacy [`crate::ast::Type`] the
+/// runtime contract checker (`check_type`) and its `Display` impl operate on.
+///
+/// This MUST produce the SAME `ast::Type` the legacy parser's `parse_type_atom`
+/// builds for the same source (same name→variant mapping, same nesting), because
+/// contract-violation messages render the type via `Type::Display`; any divergence
+/// would make a VM contract panic differ from the tree-walker's. A `None` result
+/// means the annotation was malformed/empty (treated as "no contract"); the
+/// front-end's own parser would already have rejected genuinely invalid syntax.
+fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type> {
+    use crate::ast::Type;
+    use crate::syntax::kind::SyntaxKind as K;
+    match node.kind() {
+        K::NamedType => {
+            // `nil` lexes as its own keyword token, not an Ident; everything else
+            // is a bare identifier matched against the built-in type names exactly
+            // like the legacy parser, falling back to a user-named (class/enum) type.
+            if node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == K::NilKw)
+            {
+                return Some(Type::Nil);
+            }
+            if node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == K::FnKw)
+            {
+                return Some(Type::Fn);
+            }
+            let name = cst_first_ident(node)?;
+            Some(match name.as_str() {
+                "number" => Type::Number,
+                "string" => Type::String,
+                "bool" => Type::Bool,
+                "any" => Type::Any,
+                "object" => Type::Object,
+                "error" => Type::Error,
+                _ => Type::Named(name),
+            })
+        }
+        K::GenericType => {
+            let name = cst_first_ident(node)?;
+            let args: Vec<crate::ast::Type> = node
+                .children()
+                .find(|c| c.kind() == K::TypeArgs)
+                .map(|ta| ta.children().filter_map(cst_type).collect())
+                .unwrap_or_default();
+            match name.as_str() {
+                "array" => Some(Type::Array(Box::new(args.into_iter().next()?))),
+                "Result" => Some(Type::Result(Box::new(args.into_iter().next()?))),
+                "future" => Some(Type::Future(Box::new(args.into_iter().next()?))),
+                "map" => {
+                    let mut it = args.into_iter();
+                    let k = it.next()?;
+                    let v = it.next()?;
+                    Some(Type::Map(Box::new(k), Box::new(v)))
+                }
+                // Unknown generic head — fall back to a named type (matches the
+                // legacy parser, which would treat an unrecognised `Foo<...>`
+                // head as `Type::Named` after consuming nothing of the args).
+                _ => Some(Type::Named(name)),
+            }
+        }
+        K::OptionalType => {
+            let inner = node.children().find_map(cst_type)?;
+            Some(Type::Optional(Box::new(inner)))
+        }
+        K::UnionType => {
+            // `A | B | C` is a flat run of type children; fold left-associatively
+            // into nested `Union`s exactly as the legacy parser's loop does.
+            let mut it = node.children().filter_map(cst_type);
+            let mut acc = it.next()?;
+            for rhs in it {
+                acc = Type::Union(Box::new(acc), Box::new(rhs));
+            }
+            Some(acc)
+        }
+        K::TupleType => {
+            let parts: Vec<crate::ast::Type> =
+                node.children().filter_map(cst_type).collect();
+            Some(Type::Tuple(parts))
+        }
+        _ => None,
+    }
+}
+
+/// The text of the first `Ident` token directly under a CST node.
+fn cst_first_ident(node: &crate::syntax::cst::ResolvedNode) -> Option<String> {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == crate::syntax::kind::SyntaxKind::Ident)
+        .map(|t| t.text().to_string())
+}
+
+/// Build a runtime [`crate::ast::Param`] from a CST `Param` node: its name, its
+/// declared type contract (if annotated), and whether it is a `...rest` param.
+/// The resulting params feed [`crate::interp::check_call_args`] so VM calls bind
+/// and contract-check arguments identically to the tree-walker.
+fn cst_param(node: &crate::syntax::cst::ResolvedNode) -> crate::ast::Param {
+    use crate::syntax::kind::SyntaxKind as K;
+    let rest = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == K::DotDotDot);
+    let name = cst_first_ident(node).unwrap_or_default();
+    let name_span = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == K::Ident)
+        .map(|t| {
+            let r = t.text_range();
+            Span::new(usize::from(r.start()), usize::from(r.end()))
+        })
+        .unwrap_or_else(|| range_span(node));
+    // The type child (if any) is the annotation after the `:`.
+    let ty = node
+        .children()
+        .find(|c| is_type_node(c.kind()))
+        .and_then(cst_type);
+    crate::ast::Param {
+        name,
+        ty,
+        name_span,
+        rest,
+    }
+}
+
+/// Whether a [`SyntaxKind`] is one of the type-annotation node kinds.
+fn is_type_node(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        kind,
+        NamedType | GenericType | OptionalType | UnionType | TupleType
+    )
+}
+
 /// Map a short-circuiting binary operator to the conditional-jump opcode whose
 /// "fires" condition is "the left operand already decides the result, keep it".
 /// Returns `None` for ordinary (both-operands-evaluated) binary operators.
@@ -776,6 +914,18 @@ impl Compiler {
         let arity = u8::try_from(arity_usize)
             .map_err(|_| CompileError::new("too many parameters (max 255)", span))?;
 
+        // Build the runtime param specs (name + declared type contract + rest flag)
+        // and the declared return-type contract. The VM CALL/RETURN feed these into
+        // the SAME `check_call_args` / `check_type` the tree-walker uses, so arity,
+        // per-param contracts, rest collection, and the return contract are
+        // byte-identical across engines (message + span).
+        let proto_params: Vec<crate::ast::Param> = params.iter().map(|p| cst_param(p)).collect();
+        let ret_type = fn_node
+            .children()
+            .find(|c| c.kind() == SyntaxKind::RetType)
+            .and_then(|rt| rt.children().find(|c| is_type_node(c.kind())))
+            .and_then(cst_type);
+
         // `async fn` / `fn*` / `async fn*` flags, read from the fn's own tokens.
         let mut is_async = false;
         let mut is_generator = false;
@@ -825,6 +975,8 @@ impl Compiler {
             has_rest,
             is_async,
             is_generator,
+            params: proto_params,
+            ret: ret_type,
         }))
     }
 

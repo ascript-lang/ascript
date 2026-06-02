@@ -53,6 +53,16 @@ pub struct FnProto {
     pub has_rest: bool,
     pub is_async: bool,
     pub is_generator: bool,
+    /// The parameter list in declaration order (including a trailing rest param),
+    /// carrying each param's name, declared type contract, and `rest` flag. The VM
+    /// CALL feeds this straight into [`crate::interp::check_call_args`] — the SAME
+    /// arity/contract/rest checker the tree-walker uses — so the two engines bind
+    /// arguments and panic byte-identically. Built from the function's CST param
+    /// nodes by the compiler.
+    pub params: Vec<crate::ast::Param>,
+    /// The declared return-type contract (`fn f(): T`), if any. Checked against the
+    /// returned value at RETURN, panicking exactly as the tree-walker's `run_body`.
+    pub ret: Option<crate::ast::Type>,
 }
 
 impl Chunk {
@@ -351,6 +361,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            params: Vec::new(),
+            ret: None,
         });
         assert_eq!(c.add_proto(p.clone()), 0);
         assert_eq!(c.add_proto(p), 1);

@@ -295,6 +295,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            params: Vec::new(),
+            ret: None,
         });
 
         let mut c = Chunk::new();

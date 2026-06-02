@@ -2179,81 +2179,11 @@ impl Interp {
         what: &str,
     ) -> Result<Value, Control> {
         let BodySpec { params, ret, body } = spec;
-        let has_rest = params.last().is_some_and(|p| p.rest);
-        if !has_rest {
-            // UNCHANGED fast path — exact arity, identical wording.
-            if args.len() != params.len() {
-                return Err(AsError::at(
-                    format!(
-                        "{} expected {} argument(s), got {}",
-                        what,
-                        params.len(),
-                        args.len()
-                    ),
-                    span,
-                )
-                .into());
-            }
-            for (p, a) in params.iter().zip(args.into_iter()) {
-                if let Some(ty) = &p.ty {
-                    if !check_type(&a, ty) {
-                        return Err(contract_panic(ty, &a, span));
-                    }
-                }
-                call_env.define(&p.name, a, true).map_err(AsError::new)?;
-            }
-        } else {
-            let n_fixed = params.len() - 1;
-            if args.len() < n_fixed {
-                return Err(AsError::at(
-                    format!(
-                        "{} expected at least {} argument(s), got {}",
-                        what,
-                        n_fixed,
-                        args.len()
-                    ),
-                    span,
-                )
-                .into());
-            }
-            let mut it = args.into_iter();
-            for p in &params[..n_fixed] {
-                let a = it.next().unwrap();
-                if let Some(ty) = &p.ty {
-                    if !check_type(&a, ty) {
-                        return Err(contract_panic(ty, &a, span));
-                    }
-                }
-                call_env.define(&p.name, a, true).map_err(AsError::new)?;
-            }
-            let rest_p = &params[n_fixed];
-            let elem_ty = match &rest_p.ty {
-                Some(crate::ast::Type::Array(inner)) => Some(inner.as_ref()),
-                Some(other) => {
-                    return Err(AsError::at(
-                        format!(
-                            "a rest parameter type must be an array type (array<T>), got {}",
-                            other
-                        ),
-                        span,
-                    )
-                    .into())
-                }
-                None => None,
-            };
-            let mut rest_vals = Vec::new();
-            for a in it {
-                if let Some(t) = elem_ty {
-                    if !check_type(&a, t) {
-                        return Err(contract_panic(t, &a, span));
-                    }
-                }
-                rest_vals.push(a);
-            }
-            let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(rest_vals)));
-            call_env
-                .define(&rest_p.name, arr, true)
-                .map_err(AsError::new)?;
+        // Arity + parameter contracts + rest collection. Shared verbatim with the
+        // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
+        let bound = check_call_args(params, args, span, what)?;
+        for (p, a) in params.iter().zip(bound.into_iter()) {
+            call_env.define(&p.name, a, true).map_err(AsError::new)?;
         }
         let result = match self.exec(body, call_env).await {
             Ok(Flow::Return(v)) => v,
@@ -3275,7 +3205,104 @@ fn control_to_aserror(c: Control, span: Span) -> AsError {
 }
 
 /// Runtime contract check (spec §5). Eagerly checks parametric types to full depth.
-fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
+/// Validate call arguments against a parameter list (exact arity OR rest), apply
+/// each declared parameter type contract, and return the values to bind into the
+/// callee's parameter slots in declaration order. For a rest parameter the
+/// returned slot holds the collected `Value::Array` of the trailing arguments.
+///
+/// This is the single source of truth for function-call argument checking; it is
+/// shared by the tree-walker (`run_body`) and the bytecode VM (`vm::run` CALL) so
+/// arity/contract/rest behavior — message wording AND span — is byte-identical
+/// across both engines. `span` is the CALL-site span; `what` is the callee's
+/// name/description (e.g. the function name, `"function"`, or a method name).
+pub(crate) fn check_call_args(
+    params: &[crate::ast::Param],
+    args: Vec<Value>,
+    span: Span,
+    what: &str,
+) -> Result<Vec<Value>, Control> {
+    let has_rest = params.last().is_some_and(|p| p.rest);
+    if !has_rest {
+        // Exact arity.
+        if args.len() != params.len() {
+            return Err(AsError::at(
+                format!(
+                    "{} expected {} argument(s), got {}",
+                    what,
+                    params.len(),
+                    args.len()
+                ),
+                span,
+            )
+            .into());
+        }
+        let mut bound = Vec::with_capacity(params.len());
+        for (p, a) in params.iter().zip(args.into_iter()) {
+            if let Some(ty) = &p.ty {
+                if !check_type(&a, ty) {
+                    return Err(contract_panic(ty, &a, span));
+                }
+            }
+            bound.push(a);
+        }
+        Ok(bound)
+    } else {
+        let n_fixed = params.len() - 1;
+        if args.len() < n_fixed {
+            return Err(AsError::at(
+                format!(
+                    "{} expected at least {} argument(s), got {}",
+                    what,
+                    n_fixed,
+                    args.len()
+                ),
+                span,
+            )
+            .into());
+        }
+        let mut bound = Vec::with_capacity(params.len());
+        let mut it = args.into_iter();
+        for p in &params[..n_fixed] {
+            let a = it.next().unwrap();
+            if let Some(ty) = &p.ty {
+                if !check_type(&a, ty) {
+                    return Err(contract_panic(ty, &a, span));
+                }
+            }
+            bound.push(a);
+        }
+        let rest_p = &params[n_fixed];
+        let elem_ty = match &rest_p.ty {
+            Some(crate::ast::Type::Array(inner)) => Some(inner.as_ref()),
+            Some(other) => {
+                return Err(AsError::at(
+                    format!(
+                        "a rest parameter type must be an array type (array<T>), got {}",
+                        other
+                    ),
+                    span,
+                )
+                .into())
+            }
+            None => None,
+        };
+        let mut rest_vals = Vec::new();
+        for a in it {
+            if let Some(t) = elem_ty {
+                if !check_type(&a, t) {
+                    return Err(contract_panic(t, &a, span));
+                }
+            }
+            rest_vals.push(a);
+        }
+        bound.push(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+            rest_vals,
+        ))));
+        Ok(bound)
+    }
+}
+
+pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
     use crate::ast::Type;
     match ty {
         Type::Any => true,
@@ -3338,7 +3365,7 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
 }
 
 /// Build a contract-violation panic.
-fn contract_panic(ty: &crate::ast::Type, value: &Value, span: Span) -> Control {
+pub(crate) fn contract_panic(ty: &crate::ast::Type, value: &Value, span: Span) -> Control {
     AsError::at(
         format!(
             "type contract violated: expected {}, got {} ({})",
