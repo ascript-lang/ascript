@@ -39,7 +39,40 @@ fn generate_ast_nodes() {
         let data = &grammar[node];
         let name = &data.name;
         if is_enum_rule(&grammar, node) {
-            // Pure Alt rules (Stmt, Expr, Literal) become enums in a later task.
+            // Collect node-reference variants, but exclude any node that is itself a
+            // pure-token alt (e.g. `Literal = 'number' | 'string' | …`) — those have no
+            // generated Rust type and would cause `Literal::cast(...)` compile errors.
+            let variants: Vec<String> = alt_variants(&grammar, node)
+                .into_iter()
+                .filter(|v| {
+                    // Keep the variant only if it resolves to a generated type:
+                    // either a concrete (non-alt) node, or an alt with ≥1 node-ref variant.
+                    !is_node_a_skipped_alt(&grammar, v)
+                })
+                .collect();
+            // Skip emitting an enum when there are no usable variants.
+            if variants.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "#[derive(Debug, Clone)]");
+            let _ = writeln!(out, "pub enum {name} {{");
+            for v in &variants {
+                let _ = writeln!(out, "    {v}({v}),");
+            }
+            let _ = writeln!(out, "}}");
+            let _ = writeln!(out, "impl {name} {{");
+            let _ = writeln!(out, "    pub fn cast(node: ResolvedNode) -> Option<Self> {{");
+            let _ = writeln!(out, "        match node.kind() {{");
+            for v in &variants {
+                let _ = writeln!(
+                    out,
+                    "            SyntaxKind::{v} => {v}::cast(node).map(Self::{v}),"
+                );
+            }
+            let _ = writeln!(out, "            _ => None,");
+            let _ = writeln!(out, "        }}");
+            let _ = writeln!(out, "    }}");
+            let _ = writeln!(out, "}}\n");
             continue;
         }
         let _ = writeln!(out, "#[derive(Debug, Clone)]");
@@ -62,4 +95,35 @@ fn generate_ast_nodes() {
 /// A rule is an "enum" (pure alternation) if its top-level rule is an `Alt`.
 fn is_enum_rule(grammar: &ungrammar::Grammar, node: ungrammar::Node) -> bool {
     matches!(&grammar[node].rule, ungrammar::Rule::Alt(_))
+}
+
+/// Returns true if the named node is an alt rule whose `alt_variants` is empty — i.e. a
+/// pure-token alt like `Literal = 'number' | 'string' | …`.  Such nodes have no generated
+/// Rust type and must be excluded from parent enum variant lists.
+fn is_node_a_skipped_alt(grammar: &ungrammar::Grammar, name: &str) -> bool {
+    for n in grammar.iter() {
+        if grammar[n].name == name {
+            return is_enum_rule(grammar, n) && alt_variants(grammar, n).is_empty();
+        }
+    }
+    false
+}
+
+/// Collect the node names referenced by an `Alt` rule (e.g. `Expr = A | B | C`).
+/// Only `Rule::Node` references are collected; token alternatives are ignored.
+fn alt_variants(grammar: &ungrammar::Grammar, node: ungrammar::Node) -> Vec<String> {
+    fn collect(grammar: &ungrammar::Grammar, rule: &ungrammar::Rule, out: &mut Vec<String>) {
+        match rule {
+            ungrammar::Rule::Alt(rules) => {
+                for r in rules {
+                    collect(grammar, r, out);
+                }
+            }
+            ungrammar::Rule::Node(n) => out.push(grammar[*n].name.clone()),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    collect(grammar, &grammar[node].rule, &mut out);
+    out
 }

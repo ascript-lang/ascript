@@ -17,4 +17,15 @@ mod tests {
         let has_let = file.syntax().descendants().any(|n| n.kind() == SyntaxKind::LetStmt);
         assert!(has_let);
     }
+
+    #[test]
+    fn expr_enum_casts_a_binary() {
+        let root = parse_to_tree("1 + 2");
+        let bin = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::BinaryExpr)
+            .expect("has a BinaryExpr")
+            .clone();
+        assert!(matches!(super::Expr::cast(bin), Some(super::Expr::BinaryExpr(_))));
+    }
 }
