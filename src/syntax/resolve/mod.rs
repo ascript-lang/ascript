@@ -134,6 +134,53 @@ impl Resolver {
         slot
     }
 
+    /// Whether `name` is already declared in the CURRENT (innermost) scope.
+    /// Used by the hoisting pre-pass so the in-order walk reuses a hoisted slot
+    /// instead of allocating a duplicate.
+    fn declared_in_current_scope(&self, name: &str) -> bool {
+        self.scopes
+            .last()
+            .is_some_and(|s| s.names.contains_key(name))
+    }
+
+    /// Pre-declare ("hoist") every DIRECT child `fn`/`class`/`enum` of a body so
+    /// forward/mutual/self references resolve to a frame slot (Local/Upvalue),
+    /// matching the tree-walker's late-binding outcome for define-before-call.
+    /// Runs in EVERY scope the resolver opens (file frame, function frames, and
+    /// bare blocks): pre-declaration only assigns a slot, and the VM's cells make
+    /// late binding work, so this is uniform and cannot regress the checker
+    /// (hoistable names are globally exempt from `undefined-variable`, and a
+    /// forward use still counts toward `unused-binding`). Only fn/class/enum
+    /// hoist — let/const/param/loop/pattern binding semantics are unchanged.
+    fn hoist_decls(&mut self, children: &[ResolvedNode]) {
+        use SyntaxKind::*;
+        for child in children {
+            // Unwrap a leading `export` to reach the hoistable decl underneath.
+            let decl: &ResolvedNode = if child.kind() == ExportStmt {
+                match child
+                    .children()
+                    .find(|c| matches!(c.kind(), FnDecl | ClassDecl | EnumDecl))
+                {
+                    Some(d) => d,
+                    None => continue,
+                }
+            } else {
+                child
+            };
+            let (name, kind) = match decl.kind() {
+                FnDecl => (fn_name(decl), BindingKind::Fn),
+                ClassDecl => (ident_text(decl), BindingKind::Class),
+                EnumDecl => (ident_text(decl), BindingKind::Enum),
+                _ => continue,
+            };
+            if let Some(name) = name {
+                if !self.declared_in_current_scope(&name) {
+                    self.declare(&name, kind, decl.text_range());
+                }
+            }
+        }
+    }
+
     fn resolve_local_in(&self, frame_idx: usize, name: &str) -> Option<u32> {
         let base = self.frames[frame_idx].scope_base;
         for scope in self.scopes[base..].iter().rev() {
@@ -196,16 +243,23 @@ impl Resolver {
             scope_base: self.scopes.len(),
         });
         self.push_scope();
-        for child in root.children() {
+        let children: Vec<ResolvedNode> = root.children().cloned().collect();
+        self.hoist_decls(&children);
+        for child in &children {
             self.resolve_stmt(child);
         }
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
         self.result.bindings.extend(frame.bindings.iter().cloned());
+        // Baseline VM semantics: EVERY captured local is a by-reference cell
+        // (allocated nil at frame entry, filled when its declaration executes).
+        // This preserves the tree-walker's late binding for forward/mutual/self
+        // references. Capture-by-value for never-forward-referenced immutable
+        // bindings is a FUTURE optimization (V5), not the baseline.
         let cell_slots: Vec<u32> = frame
             .bindings
             .iter()
-            .filter(|b| b.captured && b.mutated)
+            .filter(|b| b.captured)
             .map(|b| b.slot)
             .collect();
         self.result.frames.insert(
@@ -232,7 +286,9 @@ impl Resolver {
             }
             Block => {
                 self.push_scope();
-                for child in node.children() {
+                let children: Vec<ResolvedNode> = node.children().cloned().collect();
+                self.hoist_decls(&children);
+                for child in &children {
                     self.resolve_stmt(child);
                 }
                 self.pop_scope();
@@ -247,8 +303,11 @@ impl Resolver {
                 }
             }
             FnDecl => {
+                // Reuse the slot allocated by the hoisting pre-pass if present.
                 if let Some(name) = fn_name(node) {
-                    self.declare(&name, BindingKind::Fn, node.text_range());
+                    if !self.declared_in_current_scope(&name) {
+                        self.declare(&name, BindingKind::Fn, node.text_range());
+                    }
                 }
                 self.resolve_function(node);
             }
@@ -271,7 +330,9 @@ impl Resolver {
             }
             EnumDecl => {
                 if let Some(name) = ident_text(node) {
-                    self.declare(&name, BindingKind::Enum, node.text_range());
+                    if !self.declared_in_current_scope(&name) {
+                        self.declare(&name, BindingKind::Enum, node.text_range());
+                    }
                 }
                 for v in node.descendants().filter(|n| n.kind() == EnumVariant) {
                     for e in v.children().filter(|c| is_expr(c.kind())) {
@@ -281,7 +342,9 @@ impl Resolver {
             }
             ClassDecl => {
                 if let Some(name) = ident_text(node) {
-                    self.declare(&name, BindingKind::Class, node.text_range());
+                    if !self.declared_in_current_scope(&name) {
+                        self.declare(&name, BindingKind::Class, node.text_range());
+                    }
                 }
                 self.resolve_class(node);
             }
@@ -490,7 +553,9 @@ impl Resolver {
             }
         }
         if let Some(body) = node.children().find(|c| c.kind() == Block) {
-            for child in body.children() {
+            let children: Vec<ResolvedNode> = body.children().cloned().collect();
+            self.hoist_decls(&children);
+            for child in &children {
                 self.resolve_stmt(child);
             }
         }
@@ -504,10 +569,11 @@ impl Resolver {
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
         self.result.bindings.extend(frame.bindings.iter().cloned());
+        // See `resolve_file`: every captured local is a by-reference cell.
         let cell_slots: Vec<u32> = frame
             .bindings
             .iter()
-            .filter(|b| b.captured && b.mutated)
+            .filter(|b| b.captured)
             .map(|b| b.slot)
             .collect();
         self.result.frames.insert(
@@ -749,11 +815,13 @@ mod tests {
                 n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("inner")
             })
             .unwrap();
+        // Hoisting pre-declares `inner` (slot 0), so `x` is slot 1 in `outer`;
+        // the captured upvalue therefore points at ParentLocal(1).
         let fi = r
             .frames
             .get(&(SyntaxKind::FnDecl, inner.text_range()))
             .expect("inner frame");
-        assert_eq!(fi.upvalues, vec![UpvalueDescriptor::ParentLocal(0)]);
+        assert_eq!(fi.upvalues, vec![UpvalueDescriptor::ParentLocal(1)]);
     }
 
     #[test]
@@ -844,8 +912,15 @@ mod tests {
     }
 
     #[test]
-    fn captured_immutable_is_not_a_cell() {
-        // x captured but never reassigned → NOT a cell.
+    fn captured_local_is_a_cell() {
+        // Baseline VM semantics: EVERY captured local is a by-reference cell,
+        // regardless of mutation. This preserves late binding — the cell is
+        // allocated (nil) at frame entry and filled when its declaration runs,
+        // so a closure that captured it sees the filled value at call time.
+        // (Capture-by-value for immutable, never-forward-referenced bindings is
+        // a FUTURE optimization (V5), not the baseline.)
+        //
+        // x captured but never reassigned → STILL a cell.
         let immut = parse_to_tree("fn o() {\n let x = 1\n fn i() { return x }\n}");
         let r1 = resolve(&immut);
         let oi = immut
@@ -854,14 +929,17 @@ mod tests {
                 n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o")
             })
             .unwrap();
-        assert!(r1
-            .frames
-            .get(&(SyntaxKind::FnDecl, oi.text_range()))
-            .unwrap()
-            .cell_slots
-            .is_empty());
+        // Hoisting pre-declares `i` (slot 0), so `x` is slot 1.
+        assert_eq!(
+            r1.frames
+                .get(&(SyntaxKind::FnDecl, oi.text_range()))
+                .unwrap()
+                .cell_slots,
+            vec![1],
+            "an immutable captured local is a cell under the baseline rule"
+        );
 
-        // y captured AND reassigned → IS a cell.
+        // y captured AND reassigned → IS a cell (unchanged).
         let mutated = parse_to_tree("fn o() {\n let y = 1\n fn i() { y = 2 }\n}");
         let r2 = resolve(&mutated);
         let oi2 = mutated
@@ -870,12 +948,112 @@ mod tests {
                 n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o")
             })
             .unwrap();
+        // Hoisting pre-declares `i` (slot 0), so `y` is slot 1.
         assert_eq!(
             r2.frames
                 .get(&(SyntaxKind::FnDecl, oi2.text_range()))
                 .unwrap()
                 .cell_slots,
-            vec![0]
+            vec![1]
         );
+    }
+
+    #[test]
+    fn uncaptured_local_is_not_a_cell() {
+        // A local never captured by an inner function is NOT a cell (plain slot),
+        // even if it is reassigned — cells are only for captured bindings.
+        let tree = parse_to_tree("fn o() {\n let x = 1\n x = 2\n print(x)\n}");
+        let r = resolve(&tree);
+        let oi = tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o"))
+            .unwrap();
+        assert!(
+            r.frames
+                .get(&(SyntaxKind::FnDecl, oi.text_range()))
+                .unwrap()
+                .cell_slots
+                .is_empty(),
+            "an uncaptured local must not be a cell"
+        );
+    }
+
+    #[test]
+    fn forward_fn_ref_resolves_to_frame_binding() {
+        // `b` is referenced inside `a` before `b` is textually declared. With
+        // hoisting, the use of `b` resolves to a frame binding (Local/Upvalue),
+        // NOT Global/Unresolved — so the VM can find its slot.
+        let tree = parse_to_tree("fn a() { return b() }\nfn b() { return 7 }\n");
+        let r = resolve(&tree);
+        let b_use = tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("b"))
+            .unwrap();
+        match r.uses.get(&b_use.text_range()) {
+            Some(Resolution::Upvalue(_)) | Some(Resolution::Local(_)) => {}
+            other => panic!("forward fn ref `b` should be a frame binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn self_recursion_is_a_captured_cell() {
+        // `fac` references itself; the name is captured by the inner frame and
+        // its slot (in the file frame) is a cell.
+        let tree =
+            parse_to_tree("fn fac(n) {\n if (n <= 1) { return 1 }\n return n * fac(n - 1)\n}\n");
+        let r = resolve(&tree);
+        let fac_use = tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("fac"))
+            .last()
+            .unwrap();
+        assert!(
+            matches!(
+                r.uses.get(&fac_use.text_range()),
+                Some(Resolution::Upvalue(_)) | Some(Resolution::Local(_))
+            ),
+            "self-recursive `fac` use must resolve to a frame binding"
+        );
+        // `fac` lives in the file frame; it is captured → its slot is a cell.
+        let file = r
+            .frames
+            .get(&(SyntaxKind::SourceFile, tree.text_range()))
+            .expect("file frame");
+        let fac = r
+            .bindings
+            .iter()
+            .find(|b| b.name == "fac" && b.kind == BindingKind::Fn)
+            .expect("fac binding");
+        assert!(
+            fac.captured,
+            "self-recursive `fac` must be marked captured"
+        );
+        assert!(
+            file.cell_slots.contains(&fac.slot),
+            "captured `fac` slot must be in the file frame's cell_slots"
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_both_resolve_to_frame_bindings() {
+        // `a` calls `b`, `b` calls `a`. Both must resolve to frame bindings.
+        let tree = parse_to_tree("fn a() { return b() }\nfn b() { return a() }\n");
+        let r = resolve(&tree);
+        for name in ["a", "b"] {
+            let use_site = tree
+                .descendants()
+                .find(|n| {
+                    n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some(name)
+                })
+                .unwrap();
+            assert!(
+                matches!(
+                    r.uses.get(&use_site.text_range()),
+                    Some(Resolution::Upvalue(_)) | Some(Resolution::Local(_))
+                ),
+                "mutual-recursion use of `{name}` must be a frame binding, got {:?}",
+                r.uses.get(&use_site.text_range())
+            );
+        }
     }
 }
