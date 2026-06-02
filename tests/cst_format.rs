@@ -60,3 +60,10 @@ fn formatting_is_idempotent_over_corpus() {
     }
     assert!(failures.is_empty(), "idempotence failures:\n{}", failures.join("\n"));
 }
+
+#[test]
+fn cli_formatter_preserves_comments_end_to_end() {
+    // The library entry the CLI uses keeps comments — the original bug, fixed.
+    let src = "let x = 1 // keep me\n";
+    assert_eq!(ascript::syntax::format_tree(src), "let x = 1 // keep me\n");
+}

@@ -57,20 +57,21 @@ async fn main() -> ExitCode {
             let mut code = ExitCode::SUCCESS;
             for file in &files {
                 match std::fs::read_to_string(file) {
-                    Ok(src) => match ascript::fmt::format_source(&src) {
-                        Ok(formatted) => {
-                            if let Err(e) = std::fs::write(file, &formatted) {
-                                eprintln!("error: could not write {}: {}", file, e);
-                                code = ExitCode::from(1);
-                            } else {
-                                println!("formatted {}", file);
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("error: could not format {}: {}", file, e);
+                    Ok(src) => {
+                        let parse = ascript::syntax::parser::parse(&src);
+                        if !parse.errors.is_empty() {
+                            eprintln!("error: {}: parse error; not formatting", file);
                             code = ExitCode::from(1);
+                            continue;
                         }
-                    },
+                        let formatted = ascript::syntax::format_tree(&src);
+                        if let Err(e) = std::fs::write(file, &formatted) {
+                            eprintln!("error: could not write {}: {}", file, e);
+                            code = ExitCode::from(1);
+                        } else {
+                            println!("formatted {}", file);
+                        }
+                    }
                     Err(e) => {
                         eprintln!("error: could not read {}: {}", file, e);
                         code = ExitCode::from(1);
