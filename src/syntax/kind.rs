@@ -8,19 +8,91 @@
 #[repr(u32)]
 #[derive(cstree::Syntax)]
 pub enum SyntaxKind {
-    // --- nodes ---
-    /// The whole-document root node.
+    // --- nodes (only Root for now; the parser plan adds the rest) ---
     Root,
 
-    // --- trivia (text varies → no static_text) ---
+    // --- trivia ---
     Whitespace,
     Newline,
     LineComment,
     BlockComment,
 
-    // --- a single real token, just for the spike ---
-    /// Numeric literal (text varies).
+    // --- literals / identifiers (variable text) ---
     Number,
+    Str,
+    Ident,
+    TemplateStr,
+    TemplateStart,
+    TemplateMiddle,
+    TemplateEnd,
+
+    // --- operators & punctuation (fixed text) ---
+    #[static_text("+")] Plus,
+    #[static_text("-")] Minus,
+    #[static_text("*")] Star,
+    #[static_text("/")] Slash,
+    #[static_text("%")] Percent,
+    #[static_text("**")] StarStar,
+    #[static_text("(")] LParen,
+    #[static_text(")")] RParen,
+    #[static_text("{")] LBrace,
+    #[static_text("}")] RBrace,
+    #[static_text("[")] LBracket,
+    #[static_text("]")] RBracket,
+    #[static_text(",")] Comma,
+    #[static_text(".")] Dot,
+    #[static_text(":")] Colon,
+    #[static_text(";")] Semicolon,
+    #[static_text("!")] Bang,
+    #[static_text("!=")] BangEq,
+    #[static_text("==")] EqEq,
+    #[static_text("=")] Eq,
+    #[static_text("<")] Lt,
+    #[static_text("<=")] Le,
+    #[static_text(">")] Gt,
+    #[static_text(">=")] Ge,
+    #[static_text("&&")] AmpAmp,
+    #[static_text("||")] PipePipe,
+    #[static_text("??")] QuestionQuestion,
+    #[static_text("?")] Question,
+    #[static_text("?.")] QuestionDot,
+    #[static_text("|")] Pipe,
+    #[static_text("+=")] PlusEq,
+    #[static_text("-=")] MinusEq,
+    #[static_text("*=")] StarEq,
+    #[static_text("/=")] SlashEq,
+    #[static_text("..")] DotDot,
+    #[static_text("..=")] DotDotEq,
+    #[static_text("...")] DotDotDot,
+    #[static_text("=>")] FatArrow,
+
+    // --- keywords (fixed text) ---
+    #[static_text("true")] TrueKw,
+    #[static_text("false")] FalseKw,
+    #[static_text("nil")] NilKw,
+    #[static_text("let")] LetKw,
+    #[static_text("const")] ConstKw,
+    #[static_text("if")] IfKw,
+    #[static_text("else")] ElseKw,
+    #[static_text("while")] WhileKw,
+    #[static_text("for")] ForKw,
+    #[static_text("in")] InKw,
+    #[static_text("of")] OfKw,
+    #[static_text("return")] ReturnKw,
+    #[static_text("break")] BreakKw,
+    #[static_text("continue")] ContinueKw,
+    #[static_text("fn")] FnKw,
+    #[static_text("enum")] EnumKw,
+    #[static_text("match")] MatchKw,
+    #[static_text("class")] ClassKw,
+    #[static_text("import")] ImportKw,
+    #[static_text("export")] ExportKw,
+    #[static_text("async")] AsyncKw,
+    #[static_text("await")] AwaitKw,
+    #[static_text("yield")] YieldKw,
+
+    // --- sentinel for unrecognized input ---
+    Error,
 }
 
 impl SyntaxKind {
@@ -33,5 +105,21 @@ impl SyntaxKind {
                 | SyntaxKind::LineComment
                 | SyntaxKind::BlockComment
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trivia_classification() {
+        assert!(SyntaxKind::Whitespace.is_trivia());
+        assert!(SyntaxKind::LineComment.is_trivia());
+        assert!(SyntaxKind::BlockComment.is_trivia());
+        assert!(SyntaxKind::Newline.is_trivia());
+        assert!(!SyntaxKind::Number.is_trivia());
+        assert!(!SyntaxKind::Plus.is_trivia());
+        assert!(!SyntaxKind::LetKw.is_trivia());
     }
 }
