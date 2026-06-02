@@ -1,9 +1,14 @@
-# Bytecode Compiler + VM — Design Spec (Runtime, sub-project #2)
+# Bytecode Compiler + VM + GC — Design Spec (Runtime, sub-project #2)
 
 **Date:** 2026-06-02
 **Status:** Approved (brainstorming complete; pending implementation plan)
 **Depends on:** the CST front-end + name resolver (sub-project #1,
 `2026-06-02-cst-frontend-migration-design.md`). The compiler consumes the typed AST + resolver output.
+
+> **Scope note:** the cycle-collecting GC is **folded into this sub-project** (it shares the value
+> model, closure cells, and Fiber structures the VM rewrites). It is the **final phase**: the VM is
+> built on `Rc` to behavioral parity first, then a single `Rc → Cc` migration + collector lands. GC is
+> therefore no longer a separate sub-project.
 
 ## Problem & context
 
@@ -27,6 +32,9 @@ concentration and may be split into its own sub-spec during planning.
 - **On-disk bytecode** (`.aso`): `ascript build`, plus `import` resolving compiled modules.
 - Preserve every M17 async feature (await, generators, structured concurrency, cancel-on-drop,
   `http.serve`) and AScript's error model (`?`/`!`/`recover`, Tier-1/Tier-2) and diagnostics quality.
+- **Cycle-collecting GC** (`gcmodule` `Cc` + Bacon–Rajan trial deletion) so reference cycles in
+  `Rc`-backed mutable data + closures are reclaimed — **without** breaking deterministic native-resource
+  cleanup. Closes the unbounded-growth risk for long-running programs (`http.serve`, daemons).
 
 ## Non-Goals
 
@@ -246,13 +254,40 @@ preserved (guards + deopt), gated by `std/bench` and three-way differential test
    **diagnostics parity** (panic message + location vs tree-walker); bytecode **verifier** tests
    (reject malformed `.aso`).
 
-## GC interaction
+## Cycle-collecting GC (final phase of this sub-project)
 
-The planned `gcmodule`/`Cc` GC must trace the VM's **roots**: Fiber operand stacks, Fiber frames, upvalue
-cells (`Rc<RefCell<Value>>`), and the `ShapeRegistry`. Mutually-capturing closures via upvalue cells can
-form **reference cycles** — which is *why* the GC is planned. The VM lands with a **clean
-root-enumeration API**; coordination point: VM defines roots, GC traces them (default: GC follows the
-VM). Recorded so the GC work isn't blindsided by the VM's new root structures.
+**Why it's needed (and not obviated by the VM):** the need comes from the **value model**, which the VM
+reuses — AScript exposes mutable, shareable, `Rc`-backed containers (`Array`/`Object`/`Map`/`Set`/
+`Instance`), so user code can form reference cycles (`let a=[]; a.push(a)`, mutually-referencing objects,
+mutually-capturing closures) that pure `Rc` refcounting can never reclaim. The VM *adds* cycle-capable
+structures (upvalue cells; Fiber↔`Future`/`Generator` handle loops), so it makes the GC **more**
+relevant, not less. Harmless for short scripts (process exit reclaims), but fatal for long-running
+servers — the same class of unbounded growth M17 fought.
+
+**Approach: `gcmodule`'s `Cc<T>`** (refcounting + Bacon–Rajan trial-deletion cycle collection), chosen
+(A1) over a hand-rolled tracing collector (B1). It **augments** refcounting rather than replacing it:
+acyclic objects keep deterministic, immediate `Drop`; only actual cycles are trial-deleted. With `Cc`,
+the operand stack/frames just hold ordinary `Cc` strong refs and external references are accounted for
+by the refcount — **no separate root-enumeration API is needed** (this was a point in A1's favor).
+
+**Build order (single migration):** the VM reaches behavioral parity on **`Rc` first** (keeps the
+differential-correctness hunt clean, no `Cc` ergonomics in the bug-search). Then the **closing phase**:
+- migrate cycle-capable `Value`s + the new upvalue cells + Fiber/Closure structures `Rc → Cc`, **once**,
+  over the VM's *final* representation (no double-churn);
+- implement `Trace` for all cycle-capable types (incl. `IndexMap`-backed `Object`/`Map`);
+- enable + tune collection (scheduling/threshold).
+
+**Soundness gates (distinct from the VM's behavioral oracle — this is the *memory* proof):**
+- **Cycle reclamation** tests: `a.push(a)`, mutually-referencing objects/instances, mutually-capturing
+  closures, Fiber↔`Future` loops — all collected, verified by RSS/heap assertions.
+- **Long-running `http.serve` soak test:** bounded memory across many requests (no per-request leak).
+- **Deterministic native-resource `Drop` preserved (critical):** TCP/files/DB connections/child
+  processes/cancel-on-drop tasks must keep immediate, ordered cleanup. `Cc` preserves this for the
+  acyclic case by construction; the gate explicitly verifies a native resource is never trapped in a
+  collected cycle and its `Drop` timing is unchanged.
+
+The differential-correctness oracle (VM == tree-walker) and this memory proof are kept in **separate
+phases**, so a behavioral bug and a collector bug never share a phase.
 
 ## Performance gate
 
@@ -265,7 +300,8 @@ Falling short triggers the IC/specialization work *before* cutover.
 - **Vertical-slice sequencing** (each = compiler arm + VM arm + differential test): sync core → control
   flow → functions/calls → closures/upvalues → error handling (`?`/`!`/`recover`) → `await` →
   generators → classes/enums/`super` → match/destructuring/spread → **then** shapes + ICs →
-  specialization → `.aso` persistence + import.
+  specialization → `.aso` persistence + import → **finally `Rc → Cc` migration + cycle collector**
+  (the GC phase; soundness/soak/resource-`Drop` gates).
 - Build **alongside the tree-walker** (the differential oracle); the tree-walker keeps running the binary
   throughout. Async (await/generators) likely its **own sub-spec/plan** — risk concentration.
 - **Cutover:** per the front-end spec's OPEN DECISION (default **(i)**): develop front-end #1 + VM #2 on
@@ -300,3 +336,6 @@ Falling short triggers the IC/specialization work *before* cutover.
   resolves `.aso`** (feature A). Native dynamic-library FFI (B) = separate future spec.
 - **Reuse:** `value.rs` (+ `shape_id`) and all of `stdlib/*` unchanged; `task.rs` cancel-on-drop reused.
 - **Perf gate:** real speed-up (≥2× compute-bound target), no regression on any benchmark.
+- **GC folded into this sub-project** (not separate): `gcmodule` `Cc` + trial deletion, as the **final
+  phase** after VM parity on `Rc`; single `Rc→Cc` migration over the final representation; `Trace` for
+  cycle-capable types; soundness/soak gates; **deterministic native-resource `Drop` preserved**.
