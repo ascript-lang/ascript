@@ -194,6 +194,7 @@ impl Resolver {
         }
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
+        self.result.bindings.extend(frame.bindings.iter().cloned());
         let cell_slots: Vec<u32> = frame
             .bindings
             .iter()
@@ -477,6 +478,7 @@ impl Resolver {
         }
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
+        self.result.bindings.extend(frame.bindings.iter().cloned());
         let cell_slots: Vec<u32> = frame
             .bindings
             .iter()

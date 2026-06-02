@@ -64,4 +64,6 @@ pub struct ResolveResult {
     pub uses: HashMap<TextRange, Resolution>,
     pub frames: HashMap<(SyntaxKind, TextRange), FrameInfo>,
     pub diagnostics: Vec<ResolveDiagnostic>,
+    /// Every binding declared anywhere (across all frames), for the checker.
+    pub bindings: Vec<Binding>,
 }

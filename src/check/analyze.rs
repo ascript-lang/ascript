@@ -14,6 +14,8 @@ pub struct Analysis {
 /// Run the full analysis over `src` and return all diagnostics, sorted by
 /// start offset then code.
 pub fn analyze(src: &str) -> Analysis {
+    use crate::syntax::{resolve, tree_builder};
+
     let parsed = parse(src);
 
     let mut diagnostics: Vec<AsDiagnostic> = Vec::new();
@@ -37,6 +39,13 @@ pub fn analyze(src: &str) -> Analysis {
             message: le.message.clone(),
             fix: None,
         });
+    }
+
+    // Build the typed CST (consumes `parsed`), resolve names, and run lint rules.
+    let tree = tree_builder::build_tree(parsed);
+    let resolved = resolve::resolve(&tree);
+    for rule in crate::check::rules::ALL {
+        diagnostics.extend(rule(&tree, &resolved, src));
     }
 
     // Apply inline `ascript-ignore` suppressions before sorting.

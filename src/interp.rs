@@ -52,11 +52,15 @@ impl From<AsError> for Control {
 }
 
 /// A fresh global environment with the built-in functions installed.
+/// The bare (unqualified) builtin names installed in every program's global env.
+/// Shared with the checker (`undefined-variable`) so they cannot drift.
+pub const BUILTIN_NAMES: &[&str] = &[
+    "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit",
+];
+
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    for name in [
-        "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit",
-    ] {
+    for &name in BUILTIN_NAMES {
         env.define(name, Value::Builtin(name.into()), false)
             .expect("global env starts empty");
     }
