@@ -3135,7 +3135,7 @@ fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> 
 /// Human-readable message for a Tier-1 error value. If `err` is an Object with a
 /// `message` field, that field's value is rendered; otherwise the whole value is.
 /// Single source of truth shared by `expr!` (Unwrap) and `for await` error paths.
-fn error_message(err: &Value) -> String {
+pub(crate) fn error_message(err: &Value) -> String {
     match err {
         Value::Object(o) => o
             .borrow()

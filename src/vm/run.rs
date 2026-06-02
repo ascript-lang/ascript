@@ -13,7 +13,7 @@
 
 use crate::ast::{BinOp, UnOp};
 use crate::error::AsError;
-use crate::interp::{Control, Interp};
+use crate::interp::{error_message, Control, Interp};
 use crate::span::Span;
 use crate::value::Value;
 use crate::vm::fiber::Fiber;
@@ -618,6 +618,38 @@ impl Vm {
                         if let Some(outcome) = self.return_from_frame(fiber, pair)? {
                             return Ok(outcome);
                         }
+                    }
+                }
+
+                Op::Unwrap => {
+                    // The `!` force-unwrap operator. Mirrors the tree-walker's
+                    // `ExprKind::Unwrap` exactly: the operand must be a 2-element
+                    // `[value, err]` Result pair (else a Tier-2 panic with the
+                    // identical message, anchored at this op's span = the
+                    // `UnwrapExpr`'s code span). If `err == nil` the `value` is
+                    // left on the stack (the `!` expression's result); otherwise
+                    // it raises a RECOVERABLE `Control::Panic` carrying the
+                    // original error's message (`error_message`), so `recover`
+                    // round-trips it into `[nil, err]` IDENTICALLY to the
+                    // tree-walker's `AsError::at(error_message(&err), span)`.
+                    let v = fiber.pop();
+                    let (value, err) = match &v {
+                        Value::Array(a) if a.borrow().len() == 2 => {
+                            let b = a.borrow();
+                            (b[0].clone(), b[1].clone())
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "the ! operator requires a Result pair [value, err]".to_string(),
+                            ))
+                        }
+                    };
+                    if err == Value::Nil {
+                        fiber.push(value);
+                    } else {
+                        return Err(self.panic_at(fiber, fault_ip, error_message(&err)));
                     }
                 }
 

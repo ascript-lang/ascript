@@ -1767,3 +1767,60 @@ async fn vm_propagate_non_pair_panic_matches_treewalker() {
     // A string is not an array.
     assert_vm_run_error_matches_treewalker("let x = \"nope\"?").await;
 }
+
+// ---- V6-T2: the `!` force-unwrap operator (UNWRAP opcode) ----------------
+//
+// `expr!` mirrors the tree-walker's `ExprKind::Unwrap` exactly: the operand must
+// be a 2-element `[value, err]` Result pair. If `err == nil` the result is the
+// `value`; otherwise it raises a RECOVERABLE `Control::Panic` carrying the
+// original error's message (via `error_message`) anchored at the `!` expr span.
+
+/// Success: a `[value, nil]` pair unwraps to `value`.
+#[tokio::test]
+async fn vm_unwrap_success_matches_treewalker() {
+    let src = "fn g() { return [42, nil] }\nprint(g()!)";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("42\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// Failure with a STRING error: the recoverable panic carries `error_message` of
+/// the string (`"boom"` → `boom`, no quotes), at the `!` expr span. Both engines
+/// must produce the identical panic message + span.
+#[tokio::test]
+async fn vm_unwrap_failure_string_err_panic_matches_treewalker() {
+    assert_vm_run_error_matches_treewalker("fn g() { return [nil, \"boom\"] }\nprint(g()!)").await;
+}
+
+/// Failure with an ERROR-OBJECT error: `error_message` reads the object's
+/// `message` field (`{message: "x"}` → `x`). Identical panic on both engines.
+#[tokio::test]
+async fn vm_unwrap_failure_error_object_panic_matches_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "fn g() { return [nil, {message: \"x\"}] }\nprint(g()!)",
+    )
+    .await;
+}
+
+/// `expr!` where `expr` is NOT a 2-element `[value, err]` array is a Tier-2 panic
+/// ("the ! operator requires a Result pair [value, err]") with the exact message
+/// + span identical to the tree-walker's `ExprKind::Unwrap`.
+#[tokio::test]
+async fn vm_unwrap_non_pair_panic_matches_treewalker() {
+    assert_vm_run_error_matches_treewalker("let x = 5!").await;
+    assert_vm_run_error_matches_treewalker("let x = [1, 2, 3]!").await;
+    assert_vm_run_error_matches_treewalker("let x = \"nope\"!").await;
+}
+
+/// `!` inside `recover`: the unwrap raises a RECOVERABLE panic, so `recover`
+/// catches it and yields `[nil, err]` — byte-identical on both engines.
+#[tokio::test]
+async fn vm_unwrap_inside_recover_matches_treewalker() {
+    let src = "fn g() { return [nil, \"boom\"] }\nprint(recover(() => g()!))";
+    assert_vm_run_matches_treewalker(src).await;
+    // The success path through recover round-trips the value as well.
+    let ok = "fn g() { return [7, nil] }\nprint(recover(() => g()!))";
+    assert_vm_run_matches_treewalker(ok).await;
+}

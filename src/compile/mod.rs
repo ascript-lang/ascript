@@ -14,7 +14,7 @@ use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, BinaryExpr, Block, BreakStmt, CallExpr,
     ContinueStmt, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef,
     ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, Stmt, TemplateExpr,
-    TernaryExpr, TryExpr, UnaryExpr, WhileStmt,
+    TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
@@ -465,6 +465,7 @@ impl Compiler {
             Expr::OptMemberExpr(m) => self.compile_opt_member(m),
             Expr::TernaryExpr(t) => self.compile_ternary(t),
             Expr::TryExpr(t) => self.compile_try(t),
+            Expr::UnwrapExpr(u) => self.compile_unwrap(u),
             Expr::ArrowExpr(arrow) => self.compile_arrow(arrow),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
@@ -1875,6 +1876,26 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("? operator missing operand", span))?;
         self.compile_expr(&inner)?;
         self.chunk.emit(Op::Propagate, span);
+        Ok(())
+    }
+
+    /// Lower `expr!` (force-unwrap) into the inner expression followed by
+    /// `UNWRAP`. The op's span is the `UnwrapExpr`'s trivia-trimmed code span,
+    /// byte-identical to the tree-walker's `expr.span` for `ExprKind::Unwrap`, so
+    /// both the non-pair Tier-2 panic ("the ! operator requires a Result pair
+    /// [value, err]") and the recoverable error-promotion panic point at the same
+    /// source. At runtime `UNWRAP` checks the value is a 2-element `[value, err]`
+    /// Result pair: if `err == nil` the `value` stays on the stack (the `!`
+    /// expression's result); otherwise it raises a RECOVERABLE `Control::Panic`
+    /// carrying the original error's message (via `error_message`), exactly like
+    /// the tree-walker.
+    fn compile_unwrap(&mut self, u: &UnwrapExpr) -> Result<(), CompileError> {
+        let span = node_code_span(u);
+        let inner = u
+            .expr()
+            .ok_or_else(|| CompileError::new("! operator missing operand", span))?;
+        self.compile_expr(&inner)?;
+        self.chunk.emit(Op::Unwrap, span);
         Ok(())
     }
 
