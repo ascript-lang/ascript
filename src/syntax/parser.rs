@@ -183,14 +183,10 @@ fn is_async_fn(p: &Parser) -> bool {
 }
 
 fn expr_stmt(p: &mut Parser) {
+    // `expr_returning` now parses assignment (lowest-precedence expression), so a
+    // statement-level `x = 5` already yields an `AssignExpr` here.
     let m = p.start();
-    let lhs_cm = expr_returning(p);
-    if matches!(p.current(), SyntaxKind::Eq | SyntaxKind::PlusEq | SyntaxKind::MinusEq | SyntaxKind::StarEq | SyntaxKind::SlashEq) {
-        let am = p.precede(&lhs_cm);
-        p.bump(); // = or += etc.
-        expr(p);
-        p.complete(am, SyntaxKind::AssignExpr);
-    }
+    expr(p);
     p.complete(m, SyntaxKind::ExprStmt);
 }
 
@@ -228,6 +224,18 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
             p.error("expected ':' in ternary");
         }
         lhs_cm = p.complete(m, SyntaxKind::TernaryExpr);
+    }
+    // Assignment tail (lowest precedence, right-assoc): lhs = rhs, lhs += rhs, ...
+    // Lower than the ternary tail above (matches the legacy parser, whose
+    // assignment() wraps ternary()), so `a ? b : c = d` parses as `(a ? b : c) = d`.
+    if matches!(
+        p.current(),
+        SyntaxKind::Eq | SyntaxKind::PlusEq | SyntaxKind::MinusEq | SyntaxKind::StarEq | SyntaxKind::SlashEq
+    ) {
+        let m = p.precede(&lhs_cm);
+        p.bump(); // = / += / -= / *= / /=
+        expr(p); // rhs is a full expression (right-assoc via expr -> expr_returning)
+        lhs_cm = p.complete(m, SyntaxKind::AssignExpr);
     }
     lhs_cm
 }
@@ -1458,6 +1466,73 @@ mod tests {
     #[test]
     fn assignment_is_a_statement() {
         assert!(tree_shape("x = 5").contains(&SyntaxKind::AssignExpr));
+    }
+
+    #[test]
+    fn assignment_in_call_arg() {
+        // print(x = 5): assignment is valid in expression position (matches legacy + tree-sitter).
+        let p = parse("print(x = 5)");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let shape = tree_shape("print(x = 5)");
+        assert!(shape.contains(&SyntaxKind::AssignExpr), "shape: {shape:?}");
+        assert!(!shape.contains(&SyntaxKind::Error), "shape: {shape:?}");
+    }
+
+    #[test]
+    fn assignment_among_call_args() {
+        let p = parse("f(a, b = 2, c)");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        assert!(tree_shape("f(a, b = 2, c)").contains(&SyntaxKind::AssignExpr));
+    }
+
+    #[test]
+    fn assignment_in_array_element() {
+        let p = parse("[x = 1]");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        assert!(tree_shape("[x = 1]").contains(&SyntaxKind::AssignExpr));
+    }
+
+    #[test]
+    fn assignment_in_paren_initializer() {
+        let p = parse("let r = (x = 5)");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        assert!(tree_shape("let r = (x = 5)").contains(&SyntaxKind::AssignExpr));
+    }
+
+    #[test]
+    fn chained_assignment_right_assoc() {
+        // a = b = c: right-associative; the outer AssignExpr's rhs is another AssignExpr.
+        let p = parse("a = b = c");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let shape = tree_shape("a = b = c");
+        // Two AssignExpr nodes (nested), no error.
+        assert_eq!(
+            shape.iter().filter(|k| **k == SyntaxKind::AssignExpr).count(),
+            2,
+            "shape: {shape:?}"
+        );
+        assert!(!shape.contains(&SyntaxKind::Error));
+    }
+
+    #[test]
+    fn compound_assignment_in_expr_position() {
+        for src in ["f(x += 1)", "f(x -= 1)", "f(x *= 2)", "f(x /= 2)"] {
+            let p = parse(src);
+            assert!(p.errors.is_empty(), "{src}: {:?}", p.errors);
+            assert!(tree_shape(src).contains(&SyntaxKind::AssignExpr), "{src}");
+        }
+    }
+
+    #[test]
+    fn ternary_lower_than_nothing_but_assign_wraps_it() {
+        // `a ? b : c = d` — `=` is lower precedence than `?:`, so the whole ternary
+        // is the assignment LHS (matches the legacy parser, whose assignment() wraps
+        // ternary()). Tree: AssignExpr { TernaryExpr, ... }.
+        let p = parse("a ? b : c = d");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let shape = tree_shape("a ? b : c = d");
+        assert!(shape.contains(&SyntaxKind::AssignExpr), "shape: {shape:?}");
+        assert!(shape.contains(&SyntaxKind::TernaryExpr), "shape: {shape:?}");
     }
 
     #[test]

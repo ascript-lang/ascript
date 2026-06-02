@@ -81,6 +81,12 @@ const ACCEPT: &[&str] = &[
     "a ?? b",
     "x += 1",
     "foo(...args)",
+    // Assignment as a low-precedence expression (valid anywhere an expression is).
+    "print(x = 5)",
+    "f(a, b = 2, c)",
+    "[x = 1]",
+    "let r = (x = 5)",
+    "a = b = c",
 ];
 
 #[test]
