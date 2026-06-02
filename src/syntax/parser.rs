@@ -159,6 +159,7 @@ fn stmt(p: &mut Parser) {
             p.complete(m, SyntaxKind::ContinueStmt);
         }
         EnumKw => enum_decl(p),
+        ClassKw => class_decl(p),
         _ => expr_stmt(p),
     }
 }
@@ -952,6 +953,63 @@ fn type_primary(p: &mut Parser) -> CompletedMarker {
     }
 }
 
+fn class_decl(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // class
+    if p.at(Ident) { p.bump(); } else { p.error("expected class name"); }
+    if p.at_kw("extends") {
+        p.bump(); // extends
+        if p.at(Ident) { p.bump(); } else { p.error("expected superclass name after 'extends'"); }
+    }
+    if p.at(LBrace) { p.bump(); } else { p.error("expected '{' for class body"); }
+    while !p.at(RBrace) && !p.at_end() {
+        let before = p.pos;
+        if p.at(AsyncKw) || p.at(FnKw) {
+            method_decl(p);
+        } else if p.at(Ident) {
+            field_decl(p);
+        } else {
+            p.error("expected a field or method");
+            p.bump();
+        }
+        if p.pos == before { p.bump(); }
+    }
+    if p.at(RBrace) { p.bump(); } else { p.error("expected '}' to close class"); }
+    p.complete(m, ClassDecl);
+}
+
+fn field_decl(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // field name (Ident)
+    if p.at(Question) { p.bump(); } // optional marker `name?:`
+    if p.at(Colon) {
+        p.bump();
+        type_ann(p);
+    } else {
+        p.error("expected ':' and a type in field declaration");
+    }
+    if p.at(Eq) {
+        p.bump();
+        expr(p); // default value
+    }
+    p.complete(m, FieldDecl);
+}
+
+fn method_decl(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    if p.at(AsyncKw) { p.bump(); }
+    if p.at(FnKw) { p.bump(); } else { p.error("expected 'fn' in method"); }
+    if p.at(Star) { p.bump(); } // generator method
+    if p.at(Ident) { p.bump(); } else { p.error("expected method name"); }
+    if p.at(LParen) { param_list(p); } else { p.error("expected '(' after method name"); }
+    if p.at(Colon) { ret_type(p); }
+    if p.at(LBrace) { block(p); } else { p.error("expected '{' for method body"); }
+    p.complete(m, MethodDecl);
+}
+
 fn enum_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
@@ -1316,5 +1374,16 @@ mod tests {
         let s = tree_shape("enum Color { Red, Green = 2, Blue }");
         assert!(s.contains(&SyntaxKind::EnumDecl));
         assert!(s.contains(&SyntaxKind::EnumVariant));
+    }
+
+    #[test]
+    fn class_declaration() {
+        let src = "class Dog extends Animal {\n  name: string\n  age: number = 0\n  nickname?: string\n  fn init(name) { self.name = name }\n  fn describe(): string { return self.name }\n}";
+        let p = parse(src);
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape(src);
+        assert!(s.contains(&SyntaxKind::ClassDecl));
+        assert!(s.contains(&SyntaxKind::FieldDecl));
+        assert!(s.contains(&SyntaxKind::MethodDecl));
     }
 }
