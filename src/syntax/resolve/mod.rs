@@ -349,14 +349,22 @@ impl Resolver {
                     self.declare(t.text(), BindingKind::Import, node.text_range());
                 }
             }
-        } else if let Some(alias) = node
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .filter(|t| t.kind() == Ident)
-            .last()
-            .map(|t| t.text().to_string())
-        {
-            self.declare(&alias, BindingKind::Import, node.text_range());
+        } else {
+            // Namespace import `import * as <alias> from "..."`. The statement is a
+            // flat token run; `as`/`from` lex as Idents too, so the alias is the
+            // Ident immediately FOLLOWING the soft-keyword `as` (not the last Ident,
+            // which would be `from`).
+            let idents: Vec<String> = node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .filter(|t| t.kind() == Ident)
+                .map(|t| t.text().to_string())
+                .collect();
+            if let Some(pos) = idents.iter().position(|t| t == "as") {
+                if let Some(alias) = idents.get(pos + 1) {
+                    self.declare(alias, BindingKind::Import, node.text_range());
+                }
+            }
         }
     }
 
