@@ -22,6 +22,16 @@ enum Command {
     Repl,
     /// Format .as source files
     Fmt { files: Vec<String> },
+    /// Statically check .as files (syntax + lints)
+    Check {
+        files: Vec<String>,
+        /// Emit machine-readable JSON instead of human output.
+        #[arg(long)]
+        json: bool,
+        /// Treat all warnings as errors (non-zero exit on any warning).
+        #[arg(long)]
+        deny_warnings: bool,
+    },
     /// Run .as test files
     Test { files: Vec<String> },
     /// Run the language server (LSP over stdio)
@@ -79,6 +89,46 @@ async fn main() -> ExitCode {
                 }
             }
             code
+        }
+        Command::Check {
+            files,
+            json,
+            deny_warnings,
+        } => {
+            let mut any_error = false;
+            let mut any_warning = false;
+            for file in &files {
+                let src = match std::fs::read_to_string(file) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{}: {}", file, e);
+                        any_error = true;
+                        continue;
+                    }
+                };
+                let analysis = ascript::check::analyze(&src);
+                for d in &analysis.diagnostics {
+                    match d.severity {
+                        ascript::check::Severity::Error => any_error = true,
+                        ascript::check::Severity::Warning => any_warning = true,
+                        _ => {}
+                    }
+                }
+                if json {
+                    println!("{}", ascript::check::render::json(file, &analysis.diagnostics));
+                } else {
+                    print!(
+                        "{}",
+                        ascript::check::render::human(file, &src, &analysis.diagnostics)
+                    );
+                }
+            }
+            let fail = any_error || (deny_warnings && any_warning);
+            if fail {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Command::Test { files } => match ascript::run_tests(&files).await {
             Ok(summary) => {
