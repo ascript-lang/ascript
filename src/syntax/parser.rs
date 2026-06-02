@@ -92,8 +92,6 @@ impl Parser {
         CompletedMarker { pos: m.pos }
     }
 
-    // used in Plan 2 T6+
-    #[allow(dead_code)]
     fn precede(&mut self, cm: &CompletedMarker) -> Marker {
         let new_pos = self.events.len();
         self.events.push(Event::Start { kind: TOMBSTONE, forward_parent: None });
@@ -126,20 +124,146 @@ pub fn parse(src: &str) -> Parse {
     Parse { events: p.events, errors: p.errors, tokens: p.tokens }
 }
 
-/// Placeholder statement parser — later tasks fill this in. For T3 it parses a
-/// single number literal as an expression statement so the scaffold is testable.
 fn stmt(p: &mut Parser) {
     let m = p.start();
-    if p.at(SyntaxKind::Number) {
-        let lit = p.start();
-        p.bump();
-        p.complete(lit, SyntaxKind::Literal);
-        p.complete(m, SyntaxKind::ExprStmt);
-    } else {
-        p.error("expected statement");
-        p.bump();
-        p.complete(m, SyntaxKind::Error);
+    expr(p);
+    p.complete(m, SyntaxKind::ExprStmt);
+}
+
+/// Infix binding powers (left, right). Higher binds tighter.
+fn infix_binding_power(kind: SyntaxKind) -> Option<(u8, u8)> {
+    use SyntaxKind::*;
+    Some(match kind {
+        PipePipe => (1, 2),
+        AmpAmp => (3, 4),
+        EqEq | BangEq => (5, 6),
+        Lt | Le | Gt | Ge => (7, 8),
+        Plus | Minus => (9, 10),
+        Star | Slash | Percent => (11, 12),
+        StarStar => (16, 15), // right-assoc
+        _ => return None,
+    })
+}
+
+fn expr(p: &mut Parser) {
+    expr_bp(p, 0);
+}
+
+fn expr_bp(p: &mut Parser, min_bp: u8) {
+    let mut lhs = lhs(p);
+    loop {
+        let op = p.current();
+        let Some((l_bp, r_bp)) = infix_binding_power(op) else { break };
+        if l_bp < min_bp {
+            break;
+        }
+        let m = p.precede(&lhs);
+        p.bump(); // operator
+        expr_bp(p, r_bp);
+        lhs = p.complete(m, SyntaxKind::BinaryExpr);
     }
+}
+
+fn lhs(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    match p.current() {
+        Minus | Bang => {
+            let m = p.start();
+            p.bump();
+            let _operand = lhs(p);
+            p.complete(m, UnaryExpr)
+        }
+        _ => primary(p),
+    }
+}
+
+fn primary(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let cm = match p.current() {
+        Number | Str | TrueKw | FalseKw | NilKw => {
+            let m = p.start();
+            p.bump();
+            p.complete(m, Literal)
+        }
+        Ident => {
+            let m = p.start();
+            p.bump();
+            p.complete(m, NameRef)
+        }
+        LParen => {
+            let m = p.start();
+            p.bump(); // (
+            expr(p);
+            if p.at(RParen) {
+                p.bump();
+            } else {
+                p.error("expected ')'");
+            }
+            p.complete(m, ParenExpr)
+        }
+        _ => {
+            let m = p.start();
+            p.error("expected expression");
+            p.complete(m, Error)
+        }
+    };
+    postfix(p, cm)
+}
+
+fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
+    use SyntaxKind::*;
+    loop {
+        match p.current() {
+            LParen => {
+                let m = p.precede(&cm);
+                arg_list(p);
+                cm = p.complete(m, CallExpr);
+            }
+            Dot => {
+                let m = p.precede(&cm);
+                p.bump(); // .
+                if p.at(Ident) {
+                    p.bump();
+                } else {
+                    p.error("expected property name after '.'");
+                }
+                cm = p.complete(m, MemberExpr);
+            }
+            LBracket => {
+                let m = p.precede(&cm);
+                p.bump(); // [
+                expr(p);
+                if p.at(RBracket) {
+                    p.bump();
+                } else {
+                    p.error("expected ']'");
+                }
+                cm = p.complete(m, IndexExpr);
+            }
+            _ => break,
+        }
+    }
+    cm
+}
+
+fn arg_list(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // (
+    while !p.at(RParen) && !p.at_end() {
+        expr(p);
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RParen) {
+        p.bump();
+    } else {
+        p.error("expected ')' to close arguments");
+    }
+    p.complete(m, ArgList);
 }
 
 #[cfg(test)]
@@ -171,5 +295,55 @@ mod tests {
         let p = parse("+");
         assert!(!p.errors.is_empty(), "should record an error");
         assert!(matches!(p.events.first(), Some(Event::Start { kind: SyntaxKind::SourceFile, .. })));
+    }
+
+    fn tree_shape(src: &str) -> Vec<SyntaxKind> {
+        use crate::syntax::cst::ResolvedNode;
+        fn walk(n: &ResolvedNode, out: &mut Vec<SyntaxKind>) {
+            out.push(n.kind());
+            for c in n.children() {
+                walk(c, out);
+            }
+        }
+        let node = crate::syntax::tree_builder::build_tree(parse(src));
+        let mut out = Vec::new();
+        walk(&node, &mut out);
+        out
+    }
+
+    #[test]
+    fn precedence_groups_multiply_under_add() {
+        // 1 + 2 * 3 => Binary(+) { Literal, Binary(*) { Literal, Literal } }
+        let shape = tree_shape("1 + 2 * 3");
+        assert_eq!(
+            shape,
+            vec![
+                SyntaxKind::SourceFile, SyntaxKind::ExprStmt,
+                SyntaxKind::BinaryExpr,
+                SyntaxKind::Literal,
+                SyntaxKind::BinaryExpr,
+                SyntaxKind::Literal, SyntaxKind::Literal,
+            ]
+        );
+        assert!(parse("1 + 2 * 3").errors.is_empty());
+    }
+
+    #[test]
+    fn unary_and_paren() {
+        assert_eq!(
+            tree_shape("-(1)"),
+            vec![
+                SyntaxKind::SourceFile, SyntaxKind::ExprStmt,
+                SyntaxKind::UnaryExpr, SyntaxKind::ParenExpr, SyntaxKind::Literal,
+            ]
+        );
+    }
+
+    #[test]
+    fn name_reference() {
+        assert_eq!(
+            tree_shape("x"),
+            vec![SyntaxKind::SourceFile, SyntaxKind::ExprStmt, SyntaxKind::NameRef]
+        );
     }
 }
