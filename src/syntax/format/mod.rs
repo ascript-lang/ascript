@@ -150,6 +150,7 @@ impl Printer<'_> {
             }
             Block => self.block(node),
             FnDecl => self.fn_decl(node),
+            ClassDecl => self.class_decl(node),
             _ => {
                 self.out.text(&node.text().to_string());
                 self.out.newline();
@@ -199,6 +200,77 @@ impl Printer<'_> {
         self.out.text(" ");
         if let Some(body) = node.children().find(|c| c.kind() == Block) {
             self.block(body);
+        }
+    }
+
+    fn class_decl(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("class ");
+        if let Some(name) = first_ident_text(node) {
+            self.out.text(&name);
+        }
+        // (extends clause is Plan 4b; 4a omits it — name only)
+        self.out.text(" {");
+        self.out.newline();
+        self.out.indent();
+
+        let members: Vec<&ResolvedNode> = node
+            .children()
+            .filter(|c| matches!(c.kind(), FieldDecl | MethodDecl))
+            .collect();
+        let fields = members.iter().copied().filter(|m| m.kind() == FieldDecl);
+        let methods = members.iter().copied().filter(|m| m.kind() == MethodDecl);
+        let ordered: Vec<&ResolvedNode> = fields.chain(methods).collect();
+
+        for (i, m) in ordered.iter().enumerate() {
+            if i > 0 {
+                let blank = self.comments.leading.get(&m.text_range())
+                    .and_then(|l| l.first()).map(|c| c.blank_before).unwrap_or(false);
+                if blank { self.out.blank(); }
+            }
+            self.emit_leading(m);
+            self.member(m);
+            self.emit_trailing(m);
+        }
+
+        self.out.dedent();
+        self.out.text("}");
+        self.out.newline();
+    }
+
+    fn member(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        match node.kind() {
+            FieldDecl => {
+                // `name: Type [= default]` — 4a emits the type/default portion
+                // verbatim (4b normalizes name?:T → name:T? and pretty-prints types).
+                if let Some(name) = first_ident_text(node) {
+                    self.out.text(&name);
+                }
+                self.out.text(": ");
+                let ty = node
+                    .children()
+                    .find(|c| matches!(c.kind(), NamedType | GenericType | OptionalType | UnionType | TupleType))
+                    .map(|t| t.text().to_string())
+                    .unwrap_or_default();
+                self.out.text(ty.trim());
+                self.out.newline();
+            }
+            MethodDecl => {
+                self.out.text("fn ");
+                if let Some(name) = first_ident_text(node) {
+                    self.out.text(&name);
+                }
+                self.params(node);
+                self.out.text(" ");
+                if let Some(body) = node.children().find(|c| c.kind() == Block) {
+                    self.block(body);
+                }
+            }
+            _ => {
+                self.out.text(&node.text().to_string());
+                self.out.newline();
+            }
         }
     }
 
@@ -366,5 +438,20 @@ mod tests {
             fmt("fn f(a,b){return a+b}"),
             "fn f(a, b) {\n  return a + b\n}\n"
         );
+    }
+
+    #[test]
+    fn class_reorders_fields_before_methods_carrying_comments() {
+        // Source: a method appears BEFORE a field, each with its own comment.
+        // Canonical layout puts fields first — and each comment must travel.
+        let src = "class C {\n  // the greet method\n  fn greet() { return 1 }\n  // the name field\n  name: string\n}\n";
+        let out = fmt(src);
+        let name_pos = out.find("name: string").expect("field present");
+        let greet_pos = out.find("fn greet").expect("method present");
+        assert!(name_pos < greet_pos, "fields must be reordered before methods:\n{out}");
+        let name_c = out.find("// the name field").expect("field comment present");
+        let greet_c = out.find("// the greet method").expect("method comment present");
+        assert!(name_c < name_pos && name_pos < greet_c,
+            "each comment must travel with its member:\n{out}");
     }
 }
