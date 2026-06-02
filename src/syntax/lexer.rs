@@ -12,17 +12,36 @@ pub struct LexToken {
     pub text: String,
 }
 
+/// A lexical error (e.g. an unterminated string), positioned by its index into
+/// the full token vector returned alongside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LexError {
+    pub message: String,
+    /// Index into the returned `Vec<LexToken>` of the offending token.
+    pub token: usize,
+}
+
 /// Reconstruct source from a token stream — used by the losslessness invariant.
 pub fn render(tokens: &[LexToken]) -> String {
     tokens.iter().map(|t| t.text.as_str()).collect()
 }
 
 pub fn lex(src: &str) -> Vec<LexToken> {
+    lex_with_errors(src).0
+}
+
+/// Lex `src` into a lossless token stream plus any lexical errors (unterminated
+/// string/template/block-comment). Losslessness is preserved: the tokens still
+/// cover the entire input even in the error cases — the errors are an added
+/// channel, not a change to tokenization.
+pub fn lex_with_errors(src: &str) -> (Vec<LexToken>, Vec<LexError>) {
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0usize;
     let mut out: Vec<LexToken> = Vec::new();
+    let mut errors: Vec<LexError> = Vec::new();
     let mut brace_depth = 0usize;
-    let mut template_stack: Vec<usize> = Vec::new();
+    // Each entry: (brace_depth at the interpolation, token index of the TemplateStart).
+    let mut template_stack: Vec<(usize, usize)> = Vec::new();
 
     macro_rules! push {
         ($kind:expr, $start:expr, $end:expr) => {{
@@ -60,12 +79,20 @@ pub fn lex(src: &str) -> Vec<LexToken> {
             while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
                 i += 1;
             }
+            let mut unterminated_block = false;
             if i + 1 < chars.len() {
                 i += 2;
             } else {
                 i = chars.len();
+                unterminated_block = true;
             }
             push!(SyntaxKind::BlockComment, start, i);
+            if unterminated_block {
+                errors.push(LexError {
+                    message: "unterminated block comment".into(),
+                    token: out.len() - 1,
+                });
+            }
             continue;
         }
 
@@ -91,30 +118,48 @@ pub fn lex(src: &str) -> Vec<LexToken> {
 
         // plain strings: "..." and '...'
         if c == '"' || c == '\'' {
-            let j = scan_string_end(&chars, i, c);
+            let (j, terminated) = scan_string_end(&chars, i, c);
             push!(SyntaxKind::Str, start, j);
             i = j;
+            if !terminated {
+                errors.push(LexError {
+                    message: "unterminated string".into(),
+                    token: out.len() - 1,
+                });
+            }
             continue;
         }
 
         // templates: `...` with ${ } interpolations
         if c == '`' {
-            let (kind, j) = scan_template_chunk(&chars, i, /*from_backtick=*/ true);
+            let (kind, j, terminated) = scan_template_chunk(&chars, i, /*from_backtick=*/ true);
             push!(kind, start, j);
             i = j;
             if kind == SyntaxKind::TemplateStart {
-                template_stack.push(brace_depth);
+                template_stack.push((brace_depth, out.len() - 1));
+            }
+            if !terminated {
+                errors.push(LexError {
+                    message: "unterminated template string".into(),
+                    token: out.len() - 1,
+                });
             }
             continue;
         }
 
         // a `}` that closes a template interpolation resumes template text
-        if c == '}' && template_stack.last() == Some(&brace_depth) {
-            let (kind, j) = scan_template_chunk(&chars, i, /*from_backtick=*/ false);
+        if c == '}' && template_stack.last().map(|&(d, _)| d) == Some(brace_depth) {
+            let (kind, j, terminated) = scan_template_chunk(&chars, i, /*from_backtick=*/ false);
             push!(kind, start, j);
             i = j;
             if kind == SyntaxKind::TemplateEnd {
                 template_stack.pop();
+            }
+            if !terminated {
+                errors.push(LexError {
+                    message: "unterminated template string".into(),
+                    token: out.len() - 1,
+                });
             }
             continue;
         }
@@ -136,7 +181,17 @@ pub fn lex(src: &str) -> Vec<LexToken> {
         push!(SyntaxKind::Error, start, i);
     }
 
-    out
+    // Any template interpolation left open (e.g. `` `a${b ``): the TemplateStart
+    // itself was "terminated" by `${` but the template was never closed. Report
+    // each unclosed interpolation against its TemplateStart token.
+    for &(_, token) in &template_stack {
+        errors.push(LexError {
+            message: "unterminated template string".into(),
+            token,
+        });
+    }
+
+    (out, errors)
 }
 
 /// Advance past a numeric literal starting at `i` (a digit). Mirrors the legacy
@@ -249,26 +304,28 @@ fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
 }
 
 /// Index just past the closing quote of a "..."/'...' string starting at `i`
-/// (the opening quote `q`). Honors backslash escapes. Unterminated → chars.len().
-fn scan_string_end(chars: &[char], i: usize, q: char) -> usize {
+/// (the opening quote `q`), plus whether the string was terminated. Honors
+/// backslash escapes. Unterminated → `(chars.len(), false)`.
+fn scan_string_end(chars: &[char], i: usize, q: char) -> (usize, bool) {
     let n = chars.len();
     let mut j = i + 1;
     while j < n {
         match chars[j] {
             '\\' if j + 1 < n => j += 2,
-            c if c == q => return j + 1,
+            c if c == q => return (j + 1, true),
             _ => j += 1,
         }
     }
-    n
+    (n, false)
 }
 
 /// Scan a template text chunk. `from_backtick=true` starts at a backtick;
-/// `false` starts at a `}` closing an interpolation. Returns (kind, end_index).
-/// Stops at an unescaped `${` (more interpolation) or the closing backtick.
-/// Lossless: the slice includes the opening `` ` ``/`}` and the closing
-/// `` ` ``/`${`.
-fn scan_template_chunk(chars: &[char], i: usize, from_backtick: bool) -> (SyntaxKind, usize) {
+/// `false` starts at a `}` closing an interpolation. Returns
+/// `(kind, end_index, terminated)`. Stops at an unescaped `${` (more
+/// interpolation) or the closing backtick — both `terminated=true`; running off
+/// the end of input is `terminated=false`. Lossless: the slice includes the
+/// opening `` ` ``/`}` and the closing `` ` ``/`${`.
+fn scan_template_chunk(chars: &[char], i: usize, from_backtick: bool) -> (SyntaxKind, usize, bool) {
     use SyntaxKind::*;
     let n = chars.len();
     let mut j = i + 1; // skip opening ` or }
@@ -277,17 +334,17 @@ fn scan_template_chunk(chars: &[char], i: usize, from_backtick: bool) -> (Syntax
             '\\' if j + 1 < n => j += 2,
             '`' => {
                 let kind = if from_backtick { TemplateStr } else { TemplateEnd };
-                return (kind, j + 1);
+                return (kind, j + 1, true);
             }
             '$' if j + 1 < n && chars[j + 1] == '{' => {
                 let kind = if from_backtick { TemplateStart } else { TemplateMiddle };
-                return (kind, j + 2); // include the ${
+                return (kind, j + 2, true); // include the ${
             }
             _ => j += 1,
         }
     }
     let kind = if from_backtick { TemplateStr } else { TemplateEnd };
-    (kind, n)
+    (kind, n, false)
 }
 
 /// Map a reserved word to its keyword kind. Mirrors the legacy keyword set
@@ -330,6 +387,50 @@ mod tests {
     fn unterminated_block_comment_is_lossless() {
         let src = "/* never closed";
         assert_eq!(render(&lex(src)), src);
+    }
+
+    #[test]
+    fn unterminated_string_reports_error() {
+        let (tokens, errors) = lex_with_errors("\"oops");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("unterminated"), "msg: {}", errors[0].message);
+        assert_eq!(tokens[errors[0].token].kind, SyntaxKind::Str);
+        // Losslessness preserved.
+        assert_eq!(render(&tokens), "\"oops");
+    }
+
+    #[test]
+    fn terminated_string_no_error() {
+        assert!(lex_with_errors("\"ok\"").1.is_empty());
+        // Escaped backslash then close → terminated (no error).
+        assert!(lex_with_errors("\"a\\\\\"").1.is_empty());
+        // Escaped quote, so the string never closes → 1 error.
+        assert_eq!(lex_with_errors("\"a\\\"").1.len(), 1);
+    }
+
+    #[test]
+    fn unterminated_block_comment_reports_error() {
+        let (tokens, errors) = lex_with_errors("/* nope");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("block comment"), "msg: {}", errors[0].message);
+        assert_eq!(render(&tokens), "/* nope");
+    }
+
+    #[test]
+    fn unterminated_template_reports_error() {
+        let (_tokens, errors) = lex_with_errors("`abc");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("template"), "msg: {}", errors[0].message);
+    }
+
+    #[test]
+    fn unterminated_template_interpolation_reports_error() {
+        // `` `a${b `` — the TemplateStart closed (by `${`) but never reached a `` ` ``.
+        let (tokens, errors) = lex_with_errors("`a${b");
+        assert_eq!(errors.len(), 1, "errors: {errors:?}");
+        assert!(errors[0].message.contains("template"), "msg: {}", errors[0].message);
+        assert_eq!(tokens[errors[0].token].kind, SyntaxKind::TemplateStart);
+        assert_eq!(render(&tokens), "`a${b");
     }
 
     #[test]

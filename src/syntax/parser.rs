@@ -5,7 +5,7 @@
 
 use crate::syntax::event::{Event, TOMBSTONE};
 use crate::syntax::kind::SyntaxKind;
-use crate::syntax::lexer::{lex, LexToken};
+use crate::syntax::lexer::{lex_with_errors, LexError, LexToken};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -17,6 +17,10 @@ pub struct ParseError {
 pub struct Parse {
     pub events: Vec<Event>,
     pub errors: Vec<ParseError>,
+    /// Lexical errors (unterminated string/template/block-comment). Indexed by
+    /// FULL-token index (incl. trivia), unlike `errors` which are non-trivia
+    /// grammar errors; mapped to byte ranges by `crate::check::analyze`.
+    pub lex_errors: Vec<LexError>,
     /// The full token stream (incl. trivia), needed by the tree builder.
     pub tokens: Vec<LexToken>,
 }
@@ -29,6 +33,8 @@ struct Parser {
     pos: usize,
     events: Vec<Event>,
     errors: Vec<ParseError>,
+    /// Lexical errors surfaced by the lexer (full-token-indexed).
+    lex_errors: Vec<LexError>,
 }
 
 /// A pending open node. `complete` sets its kind; if dropped uncompleted it
@@ -44,14 +50,14 @@ struct CompletedMarker {
 
 impl Parser {
     fn new(src: &str) -> Self {
-        let tokens = lex(src);
+        let (tokens, lex_errors) = lex_with_errors(src);
         let nontrivia = tokens
             .iter()
             .enumerate()
             .filter(|(_, t)| !t.kind.is_trivia())
             .map(|(i, _)| i)
             .collect();
-        Parser { tokens, nontrivia, pos: 0, events: Vec::new(), errors: Vec::new() }
+        Parser { tokens, nontrivia, pos: 0, events: Vec::new(), errors: Vec::new(), lex_errors }
     }
 
     fn current(&self) -> SyntaxKind {
@@ -132,7 +138,7 @@ pub fn parse(src: &str) -> Parse {
         }
     }
     p.complete(m, SyntaxKind::SourceFile);
-    Parse { events: p.events, errors: p.errors, tokens: p.tokens }
+    Parse { events: p.events, errors: p.errors, lex_errors: p.lex_errors, tokens: p.tokens }
 }
 
 fn stmt(p: &mut Parser) {

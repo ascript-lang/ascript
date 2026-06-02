@@ -2,6 +2,7 @@
 
 use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
 use crate::syntax::kind::SyntaxKind;
+use crate::syntax::lexer::LexToken;
 use crate::syntax::parser::{parse, Parse, ParseError};
 use std::collections::{HashMap, HashSet};
 
@@ -22,6 +23,18 @@ pub fn analyze(src: &str) -> Analysis {
             severity: Severity::Error,
             code: "syntax-error".into(),
             message: err.message.clone(),
+            fix: None,
+        });
+    }
+
+    // Lexical errors (unterminated string/template/block-comment) are indexed by
+    // FULL-token position; compute each one's byte range directly.
+    for le in &parsed.lex_errors {
+        diagnostics.push(AsDiagnostic {
+            range: token_byte_range(&parsed.tokens, le.token),
+            severity: Severity::Error,
+            code: "syntax-error".to_string(),
+            message: le.message.clone(),
             fix: None,
         });
     }
@@ -145,6 +158,15 @@ fn line_of(line_starts: &[usize], byte: usize) -> usize {
     }
 }
 
+/// Byte span of the full-token at `idx` (sum of all preceding token lengths,
+/// extended by this token's own length). Used for lexical (full-token-indexed)
+/// errors.
+fn token_byte_range(tokens: &[LexToken], idx: usize) -> ByteSpan {
+    let start: usize = tokens.iter().take(idx).map(|t| t.text.len()).sum();
+    let end = start + tokens.get(idx).map(|t| t.text.len()).unwrap_or(0);
+    ByteSpan { start, end }
+}
+
 /// Map a `ParseError`'s non-trivia token index to a byte span in `src`.
 fn error_range(parsed: &Parse, err: &ParseError) -> ByteSpan {
     let mut byte = 0usize;
@@ -213,6 +235,37 @@ mod tests {
         assert!(!supp.suppressed_on_line(0, "some-other-code"));
         // End-to-end: the next-line `@` syntax error is suppressed.
         assert!(analyze(src).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unterminated_string_is_one_syntax_error() {
+        let a = analyze("let s = \"oops\n");
+        assert_eq!(a.diagnostics.len(), 1, "got {:?}", a.diagnostics);
+        let d = &a.diagnostics[0];
+        assert_eq!(d.code, "syntax-error");
+        assert!(
+            d.message.contains("unterminated"),
+            "message: {}",
+            d.message
+        );
+        assert!(d.range.start < d.range.end, "range: {:?}", d.range);
+    }
+
+    #[test]
+    fn unterminated_block_comment_reported() {
+        let a = analyze("/* never closed");
+        let n = a.diagnostics.iter().filter(|d| d.code == "syntax-error").count();
+        assert!(n >= 1, "expected a syntax error, got {:?}", a.diagnostics);
+        assert!(
+            a.diagnostics.iter().any(|d| d.message.contains("block comment")),
+            "got {:?}",
+            a.diagnostics
+        );
+    }
+
+    #[test]
+    fn clean_program_has_zero_diagnostics() {
+        assert!(analyze("let x = 1\nprint(x)\n").diagnostics.is_empty());
     }
 
     #[test]
