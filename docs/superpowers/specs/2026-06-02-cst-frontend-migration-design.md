@@ -159,7 +159,9 @@ Sources: biomejs.dev/internals/architecture, deepwiki.com/astral-sh/ruff, github
 ## Lexer & Parser
 
 **Lexer.** Emits *every* lexeme as a token tagged with a `SyntaxKind`, including new trivia kinds
-`LINE_COMMENT`, `BLOCK_COMMENT`, `WHITESPACE`, `NEWLINE`, and `SEMICOLON`. Nothing is discarded.
+`LINE_COMMENT`, `BLOCK_COMMENT`, `WHITESPACE`, and `NEWLINE`. (`;` is **not** trivia — it is a normal
+structural `SEMICOLON` token that the *formatter* canonicalizes to a newline; it is not attached as
+trivia.) Nothing is discarded.
 All existing tricky logic is preserved: template interpolation (`Full`/`Start`/`End`), hex/binary/
 float scanning, unterminated-block-comment error. The `?`/ternary ambiguity remains a *parser*
 concern.
