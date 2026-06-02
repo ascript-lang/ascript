@@ -454,4 +454,21 @@ mod tests {
         assert!(name_c < name_pos && name_pos < greet_c,
             "each comment must travel with its member:\n{out}");
     }
+
+    #[test]
+    fn idempotent_on_slice() {
+        for src in [
+            "1+2\n",
+            "// hi\nx\n",
+            "x // tail\n",
+            "a\n\n\nb\n",
+            "let x=1\n",
+            "fn f(a,b){return a+b}\n",
+            "class C {\n  // m\n  fn greet() { return 1 }\n  // f\n  name: string\n}\n",
+        ] {
+            let once = fmt(src);
+            let twice = fmt(&once);
+            assert_eq!(once, twice, "fmt not idempotent for {src:?}:\n{once}\n---\n{twice}");
+        }
+    }
 }
