@@ -250,12 +250,17 @@ impl Printer<'_> {
 
     fn fn_decl(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
-        // 4a: plain `fn name(params) { body }` (async/*/ret-type are Plan 4b).
-        self.out.text("fn ");
-        if let Some(name) = first_ident_text(node) {
-            self.out.text(&name);
-        }
+        let toks: Vec<SyntaxKind> = node.children_with_tokens().filter_map(|el| el.into_token()).map(|t| t.kind()).collect();
+        if toks.contains(&AsyncKw) { self.out.text("async "); }
+        self.out.text("fn");
+        if toks.contains(&Star) { self.out.text("*"); }
+        self.out.text(" ");
+        if let Some(name) = first_ident_text(node) { self.out.text(&name); }
         self.params(node);
+        if let Some(rt) = node.children().find(|c| c.kind() == RetType) {
+            self.out.text(": ");
+            if let Some(ty) = rt.children().find(|c| is_type_kind(c.kind())) { self.type_ann(ty); }
+        }
         self.out.text(" ");
         if let Some(body) = node.children().find(|c| c.kind() == Block) {
             self.block(body);
@@ -337,15 +342,36 @@ impl Printer<'_> {
         use SyntaxKind::*;
         self.out.text("(");
         if let Some(list) = node.children().find(|c| c.kind() == ParamList) {
-            let params: Vec<&ResolvedNode> =
-                list.children().filter(|c| c.kind() == Param).collect();
+            let params: Vec<&ResolvedNode> = list.children().filter(|c| c.kind() == Param).collect();
             for (i, p) in params.iter().enumerate() {
-                if i > 0 {
-                    self.out.text(", ");
+                if i > 0 { self.out.text(", "); }
+                if p.children_with_tokens().filter_map(|el| el.into_token()).any(|t| t.kind() == DotDotDot) {
+                    self.out.text("...");
                 }
-                if let Some(name) = first_ident_text(p) {
-                    self.out.text(&name);
+                if let Some(name) = first_ident_text(p) { self.out.text(&name); }
+                if let Some(ty) = p.children().find(|c| is_type_kind(c.kind())) {
+                    self.out.text(": ");
+                    self.type_ann(ty);
                 }
+            }
+        }
+        self.out.text(")");
+    }
+
+    /// Emit a parenthesized param list given the ParamList node directly.
+    fn params_from_list(&mut self, list: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("(");
+        let params: Vec<&ResolvedNode> = list.children().filter(|c| c.kind() == Param).collect();
+        for (i, p) in params.iter().enumerate() {
+            if i > 0 { self.out.text(", "); }
+            if p.children_with_tokens().filter_map(|el| el.into_token()).any(|t| t.kind() == DotDotDot) {
+                self.out.text("...");
+            }
+            if let Some(name) = first_ident_text(p) { self.out.text(&name); }
+            if let Some(ty) = p.children().find(|c| is_type_kind(c.kind())) {
+                self.out.text(": ");
+                self.type_ann(ty);
             }
         }
         self.out.text(")");
@@ -639,12 +665,75 @@ impl Printer<'_> {
     }
 
     fn arrow_expr(&mut self, node: &ResolvedNode) {
-        // T3 implements full arrows; 4a-style fallback: verbatim trimmed text.
-        self.out.text(node.text().to_string().trim());
+        use SyntaxKind::*;
+        if node.children_with_tokens().filter_map(|el| el.into_token()).any(|t| t.kind() == AsyncKw) {
+            self.out.text("async ");
+        }
+        // All arrow forms (bare `x =>`, parenthesized `(x,y) =>`) produce a ParamList.
+        // A bare single-param ParamList has no LParen token — detect that to avoid
+        // wrapping `x => e` in spurious parens.
+        if let Some(list) = node.children().find(|c| c.kind() == ParamList) {
+            let has_parens = list
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == LParen);
+            if has_parens {
+                self.params_from_list(list);
+            } else {
+                // bare single param: the ident is inside the single Param child
+                if let Some(p) = list.children().find(|c| c.kind() == Param) {
+                    if let Some(name) = first_ident_text(p) {
+                        self.out.text(&name);
+                    }
+                }
+            }
+        }
+        self.out.text(" => ");
+        if let Some(body) = node.children().find(|c| c.kind() == Block) {
+            self.block_inline(body);
+        } else if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+            self.expr(e);
+        }
     }
 
     fn match_expr(&mut self, node: &ResolvedNode) {
-        // T3 implements match; fallback: verbatim trimmed text.
+        use SyntaxKind::*;
+        self.out.text("match ");
+        if let Some(subj) = node.children().find(|c| is_expr_kind(c.kind())) { self.expr(subj); }
+        self.out.text(" {");
+        self.out.newline();
+        self.out.indent();
+        for arm in node.children().filter(|c| c.kind() == MatchArm) {
+            self.emit_leading(arm);
+            self.match_arm(arm);
+            self.emit_trailing(arm);
+        }
+        self.out.dedent();
+        self.out.text("}");
+        // match is an expression; the enclosing stmt emits the trailing newline.
+    }
+
+    fn match_arm(&mut self, arm: &ResolvedNode) {
+        use SyntaxKind::*;
+        let pats: Vec<&ResolvedNode> = arm.children().filter(|c| is_pattern_kind(c.kind())).collect();
+        for (i, p) in pats.iter().enumerate() {
+            if i > 0 { self.out.text(" | "); }
+            self.out.text(p.text().to_string().trim()); // patterns re-emit compactly via text
+        }
+        if let Some(g) = arm.children().find(|c| c.kind() == MatchGuard) {
+            self.out.text(" if ");
+            if let Some(e) = g.children().find(|c| is_expr_kind(c.kind())) { self.expr(e); }
+        }
+        self.out.text(" => ");
+        if let Some(body) = arm.children().filter(|c| is_expr_kind(c.kind())).last() {
+            self.expr(body);
+        }
+        self.out.text(",");
+        self.out.newline();
+    }
+
+    /// Minimal type printer (T5 replaces with full Named/Generic/Optional/Union/Tuple).
+    fn type_ann(&mut self, node: &ResolvedNode) {
         self.out.text(node.text().to_string().trim());
     }
 }
@@ -684,6 +773,16 @@ fn first_ident_text(node: &ResolvedNode) -> Option<String> {
         .filter_map(|el| el.into_token())
         .find(|t| t.kind() == SyntaxKind::Ident)
         .map(|t| t.text().to_string())
+}
+
+fn is_pattern_kind(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(kind, WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat)
+}
+
+fn is_type_kind(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(kind, NamedType | GenericType | OptionalType | UnionType | TupleType)
 }
 
 fn is_expr_kind(kind: SyntaxKind) -> bool {
@@ -878,6 +977,21 @@ mod tests {
         assert_eq!(fmt("break\n"), "break\n");
         assert_eq!(fmt(r#"import * as t from "std/task""#), "import * as t from \"std/task\"\n");
         assert_eq!(fmt("enum E{A,B=2}\n"), "enum E {\n  A,\n  B = 2,\n}\n");
+    }
+
+    #[test]
+    fn formats_functions_arrows_match() {
+        assert_eq!(fmt("async fn f(){return 1}\n"), "async fn f() {\n  return 1\n}\n");
+        assert_eq!(fmt("fn* g(){yield 1}\n"), "fn* g() {\n  yield 1\n}\n");
+        assert_eq!(fmt("fn add(a:number,b:number):number{return a+b}\n"),
+            "fn add(a: number, b: number): number {\n  return a + b\n}\n");
+        assert_eq!(fmt("fn v(first,...rest){return rest}\n"),
+            "fn v(first, ...rest) {\n  return rest\n}\n");
+        assert_eq!(fmt("let f=(x)=>x+1\n"), "let f = (x) => x + 1\n");
+        assert_eq!(fmt("let g=x=>x+1\n"), "let g = x => x + 1\n");
+        assert_eq!(fmt("let h=async (x)=>x\n"), "let h = async (x) => x\n");
+        assert_eq!(fmt(r#"let r=match n{0=>"z",_=>"o"}"#),
+            "let r = match n {\n  0 => \"z\",\n  _ => \"o\",\n}\n");
     }
 
     #[test]
