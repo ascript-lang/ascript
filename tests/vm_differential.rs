@@ -1667,3 +1667,103 @@ async fn vm_outer_capture_still_shared() {
     );
     assert_vm_run_matches_treewalker(src).await;
 }
+
+// ---- V6-T1: the `?` propagate operator (PROPAGATE opcode) ----------------
+
+/// `expr?` on a success pair (`err == nil`) yields the `value`, and the
+/// enclosing function returns normally. Result pairs render as `[value, err]`
+/// (e.g. `[6, nil]`), shared with the tree-walker's `Value::Display`.
+#[tokio::test]
+async fn vm_propagate_success_matches_treewalker() {
+    let src = "fn g(): Result<number> { return [5, nil] }\n\
+               fn f(): Result<number> { let v = g()?\n return [v + 1, nil] }\n\
+               print(f())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("[6, nil]\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// `expr?` on a failure pair (`err != nil`) early-returns `[nil, err]` from the
+/// enclosing function — that propagated pair becomes `f`'s return value, printed
+/// as `[nil, "boom"]`. (Untyped `f` so the propagated pair is not subject to a
+/// return-type contract — the contract path's call-site span is a separate audit,
+/// task #132; this isolates PROPAGATE's own unwind.)
+#[tokio::test]
+async fn vm_propagate_failure_returns_pair_matches_treewalker() {
+    let src = "fn g() { return [nil, \"boom\"] }\n\
+               fn f() { let v = g()?\n return [v, nil] }\n\
+               print(f())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("[nil, \"boom\"]\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// A failing `?` short-circuits the REST of the function: a `print` after the
+/// `?` does NOT run (the function early-returned the `[nil, err]` pair).
+#[tokio::test]
+async fn vm_propagate_short_circuits_rest_of_function_matches_treewalker() {
+    let src = "fn g() { return [nil, \"stop\"] }\n\
+               fn f() {\n  let a = g()?\n  print(\"not reached\")\n  return [a, nil]\n}\n\
+               print(f())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("[nil, \"stop\"]\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// Multiple `?` in a row: the first failing one short-circuits, so a later `?`
+/// (and any code after it) never runs.
+#[tokio::test]
+async fn vm_propagate_chain_matches_treewalker() {
+    let src = "fn a() { return [1, nil] }\n\
+               fn b() { return [nil, \"e2\"] }\n\
+               fn c() { return [3, nil] }\n\
+               fn f() {\n  let x = a()?\n  let y = b()?\n  let z = c()?\n\
+               \n  return [x + y + z, nil]\n}\n\
+               print(f())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("[nil, \"e2\"]\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// A top-level `?` on a failure pair ends the PROGRAM (the root frame is the
+/// function boundary): a `print` after it does NOT run, mirroring the
+/// tree-walker's top-level `Control::Propagate => Ok` (the pair is discarded).
+#[tokio::test]
+async fn vm_propagate_top_level_ends_program_matches_treewalker() {
+    let src = "let v = [nil, \"e\"]?\nprint(\"after\")";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        (String::new(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// A top-level `?` on a SUCCESS pair binds the value and execution continues.
+#[tokio::test]
+async fn vm_propagate_top_level_success_matches_treewalker() {
+    let src = "let v = [42, nil]?\nprint(v)";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("42\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// `expr?` where `expr` is NOT a 2-element `[value, err]` array is a Tier-2 panic
+/// with the exact message + span identical to the tree-walker's `ExprKind::Try`.
+#[tokio::test]
+async fn vm_propagate_non_pair_panic_matches_treewalker() {
+    assert_vm_run_error_matches_treewalker("let x = 5?").await;
+    // A 3-element array is not a Result pair either.
+    assert_vm_run_error_matches_treewalker("let x = [1, 2, 3]?").await;
+    // A string is not an array.
+    assert_vm_run_error_matches_treewalker("let x = \"nope\"?").await;
+}

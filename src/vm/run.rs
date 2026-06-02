@@ -573,37 +573,52 @@ impl Vm {
                 }
 
                 Op::Return => {
-                    // Pop the result; pop the current frame; truncate the stack back
-                    // to the frame's slot_base (discarding the callee's locals and
-                    // operands); push the result. If no frames remain, the program is
-                    // done; otherwise execution continues in the caller. Dropping the
-                    // frame releases ITS cell `Rc`s — any closures that captured those
-                    // cells keep their own strong refs, so by-reference captures stay
-                    // alive. Recursion is heap-bounded: each CALL pushed a heap frame
-                    // and this just pops one, so the Rust stack stays flat.
+                    // Pop the result and unwind one frame, returning that value to
+                    // the caller (or ending the program if this was the root frame).
+                    // The shared `return_from_frame` helper applies the return-type
+                    // contract, drops the frame (releasing its cell `Rc`s — captured
+                    // cells stay alive via the closures' own refs), truncates the
+                    // stack to `slot_base`, and pushes the result into the caller.
+                    // `PROPAGATE` reuses this SAME unwind on a propagated error.
                     let result = fiber.pop();
-                    let frame = fiber
-                        .frames
-                        .pop()
-                        .expect("Op::Return with no active frame (VM bug)");
-                    // Return-type contract: if the callee declared `: T`, the
-                    // returned value is checked against it, panicking exactly as the
-                    // tree-walker's `run_body` does — anchored at the CALL-site span
-                    // (`frame.ret_span`), with the identical message.
-                    if let Some(ret_ty) = &frame.closure.proto.ret {
-                        if !crate::interp::check_type(&result, ret_ty) {
-                            return Err(crate::interp::contract_panic(
-                                ret_ty,
-                                &result,
-                                frame.ret_span,
-                            ));
+                    if let Some(outcome) = self.return_from_frame(fiber, result)? {
+                        return Ok(outcome);
+                    }
+                }
+
+                Op::Propagate => {
+                    // The `?` operator. Mirrors the tree-walker's `ExprKind::Try`
+                    // exactly: the operand must be a 2-element `[value, err]` Result
+                    // pair (else a Tier-2 panic with the identical message, anchored
+                    // at this op's span = the `TryExpr`'s code span). If `err == nil`
+                    // the `value` is left on the stack (the `?` expression's result);
+                    // otherwise it does a FUNCTION-LEVEL early return of `[nil, err]`
+                    // — the SAME unwind-one-frame logic as `Op::Return` — so the
+                    // enclosing function returns the propagated pair (and at the top
+                    // level the program ends with that pair, treated as `Ok` by the
+                    // driver, just like `Control::Propagate` in `run_file`).
+                    let v = fiber.pop();
+                    let (value, err) = match &v {
+                        Value::Array(a) if a.borrow().len() == 2 => {
+                            let b = a.borrow();
+                            (b[0].clone(), b[1].clone())
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "the ? operator requires a Result pair [value, err]".to_string(),
+                            ))
+                        }
+                    };
+                    if err == Value::Nil {
+                        fiber.push(value);
+                    } else {
+                        let pair = crate::interp::make_pair(Value::Nil, err);
+                        if let Some(outcome) = self.return_from_frame(fiber, pair)? {
+                            return Ok(outcome);
                         }
                     }
-                    fiber.stack.truncate(frame.slot_base);
-                    if fiber.frames.is_empty() {
-                        return Ok(RunOutcome::Done(result));
-                    }
-                    fiber.push(result);
                 }
 
                 // V2–V10 fill these in; the V1 smoke only exercises the subset above.
@@ -692,6 +707,47 @@ impl Vm {
     fn panic_at(&self, fiber: &Fiber, ip: usize, msg: String) -> Control {
         let span = fiber.frame().closure.proto.chunk.span_at(ip);
         Control::Panic(AsError::at(msg, span))
+    }
+
+    /// Unwind ONE call frame, returning `value` from it.
+    ///
+    /// Shared by `Op::Return` (a normal `return v`) and `Op::Propagate` (a `?`
+    /// early-return of a `[nil, err]` pair) — the two have the same mechanics:
+    /// pop the current frame; if it declared a `: T` return contract, check the
+    /// returned value against it (panicking exactly as the tree-walker's
+    /// `run_body` does — anchored at the CALL-site span `frame.ret_span`, with the
+    /// identical message — and note the tree-walker applies this same contract to a
+    /// `Control::Propagate`-derived value too); truncate the stack back to the
+    /// frame's `slot_base` (discarding the callee's locals/operands). Dropping the
+    /// frame releases ITS cell `Rc`s — closures that captured them keep their own
+    /// strong refs, so by-reference captures stay alive. Recursion is heap-bounded:
+    /// each CALL pushed a heap frame and this pops one, so the Rust stack stays flat.
+    ///
+    /// Returns `Ok(Some(outcome))` when the ROOT frame was popped — the program is
+    /// done and `outcome` is its result (the driver treats a top-level propagated
+    /// pair as `Ok`, exactly like `run_file`'s `Control::Propagate => Ok`). Returns
+    /// `Ok(None)` when a caller frame remains — `value` was pushed onto its stack
+    /// and execution continues there.
+    fn return_from_frame(
+        &self,
+        fiber: &mut Fiber,
+        value: Value,
+    ) -> Result<Option<RunOutcome>, Control> {
+        let frame = fiber
+            .frames
+            .pop()
+            .expect("return/propagate with no active frame (VM bug)");
+        if let Some(ret_ty) = &frame.closure.proto.ret {
+            if !crate::interp::check_type(&value, ret_ty) {
+                return Err(crate::interp::contract_panic(ret_ty, &value, frame.ret_span));
+            }
+        }
+        fiber.stack.truncate(frame.slot_base);
+        if fiber.frames.is_empty() {
+            return Ok(Some(RunOutcome::Done(value)));
+        }
+        fiber.push(value);
+        Ok(None)
     }
 }
 
@@ -1552,5 +1608,69 @@ mod tests {
         c.emit(Op::Return, s());
         c.patch_jump(site); // never reached
         assert_eq!(expect_number(c), 9.0);
+    }
+
+    // ---- PROPAGATE (? operator) at the bytecode level (V6-T1) -------------
+
+    /// A success pair `[7, nil]` through PROPAGATE leaves `7` on the stack
+    /// (the `?` expression's result), so the surrounding RETURN yields `7`.
+    #[test]
+    fn propagate_success_yields_value() {
+        let mut c = Chunk::new();
+        let pair = c.add_const(crate::interp::make_pair(Value::Number(7.0), Value::Nil));
+        c.emit_u16(Op::Const, pair, s());
+        c.emit(Op::Propagate, s());
+        c.emit(Op::Return, s());
+        assert_eq!(expect_number(c), 7.0);
+    }
+
+    /// A failure pair `[nil, "boom"]` through PROPAGATE early-returns the
+    /// `[nil, err]` pair from the (root) frame — the trailing CONST 999 / RETURN
+    /// never run, so the program result is the propagated pair.
+    #[test]
+    fn propagate_failure_early_returns_pair_from_frame() {
+        let mut c = Chunk::new();
+        let pair = c.add_const(crate::interp::make_pair(
+            Value::Nil,
+            Value::Str(Rc::from("boom")),
+        ));
+        c.emit_u16(Op::Const, pair, s());
+        c.emit(Op::Propagate, s());
+        // Never reached: PROPAGATE early-returned from the root frame.
+        let k999 = c.add_const(Value::Number(999.0));
+        c.emit_u16(Op::Const, k999, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Array(a)) => {
+                let b = a.borrow();
+                assert_eq!(b.len(), 2);
+                assert_eq!(b[0], Value::Nil);
+                assert_eq!(b[1], Value::Str(Rc::from("boom")));
+            }
+            other => panic!("expected Done([nil, \"boom\"]), got {other:?}"),
+        }
+    }
+
+    /// `expr?` where `expr` is not a 2-element array is a Tier-2 panic carrying
+    /// the exact message and the PROPAGATE op's span (the `TryExpr`'s code span).
+    #[test]
+    fn propagate_non_pair_panics_with_span() {
+        let mut c = Chunk::new();
+        let k = c.add_const(Value::Number(5.0));
+        c.emit_u16(Op::Const, k, s());
+        let prop_span = Span::new(8, 10);
+        c.emit(Op::Propagate, prop_span);
+        c.emit(Op::Return, s());
+        match run_chunk(c) {
+            Err(Control::Panic(e)) => {
+                assert_eq!(
+                    e.message, "the ? operator requires a Result pair [value, err]",
+                    "msg: {}",
+                    e.message
+                );
+                assert_eq!(e.span, Some(prop_span), "panic carries the op's span");
+            }
+            other => panic!("expected Panic, got {other:?}"),
+        }
     }
 }

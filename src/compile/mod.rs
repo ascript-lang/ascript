@@ -14,7 +14,7 @@ use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, BinaryExpr, Block, BreakStmt, CallExpr,
     ContinueStmt, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef,
     ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, Stmt, TemplateExpr,
-    TernaryExpr, UnaryExpr, WhileStmt,
+    TernaryExpr, TryExpr, UnaryExpr, WhileStmt,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
@@ -464,6 +464,7 @@ impl Compiler {
             Expr::MemberExpr(m) => self.compile_member(m),
             Expr::OptMemberExpr(m) => self.compile_opt_member(m),
             Expr::TernaryExpr(t) => self.compile_ternary(t),
+            Expr::TryExpr(t) => self.compile_try(t),
             Expr::ArrowExpr(arrow) => self.compile_arrow(arrow),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
@@ -1855,6 +1856,26 @@ impl Compiler {
         })?;
         // Parens affect only grouping; no opcode is emitted.
         self.compile_expr(&inner)
+    }
+
+    /// Lower the postfix `?` propagate operator (`expr?`). The inner expression
+    /// is compiled, then `PROPAGATE` is emitted. The op's span is the `TryExpr`'s
+    /// trivia-trimmed code span, matching the tree-walker's `ExprKind::Try` panic
+    /// anchor (`expr.span` = the whole Try expression's span), so a non-pair
+    /// Tier-2 panic ("the ? operator requires a Result pair [value, err]") points
+    /// at the same source byte-for-byte. At runtime `PROPAGATE` checks the value
+    /// is a 2-element `[value, err]` Result pair: if `err == nil` the `value`
+    /// stays on the stack; otherwise it early-returns `[nil, err]` from the
+    /// enclosing function (function-level early return, exactly like the
+    /// tree-walker's `Control::Propagate`).
+    fn compile_try(&mut self, t: &TryExpr) -> Result<(), CompileError> {
+        let span = node_code_span(t);
+        let inner = t
+            .expr()
+            .ok_or_else(|| CompileError::new("? operator missing operand", span))?;
+        self.compile_expr(&inner)?;
+        self.chunk.emit(Op::Propagate, span);
+        Ok(())
     }
 
     /// Lower a template literal `` `a${e}b` `` into `n` part-pushes followed by
