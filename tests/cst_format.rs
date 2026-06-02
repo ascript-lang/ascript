@@ -67,3 +67,20 @@ fn cli_formatter_preserves_comments_end_to_end() {
     let src = "let x = 1 // keep me\n";
     assert_eq!(ascript::syntax::format_tree(src), "let x = 1 // keep me\n");
 }
+
+#[test]
+fn formatted_corpus_reparses_without_errors() {
+    let mut failures = Vec::new();
+    for path in corpus() {
+        let src = fs::read_to_string(&path).unwrap();
+        // only check files that parse cleanly to begin with
+        if !ascript::syntax::parser::parse(&src).errors.is_empty() { continue; }
+        let formatted = ascript::syntax::format_tree(&src);
+        let errs = ascript::syntax::parser::parse(&formatted).errors;
+        if !errs.is_empty() {
+            failures.push(format!("{}: formatted output has {} parse error(s) (content loss?): {:?}",
+                path.display(), errs.len(), errs));
+        }
+    }
+    assert!(failures.is_empty(), "formatter produced unparseable output:\n{}", failures.join("\n"));
+}

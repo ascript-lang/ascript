@@ -131,10 +131,15 @@ impl Printer<'_> {
                 self.out.newline();
             }
             LetStmt => {
+                use SyntaxKind::*;
                 let kw = first_kw_text(node);
                 self.out.text(&kw);
                 self.out.text(" ");
-                if let Some(name) = first_ident_text(node) {
+                if let Some(arr) = node.children().find(|c| c.kind() == ArrayBindPat) {
+                    self.bind_pat(arr, "[", "]");
+                } else if let Some(obj) = node.children().find(|c| c.kind() == ObjectBindPat) {
+                    self.bind_pat(obj, "{", "}");
+                } else if let Some(name) = first_ident_text(node) {
                     self.out.text(&name);
                 }
                 if let Some(ty) = node.children().find(|c| is_type_kind(c.kind())) {
@@ -476,6 +481,31 @@ impl Printer<'_> {
         self.out.dedent();
         self.out.text("}");
         self.out.newline();
+    }
+
+    fn bind_pat(&mut self, node: &ResolvedNode, open: &str, close: &str) {
+        use SyntaxKind::*;
+        self.out.text(open);
+        let items: Vec<&ResolvedNode> = node
+            .children()
+            .filter(|c| matches!(c.kind(), BindEntry | RestBind))
+            .collect();
+        for (i, it) in items.iter().enumerate() {
+            if i > 0 {
+                self.out.text(", ");
+            }
+            match it.kind() {
+                BindEntry => self.out.text(&bind_entry_text(it)),
+                RestBind => {
+                    self.out.text("...");
+                    if let Some(n) = first_ident_text(it) {
+                        self.out.text(&n);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.out.text(close);
     }
 
     fn expr(&mut self, node: &ResolvedNode) {
@@ -853,6 +883,15 @@ fn first_kw_text(node: &ResolvedNode) -> String {
         .unwrap_or_else(|| "let".to_string())
 }
 
+fn bind_entry_text(node: &ResolvedNode) -> String {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .map(|t| t.text().to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn first_ident_text(node: &ResolvedNode) -> Option<String> {
     node.children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -1172,6 +1211,12 @@ mod tests {
         assert_eq!(fmt("let x: number ? = nil\n"), "let x: number? = nil\n");
         // non-identifier object keys quoted; identifier-like keys bare.
         assert_eq!(fmt(r#"let o = { "a-b": 1, c: 2 }"#), "let o = {\"a-b\": 1, c: 2}\n");
+    }
+
+    #[test]
+    fn formats_destructuring_let() {
+        assert_eq!(fmt("let [a, b, ...rest]=xs\n"), "let [a, b, ...rest] = xs\n");
+        assert_eq!(fmt("let {a, b as local, ...rest}=obj\n"), "let {a, b as local, ...rest} = obj\n");
     }
 
     #[test]
