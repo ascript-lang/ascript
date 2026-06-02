@@ -158,6 +158,7 @@ fn stmt(p: &mut Parser) {
             p.bump();
             p.complete(m, SyntaxKind::ContinueStmt);
         }
+        EnumKw => enum_decl(p),
         _ => expr_stmt(p),
     }
 }
@@ -951,6 +952,26 @@ fn type_primary(p: &mut Parser) -> CompletedMarker {
     }
 }
 
+fn enum_decl(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // enum
+    if p.at(Ident) { p.bump(); } else { p.error("expected enum name"); }
+    if p.at(LBrace) { p.bump(); } else { p.error("expected '{' for enum body"); }
+    while !p.at(RBrace) && !p.at_end() {
+        let vm = p.start();
+        if p.at(Ident) { p.bump(); } else { p.error("expected variant name"); }
+        if p.at(Eq) {
+            p.bump();
+            expr(p);
+        }
+        p.complete(vm, EnumVariant);
+        if p.at(Comma) { p.bump(); } else { break; }
+    }
+    if p.at(RBrace) { p.bump(); } else { p.error("expected '}' to close enum"); }
+    p.complete(m, EnumDecl);
+}
+
 fn arg_list(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
@@ -1286,5 +1307,14 @@ mod tests {
     fn async_arrow() {
         assert!(parse("let f = async (x) => x").errors.is_empty());
         assert!(tree_shape("let f = async (x) => x").contains(&SyntaxKind::ArrowExpr));
+    }
+
+    #[test]
+    fn enum_declaration() {
+        let p = parse("enum Color { Red, Green = 2, Blue }");
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape("enum Color { Red, Green = 2, Blue }");
+        assert!(s.contains(&SyntaxKind::EnumDecl));
+        assert!(s.contains(&SyntaxKind::EnumVariant));
     }
 }
