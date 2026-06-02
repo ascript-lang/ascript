@@ -12,21 +12,30 @@ use std::rc::Rc;
 
 /// A runtime closure: a function prototype plus its captured upvalue cells.
 ///
-/// `upvalues` stays empty until V5 wires capture; each cell is shared
-/// (`Rc<RefCell<Value>>`) so closures over the same variable observe mutation.
+/// Each cell is shared (`Rc<RefCell<Value>>`) so closures over the same variable
+/// observe mutation (by-reference capture). The `upvalues` vector is indexed by
+/// upvalue number, matching the resolver's `Resolution::Upvalue(idx)` and the
+/// proto's `chunk.upvalues` capture plan.
 pub struct Closure {
     pub proto: Rc<FnProto>,
-    /// Captured upvalue cells; empty until V5 wires captures.
+    /// Captured upvalue cells, in upvalue-index order.
     pub upvalues: Vec<Rc<RefCell<Value>>>,
 }
 
 impl Closure {
-    /// Build a closure with no captured upvalues (the common case until V5).
+    /// Build a closure with no captured upvalues (the top-level script frame and
+    /// any function that captures nothing).
     pub fn new(proto: Rc<FnProto>) -> Rc<Self> {
         Rc::new(Closure {
             proto,
             upvalues: Vec::new(),
         })
+    }
+
+    /// Build a closure over `proto` capturing the given upvalue cells (in
+    /// upvalue-index order). Used by `Op::Closure` once the capture plan is known.
+    pub fn with_upvalues(proto: Rc<FnProto>, upvalues: Vec<Rc<RefCell<Value>>>) -> Rc<Self> {
+        Rc::new(Closure { proto, upvalues })
     }
 }
 

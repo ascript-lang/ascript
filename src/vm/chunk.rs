@@ -27,8 +27,15 @@ pub struct Chunk {
     /// offset (emission is monotonic).
     pub spans: Vec<(usize, Span)>,
     /// The upvalue capture plan for the closure this chunk belongs to: each entry
-    /// says where the closure pulls a captured variable from.
+    /// says where the closure pulls a captured variable from. Indexed by upvalue
+    /// number (matching the resolver's `Resolution::Upvalue(idx)`).
     pub upvalues: Vec<UpvalueDescriptor>,
+    /// Local slots that are heap *cells* (`Rc<RefCell<Value>>`) rather than plain
+    /// stack slots — the resolver's `cell_slots` for this frame (every captured
+    /// local). A cell is allocated nil at frame entry and accessed via
+    /// `GET_LOCAL_CELL`/`SET_LOCAL_CELL`, so a closure capturing it by reference
+    /// observes mutation. (Late-binding-correct baseline; V5 optimizes.)
+    pub cell_slots: Vec<u32>,
     /// Number of local slots this frame needs (stack window size).
     pub slot_count: u16,
     /// Number of reserved inline-cache slots (parallel IC array length; V11).

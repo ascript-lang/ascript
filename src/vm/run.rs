@@ -181,20 +181,87 @@ impl Vm {
 
                 Op::Call => {
                     let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at) as usize;
-                    // Pop everything into owned locals BEFORE the await so no
-                    // borrow of `fiber` is held across the suspension point
-                    // (`await_holding_refcell_ref` stays clean).
-                    let mut args = vec![Value::Nil; argc];
-                    for slot in args.iter_mut().rev() {
-                        *slot = fiber.pop();
+                    // The callee sits just below its `argc` arguments on the stack:
+                    // `[..., callee, arg0, .., arg{argc-1}]`. Its stack index is the
+                    // base where, for a Closure callee, the args become the callee
+                    // frame's first local slots (the CALL convention).
+                    let callee_idx = fiber.stack.len() - argc - 1;
+                    match fiber.stack[callee_idx].clone() {
+                        Value::Closure(callee) => {
+                            // Multi-frame call: the args already sit at
+                            // `stack[callee_idx + 1 ..]`, so the callee's slot_base
+                            // is `callee_idx + 1` and its params occupy slots
+                            // 0..argc. Overwrite the callee value's slot with the
+                            // first param (slot 0) by shifting: simplest is to drop
+                            // the callee value and let the args slide down by one.
+                            //
+                            // V4-T4 does full arity contracts; here we bind exactly
+                            // the slots the args fill and reserve the rest as Nil
+                            // (arity mismatch handling is deferred to T4).
+                            let slot_count =
+                                callee.proto.chunk.slot_count as usize;
+                            // Remove the callee value from beneath the args so the
+                            // args become the bottom of the new frame's window.
+                            fiber.stack.remove(callee_idx);
+                            let slot_base = callee_idx;
+                            // Reserve any locals beyond the passed args as Nil so the
+                            // frame window is fully sized (`slot_count` slots).
+                            // (If too few args were passed, missing params are Nil;
+                            // surplus args beyond slot_count would be a compiler/arity
+                            // bug — T4 enforces arity.)
+                            let have = fiber.stack.len() - slot_base;
+                            if have < slot_count {
+                                fiber
+                                    .stack
+                                    .resize(slot_base + slot_count, Value::Nil);
+                            }
+                            // Allocate the callee frame's cell slots and move any
+                            // arg that landed in a cell slot from the stack into its
+                            // cell (so cell-aware access sees the bound param).
+                            let cells = super::fiber::alloc_cells(
+                                slot_count,
+                                &callee.proto.chunk.cell_slots,
+                            );
+                            for (slot, cell) in cells.iter().enumerate() {
+                                if let Some(cell) = cell {
+                                    // Take the arg/Nil out of the stack slot into the
+                                    // cell; the stack slot keeps its (now stale) Nil
+                                    // copy — cell-slot access always goes via the cell.
+                                    let v = std::mem::replace(
+                                        &mut fiber.stack[slot_base + slot],
+                                        Value::Nil,
+                                    );
+                                    *cell.borrow_mut() = v;
+                                }
+                            }
+                            fiber.frames.push(super::fiber::CallFrame {
+                                closure: callee,
+                                ip: 0,
+                                slot_base,
+                                cells,
+                            });
+                            // Continue the loop in the new frame (the run loop reads
+                            // `fiber.frame()` at the top of each iteration). RETURN
+                            // pops this frame and restores the caller.
+                        }
+                        other => {
+                            // Native callee (Builtin/Function/Class/BoundMethod/...):
+                            // delegate to the shared `call_value`. Pop the args and
+                            // the callee into owned locals BEFORE the await so no
+                            // borrow of `fiber` is held across the suspension point
+                            // (`await_holding_refcell_ref` stays clean).
+                            let mut args = vec![Value::Nil; argc];
+                            for slot in args.iter_mut().rev() {
+                                *slot = fiber.pop();
+                            }
+                            let _callee = fiber.pop(); // the Value at callee_idx
+                            let span =
+                                fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let result =
+                                self.interp.call_value(other, args, span).await?;
+                            fiber.push(result);
+                        }
                     }
-                    let callee = fiber.pop();
-                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    // `call_value` dispatches Builtin/Function/Class/etc. The only
-                    // callee it cannot handle is `Value::Closure`, which the
-                    // compiler does not emit a call for until V4.
-                    let result = self.interp.call_value(callee, args, span).await?;
-                    fiber.push(result);
                 }
 
                 Op::Template => {
@@ -425,19 +492,87 @@ impl Vm {
                 }
 
                 Op::Closure => {
-                    // Build a closure over a nested proto and push it. Captures are
-                    // V5, so the closure has no upvalues for now (a body that reads
-                    // an outer local is rejected at compile time). CALLing the
-                    // closure is V4-T3 — this op only materializes the value.
+                    // Build a closure over a nested proto, capturing its upvalues
+                    // BY REFERENCE per the proto's capture plan
+                    // (`proto.chunk.upvalues`, indexed by upvalue number):
+                    //   - ParentLocal(slot): clone the CURRENT frame's cell for that
+                    //     slot. The resolver guarantees a captured local is a cell
+                    //     slot, so `cells[slot]` is `Some`; a `None` is a
+                    //     compiler/resolver bug (clear panic).
+                    //   - ParentUpvalue(idx): clone the CURRENT closure's upvalue
+                    //     cell (a transitive capture from an outer frame).
+                    // Capturing the cell `Rc` (not its value) is what makes capture
+                    // by-reference: the closure sees later mutation of the cell.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let proto = fiber.frame().closure.proto.chunk.protos[idx].clone();
-                    let closure = crate::vm::value_ext::Closure::new(proto);
+                    let mut upvalues = Vec::with_capacity(proto.chunk.upvalues.len());
+                    for desc in &proto.chunk.upvalues {
+                        let cell = match *desc {
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal(slot) => {
+                                fiber
+                                    .frame()
+                                    .cells
+                                    .get(slot as usize)
+                                    .and_then(|c| c.as_ref())
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "CLOSURE captures parent local slot {slot} that is not a cell (compiler/resolver bug)"
+                                        )
+                                    })
+                                    .clone()
+                            }
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentUpvalue(up) => {
+                                fiber.frame().closure.upvalues[up as usize].clone()
+                            }
+                        };
+                        upvalues.push(cell);
+                    }
+                    let closure =
+                        crate::vm::value_ext::Closure::with_upvalues(proto, upvalues);
                     fiber.push(Value::Closure(closure));
                 }
 
+                Op::GetLocalCell => {
+                    let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.get_local_cell(slot);
+                    fiber.push(v);
+                }
+                Op::SetLocalCell => {
+                    let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.pop();
+                    fiber.set_local_cell(slot, v);
+                }
+
+                Op::GetUpvalue => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.frame().closure.upvalues[idx].borrow().clone();
+                    fiber.push(v);
+                }
+                Op::SetUpvalue => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let v = fiber.pop();
+                    *fiber.frame().closure.upvalues[idx].borrow_mut() = v;
+                }
+
                 Op::Return => {
+                    // Pop the result; pop the current frame; truncate the stack back
+                    // to the frame's slot_base (discarding the callee's locals and
+                    // operands); push the result. If no frames remain, the program is
+                    // done; otherwise execution continues in the caller. Dropping the
+                    // frame releases ITS cell `Rc`s — any closures that captured those
+                    // cells keep their own strong refs, so by-reference captures stay
+                    // alive. Recursion is heap-bounded: each CALL pushed a heap frame
+                    // and this just pops one, so the Rust stack stays flat.
                     let result = fiber.pop();
-                    return Ok(RunOutcome::Done(result));
+                    let frame = fiber
+                        .frames
+                        .pop()
+                        .expect("Op::Return with no active frame (VM bug)");
+                    fiber.stack.truncate(frame.slot_base);
+                    if fiber.frames.is_empty() {
+                        return Ok(RunOutcome::Done(result));
+                    }
+                    fiber.push(result);
                 }
 
                 // V2–V10 fill these in; the V1 smoke only exercises the subset above.

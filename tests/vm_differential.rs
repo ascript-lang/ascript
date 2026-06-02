@@ -1155,3 +1155,103 @@ async fn vm_ternary_only_chosen_branch_evaluates() {
         assert_vm_run_matches_treewalker(src).await;
     }
 }
+
+// ---- functions: CALL/RETURN + multi-frame + by-ref capture (V4-T3) -------
+
+#[tokio::test]
+async fn vm_recursion_factorial() {
+    // Self-recursion: `fac` references its own name (a captured cell in the file
+    // frame, an upvalue inside the body). 10! = 3628800.
+    assert_vm_run_matches_treewalker(
+        "fn fac(n) { if (n < 2) { return 1 }\n return n * fac(n - 1) }\nprint(fac(10))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_forward_inter_fn_call() {
+    // `a` calls `b` declared LATER: the late-binding cell (allocated nil at frame
+    // entry, filled when `b`'s declaration runs) makes the forward reference work.
+    assert_vm_run_matches_treewalker(
+        "fn a() { return b() + 1 }\nfn b() { return 7 }\nprint(a())",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_mutual_recursion_even_odd() {
+    assert_vm_run_matches_treewalker(
+        "fn isEven(n) { if (n == 0) { return true }\n return isOdd(n - 1) }\n\
+         fn isOdd(n) { if (n == 0) { return false }\n return isEven(n - 1) }\n\
+         print(isEven(10))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_capturing_closure_read() {
+    // The arrow captures `x` from `make`'s frame BY REFERENCE (a cell); calling it
+    // after `make` returned still reads the filled value.
+    assert_vm_run_matches_treewalker(
+        "fn make() { let x = 42\n return () => x }\nlet f = make()\nprint(f())",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_capturing_closure_mutate_counter() {
+    // Mutable capture via the shared cell: each call mutates `c` through
+    // SET_UPVALUE; the counter advances 1, 2, 3.
+    assert_vm_run_matches_treewalker(
+        "fn counter() { let c = 0\n return () => { c = c + 1\n return c } }\n\
+         let inc = counter()\nprint(inc())\nprint(inc())\nprint(inc())",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_nested_calls_args_and_return_values() {
+    // Nested calls, multiple args, return values composed.
+    assert_vm_run_matches_treewalker(
+        "fn add(a, b) { return a + b }\nfn mul(a, b) { return a * b }\n\
+         print(add(mul(2, 3), add(4, 5)))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_function_as_value_and_arg() {
+    // A function passed as a value/argument and invoked through the parameter.
+    assert_vm_run_matches_treewalker(
+        "fn apply(f, x) { return f(x) }\nfn dbl(n) { return n * 2 }\nprint(apply(dbl, 21))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_deep_recursion_matches_treewalker_at_modest_depth() {
+    // Differential at a depth the TREE-WALKER survives even under the debug test
+    // thread's small (~2 MiB) stack. The tree-walker recurses on the Rust stack
+    // (`#[async_recursion]` eval, a large per-frame future), so it overflows at a
+    // modest depth in debug tests (its documented "robust unbounded deep recursion"
+    // non-goal) — and a stack overflow aborts the WHOLE test process, so the depth
+    // is kept conservatively safe (20). sum(20) = 20 * 21 / 2 = 210; this still
+    // drives 21 nested CALL/RETURN frames through the VM. The heap-bounded proof at
+    // real depth is `vm_deep_recursion_is_heap_bounded` (VM-only, 50_000 deep).
+    assert_vm_run_matches_treewalker(
+        "fn sum(n) { if (n == 0) { return 0 }\n return n + sum(n - 1) }\nprint(sum(20))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_deep_recursion_is_heap_bounded() {
+    // VM-only: each CALL pushes a HEAP `CallFrame` and the Rust `run` loop stays
+    // flat, so recursion is heap-bounded — 50_000 deep does NOT overflow the native
+    // stack (the tree-walker cannot reach this depth). sum(50000) = 1_250_025_000.
+    // This is the proof that VM frames live on the heap, not the Rust stack.
+    let src = "fn sum(n) { if (n == 0) { return 0 }\n return n + sum(n - 1) }\nprint(sum(50000))";
+    let (vm_out, code) = ascript::vm_run_source(src).await.expect("vm ok");
+    assert_eq!(code, None);
+    assert_eq!(vm_out, "1250025000\n", "deep VM recursion result");
+}

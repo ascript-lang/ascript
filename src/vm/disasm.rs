@@ -194,6 +194,8 @@ fn op_name(op: Op) -> &'static str {
         IterNext => "ITER_NEXT",
         IterSnapshot => "ITER_SNAPSHOT",
         ArrayLen => "ARRAY_LEN",
+        GetLocalCell => "GET_LOCAL_CELL",
+        SetLocalCell => "SET_LOCAL_CELL",
     }
 }
 

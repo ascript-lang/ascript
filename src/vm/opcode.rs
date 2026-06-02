@@ -206,6 +206,17 @@ pub enum Op {
     /// The operand is always a compiler-produced snapshot array (never user input),
     /// so a non-array is a compiler bug, surfaced as a Tier-2 panic.
     ArrayLen,
+
+    // ---- cell-backed locals (by-reference capture, V4-T3) -----------------
+    /// `GET_LOCAL_CELL(u16)` — push the value held in the heap cell for local
+    /// slot `n`. Emitted (instead of `GET_LOCAL`) for any slot the resolver
+    /// marked as a *cell slot* (a captured local). The cell is an
+    /// `Rc<RefCell<Value>>` allocated at frame entry so a closure that captured
+    /// it by reference observes later mutation.
+    GetLocalCell,
+    /// `SET_LOCAL_CELL(u16)` — store TOS (popped) into the heap cell for local
+    /// slot `n`. The cell-slot counterpart of `SET_LOCAL`.
+    SetLocalCell,
 }
 
 impl Op {
@@ -290,6 +301,9 @@ impl Op {
             x if x == IterSnapshot as u8 => IterSnapshot,
             x if x == ArrayLen as u8 => ArrayLen,
 
+            x if x == GetLocalCell as u8 => GetLocalCell,
+            x if x == SetLocalCell as u8 => SetLocalCell,
+
             _ => return None,
         })
     }
@@ -300,9 +314,9 @@ impl Op {
         use Op::*;
         match self {
             // u16-operand ops.
-            Const | GetLocal | SetLocal | GetUpvalue | SetUpvalue | CloseUpvalue | GetGlobal
-            | SetGlobal | Closure | NewArray | NewObject | GetProp | SetProp | GetPropOpt
-            | Class | Method | GetSuper | Template | Import => 2,
+            Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | GetUpvalue | SetUpvalue
+            | CloseUpvalue | GetGlobal | SetGlobal | Closure | NewArray | NewObject | GetProp
+            | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -397,6 +411,8 @@ mod tests {
         Op::IterNext,
         Op::IterSnapshot,
         Op::ArrayLen,
+        Op::GetLocalCell,
+        Op::SetLocalCell,
     ];
 
     #[test]

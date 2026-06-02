@@ -24,6 +24,7 @@ use crate::value::Value;
 use crate::vm::chunk::{Chunk, FnProto};
 use crate::vm::opcode::Op;
 use cstree::text::TextRange;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 /// A compile-time error: a message plus the source span that triggered it. The
@@ -108,17 +109,20 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     // (including block-scoped ones — slots are frame-flat, see `compile_block`).
     let mut chunk = Chunk::new();
     let top_key = (SyntaxKind::SourceFile, root.text_range());
-    let slot_count = resolved
-        .frames
-        .get(&top_key)
-        .map(|f| f.slot_count)
-        .unwrap_or(0);
+    let top_frame = resolved.frames.get(&top_key);
+    let slot_count = top_frame.map(|f| f.slot_count).unwrap_or(0);
     chunk.slot_count = u16::try_from(slot_count).map_err(|_| {
         CompileError::new(
             "too many local slots in top-level frame (max 65535)",
             Span::new(0, src.len()),
         )
     })?;
+    // The top frame's cell slots (captured top-level bindings, e.g. a forward- or
+    // self-referenced `fn`) and its upvalue plan (always empty — the file frame
+    // has no parent to capture from). `Fiber::new` allocates cells from these.
+    chunk.cell_slots = top_frame.map(|f| f.cell_slots.clone()).unwrap_or_default();
+    chunk.upvalues = top_frame.map(|f| f.upvalues.clone()).unwrap_or_default();
+    let cur_cells: HashSet<u32> = chunk.cell_slots.iter().copied().collect();
 
     // Scratch temporaries are allocated ABOVE the named-local window, so seed the
     // temp cursor from the same slot count the chunk was sized with.
@@ -128,6 +132,7 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
         resolved,
         loops: Vec::new(),
         next_temp,
+        cur_cells,
     };
 
     // V2 supports a sequence of statements whose meaningful tail is an
@@ -225,9 +230,37 @@ struct Compiler {
     /// each `alloc_temp` bumps both this cursor and the chunk's `slot_count` so
     /// `Fiber::new` reserves the temp.
     next_temp: u16,
+    /// The set of local slots that are heap *cells* in the CURRENT frame (the
+    /// resolver's `cell_slots` — every captured local). A `GET_LOCAL`/`SET_LOCAL`
+    /// for one of these slots is emitted as `GET_LOCAL_CELL`/`SET_LOCAL_CELL`
+    /// instead, so the access goes through the by-reference cell. Swapped on
+    /// function entry (saved/restored in `compile_fn_proto`).
+    cur_cells: HashSet<u32>,
 }
 
 impl Compiler {
+    /// Emit a read of local `slot`: `GET_LOCAL_CELL` if `slot` is a cell slot in
+    /// the current frame (a captured local, accessed by reference), else the plain
+    /// `GET_LOCAL`. The two are byte-distinct opcodes so the run loop stays
+    /// branch-free.
+    fn emit_get_local(&mut self, slot: u16, span: Span) {
+        if self.cur_cells.contains(&u32::from(slot)) {
+            self.chunk.emit_u16(Op::GetLocalCell, slot, span);
+        } else {
+            self.chunk.emit_u16(Op::GetLocal, slot, span);
+        }
+    }
+
+    /// Emit a store into local `slot`: `SET_LOCAL_CELL` for a cell slot, else
+    /// `SET_LOCAL`. Both pop the value.
+    fn emit_set_local(&mut self, slot: u16, span: Span) {
+        if self.cur_cells.contains(&u32::from(slot)) {
+            self.chunk.emit_u16(Op::SetLocalCell, slot, span);
+        } else {
+            self.chunk.emit_u16(Op::SetLocal, slot, span);
+        }
+    }
+
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
             Expr::Literal(lit) => self.compile_literal(lit),
@@ -269,13 +302,18 @@ impl Compiler {
                 let slot = u16::try_from(*slot).map_err(|_| {
                     CompileError::new("local slot index exceeds 65535", span)
                 })?;
-                self.chunk.emit_u16(Op::GetLocal, slot, span);
+                self.emit_get_local(slot, span);
                 Ok(())
             }
-            Some(Resolution::Upvalue(_)) => Err(CompileError::new(
-                "upvalue (closure capture) reads not yet supported (V5)",
-                span,
-            )),
+            // A captured outer-scope variable: read its upvalue cell by index
+            // (the resolver's `Upvalue(idx)` is the position in this frame's
+            // upvalue plan, matching the closure's `upvalues` vector).
+            Some(Resolution::Upvalue(idx)) => {
+                let idx = u16::try_from(*idx)
+                    .map_err(|_| CompileError::new("upvalue index exceeds 65535", span))?;
+                self.chunk.emit_u16(Op::GetUpvalue, idx, span);
+                Ok(())
+            }
             // A bare reference to a builtin name is a first-class builtin value:
             // `GET_GLOBAL <name>` resolves it to `Value::Builtin` at runtime, the
             // same value the tree-walker reads from its global env. This makes
@@ -334,15 +372,21 @@ impl Compiler {
                 node_span(&target),
             ));
         };
-        let slot = match self.resolved.uses.get(&name_ref.syntax().text_range()) {
-            Some(Resolution::Local(slot)) => u16::try_from(*slot)
-                .map_err(|_| CompileError::new("local slot index exceeds 65535", span))?,
-            Some(Resolution::Upvalue(_)) => {
-                return Err(CompileError::new(
-                    "assignment to a captured upvalue not yet supported (V5)",
-                    node_span(&target),
-                ))
-            }
+        // The store target: either a frame-local slot (cell-aware) or an upvalue
+        // (a captured outer variable, mutated by reference via SET_UPVALUE).
+        enum Target {
+            Local(u16),
+            Upvalue(u16),
+        }
+        let store = match self.resolved.uses.get(&name_ref.syntax().text_range()) {
+            Some(Resolution::Local(slot)) => Target::Local(
+                u16::try_from(*slot)
+                    .map_err(|_| CompileError::new("local slot index exceeds 65535", span))?,
+            ),
+            Some(Resolution::Upvalue(idx)) => Target::Upvalue(
+                u16::try_from(*idx)
+                    .map_err(|_| CompileError::new("upvalue index exceeds 65535", span))?,
+            ),
             _ => {
                 return Err(CompileError::new(
                     "assignment to a non-local target not yet supported (V4)",
@@ -357,7 +401,10 @@ impl Compiler {
         self.compile_expr(&value)?;
         // Leave the assigned value as the expression's result, then store a copy.
         self.chunk.emit(Op::Dup, span);
-        self.chunk.emit_u16(Op::SetLocal, slot, span);
+        match store {
+            Target::Local(slot) => self.emit_set_local(slot, span),
+            Target::Upvalue(idx) => self.chunk.emit_u16(Op::SetUpvalue, idx, span),
+        }
         Ok(())
     }
 
@@ -602,9 +649,12 @@ impl Compiler {
         let idx = self.chunk.add_proto(proto);
         self.chunk.emit_u16(Op::Closure, idx, span);
 
-        // Bind the closure to the fn name's slot in the enclosing frame.
+        // Bind the closure to the fn name's slot in the enclosing frame. The name
+        // may be a cell slot (e.g. a self- or forward-referenced fn), so use the
+        // cell-aware store: the cell, allocated nil at frame entry and captured by
+        // the closure's own body, is filled HERE — late-binding-correct.
         let slot = self.fn_decl_slot(fn_decl)?;
-        self.chunk.emit_u16(Op::SetLocal, slot, span);
+        self.emit_set_local(slot, span);
         Ok(())
     }
 
@@ -685,18 +735,16 @@ impl Compiler {
                 CompileError::new("function body has no resolver frame (compiler bug)", span)
             })?;
 
-        // V5: closures capturing outer-scope variables are not yet supported. A
-        // non-empty upvalue plan means the body reads an outer local (or the fn's
-        // own name, for recursion) — defer with a clear, documented error.
-        if !frame.upvalues.is_empty() {
-            return Err(CompileError::new(
-                "closures capturing outer variables: V5",
-                span,
-            ));
-        }
         let slot_count = u16::try_from(frame.slot_count).map_err(|_| {
             CompileError::new("too many local slots in function frame (max 65535)", span)
         })?;
+        // The function's capture plan (upvalues, indexed by upvalue number) and its
+        // cell slots (captured locals) come straight from its resolver frame. The
+        // capture plan is stored on the body chunk so `Op::Closure` can wire the
+        // upvalue cells at runtime; the cell slots drive both cell allocation at
+        // frame entry and the compiler's cell-aware local opcodes.
+        let upvalues = frame.upvalues.clone();
+        let cell_slots = frame.cell_slots.clone();
 
         // Calling-convention flags + params. `children()` borrows, so collect the
         // param nodes as references (we only inspect them, never store them).
@@ -746,10 +794,18 @@ impl Compiler {
         let mut body_chunk = Chunk::new();
         body_chunk.slot_count = slot_count;
         body_chunk.name = fn_name_token_text(fn_node);
+        body_chunk.upvalues = upvalues;
+        body_chunk.cell_slots = cell_slots;
 
         let saved_chunk = std::mem::replace(&mut self.chunk, body_chunk);
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_next_temp = self.next_temp;
+        // Swap in the body frame's cell-slot set so the body's local accesses emit
+        // the cell-aware opcodes for ITS captured locals.
+        let saved_cells = std::mem::replace(
+            &mut self.cur_cells,
+            self.chunk.cell_slots.iter().copied().collect(),
+        );
         // Scratch temporaries in the body start ABOVE its own named-local window.
         self.next_temp = slot_count;
 
@@ -760,6 +816,7 @@ impl Compiler {
         let body_chunk = std::mem::replace(&mut self.chunk, saved_chunk);
         self.loops = saved_loops;
         self.next_temp = saved_next_temp;
+        self.cur_cells = saved_cells;
         result?;
 
         Ok(Rc::new(FnProto {
@@ -923,11 +980,11 @@ impl Compiler {
         self.compile_expr(&end)?;
         self.chunk.emit(Op::CheckNumbers, start_span);
         self.chunk.emit_u16(Op::SetLocal, end_slot, span);
-        self.chunk.emit_u16(Op::SetLocal, var_slot, span);
+        self.emit_set_local(var_slot, span);
 
         // Condition: re-test `i < end` each iteration.
         let cond_start = self.chunk.code.len();
-        self.chunk.emit_u16(Op::GetLocal, var_slot, span);
+        self.emit_get_local(var_slot, span);
         self.chunk.emit_u16(Op::GetLocal, end_slot, span);
         self.chunk.emit(Op::Lt, span);
         let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
@@ -1053,7 +1110,7 @@ impl Compiler {
         self.chunk.emit_u16(Op::GetLocal, arr_slot, span);
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
         self.chunk.emit(Op::GetIndex, span);
-        self.chunk.emit_u16(Op::SetLocal, var_slot, span);
+        self.emit_set_local(var_slot, span);
 
         // The continue target is the INCREMENT (so `continue` advances to the next
         // item then re-tests, exactly like the tree-walker's `Flow::Continue`
@@ -1151,7 +1208,7 @@ impl Compiler {
             // `let x` with no initializer binds nil (mirrors the tree-walker).
             None => self.chunk.emit(Op::Nil, span),
         }
-        self.chunk.emit_u16(Op::SetLocal, slot, span);
+        self.emit_set_local(slot, span);
         Ok(())
     }
 
@@ -1196,44 +1253,39 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower a call whose callee is a bare builtin name (`print`, `len`, `type`,
-    /// …): `GET_GLOBAL <name>`, then each argument, then `CALL argc`.
+    /// Lower a call `callee(arg0, .., argN)`. The general convention places the
+    /// callee value on the stack first, then each argument left-to-right, then
+    /// `CALL argc` — the run loop reads `[.., callee, arg0, .., arg{argc-1}]`. A
+    /// `Value::Closure` callee enters a new VM frame (the args become its first
+    /// local slots); any other callee (builtin, native function, class
+    /// constructor, bound method) is dispatched through the shared `call_value`.
     ///
-    /// V2 supports only calls to bare builtins. The callee is classified via the
-    /// resolver: a `NameRef` whose use resolves to `Resolution::Global(name)`
-    /// where `name` is a known builtin. Anything else (method calls, calls to
-    /// user functions/locals/upvalues) is a documented V4 deferral.
+    /// The callee is any compilable expression: a bare builtin name
+    /// (`Resolution::Global` → `GET_GLOBAL`, yielding a `Value::Builtin`), a
+    /// local/upvalue holding a closure (`GET_LOCAL`/`GET_LOCAL_CELL`/`GET_UPVALUE`),
+    /// or a parenthesized arrow. Member calls (`a.m(...)`) and calls whose callee
+    /// resolves to a non-builtin bare global are later deferrals (V9).
     fn compile_call(&mut self, call: &CallExpr) -> Result<(), CompileError> {
         let span = node_span(call);
         let callee = call
             .expr()
             .ok_or_else(|| CompileError::new("call expression missing callee", span))?;
 
-        // Only a bare `NameRef` callee is supported in V2.
-        let Expr::NameRef(name_ref) = &callee else {
+        // Member calls (`a.m(...)`) need the receiver-bound dispatch and are a V9
+        // deferral; reject them here rather than silently compiling a GET_PROP +
+        // CALL that could diverge from the tree-walker's method semantics.
+        if matches!(&callee, Expr::MemberExpr(_) | Expr::OptMemberExpr(_)) {
             return Err(CompileError::new(
-                "calls to non-builtins not yet supported (V4)",
+                "method calls (a.m(...)) not yet supported (V9)",
                 node_span(&callee),
             ));
-        };
+        }
 
-        // Classify the callee via the resolver: it must be a Global builtin.
-        let key = name_ref.syntax().text_range();
-        let builtin_name = match self.resolved.uses.get(&key) {
-            Some(Resolution::Global(name)) if crate::interp::BUILTIN_NAMES.contains(&name.as_str()) => {
-                name.clone()
-            }
-            _ => {
-                return Err(CompileError::new(
-                    "calls to non-builtins not yet supported (V4)",
-                    node_span(&callee),
-                ));
-            }
-        };
-
-        // GET_GLOBAL <name-const>
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(builtin_name.as_str())));
-        self.chunk.emit_u16(Op::GetGlobal, name_idx, span);
+        // Compile the callee onto the stack. `compile_expr` routes a `NameRef`
+        // through `compile_name_ref`, which already handles a bare-builtin name
+        // (GET_GLOBAL) and a local/upvalue (GET_LOCAL[_CELL]/GET_UPVALUE), and
+        // defers a non-builtin bare global with its own clear error.
+        self.compile_expr(&callee)?;
 
         // Compile each argument, left to right.
         let mut argc: u8 = 0;
@@ -1791,12 +1843,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_call_to_non_builtin() {
-        // `foo` is not a builtin; resolver classifies it Global("foo") which is
-        // not in BUILTIN_NAMES → documented V4 deferral.
+    fn rejects_call_to_non_builtin_global() {
+        // `foo` is a free name; the resolver classifies it Global("foo"), which is
+        // not in BUILTIN_NAMES and has no user-global runtime binding (top-level
+        // lets are frame-locals) — so compiling the callee defers it (V4). A call
+        // to a closure/local/upvalue callee, by contrast, now compiles (V4-T3).
         let err = compile_source("foo(1)").unwrap_err();
         assert!(
-            err.message.contains("non-builtins not yet supported (V4)"),
+            err.message.contains("bare global reference 'foo' not yet supported (V4)"),
             "got {err:?}"
         );
     }
@@ -2207,14 +2261,29 @@ mod tests {
     }
 
     #[test]
-    fn fn_capturing_outer_local_is_deferred_to_v5() {
-        // A function reading an outer-scope local needs an upvalue capture (V5).
-        // The resolver marks the frame with a non-empty upvalue plan, so the
-        // compiler defers with a documented `V5` error.
-        let err = compile_source("let n = 1\nfn f() { return n }\nf").unwrap_err();
+    fn fn_capturing_outer_local_compiles_with_upvalue() {
+        // A function reading an outer-scope local captures it by reference (V4-T3).
+        // `n` is captured, so it is a CELL SLOT in the file frame (SET_LOCAL_CELL
+        // binds it) and the inner body reads it via GET_UPVALUE; the inner proto
+        // carries a one-entry upvalue capture plan.
+        let chunk = compile_source("let n = 1\nfn f() { return n }\nf").expect("compiles");
+        let text = disasm(&chunk);
+        // The captured top-level binding is filled through its cell.
         assert!(
-            err.message.contains("capturing outer variables: V5"),
-            "expected V5 capture deferral, got {err:?}"
+            text.contains("SET_LOCAL_CELL"),
+            "captured `n` should bind via SET_LOCAL_CELL in:\n{text}"
+        );
+        // The inner proto reads the capture via GET_UPVALUE and has a capture plan.
+        let proto = chunk.protos.first().expect("one nested proto");
+        assert_eq!(
+            proto.chunk.upvalues.len(),
+            1,
+            "inner fn captures exactly one upvalue (`n`)"
+        );
+        let inner = disasm(&proto.chunk);
+        assert!(
+            inner.contains("GET_UPVALUE"),
+            "inner body should read `n` via GET_UPVALUE in:\n{inner}"
         );
     }
 
