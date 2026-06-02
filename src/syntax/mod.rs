@@ -4,6 +4,7 @@
 //! does not yet drive the binary.
 
 pub mod cst;
+pub mod event;
 pub mod kind;
 pub mod lexer;
 
