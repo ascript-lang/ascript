@@ -1,10 +1,10 @@
 # `ascript check` — Checker & Linter Design Spec
 
 **Date:** 2026-06-02
-**Status:** Draft for review (authored under the "I draft, you approve" mode)
+**Status:** Approved (authored under "I draft, you approve"; all 4 flagged decisions resolved during review — see Decisions resolved during review)
 **Sub-projects covered:** #3 (`ascript check` CLI + shared analysis core), #4 (scope & control-flow lints), #5 (AScript-specific lints), #6 (static contract checking). Depends on the **CST front-end + name resolver** (front-end spec + Plans 1–3).
 
-> A handful of decisions are flagged **[CONFIRM]** inline — those are the ones that genuinely need your call. Everything else is a recommendation made under the draft mode.
+> All four decisions flagged during the draft were resolved in review (see *Decisions resolved during review* at the end): CI exit policy, suppression syntax, autofix scope, and the conservative contract-checking stance.
 
 ## Problem
 
