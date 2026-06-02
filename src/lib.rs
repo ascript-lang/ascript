@@ -17,6 +17,7 @@ pub mod stdlib;
 pub mod task;
 pub mod token;
 pub mod value;
+pub mod vm;
 
 use crate::error::{AsError, SourceInfo};
 use crate::interp::Interp;
