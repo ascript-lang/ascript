@@ -10,7 +10,8 @@
 
 use crate::span::Span;
 use crate::syntax::ast::{
-    AstNode, BinaryExpr, CallExpr, Expr, Literal, ParenExpr, SourceFile, Stmt, UnaryExpr,
+    AstNode, BinaryExpr, CallExpr, Expr, Literal, ParenExpr, SourceFile, Stmt, TemplateExpr,
+    UnaryExpr,
 };
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
@@ -155,6 +156,7 @@ impl Compiler {
             Expr::UnaryExpr(un) => self.compile_unary(un),
             Expr::ParenExpr(paren) => self.compile_paren(paren),
             Expr::CallExpr(call) => self.compile_call(call),
+            Expr::TemplateExpr(t) => self.compile_template(t),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
                 node_span(other),
@@ -227,11 +229,14 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("malformed literal (no token text)", span))?;
         let value = match kind {
             SyntaxKind::Number => {
-                let n = parse_number(&text)
-                    .ok_or_else(|| CompileError::new(format!("unsupported number literal {text:?} in V1"), span))?;
+                let n = parse_number(&text).ok_or_else(|| {
+                    // The lexer already validated the token, so this is a
+                    // compiler bug rather than a user error if it ever fires.
+                    CompileError::new(format!("malformed number literal {text:?}"), span)
+                })?;
                 Value::Number(n)
             }
-            SyntaxKind::Str => Value::Str(Rc::from(unescape_basic(&text).as_str())),
+            SyntaxKind::Str => Value::Str(Rc::from(unescape_string(&text).as_str())),
             SyntaxKind::TrueKw => Value::Bool(true),
             SyntaxKind::FalseKw => Value::Bool(false),
             SyntaxKind::NilKw => Value::Nil,
@@ -308,6 +313,55 @@ impl Compiler {
         // Parens affect only grouping; no opcode is emitted.
         self.compile_expr(&inner)
     }
+
+    /// Lower a template literal `` `a${e}b` `` into `n` part-pushes followed by
+    /// `TEMPLATE n`, where `n` is the total number of parts (literal chunks +
+    /// interpolated expressions). The CST `TemplateExpr` node interleaves
+    /// template *tokens* (`TemplateStr`/`TemplateStart`/`TemplateMiddle`/
+    /// `TemplateEnd`, each carrying its raw delimited source text) with the
+    /// interpolated expression *nodes*. We walk `children_with_tokens()` in
+    /// source order: every template token contributes a literal string chunk
+    /// (delimiters stripped + unescaped, exactly mirroring the tree-walker's
+    /// `lex_template_chunk`), and every expression node is compiled in place.
+    ///
+    /// The tree-walker's `ExprKind::Template` concatenates each chunk and each
+    /// interpolated value (coerced via `Value::to_string()`); the VM's
+    /// `TEMPLATE n` op performs the identical concatenation/coercion.
+    fn compile_template(&mut self, t: &TemplateExpr) -> Result<(), CompileError> {
+        let span = node_span(t);
+        let mut parts: u16 = 0;
+        for child in t.syntax().children_with_tokens() {
+            if let Some(tok) = child.as_token() {
+                // A template *token* carries a raw, delimited literal chunk
+                // (`` `...${ ``, `}...${`, `` }...` ``, or full `` `...` ``).
+                match tok.kind() {
+                    SyntaxKind::TemplateStr
+                    | SyntaxKind::TemplateStart
+                    | SyntaxKind::TemplateMiddle
+                    | SyntaxKind::TemplateEnd => {
+                        let chunk = unescape_template_chunk(tok.text());
+                        let idx = self.chunk.add_const(Value::Str(Rc::from(chunk.as_str())));
+                        self.chunk.emit_u16(Op::Const, idx, span);
+                    }
+                    // Trivia (whitespace/comments) never appears between template
+                    // delimiters, but skip it defensively (no part emitted).
+                    _ => continue,
+                }
+            } else if let Some(node) = child.as_node() {
+                let expr = Expr::cast((*node).clone()).ok_or_else(|| {
+                    CompileError::new("template interpolation is not an expression", span)
+                })?;
+                self.compile_expr(&expr)?;
+            } else {
+                continue;
+            }
+            parts = parts
+                .checked_add(1)
+                .ok_or_else(|| CompileError::new("template has too many parts", span))?;
+        }
+        self.chunk.emit_u16(Op::Template, parts, span);
+        Ok(())
+    }
 }
 
 /// The text of a `Literal` node's value token (Number/Str/keyword), excluding
@@ -329,38 +383,60 @@ fn literal_token_text(lit: &Literal) -> Option<String> {
         .map(|t| t.text().to_string())
 }
 
-/// Parse a V1 number literal: plain decimal integers and floats only. Returns
-/// `None` for forms V1 does not support yet (hex/binary/scientific/underscored)
-/// so the caller can raise a clear `CompileError`. V2 widens this.
+/// Parse a numeric literal token into the exact `f64` the tree-walker produces.
+///
+/// This mirrors the legacy lexer's number scan (`src/lexer.rs`) byte-for-byte:
+/// hex (`0x..`/`0X..`) and binary (`0b..`/`0B..`) prefixes parse the digits via
+/// `u64::from_str_radix` then cast to `f64`; everything else (plain decimals,
+/// floats, scientific `1e9`) is parsed by `f64::parse`. Underscore digit
+/// separators are stripped first in all forms. The lexer has already validated
+/// the token's shape, so this only fails on a genuine compiler/lexer
+/// disagreement (→ `None`, surfaced as a `CompileError`).
 fn parse_number(text: &str) -> Option<f64> {
-    // V1 accepts only `[0-9]+` and `[0-9]+.[0-9]+` style decimals — reject any
-    // alphabetic radix prefix, exponent, or digit separator for now.
-    if text.bytes().any(|b| !(b.is_ascii_digit() || b == b'.')) {
-        return None;
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'0' && matches!(bytes[1], b'x' | b'X' | b'b' | b'B') {
+        let radix = if matches!(bytes[1], b'x' | b'X') { 16 } else { 2 };
+        let digits: String = text[2..].chars().filter(|&c| c != '_').collect();
+        if digits.is_empty() {
+            return None;
+        }
+        return u64::from_str_radix(&digits, radix).ok().map(|n| n as f64);
     }
-    text.parse::<f64>().ok()
+    let cleaned: String = text.chars().filter(|&c| c != '_').collect();
+    cleaned.parse::<f64>().ok()
 }
 
-/// A minimal string-literal unescape for V1: strips the surrounding quotes and
-/// handles the common backslash escapes (`\n \t \r \\ \" \' \0`). Templates,
-/// `${…}` interpolation, and `\u`/`\x` escapes are V2.
-fn unescape_basic(raw: &str) -> String {
-    // Strip one matching quote on each side if present.
+/// Translate the character following a `\` into its escaped value. Mirrors the
+/// legacy lexer's `escape_char` (`src/lexer.rs`) EXACTLY: the known escapes plus
+/// a lenient passthrough for any other char (`\x` → `x`). AScript has NO
+/// `\u`/`\x`/numeric escapes, so they fall through to the passthrough — matching
+/// the tree-walker.
+fn escape_char(c: char) -> char {
+    match c {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        '0' => '\0',
+        '\\' => '\\',
+        '"' => '"',
+        '\'' => '\'',
+        other => other,
+    }
+}
+
+/// Unescape a `"..."` / `'...'` string-literal token into its runtime value,
+/// mirroring the legacy lexer's `lex_quoted`. The raw token text includes the
+/// surrounding quotes; they are stripped, then backslash escapes are translated
+/// via [`escape_char`]. A trailing lone `\` (cannot occur for a lexer-accepted,
+/// terminated token) is kept verbatim, matching the legacy scan's behavior.
+fn unescape_string(raw: &str) -> String {
     let inner = strip_quotes(raw);
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some('\\') => out.push('\\'),
-                Some('"') => out.push('"'),
-                Some('\'') => out.push('\''),
-                Some('0') => out.push('\0'),
-                // Unknown escape (incl. \u/\x, V2): keep the char verbatim.
-                Some(other) => out.push(other),
+                Some(e) => out.push(escape_char(e)),
                 None => out.push('\\'),
             }
         } else {
@@ -368,6 +444,48 @@ fn unescape_basic(raw: &str) -> String {
         }
     }
     out
+}
+
+/// Unescape a template literal *chunk* token (`TemplateStr`/`TemplateStart`/
+/// `TemplateMiddle`/`TemplateEnd`) into its literal string contents, mirroring
+/// the legacy lexer's `lex_template_chunk`. The raw token text carries its
+/// delimiters: a leading `` ` `` or `}`, and a trailing `` ` `` or `${`. We
+/// strip those, then apply the template escape set — `` \` `` → `` ` `` and
+/// `\$` → `$` are template-specific; everything else shares [`escape_char`].
+fn unescape_template_chunk(raw: &str) -> String {
+    let inner = strip_template_delims(raw);
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('`') => out.push('`'),
+                Some('$') => out.push('$'),
+                Some(other) => out.push(escape_char(other)),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Strip the leading delimiter (`` ` `` or `}`) and trailing delimiter
+/// (`` ` `` or `${`) from a raw template-chunk token, yielding the inner text.
+/// Mirrors the lossless slicing the CST lexer's `scan_template_chunk` produces.
+fn strip_template_delims(s: &str) -> &str {
+    // Leading delimiter is a single byte: `` ` `` or `}`.
+    let after_open = s.strip_prefix('`').or_else(|| s.strip_prefix('}')).unwrap_or(s);
+    // Trailing delimiter is either `${` (interpolation continues) or `` ` ``.
+    if let Some(inner) = after_open.strip_suffix("${") {
+        inner
+    } else if let Some(inner) = after_open.strip_suffix('`') {
+        inner
+    } else {
+        // Unterminated tail (lexer would have flagged it); use as-is.
+        after_open
+    }
 }
 
 /// Strip one leading and one trailing matching quote (`"` or `'`) if present.
@@ -482,5 +600,81 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn power() {
         assert_eq!(eval_number("2 ** 10").await, 1024.0);
+    }
+
+    #[test]
+    fn parse_number_all_forms() {
+        assert_eq!(parse_number("0xff"), Some(255.0));
+        assert_eq!(parse_number("0XFF"), Some(255.0));
+        assert_eq!(parse_number("0b1010"), Some(10.0));
+        assert_eq!(parse_number("0B1111"), Some(15.0));
+        assert_eq!(parse_number("1e3"), Some(1000.0));
+        assert_eq!(parse_number("2.5e-2"), Some(0.025));
+        assert_eq!(parse_number("1_000"), Some(1000.0));
+        assert_eq!(parse_number("0xFF_FF"), Some(65535.0));
+        assert_eq!(parse_number("12.5"), Some(12.5));
+        assert_eq!(parse_number("0"), Some(0.0));
+    }
+
+    #[test]
+    fn unescape_string_handles_full_escape_set() {
+        assert_eq!(unescape_string(r#""a\nb""#), "a\nb");
+        assert_eq!(unescape_string(r#""t\ta""#), "t\ta");
+        assert_eq!(unescape_string(r#""r\ra""#), "r\ra");
+        assert_eq!(unescape_string(r#""q\"x""#), "q\"x");
+        assert_eq!(unescape_string(r#""b\\s""#), "b\\s");
+        assert_eq!(unescape_string(r#""n\0e""#), "n\0e");
+        assert_eq!(unescape_string(r#"'single'"#), "single");
+        assert_eq!(unescape_string(r#"'\'q\''"#), "'q'");
+        // Unknown escape passes through leniently (\q -> q).
+        assert_eq!(unescape_string(r#""x\qy""#), "xqy");
+    }
+
+    #[test]
+    fn unescape_template_chunk_strips_delims_and_escapes() {
+        // Full template `` `...` ``.
+        assert_eq!(unescape_template_chunk("`plain`"), "plain");
+        // Start chunk `` `a${ ``.
+        assert_eq!(unescape_template_chunk("`a${"), "a");
+        // Middle chunk `}b${`.
+        assert_eq!(unescape_template_chunk("}b${"), "b");
+        // End chunk `` }c` ``.
+        assert_eq!(unescape_template_chunk("}c`"), "c");
+        // Empty leading/middle chunks.
+        assert_eq!(unescape_template_chunk("`${"), "");
+        assert_eq!(unescape_template_chunk("}${"), "");
+        // Template escapes: \` -> ` and \$ -> $, plus the shared set.
+        assert_eq!(unescape_template_chunk("`a\\`b`"), "a`b");
+        assert_eq!(unescape_template_chunk("`a\\$b`"), "a$b");
+        assert_eq!(unescape_template_chunk("`a\\nb`"), "a\nb");
+    }
+
+    #[test]
+    fn compiles_template_emits_template_op() {
+        let chunk = compile_source("`hi ${1}!`").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("TEMPLATE"), "missing TEMPLATE op in:\n{text}");
+    }
+
+    async fn eval_string(src: &str) -> String {
+        match crate::vm_eval_source(src).await.expect("evaluates") {
+            Value::Str(s) => s.to_string(),
+            other => panic!("expected Str, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn template_interpolation_evaluates() {
+        assert_eq!(eval_string("`hi ${1+2}!`").await, "hi 3!");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn template_coerces_non_strings() {
+        assert_eq!(eval_string("`b=${true} n=${42}`").await, "b=true n=42");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hex_literal_evaluates() {
+        assert_eq!(eval_number("0xff").await, 255.0);
     }
 }

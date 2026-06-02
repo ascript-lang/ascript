@@ -61,6 +61,78 @@ async fn vm_matches_treewalker_arithmetic_and_literals() {
     }
 }
 
+#[tokio::test]
+async fn vm_matches_treewalker_number_forms() {
+    // Every numeric literal form the lexer accepts must const-fold to the
+    // identical f64 the tree-walker produces (byte-identical `print`).
+    let cases = [
+        "0xff",          // hex
+        "0XFF",          // upper-case hex prefix + digits
+        "0b1010",        // binary
+        "0B1111",        // upper-case binary prefix
+        "1e3",           // scientific
+        "1E3",           // upper-case exponent
+        "2.5e-2",        // float + signed exponent
+        "1_000",         // underscore digit separators
+        "1_000_000",     // more separators
+        "0xFF_FF",       // underscores in hex
+        "3.14",          // float
+        "0.5",           // leading-zero float
+        "0",             // bare zero
+        "1000000000000", // large integer printed without exponent
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_matches_treewalker_string_escapes() {
+    // The full escape set the tree-walker's `escape_char` handles, plus single
+    // quotes and lenient passthrough of unknown escapes (AScript has no
+    // `\u`/`\x`). Byte-identical via `print`.
+    let cases = [
+        r#""a\nb""#,            // newline
+        r#""tab\there""#,       // tab
+        r#""cr\rhere""#,        // carriage return
+        r#""quote\"x""#,        // escaped double-quote
+        r#""back\\slash""#,     // escaped backslash
+        r#""nul\0end""#,        // NUL
+        r#"'single'"#,          // single-quoted
+        r#"'he said \'hi\''"#,  // escaped single-quote inside single quotes
+        r#""unknown\qescape""#, // lenient passthrough: \q -> q
+        r#""""#,                // empty string
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_matches_treewalker_templates() {
+    // Template interpolation: literal chunks + `${expr}` slots, with the value
+    // coercion matching `Value::to_string()` exactly.
+    let cases = [
+        "`plain`",                   // no interpolation
+        "`hi ${1+2}!`",              // arithmetic interpolation
+        "`n=${42}`",                 // number coercion
+        "`b=${true}`",               // bool coercion
+        "`nothing=${nil}`",          // nil coercion
+        "`s=${\"inner\"}`",          // nested string literal
+        "`${1} and ${2} and ${3}`",  // multiple interpolations
+        "`${`${1}`}`",               // nested template
+        "`leading${1}`",             // leading literal chunk only
+        "`${1}trailing`",            // trailing literal chunk only
+        "`${1}${2}`",                // adjacent interpolations, empty middle chunk
+        "`tab\tin\ttemplate`",       // escapes inside a template chunk
+        "`escaped \\` backtick`",    // escaped backtick
+        "`escaped \\${not} interp`", // escaped ${ (literal, not interpolation)
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
 /// Assert that running `src` (a full program, for side effects) on the VM
 /// produces byte-identical stdout to running it on the tree-walker. This is the
 /// V2 output-path differential: `print(...)` must agree exactly.

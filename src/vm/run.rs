@@ -177,6 +177,24 @@ impl Vm {
                     fiber.push(result);
                 }
 
+                Op::Template => {
+                    // Pop `n` parts (pushed left-to-right) and concatenate their
+                    // string coercions in source order. The coercion is exactly
+                    // the tree-walker's `Value::to_string()` (the `Display` impl
+                    // shared with `print`), so a template interpolating any value
+                    // renders byte-identically to `ExprKind::Template`.
+                    let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let mut parts = vec![Value::Nil; n];
+                    for slot in parts.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let mut out = String::new();
+                    for v in &parts {
+                        out.push_str(&v.to_string());
+                    }
+                    fiber.push(Value::Str(out.into()));
+                }
+
                 Op::Return => {
                     let result = fiber.pop();
                     return Ok(RunOutcome::Done(result));
