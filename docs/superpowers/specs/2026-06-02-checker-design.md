@@ -81,23 +81,23 @@ pub struct TextEdit { pub range: Span, pub replacement: String }
 
 Neutral on purpose: ariadne, the LSP, and `--json` all derive from this. `RuleCode` is a stable string so config/suppression/CI can reference rules.
 
-### Severity & exit codes **[CONFIRM]**
+### Severity & exit codes (DECIDED)
 
 - **Syntax errors** → `Error`; `ascript check` exits **non-zero**.
 - **Lints** default severities: correctness-ish lints (undefined var, unreachable, unawaited future, ignored Result) → `Warning`; style lints (unused binding/import, shadowing) → `Warning`; contract mismatches → `Warning`.
-- **[CONFIRM] CI exit policy:** does `ascript check` exit non-zero on *warnings*, or only on *errors*? Recommendation: **non-zero on Error always; non-zero on Warning only with `--deny-warnings`** (ruff/clippy convention) — clean for both "show me issues" and "fail CI."
+- **CI exit policy (DECIDED):** non-zero on `Error` **always**; non-zero on `Warning` **only** under `--deny-warnings` (or `--deny <rule>`) — ruff/clippy convention.
 
-### Suppression **[CONFIRM]**
+### Suppression (DECIDED)
 
-Recommendation: inline comments — `// ascript-ignore[rule-code]` on the line above (or the same line as) the offending node suppresses that rule there; `// ascript-ignore-file[rule-code]` at the top suppresses file-wide. The checker reads these from the **CST trivia** (comments are in the tree — Plan 1/2). **[CONFIRM]** the syntax (`ascript-ignore` vs `as-ignore` vs an attribute form).
+Inline comments — `// ascript-ignore[rule-code]` on the line above (or the same line as) the offending node suppresses that rule there; `// ascript-ignore-file[rule-code]` at the top suppresses file-wide. The checker reads these from the **CST trivia** (comments are in the tree — Plan 1/2). Multiple codes comma-separated; bare `// ascript-ignore` suppresses all rules at that site.
 
 ### Configuration
 
 A `[lint]` table in an optional `ascript.toml` at the project root: `deny`/`warn`/`allow` lists by rule code, mirroring CLI flags (`--deny`, `--warn`, `--allow`). CLI flags override the file. No config file → sensible defaults (above). Keep it minimal (YAGNI): no per-directory configs in v1.
 
-### Autofix **[CONFIRM]**
+### Autofix (DECIDED)
 
-`AsDiagnostic.fix` carries an optional edit-based fix (e.g. remove an unused import, add `await`). `ascript check --fix` applies fixes to the working tree; the LSP surfaces them as code actions. **[CONFIRM] scope:** include `--fix` in #3, or defer to a later phase and just *populate* `fix` for the safest rules (unused import/binding)? Recommendation: **populate `fix` from the start for trivially-safe rules; ship `--fix` once a couple of rules have fixes** (cheap once the model carries them).
+`AsDiagnostic.fix` carries an optional edit-based fix (e.g. remove an unused import, add `await`). The model carries `fix` **from the start**, populated for trivially-safe rules (unused import/binding). `ascript check --fix` (and the LSP code-action) **ships once a couple of rules have fixes** — cheap once the model carries them. Fixes are edit-based (re-parse after applying), à la ruff/biome.
 
 ## Rule catalog
 
