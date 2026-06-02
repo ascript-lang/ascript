@@ -16,6 +16,20 @@ const ACCEPT: &[&str] = &[
     "let f = (x) => x + 1",
     "foo(1, 2)",
     "a.b[c]",
+    "[1, ...xs, 2]",
+    r#"let o = { a: 1, "k": 2, ...rest }"#,
+    "`hello`",
+    "`a${x}b${y}c`",
+    "a?.b",
+    "f()?",
+    "g()!",
+    "a ? b : c",
+    "f()? - 1",
+    "await f()",
+    "yield x",
+    "a ?? b",
+    "x += 1",
+    "foo(...args)",
 ];
 
 #[test]
