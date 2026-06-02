@@ -6,7 +6,6 @@
 //! tower-lsp `LanguageServer` impl `Send + Sync`-clean.
 
 use crate::ast::{Expr, ExprKind, MatchArm, Param, Pattern, Stmt};
-use crate::error::AsError;
 use crate::lexer;
 use crate::lsp::line_index::LineIndex;
 use crate::parser;
@@ -14,7 +13,7 @@ use crate::span::Span;
 use crate::token::Tok;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, Diagnostic, DiagnosticSeverity, DocumentSymbol, Hover,
-    HoverContents, MarkupContent, MarkupKind, Position, Range, SymbolKind,
+    HoverContents, MarkupContent, MarkupKind, NumberOrString, Range, SymbolKind,
 };
 
 /// The AScript keywords offered as completions (KEYWORD kind). Mirrors the lexer's
@@ -66,40 +65,45 @@ const STD_MODULE_PATHS: &[&str] = &[
     "std/tui",
 ];
 
-/// Lex + parse `text`, reporting the first lex-or-parse error as a single
-/// `Diagnostic`. Valid programs produce an empty vec.
+/// Produce LSP diagnostics by adapting the shared analysis core
+/// (`crate::check::analyze`), so the editor and `ascript check` report the
+/// identical diagnostics from ONE analysis path. Core ranges are BYTE offsets;
+/// the `LineIndex` is char-based, so we convert byte→char per endpoint.
 pub fn diagnostics(text: &str) -> Vec<Diagnostic> {
+    let analysis = crate::check::analyze(text);
     let index = LineIndex::new(text);
-    match lexer::lex(text) {
-        Err(e) => vec![error_diagnostic(&e, &index)],
-        Ok(tokens) => match parser::parse(&tokens) {
-            Err(e) => vec![error_diagnostic(&e, &index)],
-            Ok(_) => Vec::new(),
-        },
-    }
+    analysis
+        .diagnostics
+        .iter()
+        .map(|d| Diagnostic {
+            range: Range {
+                start: index.position(byte_to_char(text, d.range.start)),
+                end: index.position(byte_to_char(text, d.range.end)),
+            },
+            severity: Some(match d.severity {
+                crate::check::Severity::Error => DiagnosticSeverity::ERROR,
+                crate::check::Severity::Warning => DiagnosticSeverity::WARNING,
+                crate::check::Severity::Info => DiagnosticSeverity::INFORMATION,
+                crate::check::Severity::Hint => DiagnosticSeverity::HINT,
+            }),
+            code: Some(NumberOrString::String(d.code.clone())),
+            source: Some("ascript".to_string()),
+            message: d.message.clone(),
+            ..Diagnostic::default()
+        })
+        .collect()
 }
 
-/// Build an Error-severity diagnostic from an `AsError`, using its span (via the
-/// `LineIndex`) for the range, or the whole first line when no span is present.
-fn error_diagnostic(error: &AsError, index: &LineIndex) -> Diagnostic {
-    let range = match error.span {
-        Some(span) => Range {
-            start: index.position(span.start),
-            end: index.position(span.end),
-        },
-        // No span: point at the start of the document (line 0).
-        None => Range {
-            start: Position::new(0, 0),
-            end: Position::new(0, 0),
-        },
-    };
-    Diagnostic {
-        range,
-        severity: Some(DiagnosticSeverity::ERROR),
-        source: Some("ascript".to_string()),
-        message: error.message.clone(),
-        ..Diagnostic::default()
+/// Convert a byte offset to a char offset (the existing `LineIndex` is
+/// char-based). Robust against out-of-range and mid-codepoint inputs: clamps to
+/// the largest char boundary `<= byte` so the `&str` slice never panics on
+/// multi-byte UTF-8.
+fn byte_to_char(src: &str, byte: usize) -> usize {
+    let mut b = byte.min(src.len());
+    while b > 0 && !src.is_char_boundary(b) {
+        b -= 1;
     }
+    src[..b].chars().count()
 }
 
 /// Convert a char-offset `Span` into an LSP `Range` via the `LineIndex`.
@@ -1083,6 +1087,26 @@ fn collect_decl_name_span(stmt: &Stmt, name: &str, out: &mut Option<Span>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsp_diagnostics_match_core_count() {
+        let src = "let = 1\nlet = 2\n";
+        let core = crate::check::analyze(src).diagnostics.len();
+        let lsp = diagnostics(src).len();
+        assert_eq!(core, lsp, "LSP must mirror the analysis core");
+    }
+
+    #[test]
+    fn byte_to_char_handles_non_ascii() {
+        // "héllo" — 'é' is two bytes (0xC3 0xA9), so byte offsets diverge from
+        // char offsets. Mid-codepoint and out-of-range inputs must not panic.
+        let src = "héllo";
+        assert_eq!(byte_to_char(src, 0), 0);
+        assert_eq!(byte_to_char(src, 1), 1); // just before 'é'
+        assert_eq!(byte_to_char(src, 2), 1); // mid-'é' → clamps back to boundary 1
+        assert_eq!(byte_to_char(src, 3), 2); // just after 'é'
+        assert_eq!(byte_to_char(src, 999), src.chars().count()); // out of range
+    }
 
     #[test]
     fn valid_program_has_no_diagnostics() {
