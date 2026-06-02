@@ -143,6 +143,7 @@ fn stmt(p: &mut Parser) {
         WhileKw => while_stmt(p),
         ReturnKw => return_stmt(p),
         FnKw => fn_decl(p),
+        AsyncKw if is_async_fn(p) => fn_decl(p),
         LBrace => {
             block(p);
         }
@@ -159,6 +160,11 @@ fn stmt(p: &mut Parser) {
         }
         _ => expr_stmt(p),
     }
+}
+
+/// True if `async fn` starts here (vs an async arrow `async (`).
+fn is_async_fn(p: &Parser) -> bool {
+    matches!(p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind), Some(SyntaxKind::FnKw))
 }
 
 fn expr_stmt(p: &mut Parser) {
@@ -448,23 +454,21 @@ fn return_stmt(p: &mut Parser) {
 fn fn_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
-    p.bump(); // fn
-    if p.at(Ident) {
-        p.bump();
-    } else {
-        p.error("expected function name");
-    }
-    if p.at(LParen) {
-        param_list(p);
-    } else {
-        p.error("expected '(' after function name");
-    }
-    if p.at(LBrace) {
-        block(p);
-    } else {
-        p.error("expected '{' for function body");
-    }
+    if p.at(AsyncKw) { p.bump(); }
+    if p.at(FnKw) { p.bump(); } else { p.error("expected 'fn'"); }
+    if p.at(Star) { p.bump(); } // generator
+    if p.at(Ident) { p.bump(); } else { p.error("expected function name"); }
+    if p.at(LParen) { param_list(p); } else { p.error("expected '(' after function name"); }
+    if p.at(Colon) { ret_type(p); }
+    if p.at(LBrace) { block(p); } else { p.error("expected '{' for function body"); }
     p.complete(m, FnDecl);
+}
+
+fn ret_type(p: &mut Parser) {
+    let m = p.start();
+    p.bump(); // :
+    type_ann(p);
+    p.complete(m, SyntaxKind::RetType);
 }
 
 fn param_list(p: &mut Parser) {
@@ -473,17 +477,11 @@ fn param_list(p: &mut Parser) {
     p.bump(); // (
     while !p.at(RParen) && !p.at_end() {
         let pm = p.start();
-        if p.at(Ident) {
-            p.bump();
-        } else {
-            p.error("expected parameter name");
-        }
+        if p.at(DotDotDot) { p.bump(); } // rest
+        if p.at(Ident) { p.bump(); } else { p.error("expected parameter name"); }
+        if p.at(Colon) { p.bump(); type_ann(p); }
         p.complete(pm, Param);
-        if p.at(Comma) {
-            p.bump();
-        } else {
-            break;
-        }
+        if p.at(Comma) { p.bump(); } else { break; }
     }
     if p.at(RParen) {
         p.bump();
@@ -640,6 +638,14 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.bump();
             p.complete(m, NameRef)
         }
+        AsyncKw if is_async_arrow_ahead(p) => {
+            let m = p.start();
+            p.bump(); // async
+            param_list(p);
+            p.bump(); // =>
+            if p.at(LBrace) { block(p); } else { expr(p); }
+            p.complete(m, ArrowExpr)
+        }
         LParen if is_arrow_ahead(p) => {
             let m = p.start();
             param_list(p);
@@ -748,6 +754,35 @@ fn is_arrow_ahead(p: &Parser) -> bool {
         i += 1;
     }
     false
+}
+
+/// True if `async (` ... `) =>` starts here (an async arrow).
+fn is_async_arrow_ahead(p: &Parser) -> bool {
+    use SyntaxKind::*;
+    match p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind) {
+        Some(LParen) => {
+            let mut depth = 0i32;
+            let mut i = p.pos + 1;
+            while i < p.nontrivia.len() {
+                match p.tokens[p.nontrivia[i]].kind {
+                    LParen => depth += 1,
+                    RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return matches!(
+                                p.nontrivia.get(i + 1).map(|&ti| p.tokens[ti].kind),
+                                Some(FatArrow)
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            false
+        }
+        _ => false,
+    }
 }
 
 fn spread_elem(p: &mut Parser) {
@@ -1229,5 +1264,27 @@ mod tests {
             assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
             assert!(tree_shape(src).contains(&kind), "missing {kind:?} for {src}");
         }
+    }
+
+    #[test]
+    fn async_and_generator_fns() {
+        for src in [
+            "async fn f() { return 1 }",
+            "fn* g() { yield 1 }",
+            "async fn* h() { yield 1 }",
+            "fn add(a: number, b: number): number { return a + b }",
+            "fn variadic(first, ...rest) { return rest }",
+        ] {
+            let p = parse(src);
+            assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
+            assert!(tree_shape(src).contains(&SyntaxKind::FnDecl), "no FnDecl for {src}");
+        }
+        assert!(tree_shape("fn add(a: number): number {}").contains(&SyntaxKind::RetType));
+    }
+
+    #[test]
+    fn async_arrow() {
+        assert!(parse("let f = async (x) => x").errors.is_empty());
+        assert!(tree_shape("let f = async (x) => x").contains(&SyntaxKind::ArrowExpr));
     }
 }
