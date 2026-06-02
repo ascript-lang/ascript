@@ -87,6 +87,10 @@ const ACCEPT: &[&str] = &[
     "[x = 1]",
     "let r = (x = 5)",
     "a = b = c",
+    // `nil` is a valid type (Type::Nil): return type, let annotation, union member.
+    "fn f(): nil {}",
+    "let x: nil = nil",
+    "fn g(): number | nil { return nil }",
 ];
 
 #[test]

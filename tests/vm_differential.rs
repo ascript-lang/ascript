@@ -1373,4 +1373,13 @@ async fn vm_return_type_contract_matches_treewalker() {
         "fn f(b): number | string { if (b) { return 1 }\n return \"x\" }\nprint(f(false))",
     )
     .await;
+    // `: nil` return type — falling off the end yields nil and is accepted
+    // (prints "hi" on both engines); explicitly returning a non-nil value
+    // (`return 5`) is contract-rejected identically (same panic msg + span).
+    // (Calls are wrapped in `print(...)` so the panic anchors at the wrapper
+    // call-site span on both engines, matching the other return-type cases.)
+    assert_vm_run_matches_treewalker("fn f(): nil { print(\"hi\") }\nprint(f())").await;
+    assert_vm_run_error_matches_treewalker("fn f(): nil { return 5 }\nprint(f())").await;
+    // `: nil` as a union member is also accepted.
+    assert_vm_run_matches_treewalker("fn g(): number | nil { return nil }\nprint(g())").await;
 }

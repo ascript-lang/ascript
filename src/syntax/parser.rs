@@ -997,6 +997,18 @@ fn type_primary(p: &mut Parser) -> CompletedMarker {
             }
             p.complete(m, NamedType)
         }
+        // `nil` lexes as its own keyword (not an `Ident`) but is a valid type
+        // (`Type::Nil` in the spec; accepted by the legacy parser and the
+        // tree-sitter grammar). Wrap it in a `NamedType` so `cst_type` and the
+        // formatter — both keyed on the node's first non-trivia token text —
+        // treat it uniformly with `number`/`string`/etc. Note: only `nil` is a
+        // keyword-lexed type here; literal keywords `true`/`false` and number/
+        // string literals are deliberately NOT types (matching the legacy parser).
+        NilKw => {
+            let m = p.start();
+            p.bump(); // nil
+            p.complete(m, NamedType)
+        }
         LBracket => {
             let m = p.start();
             p.bump(); // [
@@ -1701,6 +1713,9 @@ mod tests {
     fn type_annotations() {
         for (src, kind) in [
             ("let x: number = 1", SyntaxKind::NamedType),
+            ("let x: nil = nil", SyntaxKind::NamedType),
+            ("fn f(): nil {}", SyntaxKind::NamedType),
+            ("fn g(): number | nil { return nil }", SyntaxKind::NamedType),
             ("let x: array<number> = []", SyntaxKind::GenericType),
             ("let x: number? = nil", SyntaxKind::OptionalType),
             ("let x: number | string = 1", SyntaxKind::UnionType),
@@ -1710,6 +1725,7 @@ mod tests {
             let p = parse(src);
             assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
             assert!(tree_shape(src).contains(&kind), "missing {kind:?} for {src}");
+            assert!(!tree_shape(src).contains(&SyntaxKind::Error), "Error node for {src}");
         }
     }
 

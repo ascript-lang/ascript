@@ -21,6 +21,27 @@ fn clean_file_exits_zero() {
     );
 }
 #[test]
+fn nil_return_type_is_not_a_syntax_error() {
+    // `nil` is a valid type (Type::Nil); the CST type parser must accept it so
+    // the checker does not emit a false `syntax-error`. Regression for the
+    // missing `NilKw` arm in `type_primary`.
+    let p = write_tmp("nilret.as", "fn f(): nil { print(\"hi\") }\nf()\n");
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "`: nil` must not produce a syntax error; output: {combined}"
+    );
+    assert!(
+        !combined.contains("syntax-error"),
+        "no syntax-error expected for `: nil`; output: {combined}"
+    );
+}
+#[test]
 fn syntax_error_exits_nonzero_and_reports() {
     let p = write_tmp("bad.as", "let = 1\n");
     let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();

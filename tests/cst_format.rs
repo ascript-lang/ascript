@@ -69,6 +69,27 @@ fn cli_formatter_preserves_comments_end_to_end() {
 }
 
 #[test]
+fn formats_nil_type_idempotently() {
+    // `nil` as a type formats via the NamedType path (first non-trivia token
+    // text) and round-trips. Regression for the missing `NilKw` arm in the CST
+    // type parser.
+    for src in [
+        "fn f(): nil {\n}\n",
+        "let x: nil = nil\n",
+        "fn g(): number | nil {\n  return nil\n}\n",
+    ] {
+        let once = ascript::syntax::format_tree(src);
+        assert!(once.contains("nil"), "lost `nil` type formatting {src:?} -> {once:?}");
+        let twice = ascript::syntax::format_tree(&once);
+        assert_eq!(once, twice, "not idempotent for {src:?}");
+        assert!(
+            ascript::syntax::parser::parse(&once).errors.is_empty(),
+            "formatted `nil`-type output does not reparse: {once:?}"
+        );
+    }
+}
+
+#[test]
 fn formatted_corpus_reparses_without_errors() {
     let mut failures = Vec::new();
     for path in corpus() {
