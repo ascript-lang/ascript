@@ -999,14 +999,54 @@ fn unquote(raw: &str) -> String {
     }
 }
 
-/// Canonical double-quoted string: escape backslashes and double quotes.
+/// Canonical double-quoted string.
+///
+/// - Already double-quoted → return verbatim (idempotent; escape sequences
+///   are already correct for double-quote context).
+/// - Single-quoted → convert: unescape `\'` → `'`, escape bare `"` → `\"`,
+///   leave all other escape sequences (`\\`, `\n`, `\t`, …) intact.
 fn requote(raw: &str) -> String {
-    let inner = unquote(raw);
+    let s = raw.trim();
+    // Already double-quoted: pass through unchanged.
+    if s.starts_with('"') {
+        return s.to_string();
+    }
+    // Single-quoted: convert to double-quoted.
+    let inner = if s.len() >= 2 && s.starts_with('\'') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
     let mut out = String::from("\"");
-    for ch in inner.chars() {
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
+            '\\' => {
+                // Peek at the escape character.
+                match chars.peek() {
+                    Some('\'') => {
+                        // \' in single-quoted becomes bare ' in double-quoted.
+                        chars.next();
+                        out.push('\'');
+                    }
+                    Some('"') => {
+                        // \" is not a valid escape in single-quoted strings
+                        // (the `"` was bare), but just in case, keep it.
+                        chars.next();
+                        out.push_str("\\\"");
+                    }
+                    _ => {
+                        // All other escape sequences (\\, \n, \t, \r, \uXXXX, …)
+                        // are identical in both quote styles — copy verbatim.
+                        out.push('\\');
+                        if let Some(&next) = chars.peek() {
+                            chars.next();
+                            out.push(next);
+                        }
+                    }
+                }
+            }
+            '"' => out.push_str("\\\""), // bare " in single-quoted → escaped
             _ => out.push(ch),
         }
     }
