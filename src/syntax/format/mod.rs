@@ -137,6 +137,10 @@ impl Printer<'_> {
                 if let Some(name) = first_ident_text(node) {
                     self.out.text(&name);
                 }
+                if let Some(ty) = node.children().find(|c| is_type_kind(c.kind())) {
+                    self.out.text(": ");
+                    self.type_ann(ty);
+                }
                 if let Some(init) = node.children().find(|c| is_expr_kind(c.kind())) {
                     self.out.text(" = ");
                     self.expr(init);
@@ -685,23 +689,29 @@ impl Printer<'_> {
         self.out.text("}");
     }
 
-    // --- 4a/4b-pending stubs (real impls in later tasks) ---
     fn literal_text(&self, node: &ResolvedNode) -> String {
-        // T5 adds canonical re-quoting; for now return the literal's token text.
-        node.children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .find(|t| !t.kind().is_trivia())
-            .map(|t| t.text().to_string())
-            .unwrap_or_else(|| node.text().to_string().trim().to_string())
+        // numbers/bools/nil verbatim; strings re-quoted canonically (double quotes).
+        let tok = node.children_with_tokens().filter_map(|el| el.into_token())
+            .find(|t| !t.kind().is_trivia());
+        match tok {
+            Some(t) if t.kind() == SyntaxKind::Str => requote(t.text()),
+            Some(t) => t.text().to_string(),
+            None => node.text().to_string().trim().to_string(),
+        }
     }
 
     fn object_key(&self, node: &ResolvedNode) -> String {
-        // T5 adds quote/ident-key normalization; for now the first ident/str token.
-        node.children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .find(|t| matches!(t.kind(), SyntaxKind::Ident | SyntaxKind::Str))
-            .map(|t| t.text().to_string())
-            .unwrap_or_default()
+        use SyntaxKind::*;
+        let key_tok = node.children_with_tokens().filter_map(|el| el.into_token())
+            .find(|t| matches!(t.kind(), Ident | Str));
+        match key_tok {
+            Some(t) if t.kind() == Ident => t.text().to_string(),
+            Some(t) => {
+                let inner = unquote(t.text());
+                if crate::token::is_ident_like(&inner) { inner } else { requote(t.text()) }
+            }
+            None => String::new(),
+        }
     }
 
     fn arrow_expr(&mut self, node: &ResolvedNode) {
@@ -772,9 +782,44 @@ impl Printer<'_> {
         self.out.newline();
     }
 
-    /// Minimal type printer (T5 replaces with full Named/Generic/Optional/Union/Tuple).
     fn type_ann(&mut self, node: &ResolvedNode) {
-        self.out.text(node.text().to_string().trim());
+        use SyntaxKind::*;
+        match node.kind() {
+            NamedType => self.out.text(node_first_ident_or_text(node).trim()),
+            GenericType => {
+                if let Some(name) = first_ident_text(node) { self.out.text(&name); }
+                self.out.text("<");
+                if let Some(args) = node.children().find(|c| c.kind() == TypeArgs) {
+                    let ts: Vec<&ResolvedNode> = args.children().filter(|c| is_type_kind(c.kind())).collect();
+                    for (i, t) in ts.iter().enumerate() {
+                        if i > 0 { self.out.text(", "); }
+                        self.type_ann(t);
+                    }
+                }
+                self.out.text(">");
+            }
+            OptionalType => {
+                if let Some(inner) = node.children().find(|c| is_type_kind(c.kind())) { self.type_ann(inner); }
+                self.out.text("?");
+            }
+            UnionType => {
+                let ts: Vec<&ResolvedNode> = node.children().filter(|c| is_type_kind(c.kind())).collect();
+                for (i, t) in ts.iter().enumerate() {
+                    if i > 0 { self.out.text(" | "); }
+                    self.type_ann(t);
+                }
+            }
+            TupleType => {
+                self.out.text("[");
+                let ts: Vec<&ResolvedNode> = node.children().filter(|c| is_type_kind(c.kind())).collect();
+                for (i, t) in ts.iter().enumerate() {
+                    if i > 0 { self.out.text(", "); }
+                    self.type_ann(t);
+                }
+                self.out.text("]");
+            }
+            _ => self.out.text(node.text().to_string().trim()),
+        }
     }
 }
 
@@ -937,6 +982,38 @@ fn member_name(node: &ResolvedNode) -> String {
         .unwrap_or_default()
 }
 
+fn node_first_ident_or_text(node: &ResolvedNode) -> String {
+    node.children_with_tokens().filter_map(|el| el.into_token())
+        .find(|t| !t.kind().is_trivia())
+        .map(|t| t.text().to_string())
+        .unwrap_or_else(|| node.text().to_string())
+}
+
+/// Strip surrounding quotes from a string literal's raw text.
+fn unquote(raw: &str) -> String {
+    let s = raw.trim();
+    if s.len() >= 2 && (s.starts_with('"') || s.starts_with('\'')) {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Canonical double-quoted string: escape backslashes and double quotes.
+fn requote(raw: &str) -> String {
+    let inner = unquote(raw);
+    let mut out = String::from("\"");
+    for ch in inner.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,6 +1122,16 @@ mod tests {
         let id = out.find("id:").unwrap();
         let greet = out.find("fn greet").unwrap();
         assert!(id < greet, "fields before methods:\n{out}");
+    }
+
+    #[test]
+    fn formats_types_and_keys() {
+        assert_eq!(fmt("let x: array< number > = []\n"), "let x: array<number> = []\n");
+        assert_eq!(fmt("let x: map<string,number> = m\n"), "let x: map<string, number> = m\n");
+        assert_eq!(fmt("let x: number|string = 1\n"), "let x: number | string = 1\n");
+        assert_eq!(fmt("let x: number ? = nil\n"), "let x: number? = nil\n");
+        // non-identifier object keys quoted; identifier-like keys bare.
+        assert_eq!(fmt(r#"let o = { "a-b": 1, c: 2 }"#), "let o = {\"a-b\": 1, c: 2}\n");
     }
 
     #[test]
