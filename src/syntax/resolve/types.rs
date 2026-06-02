@@ -1,6 +1,7 @@
 //! Data produced by name resolution. Keyed by source `TextRange` so any consumer
 //! (compiler, checker) can look results up without holding the tree's node types.
 
+use crate::syntax::kind::SyntaxKind;
 use cstree::text::TextRange;
 use std::collections::HashMap;
 
@@ -61,6 +62,6 @@ pub struct ResolveDiagnostic {
 #[derive(Debug, Clone, Default)]
 pub struct ResolveResult {
     pub uses: HashMap<TextRange, Resolution>,
-    pub frames: HashMap<TextRange, FrameInfo>,
+    pub frames: HashMap<(SyntaxKind, TextRange), FrameInfo>,
     pub diagnostics: Vec<ResolveDiagnostic>,
 }

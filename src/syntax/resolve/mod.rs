@@ -201,7 +201,7 @@ impl Resolver {
             .map(|b| b.slot)
             .collect();
         self.result.frames.insert(
-            frame.key,
+            (SyntaxKind::SourceFile, frame.key),
             FrameInfo {
                 slot_count: frame.next_slot,
                 upvalues: frame.upvalues,
@@ -325,6 +325,7 @@ impl Resolver {
     fn resolve_function(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         let key = node.text_range();
+        let node_kind = node.kind();
         self.frames.push(Frame {
             bindings: Vec::new(),
             next_slot: 0,
@@ -354,7 +355,7 @@ impl Resolver {
             .map(|b| b.slot)
             .collect();
         self.result.frames.insert(
-            frame.key,
+            (node_kind, frame.key),
             FrameInfo {
                 slot_count: frame.next_slot,
                 upvalues: frame.upvalues,
@@ -452,17 +453,17 @@ mod tests {
                 n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("inner")
             })
             .unwrap();
-        let fi = r.frames.get(&inner.text_range()).expect("inner frame");
+        let fi = r
+            .frames
+            .get(&(SyntaxKind::FnDecl, inner.text_range()))
+            .expect("inner frame");
         assert_eq!(fi.upvalues, vec![UpvalueDescriptor::ParentLocal(0)]);
     }
 
     #[test]
     fn captured_immutable_is_not_a_cell() {
-        // Prefix with `let _ = 0` so fn o() doesn't start at byte 0 and
-        // its text_range doesn't collide with the SourceFile range in r.frames.
-
         // x captured but never reassigned → NOT a cell.
-        let immut = parse_to_tree("let _ = 0\nfn o() {\n let x = 1\n fn i() { return x }\n}");
+        let immut = parse_to_tree("fn o() {\n let x = 1\n fn i() { return x }\n}");
         let r1 = resolve(&immut);
         let oi = immut
             .descendants()
@@ -470,10 +471,15 @@ mod tests {
                 n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o")
             })
             .unwrap();
-        assert!(r1.frames.get(&oi.text_range()).unwrap().cell_slots.is_empty());
+        assert!(r1
+            .frames
+            .get(&(SyntaxKind::FnDecl, oi.text_range()))
+            .unwrap()
+            .cell_slots
+            .is_empty());
 
         // y captured AND reassigned → IS a cell.
-        let mutated = parse_to_tree("let _ = 0\nfn o() {\n let y = 1\n fn i() { y = 2 }\n}");
+        let mutated = parse_to_tree("fn o() {\n let y = 1\n fn i() { y = 2 }\n}");
         let r2 = resolve(&mutated);
         let oi2 = mutated
             .descendants()
@@ -481,6 +487,12 @@ mod tests {
                 n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o")
             })
             .unwrap();
-        assert_eq!(r2.frames.get(&oi2.text_range()).unwrap().cell_slots, vec![0]);
+        assert_eq!(
+            r2.frames
+                .get(&(SyntaxKind::FnDecl, oi2.text_range()))
+                .unwrap()
+                .cell_slots,
+            vec![0]
+        );
     }
 }
