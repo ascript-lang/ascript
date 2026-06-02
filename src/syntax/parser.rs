@@ -402,6 +402,8 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             }
             p.complete(m, ParenExpr)
         }
+        LBracket => array_expr(p),
+        LBrace => object_expr(p),
         _ => {
             let m = p.start();
             p.error("expected expression");
@@ -472,12 +474,83 @@ fn is_arrow_ahead(p: &Parser) -> bool {
     false
 }
 
+fn spread_elem(p: &mut Parser) {
+    let m = p.start();
+    p.bump(); // ...
+    expr(p);
+    p.complete(m, SyntaxKind::SpreadElem);
+}
+
+fn array_expr(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // [
+    while !p.at(RBracket) && !p.at_end() {
+        if p.at(DotDotDot) {
+            spread_elem(p);
+        } else {
+            expr(p);
+        }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RBracket) {
+        p.bump();
+    } else {
+        p.error("expected ']' to close array");
+    }
+    p.complete(m, ArrayExpr)
+}
+
+fn object_expr(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // {
+    while !p.at(RBrace) && !p.at_end() {
+        if p.at(DotDotDot) {
+            spread_elem(p);
+        } else {
+            let fm = p.start();
+            if p.at(Ident) || p.at(Str) {
+                p.bump();
+            } else {
+                p.error("expected object key");
+            }
+            if p.at(Colon) {
+                p.bump();
+                expr(p);
+            } else {
+                p.error("expected ':' after object key");
+            }
+            p.complete(fm, ObjectField);
+        }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close object");
+    }
+    p.complete(m, ObjectExpr)
+}
+
 fn arg_list(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // (
     while !p.at(RParen) && !p.at_end() {
-        expr(p);
+        if p.at(DotDotDot) {
+            spread_elem(p);
+        } else {
+            expr(p);
+        }
         if p.at(Comma) {
             p.bump();
         } else {
@@ -619,5 +692,22 @@ mod tests {
     fn arrow_expression() {
         assert!(parse("let f = (x) => x + 1").errors.is_empty());
         assert!(tree_shape("let f = (x) => x + 1").contains(&SyntaxKind::ArrowExpr));
+    }
+
+    #[test]
+    fn array_literal_with_spread() {
+        let shape = tree_shape("[1, ...xs, 2]");
+        assert!(shape.contains(&SyntaxKind::ArrayExpr));
+        assert!(shape.contains(&SyntaxKind::SpreadElem));
+        assert!(parse("[1, ...xs, 2]").errors.is_empty());
+    }
+
+    #[test]
+    fn object_literal_with_spread() {
+        let shape = tree_shape(r#"let o = { a: 1, "k": 2, ...rest }"#);
+        assert!(shape.contains(&SyntaxKind::ObjectExpr));
+        assert!(shape.contains(&SyntaxKind::ObjectField));
+        assert!(shape.contains(&SyntaxKind::SpreadElem));
+        assert!(parse(r#"let o = { a: 1, "k": 2, ...rest }"#).errors.is_empty());
     }
 }
