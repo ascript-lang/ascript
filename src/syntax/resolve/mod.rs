@@ -389,6 +389,15 @@ impl Resolver {
                 };
                 self.result.uses.insert(node.text_range(), resolution);
             }
+            MatchExpr => {
+                // subject is the first expr child
+                if let Some(subj) = node.children().find(|c| is_expr(c.kind())) {
+                    self.resolve_expr(subj);
+                }
+                for arm in node.children().filter(|c| c.kind() == MatchArm) {
+                    self.resolve_match_arm(arm);
+                }
+            }
             ArrowExpr => {
                 self.resolve_function(node);
             }
@@ -477,8 +486,105 @@ impl Resolver {
         );
     }
 
+    fn resolve_match_arm(&mut self, arm: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.push_scope();
+        for pat in arm.children().filter(|c| is_pattern(c.kind())) {
+            self.resolve_pattern(pat);
+        }
+        for child in arm.children() {
+            match child.kind() {
+                MatchGuard => {
+                    for e in child.children().filter(|c| is_expr(c.kind())) {
+                        self.resolve_expr(e);
+                    }
+                }
+                k if is_expr(k) => self.resolve_expr(child),
+                _ => {}
+            }
+        }
+        self.pop_scope();
+    }
+
+    /// Option-C: a bare-ident LiteralPat NOT already resolvable binds the subject;
+    /// a resolvable ident is a value compare. Nested array/object patterns recurse;
+    /// ranges/values resolve their expressions.
+    fn resolve_pattern(&mut self, pat: &ResolvedNode) {
+        use SyntaxKind::*;
+        match pat.kind() {
+            WildcardPat => {}
+            LiteralPat => {
+                if let Some(name) = bare_ident_pattern(pat) {
+                    let resolvable = self.resolve_local(&name).is_some()
+                        || self.resolve_upvalue(self.frames.len() - 1, &name).is_some();
+                    if resolvable {
+                        // defined → value compare (resolve as a use)
+                        for e in pat.children().filter(|c| is_expr(c.kind())) {
+                            self.resolve_expr(e);
+                        }
+                    } else {
+                        // undefined → bind
+                        self.declare(&name, BindingKind::PatternBind, pat.text_range());
+                    }
+                } else {
+                    for e in pat.children().filter(|c| is_expr(c.kind())) {
+                        self.resolve_expr(e);
+                    }
+                }
+            }
+            RangePat => {
+                for e in pat.children().filter(|c| is_expr(c.kind())) {
+                    self.resolve_expr(e);
+                }
+            }
+            ArrayPat | ObjectPat => {
+                for sub in pat.children() {
+                    match sub.kind() {
+                        PatRest => {
+                            if let Some(name) = ident_text(sub) {
+                                self.declare(&name, BindingKind::PatternBind, sub.text_range());
+                            }
+                        }
+                        ObjPatEntry => {
+                            if let Some(subpat) = sub.children().find(|c| is_pattern(c.kind())) {
+                                self.resolve_pattern(subpat);
+                            } else if let Some(name) = ident_text(sub) {
+                                self.declare(&name, BindingKind::PatternBind, sub.text_range());
+                            }
+                        }
+                        k if is_pattern(k) => self.resolve_pattern(sub),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn finish(self) -> ResolveResult {
         self.result
+    }
+}
+
+fn is_pattern(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        kind,
+        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat
+    )
+}
+
+/// If a LiteralPat is exactly a single bare `NameRef`, return its name.
+fn bare_ident_pattern(pat: &ResolvedNode) -> Option<String> {
+    let mut exprs = pat.children().filter(|c| is_expr(c.kind()));
+    let first = exprs.next()?;
+    if exprs.next().is_some() {
+        return None;
+    }
+    if first.kind() == SyntaxKind::NameRef {
+        ident_text(first)
+    } else {
+        None
     }
 }
 
@@ -596,6 +702,42 @@ mod tests {
         assert!(
             r.uses.values().any(|u| matches!(u, Resolution::Local(_))),
             "C resolves to a local binding"
+        );
+    }
+
+    #[test]
+    fn match_binds_undefined_compares_defined() {
+        // Option-C: in `match v { other => other }`, `other` is undefined → binds,
+        // and the body use of `other` resolves to that Local.
+        let tree = parse_to_tree("let v = 1\nlet r = match v { other => other }");
+        let r = resolve(&tree);
+        let body_use = tree
+            .descendants()
+            .filter(|n| {
+                n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("other")
+            })
+            .last()
+            .unwrap();
+        assert!(
+            matches!(r.uses.get(&body_use.text_range()), Some(Resolution::Local(_))),
+            "bound pattern name is a Local in the arm body"
+        );
+    }
+
+    #[test]
+    fn match_arm_bindings_dont_leak() {
+        let tree = parse_to_tree("let r = match v { x => x }\nprint(x)");
+        let r = resolve(&tree);
+        let outer_x = tree
+            .descendants()
+            .filter(|n| {
+                n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x")
+            })
+            .last()
+            .unwrap();
+        assert_eq!(
+            r.uses.get(&outer_x.text_range()),
+            Some(&Resolution::Global("x".into()))
         );
     }
 
