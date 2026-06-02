@@ -196,6 +196,7 @@ fn op_name(op: Op) -> &'static str {
         ArrayLen => "ARRAY_LEN",
         GetLocalCell => "GET_LOCAL_CELL",
         SetLocalCell => "SET_LOCAL_CELL",
+        FreshCell => "FRESH_CELL",
     }
 }
 

@@ -180,6 +180,25 @@ impl Fiber {
         );
         *cell.borrow_mut() = v;
     }
+
+    /// Install a BRAND-NEW heap cell (`Rc<RefCell<Value::Nil>>`) into the current
+    /// frame's `slot`, dropping the frame's strong ref to the previous cell. Any
+    /// closure that captured the previous cell keeps it alive with its own value.
+    /// Used by `Op::FreshCell` to give each loop iteration a fresh cell for the
+    /// loop variable / loop-body captured `let`s (per-iteration capture freshness).
+    ///
+    /// # Panics
+    /// If `slot` is not a cell slot (the compiler only emits `FRESH_CELL` for
+    /// resolver cell slots, so a `None` here is a compiler/resolver bug).
+    pub fn fresh_cell(&mut self, slot: usize) {
+        let slot_cell = self
+            .frame_mut()
+            .cells
+            .get_mut(slot)
+            .and_then(|c| c.as_mut())
+            .expect("Fiber::fresh_cell on a non-cell slot (compiler/resolver bug)");
+        *slot_cell = Rc::new(RefCell::new(Value::Nil));
+    }
 }
 
 #[cfg(test)]

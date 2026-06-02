@@ -1562,3 +1562,108 @@ async fn vm_run_function_heavy_multi_feature_programs() {
         assert_vm_run_matches_treewalker(src).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// V5-T1: per-iteration loop-var / loop-body cell freshness.
+//
+// The tree-walker creates a FRESH binding per loop iteration, so a closure that
+// captures the loop variable (or a `let` declared in the loop body) sees THAT
+// iteration's value. The VM must allocate a fresh cell per iteration for each
+// captured cell-slot so the byte-identical differential gate holds.
+// ---------------------------------------------------------------------------
+
+/// The confirmed divergence target: a closure capturing the for-RANGE loop var.
+/// Tree-walker prints 0,1,2; the pre-fix shared-cell VM printed 1,2,2.
+#[tokio::test]
+async fn vm_for_range_loop_var_capture_is_per_iteration() {
+    let src = "let prev = nil\n\
+               for (i in 0..3) {\n  if (prev != nil) { print(prev()) }\n  prev = () => i\n}\n\
+               print(prev())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("0\n1\n2\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// for-OF variant: a closure capturing the for-of loop var.
+#[tokio::test]
+async fn vm_for_of_loop_var_capture_is_per_iteration() {
+    let src = "let prev = nil\n\
+               for (x of [10, 20, 30]) {\n  if (prev != nil) { print(prev()) }\n  prev = () => x\n}\n\
+               print(prev())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("10\n20\n30\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// while variant: a captured `let` declared INSIDE the loop body.
+#[tokio::test]
+async fn vm_while_body_let_capture_is_per_iteration() {
+    let src = "let prev = nil\nlet i = 0\n\
+               while (i < 3) {\n  let j = i\n  if (prev != nil) { print(prev()) }\n  \
+               prev = () => j\n  i = i + 1\n}\n\
+               print(prev())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("0\n1\n2\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// A captured `let` declared inside a for-range BODY (not just the loop var).
+#[tokio::test]
+async fn vm_for_range_body_let_capture_is_per_iteration() {
+    let src = "let prev = nil\n\
+               for (i in 0..3) {\n  let doubled = i * 2\n  if (prev != nil) { print(prev()) }\n  \
+               prev = () => doubled\n}\n\
+               print(prev())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("0\n2\n4\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// Nested loops capturing BOTH loop vars: the inner closure created in the
+/// PREVIOUS (a, b) iteration is invoked at the START of the next one, so it must
+/// report the exact (outer, inner) pair from the iteration that created it. With
+/// shared cells the inner `b` (and `a` across the inner-loop boundary) would be
+/// stale; per-iteration fresh cells make each closure pin its own pair.
+#[tokio::test]
+async fn vm_nested_loop_capture_both_vars() {
+    let src = "let prev = nil\n\
+               for (a in 0..2) {\n  for (b in 0..2) {\n    \
+               if (prev != nil) { print(prev()) }\n    prev = () => a * 10 + b\n  }\n}\n\
+               print(prev())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// Regression: a NON-captured for-range loop var (no closure) still iterates
+/// correctly — no behavior change for the common case.
+#[tokio::test]
+async fn vm_non_captured_loop_var_unchanged() {
+    let src = "let total = 0\nfor (i in 0..5) { total = total + i }\nprint(total)";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("10\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+/// Regression: a closure capturing an OUTER (non-loop) variable still sees that
+/// variable's CURRENT value (shared cell across iterations), as in V4. Only
+/// loop-local cells are refreshed per iteration.
+#[tokio::test]
+async fn vm_outer_capture_still_shared() {
+    let src = "let count = 0\nlet bump = nil\n\
+               for (i in 0..3) {\n  count = count + 1\n  bump = () => count\n}\n\
+               print(bump())";
+    assert_eq!(
+        ascript::vm_run_source(src).await.expect("vm ok"),
+        ("3\n".to_string(), None)
+    );
+    assert_vm_run_matches_treewalker(src).await;
+}

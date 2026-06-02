@@ -399,6 +399,54 @@ impl Compiler {
         }
     }
 
+    /// The set of cell slots a loop must refresh at the TOP of every iteration so
+    /// captured bindings get per-iteration freshness (matching the tree-walker,
+    /// which makes a fresh binding per iteration). This is:
+    /// - the loop variable's slot (for for-range / for-of), if it is a cell slot,
+    ///   passed via `loop_var_slot`; AND
+    /// - every cell slot in the CURRENT frame whose binding's `decl_range` lies
+    ///   strictly INSIDE the loop BODY's text range (a captured `let`/`fn` etc.
+    ///   declared in the body).
+    ///
+    /// Only CELL slots matter: a non-captured local is a plain slot overwritten
+    /// each iteration (already correct). Scratch/induction slots (`alloc_temp`)
+    /// are never resolver cell slots, so they are never refreshed. The returned
+    /// slots are sorted (ascending) and de-duplicated for deterministic bytecode.
+    fn loop_refresh_slots(&self, body: &Block, loop_var_slot: Option<u16>) -> Vec<u16> {
+        let body_range = body.syntax().text_range();
+        let mut slots: Vec<u16> = Vec::new();
+        if let Some(v) = loop_var_slot {
+            if self.cur_cells.contains(&u32::from(v)) {
+                slots.push(v);
+            }
+        }
+        for b in &self.resolved.bindings {
+            // Only cell slots in THIS frame; only bindings declared inside the
+            // body. `contains_range` is inclusive, which is exactly what we want
+            // (the body node fully contains its descendant declarations).
+            if self.cur_cells.contains(&b.slot)
+                && body_range.contains_range(b.decl_range)
+                && b.decl_range != body_range
+            {
+                if let Ok(slot) = u16::try_from(b.slot) {
+                    slots.push(slot);
+                }
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    /// Emit a `FRESH_CELL` for each slot in `slots` (in order). Installs a fresh
+    /// heap cell so closures created in this iteration capture only this
+    /// iteration's value.
+    fn emit_fresh_cells(&mut self, slots: &[u16], span: Span) {
+        for &slot in slots {
+            self.chunk.emit_u16(Op::FreshCell, slot, span);
+        }
+    }
+
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
             Expr::Literal(lit) => self.compile_literal(lit),
@@ -686,6 +734,12 @@ impl Compiler {
             .body()
             .ok_or_else(|| CompileError::new("while statement missing body", span))?;
 
+        // Cell slots to refresh per iteration: any captured `let`/`fn` declared in
+        // the loop BODY (a `while` has no loop variable). The tree-walker runs the
+        // body in a fresh child env each iteration, so a body `let` captured by a
+        // closure sees only that iteration's value.
+        let refresh_slots = self.loop_refresh_slots(&body, None);
+
         // The continue target is the start of the condition re-test.
         let cond_start = self.chunk.code.len();
         self.compile_expr(&cond)?;
@@ -699,6 +753,8 @@ impl Compiler {
             continue_sites: Vec::new(),
             break_sites: Vec::new(),
         });
+        // Top of the iteration: fresh cells for captured body lets BEFORE the body.
+        self.emit_fresh_cells(&refresh_slots, span);
         self.compile_block(&body)?;
         // Backward jump to re-test the condition.
         self.chunk.emit_loop(Op::Loop, cond_start, span);
@@ -1130,27 +1186,45 @@ impl Compiler {
 
         let var_slot = self.for_loop_var_slot(for_stmt)?;
         let end_slot = self.alloc_temp()?;
+        // A SCRATCH induction counter drives the loop, separate from the
+        // user-visible loop variable `i`. The tree-walker iterates with its own
+        // `f64` counter and `define`s a FRESH `var` binding each iteration, so
+        // mutating `i` inside the body never changes loop progression. Driving the
+        // loop from a scratch slot (never a cell, never captured) reproduces that:
+        // we re-derive `i` from the counter at the TOP of each iteration, AFTER
+        // installing a fresh cell for it (per-iteration capture freshness).
+        let idx_slot = self.alloc_temp()?;
+        // Cell slots to refresh per iteration: the loop var `i` (if captured) plus
+        // any captured `let`/`fn` declared in the loop BODY.
+        let refresh_slots = self.loop_refresh_slots(&body, Some(var_slot));
         // Anchor the bounds-numbers panic at the START bound's CODE start (trivia
         // trimmed), byte-identical to the tree-walker's `AsError::at(_, start.span)`.
         let start_span = node_code_span(&start);
 
         // Evaluate start then end (start below, end on top), guard both are
         // numbers (panic anchored at the START bound's span, matching the
-        // tree-walker), then store end ONCE and seed `i = start`.
+        // tree-walker), then store end ONCE and seed the counter `idx = start`.
         self.compile_expr(&start)?;
         self.compile_expr(&end)?;
         self.chunk.emit(Op::CheckNumbers, start_span);
         self.chunk.emit_u16(Op::SetLocal, end_slot, span);
-        self.emit_set_local(var_slot, span);
+        self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
-        // Condition: re-test `i < end` each iteration.
+        // Condition: re-test `idx < end` each iteration.
         let cond_start = self.chunk.code.len();
-        self.emit_get_local(var_slot, span);
+        self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
         self.chunk.emit_u16(Op::GetLocal, end_slot, span);
         self.chunk.emit(Op::Lt, span);
         let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
 
-        // The continue target is the INCREMENT (so `continue` runs `i += 1` then
+        // Top of the iteration: give the loop var (and any loop-body captured
+        // lets) a FRESH cell so a closure created this iteration captures only this
+        // iteration's value, then bind `i = idx` into the (fresh) loop-var slot.
+        self.emit_fresh_cells(&refresh_slots, span);
+        self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
+        self.emit_set_local(var_slot, span);
+
+        // The continue target is the INCREMENT (so `continue` runs `idx += 1` then
         // re-tests, exactly like the tree-walker's `Flow::Continue` falling through
         // to `i += 1.0`). The increment is emitted AFTER the body, so its offset
         // is not yet known: push the ctx with `continue_target: None` so each
@@ -1163,10 +1237,11 @@ impl Compiler {
         });
         self.compile_block(&body)?;
 
-        // Increment: `i = i + 1`. This is where every `continue` lands — at the
+        // Increment: `idx = idx + 1`. This is where every `continue` lands — at the
         // CURRENT end of code, which is exactly what `patch_jump` targets — so
         // patch every recorded forward `continue` site here, BEFORE emitting the
-        // increment instructions.
+        // increment instructions. The counter is the scratch slot, NOT the
+        // user-visible `i`, so body mutation of `i` cannot affect progression.
         let continue_sites = std::mem::take(
             &mut self
                 .loops
@@ -1177,11 +1252,11 @@ impl Compiler {
         for site in continue_sites {
             self.chunk.patch_jump(site);
         }
-        self.chunk.emit_u16(Op::GetLocal, var_slot, span);
+        self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
         let one = self.chunk.add_const(Value::Number(1.0));
         self.chunk.emit_u16(Op::Const, one, span);
         self.chunk.emit(Op::Add, span);
-        self.chunk.emit_u16(Op::SetLocal, var_slot, span);
+        self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
         // Back-edge to re-test the condition.
         self.chunk.emit_loop(Op::Loop, cond_start, span);
@@ -1241,6 +1316,9 @@ impl Compiler {
         let arr_slot = self.alloc_temp()?;
         let len_slot = self.alloc_temp()?;
         let idx_slot = self.alloc_temp()?;
+        // Cell slots to refresh per iteration: the loop var `x` (if captured) plus
+        // any captured `let`/`fn` declared in the loop BODY.
+        let refresh_slots = self.loop_refresh_slots(body, Some(var_slot));
 
         // Anchor the "not iterable" panic at the iterable expression's CODE span
         // (trivia-trimmed), byte-identical to the tree-walker's `AsError::at(_,
@@ -1267,7 +1345,10 @@ impl Compiler {
         self.chunk.emit(Op::Lt, span);
         let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
 
-        // Bind the loop var to `arr[idx]` at the top of each iteration.
+        // Top of the iteration: give the loop var (and any loop-body captured
+        // lets) a FRESH cell so a closure created this iteration captures only this
+        // iteration's value, then bind the loop var to `arr[idx]`.
+        self.emit_fresh_cells(&refresh_slots, span);
         self.chunk.emit_u16(Op::GetLocal, arr_slot, span);
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
         self.chunk.emit(Op::GetIndex, span);

@@ -551,6 +551,15 @@ impl Vm {
                     let v = fiber.pop();
                     fiber.set_local_cell(slot, v);
                 }
+                Op::FreshCell => {
+                    // Install a brand-new heap cell into this slot, dropping the
+                    // frame's ref to the previous cell (any closure that captured
+                    // it keeps its own `Rc`, so it retains that iteration's value).
+                    // Emitted at the top of each loop iteration for per-iteration
+                    // capture freshness.
+                    let slot = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    fiber.fresh_cell(slot);
+                }
 
                 Op::GetUpvalue => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;

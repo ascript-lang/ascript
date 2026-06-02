@@ -217,6 +217,18 @@ pub enum Op {
     /// `SET_LOCAL_CELL(u16)` — store TOS (popped) into the heap cell for local
     /// slot `n`. The cell-slot counterpart of `SET_LOCAL`.
     SetLocalCell,
+    /// `FRESH_CELL(u16)` — install a BRAND-NEW heap cell (`Rc<RefCell<Value::Nil>>`)
+    /// into the current frame's slot `n`, dropping the frame's strong ref to the
+    /// PREVIOUS cell. Any closure that captured the previous cell keeps it alive (an
+    /// `Rc` clone) with its own value, so that closure is unaffected. Emitted at the
+    /// TOP of each loop iteration for every cell slot that must be fresh per
+    /// iteration — the loop variable (for-range/for-of) and any captured `let`
+    /// declared inside the loop body — so a closure created in iteration N captures
+    /// THAT iteration's cell and observes only that iteration's value
+    /// (per-iteration capture freshness, matching the tree-walker's fresh-binding-
+    /// per-iteration semantics). `slot` is always a resolver cell slot, so the
+    /// frame's `cells[slot]` exists; a non-cell slot would be a compiler bug.
+    FreshCell,
 }
 
 impl Op {
@@ -303,6 +315,7 @@ impl Op {
 
             x if x == GetLocalCell as u8 => GetLocalCell,
             x if x == SetLocalCell as u8 => SetLocalCell,
+            x if x == FreshCell as u8 => FreshCell,
 
             _ => return None,
         })
@@ -314,9 +327,9 @@ impl Op {
         use Op::*;
         match self {
             // u16-operand ops.
-            Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | GetUpvalue | SetUpvalue
-            | CloseUpvalue | GetGlobal | SetGlobal | Closure | NewArray | NewObject | GetProp
-            | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import => 2,
+            Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
+            | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | Closure | NewArray | NewObject
+            | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -413,6 +426,7 @@ mod tests {
         Op::ArrayLen,
         Op::GetLocalCell,
         Op::SetLocalCell,
+        Op::FreshCell,
     ];
 
     #[test]
