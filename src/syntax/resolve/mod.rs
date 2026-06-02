@@ -61,6 +61,9 @@ struct Frame {
     bindings: Vec<Binding>,
     next_slot: u32,
     key: TextRange,
+    upvalues: Vec<UpvalueDescriptor>,
+    /// Index, within `scopes`, of the first scope belonging to this frame.
+    scope_base: usize,
 }
 
 struct Scope {
@@ -128,13 +131,52 @@ impl Resolver {
         slot
     }
 
-    fn resolve_local(&self, name: &str) -> Option<u32> {
-        for scope in self.scopes.iter().rev() {
+    fn resolve_local_in(&self, frame_idx: usize, name: &str) -> Option<u32> {
+        let base = self.frames[frame_idx].scope_base;
+        for scope in self.scopes[base..].iter().rev() {
             if let Some(&slot) = scope.names.get(name) {
                 return Some(slot);
             }
         }
         None
+    }
+
+    fn resolve_local(&self, name: &str) -> Option<u32> {
+        self.resolve_local_in(self.frames.len() - 1, name)
+    }
+
+    fn resolve_upvalue(&mut self, frame_idx: usize, name: &str) -> Option<u32> {
+        if frame_idx == 0 {
+            return None;
+        }
+        let parent = frame_idx - 1;
+        if let Some(slot) = self.resolve_local_in(parent, name) {
+            self.mark_captured(parent, slot);
+            return Some(self.add_upvalue(frame_idx, UpvalueDescriptor::ParentLocal(slot)));
+        }
+        if let Some(idx) = self.resolve_upvalue(parent, name) {
+            return Some(self.add_upvalue(frame_idx, UpvalueDescriptor::ParentUpvalue(idx)));
+        }
+        None
+    }
+
+    fn add_upvalue(&mut self, frame_idx: usize, desc: UpvalueDescriptor) -> u32 {
+        let ups = &mut self.frames[frame_idx].upvalues;
+        if let Some(i) = ups.iter().position(|u| *u == desc) {
+            return i as u32;
+        }
+        ups.push(desc);
+        (ups.len() - 1) as u32
+    }
+
+    fn mark_captured(&mut self, frame_idx: usize, slot: u32) {
+        if let Some(b) = self.frames[frame_idx]
+            .bindings
+            .iter_mut()
+            .find(|b| b.slot == slot)
+        {
+            b.captured = true;
+        }
     }
 
     fn resolve_file(&mut self, root: &ResolvedNode) {
@@ -143,6 +185,8 @@ impl Resolver {
             bindings: Vec::new(),
             next_slot: 0,
             key,
+            upvalues: Vec::new(),
+            scope_base: self.scopes.len(),
         });
         self.push_scope();
         for child in root.children() {
@@ -150,12 +194,18 @@ impl Resolver {
         }
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
+        let cell_slots: Vec<u32> = frame
+            .bindings
+            .iter()
+            .filter(|b| b.captured && b.mutated)
+            .map(|b| b.slot)
+            .collect();
         self.result.frames.insert(
             frame.key,
             FrameInfo {
                 slot_count: frame.next_slot,
-                upvalues: Vec::new(),
-                cell_slots: Vec::new(),
+                upvalues: frame.upvalues,
+                cell_slots,
             },
         );
     }
@@ -190,6 +240,12 @@ impl Resolver {
                     }
                 }
             }
+            FnDecl => {
+                if let Some(name) = fn_name(node) {
+                    self.declare(&name, BindingKind::Fn, node.text_range());
+                }
+                self.resolve_function(node);
+            }
             ExprStmt | ReturnStmt => {
                 for child in node.children() {
                     if is_expr(child.kind()) {
@@ -210,14 +266,18 @@ impl Resolver {
         match node.kind() {
             NameRef => {
                 let name = ident_text(node).unwrap_or_default();
-                let resolution = match self.resolve_local(&name) {
-                    Some(slot) => {
-                        self.bump_use(slot);
-                        Resolution::Local(slot)
-                    }
-                    None => Resolution::Global(name),
+                let resolution = if let Some(slot) = self.resolve_local(&name) {
+                    self.bump_use(slot);
+                    Resolution::Local(slot)
+                } else if let Some(idx) = self.resolve_upvalue(self.frames.len() - 1, &name) {
+                    Resolution::Upvalue(idx)
+                } else {
+                    Resolution::Global(name)
                 };
                 self.result.uses.insert(node.text_range(), resolution);
+            }
+            ArrowExpr => {
+                self.resolve_function(node);
             }
             _ => {
                 for child in node.children() {
@@ -238,9 +298,58 @@ impl Resolver {
         }
     }
 
+    fn resolve_function(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        let key = node.text_range();
+        self.frames.push(Frame {
+            bindings: Vec::new(),
+            next_slot: 0,
+            key,
+            upvalues: Vec::new(),
+            scope_base: self.scopes.len(),
+        });
+        self.push_scope();
+        if let Some(params) = node.children().find(|c| c.kind() == ParamList) {
+            for p in params.children().filter(|c| c.kind() == Param) {
+                if let Some(name) = ident_text(p) {
+                    self.declare(&name, BindingKind::Param, p.text_range());
+                }
+            }
+        }
+        if let Some(body) = node.children().find(|c| c.kind() == Block) {
+            for child in body.children() {
+                self.resolve_stmt(child);
+            }
+        }
+        self.pop_scope();
+        let frame = self.frames.pop().unwrap();
+        let cell_slots: Vec<u32> = frame
+            .bindings
+            .iter()
+            .filter(|b| b.captured && b.mutated)
+            .map(|b| b.slot)
+            .collect();
+        self.result.frames.insert(
+            frame.key,
+            FrameInfo {
+                slot_count: frame.next_slot,
+                upvalues: frame.upvalues,
+                cell_slots,
+            },
+        );
+    }
+
     fn finish(self) -> ResolveResult {
         self.result
     }
+}
+
+/// The declared name of a function (first IDENT token after `fn`/`async`/`*`).
+fn fn_name(node: &ResolvedNode) -> Option<String> {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| t.text().to_string())
 }
 
 #[cfg(test)]
@@ -289,5 +398,37 @@ mod tests {
             .collect();
         assert_eq!(refs[0], Some(Resolution::Local(0)), "inner x is Local");
         assert_eq!(refs[1], Some(Resolution::Global("x".into())), "outer x is Global");
+    }
+
+    #[test]
+    fn params_are_locals_in_their_frame() {
+        let tree = parse_to_tree("fn add(a, b) { return a + b }");
+        let r = resolve(&tree);
+        let mut local_uses = 0;
+        for n in tree.descendants().filter(|n| n.kind() == SyntaxKind::NameRef) {
+            if matches!(r.uses.get(&n.text_range()), Some(Resolution::Local(_))) {
+                local_uses += 1;
+            }
+        }
+        assert_eq!(local_uses, 2, "a and b resolve to locals");
+    }
+
+    #[test]
+    fn inner_closure_captures_outer_as_upvalue() {
+        let tree = parse_to_tree("fn outer() {\n let x = 1\n fn inner() { return x }\n}");
+        let r = resolve(&tree);
+        let x_use = tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x"))
+            .unwrap();
+        assert!(matches!(r.uses.get(&x_use.text_range()), Some(Resolution::Upvalue(0))));
+        let inner = tree
+            .descendants()
+            .find(|n| {
+                n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("inner")
+            })
+            .unwrap();
+        let fi = r.frames.get(&inner.text_range()).expect("inner frame");
+        assert_eq!(fi.upvalues, vec![UpvalueDescriptor::ParentLocal(0)]);
     }
 }
