@@ -16,8 +16,11 @@ print(area(3, 4))
 print(greet("Ada"))
 print(total)
 
-// a contract violation, caught by recover
-let r = recover(() => area("wide", 4))
+// a contract violation, caught by recover (the bad value comes through an
+// `any`-typed binding so it's a *runtime* contract breach, not a statically
+// provable one — the static `contract-mismatch` lint stays conservative here)
+let bad: any = "wide"
+let r = recover(() => area(bad, 4))
 print(r[1].message)
 
 // a `future<T>` contract: calling an async fn yields a future; the binding
