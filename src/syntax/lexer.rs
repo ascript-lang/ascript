@@ -21,6 +21,8 @@ pub fn lex(src: &str) -> Vec<LexToken> {
     let chars: Vec<char> = src.chars().collect();
     let mut i = 0usize;
     let mut out: Vec<LexToken> = Vec::new();
+    let mut brace_depth = 0usize;
+    let mut template_stack: Vec<usize> = Vec::new();
 
     macro_rules! push {
         ($kind:expr, $start:expr, $end:expr) => {{
@@ -87,14 +89,49 @@ pub fn lex(src: &str) -> Vec<LexToken> {
             continue;
         }
 
+        // plain strings: "..." and '...'
+        if c == '"' || c == '\'' {
+            let j = scan_string_end(&chars, i, c);
+            push!(SyntaxKind::Str, start, j);
+            i = j;
+            continue;
+        }
+
+        // templates: `...` with ${ } interpolations
+        if c == '`' {
+            let (kind, j) = scan_template_chunk(&chars, i, /*from_backtick=*/ true);
+            push!(kind, start, j);
+            i = j;
+            if kind == SyntaxKind::TemplateStart {
+                template_stack.push(brace_depth);
+            }
+            continue;
+        }
+
+        // a `}` that closes a template interpolation resumes template text
+        if c == '}' && template_stack.last() == Some(&brace_depth) {
+            let (kind, j) = scan_template_chunk(&chars, i, /*from_backtick=*/ false);
+            push!(kind, start, j);
+            i = j;
+            if kind == SyntaxKind::TemplateEnd {
+                template_stack.pop();
+            }
+            continue;
+        }
+
         // multi-char operators first (longest match), then single-char
         if let Some((kind, len)) = match_operator(&chars, i) {
+            match kind {
+                SyntaxKind::LBrace => brace_depth += 1,
+                SyntaxKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
+                _ => {}
+            }
             i += len;
             push!(kind, start, i);
             continue;
         }
 
-        // genuinely unrecognized char (identifiers, strings, etc. handled in later tasks)
+        // genuinely unrecognized char
         i += 1;
         push!(SyntaxKind::Error, start, i);
     }
@@ -211,6 +248,48 @@ fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
     Some((one, 1))
 }
 
+/// Index just past the closing quote of a "..."/'...' string starting at `i`
+/// (the opening quote `q`). Honors backslash escapes. Unterminated → chars.len().
+fn scan_string_end(chars: &[char], i: usize, q: char) -> usize {
+    let n = chars.len();
+    let mut j = i + 1;
+    while j < n {
+        match chars[j] {
+            '\\' if j + 1 < n => j += 2,
+            c if c == q => return j + 1,
+            _ => j += 1,
+        }
+    }
+    n
+}
+
+/// Scan a template text chunk. `from_backtick=true` starts at a backtick;
+/// `false` starts at a `}` closing an interpolation. Returns (kind, end_index).
+/// Stops at an unescaped `${` (more interpolation) or the closing backtick.
+/// Lossless: the slice includes the opening `` ` ``/`}` and the closing
+/// `` ` ``/`${`.
+fn scan_template_chunk(chars: &[char], i: usize, from_backtick: bool) -> (SyntaxKind, usize) {
+    use SyntaxKind::*;
+    let n = chars.len();
+    let mut j = i + 1; // skip opening ` or }
+    while j < n {
+        match chars[j] {
+            '\\' if j + 1 < n => j += 2,
+            '`' => {
+                let kind = if from_backtick { TemplateStr } else { TemplateEnd };
+                return (kind, j + 1);
+            }
+            '$' if j + 1 < n && chars[j + 1] == '{' => {
+                let kind = if from_backtick { TemplateStart } else { TemplateMiddle };
+                return (kind, j + 2); // include the ${
+            }
+            _ => j += 1,
+        }
+    }
+    let kind = if from_backtick { TemplateStr } else { TemplateEnd };
+    (kind, n)
+}
+
 /// Map a reserved word to its keyword kind. Mirrors the legacy keyword set
 /// (`src/token.rs`); `as` is a soft keyword (stays `Ident`), `of` is a keyword.
 fn keyword_kind(s: &str) -> Option<SyntaxKind> {
@@ -279,6 +358,29 @@ mod tests {
         assert_eq!(kinds("0..=10"), vec![Number, DotDotEq, Number]);
         assert_eq!(kinds("a...b"), vec![Ident, DotDotDot, Ident]);
         assert_eq!(render(&lex("3.14 + 0xFF")), "3.14 + 0xFF");
+    }
+
+    #[test]
+    fn strings_and_templates_are_lossless() {
+        for src in [
+            r#""hello\nworld""#,
+            r#"'single \'quoted\''"#,
+            "`plain template`",
+            "`a${x}b`",
+            "`outer ${ `inner ${y}` } end`", // nested template
+            r#""has } and { and ${ literally""#,
+        ] {
+            assert_eq!(render(&lex(src)), src, "not lossless: {src}");
+        }
+    }
+
+    #[test]
+    fn string_kinds() {
+        use SyntaxKind::*;
+        assert_eq!(kinds(r#""hi""#), vec![Str]);
+        assert_eq!(kinds("`plain`"), vec![TemplateStr]);
+        // `a${x}b` => TemplateStart "a${", Ident x, TemplateEnd "}b`"
+        assert_eq!(kinds("`a${x}b`"), vec![TemplateStart, Ident, TemplateEnd]);
     }
 
     #[test]
