@@ -146,6 +146,17 @@ fn stmt(p: &mut Parser) {
         LBrace => {
             block(p);
         }
+        ForKw => for_stmt(p),
+        BreakKw => {
+            let m = p.start();
+            p.bump();
+            p.complete(m, SyntaxKind::BreakStmt);
+        }
+        ContinueKw => {
+            let m = p.start();
+            p.bump();
+            p.complete(m, SyntaxKind::ContinueStmt);
+        }
         _ => expr_stmt(p),
     }
 }
@@ -369,6 +380,59 @@ fn while_stmt(p: &mut Parser) {
         p.error("expected '{' after while condition");
     }
     p.complete(m, WhileStmt);
+}
+
+fn for_stmt(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // for
+    if p.at(AwaitKw) {
+        p.bump(); // await
+    }
+    if p.at(LParen) {
+        p.bump();
+    } else {
+        p.error("expected '(' after for");
+    }
+    if p.at(Ident) {
+        p.bump(); // loop variable
+    } else {
+        p.error("expected loop variable");
+    }
+    if p.at(InKw) || p.at(OfKw) {
+        p.bump();
+    } else {
+        p.error("expected 'in' or 'of' in for");
+    }
+    // iterable, or a range a..b / a..=b. Parse a (possibly binary) expression,
+    // then a trailing .. / ..= makes it a RangeExpr.
+    let iter = lhs(p);
+    let mut iter_cm = iter;
+    loop {
+        let op = p.current();
+        let Some((_l, r_bp)) = infix_binding_power(op) else { break };
+        let bm = p.precede(&iter_cm);
+        p.bump();
+        expr_bp(p, r_bp);
+        iter_cm = p.complete(bm, BinaryExpr);
+    }
+    if p.at(DotDot) || p.at(DotDotEq) {
+        let rm = p.precede(&iter_cm);
+        p.bump(); // .. or ..=
+        expr(p); // range end
+        p.complete(rm, RangeExpr);
+    }
+    if p.at(RParen) {
+        p.bump();
+    } else {
+        p.error("expected ')' to close for header");
+    }
+    if p.at(LBrace) {
+        block(p);
+    } else {
+        p.error("expected '{' for loop body");
+    }
+    p.complete(m, ForStmt);
 }
 
 fn return_stmt(p: &mut Parser) {
@@ -1127,6 +1191,28 @@ mod tests {
         assert!(s.contains(&SyntaxKind::ObjectBindPat));
         assert!(s.contains(&SyntaxKind::BindEntry));
         assert!(s.contains(&SyntaxKind::RestBind));
+    }
+
+    #[test]
+    fn for_loops() {
+        for src in [
+            "for (x of items) { print(x) }",
+            "for (i in 1..6) { print(i) }",
+            "for (i in 0..=5) { print(i) }",
+            "for await (x in stream) { print(x) }",
+        ] {
+            let p = parse(src);
+            assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
+            assert!(tree_shape(src).contains(&SyntaxKind::ForStmt), "no ForStmt for {src}");
+        }
+        assert!(tree_shape("for (i in 1..6) {}").contains(&SyntaxKind::RangeExpr));
+    }
+
+    #[test]
+    fn break_continue() {
+        assert!(parse("while (x) { break }").errors.is_empty());
+        assert!(tree_shape("while (x) { break }").contains(&SyntaxKind::BreakStmt));
+        assert!(tree_shape("while (x) { continue }").contains(&SyntaxKind::ContinueStmt));
     }
 
     #[test]
