@@ -220,9 +220,7 @@ impl Resolver {
                         self.resolve_expr(child);
                     }
                 }
-                if let Some(name) = ident_text(node) {
-                    self.declare(&name, BindingKind::Let, node.text_range());
-                }
+                self.declare_let_bindings(node);
             }
             Block => {
                 self.push_scope();
@@ -246,6 +244,48 @@ impl Resolver {
                 }
                 self.resolve_function(node);
             }
+            ForStmt => {
+                self.push_scope();
+                for child in node.children() {
+                    if is_expr(child.kind()) {
+                        self.resolve_expr(child);
+                    }
+                }
+                if let Some(name) = ident_text(node) {
+                    self.declare(&name, BindingKind::LoopVar, node.text_range());
+                }
+                if let Some(body) = node.children().find(|c| c.kind() == Block) {
+                    for s in body.children() {
+                        self.resolve_stmt(s);
+                    }
+                }
+                self.pop_scope();
+            }
+            EnumDecl => {
+                if let Some(name) = ident_text(node) {
+                    self.declare(&name, BindingKind::Enum, node.text_range());
+                }
+                for v in node.descendants().filter(|n| n.kind() == EnumVariant) {
+                    for e in v.children().filter(|c| is_expr(c.kind())) {
+                        self.resolve_expr(e);
+                    }
+                }
+            }
+            ClassDecl => {
+                if let Some(name) = ident_text(node) {
+                    self.declare(&name, BindingKind::Class, node.text_range());
+                }
+                self.resolve_class(node);
+            }
+            ImportStmt => {
+                self.declare_import_bindings(node);
+            }
+            ExportStmt => {
+                for child in node.children() {
+                    self.resolve_stmt(child);
+                }
+            }
+            BreakStmt | ContinueStmt => {}
             ExprStmt | ReturnStmt => {
                 for child in node.children() {
                     if is_expr(child.kind()) {
@@ -257,6 +297,79 @@ impl Resolver {
                 for child in node.children() {
                     self.resolve_stmt(child);
                 }
+            }
+        }
+    }
+
+    fn declare_let_bindings(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        if let Some(arr) = node.children().find(|c| c.kind() == ArrayBindPat) {
+            self.declare_pattern_names(arr);
+        } else if let Some(obj) = node.children().find(|c| c.kind() == ObjectBindPat) {
+            self.declare_pattern_names(obj);
+        } else if let Some(name) = ident_text(node) {
+            self.declare(&name, BindingKind::Let, node.text_range());
+        }
+    }
+
+    /// Declare every name introduced by a binding pattern (BindEntry's local/key,
+    /// RestBind's name).
+    fn declare_pattern_names(&mut self, pat: &ResolvedNode) {
+        use SyntaxKind::*;
+        for entry in pat.children() {
+            match entry.kind() {
+                BindEntry => {
+                    // `key` or `key as local` — the LAST IDENT is the local name.
+                    let local = entry
+                        .children_with_tokens()
+                        .filter_map(|el| el.into_token())
+                        .filter(|t| t.kind() == Ident)
+                        .last()
+                        .map(|t| t.text().to_string());
+                    if let Some(name) = local {
+                        self.declare(&name, BindingKind::PatternBind, entry.text_range());
+                    }
+                }
+                RestBind => {
+                    if let Some(name) = ident_text(entry) {
+                        self.declare(&name, BindingKind::PatternBind, entry.text_range());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn declare_import_bindings(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        if let Some(list) = node.children().find(|c| c.kind() == ImportList) {
+            for t in list.children_with_tokens().filter_map(|el| el.into_token()) {
+                if t.kind() == Ident {
+                    self.declare(t.text(), BindingKind::Import, node.text_range());
+                }
+            }
+        } else if let Some(alias) = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == Ident)
+            .last()
+            .map(|t| t.text().to_string())
+        {
+            self.declare(&alias, BindingKind::Import, node.text_range());
+        }
+    }
+
+    fn resolve_class(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        for member in node.children() {
+            match member.kind() {
+                FieldDecl => {
+                    for e in member.children().filter(|c| is_expr(c.kind())) {
+                        self.resolve_expr(e);
+                    }
+                }
+                MethodDecl => self.resolve_function(member),
+                _ => {}
             }
         }
     }
@@ -458,6 +571,32 @@ mod tests {
             .get(&(SyntaxKind::FnDecl, inner.text_range()))
             .expect("inner frame");
         assert_eq!(fi.upvalues, vec![UpvalueDescriptor::ParentLocal(0)]);
+    }
+
+    #[test]
+    fn destructuring_binds_all_names() {
+        let tree = parse_to_tree("let [a, b, ...rest] = xs\nprint(a)\nprint(rest)");
+        let r = resolve(&tree);
+        let locals = tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::NameRef)
+            .filter(|n| matches!(r.uses.get(&n.text_range()), Some(Resolution::Local(_))))
+            .count();
+        assert_eq!(locals, 2, "a and rest are locals (xs/print are not)");
+    }
+
+    #[test]
+    fn for_var_and_class_enum_bind() {
+        let r1 = resolve(&parse_to_tree("for (i in 0..3) { print(i) }"));
+        assert!(
+            r1.uses.values().any(|r| matches!(r, Resolution::Local(_))),
+            "i is a local"
+        );
+        let r = resolve(&parse_to_tree("class C {}\nlet x = C"));
+        assert!(
+            r.uses.values().any(|u| matches!(u, Resolution::Local(_))),
+            "C resolves to a local binding"
+        );
     }
 
     #[test]
