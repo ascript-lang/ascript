@@ -642,6 +642,7 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.bump();
             p.complete(m, NameRef)
         }
+        MatchKw => match_expr(p),
         AsyncKw if is_async_arrow_ahead(p) => {
             let m = p.start();
             p.bump(); // async
@@ -1088,6 +1089,159 @@ fn arg_list(p: &mut Parser) {
     p.complete(m, ArgList);
 }
 
+fn match_expr(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // match
+    expr(p); // subject
+    if p.at(LBrace) {
+        p.bump();
+    } else {
+        p.error("expected '{' for match body");
+    }
+    while !p.at(RBrace) && !p.at_end() {
+        match_arm(p);
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close match");
+    }
+    p.complete(m, MatchExpr)
+}
+
+fn match_arm(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    // Parse the first pattern, then check for `|` or-alternatives.
+    let first_pat = pattern(p);
+    if p.at(Pipe) {
+        // Wrap first_pat + all subsequent alternatives in an OrPat node.
+        let orm = p.precede(&first_pat);
+        while p.at(Pipe) {
+            p.bump(); // |
+            pattern(p);
+        }
+        p.complete(orm, OrPat);
+    }
+    // Optional guard: `if cond`
+    if p.at(IfKw) {
+        let g = p.start();
+        p.bump(); // if
+        expr(p);
+        p.complete(g, MatchGuard);
+    }
+    if p.at(FatArrow) {
+        p.bump();
+    } else {
+        p.error("expected '=>' in match arm");
+    }
+    expr(p); // arm body
+    p.complete(m, MatchArm);
+}
+
+/// Parse a single match pattern. Returns the CompletedMarker so callers can
+/// wrap it (e.g. for OrPat). Bare identifiers are emitted as LiteralPat
+/// (Option-C: compare-vs-bind resolved later); wildcard `_` → WildcardPat.
+fn pattern(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    match p.current() {
+        Ident if p.at_kw("_") => {
+            let m = p.start();
+            p.bump();
+            p.complete(m, WildcardPat)
+        }
+        LBracket => array_pat(p),
+        LBrace => object_pat(p),
+        _ => {
+            // value / ident / range: parse a primary-ish expression; a trailing
+            // `..` / `..=` makes it a RangePat, else LiteralPat.
+            let m = p.start();
+            let _ = lhs(p);
+            if p.at(DotDot) || p.at(DotDotEq) {
+                p.bump();
+                let _ = lhs(p);
+                p.complete(m, RangePat)
+            } else {
+                p.complete(m, LiteralPat)
+            }
+        }
+    }
+}
+
+fn array_pat(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // [
+    while !p.at(RBracket) && !p.at_end() {
+        if p.at(DotDotDot) {
+            pat_rest(p);
+        } else {
+            pattern(p);
+        }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RBracket) {
+        p.bump();
+    } else {
+        p.error("expected ']' to close array pattern");
+    }
+    p.complete(m, ArrayPat)
+}
+
+fn object_pat(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // {
+    while !p.at(RBrace) && !p.at_end() {
+        if p.at(DotDotDot) {
+            pat_rest(p);
+        } else {
+            let e = p.start();
+            if p.at(Ident) || p.at(Str) {
+                p.bump();
+            } else {
+                p.error("expected key in object pattern");
+            }
+            if p.at(Colon) {
+                p.bump();
+                pattern(p);
+            }
+            p.complete(e, ObjPatEntry);
+        }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close object pattern");
+    }
+    p.complete(m, ObjectPat)
+}
+
+fn pat_rest(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // ...
+    if p.at(Ident) {
+        p.bump(); // optional bound name
+    }
+    p.complete(m, PatRest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,6 +1573,22 @@ mod tests {
         assert!(s.contains(&SyntaxKind::ClassDecl));
         assert!(s.contains(&SyntaxKind::FieldDecl));
         assert!(s.contains(&SyntaxKind::MethodDecl));
+    }
+
+    #[test]
+    fn match_expression_patterns() {
+        let src = r#"let r = match n { _ if n < 0 => "neg", 0 => "zero", 1..=9 => "single", "sat" | "sun" => "weekend", [] => "empty", [x] => "one", [first, ...rest] => "many", {a, b: c} => "obj", _ => "big" }"#;
+        let p = parse(src);
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape(src);
+        for k in [
+            SyntaxKind::MatchExpr, SyntaxKind::MatchArm, SyntaxKind::MatchGuard,
+            SyntaxKind::WildcardPat, SyntaxKind::LiteralPat, SyntaxKind::RangePat,
+            SyntaxKind::OrPat, SyntaxKind::ArrayPat, SyntaxKind::ObjectPat,
+            SyntaxKind::PatRest,
+        ] {
+            assert!(s.contains(&k), "missing {k:?}");
+        }
     }
 
     #[test]
