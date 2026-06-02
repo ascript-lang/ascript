@@ -226,6 +226,16 @@ impl Vm {
                     let base = fiber.frame().ip as isize;
                     fiber.frame_mut().ip = (base + disp as isize) as usize;
                 }
+                Op::Loop => {
+                    // Unconditional backward (relative) jump used for loop
+                    // back-edges. Identical mechanics to `Op::Jump` — the
+                    // displacement (negative for a real backward jump) is measured
+                    // from the byte AFTER the operand to the target (see
+                    // `Chunk::emit_loop`).
+                    let disp = fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                    let base = fiber.frame().ip as isize;
+                    fiber.frame_mut().ip = (base + disp as isize) as usize;
+                }
                 Op::JumpIfFalse => {
                     // Pop the tested value; jump iff it is falsy. Short-circuit
                     // lowering `DUP`s the operand beforehand so the un-tested copy

@@ -670,3 +670,87 @@ async fn vm_short_circuit_does_evaluate_rhs_when_needed() {
         assert_vm_run_matches_treewalker(src).await;
     }
 }
+
+// ----- V3-T2: while + break / continue ----------------------------------------
+
+#[tokio::test]
+async fn vm_while_loop_matches_treewalker() {
+    // The tree-walker (the oracle) requires parenthesized conditions:
+    // `while (cond) { ... }`. The CST front-end accepts the same form (the cond
+    // is a ParenExpr the compiler transparently unwraps).
+    let cases = [
+        // Counting loop: prints 0,1,2 then stops.
+        "let i = 0\nwhile (i < 3) { print(i)\n i = i + 1 }",
+        // Loop that never runs (condition false up front): no output.
+        "let i = 5\nwhile (i < 3) { print(i)\n i = i + 1 }",
+        // `break` from an infinite loop: prints 0,1 then breaks at i == 2.
+        "let i = 0\nwhile (true) { if (i == 2) { break }\n print(i)\n i = i + 1 }",
+        // `continue`: increment first, skip the print when i == 3 -> 1,2,4,5.
+        "let i = 0\nwhile (i < 5) { i = i + 1\n if (i == 3) { continue }\n print(i) }",
+        // `break` on the very first iteration: no output.
+        "let i = 0\nwhile (true) { break\n print(i) }",
+        // Loop with a block-scoped let in the body (fresh slot each iteration).
+        "let i = 0\nwhile (i < 3) { let sq = i * i\n print(sq)\n i = i + 1 }",
+        // Loop between other statements: the stack must stay balanced.
+        "print(\"start\")\nlet i = 0\nwhile (i < 2) { print(i)\n i = i + 1 }\nprint(\"end\")",
+        // Trailing expression value after a loop (proves locals survive).
+        "let i = 0\nwhile (i < 4) { i = i + 1 }\ni",
+        // Non-bool truthy condition (a non-empty string is truthy; break ends it).
+        "let i = 0\nwhile (\"go\") { if (i == 2) { break }\n print(i)\n i = i + 1 }",
+        // `break` nested inside an `if` inside the loop (the if pushes no ctx, so
+        // the break still targets the loop).
+        "let i = 0\nwhile (i < 10) { if (i >= 3) { break }\n print(i)\n i = i + 1 }",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_nested_while_break_inner_only_matches_treewalker() {
+    // `break`/`continue` target the INNERMOST loop. The inner loop breaks at j ==
+    // 2, but the outer loop keeps running, so both engines emit the same grid of
+    // (i, j) pairs. Guards against a loop-context stack that targets the wrong
+    // loop.
+    let cases = [
+        // Inner break: for each outer i, inner prints j=0,1 then breaks.
+        "let i = 0\nwhile (i < 3) { let j = 0\n while (j < 5) { if (j == 2) { break }\n print(i * 10 + j)\n j = j + 1 }\n i = i + 1 }",
+        // Inner continue: inner skips j == 1 but runs to completion (0,2).
+        "let i = 0\nwhile (i < 2) { let j = 0\n while (j < 3) { j = j + 1\n if (j == 1) { continue }\n print(i * 10 + j) }\n i = i + 1 }",
+        // Outer break after the inner loop completes: outer stops at i == 1.
+        "let i = 0\nwhile (i < 5) { if (i == 1) { break }\n let j = 0\n while (j < 2) { print(j)\n j = j + 1 }\n i = i + 1 }",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_break_continue_outside_loop_match_treewalker() {
+    // `break`/`continue` with no enclosing loop is rejected by BOTH engines with
+    // the identical message. The tree-walker raises it at runtime; the VM rejects
+    // it at compile time — but both surface as an `Err(AsError)` from the public
+    // entry points, so the differential check compares the error message.
+    for (src, expected) in [
+        ("break", "'break' outside of a loop"),
+        ("continue", "'continue' outside of a loop"),
+        // Inside an `if` (which does NOT open a loop context) still counts as
+        // outside a loop.
+        ("if (true) { break }", "'break' outside of a loop"),
+        ("if (true) { continue }", "'continue' outside of a loop"),
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        let tw_err = tw.expect_err(&format!("tree-walker should reject `{src}`"));
+        let vm_err = vm.expect_err(&format!("VM should reject `{src}`"));
+        assert!(
+            tw_err.message.contains(expected),
+            "tree-walker message for `{src}` was {:?}, expected to contain {expected:?}",
+            tw_err.message
+        );
+        assert_eq!(
+            tw_err.message, vm_err.message,
+            "VM and tree-walker error messages diverge for `{src}`"
+        );
+    }
+}

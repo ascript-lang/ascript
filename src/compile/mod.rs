@@ -11,9 +11,9 @@
 use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_template_body};
 use crate::span::Span;
 use crate::syntax::ast::{
-    ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, CallExpr, Expr, IfStmt, IndexExpr, LetStmt,
-    Literal, MemberExpr, NameRef, ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, SourceFile, Stmt,
-    TemplateExpr, UnaryExpr,
+    ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, BreakStmt, CallExpr, ContinueStmt, Expr,
+    IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef, ObjectExpr, OptMemberExpr, ParenExpr,
+    RangeExpr, SourceFile, Stmt, TemplateExpr, UnaryExpr, WhileStmt,
 };
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
@@ -99,7 +99,11 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
         )
     })?;
 
-    let mut compiler = Compiler { chunk, resolved };
+    let mut compiler = Compiler {
+        chunk,
+        resolved,
+        loops: Vec::new(),
+    };
 
     // V2 supports a sequence of statements whose meaningful tail is an
     // expression. Each statement is compiled in source order; a leading
@@ -163,9 +167,23 @@ fn stmt_span(stmt: &Stmt) -> Span {
     range_span(node)
 }
 
+/// A single enclosing loop's patch context, pushed while compiling a loop body so
+/// `break`/`continue` inside it (including nested in `if`s) target THIS loop. The
+/// stack's `last` is always the innermost loop.
+struct LoopCtx {
+    /// The code offset to which `continue` jumps back (for `while`, the start of
+    /// the condition re-test).
+    continue_target: usize,
+    /// Forward `Jump` patch sites emitted by each `break`, patched to land just
+    /// after the loop once it is fully compiled.
+    break_sites: Vec<usize>,
+}
+
 struct Compiler {
     chunk: Chunk,
     resolved: ResolveResult,
+    /// Stack of enclosing loops; `break`/`continue` target the innermost (`last`).
+    loops: Vec<LoopCtx>,
 }
 
 impl Compiler {
@@ -308,6 +326,9 @@ impl Compiler {
             Stmt::LetStmt(let_stmt) => self.compile_let(let_stmt),
             Stmt::Block(block) => self.compile_block(block),
             Stmt::IfStmt(if_stmt) => self.compile_if(if_stmt),
+            Stmt::WhileStmt(while_stmt) => self.compile_while(while_stmt),
+            Stmt::BreakStmt(break_stmt) => self.compile_break(break_stmt),
+            Stmt::ContinueStmt(continue_stmt) => self.compile_continue(continue_stmt),
             other => Err(CompileError::new(
                 "statement kind not yet supported in V2",
                 stmt_span(other),
@@ -361,6 +382,92 @@ impl Compiler {
         }
         // End: both the then-branch and the else branch converge here.
         self.chunk.patch_jump(je);
+        Ok(())
+    }
+
+    /// Compile a `while (cond) { body }` loop. `while` is a *statement* — it
+    /// produces no value and leaves the stack exactly as it found it. Mirrors the
+    /// tree-walker's `Stmt::While`: re-test the condition each iteration, run the
+    /// body while truthy; `break` exits the loop, `continue` jumps back to the
+    /// condition re-test.
+    ///
+    /// Lowering:
+    /// ```text
+    ///   cond_start:                ; continue target (re-test the cond)
+    ///   <cond>
+    ///   exit = JUMP_IF_FALSE       ; pops cond; jump past the loop when falsy
+    ///   <body block>
+    ///   LOOP cond_start            ; backward jump to re-test
+    ///   patch(exit)                ; loop exit lands here
+    ///   patch(break_sites...)      ; each `break` lands here too (after the loop)
+    /// ```
+    /// `JUMP_IF_FALSE` pops the tested condition, the `LOOP` back-edge and the
+    /// forward `break` jumps move nothing, and each body statement is
+    /// self-balancing, so the loop is stack-neutral.
+    fn compile_while(&mut self, while_stmt: &WhileStmt) -> Result<(), CompileError> {
+        let span = node_span(while_stmt);
+        let cond = while_stmt
+            .cond()
+            .ok_or_else(|| CompileError::new("while statement missing condition", span))?;
+        let body = while_stmt
+            .body()
+            .ok_or_else(|| CompileError::new("while statement missing body", span))?;
+
+        // The continue target is the start of the condition re-test.
+        let cond_start = self.chunk.code.len();
+        self.compile_expr(&cond)?;
+        // Exit the loop when the condition is falsy (JUMP_IF_FALSE pops the cond).
+        let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
+
+        // Push this loop's context BEFORE compiling the body so any `break`/
+        // `continue` nested in the body (including inside `if`s) targets it.
+        self.loops.push(LoopCtx {
+            continue_target: cond_start,
+            break_sites: Vec::new(),
+        });
+        self.compile_block(&body)?;
+        // Backward jump to re-test the condition.
+        self.chunk.emit_loop(Op::Loop, cond_start, span);
+        let ctx = self
+            .loops
+            .pop()
+            .expect("loop context pushed before body must still be present");
+
+        // Loop exit: a falsy condition lands here; every `break` does too.
+        self.chunk.patch_jump(exit);
+        for site in ctx.break_sites {
+            self.chunk.patch_jump(site);
+        }
+        Ok(())
+    }
+
+    /// Compile a `break`: an unconditional forward `JUMP` whose patch site is
+    /// recorded on the innermost enclosing loop, to be patched to land just after
+    /// the loop. `break` outside any loop is a compile-time error (the tree-walker
+    /// rejects it at runtime with the same message).
+    fn compile_break(&mut self, break_stmt: &BreakStmt) -> Result<(), CompileError> {
+        let span = node_span(break_stmt);
+        let site = self.chunk.emit_jump(Op::Jump, span);
+        self.loops
+            .last_mut()
+            .ok_or_else(|| CompileError::new("'break' outside of a loop", span))?
+            .break_sites
+            .push(site);
+        Ok(())
+    }
+
+    /// Compile a `continue`: an unconditional backward `LOOP` jump to the innermost
+    /// enclosing loop's continue target (for `while`, the condition re-test).
+    /// `continue` outside any loop is a compile-time error (mirroring the
+    /// tree-walker's runtime rejection message).
+    fn compile_continue(&mut self, continue_stmt: &ContinueStmt) -> Result<(), CompileError> {
+        let span = node_span(continue_stmt);
+        let target = self
+            .loops
+            .last()
+            .ok_or_else(|| CompileError::new("'continue' outside of a loop", span))?
+            .continue_target;
+        self.chunk.emit_loop(Op::Loop, target, span);
         Ok(())
     }
 
