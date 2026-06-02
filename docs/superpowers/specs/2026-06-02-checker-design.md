@@ -125,7 +125,7 @@ A `[lint]` table in an optional `ascript.toml` at the project root: `deny`/`warn
 Best-effort verification of the gradual type contracts where the answer is **decidable from syntax + resolver data**, with a strict **no-false-positives** rule:
 
 - **`contract-mismatch`** (Warning): flag only **provably-wrong** cases — e.g. a literal of the wrong primitive passed where a `number` param is annotated (`f("x")` for `fn f(n: number)`), a `nil` passed to a non-`T?` annotated param, a field assignment of a literal of the wrong type inside `init`, an obviously-wrong `.from`/`json.parse(_, Class)` shape with literal inputs.
-- **Philosophy [CONFIRM]:** **conservative — never flag when uncertain.** If a value's type isn't statically known (most non-literal expressions in a dynamic language), say nothing. This keeps `contract-mismatch` trustworthy (zero false positives) at the cost of coverage — the right trade for a gradually-typed language where false positives would train users to ignore the checker. **[CONFIRM]** you want this conservative stance (vs. a more aggressive flow-typing pass that risks false positives).
+- **Philosophy (DECIDED): conservative — never flag when uncertain.** If a value's type isn't statically known (most non-literal expressions in a dynamic language), say nothing. Zero false positives, at the cost of coverage — the right trade for a gradually-typed language, where false positives train users to mute the checker. Concretely, `contract-mismatch` fires only when the argument/value type is *statically certain* (a literal, or a value provably of a primitive type) **and** provably incompatible with an annotation. A deeper **flow-typing / inference** pass is explicitly out of scope here — without full inference + nil-narrowing it produces false positives on legal dynamic code (reassignment-changes-type, `any`-from-`json.parse`, unannotated returns, nil-guarded narrowing); *with* full inference it is a type-system-scale effort. See Future sub-projects.
 
 ## CLI
 
@@ -163,9 +163,13 @@ The checker is the **tooling** consumer of the error-recovering parser (front-en
 - **Autofix** carried in the diagnostic model from the start; `--fix` shipped once safe rules have fixes.
 - **`unawaited-future`** is the flagship AScript-specific lint (directly targets the M17 leak class).
 
-## Open items flagged for your approval
+## Future sub-projects (recorded, not in this spec)
 
-1. **[CONFIRM] CI exit policy** — non-zero on warnings only under `--deny-warnings` (recommended), or non-zero on any warning by default?
-2. **[CONFIRM] Suppression syntax** — `// ascript-ignore[rule]` (recommended) or another form?
-3. **[CONFIRM] Autofix scope** — populate `fix` now + ship `--fix` after a couple safe rules (recommended), or defer the fix model entirely?
-4. **[CONFIRM] Contract-checking stance** — conservative / zero-false-positives (recommended) vs. a more aggressive flow-typing pass?
+- **Full gradual type-checker** — an inference + flow-narrowing pass (TypeScript/mypy/Sorbet-class) that can verify far more contract usage *without* false positives. This is a **type-system-scale effort** (realistically comparable to the VM in size) and gets its **own spec** if pursued. The conservative `contract-mismatch` rule here is the trustworthy floor; the full checker would be the ceiling. It would still ship behind opt-in and retain an `any` escape hatch.
+
+## Decisions resolved during review
+
+1. **CI exit policy** — non-zero on `Error` always; on `Warning` only under `--deny-warnings`. ✅
+2. **Suppression syntax** — `// ascript-ignore[rule-code]` (+ `-file` variant; comma-separated codes; bare = all). ✅
+3. **Autofix** — `fix` in the model from the start (safe rules); `--fix` ships after a couple of fixable rules exist. ✅
+4. **Contract-checking stance** — conservative / zero-false-positives; full inference-based type-checker deferred to a future sub-project. ✅
