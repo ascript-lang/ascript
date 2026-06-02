@@ -190,6 +190,22 @@ pub enum Op {
     GetIter,
     /// `iterator -- iterator value done` — advance the iterator.
     IterNext,
+    /// `iterable -- snapshot:array` — materialize the SYNC for-of snapshot.
+    /// Mirrors the tree-walker's `Stmt::ForOf` (sync) `items` build exactly:
+    /// an `Array` yields a *clone* of its current elements (so later mutation of
+    /// the source array does not change the iteration), a `Str` yields its chars
+    /// each as a 1-char string, and ANY OTHER value raises the Tier-2 panic
+    /// `value of type {t} is not iterable` (`t` = `interp::type_name`) anchored at
+    /// this op's span (the iterable expression's trivia-trimmed code span). Object/
+    /// Map/Set are NOT iterable in sync for-of — they hit the "not iterable" panic,
+    /// byte-identically to the tree-walker.
+    IterSnapshot,
+    /// `array -- len:number` — pop an `Array` and push its element count as a
+    /// `Number`. Used to hoist a for-of snapshot's (fixed) length into a scratch
+    /// slot once, so the loop condition re-tests `idx < len` without rebuilding it.
+    /// The operand is always a compiler-produced snapshot array (never user input),
+    /// so a non-array is a compiler bug, surfaced as a Tier-2 panic.
+    ArrayLen,
 }
 
 impl Op {
@@ -271,6 +287,8 @@ impl Op {
 
             x if x == GetIter as u8 => GetIter,
             x if x == IterNext as u8 => IterNext,
+            x if x == IterSnapshot as u8 => IterSnapshot,
+            x if x == ArrayLen as u8 => ArrayLen,
 
             _ => return None,
         })
@@ -296,7 +314,7 @@ impl Op {
             Nil | True | False | Pop | Dup | Add | Sub | Mul | Div | Mod | Pow | Neg | Not
             | Eq | Ne | Lt | Le | Gt | Ge | Range | CheckNumbers | Return | Spread | GetIndex
             | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate | Unwrap
-            | GetIter | IterNext => 0,
+            | GetIter | IterNext | IterSnapshot | ArrayLen => 0,
         }
     }
 
@@ -377,6 +395,8 @@ mod tests {
         Op::Import,
         Op::GetIter,
         Op::IterNext,
+        Op::IterSnapshot,
+        Op::ArrayLen,
     ];
 
     #[test]

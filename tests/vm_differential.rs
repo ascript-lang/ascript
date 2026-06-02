@@ -870,3 +870,97 @@ async fn vm_for_range_inclusive_rejected_like_treewalker() {
         );
     }
 }
+
+// ----- V3-T4: sync for-of (Array + Str snapshot iteration) --------------------
+
+#[tokio::test]
+async fn vm_for_of_matches_treewalker() {
+    // `for (x of iterable)` SYNC for-of iterates a SNAPSHOT of an Array (its
+    // elements) or a Str (its chars, each a 1-char string). The loop var rebinds
+    // each iteration, `break` exits, `continue` advances to the next item. All
+    // byte-identical to the tree-walker's `Stmt::ForOf` (for_await = false).
+    let cases = [
+        // array of numbers: 10,20,30.
+        "for (x of [10, 20, 30]) { print(x) }",
+        // string: each char as a 1-char string -> a,b,c.
+        "for (c of \"abc\") { print(c) }",
+        // RangeExpr iterable: builds the range ARRAY then iterates it -> 0,1,2.
+        "for (x of 0..3) { print(x) }",
+        // empty array: no output.
+        "for (x of []) { print(x) }\nprint(\"done\")",
+        // empty string: no output.
+        "for (c of \"\") { print(c) }\nprint(\"done\")",
+        // single-element array.
+        "for (x of [42]) { print(x) }",
+        // iterate over a NAME bound to an array (not just a literal).
+        "let xs = [1, 2, 3]\nfor (x of xs) { print(x) }",
+        // mixed-type elements render via the same Display as the tree-walker.
+        "for (x of [1, \"two\", true, nil]) { print(x) }",
+        // break at the second element -> 10.
+        "for (x of [10, 20, 30]) { if (x == 20) { break }\n print(x) }",
+        // continue skips x == 20 -> 10,30.
+        "for (x of [10, 20, 30]) { if (x == 20) { continue }\n print(x) }",
+        // accumulate into an outer local: 1+2+3+4 = 10.
+        "let sum = 0\nfor (x of [1, 2, 3, 4]) { sum = sum + x }\nprint(sum)",
+        // body with a block-scoped local (fresh slot each iteration).
+        "for (x of [1, 2, 3]) { let sq = x * x\n print(sq) }",
+        // for-of between other statements: the stack must stay balanced.
+        "print(\"start\")\nfor (x of [1, 2]) { print(x) }\nprint(\"end\")",
+        // nested for-of: a grid of i*10 + j over two arrays.
+        "for (i of [0, 1]) { for (j of [0, 1, 2]) { print(i * 10 + j) } }",
+        // nested with inner break: inner stops at j == 1 each outer iter.
+        "for (i of [0, 1]) { for (j of [0, 1, 2]) { if (j == 1) { break }\n print(i * 10 + j) } }",
+        // nested with inner continue: inner skips j == 1.
+        "for (i of [0, 1]) { for (j of [0, 1, 2]) { if (j == 1) { continue }\n print(i * 10 + j) } }",
+        // for-of over a string nested in a for-of over an array.
+        "for (s of [\"ab\", \"cd\"]) { for (c of s) { print(c) } }",
+        // trailing expression value after a loop (proves locals survive).
+        "let last = 0\nfor (x of [5, 6, 7]) { last = x }\nlast",
+        // loop var read inside arithmetic.
+        "for (x of [1, 2, 3]) { print(x + 100) }",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_for_of_not_iterable_error_matches_treewalker() {
+    // A non-Array, non-Str iterable raises the SAME Tier-2 panic (`value of type
+    // {t} is not iterable`) at the SAME span (the iterable expression) on both
+    // engines. CRUCIALLY this includes object/map/set, which are NOT iterable in
+    // sync for-of (they hit the "not iterable" path, NOT element iteration) —
+    // byte-identical to the tree-walker's `Stmt::ForOf`.
+    for (src, expected) in [
+        ("for (x of 5) { print(x) }", "value of type number is not iterable"),
+        ("for (x of true) { print(x) }", "value of type bool is not iterable"),
+        ("for (x of nil) { print(x) }", "value of type nil is not iterable"),
+        // An OBJECT is not iterable in sync for-of.
+        ("for (x of {a: 1}) { print(x) }", "value of type object is not iterable"),
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        match (tw, vm) {
+            (Err(tw_err), Err(vm_err)) => {
+                assert_eq!(
+                    tw_err.message, vm_err.message,
+                    "for-of not-iterable panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                    tw_err.message, vm_err.message
+                );
+                assert_eq!(
+                    tw_err.message, expected,
+                    "unexpected message for `{src}`: {:?}",
+                    tw_err.message
+                );
+                assert_eq!(
+                    tw_err.span, vm_err.span,
+                    "for-of not-iterable panic span diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                    tw_err.span, vm_err.span
+                );
+            }
+            (tw, vm) => panic!(
+                "expected BOTH engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+            ),
+        }
+    }
+}

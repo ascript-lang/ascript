@@ -192,6 +192,8 @@ fn op_name(op: Op) -> &'static str {
         Import => "IMPORT",
         GetIter => "GET_ITER",
         IterNext => "ITER_NEXT",
+        IterSnapshot => "ITER_SNAPSHOT",
+        ArrayLen => "ARRAY_LEN",
     }
 }
 

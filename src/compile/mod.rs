@@ -578,31 +578,38 @@ impl Compiler {
     /// in the tree-walker. The VM must not invent behavior the oracle lacks, so an
     /// `..=` for-range is a documented `CompileError` (both engines reject it).
     ///
-    /// A for-of (`for (x of iterable)`, no range tail) is V3-T4; it returns a
-    /// documented deferral here.
+    /// A for-of (`for (x of iterable)`, `op() == OfKw`) is lowered by
+    /// [`Self::compile_for_of`] (sync snapshot iteration); `for await` async
+    /// iteration is V7.
     fn compile_for(&mut self, for_stmt: &ForStmt) -> Result<(), CompileError> {
         let span = node_span(for_stmt);
 
-        // `for await` is async iteration (V8); not a range loop.
+        // `for await` is async iteration (V7); neither a range loop nor a sync
+        // for-of.
         if for_stmt.await_token().is_some() {
-            return Err(CompileError::new(
-                "for await (async iteration) not yet supported (V8)",
-                span,
-            ));
+            return Err(CompileError::new("for await: V7", span));
         }
 
         let body = for_stmt
             .body()
             .ok_or_else(|| CompileError::new("for statement missing body", span))?;
 
-        // The CST nests the `start .. end` bounds in a single `RangeExpr` child
-        // (the for-head's sole expression). A for-RANGE is `in` + a `RangeExpr`
-        // iterable; the iterator-driven `for (x of ...)` form — INCLUDING `for (x
-        // of a..b)`, which iterates the materialized range ARRAY, a different
-        // construct — is V3-T4.
+        // The CST head holds the iterable/bounds expression plus an `in`/`of`
+        // operator. A for-RANGE is `in` + a `RangeExpr` iterable; the
+        // iterator-driven `for (x of ...)` form is a sync for-of — INCLUDING `for
+        // (x of a..b)`, which materializes the range ARRAY then iterates it (a
+        // different construct from the range loop).
         let iter = for_stmt
             .iter()
             .ok_or_else(|| CompileError::new("for statement missing iterable/start bound", span))?;
+
+        // `of` → sync for-of (snapshot iteration over Array/Str). The iterable can
+        // be any expression (array literal, name, even a `RangeExpr` that builds
+        // the range array).
+        if for_stmt.op() == Some(SyntaxKind::OfKw) {
+            return self.compile_for_of(for_stmt, &iter, &body);
+        }
+
         let is_in = for_stmt.op() == Some(SyntaxKind::InKw);
         let Expr::RangeExpr(range) = &iter else {
             return Err(CompileError::new(
@@ -696,6 +703,126 @@ impl Compiler {
             .expect("for-range loop context pushed before body must still be present");
 
         // Loop exit: `i >= end` lands here; every `break` does too.
+        self.chunk.patch_jump(exit);
+        for site in ctx.break_sites {
+            self.chunk.patch_jump(site);
+        }
+        Ok(())
+    }
+
+    /// Compile a `for (x of iterable) { body }` SYNC for-of. Mirrors the
+    /// tree-walker's `Stmt::ForOf` (`for_await == false`, src/interp.rs) exactly:
+    /// evaluate the iterable, SNAPSHOT it into a fixed list of items (an `Array`
+    /// clones its current elements; a `Str` yields its chars each as a 1-char
+    /// string; anything else — incl. object/map/set — is the Tier-2 panic `value of
+    /// type {t} is not iterable` at the ITERABLE's span), then bind `x` to each item
+    /// in turn and run the body. `break` exits, `continue` advances to the next
+    /// item, `return` returns. The snapshot means mutating the source array inside
+    /// the body does NOT change what is iterated, byte-identically to the
+    /// tree-walker.
+    ///
+    /// Lowering (scratch-slot index iteration, like for-range):
+    /// ```text
+    ///   <iterable>                 ; iterable on top
+    ///   ITER_SNAPSHOT              ; -> snapshot array (panic @ iter.span if not iterable)
+    ///   SET_LOCAL arr_slot         ; arr_slot = alloc_temp(); the fixed snapshot
+    ///   GET_LOCAL arr_slot; ARRAY_LEN; SET_LOCAL len_slot   ; len_slot = alloc_temp()
+    ///   CONST 0.0; SET_LOCAL idx_slot                       ; idx_slot = alloc_temp() = 0
+    /// cond_start:
+    ///   GET_LOCAL idx_slot; GET_LOCAL len_slot; LT
+    ///   exit = JUMP_IF_FALSE       ; exit when idx >= len
+    ///   GET_LOCAL arr_slot; GET_LOCAL idx_slot; GET_INDEX; SET_LOCAL var_slot  ; x = arr[idx]
+    ///   <body block>               ; loop ctx: continue_target = increment below
+    ///   increment:                 ; continue lands here → idx += 1 then re-test
+    ///   GET_LOCAL idx_slot; CONST 1.0; ADD; SET_LOCAL idx_slot
+    ///   LOOP cond_start
+    /// exit:
+    ///   patch(break_sites...)      ; each `break` lands here
+    /// ```
+    /// `var_slot` comes from the resolver's `LoopVar` binding (matched by
+    /// `decl_range == for_stmt.text_range()`, same as for-range).
+    fn compile_for_of(
+        &mut self,
+        for_stmt: &ForStmt,
+        iter: &Expr,
+        body: &Block,
+    ) -> Result<(), CompileError> {
+        let span = node_span(for_stmt);
+
+        let var_slot = self.for_loop_var_slot(for_stmt)?;
+        let arr_slot = self.alloc_temp()?;
+        let len_slot = self.alloc_temp()?;
+        let idx_slot = self.alloc_temp()?;
+
+        // Anchor the "not iterable" panic at the iterable expression's CODE span
+        // (trivia-trimmed), byte-identical to the tree-walker's `AsError::at(_,
+        // iter.span)`.
+        let iter_span = node_code_span(iter);
+
+        // Build the snapshot once: evaluate the iterable, materialize the fixed
+        // items array (panic anchored at the iterable's span), store it, then
+        // hoist its (fixed) length into a slot. Seed idx = 0.
+        self.compile_expr(iter)?;
+        self.chunk.emit(Op::IterSnapshot, iter_span);
+        self.chunk.emit_u16(Op::SetLocal, arr_slot, span);
+        self.chunk.emit_u16(Op::GetLocal, arr_slot, span);
+        self.chunk.emit(Op::ArrayLen, span);
+        self.chunk.emit_u16(Op::SetLocal, len_slot, span);
+        let zero = self.chunk.add_const(Value::Number(0.0));
+        self.chunk.emit_u16(Op::Const, zero, span);
+        self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
+
+        // Condition: re-test `idx < len` each iteration.
+        let cond_start = self.chunk.code.len();
+        self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
+        self.chunk.emit_u16(Op::GetLocal, len_slot, span);
+        self.chunk.emit(Op::Lt, span);
+        let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
+
+        // Bind the loop var to `arr[idx]` at the top of each iteration.
+        self.chunk.emit_u16(Op::GetLocal, arr_slot, span);
+        self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
+        self.chunk.emit(Op::GetIndex, span);
+        self.chunk.emit_u16(Op::SetLocal, var_slot, span);
+
+        // The continue target is the INCREMENT (so `continue` advances to the next
+        // item then re-tests, exactly like the tree-walker's `Flow::Continue`
+        // moving to the next `item`). The increment is emitted AFTER the body, so
+        // push the ctx with `continue_target: None` and patch each forward
+        // `continue` site to the increment below.
+        self.loops.push(LoopCtx {
+            continue_target: None,
+            continue_sites: Vec::new(),
+            break_sites: Vec::new(),
+        });
+        self.compile_block(body)?;
+
+        // Increment: `idx = idx + 1`. Every `continue` lands here (the current end
+        // of code), so patch the recorded forward sites BEFORE emitting it.
+        let continue_sites = std::mem::take(
+            &mut self
+                .loops
+                .last_mut()
+                .expect("for-of loop context present")
+                .continue_sites,
+        );
+        for site in continue_sites {
+            self.chunk.patch_jump(site);
+        }
+        self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
+        let one = self.chunk.add_const(Value::Number(1.0));
+        self.chunk.emit_u16(Op::Const, one, span);
+        self.chunk.emit(Op::Add, span);
+        self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
+
+        // Back-edge to re-test the condition.
+        self.chunk.emit_loop(Op::Loop, cond_start, span);
+        let ctx = self
+            .loops
+            .pop()
+            .expect("for-of loop context pushed before body must still be present");
+
+        // Loop exit: `idx >= len` lands here; every `break` does too.
         self.chunk.patch_jump(exit);
         for site in ctx.break_sites {
             self.chunk.patch_jump(site);
@@ -1692,19 +1819,35 @@ mod tests {
     }
 
     #[test]
-    fn for_of_is_deferred() {
-        // The iterator-driven `for (x of ...)` form is V3-T4.
-        let err = compile_source("for (x of [1, 2, 3]) { print(x) }").unwrap_err();
-        assert!(err.message.contains("for-of"), "got {err:?}");
+    fn for_of_emits_snapshot_and_loop() {
+        // The sync for-of lowering materializes a snapshot (ITER_SNAPSHOT), reads
+        // its length once (ARRAY_LEN), index-iterates (GET_INDEX) with the
+        // exclusive comparison (LT), and has a backward LOOP back-edge.
+        let chunk = compile_source("for (x of [1, 2, 3]) { print(x) }").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("ITER_SNAPSHOT"), "no snapshot in:\n{text}");
+        assert!(text.contains("ARRAY_LEN"), "no length read in:\n{text}");
+        assert!(text.contains("GET_INDEX"), "no index read in:\n{text}");
+        assert!(text.contains("LT"), "no exclusive comparison in:\n{text}");
+        assert!(text.contains("LOOP"), "no loop back-edge in:\n{text}");
     }
 
     #[test]
-    fn for_of_over_range_value_is_deferred() {
+    fn for_of_over_range_value_compiles() {
         // `for (x of 0..5)` iterates the materialized range ARRAY — a for-OF, not a
-        // for-RANGE — so it is deferred to V3-T4 even though the iterable is a
-        // RangeExpr.
-        let err = compile_source("for (x of 0..5) { print(x) }").unwrap_err();
-        assert!(err.message.contains("for-of"), "got {err:?}");
+        // for-RANGE — so the iterable is a RangeExpr compiled to a RANGE array,
+        // then snapshotted and iterated.
+        let chunk = compile_source("for (x of 0..5) { print(x) }").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("RANGE"), "no range array build in:\n{text}");
+        assert!(text.contains("ITER_SNAPSHOT"), "no snapshot in:\n{text}");
+    }
+
+    #[test]
+    fn for_await_is_deferred() {
+        // `for await` (async iteration) is V7.
+        let err = compile_source("for await (x of [1, 2]) { print(x) }").unwrap_err();
+        assert!(err.message.contains("for await: V7"), "got {err:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

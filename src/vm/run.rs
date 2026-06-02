@@ -372,6 +372,58 @@ impl Vm {
                     }
                 }
 
+                Op::IterSnapshot => {
+                    // Materialize the SYNC for-of snapshot from the iterable on
+                    // TOS. Byte-identical to the tree-walker's `Stmt::ForOf` (sync,
+                    // `for_await == false`) `items` build: an `Array` snapshots a
+                    // CLONE of its current elements (so the iteration is fixed even
+                    // if the body mutates the source array), a `Str` snapshots its
+                    // chars each as a 1-char string, and ANYTHING ELSE — including
+                    // object/map/set, which are NOT iterable in sync for-of —
+                    // raises the Tier-2 panic at this op's span (the iterable
+                    // expression's trivia-trimmed code span), exactly like
+                    // `AsError::at(format!("value of type {} is not iterable", ...))`.
+                    let iterable = fiber.pop();
+                    let items: Vec<Value> = match iterable {
+                        Value::Array(arr) => arr.borrow().clone(),
+                        Value::Str(s) => {
+                            s.chars().map(|c| Value::Str(c.to_string().into())).collect()
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "value of type {} is not iterable",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ))
+                        }
+                    };
+                    fiber.push(Value::Array(Rc::new(RefCell::new(items))));
+                }
+
+                Op::ArrayLen => {
+                    // Pop a (compiler-produced) snapshot array and push its element
+                    // count as a `Number`. The operand is never user input — the
+                    // compiler emits this only over an `IterSnapshot` result — so a
+                    // non-array is a compiler bug surfaced as a Tier-2 panic.
+                    let v = fiber.pop();
+                    match v {
+                        Value::Array(arr) => {
+                            let len = arr.borrow().len();
+                            fiber.push(Value::Number(len as f64));
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("ARRAY_LEN operand is not an array: {other:?}"),
+                            ))
+                        }
+                    }
+                }
+
                 Op::Return => {
                     let result = fiber.pop();
                     return Ok(RunOutcome::Done(result));
