@@ -742,6 +742,13 @@ mod tests {
     }
 
     #[test]
+    fn builtins_are_not_flagged_unresolved() {
+        // print/len are builtins → Global, not diagnostics.
+        let r = resolve(&parse_to_tree("print(len([1,2]))"));
+        assert!(r.diagnostics.is_empty(), "builtins must not be flagged: {:?}", r.diagnostics);
+    }
+
+    #[test]
     fn captured_immutable_is_not_a_cell() {
         // x captured but never reassigned → NOT a cell.
         let immut = parse_to_tree("fn o() {\n let x = 1\n fn i() { return x }\n}");
