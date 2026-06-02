@@ -1,8 +1,19 @@
 # CST Front-End Migration — Design Spec
 
 **Date:** 2026-06-02
-**Status:** Approved (brainstorming complete; pending implementation plan)
-**Sub-project:** #1 of a larger "powerful tooling" effort (see Decomposition)
+**Status:** Approved (brainstorming complete; Plan 1 written)
+**Sub-project:** #1 of a larger "powerful tooling + runtime" effort (see Decomposition)
+
+> **REVISION 2026-06-02 — runtime pivot.** After this spec was first approved, we revisited the
+> interpreter representation. The runtime will **not** execute the CST directly. Instead the CST is
+> the *tooling* source-of-truth (formatter/checker/LSP), and the runtime is rebuilt as a **bytecode
+> compiler + virtual machine (model "2a": an async dispatch loop that keeps tokio / `spawn_local` /
+> cancel-on-drop)**. The bytecode VM is **pulled forward** to be the next major phase after the CST
+> foundation + resolver. The VM itself (and its async/generator integration) is large enough that it
+> gets its **own dedicated design spec**; this document records the decision, the revised
+> decomposition, and the unchanged front-end foundation. **Plan 1 (the lossless lexer) is unaffected
+> by the pivot.** Durable/serializable continuations + deterministic scheduling (model "2b") remain
+> explicit non-goals.
 
 ## Problem
 
@@ -28,11 +39,13 @@ loss-less representation of source — which the current discard-trivia front-en
   whitespace, `;`) is represented in the tree.
 - A **comment-preserving, idempotent formatter** built on that tree (this sub-project's
   user-visible deliverable and acceptance gate).
-- A **CST-native interpreter** with no observable behavior change and no unacceptable performance
-  regression.
-- A **shared name resolver** built as reusable infrastructure (consumed by the interpreter now,
-  the checker later).
-- Foundations that make the later checker sub-projects straightforward to build.
+- A **shared name resolver** built as reusable infrastructure (consumed by the **bytecode compiler**
+  for local-slot allocation, and by the checker later).
+- Foundations that make both the **bytecode VM** and the later checker sub-projects straightforward
+  to build (a clean typed AST + resolved bindings is exactly what the compiler consumes).
+
+> The runtime goal — *no observable behavior change, plus a measurable speed-up* — now belongs to the
+> bytecode-VM phase (its own spec), not to this front-end sub-project.
 
 ## Non-Goals (this sub-project)
 
@@ -41,24 +54,36 @@ loss-less representation of source — which the current discard-trivia front-en
 - Collapsing the tree-sitter grammar into the new pipeline (it stays as a test-only oracle; any
   future unification is a separate decision).
 - Incremental/streaming reparse (cstree supports the shape; not needed yet).
+- **The bytecode compiler + VM itself** — pulled forward as the next phase, but designed in its own
+  dedicated spec; this document only records the decision + revised ordering.
+- **Model "2b" durable execution** (serializable continuations, deterministic/replayable scheduling).
+  The VM is built as model "2a" (async loop borrowing tokio's suspension). 2b stays a non-goal,
+  consistent with the existing async non-goals in CLAUDE.md §7.
 
 ## Decomposition (full effort)
 
 This spec covers **sub-project #1 only**. The whole effort decomposes into independent
-spec → plan → build cycles:
+spec → plan → build cycles. **Revised ordering (runtime pulled forward):**
 
-1. **Lossless CST + typed-AST front-end** (this spec) — delivers the comment-preserving formatter;
-   also builds the shared name resolver.
-2. **`ascript check` CLI + shared analysis core** — feature-independent diagnostic type, ariadne
+1. **Lossless CST + typed-AST front-end** (this spec) — lexer (trivia) → event parser → ungrammar
+   codegen → **shared name resolver** → **comment-preserving formatter** (the user-visible deliverable
+   + CST acceptance gate). Foundation for everything below.
+2. **Bytecode compiler + VM (model 2a)** — *own dedicated spec.* Compiler lowers the typed AST
+   (using the resolver's slot allocation) to bytecode; an async dispatch-loop VM executes it,
+   replacing the tree-walker. Keeps tokio / `spawn_local` / cancel-on-drop / generators / `http.serve`.
+   The async + generator integration is the high-risk part and may be split into its own sub-spec.
+   *Pulled forward ahead of the checker per project-owner decision.*
+3. **`ascript check` CLI + shared analysis core** — feature-independent diagnostic type, ariadne
    CLI renderer with exit codes, all syntax errors (not just first), LSP rewired onto the core.
-3. **Scope & control-flow lints** — *uses* the resolver from #1 (undefined/unused/shadowed/
+4. **Scope & control-flow lints** — *uses* the resolver from #1 (undefined/unused/shadowed/
    unused-import, unreachable code, non-exhaustive match, missing return).
-4. **AScript-specific lints** — unawaited `future`, ignored `Result`/`?`/`!`, dead `recover`.
-5. **Static contract checking** — best-effort verification of gradual type contracts / `T?` /
+5. **AScript-specific lints** — unawaited `future`, ignored `Result`/`?`/`!`, dead `recover`.
+6. **Static contract checking** — best-effort verification of gradual type contracts / `T?` /
    schema-class shapes, with an explicit false-positive philosophy.
 
-Ordering is dependency-driven; #1 is the load-bearing foundation. Note the resolver was moved
-from #3 into #1 (see Decisions).
+Ordering is dependency-driven; #1 is the load-bearing foundation (the compiler in #2 needs its typed
+AST + resolved bindings). The resolver was moved from the lint phase into #1 (see Decisions) and now
+serves the compiler first.
 
 ## Architecture
 
@@ -70,8 +95,16 @@ source text
   → PARSER       recursive descent, emits Start(kind)/Token/Finish events; error-recovering
   → CST          cstree green/red tree (lossless); built by cstree's builder from the events
   → TYPED AST    thin typed wrappers over CST nodes, GENERATED from an ungrammar grammar file
-  → CONSUMERS    interp (execution view), fmt (walks CST, prints trivia), lsp, future checker
+        │
+        ├──► TOOLING:   fmt (walks CST, prints trivia), checker, lsp        [reads CST/AST]
+        │
+        └──► RUNTIME:   RESOLVER (binding → slot) → COMPILER → bytecode → VM (model 2a)
 ```
+
+The CST is the **tooling** source-of-truth (fidelity, positions). The **runtime does not execute the
+CST**; it executes bytecode produced by lowering the typed AST. This separation is the industry norm
+(rust-analyzer: CST → HIR; CPython: AST → bytecode; Roslyn: syntax tree → IL) and lets each side
+optimize without compromising the other.
 
 ### Library & codegen choices
 
@@ -82,10 +115,15 @@ source text
     this directly mitigates the primary performance risk.
   - cstree **interns token strings** — deduplicates repeated identifiers (memory + comparison win;
     pairs with the runtime's existing `Rc<str>` interning).
-  - cstree nodes can carry **custom data** — a natural home for the resolution cache.
+  - cstree nodes can carry **custom data** — useful for tooling annotations.
   - Cost: no mutable-tree API. Not a real loss — autofix (later) uses edit-based rewriting like
     ruff/biome, not in-place mutation.
   - `!Send`/`!Sync` of the chosen config is irrelevant; the runtime is single-threaded by design.
+
+  > **Post-pivot note:** the "persistent red nodes mitigate interpreter hot-path cost" rationale no
+  > longer applies (the runtime executes bytecode, not the CST). cstree remains the right choice for
+  > the **tooling** layer (losslessness + string interning + mature green/red API); rowan would also
+  > be acceptable now, but there's no reason to switch.
 - **Typed AST: generated from an `ungrammar` grammar file** (`ascript.ungram`) via a `build.rs`
   codegen step. ungrammar describes only AST *shape* (it is not a parser and encodes no tokens/
   precedence). Validated by Biome, which autogenerates its typed API from a grammar over a
@@ -108,9 +146,11 @@ Sources: biomejs.dev/internals/architecture, deepwiki.com/astral-sh/ruff, github
   recovery), `cst.rs` (cstree `Language` impl, `SyntaxNode`/`SyntaxToken` aliases),
   `ast/` (generated typed wrappers + `ascript.ungram`).
 - `build.rs`: gains the ungrammar codegen step (alongside the existing tree-sitter `cc` compile).
-- `src/interp.rs`: consumes the typed AST via an execution view (below).
 - `src/fmt.rs`: rewritten to walk the CST and re-emit trivia.
-- `src/repl.rs`, `src/lsp/*`: rewired onto the new pipeline.
+- `src/repl.rs`, `src/lsp/*`: rewired onto the new pipeline (parse path).
+- **Runtime (sub-project #2, separate spec):** a new compiler + VM replaces `src/interp.rs`'s
+  tree-walker. Reuses `src/value.rs` and the entire `src/stdlib/*` unchanged. Out of scope for this
+  document beyond the decision record below.
 - Old `src/lexer.rs`, `src/token.rs`, `src/parser.rs`, `src/ast.rs`: **coexist with the new path
   during branch development** (enables live old-vs-new differential testing) and are **deleted in
   the merge commit** — `main` never carries two front-ends.
@@ -150,29 +190,24 @@ Error recovery is a **tooling** capability, not a runtime one:
 Regression gate: every existing "this is a syntax/parse error" test still aborts the run with the
 same exit behavior.
 
-## Interpreter execution view
+## Name resolver (built in this sub-project)
 
-The interpreter consumes the generated typed AST (CST-native). Hot-path cost is controlled in two
-tiers:
+The runtime no longer "caches values on CST nodes." Instead, the front-end builds a **name resolver**
+— a scope-analysis pass over the typed AST that maps every identifier use to its declaration and
+assigns each local a **slot index** within its function frame. This is the artifact the bytecode
+compiler needs to emit fast slot-based loads/stores instead of name lookups.
 
-- **Tier-1 value caching (folded into the migration).** Parsed numeric literals, resolved string/
-  template escapes — pure functions of a node's own text, cached on the node (cstree custom-data).
-  Restores the "parse-once" property the old AST had for free. Trivial to keep correct (node text
-  is immutable for a given parse).
-- **Tier-2 binding resolution (explicit second step — NOT deferred).** A real **name resolver**
-  (scope analysis) computes "this identifier binds to that declaration"; results cached on nodes.
-  The interpreter switches from env-chain walks to resolved bindings. The resolver is built as
-  **shared infrastructure with a clean API**, explicitly so sub-project #3's checker consumes it
-  instead of reimplementing it. (Decision: the resolver moved from #3 into #1 — building it now and
-  sharing it is better than building it twice. "The cache" is just where the resolver's output
-  lives; a binding cache without a resolver holds nothing, so "don't defer the cache" means "build
-  the resolver now.")
+- Built as **shared infrastructure with a clean API**: the **compiler** (sub-project #2) consumes the
+  slot allocation; the **checker** (sub-project #4) consumes the same resolver for
+  undefined/unused/shadowed diagnostics. Build once, two consumers.
+- Parsed-literal values (numbers, string/template escapes) are no longer "node caches" — they become
+  **compile-time constants in the bytecode constant pool**, parsed exactly once during compilation.
+  This subsumes the old "tier-1 value caching" idea more cleanly than node-attached caches.
 
-Other invariants preserved: `SyntaxKind`-dispatch replaces `match ExprKind` arm-by-arm but each
-arm's runtime semantics (`Flow`/`Control`, resource handling, async model) are unchanged. The
-`Rc`/`RefCell`/`!Send` model, the take-out-across-await discipline, and the
-`await_holding_refcell_ref` lint are unaffected (the CST is immutable, shared via handles; no new
-borrow-across-await hazard).
+> The previous "Interpreter execution view" (CST-native typed accessors + node-attached value/binding
+> caches) is **superseded by the bytecode-VM pivot**. The runtime semantics (`Flow`/`Control`,
+> resource handling, the `Rc`/`RefCell`/`!Send` async model, take-out-across-await discipline) are
+> preserved by the VM and specified in the dedicated bytecode-VM spec, not here.
 
 ## Formatter (acceptance gate)
 
@@ -207,44 +242,54 @@ and is idempotent. The migration is not done until this is green.
 2. **Lossless round-trip.** Concatenating every token's text in the new CST must reproduce the
    source **byte-for-byte** — the property that *guarantees* no trivia is dropped (stronger than
    "comments look preserved").
-3. **Behavioral equivalence.** Two complementary forms:
-   - **Live old-vs-new** while both front-ends coexist on the branch: identical stdout/exit-code on
-     the whole corpus.
-   - **Recorded goldens** captured from `main` *before* changes (via Phase 9 `assert.snapshot`):
-     the new impl must match byte-for-byte (survives the eventual deletion of the old path).
-   - Full `cargo test` (~540+ tests) green with identical output in both feature configs.
+3. **Resolver cross-check.** The new resolver's binding decisions must agree with the legacy
+   interpreter's scoping on the corpus (no use-before-def divergence, same shadowing). Plus resolver
+   unit tests. *(Execution-behavioral equivalence belongs to sub-project #2 — see below.)*
 
-## Rollout
+> **Note on behavioral equivalence:** because this sub-project does **not** change execution (the
+> legacy interpreter keeps running the binary; only `fmt`/LSP/checker move onto the new pipeline),
+> *runtime* behavioral equivalence + the perf benchmark are owned by the **bytecode-VM spec (#2)**,
+> where the VM replaces the tree-walker. There, the gate is byte-identical stdout/exit-code vs
+> recorded `main` goldens **and a measurable speed-up** (a bytecode VM is expected to be *faster*,
+> not within 5% — the 5%-regression ceiling was an artifact of the superseded CST-native-interp plan).
 
-- **Capture goldens on `main` first** (snapshot fixtures of current behavior); commit.
-- **One feature branch**; old and new front-ends **coexist during development** (enables live
-  differential testing). Old front-end is **deleted in the merge commit**.
-- **Internal checkpoints on the branch** (each with its gates green, not separate merges):
-  - **A — Front-end + interp to parity:** new lexer/parser/CST, ungrammar codegen, interp rewritten
-    arm-by-arm with tier-1 value caching. Gate: oracles 1–3 green.
-  - **B — Comment-preserving formatter:** rewrite `fmt` on the CST. Gate: comment-preservation +
-    idempotence across corpus.
-  - **C — Name resolver + binding cache:** shared resolver; interp uses resolved bindings. Gate:
-    behavioral equivalence holds; resolver unit-tested.
-  - **D — Cut over & delete:** point `main.rs`/`lib.rs`/`repl`/`lsp` at the new path, delete the old
-    front-end. Gate: clippy clean in **both** feature configs, full suite green.
-- **Performance gate:** after A's vertical slice runs, benchmark new vs old interpreter with
-  `std/bench`. **A regression of more than 5% is unacceptable** and triggers the binding-cache work
-  (and any further optimization) before proceeding — no perf wall discovered after the expensive
-  rewrite. 5% is a hard ceiling, not a target.
-- **Single merge to `main`** once all gates pass.
+## Rollout (this sub-project = front-end #1)
+
+- **Capture goldens on `main` first** (snapshot fixtures of current behavior); commit. These serve
+  the VM spec (#2) later.
+- **One feature branch.** The new front-end is added; the **legacy lexer/parser/AST + the
+  tree-walking interpreter stay in place and keep running the binary** — only `fmt`, the LSP parse
+  path, and (later) the checker move onto the new CST pipeline.
+- **Internal checkpoints on the branch** (each with its gates green):
+  - **A — New parse pipeline:** trivia lexer, event parser, cstree CST, ungrammar codegen. Gate:
+    losslessness (oracle 2) + differential parse oracle (oracle 1) green over the corpus.
+  - **B — Name resolver:** scope analysis + per-frame slot allocation, as shared infrastructure.
+    Gate: resolver unit tests + resolver cross-check (oracle 3) green.
+  - **C — Comment-preserving formatter:** rewrite `fmt` on the CST; point `ascript fmt` at it. Gate:
+    comment-preservation + idempotence across corpus.
+  - **D — Wire LSP/REPL parse path** onto the new pipeline. Gate: clippy clean in **both** feature
+    configs, full suite green.
 - **No drift management needed:** the project owner is holding `main` (no new features land) until
-  this work merges, so the branch cannot diverge. No freeze window or periodic rebase is required.
+  the whole effort merges, so the branch cannot diverge.
+
+> **OPEN DECISION (carried to the #2 spec) — "no two front-ends on `main`".** The earlier rule was
+> "delete the legacy front-end in the merge commit." Pulling the VM forward splits the work: #1
+> (front-end) leaves the legacy *parser+interp* in place to keep execution working; only #2 (the VM)
+> can finally delete the legacy lexer/parser/AST/interp once the VM consumes the new typed AST. Two
+> options, to confirm when speccing #2: **(i)** merge #1 and #2 together on one long branch so `main`
+> never carries two parsers (honors the original preference; one big merge — fine since `main` is
+> frozen), or **(ii)** merge #1 first (transient dual-parser window on `main`), then #2 deletes the
+> legacy path. Default assumption: **(i)**.
 
 ## Risks
 
-- **Effort, not design, is the dominant risk:** rewriting every `interp.rs` arm (6,507 lines) is the
-  bulk of the work. Mitigated by the three-oracle net and arm-by-arm equivalence.
-- **Performance:** addressed by cstree's persistent red nodes + tier-1 caching, with the resolver/
-  binding-cache and an early benchmark as the backstop; **>5% regression is a hard fail.**
-- **Branch drift:** not a risk — `main` is frozen by the project owner until this lands.
-- **Trivia attachment subtleties** (esp. around reordering): addressed by the documented attachment
-  rule + the enumerated formatter edge-case tests + lossless round-trip.
+- **Trivia attachment subtleties** (esp. around the formatter's reordering): addressed by the
+  documented attachment rule + the enumerated formatter edge-case tests + lossless round-trip.
+- **Two parsers transiently** (legacy for execution, new for tooling) until the VM lands: bounded by
+  the OPEN DECISION above; differential parse oracle keeps them in agreement meanwhile.
+- **Resolver/legacy-scope divergence:** caught by the resolver cross-check oracle.
+- **The dominant *effort* risk has moved to sub-project #2** (compiler + VM + async/generator
+  integration) — tracked in its own spec, not here.
 
 ## Docs to update (within this sub-project)
 
@@ -257,16 +302,25 @@ and is idempotent. The migration is not done until this is green.
 ## Decisions (log)
 
 - **Checker scope target:** up to and including static contract checking (informs the decomposition;
-  contract checking is sub-project #5).
+  contract checking is the last sub-project).
 - **Trivia model:** full lossless CST (chosen over attach-to-AST-node and position-keyed side-table).
-- **Interpreter:** CST-native typed accessors (chosen over lower-CST-to-existing-AST).
-- **Tree library:** `cstree` (chosen over rowan for persistent red nodes + interning + custom data;
-  over eventree for maturity).
-- **Typed AST:** ungrammar grammar-driven codegen (Approach C; chosen over hand-written wrappers and
-  over a no-codegen approach).
-- **tree-sitter:** retained as a test-only differential oracle (Option X; tree-sitter-as-CST
-  rejected due to runtime C-FFI on the hot path, untyped/coarser trees, loss of hand-tuned control).
-- **Name resolver:** built in #1 as shared infrastructure (moved out of #3); tier-1 value caching
-  folded into the migration, resolver + binding cache as an explicit second step — neither deferred.
-- **Rollout:** coexist during branch development for live differential testing; delete old front-end
-  in the merge commit; single merge to `main`; never two front-ends on `main`.
+- **Runtime representation (REVISED):** **bytecode compiler + VM** consuming a *lowered* IR — the
+  runtime does **not** execute the CST. *Supersedes the earlier "CST-native typed accessors"
+  decision*, which was identified as executing the tooling tree (against the grain; the whole industry
+  lowers CST → execution IR). The CST remains the tooling source-of-truth only.
+- **VM suspension model:** **2a** — async dispatch loop that borrows tokio's suspension (keeps
+  `spawn_local`/`Value::Future`/`await`/cancel-on-drop/generators/`http.serve`). Chosen over **2b**
+  (explicit-stack VM with serializable continuations + deterministic scheduling), which stays a
+  non-goal. Bytecode/VM is **pulled forward** to be sub-project #2, ahead of the checker.
+- **Tree library:** `cstree` (interning + lossless green/red API + maturity; over rowan and eventree).
+  *Post-pivot:* the interpreter-hot-path rationale is moot, but cstree remains fine for tooling.
+- **Typed AST:** ungrammar grammar-driven codegen (Approach C; over hand-written wrappers and no
+  codegen).
+- **tree-sitter:** retained as a test-only differential oracle (Option X; tree-sitter-as-CST rejected
+  due to runtime C-FFI, untyped/coarser trees, loss of hand-tuned control).
+- **Name resolver:** built in #1 as shared infrastructure; now serves the **compiler** (slot
+  allocation) first and the checker later. Parsed-literal values become **constant-pool entries** at
+  compile time (supersedes node-attached "tier-1 value caching").
+- **Rollout (REVISED):** legacy parser+interp stay in #1 to keep execution working; only the VM (#2)
+  can delete the legacy path. "Never two front-ends on `main`" is now an OPEN DECISION carried to the
+  #2 spec (default: develop #1+#2 on one branch, single merge, delete legacy then).

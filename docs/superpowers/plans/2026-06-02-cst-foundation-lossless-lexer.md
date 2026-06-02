@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, `cstree` 0.14 (green/red trees + string interning + `#[derive(Syntax)]`), existing `ariadne`/`AsError` error types.
 
-**Scope note:** This is Plan 1 of the CST migration (spec: `docs/superpowers/specs/2026-06-02-cst-frontend-migration-design.md`). It delivers Step A's *lexer + lossless* portion only. Follow-on plans: (2) event parser + ungrammar codegen, (3) CST-native interp vertical slice + 5% perf benchmark, (4) coverage growth to full parity, (5) comment-preserving formatter, (6) name resolver + binding cache.
+**Scope note:** This is Plan 1 of the CST front-end (spec: `docs/superpowers/specs/2026-06-02-cst-frontend-migration-design.md`, see the runtime-pivot REVISION). It delivers the *lexer + lossless CST* foundation only, and is **unaffected by the bytecode-VM pivot** — it's pure parse-layer foundation either way. Follow-on plans for the front-end: (2) event parser + ungrammar codegen + tree-sitter differential oracle, (3) name resolver (shared infra; feeds the compiler), (4) comment-preserving formatter. The runtime (bytecode compiler + VM, model 2a) is a **separate effort with its own spec**, built after this front-end + resolver land.
 
 **Key invariant established here:** *losslessness* — concatenating every token's text in lex order equals the source exactly. Every later layer depends on this property; it is the single most important thing this plan proves.
 
@@ -1145,4 +1145,4 @@ git commit -m "feat(syntax): build flat cstree CST + corpus tree-level losslessn
 - [ ] A flat cstree CST round-trips the whole corpus.
 - [ ] The legacy front-end and the binary are **unchanged** — nothing user-facing switched.
 
-**Next plan:** `2026-06-??-cst-event-parser-and-codegen.md` — convert the parser to emit `start_node/token/finish_node` events with error recovery and trivia attachment, add the `ascript.ungram` grammar + `build.rs` codegen for the typed-AST layer, and add the tree-sitter differential parse oracle.
+**Next plan:** `cst-event-parser-and-codegen.md` — convert the parser to emit `start_node/token/finish_node` events with error recovery and trivia attachment, add the `ascript.ungram` grammar + `build.rs` codegen for the typed-AST layer, and add the tree-sitter differential parse oracle. (Then: resolver, then comment-preserving formatter. The bytecode compiler + VM follow under their own spec.)
