@@ -1,0 +1,23 @@
+SourceFile = Stmt*
+Stmt = LetStmt | ExprStmt | Block | IfStmt | WhileStmt | ReturnStmt | FnDecl
+LetStmt = ('let' | 'const') 'ident' ('=' Expr)?
+ExprStmt = Expr
+Block = '{' Stmt* '}'
+IfStmt = 'if' cond:Expr then:Block ('else' (IfStmt | Block))?
+WhileStmt = 'while' cond:Expr body:Block
+ReturnStmt = 'return' Expr?
+FnDecl = 'fn' 'ident' ParamList Block
+ParamList = '(' Param* ')'
+Param = 'ident'
+Expr = Literal | NameRef | UnaryExpr | BinaryExpr | ParenExpr | CallExpr | MemberExpr | IndexExpr | ArrowExpr | AssignExpr
+Literal = 'number' | 'string' | 'true' | 'false' | 'nil'
+NameRef = 'ident'
+UnaryExpr = op:('-' | '!') Expr
+BinaryExpr = lhs:Expr op:('+'|'-'|'*'|'/'|'%'|'**'|'=='|'!='|'<'|'<='|'>'|'>='|'&&'|'||') rhs:Expr
+ParenExpr = '(' Expr ')'
+CallExpr = Expr ArgList
+ArgList = '(' Expr* ')'
+MemberExpr = Expr '.' 'ident'
+IndexExpr = Expr '[' Expr ']'
+ArrowExpr = ParamList '=>' (Block | Expr)
+AssignExpr = target:Expr '=' value:Expr

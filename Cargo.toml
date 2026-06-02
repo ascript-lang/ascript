@@ -63,6 +63,7 @@ sysinfo = { version = "0.31", optional = true }
 
 [build-dependencies]
 cc = "1"
+ungrammar = "1"
 
 [dev-dependencies]
 tree-sitter = "0.25"

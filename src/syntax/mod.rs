@@ -3,6 +3,7 @@
 //! Built in parallel with the legacy `lexer`/`token`/`parser`/`ast` front-end;
 //! does not yet drive the binary.
 
+pub mod ast;
 pub mod cst;
 pub mod event;
 pub mod kind;
