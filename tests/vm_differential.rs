@@ -556,20 +556,31 @@ async fn vm_run_sync_multi_feature_programs() {
 /// V4 qualifiers (added now that the VM supports user functions — definitions,
 /// calls, recursion, mutual/forward refs, closures, params/rest/contracts): an
 /// example that ALSO uses `fn`/arrows/calls now qualifies, provided it STILL
-/// contains none of V6..V12: `?`/`!` operators, recover-as-`?`, async/await,
-/// generators, `match`, `class`/`enum`, `import`, destructuring/spread, OR
-/// compound assignment (`+=`/`-=`/`*=`/`/=`, V9). The set of files that match
-/// byte-identically is established empirically (run both engines over each
-/// `examples/*.as` and keep only the ones that agree); see the audit note below
-/// each entry. Deliberately EXCLUDED, with the verified reason:
+/// contains none of V7..V12: async/await, generators, `match`, `class`/`enum`,
+/// `import`, destructuring/spread, OR compound assignment (`+=`/`-=`/`*=`/`/=`,
+/// V9). The set of files that match byte-identically is established empirically
+/// (run both engines over each `examples/*.as` and keep only the ones that
+/// agree); see the audit note below each entry.
+///
+/// V6 qualifiers (added now that the VM supports the error model — `?` propagate,
+/// `!` unwrap, `recover`, panic unwinding, diagnostics parity): an example that
+/// ALSO uses `?`/`!`/`recover`/`Ok`/`Err` now qualifies, provided it STILL
+/// contains none of V7..V12 (async/await, generators, `match`, `class`/`enum`,
+/// `import`, destructuring/spread, compound assignment, member-method CALLS).
+/// Verified empirically by running both engines over every `examples/*.as` and
+/// keeping only the byte-identical agreers. Deliberately EXCLUDED, with the
+/// verified reason (from that scan):
 ///   - `functions.as` — uses `+=` (line 9; V9 compound assignment).
 ///   - `factorial.as` — uses `*=` (V9 compound assignment).
 ///   - `data.as`      — uses `+=` (V9 compound assignment).
-///   - `typed.as`     — uses `+=` (V9) and `recover`/await (V6/V7).
-///   - `result.as`    — uses the `?` propagation operator (V6).
+///   - `typed.as`     — uses `+=` (V9) and async/await (V7).
+///   - `validation.as`— uses `import` (V12) AND destructuring `let [u, e1] = …`
+///     (V10), so the VM rejects it at compile time (it does NOT diverge): it
+///     exercises `?`/`!`/recover only via the stdlib `std/schema` it imports.
 ///   - every other function-heavy example uses `import` (V12), `match` (V10),
-///     `class`/`enum` (V9), async/generators (V7/V8), or `?`/`!` (V6) — none of
-///     which the VM compiles yet, so they error rather than diverge.
+///     `class`/`enum` (V9), async/generators (V7/V8), destructuring/spread (V10),
+///     or compound assignment (V9) — none of which the VM compiles yet, so they
+///     ERROR (rather than diverge) and are correctly not on the list.
 const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     "examples/hello.as",   // `print(1 + 2 * 3)` — literals + arithmetic + print.
     "examples/numbers.as", // numeric-literal forms bound to locals, then printed.
@@ -583,6 +594,16 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     // `import`/compound-assign/`match`/`class`/`?`-operator — byte-identical
     // (verified by running both engines over the file).
     "examples/optional_types.as",
+    // V6 error-model qualifiers (verified byte-identical by running both engines):
+    // `safeDivide` returns `Ok`/`Err` Result pairs, `compute` chains `?`
+    // propagation through two calls, a ternary reuses `?`, and `recover` wraps a
+    // function that out-of-bounds-indexes (a Tier-2 panic → `[nil, err]`). No
+    // `import`/`match`/`class`/destructuring/compound-assign — all V6 features.
+    "examples/result.as",
+    // `!` force-unwrap on Result pairs (success yields the value; an error pair
+    // panics, caught by `recover` which round-trips the `.message`), plus arrows,
+    // `assert`, and `Ok`/`Err`. All V6 — byte-identical on both engines.
+    "examples/force_unwrap.as",
 ];
 
 #[tokio::test]
@@ -1989,4 +2010,120 @@ async fn vm_panic_inside_native_hof_callback_matches_treewalker() {
                 print(r[0])\n\
                 print(r[1].message)";
     assert_vm_run_matches_treewalker(src2).await;
+}
+
+// ----- V6-T5: error-model multi-feature sync programs -------------------------
+//
+// These COMBINE the full V6 error model (`?` propagate chains, `!` force-unwrap
+// on success AND failure, `recover` wrapping computations that may panic, error
+// objects `{message: …}`, `Ok`/`Err`, nested recover) with the V1..V5 base
+// (locals, arithmetic, arrays/objects, index/member READS, templates, short-
+// circuit/`??`, `if`/`for`/`while`, ternary, `fn`/arrows/closures, recursion).
+// The single-feature error-model tests above prove each construct in isolation;
+// these prove they compose correctly through the compiler + VM, byte-for-byte
+// against the tree-walker. This is the V6 sync-subset gate. NEVER weaken the
+// byte-identical assertion: a divergence here is a real VM/compiler bug.
+//
+// NOTE: every snippet here resolves to a CLEAN value path (no escaping panic) so
+// the program completes and its stdout is compared; the panic PATH is covered by
+// the error-parity helper in the dedicated error tests below.
+
+#[tokio::test]
+async fn vm_run_error_model_multi_feature_programs() {
+    let programs = [
+        // (a) "safe divide" returning a Result pair, chained via `?` through a
+        // second function; both the success and the error branch are printed.
+        "fn safeDiv(a, b) { if (b == 0) { return [nil, \"divide by zero\"] }\n return [a / b, nil] }\n\
+         fn compute(a, b, c) { let x = safeDiv(a, b)?\n let y = safeDiv(x, c)?\n return [y, nil] }\n\
+         let good = compute(100, 5, 2)\nprint(good[0])\nprint(good[1])\n\
+         let bad = compute(100, 0, 2)\nprint(bad[0])\nprint(bad[1])",
+        // (b) `?` propagation chain through THREE functions; the middle one fails,
+        // so the outer one short-circuits and returns the propagated pair.
+        "fn a() { return [10, nil] }\nfn b() { return [nil, \"b-failed\"] }\nfn c() { return [30, nil] }\n\
+         fn pipeline() { let x = a()?\n let y = b()?\n let z = c()?\n return [x + y + z, nil] }\n\
+         let r = pipeline()\nprint(r[0])\nprint(r[1])",
+        // (c) `!` unwrap SUCCESS inside an expression: a `[value, nil]` pair force-
+        // unwraps to the value, threaded through arithmetic + a template.
+        "fn parse(n) { return [n * 2, nil] }\nlet v = parse(21)!\nprint(`v = ${v}`)\nprint(v + 1)",
+        // (d) `!` unwrap FAILURE inside `recover`: the unwrap panics (recoverable),
+        // recover catches it into `[nil, err]`, and the error message is read back.
+        "fn load(ok) { if (ok) { return [\"data\", nil] }\n return [nil, \"not found\"] }\n\
+         let r = recover(() => load(false)!)\nprint(r[0])\nprint(r[1].message)\n\
+         let ok = recover(() => load(true)!)\nprint(ok[0])\nprint(ok[1])",
+        // (e) recover wrapping a computation that MAY panic (out-of-bounds index),
+        // with the index chosen by a runtime condition; both branches exercised.
+        "fn at(xs, i) { return recover(() => xs[i]) }\nlet data = [10, 20, 30]\n\
+         let inb = at(data, 1)\nprint(inb[0])\nprint(inb[1])\n\
+         let oob = at(data, 99)\nprint(oob[0])\nprint(oob[1] != nil)",
+        // (f) mixing `?`/`!` with control flow + closures: a fn loops over inputs,
+        // uses `?` to bail on the first failure, returns the accumulated total.
+        "fn check(n) { if (n < 0) { return [nil, \"negative\"] }\n return [n, nil] }\n\
+         fn sumChecked(xs) { let total = 0\n for (x of xs) { let v = check(x)?\n total = total + v }\n\
+         return [total, nil] }\n\
+         let okR = sumChecked([1, 2, 3])\nprint(okR[0])\nprint(okR[1])\n\
+         let errR = sumChecked([1, -2, 3])\nprint(errR[0])\nprint(errR[1])",
+        // (g) error OBJECTS `{message: …}`: a fn returns an Err with a structured
+        // error; `!` inside recover surfaces the object, whose `.message` is read.
+        "fn validate(age) { if (age < 18) { return [nil, {message: \"too young\", code: 403}] }\n\
+         return [age, nil] }\n\
+         let r = recover(() => validate(15)!)\nprint(r[1].message)\nprint(r[1].code)\n\
+         let okV = validate(21)\nprint(okV[0])",
+        // (h) NESTED recover: the inner recover catches a panic into a pair; the
+        // outer recover wraps the inner's SUCCESS, so the outer error slot is nil.
+        "fn boom() { return [nil, \"inner-err\"]! }\n\
+         let outer = recover(() => recover(() => boom()))\n\
+         print(outer[0][0])\nprint(outer[0][1].message)\nprint(outer[1])",
+        // (i) `??` defaulting on a propagated/unwrapped value + ternary classifying
+        // the outcome: combine the Result model with short-circuit + conditional.
+        "fn lookup(key) { if (key == \"x\") { return [42, nil] }\n return [nil, \"missing\"] }\n\
+         let hit = lookup(\"x\")\nlet miss = lookup(\"y\")\n\
+         let hv = hit[0] ?? -1\nlet mv = miss[0] ?? -1\n\
+         print(hv)\nprint(mv)\n\
+         print(hit[1] == nil ? \"hit ok\" : \"hit err\")\nprint(miss[1] == nil ? \"miss ok\" : \"miss err\")",
+        // (j) `Ok`/`Err` builtins (the canonical pair constructors) flowing through
+        // a `?` chain + recover, with the `.message` of the Err read back.
+        "fn step(n) { if (n == 0) { return Err(\"zero\") }\n return Ok(100 / n) }\n\
+         fn run(n) { let v = step(n)?\n return Ok(v + 1) }\n\
+         let good = run(4)\nprint(good[0])\nprint(good[1])\n\
+         let bad = run(0)\nprint(bad[0])\nprint(bad[1].message)",
+        // (k) recover around a RECURSIVE function that unwraps a failure pair deep
+        // in the recursion: the recoverable panic unwinds every frame to recover.
+        "fn descend(n) { if (n == 0) { return [nil, \"bottom\"]! }\n return descend(n - 1) }\n\
+         let r = recover(() => descend(5))\nprint(r[0])\nprint(r[1].message)",
+        // (l) a closure capturing an outer var, returning a Result; `?` propagates
+        // its failure out of an enclosing fn; the success path is also shown.
+        "fn makeChecker(limit) { return (n) => { if (n > limit) { return [nil, \"over limit\"] }\n\
+         return [n, nil] } }\n\
+         let under10 = makeChecker(10)\n\
+         fn doubleIfOk(n) { let v = under10(n)?\n return [v * 2, nil] }\n\
+         let okR = doubleIfOk(4)\nprint(okR[0])\nprint(okR[1])\n\
+         let errR = doubleIfOk(20)\nprint(errR[0])\nprint(errR[1])",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+/// Error-model snippets whose panic PATH ESCAPES to the driver (not recovered):
+/// both engines must abort with the IDENTICAL Tier-2 panic message AND span.
+/// These complement the value-path programs above by pinning the diagnostics
+/// parity of the error model when a `?`-non-pair / `!`-failure is NOT caught.
+#[tokio::test]
+async fn vm_run_error_model_uncaught_panic_programs() {
+    let cases = [
+        // `!` on a failure pair, uncaught, deep in a `?`-style call chain.
+        "fn inner() { return [nil, \"kaboom\"]! }\n\
+         fn outer() { return inner() }\n\
+         print(outer())",
+        // `!` on a NON-pair value (a number) — the "requires a Result pair" panic.
+        "fn bad() { return 7! }\nprint(bad())",
+        // `?` on a NON-pair value (a 3-element array) — the propagate non-pair panic.
+        "fn bad() { let x = [1, 2, 3]?\n return x }\nprint(bad())",
+        // `!` on an error OBJECT pair, uncaught: the panic carries `error_message`
+        // of the object (its `.message` field), surfacing to the driver identically.
+        "fn v() { return [nil, {message: \"invalid\"}]! }\nprint(v())",
+    ];
+    for src in cases {
+        assert_vm_run_error_matches_treewalker(src).await;
+    }
 }
