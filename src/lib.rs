@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod check;
+pub mod compile;
 pub mod syntax;
 pub mod coro;
 pub mod diagnostics;
@@ -127,5 +128,61 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         // exit(n) — return the captured output plus the exit code.
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// Compile `src` to bytecode and run it on the VM, returning the value of the
+/// program's trailing expression (VM plan V1).
+///
+/// This is the entry point that drives the new bytecode pipeline end-to-end
+/// (compile → `FnProto`/`Closure`/`Fiber` → `Vm::run`). It is exposed (behind
+/// `#[doc(hidden)]`) so the differential-test harness in V1-T7 can call it from
+/// an integration test. The tree-walker remains the production path.
+#[doc(hidden)]
+pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let chunk = crate::compile::compile_source(src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+    });
+    let closure = Closure::new(proto);
+
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let vm = Vm::new(interp);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let outcome = local
+        .run_until(vm.run(&mut fiber))
+        .await
+        .map_err(|c| control_to_aserror(c).with_source(src_info))?;
+    match outcome {
+        RunOutcome::Done(v) => Ok(v),
+        RunOutcome::Yielded(_) => unreachable!("top-level program cannot yield"),
+    }
+}
+
+/// Map a VM [`crate::interp::Control`] outcome to an [`AsError`], mirroring how
+/// the tree-walker entry points treat each channel.
+fn control_to_aserror(c: crate::interp::Control) -> AsError {
+    match c {
+        crate::interp::Control::Panic(e) => e,
+        crate::interp::Control::Propagate(_) => {
+            AsError::new("unexpected '?' propagation at top level")
+        }
+        crate::interp::Control::Exit(code) => AsError::new(format!("exit({code}) at top level")),
     }
 }
