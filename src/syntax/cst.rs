@@ -12,6 +12,8 @@ pub type SyntaxNode = cstree::syntax::SyntaxNode<SyntaxKind>;
 pub type SyntaxToken = cstree::syntax::SyntaxToken<SyntaxKind>;
 /// A `SyntaxNode` that has a resolver attached so token text can be recovered.
 pub type ResolvedNode = cstree::syntax::ResolvedNode<SyntaxKind>;
+/// A `SyntaxToken` that has a resolver attached so `.text()` works.
+pub type ResolvedToken = cstree::syntax::ResolvedToken<SyntaxKind>;
 
 /// Build a flat CST: a single `Root` node containing every lexeme (including
 /// trivia) as a token, in source order. Temporary scaffolding — the parser plan

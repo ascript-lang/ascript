@@ -25,7 +25,7 @@ ParenExpr = '(' Expr ')'
 CallExpr = Expr ArgList
 ArgList = '(' Expr* ')'
 MemberExpr = Expr '.' 'ident'
-IndexExpr = Expr '[' Expr ']'
+IndexExpr = base:Expr '[' index:Expr ']'
 ArrowExpr = ParamList '=>' (Block | Expr)
 AssignExpr = target:Expr '=' value:Expr
 ArrayExpr = '[' (Expr | SpreadElem)* ']'
