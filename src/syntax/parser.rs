@@ -160,6 +160,8 @@ fn stmt(p: &mut Parser) {
         }
         EnumKw => enum_decl(p),
         ClassKw => class_decl(p),
+        ImportKw => import_stmt(p),
+        ExportKw => export_stmt(p),
         _ => expr_stmt(p),
     }
 }
@@ -1030,6 +1032,38 @@ fn enum_decl(p: &mut Parser) {
     p.complete(m, EnumDecl);
 }
 
+fn import_stmt(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // import
+    if p.at(Star) {
+        p.bump(); // *
+        if p.at_kw("as") { p.bump(); } else { p.error("expected 'as' in namespace import"); }
+        if p.at(Ident) { p.bump(); } else { p.error("expected import alias"); }
+    } else if p.at(LBrace) {
+        let l = p.start();
+        p.bump(); // {
+        while !p.at(RBrace) && !p.at_end() {
+            if p.at(Ident) { p.bump(); } else { p.error("expected an import name"); }
+            if p.at(Comma) { p.bump(); } else { break; }
+        }
+        if p.at(RBrace) { p.bump(); } else { p.error("expected '}' to close import list"); }
+        p.complete(l, ImportList);
+    } else {
+        p.error("expected '{' or '*' after import");
+    }
+    if p.at_kw("from") { p.bump(); } else { p.error("expected 'from'"); }
+    if p.at(Str) { p.bump(); } else { p.error("expected a module path string"); }
+    p.complete(m, ImportStmt);
+}
+
+fn export_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(); // export
+    stmt(p); // the exported declaration
+    p.complete(m, SyntaxKind::ExportStmt);
+}
+
 fn arg_list(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
@@ -1385,5 +1419,20 @@ mod tests {
         assert!(s.contains(&SyntaxKind::ClassDecl));
         assert!(s.contains(&SyntaxKind::FieldDecl));
         assert!(s.contains(&SyntaxKind::MethodDecl));
+    }
+
+    #[test]
+    fn imports_and_exports() {
+        for src in [
+            r#"import * as task from "std/task""#,
+            r#"import { a, b } from "./mod""#,
+            "export fn f() { return 1 }",
+        ] {
+            let p = parse(src);
+            assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
+        }
+        assert!(tree_shape(r#"import * as t from "std/task""#).contains(&SyntaxKind::ImportStmt));
+        assert!(tree_shape(r#"import { a } from "m""#).contains(&SyntaxKind::ImportList));
+        assert!(tree_shape("export fn f() {}").contains(&SyntaxKind::ExportStmt));
     }
 }
