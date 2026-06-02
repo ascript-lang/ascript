@@ -210,3 +210,45 @@ async fn vm_run_locals_match_treewalker() {
         assert_vm_run_matches_treewalker(src).await;
     }
 }
+
+// ----- V2-T4: bare builtins through GET_GLOBAL → CALL -------------------------
+
+#[tokio::test]
+async fn vm_run_bare_builtins_match_treewalker() {
+    // Every bare builtin reachable as a call in the V2 expression subset must run
+    // through the VM's GET_GLOBAL → CALL path byte-identically to the tree-walker.
+    // (Array/object-literal arguments await the container-literal compiler slice;
+    // these all use number/string/nested-call arguments that compile today.)
+    let cases = [
+        // len over a string and over range's array result.
+        "print(len(\"hello\"))",     // 5
+        "print(len(range(5)))",       // range(5) -> [0,1,2,3,4]; len -> 5
+        // type strings (must match the tree-walker's exact spellings).
+        "print(type(1))",             // number
+        "print(type(\"x\"))",         // string
+        "print(type(true))",          // bool
+        "print(type(nil))",           // nil
+        "print(type(range(2)))",      // array
+        // Ok / Err formatting ([value, nil] / [nil, {message}]).
+        "print(Ok(1))",
+        "print(Err(\"e\"))",
+        // assert(true) is a no-op (no output, no panic); a trailing print proves
+        // the program continued.
+        "assert(true)\nprint(\"ok\")",
+        // a nested builtin chain.
+        "print(len(range(len(\"abc\"))))", // len("abc")=3 -> range(3) -> len 3
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_eval_first_class_builtin_reference_matches_treewalker() {
+    // A bare builtin name used as a *value* (not called) is the `Value::Builtin`
+    // itself; printing it must render identically on both engines. This exercises
+    // the compiler's `compile_name_ref` GET_GLOBAL path (first-class builtins).
+    for name in ["print", "len", "type", "range", "assert", "Ok", "Err"] {
+        assert_vm_matches_treewalker(name).await;
+    }
+}

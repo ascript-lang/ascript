@@ -56,8 +56,22 @@ pub enum Op {
 
     // ---- globals ----------------------------------------------------------
     /// `GET_GLOBAL(u16)` — push the global named by `consts[idx]` (a `Str`).
+    /// The VM's globals are the bare builtins (`crate::interp::BUILTIN_NAMES`);
+    /// the result is the corresponding `Value::Builtin`.
     GetGlobal,
     /// `SET_GLOBAL(u16)` — store TOS into the global named by `consts[idx]`.
+    ///
+    /// **Currently unused — never emitted by the compiler, never executed.**
+    /// AScript has no writable user globals: a top-level `let`/`const` binds a
+    /// *frame-local* of the SourceFile frame (so `x = ...` at top level lowers to
+    /// `SET_LOCAL`, handled by the locals slice), and the only true globals — the
+    /// bare builtins — are *immutable* (the tree-walker rejects `print = 5` with
+    /// "cannot assign to immutable binding 'print'", so the compiler never reaches
+    /// an assignment whose target resolves to a builtin global). The opcode stays
+    /// declared (it was reserved in V1 and keeps the byte layout stable for the
+    /// disassembler / future host-injected mutable globals), but `Vm::run` has no
+    /// arm for it; if one were ever emitted it would hit the "not yet implemented"
+    /// guard rather than silently mis-store.
     SetGlobal,
 
     // ---- arithmetic / logic ----------------------------------------------

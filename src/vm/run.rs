@@ -160,15 +160,23 @@ impl Vm {
                             ))
                         }
                     };
-                    // V2's globals are the bare builtins (the resolver guarantees
-                    // the compiler only emits GET_GLOBAL for builtin names).
+                    // The VM's globals are the bare builtins. The resolver classes
+                    // every free identifier as `Global`, and the compiler only
+                    // emits `GET_GLOBAL` for names in `BUILTIN_NAMES` (a bare-builtin
+                    // call or a first-class builtin reference like `let p = print`);
+                    // a non-builtin global is a compile-time deferral, so it never
+                    // reaches here in a validly-compiled program. The guard below is
+                    // defence-in-depth: should one ever arrive, we surface the
+                    // tree-walker's exact runtime message (`undefined variable '<n>'`,
+                    // see `Interp::eval_expr`'s `ExprKind::Ident` arm) so the two
+                    // engines stay byte-identical.
                     if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
                         fiber.push(Value::Builtin(name));
                     } else {
                         return Err(self.panic_at(
                             fiber,
                             fault_ip,
-                            format!("undefined global '{name}'"),
+                            format!("undefined variable '{name}'"),
                         ));
                     }
                 }
@@ -555,8 +563,11 @@ mod tests {
         c.emit(Op::Return, s());
         match run_chunk(c) {
             Err(Control::Panic(e)) => {
+                // The message matches the tree-walker's runtime undefined-name
+                // error exactly (`undefined variable '<name>'`), so the two
+                // engines stay byte-identical even on this defence-in-depth path.
                 assert!(
-                    e.message.contains("undefined global"),
+                    e.message.contains("undefined variable"),
                     "message was: {}",
                     e.message
                 );

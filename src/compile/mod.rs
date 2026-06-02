@@ -170,10 +170,12 @@ impl Compiler {
 
     /// Lower a bare identifier reference (`NameRef`). The resolver classifies the
     /// use via its `text_range()`: a `Local(slot)` reads the frame's slot
-    /// (`GET_LOCAL`); a `Global(name)` builtin is left for the call path / future
-    /// global support; `Upvalue` is a closure capture (V5) and `Unresolved` would
-    /// be an undefined name (the checker flags it, but we still emit a clear
-    /// compile error rather than mis-compile).
+    /// (`GET_LOCAL`); a `Global(name)` that is a known builtin is a first-class
+    /// builtin reference (`GET_GLOBAL`, yielding the `Value::Builtin` — e.g.
+    /// `let p = print`, exactly as the tree-walker treats a bare builtin name);
+    /// `Upvalue` is a closure capture (V5) and a non-builtin `Global` is a
+    /// user-global reference, which does not exist at runtime (top-level `let`s
+    /// are frame-locals) so it is a documented V4 deferral.
     fn compile_name_ref(&mut self, name_ref: &NameRef) -> Result<(), CompileError> {
         let span = node_span(name_ref);
         let key = name_ref.syntax().text_range();
@@ -189,6 +191,17 @@ impl Compiler {
                 "upvalue (closure capture) reads not yet supported (V5)",
                 span,
             )),
+            // A bare reference to a builtin name is a first-class builtin value:
+            // `GET_GLOBAL <name>` resolves it to `Value::Builtin` at runtime, the
+            // same value the tree-walker reads from its global env. This makes
+            // `let p = print; p("hi")` work identically.
+            Some(Resolution::Global(name))
+                if crate::interp::BUILTIN_NAMES.contains(&name.as_str()) =>
+            {
+                let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                self.chunk.emit_u16(Op::GetGlobal, idx, span);
+                Ok(())
+            }
             Some(Resolution::Global(name)) => Err(CompileError::new(
                 format!("bare global reference '{name}' not yet supported (V4)"),
                 span,
@@ -741,6 +754,31 @@ mod tests {
         let err = compile_source("foo(1)").unwrap_err();
         assert!(
             err.message.contains("non-builtins not yet supported (V4)"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn bare_builtin_reference_emits_get_global() {
+        // A bare builtin name used as a value (not a call) is a first-class
+        // builtin reference: `let p = print` stores the `Value::Builtin`. The
+        // initializer compiles to `GET_GLOBAL print`.
+        let chunk = compile_source("let p = print\np").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(
+            text.contains("GET_GLOBAL") && text.contains("print"),
+            "missing GET_GLOBAL print in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_non_builtin_global_reference() {
+        // `foo` is a free name → resolver classifies it Global("foo"); not a
+        // builtin, and there are no user globals (top-level lets are locals), so
+        // this is a documented V4 deferral rather than a runtime undefined.
+        let err = compile_source("foo").unwrap_err();
+        assert!(
+            err.message.contains("bare global reference 'foo' not yet supported (V4)"),
             "got {err:?}"
         );
     }
