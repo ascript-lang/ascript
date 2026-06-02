@@ -20,6 +20,11 @@ pub enum SyntaxKind {
     Literal, NameRef, UnaryExpr, BinaryExpr, ParenExpr, CallExpr, ArgList,
     MemberExpr, IndexExpr, ArrowExpr, AssignExpr,
 
+    // --- expression nodes (Plan 2b-i) ---
+    ArrayExpr, ObjectExpr, ObjectField, SpreadElem,
+    TemplateExpr, OptMemberExpr, TryExpr, UnwrapExpr, TernaryExpr,
+    AwaitExpr, YieldExpr,
+
     // --- trivia ---
     Whitespace,
     Newline,
@@ -133,6 +138,18 @@ mod tests {
         assert!(!SyntaxKind::Number.is_trivia());
         assert!(!SyntaxKind::Plus.is_trivia());
         assert!(!SyntaxKind::LetKw.is_trivia());
+    }
+
+    #[test]
+    fn expression_node_kinds_exist() {
+        for k in [
+            SyntaxKind::ArrayExpr, SyntaxKind::ObjectExpr, SyntaxKind::ObjectField,
+            SyntaxKind::SpreadElem, SyntaxKind::TemplateExpr, SyntaxKind::OptMemberExpr,
+            SyntaxKind::TryExpr, SyntaxKind::UnwrapExpr, SyntaxKind::TernaryExpr,
+            SyntaxKind::AwaitExpr, SyntaxKind::YieldExpr,
+        ] {
+            assert!(!k.is_trivia(), "{k:?}");
+        }
     }
 
     #[test]
