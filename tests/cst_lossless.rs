@@ -52,6 +52,15 @@ fn no_error_tokens_over_corpus() {
 }
 
 #[test]
+fn flat_tree_is_lossless_over_corpus() {
+    for path in corpus() {
+        let src = fs::read_to_string(&path).unwrap();
+        let node = ascript::syntax::build_flat_tree(&src);
+        assert_eq!(node.text().to_string(), src, "tree not lossless for {}", path.display());
+    }
+}
+
+#[test]
 fn nontrivia_token_count_matches_legacy() {
     for path in corpus() {
         let src = fs::read_to_string(&path).unwrap();
