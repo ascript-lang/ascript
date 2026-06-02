@@ -74,6 +74,19 @@ pub fn lex(src: &str) -> Vec<LexToken> {
             continue;
         }
 
+        // identifiers & keywords
+        if c.is_alphabetic() || c == '_' {
+            let mut j = i + 1;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let text: String = chars[i..j].iter().collect();
+            let kind = keyword_kind(&text).unwrap_or(SyntaxKind::Ident);
+            out.push(LexToken { kind, text });
+            i = j;
+            continue;
+        }
+
         // multi-char operators first (longest match), then single-char
         if let Some((kind, len)) = match_operator(&chars, i) {
             i += len;
@@ -198,6 +211,22 @@ fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
     Some((one, 1))
 }
 
+/// Map a reserved word to its keyword kind. Mirrors the legacy keyword set
+/// (`src/token.rs`); `as` is a soft keyword (stays `Ident`), `of` is a keyword.
+fn keyword_kind(s: &str) -> Option<SyntaxKind> {
+    use SyntaxKind::*;
+    Some(match s {
+        "true" => TrueKw, "false" => FalseKw, "nil" => NilKw,
+        "let" => LetKw, "const" => ConstKw, "if" => IfKw, "else" => ElseKw,
+        "while" => WhileKw, "for" => ForKw, "in" => InKw, "of" => OfKw,
+        "return" => ReturnKw, "break" => BreakKw, "continue" => ContinueKw,
+        "fn" => FnKw, "enum" => EnumKw, "match" => MatchKw, "class" => ClassKw,
+        "import" => ImportKw, "export" => ExportKw, "async" => AsyncKw,
+        "await" => AwaitKw, "yield" => YieldKw,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,7 +254,17 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs identifiers from Task 6"]
+    fn identifiers_and_keywords() {
+        use SyntaxKind::*;
+        assert_eq!(kinds("let x"), vec![LetKw, Whitespace, Ident]);
+        assert_eq!(kinds("return"), vec![ReturnKw]);
+        assert_eq!(kinds("await x"), vec![AwaitKw, Whitespace, Ident]);
+        assert_eq!(kinds("as"), vec![Ident]);       // soft keyword stays Ident
+        assert_eq!(kinds("trueish"), vec![Ident]);  // not the `true` keyword
+        assert_eq!(kinds("_foo123"), vec![Ident]);
+    }
+
+    #[test]
     fn operators_and_numbers() {
         use SyntaxKind::*;
         assert_eq!(kinds("1 + 2"), vec![Number, Whitespace, Plus, Whitespace, Number]);
