@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod cst;
 pub mod event;
+pub mod format;
 pub mod kind;
 pub mod lexer;
 pub mod parser;
@@ -24,4 +25,9 @@ pub fn parse_to_tree(src: &str) -> crate::syntax::cst::ResolvedNode {
 /// Parse + resolve in one step (convenience for tests/tools).
 pub fn resolve_source(src: &str) -> resolve::types::ResolveResult {
     resolve::resolve(&parse_to_tree(src))
+}
+
+/// Parse + format in one step (convenience for tests/tools).
+pub fn format_tree(src: &str) -> String {
+    format::format(&parse_to_tree(src))
 }
