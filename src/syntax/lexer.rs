@@ -67,12 +67,135 @@ pub fn lex(src: &str) -> Vec<LexToken> {
             continue;
         }
 
-        // non-trivia: refined in Tasks 5-7. For now, one Error char (keeps lossless).
+        // numbers: decimal/float/hex/bin/scientific (legacy-faithful)
+        if c.is_ascii_digit() {
+            i = scan_number(&chars, i);
+            push!(SyntaxKind::Number, start, i);
+            continue;
+        }
+
+        // multi-char operators first (longest match), then single-char
+        if let Some((kind, len)) = match_operator(&chars, i) {
+            i += len;
+            push!(kind, start, i);
+            continue;
+        }
+
+        // genuinely unrecognized char (identifiers, strings, etc. handled in later tasks)
         i += 1;
         push!(SyntaxKind::Error, start, i);
     }
 
     out
+}
+
+/// Advance past a numeric literal starting at `i` (a digit). Mirrors the legacy
+/// lexer: hex/bin prefixes, decimal with `_`, a fraction only when `.` is
+/// followed by a digit (so `0..5` and `a.0` are NOT consumed as floats), and an
+/// optional exponent.
+fn scan_number(chars: &[char], mut i: usize) -> usize {
+    let n = chars.len();
+    if chars[i] == '0' && i + 1 < n && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+        i += 2;
+        while i < n && (chars[i].is_ascii_hexdigit() || chars[i] == '_') {
+            i += 1;
+        }
+        return i;
+    }
+    if chars[i] == '0' && i + 1 < n && (chars[i + 1] == 'b' || chars[i + 1] == 'B') {
+        i += 2;
+        while i < n && (chars[i] == '0' || chars[i] == '1' || chars[i] == '_') {
+            i += 1;
+        }
+        return i;
+    }
+    while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
+        i += 1;
+    }
+    if i + 1 < n && chars[i] == '.' && chars[i + 1].is_ascii_digit() {
+        i += 1;
+        while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
+            i += 1;
+        }
+    }
+    if i < n && (chars[i] == 'e' || chars[i] == 'E') {
+        let mut j = i + 1;
+        if j < n && (chars[j] == '+' || chars[j] == '-') {
+            j += 1;
+        }
+        if j < n && chars[j].is_ascii_digit() {
+            j += 1;
+            while j < n && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+        }
+    }
+    i
+}
+
+/// Longest-match operator/punctuation table → (kind, char-length). 3-char before
+/// 2-char before 1-char; `**` before `*=` to match the legacy lexer exactly.
+fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
+    use SyntaxKind::*;
+    let n = chars.len();
+    let c0 = chars[i];
+    let c1 = if i + 1 < n { Some(chars[i + 1]) } else { None };
+    let c2 = if i + 2 < n { Some(chars[i + 2]) } else { None };
+
+    match (c0, c1, c2) {
+        ('.', Some('.'), Some('=')) => return Some((DotDotEq, 3)),
+        ('.', Some('.'), Some('.')) => return Some((DotDotDot, 3)),
+        _ => {}
+    }
+    if let Some(c1) = c1 {
+        let two = match (c0, c1) {
+            ('*', '*') => Some(StarStar),
+            ('=', '=') => Some(EqEq),
+            ('!', '=') => Some(BangEq),
+            ('<', '=') => Some(Le),
+            ('>', '=') => Some(Ge),
+            ('&', '&') => Some(AmpAmp),
+            ('|', '|') => Some(PipePipe),
+            ('?', '?') => Some(QuestionQuestion),
+            ('?', '.') => Some(QuestionDot),
+            ('+', '=') => Some(PlusEq),
+            ('-', '=') => Some(MinusEq),
+            ('*', '=') => Some(StarEq),
+            ('/', '=') => Some(SlashEq),
+            ('.', '.') => Some(DotDot),
+            ('=', '>') => Some(FatArrow),
+            _ => None,
+        };
+        if let Some(k) = two {
+            return Some((k, 2));
+        }
+    }
+    let one = match c0 {
+        '+' => Plus,
+        '-' => Minus,
+        '*' => Star,
+        '/' => Slash,
+        '%' => Percent,
+        '(' => LParen,
+        ')' => RParen,
+        '{' => LBrace,
+        '}' => RBrace,
+        '[' => LBracket,
+        ']' => RBracket,
+        ',' => Comma,
+        '.' => Dot,
+        ':' => Colon,
+        ';' => Semicolon,
+        '!' => Bang,
+        '=' => Eq,
+        '<' => Lt,
+        '>' => Gt,
+        '|' => Pipe,
+        '?' => Question,
+        _ => return None,
+    };
+    Some((one, 1))
 }
 
 #[cfg(test)]
@@ -99,5 +222,50 @@ mod tests {
     fn unterminated_block_comment_is_lossless() {
         let src = "/* never closed";
         assert_eq!(render(&lex(src)), src);
+    }
+
+    #[test]
+    #[ignore = "needs identifiers from Task 6"]
+    fn operators_and_numbers() {
+        use SyntaxKind::*;
+        assert_eq!(kinds("1 + 2"), vec![Number, Whitespace, Plus, Whitespace, Number]);
+        assert_eq!(kinds("a**=b"), vec![Ident, StarStar, Eq, Ident]); // ** wins, then =
+        assert_eq!(
+            kinds("x ?? y ?. z"),
+            vec![
+                Ident, Whitespace, QuestionQuestion, Whitespace, Ident, Whitespace, QuestionDot,
+                Whitespace, Ident,
+            ]
+        );
+        assert_eq!(kinds("0..=10"), vec![Number, DotDotEq, Number]);
+        assert_eq!(kinds("a...b"), vec![Ident, DotDotDot, Ident]);
+        assert_eq!(render(&lex("3.14 + 0xFF")), "3.14 + 0xFF");
+    }
+
+    #[test]
+    fn operators_and_numbers_isolated() {
+        use SyntaxKind::*;
+        assert_eq!(kinds("1 + 2"), vec![Number, Whitespace, Plus, Whitespace, Number]);
+        assert_eq!(
+            kinds("** = =="),
+            vec![StarStar, Whitespace, Eq, Whitespace, EqEq]
+        );
+        assert_eq!(
+            kinds("?? ?. ..= ..."),
+            vec![
+                QuestionQuestion,
+                Whitespace,
+                QuestionDot,
+                Whitespace,
+                DotDotEq,
+                Whitespace,
+                DotDotDot,
+            ]
+        );
+        assert_eq!(kinds("0..=10"), vec![Number, DotDotEq, Number]);
+        assert_eq!(
+            render(&lex("3.14 + 0xFF + 0b1010 + 1_000 + 1e9")),
+            "3.14 + 0xFF + 0b1010 + 1_000 + 1e9"
+        );
     }
 }
