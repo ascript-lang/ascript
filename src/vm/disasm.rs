@@ -77,7 +77,7 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
         }
         // i16 relative jump → show the absolute target offset.
-        Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::Loop => {
+        Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpIfNotNil | Op::Loop => {
             let disp = chunk.read_i16(at + 1);
             let after = at + 1 + width;
             let target = (after as i64 + disp as i64) as usize;
@@ -165,6 +165,7 @@ fn op_name(op: Op) -> &'static str {
         Jump => "JUMP",
         JumpIfFalse => "JUMP_IF_FALSE",
         JumpIfTrue => "JUMP_IF_TRUE",
+        JumpIfNotNil => "JUMP_IF_NOT_NIL",
         Loop => "LOOP",
         Call => "CALL",
         Return => "RETURN",

@@ -21,7 +21,7 @@ Expr =
 Literal = 'number' | 'string' | 'true' | 'false' | 'nil'
 NameRef = 'ident'
 UnaryExpr = op:('-' | '!') Expr
-BinaryExpr = lhs:Expr op:('+'|'-'|'*'|'/'|'%'|'**'|'=='|'!='|'<'|'<='|'>'|'>='|'&&'|'||') rhs:Expr
+BinaryExpr = lhs:Expr op:('+'|'-'|'*'|'/'|'%'|'**'|'=='|'!='|'<'|'<='|'>'|'>='|'&&'|'||'|'??') rhs:Expr
 ParenExpr = '(' Expr ')'
 CallExpr = Expr ArgList
 ArgList = '(' Expr* ')'

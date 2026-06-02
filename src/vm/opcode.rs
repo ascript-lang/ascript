@@ -114,6 +114,11 @@ pub enum Op {
     JumpIfFalse,
     /// `JUMP_IF_TRUE(i16)` — pop TOS; jump if truthy.
     JumpIfTrue,
+    /// `JUMP_IF_NOT_NIL(i16)` — pop TOS; jump if it is NOT `nil`. Used to lower
+    /// the nil-coalescing operator `??` (jump = keep the non-nil left operand),
+    /// mirroring how `JUMP_IF_FALSE`/`JUMP_IF_TRUE` lower `&&`/`||`. Reusable by
+    /// later control-flow slices.
+    JumpIfNotNil,
     /// `LOOP(i16)` — unconditional backward relative jump (negative displacement).
     Loop,
 
@@ -226,6 +231,7 @@ impl Op {
             x if x == Jump as u8 => Jump,
             x if x == JumpIfFalse as u8 => JumpIfFalse,
             x if x == JumpIfTrue as u8 => JumpIfTrue,
+            x if x == JumpIfNotNil as u8 => JumpIfNotNil,
             x if x == Loop as u8 => Loop,
 
             x if x == Call as u8 => Call,
@@ -273,7 +279,7 @@ impl Op {
             | Class | Method | GetSuper | Template | Import => 2,
 
             // i16-operand (jump) ops.
-            Jump | JumpIfFalse | JumpIfTrue | Loop => 2,
+            Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
 
             // u8-operand ops.
             Call => 1,
@@ -336,6 +342,7 @@ mod tests {
         Op::Jump,
         Op::JumpIfFalse,
         Op::JumpIfTrue,
+        Op::JumpIfNotNil,
         Op::Loop,
         Op::Call,
         Op::Return,

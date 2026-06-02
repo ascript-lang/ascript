@@ -368,3 +368,90 @@ async fn vm_operator_errors_match_treewalker() {
         assert_vm_error_matches_treewalker(expr).await;
     }
 }
+
+// ---- short-circuit `&&` / `||` / `??` (V2-T6) ---------------------------
+
+#[tokio::test]
+async fn vm_short_circuit_result_values_match_treewalker() {
+    // The tree-walker returns the actual OPERAND (JS-like), not a coerced bool.
+    // `&&`: truthy left -> right; falsy left -> the (falsy) left value.
+    // `||`: truthy left -> left;  falsy left -> right.
+    // `??`: nil left   -> right;  non-nil left -> left.
+    // AScript truthiness: only `nil` and `false` are falsy; `0` and `""` are
+    // TRUTHY (so `0 || 9` is `0`, `"" || "x"` is `""`).
+    let cases = [
+        "true && 5",
+        "false && 5",
+        "true || 5",
+        "false || 5",
+        "nil ?? 7",
+        "5 ?? 7",
+        "0 || 9",      // 0 is truthy -> 0
+        "0 && 9",      // 0 is truthy -> 9
+        "\"\" || \"x\"", // "" is truthy -> ""
+        "\"\" && \"x\"", // "" is truthy -> "x"
+        "nil && 1",    // nil is falsy -> nil
+        "nil || 1",    // nil is falsy -> 1
+        "false ?? 7",  // false is non-nil -> false
+        "nil ?? nil",  // -> nil
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_short_circuit_chained_match_treewalker() {
+    let cases = [
+        "true && true && 3",
+        "true && false && 3",
+        "false || false || 7",
+        "false || true || 7",
+        "nil ?? nil ?? 3",
+        "nil ?? 2 ?? 3",
+        // mixed precedence / interaction with other operators
+        "1 + 2 == 3 && 9",
+        "true && 1 + 2",
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_short_circuit_does_not_evaluate_rhs() {
+    // PROVE the RHS is not evaluated when the operator short-circuits: the RHS
+    // has an observable side effect (a `print`). Both engines must print ONLY
+    // `done`, never `ran`. The short-circuit expression is bound with `let` so
+    // it begins its own statement (a bare leading `(` would otherwise glue onto
+    // the previous line as a call — an ASI quirk unrelated to this feature).
+    let programs = [
+        // `&&`: left is falsy -> RHS print skipped.
+        "let cond = false\nlet r = cond && print(\"ran\")\nprint(\"done\")",
+        // `||`: left is truthy -> RHS print skipped.
+        "let cond = true\nlet r = cond || print(\"ran\")\nprint(\"done\")",
+        // `??`: left is non-nil -> RHS print skipped.
+        "let r = 5 ?? print(\"ran\")\nprint(\"done\")",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_short_circuit_does_evaluate_rhs_when_needed() {
+    // The complementary case: when NOT short-circuited the RHS print runs, so
+    // both engines print `ran` then `done`. Guards against a lowering that
+    // wrongly skips the RHS.
+    let programs = [
+        // `&&`: left truthy -> RHS runs.
+        "let cond = true\nlet r = cond && print(\"ran\")\nprint(\"done\")",
+        // `||`: left falsy -> RHS runs.
+        "let cond = false\nlet r = cond || print(\"ran\")\nprint(\"done\")",
+        // `??`: left nil -> RHS runs.
+        "let r = nil ?? print(\"ran\")\nprint(\"done\")",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}

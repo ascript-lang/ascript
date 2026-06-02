@@ -215,6 +215,50 @@ impl Vm {
                     fiber.push(Value::Str(out.into()));
                 }
 
+                Op::Jump => {
+                    // Unconditional relative jump. The displacement is measured
+                    // from the byte AFTER the operand to the target (see
+                    // `Chunk::patch_jump`/`emit_loop`). At this point we have
+                    // already advanced `ip` past the opcode and its 2-byte
+                    // operand, so `fiber.frame().ip == operand_at + 2` is exactly
+                    // that base; add the signed displacement to land on target.
+                    let disp = fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                    let base = fiber.frame().ip as isize;
+                    fiber.frame_mut().ip = (base + disp as isize) as usize;
+                }
+                Op::JumpIfFalse => {
+                    // Pop the tested value; jump iff it is falsy. Short-circuit
+                    // lowering `DUP`s the operand beforehand so the un-tested copy
+                    // survives as the expression's result when we jump.
+                    let v = fiber.pop();
+                    if !v.is_truthy() {
+                        let disp = fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+                Op::JumpIfTrue => {
+                    // Pop the tested value; jump iff it is truthy.
+                    let v = fiber.pop();
+                    if v.is_truthy() {
+                        let disp = fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+                Op::JumpIfNotNil => {
+                    // Pop the tested value; jump iff it is NOT `nil`. Mirrors the
+                    // tree-walker's `??` test (`l == Value::Nil` selects the RHS;
+                    // anything else keeps the left), so the jump fires on "keep
+                    // the non-nil left operand".
+                    let v = fiber.pop();
+                    if v != Value::Nil {
+                        let disp = fiber.frame().closure.proto.chunk.read_i16(operand_at);
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+
                 Op::Return => {
                     let result = fiber.pop();
                     return Ok(RunOutcome::Done(result));
@@ -697,12 +741,13 @@ mod tests {
 
     #[test]
     fn unimplemented_op_panics() {
-        // JUMP is not implemented in the V1 subset.
+        // `AWAIT` is not implemented until a later VM slice; an unimplemented op
+        // must surface a span-carrying "not yet implemented" Tier-2 panic.
+        // (JUMP/JUMP_IF_*/JUMP_IF_NOT_NIL are now implemented as of V2-T6.)
         let mut c = Chunk::new();
-        let jump_span = Span::new(2, 4);
-        let site = c.emit_jump(Op::Jump, jump_span);
-        c.patch_jump(site);
+        let await_span = Span::new(2, 4);
         c.emit(Op::Nil, s());
+        c.emit(Op::Await, await_span);
         c.emit(Op::Return, s());
         match run_chunk(c) {
             Err(Control::Panic(e)) => {
@@ -711,9 +756,87 @@ mod tests {
                     "message was: {}",
                     e.message
                 );
-                assert_eq!(e.span, Some(jump_span));
+                assert_eq!(e.span, Some(await_span));
             }
             other => panic!("expected Panic, got {other:?}"),
         }
+    }
+
+    // ---- jump exec arms (V2-T6) -------------------------------------------
+
+    #[test]
+    fn jump_skips_intervening_code() {
+        // NIL is pushed, then an unconditional JUMP hops over a CONST 999, so the
+        // result is `nil` (proving the jump landed past the skipped push).
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s());
+        let site = c.emit_jump(Op::Jump, s());
+        let k = c.add_const(Value::Number(999.0));
+        c.emit_u16(Op::Const, k, s()); // skipped
+        c.patch_jump(site); // land here, leaving only NIL
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Nil) => {}
+            other => panic!("expected Done(Nil), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jump_if_false_pops_and_branches_on_falsy() {
+        // FALSE on the stack -> JUMP_IF_FALSE pops it and jumps; the CONST 1 in
+        // between is skipped, so RETURN sees the trailing CONST 2.
+        let mut c = Chunk::new();
+        c.emit(Op::False, s());
+        let site = c.emit_jump(Op::JumpIfFalse, s());
+        let k1 = c.add_const(Value::Number(1.0));
+        c.emit_u16(Op::Const, k1, s()); // skipped (would otherwise be the result)
+        c.patch_jump(site);
+        let k2 = c.add_const(Value::Number(2.0));
+        c.emit_u16(Op::Const, k2, s());
+        c.emit(Op::Return, s());
+        assert_eq!(expect_number(c), 2.0);
+    }
+
+    #[test]
+    fn jump_if_true_pops_and_falls_through_on_falsy() {
+        // FALSE -> JUMP_IF_TRUE pops, does NOT jump, falls through to CONST 7.
+        let mut c = Chunk::new();
+        c.emit(Op::False, s());
+        let site = c.emit_jump(Op::JumpIfTrue, s());
+        let k7 = c.add_const(Value::Number(7.0));
+        c.emit_u16(Op::Const, k7, s()); // executed (no jump)
+        c.emit(Op::Return, s());
+        c.patch_jump(site); // target is past RETURN; never reached
+        assert_eq!(expect_number(c), 7.0);
+    }
+
+    #[test]
+    fn jump_if_not_nil_pops_and_branches_on_non_nil() {
+        // CONST 5 (non-nil) -> JUMP_IF_NOT_NIL pops & jumps over CONST 1; RETURN
+        // sees the trailing CONST 2.
+        let mut c = Chunk::new();
+        let k5 = c.add_const(Value::Number(5.0));
+        c.emit_u16(Op::Const, k5, s());
+        let site = c.emit_jump(Op::JumpIfNotNil, s());
+        let k1 = c.add_const(Value::Number(1.0));
+        c.emit_u16(Op::Const, k1, s()); // skipped
+        c.patch_jump(site);
+        let k2 = c.add_const(Value::Number(2.0));
+        c.emit_u16(Op::Const, k2, s());
+        c.emit(Op::Return, s());
+        assert_eq!(expect_number(c), 2.0);
+    }
+
+    #[test]
+    fn jump_if_not_nil_falls_through_on_nil() {
+        // NIL -> JUMP_IF_NOT_NIL pops, does NOT jump, falls through to CONST 9.
+        let mut c = Chunk::new();
+        c.emit(Op::Nil, s());
+        let site = c.emit_jump(Op::JumpIfNotNil, s());
+        let k9 = c.add_const(Value::Number(9.0));
+        c.emit_u16(Op::Const, k9, s()); // executed (no jump)
+        c.emit(Op::Return, s());
+        c.patch_jump(site); // never reached
+        assert_eq!(expect_number(c), 9.0);
     }
 }

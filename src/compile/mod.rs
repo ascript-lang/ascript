@@ -50,6 +50,22 @@ fn range_span(node: &crate::syntax::cst::ResolvedNode) -> Span {
     Span::new(usize::from(range.start()), usize::from(range.end()))
 }
 
+/// Map a short-circuiting binary operator to the conditional-jump opcode whose
+/// "fires" condition is "the left operand already decides the result, keep it".
+/// Returns `None` for ordinary (both-operands-evaluated) binary operators.
+///
+/// - `&&` keeps the left when it is FALSY -> `JUMP_IF_FALSE`.
+/// - `||` keeps the left when it is TRUTHY -> `JUMP_IF_TRUE`.
+/// - `??` keeps the left when it is NON-NIL -> `JUMP_IF_NOT_NIL`.
+fn short_circuit_op(op: SyntaxKind) -> Option<Op> {
+    match op {
+        SyntaxKind::AmpAmp => Some(Op::JumpIfFalse),
+        SyntaxKind::PipePipe => Some(Op::JumpIfTrue),
+        SyntaxKind::QuestionQuestion => Some(Op::JumpIfNotNil),
+        _ => None,
+    }
+}
+
 /// Compile `src` into a top-level [`Chunk`].
 ///
 /// Pipeline: `parse_to_tree` → `SourceFile::cast` → `resolve` (wired so the full
@@ -464,6 +480,32 @@ impl Compiler {
         let op = bin
             .op()
             .ok_or_else(|| CompileError::new("binary expression missing operator", span))?;
+
+        // `&&`/`||`/`??` short-circuit: the right operand must NOT be evaluated
+        // when the left already decides the result, and the result is the actual
+        // OPERAND value (JS-like), not a coerced bool — exactly the tree-walker's
+        // `BinOp::And`/`Or`/`Coalesce` arms. Lower each as a `Dup` + conditional
+        // jump that POPS the tested copy, leaving precisely one value on the stack:
+        //
+        //   a && b: a; DUP; jf=JF; POP; b; patch(jf)
+        //     - a falsy:  JF pops the dup, jumps to end leaving the falsy `a`.
+        //     - a truthy: JF pops the dup, falls through; POP discards `a`; eval b.
+        //   a || b: a; DUP; jt=JT; POP; b; patch(jt)
+        //     - a truthy: JT pops the dup, jumps to end leaving `a`.
+        //     - a falsy:  JT pops the dup, falls through; POP discards `a`; eval b.
+        //   a ?? b: a; DUP; jnn=JNN; POP; b; patch(jnn)
+        //     - a non-nil: JNN pops the dup, jumps to end leaving `a`.
+        //     - a nil:     JNN pops the dup, falls through; POP discards `a`; eval b.
+        if let Some(jop) = short_circuit_op(op) {
+            self.compile_expr(&lhs)?;
+            self.chunk.emit(Op::Dup, span);
+            let skip = self.chunk.emit_jump(jop, span);
+            self.chunk.emit(Op::Pop, span);
+            self.compile_expr(&rhs)?;
+            self.chunk.patch_jump(skip);
+            return Ok(());
+        }
+
         self.compile_expr(&lhs)?;
         self.compile_expr(&rhs)?;
         let bytecode = match op {
@@ -479,8 +521,8 @@ impl Compiler {
             SyntaxKind::Ge => Op::Ge,
             SyntaxKind::EqEq => Op::Eq,
             SyntaxKind::BangEq => Op::Ne,
-            // `&&`/`||`/`??` short-circuit and are lowered to jumps, not a single
-            // binary opcode — that is V2-T6, not this task.
+            // `&&`/`||`/`??` are handled by the short-circuit path above (they
+            // never reach this non-short-circuit dispatch).
             other => {
                 return Err(CompileError::new(
                     format!("binary operator {other:?} not yet supported in V2"),
@@ -766,13 +808,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_binary_operator() {
-        // Short-circuit `&&`/`||`/`??` are lowered to jumps (V2-T6), not a single
-        // binary opcode, so they are still unsupported in this slice.
-        let err = compile_source("1 && 2").unwrap_err();
-        assert!(err.message.contains("not yet supported"), "got {err:?}");
-        let err = compile_source("1 || 2").unwrap_err();
-        assert!(err.message.contains("not yet supported"), "got {err:?}");
+    fn short_circuit_operators_lower_to_jumps() {
+        // V2-T6: `&&`/`||`/`??` short-circuit via a `DUP` + conditional jump +
+        // `POP`, NOT a single binary opcode. Assert the expected jump mnemonic
+        // appears (and that there is exactly one DUP + one POP per operator).
+        for (src, jump_mnemonic) in [
+            ("1 && 2", "JUMP_IF_FALSE"),
+            ("1 || 2", "JUMP_IF_TRUE"),
+            ("1 ?? 2", "JUMP_IF_NOT_NIL"),
+        ] {
+            let chunk = compile_source(src).expect("compiles");
+            let text = disasm(&chunk);
+            assert!(
+                text.contains(jump_mnemonic),
+                "missing {jump_mnemonic} for `{src}` in:\n{text}"
+            );
+            let dups = text.lines().filter(|l| l.contains("DUP")).count();
+            let pops = text.lines().filter(|l| l.contains(" POP")).count();
+            assert_eq!(dups, 1, "expected exactly one DUP for `{src}` in:\n{text}");
+            assert_eq!(pops, 1, "expected exactly one POP for `{src}` in:\n{text}");
+        }
     }
 
     #[test]
