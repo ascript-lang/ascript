@@ -519,19 +519,22 @@ async fn vm_run_sync_multi_feature_programs() {
 /// V3 qualifiers (added now that the VM supports control flow): examples that
 /// also use `if`/`else`/`while`/`for (i in a..b)`/`for (x of …)`/ternary, but
 /// STILL contain NO `fn`, `match`, `class`/`enum`, `import`, async/await,
-/// generators, `?`/`!`/recover, destructuring/spread, compound assignment
-/// (`+=`/`-=`/`*=`/`/=`, deferred to V9), OR `for (x in name)` over a NAME bound
-/// to a range/array value (the VM's V3 for-range slice only compiles a LITERAL
-/// `a..b` range head; an iterator-based `for…in <value>` is the still-unsupported
-/// for-of path). Deliberately EXCLUDED for those reasons:
+/// generators, `?`/`!`/recover, destructuring/spread, OR compound assignment
+/// (`+=`/`-=`/`*=`/`/=`, deferred to V9). NOTE: `for (i in <value>)` over a NAME
+/// bound to a range/array value now qualifies — the VM routes `in` over a
+/// non-`RangeExpr` to the for-of path (matching the legacy parser's `in` overload),
+/// so a range-VALUE for-in iterates fine (V3-T4b). Deliberately EXCLUDED for those
+/// reasons:
 ///   - `factorial.as` — uses `*=`.
 ///   - `data.as`      — uses `+=`.
-///   - `ranges.as`    — uses `for (i in r)` over a range VALUE (not a literal head).
 const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     "examples/hello.as",   // `print(1 + 2 * 3)` — literals + arithmetic + print.
     "examples/numbers.as", // numeric-literal forms bound to locals, then printed.
     // V3 control-flow qualifier:
     "examples/strings.as", // string literals + escapes through print.
+    // V3-T4b: range/array VALUE for-in (`for (i in r)`) routes to for-of; also uses
+    // `let` w/o initializer, typed decl, `len`, and a literal-range for-in.
+    "examples/ranges.as",
 ];
 
 #[tokio::test]
@@ -969,6 +972,74 @@ async fn vm_for_of_not_iterable_error_matches_treewalker() {
                 assert_eq!(
                     tw_err.span, vm_err.span,
                     "for-of not-iterable panic span diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                    tw_err.span, vm_err.span
+                );
+            }
+            (tw, vm) => panic!(
+                "expected BOTH engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+            ),
+        }
+    }
+}
+
+// ----- V3-T4b: `for (i in value)` routes to for-of (legacy `in` overload) ------
+
+#[tokio::test]
+async fn vm_for_in_over_value_matches_treewalker() {
+    // The legacy parser OVERLOADS `for ... in ...`: `in` + a LITERAL `a..b` range
+    // uses the lazy range loop; `in` over any OTHER value falls back to ForOf and
+    // iterates the resulting value (src/parser.rs `Tok::In` arm). The VM must mirror
+    // that overload: `in` + non-`RangeExpr` is a sync for-of, byte-identical to the
+    // tree-walker. `..` itself produces a `Value::Array`, so `for (i in r)` where `r`
+    // is a range VALUE iterates that array's elements.
+    let cases = [
+        // `in` over a NAME bound to a range VALUE -> iterate elements 0,1,2.
+        "let r = 0..3\nfor (i in r) { print(i) }",
+        // `in` over a NAME bound to an array literal -> 10,20.
+        "let xs = [10, 20]\nfor (i in xs) { print(i) }",
+        // `in` over a NAME bound to a string -> chars a,b,c.
+        "let s = \"abc\"\nfor (c in s) { print(c) }",
+        // `in` directly over an array literal (non-range expr) -> 1,2,3.
+        "for (i in [1, 2, 3]) { print(i) }",
+        // accumulate over a range value: 0+1+2+3+4 = 10 (mirrors examples/ranges.as).
+        "let r = 0..5\nlet total = 0\nfor (i in r) { total = total + i }\nprint(total)",
+        // REGRESSION: `in` + a LITERAL range still uses the lazy range loop -> 0,1,2.
+        "for (i in 0..3) { print(i) }",
+        // REGRESSION: empty range value -> no output.
+        "let r = 0..0\nfor (i in r) { print(i) }\nprint(\"done\")",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_for_in_over_non_iterable_value_matches_treewalker() {
+    // `in` over a non-`RangeExpr`, non-iterable value goes through the for-of path
+    // and raises the SAME Tier-2 panic (`value of type {t} is not iterable`) at the
+    // SAME span on both engines.
+    for (src, expected) in [
+        ("for (i in 5) { print(i) }", "value of type number is not iterable"),
+        ("let n = 5\nfor (i in n) { print(i) }", "value of type number is not iterable"),
+        ("for (i in true) { print(i) }", "value of type bool is not iterable"),
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        match (tw, vm) {
+            (Err(tw_err), Err(vm_err)) => {
+                assert_eq!(
+                    tw_err.message, vm_err.message,
+                    "for-in not-iterable panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                    tw_err.message, vm_err.message
+                );
+                assert_eq!(
+                    tw_err.message, expected,
+                    "unexpected message for `{src}`: {:?}",
+                    tw_err.message
+                );
+                assert_eq!(
+                    tw_err.span, vm_err.span,
+                    "for-in not-iterable panic span diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
                     tw_err.span, vm_err.span
                 );
             }

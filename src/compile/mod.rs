@@ -645,26 +645,19 @@ impl Compiler {
             .iter()
             .ok_or_else(|| CompileError::new("for statement missing iterable/start bound", span))?;
 
-        // `of` → sync for-of (snapshot iteration over Array/Str). The iterable can
-        // be any expression (array literal, name, even a `RangeExpr` that builds
-        // the range array).
-        if for_stmt.op() == Some(SyntaxKind::OfKw) {
-            return self.compile_for_of(for_stmt, &iter, &body);
-        }
-
+        // The legacy parser OVERLOADS `for ... in ...`: only `in` + a LITERAL
+        // `RangeExpr` lowers to the allocation-free lazy range loop; `in` over any
+        // OTHER value (an array, a range VALUE bound to a name, etc.) falls back to
+        // ForOf and iterates the resulting value (src/parser.rs `Tok::In` arm). So
+        // the ONLY range-for case here is `in` + a `RangeExpr`; `of`, and `in` over
+        // a non-`RangeExpr`, are both sync for-of (snapshot iteration over
+        // Array/Str). The iterable can be any expression (array literal, name, even
+        // a `RangeExpr` that builds the range array via `of`).
         let is_in = for_stmt.op() == Some(SyntaxKind::InKw);
-        let Expr::RangeExpr(range) = &iter else {
-            return Err(CompileError::new(
-                "for-of (iterator-based for) not yet supported (V3-T4)",
-                span,
-            ));
+        let range = match &iter {
+            Expr::RangeExpr(range) if is_in => range,
+            _ => return self.compile_for_of(for_stmt, &iter, &body),
         };
-        if !is_in {
-            return Err(CompileError::new(
-                "for-of (iterator-based for) not yet supported (V3-T4)",
-                span,
-            ));
-        }
 
         // Inclusive `..=` for-range is rejected by the legacy parser (the oracle),
         // so the VM rejects it too — never silently treat it as exclusive.
