@@ -11,8 +11,8 @@
 use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_template_body};
 use crate::span::Span;
 use crate::syntax::ast::{
-    ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, CallExpr, Expr, IndexExpr, LetStmt, Literal,
-    MemberExpr, NameRef, ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, SourceFile, Stmt,
+    ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, CallExpr, Expr, IfStmt, IndexExpr, LetStmt,
+    Literal, MemberExpr, NameRef, ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, SourceFile, Stmt,
     TemplateExpr, UnaryExpr,
 };
 use crate::syntax::kind::SyntaxKind;
@@ -307,11 +307,61 @@ impl Compiler {
         match stmt {
             Stmt::LetStmt(let_stmt) => self.compile_let(let_stmt),
             Stmt::Block(block) => self.compile_block(block),
+            Stmt::IfStmt(if_stmt) => self.compile_if(if_stmt),
             other => Err(CompileError::new(
                 "statement kind not yet supported in V2",
                 stmt_span(other),
             )),
         }
+    }
+
+    /// Compile an `if` / `else if` / `else` statement. `if` is a *statement* — it
+    /// produces no value and leaves nothing extra on the stack. Mirrors the
+    /// tree-walker's `Stmt::If`: evaluate the condition, run the then-branch when
+    /// truthy, else run the else-branch (which is another `if` for `else if`, a
+    /// `Block` for a plain `else`, or absent).
+    ///
+    /// Lowering:
+    /// ```text
+    ///   <cond>
+    ///   jf = JUMP_IF_FALSE   ; pops cond; jumps to the else target when falsy
+    ///   <then block>
+    ///   je = JUMP             ; skip the else branch
+    ///   patch(jf)             ; else target
+    ///   <else branch?>        ; else Block, or recursively the `else if` IfStmt
+    ///   patch(je)             ; end
+    /// ```
+    /// `JUMP_IF_FALSE` already pops the tested condition, and each inner statement
+    /// is self-balancing (expression statements `POP` their value), so the `if`
+    /// leaves the stack exactly as it found it.
+    fn compile_if(&mut self, if_stmt: &IfStmt) -> Result<(), CompileError> {
+        let span = node_span(if_stmt);
+        let cond = if_stmt
+            .cond()
+            .ok_or_else(|| CompileError::new("if statement missing condition", span))?;
+        let then_block = if_stmt
+            .then()
+            .ok_or_else(|| CompileError::new("if statement missing then-branch", span))?;
+
+        self.compile_expr(&cond)?;
+        // Jump over the then-branch to the else target when the condition is falsy
+        // (JUMP_IF_FALSE pops the condition either way).
+        let jf = self.chunk.emit_jump(Op::JumpIfFalse, span);
+        self.compile_block(&then_block)?;
+        // After the then-branch, skip the else branch.
+        let je = self.chunk.emit_jump(Op::Jump, span);
+        // Else target: when the condition was falsy we land here.
+        self.chunk.patch_jump(jf);
+        // The else branch is at most one of: an `else if` (chained IfStmt) or a
+        // plain `else { ... }` block. The grammar makes these mutually exclusive.
+        if let Some(elif) = if_stmt.if_stmt() {
+            self.compile_if(&elif)?;
+        } else if let Some(else_block) = if_stmt.block() {
+            self.compile_block(&else_block)?;
+        }
+        // End: both the then-branch and the else branch converge here.
+        self.chunk.patch_jump(je);
+        Ok(())
     }
 
     /// Compile a `let`/`const` declaration: evaluate the initializer (or push

@@ -606,6 +606,53 @@ async fn vm_opt_member_read_matches_treewalker() {
     }
 }
 
+// ----- V3-T1: if / else if / else ---------------------------------------------
+
+#[tokio::test]
+async fn vm_if_statement_matches_treewalker() {
+    // The tree-walker (the differential oracle) requires parenthesized
+    // conditions: `if (cond) { ... }`. The CST front-end accepts the same form
+    // (the cond is a ParenExpr the compiler transparently unwraps).
+    let cases = [
+        // bare if, condition true → body runs.
+        "if (true) { print(\"yes\") }",
+        // bare if, condition false → body skipped, no output.
+        "if (false) { print(\"no\") }",
+        // if/else, then-branch taken.
+        "let x = 5\nif (x > 3) { print(\"big\") } else { print(\"small\") }",
+        // if/else, else-branch taken.
+        "let x = 1\nif (x > 3) { print(\"big\") } else { print(\"small\") }",
+        // else if chain → middle arm taken.
+        "let x = 2\nif (x == 1) { print(\"one\") } else if (x == 2) { print(\"two\") } else { print(\"other\") }",
+        // else if chain → first arm taken.
+        "let x = 1\nif (x == 1) { print(\"one\") } else if (x == 2) { print(\"two\") } else { print(\"other\") }",
+        // else if chain → final else taken.
+        "let x = 9\nif (x == 1) { print(\"one\") } else if (x == 2) { print(\"two\") } else { print(\"other\") }",
+        // longer else-if chain (multiple `else if`).
+        "let x = 3\nif (x == 1) { print(\"a\") } else if (x == 2) { print(\"b\") } else if (x == 3) { print(\"c\") } else { print(\"d\") }",
+        // if between other statements: stack must stay balanced.
+        "print(\"a\")\nif (true) { print(\"b\") }\nprint(\"c\")",
+        // if with a block-scoped let inside the body.
+        "if (true) { let y = 10\n print(y) }",
+        // nested ifs.
+        "let x = 5\nif (x > 0) { if (x > 3) { print(\"both\") } else { print(\"only-positive\") } }",
+        // nested ifs, inner false.
+        "let x = 2\nif (x > 0) { if (x > 3) { print(\"both\") } else { print(\"only-positive\") } }",
+        // truthiness: a non-bool condition follows is_truthy (0 is truthy, only
+        // nil/false are falsy in AScript).
+        "if (0) { print(\"zero-truthy\") }",
+        "if (\"\") { print(\"empty-str-truthy\") }",
+        "if (nil) { print(\"nil\") } else { print(\"nil-falsy\") }",
+        // if statement followed by a trailing expression value (program value).
+        "let x = 7\nif (x > 5) { print(\"hi\") }\nx",
+        // else-only side-effect, with a trailing read proving locals survive.
+        "let n = 0\nif (false) { n = 1 } else { n = 2 }\nprint(n)",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
 #[tokio::test]
 async fn vm_short_circuit_does_evaluate_rhs_when_needed() {
     // The complementary case: when NOT short-circuited the RHS print runs, so
