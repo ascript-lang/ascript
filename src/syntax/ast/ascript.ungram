@@ -17,6 +17,7 @@ Expr =
   | MemberExpr | IndexExpr | ArrowExpr | AssignExpr
   | ArrayExpr | ObjectExpr | TemplateExpr | OptMemberExpr
   | TryExpr | UnwrapExpr | TernaryExpr | AwaitExpr | YieldExpr | MatchExpr
+  | RangeExpr
 Literal = 'number' | 'string' | 'true' | 'false' | 'nil'
 NameRef = 'ident'
 UnaryExpr = op:('-' | '!') Expr

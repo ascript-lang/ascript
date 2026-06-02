@@ -103,6 +103,9 @@ pub enum Op {
     Gt,
     /// `a b -- (a >= b)`.
     Ge,
+    /// `a b -- [a, a+1, .. b)` — eager half-open `array<number>` (step 1). Mirrors
+    /// the tree-walker's `BinOp::Range`; both bounds must be `Number`.
+    Range,
 
     // ---- control flow -----------------------------------------------------
     /// `JUMP(i16)` — unconditional relative jump.
@@ -218,6 +221,7 @@ impl Op {
             x if x == Le as u8 => Le,
             x if x == Gt as u8 => Gt,
             x if x == Ge as u8 => Ge,
+            x if x == Range as u8 => Range,
 
             x if x == Jump as u8 => Jump,
             x if x == JumpIfFalse as u8 => JumpIfFalse,
@@ -276,8 +280,9 @@ impl Op {
 
             // Zero-operand ops.
             Nil | True | False | Pop | Dup | Add | Sub | Mul | Div | Mod | Pow | Neg | Not
-            | Eq | Ne | Lt | Le | Gt | Ge | Return | Spread | GetIndex | SetIndex | InstanceOf
-            | Await | Yield | MakeGenerator | Propagate | Unwrap | GetIter | IterNext => 0,
+            | Eq | Ne | Lt | Le | Gt | Ge | Range | Return | Spread | GetIndex | SetIndex
+            | InstanceOf | Await | Yield | MakeGenerator | Propagate | Unwrap | GetIter
+            | IterNext => 0,
         }
     }
 
@@ -327,6 +332,7 @@ mod tests {
         Op::Le,
         Op::Gt,
         Op::Ge,
+        Op::Range,
         Op::Jump,
         Op::JumpIfFalse,
         Op::JumpIfTrue,

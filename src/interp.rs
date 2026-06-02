@@ -1319,14 +1319,7 @@ impl Interp {
             }
             ExprKind::Unary { op, expr: operand } => {
                 let v = self.eval_expr(operand, env).await?;
-                match op {
-                    UnOp::Neg => match v {
-                        Value::Number(n) => Ok(Value::Number(-n)),
-                        Value::Decimal(d) => Ok(Value::Decimal(-d)),
-                        _ => Err(AsError::at("cannot negate a non-number", operand.span).into()),
-                    },
-                    UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
-                }
+                apply_unop(*op, v, operand.span)
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 match op {
@@ -1360,140 +1353,9 @@ impl Interp {
                 let l = self.eval_expr(lhs, env).await?;
                 let r = self.eval_expr(rhs, env).await?;
 
-                // Eq/Ne: cross-type Decimal↔Number comparison before generic `==`.
-                match op {
-                    BinOp::Eq => {
-                        let eq = decimal_cross_eq(&l, &r, expr.span)?;
-                        return Ok(Value::Bool(eq));
-                    }
-                    BinOp::Ne => {
-                        let eq = decimal_cross_eq(&l, &r, expr.span)?;
-                        return Ok(Value::Bool(!eq));
-                    }
-                    _ => {}
-                }
-
-                // Range `a..b`: eager, half-open `array<number>` with step 1,
-                // matching ForRange and the `range()` builtin. Returns an Array,
-                // so it must be handled before the generic "two numbers → Number"
-                // path below.
-                if let BinOp::Range = op {
-                    let (start, end) = match (&l, &r) {
-                        (Value::Number(a), Value::Number(b)) => (*a, *b),
-                        _ => {
-                            return Err(
-                                AsError::at("range bounds must be numbers", expr.span).into()
-                            )
-                        }
-                    };
-                    let mut items = Vec::new();
-                    let mut i = start;
-                    while i < end {
-                        items.push(Value::Number(i));
-                        i += 1.0;
-                    }
-                    return Ok(Value::Array(Rc::new(RefCell::new(items))));
-                }
-
-                // String concatenation: `+` joins two strings.
-                if let BinOp::Add = op {
-                    if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
-                        return Ok(Value::Str(format!("{}{}", a, b).into()));
-                    }
-                }
-
-                // Decimal arithmetic/comparison: triggered when either operand is
-                // Decimal. The other side is coerced (Number→Decimal; non-finite→
-                // Tier-2 panic; non-number/non-decimal → fall through to error).
-                if matches!((&l, &r), (Value::Decimal(_), _) | (_, Value::Decimal(_))) {
-                    use crate::stdlib::decimal::coerce_to_decimal;
-                    let da = coerce_to_decimal(&l, expr.span)?;
-                    let db = coerce_to_decimal(&r, expr.span)?;
-                    if let (Some(a), Some(b)) = (da, db) {
-                        let result = match op {
-                            BinOp::Add => Value::Decimal(a + b),
-                            BinOp::Sub => Value::Decimal(a - b),
-                            BinOp::Mul => Value::Decimal(a * b),
-                            BinOp::Div => {
-                                if b.is_zero() {
-                                    return Err(AsError::at(
-                                        "decimal division by zero",
-                                        expr.span,
-                                    )
-                                    .into());
-                                }
-                                Value::Decimal(a / b)
-                            }
-                            BinOp::Mod => {
-                                if b.is_zero() {
-                                    return Err(AsError::at(
-                                        "decimal remainder by zero",
-                                        expr.span,
-                                    )
-                                    .into());
-                                }
-                                Value::Decimal(a % b)
-                            }
-                            // Ordering: both operands are already finite Decimals
-                            // here (coerce_to_decimal above Tier-2-panics on a
-                            // non-finite Number). This is the INTENTIONAL asymmetry
-                            // vs equality: `decimal == Infinity` is a lenient `false`
-                            // (decimal_cross_eq), but `decimal < Infinity` panics —
-                            // there is no sensible order. See decimal_cross_eq's doc.
-                            BinOp::Lt => Value::Bool(a < b),
-                            BinOp::Le => Value::Bool(a <= b),
-                            BinOp::Gt => Value::Bool(a > b),
-                            BinOp::Ge => Value::Bool(a >= b),
-                            // Pow: not defined for Decimal — fall through to error.
-                            BinOp::Pow => {
-                                return Err(AsError::at(
-                                    "exponentiation (**) is not supported for decimal; use math.pow or convert to number",
-                                    expr.span,
-                                )
-                                .into())
-                            }
-                            BinOp::Eq
-                            | BinOp::Ne
-                            | BinOp::And
-                            | BinOp::Or
-                            | BinOp::Coalesce
-                            | BinOp::Range => unreachable!("handled above"),
-                        };
-                        return Ok(result);
-                    }
-                    // One operand was not a number or decimal — fall through to the
-                    // generic "operator requires two numbers or decimals" error.
-                }
-
-                let (a, b) = match (&l, &r) {
-                    (Value::Number(a), Value::Number(b)) => (*a, *b),
-                    _ => return Err(AsError::at(
-                        "operator requires two numbers (or two decimals, or number and decimal)",
-                        expr.span,
-                    )
-                    .into()),
-                };
-                let result = match op {
-                    BinOp::Add => Value::Number(a + b),
-                    BinOp::Sub => Value::Number(a - b),
-                    BinOp::Mul => Value::Number(a * b),
-                    BinOp::Div => Value::Number(a / b),
-                    BinOp::Mod => Value::Number(a % b),
-                    BinOp::Pow => Value::Number(a.powf(b)),
-                    BinOp::Lt => Value::Bool(a < b),
-                    BinOp::Le => Value::Bool(a <= b),
-                    BinOp::Gt => Value::Bool(a > b),
-                    BinOp::Ge => Value::Bool(a >= b),
-                    BinOp::Eq
-                    | BinOp::Ne
-                    | BinOp::And
-                    | BinOp::Or
-                    | BinOp::Coalesce
-                    | BinOp::Range => {
-                        unreachable!("handled above")
-                    }
-                };
-                Ok(result)
+                // All non-short-circuit operators (string concat / decimal / range
+                // / cross-type equality / numeric) share ONE dispatch with the VM.
+                apply_binop(*op, l, r, expr.span)
             }
             ExprKind::Arrow {
                 params,
@@ -3055,6 +2917,159 @@ impl Interp {
             _ => Err(AsError::at("invalid assignment target", target.span).into()),
         }
     }
+}
+
+/// Pure unary-operator dispatch shared by the tree-walker (`ExprKind::Unary`) and
+/// the bytecode VM (`Op::Neg`/`Op::Not`). `span` anchors the Tier-2 panic so both
+/// engines emit byte-identical diagnostics.
+pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Control> {
+    match op {
+        UnOp::Neg => match v {
+            Value::Number(n) => Ok(Value::Number(-n)),
+            Value::Decimal(d) => Ok(Value::Decimal(-d)),
+            _ => Err(AsError::at("cannot negate a non-number", span).into()),
+        },
+        UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
+    }
+}
+
+/// Pure binary-operator dispatch shared by the tree-walker (`ExprKind::Binary`)
+/// and the bytecode VM. Both engines evaluate the operands first, then call this
+/// with the two values; `span` anchors every Tier-2 panic so diagnostics stay
+/// byte-identical.
+///
+/// `And`/`Or`/`Coalesce` are NOT handled here — they short-circuit and so must be
+/// evaluated by each engine before either operand is forced (the tree-walker
+/// inlines them above the operand evals; the VM lowers them to jumps). Passing one
+/// of those ops here is a programmer error (`unreachable!`).
+///
+/// Dispatch order mirrors `eval_expr`'s `ExprKind::Binary` arm exactly:
+/// Eq/Ne (cross-type decimal equality) → Range (eager `array<number>`) → string
+/// concat (`+` on two `Str`) → decimal arithmetic/ordering (either operand a
+/// `Decimal`) → the two-`Number` path → the generic "requires two numbers" error.
+pub(crate) fn apply_binop(
+    op: BinOp,
+    l: Value,
+    r: Value,
+    span: Span,
+) -> Result<Value, Control> {
+    // Eq/Ne: cross-type Decimal↔Number comparison before generic `==`.
+    match op {
+        BinOp::Eq => {
+            let eq = decimal_cross_eq(&l, &r, span)?;
+            return Ok(Value::Bool(eq));
+        }
+        BinOp::Ne => {
+            let eq = decimal_cross_eq(&l, &r, span)?;
+            return Ok(Value::Bool(!eq));
+        }
+        _ => {}
+    }
+
+    // Range `a..b`: eager, half-open `array<number>` with step 1, matching
+    // ForRange and the `range()` builtin. Returns an Array, so it must be handled
+    // before the generic "two numbers → Number" path below.
+    if let BinOp::Range = op {
+        let (start, end) = match (&l, &r) {
+            (Value::Number(a), Value::Number(b)) => (*a, *b),
+            _ => return Err(AsError::at("range bounds must be numbers", span).into()),
+        };
+        let mut items = Vec::new();
+        let mut i = start;
+        while i < end {
+            items.push(Value::Number(i));
+            i += 1.0;
+        }
+        return Ok(Value::Array(Rc::new(RefCell::new(items))));
+    }
+
+    // String concatenation: `+` joins two strings.
+    if let BinOp::Add = op {
+        if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
+            return Ok(Value::Str(format!("{}{}", a, b).into()));
+        }
+    }
+
+    // Decimal arithmetic/comparison: triggered when either operand is Decimal.
+    // The other side is coerced (Number→Decimal; non-finite→Tier-2 panic;
+    // non-number/non-decimal → fall through to error).
+    if matches!((&l, &r), (Value::Decimal(_), _) | (_, Value::Decimal(_))) {
+        use crate::stdlib::decimal::coerce_to_decimal;
+        let da = coerce_to_decimal(&l, span)?;
+        let db = coerce_to_decimal(&r, span)?;
+        if let (Some(a), Some(b)) = (da, db) {
+            let result = match op {
+                BinOp::Add => Value::Decimal(a + b),
+                BinOp::Sub => Value::Decimal(a - b),
+                BinOp::Mul => Value::Decimal(a * b),
+                BinOp::Div => {
+                    if b.is_zero() {
+                        return Err(AsError::at("decimal division by zero", span).into());
+                    }
+                    Value::Decimal(a / b)
+                }
+                BinOp::Mod => {
+                    if b.is_zero() {
+                        return Err(AsError::at("decimal remainder by zero", span).into());
+                    }
+                    Value::Decimal(a % b)
+                }
+                // Ordering: both operands are already finite Decimals here
+                // (coerce_to_decimal above Tier-2-panics on a non-finite Number).
+                // This is the INTENTIONAL asymmetry vs equality: `decimal ==
+                // Infinity` is a lenient `false` (decimal_cross_eq), but `decimal
+                // < Infinity` panics — there is no sensible order. See
+                // decimal_cross_eq's doc.
+                BinOp::Lt => Value::Bool(a < b),
+                BinOp::Le => Value::Bool(a <= b),
+                BinOp::Gt => Value::Bool(a > b),
+                BinOp::Ge => Value::Bool(a >= b),
+                // Pow: not defined for Decimal — Tier-2 panic.
+                BinOp::Pow => {
+                    return Err(AsError::at(
+                        "exponentiation (**) is not supported for decimal; use math.pow or convert to number",
+                        span,
+                    )
+                    .into())
+                }
+                BinOp::Eq | BinOp::Ne | BinOp::Range => unreachable!("handled above"),
+                BinOp::And | BinOp::Or | BinOp::Coalesce => {
+                    unreachable!("short-circuit ops are not dispatched through apply_binop")
+                }
+            };
+            return Ok(result);
+        }
+        // One operand was not a number or decimal — fall through to the generic
+        // "operator requires two numbers or decimals" error.
+    }
+
+    let (a, b) = match (&l, &r) {
+        (Value::Number(a), Value::Number(b)) => (*a, *b),
+        _ => {
+            return Err(AsError::at(
+                "operator requires two numbers (or two decimals, or number and decimal)",
+                span,
+            )
+            .into())
+        }
+    };
+    let result = match op {
+        BinOp::Add => Value::Number(a + b),
+        BinOp::Sub => Value::Number(a - b),
+        BinOp::Mul => Value::Number(a * b),
+        BinOp::Div => Value::Number(a / b),
+        BinOp::Mod => Value::Number(a % b),
+        BinOp::Pow => Value::Number(a.powf(b)),
+        BinOp::Lt => Value::Bool(a < b),
+        BinOp::Le => Value::Bool(a <= b),
+        BinOp::Gt => Value::Bool(a > b),
+        BinOp::Ge => Value::Bool(a >= b),
+        BinOp::Eq | BinOp::Ne | BinOp::Range => unreachable!("handled above"),
+        BinOp::And | BinOp::Or | BinOp::Coalesce => {
+            unreachable!("short-circuit ops are not dispatched through apply_binop")
+        }
+    };
+    Ok(result)
 }
 
 /// Validate that a value is a usable array index (a non-negative integer).

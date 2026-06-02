@@ -1,17 +1,17 @@
 //! The VM's async run loop (`Vm::run`).
 //!
-//! V1 implements the **synchronous arithmetic subset** only: constants, the
-//! literal pushes, stack `Pop`/`Dup`, the numeric binary/unary operators, the
-//! numeric comparisons, numeric `Eq`/`Ne`, and `Return`. Every other opcode is a
-//! documented `not yet implemented` Tier-2 panic that later VM slices (V2–V10)
-//! fill in. Panics carry the faulting instruction's [`Span`] so ariadne points at
-//! the source exactly like the tree-walker.
+//! V2 implements the **synchronous core**: constants, literal pushes, stack
+//! `Pop`/`Dup`, locals/globals, calls, templates, the full binary/unary operators
+//! (string concat / decimal / range / cross-type equality / numeric) and `Return`.
+//! Every other opcode is a documented `not yet implemented` Tier-2 panic that
+//! later VM slices fill in. Panics carry the faulting instruction's [`Span`] so
+//! ariadne points at the source exactly like the tree-walker.
 //!
-//! The loop mirrors the tree-walker's Number-path semantics
-//! (`src/interp.rs`): the full String-concat / Decimal / Range / container paths
-//! are deferred to V2, which replaces the subset's "two numbers" panic with the
-//! complete dispatch.
+//! The binary/unary arms call the SAME `apply_binop`/`apply_unop` free functions
+//! the tree-walker uses (`src/interp.rs`), so the two engines cannot drift on
+//! arithmetic semantics or panic messages — there is one implementation.
 
+use crate::ast::{BinOp, UnOp};
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
 use crate::value::Value;
@@ -97,41 +97,39 @@ impl Vm {
                     fiber.push(top);
                 }
 
-                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Pow => {
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::Pow
+                | Op::Lt
+                | Op::Le
+                | Op::Gt
+                | Op::Ge
+                | Op::Eq
+                | Op::Ne
+                | Op::Range => {
+                    // The two operands were pushed lhs-then-rhs, so pop rhs first.
+                    // The op's span anchors any Tier-2 panic so the VM's
+                    // diagnostics are byte-identical to the tree-walker.
                     let b = fiber.pop();
                     let a = fiber.pop();
-                    let v = self.num_arith(op, a, b, fiber, fault_ip)?;
-                    fiber.push(v);
-                }
-                Op::Lt | Op::Le | Op::Gt | Op::Ge => {
-                    let b = fiber.pop();
-                    let a = fiber.pop();
-                    let v = self.num_compare(op, a, b, fiber, fault_ip)?;
-                    fiber.push(v);
-                }
-                Op::Eq | Op::Ne => {
-                    let b = fiber.pop();
-                    let a = fiber.pop();
-                    let v = self.num_eq(op, a, b, fiber, fault_ip)?;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    // ONE shared dispatch with the tree-walker (`apply_binop`):
+                    // string concat / decimal / range / cross-type equality /
+                    // numeric, plus every exact panic message. And/Or/Coalesce are
+                    // never lowered to these ops (they short-circuit via jumps), so
+                    // `binop_of` never maps to one of them.
+                    let v = crate::interp::apply_binop(binop_of(op), a, b, span)?;
                     fiber.push(v);
                 }
 
-                Op::Neg => {
+                Op::Neg | Op::Not => {
                     let a = fiber.pop();
-                    match a {
-                        Value::Number(n) => fiber.push(Value::Number(-n)),
-                        _ => {
-                            return Err(self.panic_at(
-                                fiber,
-                                fault_ip,
-                                "cannot negate a non-number".to_string(),
-                            ))
-                        }
-                    }
-                }
-                Op::Not => {
-                    let a = fiber.pop();
-                    fiber.push(Value::Bool(!a.is_truthy()));
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::apply_unop(unop_of(op), a, span)?;
+                    fiber.push(v);
                 }
 
                 Op::GetLocal => {
@@ -234,89 +232,44 @@ impl Vm {
         }
     }
 
-    /// Numeric binary arithmetic (`Add/Sub/Mul/Div/Mod/Pow`) over two
-    /// [`Value::Number`]s. Any non-Number operand is the subset's deferred path →
-    /// Tier-2 panic at the faulting instruction's span (V2 replaces this with the
-    /// full dispatch).
-    fn num_arith(
-        &self,
-        op: Op,
-        a: Value,
-        b: Value,
-        fiber: &Fiber,
-        fault_ip: usize,
-    ) -> Result<Value, Control> {
-        match (a, b) {
-            (Value::Number(a), Value::Number(b)) => Ok(Value::Number(match op {
-                Op::Add => a + b,
-                Op::Sub => a - b,
-                Op::Mul => a * b,
-                Op::Div => a / b,
-                Op::Mod => a % b,
-                Op::Pow => a.powf(b),
-                _ => unreachable!("num_arith called with non-arith op {op:?}"),
-            })),
-            _ => Err(self.operator_requires_numbers(fiber, fault_ip)),
-        }
-    }
-
-    /// Numeric ordering comparison (`Lt/Le/Gt/Ge`) → [`Value::Bool`].
-    fn num_compare(
-        &self,
-        op: Op,
-        a: Value,
-        b: Value,
-        fiber: &Fiber,
-        fault_ip: usize,
-    ) -> Result<Value, Control> {
-        match (a, b) {
-            (Value::Number(a), Value::Number(b)) => Ok(Value::Bool(match op {
-                Op::Lt => a < b,
-                Op::Le => a <= b,
-                Op::Gt => a > b,
-                Op::Ge => a >= b,
-                _ => unreachable!("num_compare called with non-compare op {op:?}"),
-            })),
-            _ => Err(self.operator_requires_numbers(fiber, fault_ip)),
-        }
-    }
-
-    /// Numeric equality (`Eq/Ne`) → [`Value::Bool`]. The full decimal-cross /
-    /// container equality is V2; the subset compares two Numbers only and treats
-    /// any non-Number operand as the deferred path → panic.
-    fn num_eq(
-        &self,
-        op: Op,
-        a: Value,
-        b: Value,
-        fiber: &Fiber,
-        fault_ip: usize,
-    ) -> Result<Value, Control> {
-        match (a, b) {
-            (Value::Number(a), Value::Number(b)) => Ok(Value::Bool(match op {
-                Op::Eq => a == b,
-                Op::Ne => a != b,
-                _ => unreachable!("num_eq called with non-eq op {op:?}"),
-            })),
-            _ => Err(self.operator_requires_numbers(fiber, fault_ip)),
-        }
-    }
-
-    /// The subset's "two numbers" panic, carrying the faulting instruction's span.
-    fn operator_requires_numbers(&self, fiber: &Fiber, fault_ip: usize) -> Control {
-        self.panic_at(
-            fiber,
-            fault_ip,
-            "operator requires two numbers (or two decimals, or number and decimal)".to_string(),
-        )
-    }
-
     /// Build a Tier-2 [`Control::Panic`] whose [`AsError`] is anchored at the span
     /// of the instruction at `ip`, so ariadne points at the source exactly like
     /// the tree-walker.
     fn panic_at(&self, fiber: &Fiber, ip: usize, msg: String) -> Control {
         let span = fiber.frame().closure.proto.chunk.span_at(ip);
         Control::Panic(AsError::at(msg, span))
+    }
+}
+
+/// Map a binary-operator opcode to the shared [`BinOp`] the tree-walker uses, so
+/// both engines run the SAME `apply_binop` dispatch. Short-circuit operators
+/// (`&&`/`||`/`??`) are never lowered to a single binary opcode — the compiler
+/// emits jumps for them (V2-T6) — so they have no opcode and never reach here.
+fn binop_of(op: Op) -> BinOp {
+    match op {
+        Op::Add => BinOp::Add,
+        Op::Sub => BinOp::Sub,
+        Op::Mul => BinOp::Mul,
+        Op::Div => BinOp::Div,
+        Op::Mod => BinOp::Mod,
+        Op::Pow => BinOp::Pow,
+        Op::Lt => BinOp::Lt,
+        Op::Le => BinOp::Le,
+        Op::Gt => BinOp::Gt,
+        Op::Ge => BinOp::Ge,
+        Op::Eq => BinOp::Eq,
+        Op::Ne => BinOp::Ne,
+        Op::Range => BinOp::Range,
+        _ => unreachable!("binop_of called with non-binary opcode {op:?}"),
+    }
+}
+
+/// Map a unary-operator opcode to the shared [`UnOp`].
+fn unop_of(op: Op) -> UnOp {
+    match op {
+        Op::Neg => UnOp::Neg,
+        Op::Not => UnOp::Not,
+        _ => unreachable!("unop_of called with non-unary opcode {op:?}"),
     }
 }
 
@@ -509,6 +462,171 @@ mod tests {
                 e.message
             ),
             other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    /// A `Value::Decimal` from a decimal string literal (test helper). The VM
+    /// compiler cannot yet *produce* a decimal (that needs `import`/member-access
+    /// for `std/decimal`), so the decimal arithmetic path is exercised by pushing
+    /// decimal consts directly. The semantics themselves are the SAME shared
+    /// `apply_binop` the tree-walker runs, so these tests pin the VM's dispatch to
+    /// it.
+    fn dec(s: &str) -> Value {
+        use std::str::FromStr;
+        Value::Decimal(rust_decimal::Decimal::from_str(s).expect("valid decimal literal"))
+    }
+
+    /// Push two decimal consts and apply `op`, returning the run outcome.
+    fn run_decimal_binop(a: &str, op: Op, b: &str) -> Result<RunOutcome, Control> {
+        let mut c = Chunk::new();
+        let ka = c.add_const(dec(a));
+        let kb = c.add_const(dec(b));
+        c.emit_u16(Op::Const, ka, s());
+        c.emit_u16(Op::Const, kb, s());
+        c.emit(op, s());
+        c.emit(Op::Return, s());
+        run_chunk(c)
+    }
+
+    #[test]
+    fn decimal_arithmetic_through_shared_dispatch() {
+        // Add / Sub / Mul / Div over two decimals → Decimal, formatted exactly.
+        // Expected renderings preserve rust_decimal's scale exactly (the same
+        // `Value::Display` the tree-walker uses), so e.g. `3 / 2` is `1.50`.
+        for (a, op, b, want) in [
+            ("1.5", Op::Add, "2.5", "4.0"),
+            ("2.5", Op::Sub, "0.5", "2.0"),
+            ("1.5", Op::Mul, "2", "3.0"),
+            ("3", Op::Div, "2", "1.50"),
+        ] {
+            match run_decimal_binop(a, op, b).expect("decimal arith ok") {
+                RunOutcome::Done(v) => assert_eq!(
+                    v.to_string(),
+                    want,
+                    "{a} {op:?} {b} rendered wrong"
+                ),
+                other => panic!("expected Done, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_division_by_zero_panics() {
+        match run_decimal_binop("1", Op::Div, "0") {
+            Err(Control::Panic(e)) => {
+                assert_eq!(e.message, "decimal division by zero", "msg: {}", e.message)
+            }
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_remainder_by_zero_panics() {
+        match run_decimal_binop("1", Op::Mod, "0") {
+            Err(Control::Panic(e)) => {
+                assert_eq!(e.message, "decimal remainder by zero", "msg: {}", e.message)
+            }
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_pow_is_unsupported() {
+        match run_decimal_binop("2", Op::Pow, "3") {
+            Err(Control::Panic(e)) => assert_eq!(
+                e.message,
+                "exponentiation (**) is not supported for decimal; use math.pow or convert to number",
+                "msg: {}",
+                e.message
+            ),
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_ordering_through_shared_dispatch() {
+        match run_decimal_binop("1.5", Op::Lt, "2.5").expect("ok") {
+            RunOutcome::Done(Value::Bool(b)) => assert!(b),
+            other => panic!("expected Done(Bool), got {other:?}"),
+        }
+        match run_decimal_binop("3", Op::Ge, "3").expect("ok") {
+            RunOutcome::Done(Value::Bool(b)) => assert!(b),
+            other => panic!("expected Done(Bool), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_vs_number_cross_equality() {
+        // decimal("1") == 1 → true (cross-type Decimal↔Number equality), exactly
+        // as the tree-walker's `decimal_cross_eq`.
+        let mut c = Chunk::new();
+        let kd = c.add_const(dec("1"));
+        let kn = c.add_const(Value::Number(1.0));
+        c.emit_u16(Op::Const, kd, s());
+        c.emit_u16(Op::Const, kn, s());
+        c.emit(Op::Eq, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Bool(b)) => assert!(b, "decimal(1) == 1 should be true"),
+            other => panic!("expected Done(Bool), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_op_builds_half_open_array() {
+        // 0 .. 5 → [0, 1, 2, 3, 4].
+        let mut c = Chunk::new();
+        let k0 = c.add_const(Value::Number(0.0));
+        let k5 = c.add_const(Value::Number(5.0));
+        c.emit_u16(Op::Const, k0, s());
+        c.emit_u16(Op::Const, k5, s());
+        c.emit(Op::Range, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Array(a)) => {
+                let got: Vec<f64> = a
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Value::Number(n) => *n,
+                        other => panic!("non-number in range array: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+            }
+            other => panic!("expected Done(Array), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_op_non_number_bounds_panics() {
+        let mut c = Chunk::new();
+        let ks = c.add_const(Value::Str(Rc::from("x")));
+        let k5 = c.add_const(Value::Number(5.0));
+        c.emit_u16(Op::Const, ks, s());
+        c.emit_u16(Op::Const, k5, s());
+        c.emit(Op::Range, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c) {
+            Err(Control::Panic(e)) => {
+                assert_eq!(e.message, "range bounds must be numbers", "msg: {}", e.message)
+            }
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_concat_through_add() {
+        let mut c = Chunk::new();
+        let ka = c.add_const(Value::Str(Rc::from("foo")));
+        let kb = c.add_const(Value::Str(Rc::from("bar")));
+        c.emit_u16(Op::Const, ka, s());
+        c.emit_u16(Op::Const, kb, s());
+        c.emit(Op::Add, s());
+        c.emit(Op::Return, s());
+        match run_chunk(c).expect("ok") {
+            RunOutcome::Done(Value::Str(st)) => assert_eq!(&*st, "foobar"),
+            other => panic!("expected Done(Str), got {other:?}"),
         }
     }
 

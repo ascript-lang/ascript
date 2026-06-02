@@ -11,7 +11,7 @@
 use crate::span::Span;
 use crate::syntax::ast::{
     AssignExpr, AstNode, BinaryExpr, Block, CallExpr, Expr, LetStmt, Literal, NameRef, ParenExpr,
-    SourceFile, Stmt, TemplateExpr, UnaryExpr,
+    RangeExpr, SourceFile, Stmt, TemplateExpr, UnaryExpr,
 };
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
@@ -161,6 +161,7 @@ impl Compiler {
             Expr::TemplateExpr(t) => self.compile_template(t),
             Expr::NameRef(name_ref) => self.compile_name_ref(name_ref),
             Expr::AssignExpr(assign) => self.compile_assign(assign),
+            Expr::RangeExpr(range) => self.compile_range(range),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
                 node_span(other),
@@ -472,14 +473,56 @@ impl Compiler {
             SyntaxKind::Slash => Op::Div,
             SyntaxKind::Percent => Op::Mod,
             SyntaxKind::StarStar => Op::Pow,
+            SyntaxKind::Lt => Op::Lt,
+            SyntaxKind::Le => Op::Le,
+            SyntaxKind::Gt => Op::Gt,
+            SyntaxKind::Ge => Op::Ge,
+            SyntaxKind::EqEq => Op::Eq,
+            SyntaxKind::BangEq => Op::Ne,
+            // `&&`/`||`/`??` short-circuit and are lowered to jumps, not a single
+            // binary opcode — that is V2-T6, not this task.
             other => {
                 return Err(CompileError::new(
-                    format!("binary operator {other:?} not yet supported in V1"),
+                    format!("binary operator {other:?} not yet supported in V2"),
                     span,
                 ))
             }
         };
         self.chunk.emit(bytecode, span);
+        Ok(())
+    }
+
+    /// Lower a `RangeExpr` (`a..b`). Mirrors the tree-walker's `BinOp::Range`:
+    /// pushes both bounds and emits `RANGE`, which builds the eager half-open
+    /// `array<number>`. Only the exclusive `..` form has a tree-walker equivalent
+    /// in value position (the old parser produces `..=` only inside match
+    /// patterns), so an inclusive `..=` range as a value is a documented deferral.
+    fn compile_range(&mut self, range: &RangeExpr) -> Result<(), CompileError> {
+        let span = node_span(range);
+        let start = range
+            .start()
+            .ok_or_else(|| CompileError::new("range expression missing start bound", span))?;
+        let end = range
+            .end()
+            .ok_or_else(|| CompileError::new("range expression missing end bound", span))?;
+        match range.op() {
+            Some(SyntaxKind::DotDot) => {}
+            Some(SyntaxKind::DotDotEq) => {
+                return Err(CompileError::new(
+                    "inclusive range (..=) as a value is not yet supported in V2",
+                    span,
+                ))
+            }
+            other => {
+                return Err(CompileError::new(
+                    format!("range expression has unexpected operator {other:?}"),
+                    span,
+                ))
+            }
+        }
+        self.compile_expr(&start)?;
+        self.compile_expr(&end)?;
+        self.chunk.emit(Op::Range, span);
         Ok(())
     }
 
@@ -491,6 +534,11 @@ impl Compiler {
         let op = un
             .op()
             .ok_or_else(|| CompileError::new("unary expression missing operator", span))?;
+        // The tree-walker anchors a unary panic at the OPERAND's span
+        // (`apply_unop(op, v, operand.span)` in `eval_expr`), e.g. `cannot negate a
+        // non-number` points at the operand, not the `-`. Emit the op with the
+        // operand span so the VM's diagnostics are byte-identical.
+        let operand_span = node_span(&operand);
         self.compile_expr(&operand)?;
         let bytecode = match op {
             SyntaxKind::Minus => Op::Neg,
@@ -502,7 +550,7 @@ impl Compiler {
                 ))
             }
         };
-        self.chunk.emit(bytecode, span);
+        self.chunk.emit(bytecode, operand_span);
         Ok(())
     }
 
@@ -719,8 +767,45 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_binary_operator() {
-        let err = compile_source("1 == 2").unwrap_err();
+        // Short-circuit `&&`/`||`/`??` are lowered to jumps (V2-T6), not a single
+        // binary opcode, so they are still unsupported in this slice.
+        let err = compile_source("1 && 2").unwrap_err();
         assert!(err.message.contains("not yet supported"), "got {err:?}");
+        let err = compile_source("1 || 2").unwrap_err();
+        assert!(err.message.contains("not yet supported"), "got {err:?}");
+    }
+
+    #[test]
+    fn comparison_and_equality_operators_compile() {
+        // V2-T5 added the comparison/equality binary opcodes to the compiler.
+        for (src, mnemonic) in [
+            ("1 < 2", "LT"),
+            ("1 <= 2", "LE"),
+            ("1 > 2", "GT"),
+            ("1 >= 2", "GE"),
+            ("1 == 2", "EQ"),
+            ("1 != 2", "NE"),
+        ] {
+            let chunk = compile_source(src).expect("compiles");
+            let text = disasm(&chunk);
+            assert!(text.contains(mnemonic), "missing {mnemonic} for `{src}` in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn range_expression_compiles_to_range_op() {
+        let chunk = compile_source("0..5").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("RANGE"), "missing RANGE in:\n{text}");
+    }
+
+    #[test]
+    fn inclusive_range_value_is_deferred() {
+        let err = compile_source("0..=5").unwrap_err();
+        assert!(
+            err.message.contains("inclusive range"),
+            "expected inclusive-range deferral, got {err:?}"
+        );
     }
 
     #[test]

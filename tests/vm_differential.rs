@@ -252,3 +252,119 @@ async fn vm_eval_first_class_builtin_reference_matches_treewalker() {
         assert_vm_matches_treewalker(name).await;
     }
 }
+
+// ----- V2-T5: complete arithmetic / comparison / equality / range / errors ----
+
+#[tokio::test]
+async fn vm_string_concat_matches_treewalker() {
+    // `+` on two strings concatenates; the result renders identically on both
+    // engines (no surrounding quotes — `print` uses the raw string `Display`).
+    let cases = [
+        "\"a\" + \"b\"",
+        "\"foo\" + \"\"",
+        "\"\" + \"bar\"",
+        "\"x\" + \"y\" + \"z\"",
+        "`a${1}` + `b${2}`", // template results are strings → concat
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_range_value_matches_treewalker() {
+    // `a..b` is an eager half-open `array<number>`; the printed array form and
+    // `len(...)` over it must agree byte-for-byte with the tree-walker.
+    let cases = [
+        "0..5",          // [0, 1, 2, 3, 4]
+        "0..0",          // [] (empty)
+        "3..3",          // [] (empty, non-zero bound)
+        "2..5",          // [2, 3, 4]
+        "len(0..5)",     // 5
+        "len(0..0)",     // 0
+        "1..1",          // []
+        "(1 + 1)..5",    // additive binds tighter: (2)..5 → [2,3,4]
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_comparisons_match_treewalker() {
+    let cases = [
+        "1 < 2", "2 < 1", "2 >= 2", "3 >= 4", "1 <= 1", "5 > 2", "2 > 5", "2 <= 1",
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_equality_matches_treewalker() {
+    let cases = [
+        "1 == 1",
+        "1 == 2",
+        "1 != 2",
+        "1 != 1",
+        "\"a\" == \"a\"",
+        "\"a\" == \"b\"",
+        "\"a\" != \"b\"",
+        "true == true",
+        "true == false",
+        "nil == nil",
+        "nil != nil",
+        // Container equality is pointer identity on both engines (a fresh literal
+        // is never equal to another): `range(1) == range(1)` is `false`. We use
+        // `range(...)` rather than an `[...]` array literal because array-literal
+        // compilation is a separate VM slice (V2-T4b); the equality *semantics*
+        // (identity, via `apply_binop`'s `Value` `==`) are what this exercises.
+        "range(1) == range(1)",
+        "range(1) != range(1)",
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+/// Assert both engines FAIL identically for `expr_src` (run as `print(expr)`):
+/// same Tier-2 panic message AND the same source span. A divergence here is a
+/// real diagnostics-parity bug, not something to normalize away.
+async fn assert_vm_error_matches_treewalker(expr_src: &str) {
+    let src = format!("print({expr_src})");
+    let tw = ascript::run_source(&src).await;
+    let vm = ascript::vm_run_source(&src).await;
+    match (tw, vm) {
+        (Err(tw_err), Err(vm_err)) => {
+            assert_eq!(
+                tw_err.message, vm_err.message,
+                "panic message diverged for `{expr_src}`\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, vm_err.message
+            );
+            assert_eq!(
+                tw_err.span, vm_err.span,
+                "panic span diverged for `{expr_src}` (msg {:?})\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, tw_err.span, vm_err.span
+            );
+        }
+        (tw, vm) => panic!(
+            "expected BOTH engines to error for `{expr_src}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn vm_operator_errors_match_treewalker() {
+    // Each must produce the SAME message and SAME span on both engines.
+    let cases = [
+        "-(true)",      // cannot negate a non-number
+        "true + 1",     // operator requires two numbers ...
+        "1 < \"x\"",    // operator requires two numbers ... (ordering)
+        "\"a\" - 1",    // string is not concat for `-`
+        "nil * 2",      // non-number operand
+        "true < false", // ordering on bools
+    ];
+    for expr in cases {
+        assert_vm_error_matches_treewalker(expr).await;
+    }
+}
