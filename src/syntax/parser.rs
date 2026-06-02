@@ -367,8 +367,19 @@ fn expr_bp(p: &mut Parser, min_bp: u8) {
     }
 }
 
-/// Unary/primary layer: prefix `-`/`!x` (await/yield added in a later task),
-/// then a primary with its tight postfix chain (call/member/index/?.).
+/// True if the current token can begin an expression (for optional operands
+/// like `yield`).
+fn can_start_expr(p: &Parser) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        p.current(),
+        Number | Str | TrueKw | FalseKw | NilKw | Ident | LParen | LBracket
+            | LBrace | Minus | Bang | TemplateStr | TemplateStart | AwaitKw | YieldKw
+    )
+}
+
+/// Unary/primary layer: prefix `-`/`!x`, `await`, `yield`, then a primary
+/// with its tight postfix chain (call/member/index/?.).
 fn unary(p: &mut Parser) -> CompletedMarker {
     use SyntaxKind::*;
     match p.current() {
@@ -377,6 +388,20 @@ fn unary(p: &mut Parser) -> CompletedMarker {
             p.bump();
             let _operand = unary(p);
             p.complete(m, UnaryExpr)
+        }
+        AwaitKw => {
+            let m = p.start();
+            p.bump(); // await
+            let _operand = unary(p);
+            p.complete(m, AwaitExpr)
+        }
+        YieldKw => {
+            let m = p.start();
+            p.bump(); // yield
+            if can_start_expr(p) {
+                let _ = unary(p);
+            }
+            p.complete(m, YieldExpr)
         }
         _ => primary(p),
     }
@@ -869,5 +894,25 @@ mod tests {
         assert!(!tree_shape("f()? - 1").contains(&SyntaxKind::TernaryExpr));
         // `a ? -b : c` IS a ternary.
         assert!(tree_shape("a ? -b : c").contains(&SyntaxKind::TernaryExpr));
+    }
+
+    #[test]
+    fn await_expression() {
+        assert!(tree_shape("await f()").contains(&SyntaxKind::AwaitExpr));
+        assert!(parse("await f()").errors.is_empty());
+        // The unwrap tier is looser than unary, so `await x?` = `(await x)?`:
+        // in pre-order the TryExpr must appear BEFORE (wrap) the AwaitExpr.
+        let shape = tree_shape("await x?");
+        let try_idx = shape.iter().position(|k| *k == SyntaxKind::TryExpr)
+            .expect("TryExpr present");
+        let await_idx = shape.iter().position(|k| *k == SyntaxKind::AwaitExpr)
+            .expect("AwaitExpr present");
+        assert!(try_idx < await_idx, "expected (await x)? — TryExpr should wrap AwaitExpr");
+    }
+
+    #[test]
+    fn yield_expression() {
+        assert!(tree_shape("yield x").contains(&SyntaxKind::YieldExpr));
+        assert!(tree_shape("yield").contains(&SyntaxKind::YieldExpr));
     }
 }
