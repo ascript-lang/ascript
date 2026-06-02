@@ -1383,3 +1383,72 @@ async fn vm_return_type_contract_matches_treewalker() {
     // `: nil` as a union member is also accepted.
     assert_vm_run_matches_treewalker("fn g(): number | nil { return nil }\nprint(g())").await;
 }
+
+// ---- call_value bridge: native code invokes a VM closure (V4-T5) ----------
+//
+// `recover(fn)` is the testable end-to-end surface for the `native → VM` bridge:
+// it is a BARE builtin (so the VM compiler can emit the call without `import`,
+// which lands in a later VM slice) and its native implementation invokes the
+// closure argument through `Interp::call_value`, which routes a `Value::Closure`
+// back into `Vm::call_value` to run it on a fresh Fiber. The whole point is that
+// the closure runs on the VM and produces byte-identical observable output to the
+// tree-walker. The HOF callers (`array.map`/`filter`/sort comparator/middleware)
+// exercise the IDENTICAL `call_value` primitive; their end-to-end differential
+// gate lands once the VM compiler grows `import` (module-namespaced calls), and
+// the primitive itself is pinned directly by the `Vm::call_value` unit tests in
+// `src/vm/run.rs`.
+
+#[tokio::test]
+async fn vm_recover_invokes_vm_closure_success_matches_treewalker() {
+    // recover(() => v) → [v, nil] on both engines: the closure runs on the VM via
+    // the bridge and its result is wrapped identically.
+    assert_vm_run_matches_treewalker("print(recover(() => 1))").await;
+    assert_vm_run_matches_treewalker("print(recover(() => 1 + 2))").await;
+    assert_vm_run_matches_treewalker("print(recover(() => \"ok\"))").await;
+    assert_vm_run_matches_treewalker("print(recover(() => nil))").await;
+}
+
+#[tokio::test]
+async fn vm_recover_closure_captures_outer_var_matches_treewalker() {
+    // A closure that captures an outer `k` is invoked by native `recover`; the
+    // captured upvalue cell travels with the closure value, so the bridge sees it.
+    assert_vm_run_matches_treewalker("let k = 10\nprint(recover(() => k + 5))").await;
+}
+
+#[tokio::test]
+async fn vm_recover_catches_closure_panic_matches_treewalker() {
+    // A panic raised inside the VM-run closure surfaces back through the bridge as
+    // a `Control::Panic`, which `recover` converts into `[nil, err]` IDENTICALLY
+    // on both engines (same error message round-tripped). Here the closure indexes
+    // a 1-element array out of bounds (a runtime Tier-2 panic).
+    assert_vm_run_matches_treewalker("let a = [1]\nprint(recover(() => a[9]))").await;
+}
+
+#[tokio::test]
+async fn vm_recover_closure_calls_another_fn_matches_treewalker() {
+    // The closure passed to recover calls a user `fn`; that call (closure → VM
+    // function) and the recover bridge (native → VM closure) compose, and the
+    // result is byte-identical.
+    assert_vm_run_matches_treewalker("fn dbl(x) { return x * 2 }\nprint(recover(() => dbl(21)))")
+        .await;
+}
+
+#[tokio::test]
+async fn vm_panic_through_closure_escapes_recover_message_matches_treewalker() {
+    // A panic inside a VM closure that is NOT wrapped by recover propagates all the
+    // way out and aborts the program with the SAME diagnostic MESSAGE on both
+    // engines. We assert message-equality (not span) here on purpose: the panic
+    // originates from an index-out-of-bounds *inside a closure body*, whose span
+    // is subject to the orthogonal VM span-table off-by-one tracked separately (the
+    // "VM diagnostic spans must use trivia-trimmed code spans" audit) — it is NOT a
+    // call_value-bridge concern. The bridge's job, verified here, is that the panic
+    // SURFACES out of the VM closure to the top level identically.
+    let src = "let bad = (x) => x[9]\nprint(bad([0]))";
+    let tw = ascript::run_source(src).await.expect_err("tree-walker errors");
+    let vm = ascript::vm_run_source(src).await.expect_err("vm errors");
+    assert_eq!(
+        tw.message, vm.message,
+        "panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+        tw.message, vm.message
+    );
+}

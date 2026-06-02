@@ -290,6 +290,14 @@ pub struct Interp {
     /// `Rc<Interp>` (`rc()`) so they can `spawn_local` a `'static` task that
     /// re-enters the interpreter — required for M17 Phase 2 async-fn scheduling.
     self_weak: RefCell<std::rc::Weak<Interp>>,
+    /// A `Weak` to the bytecode [`Vm`] driving this interpreter, installed by
+    /// [`Vm::new`] via [`Interp::set_vm`]. Lets a native higher-order stdlib
+    /// function (e.g. `array.map`, `recover`) re-enter the VM to run a
+    /// `Value::Closure` callback (see [`Interp::call_value`]'s `Closure` arm).
+    /// `None` (an empty `Weak`) on a pure tree-walker run where no VM exists; a
+    /// `Value::Closure` can only be produced by the VM, so a VM is always
+    /// registered whenever a closure can reach `call_value`.
+    vm: RefCell<std::rc::Weak<crate::vm::Vm>>,
     /// Number of eagerly-spawned `async fn`/method body tasks currently alive
     /// (incremented at spawn, decremented when the task future drops — completion
     /// OR cancel-on-drop). Used for cooperative backpressure so a tight un-awaited
@@ -370,6 +378,7 @@ impl Interp {
             resources: RefCell::new(HashMap::new()),
             next_resource_id: Cell::new(0),
             self_weak: RefCell::new(std::rc::Weak::new()),
+            vm: RefCell::new(std::rc::Weak::new()),
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
             #[cfg(feature = "log")]
@@ -439,6 +448,21 @@ impl Interp {
     /// at every entry point, before running any program.
     pub(crate) fn install_self(self: &Rc<Interp>) {
         *self.self_weak.borrow_mut() = Rc::downgrade(self);
+    }
+
+    /// Register the bytecode [`Vm`] driving this interpreter. Called by
+    /// [`Vm::new`] right after the VM is constructed, so that a native
+    /// higher-order stdlib function reaching a `Value::Closure` in
+    /// [`Interp::call_value`] can re-enter the VM to run it (`native → VM`).
+    pub(crate) fn set_vm(&self, vm: std::rc::Weak<crate::vm::Vm>) {
+        *self.vm.borrow_mut() = vm;
+    }
+
+    /// Recover an owned `Rc<Vm>` from the registered weak, or `None` if no VM is
+    /// installed. Upgrading to an owned `Rc` lets callers drop the `RefCell`
+    /// borrow before awaiting (`await_holding_refcell_ref` stays clean).
+    pub(crate) fn vm(&self) -> Option<Rc<crate::vm::Vm>> {
+        self.vm.borrow().upgrade()
     }
 
     /// Recover an owned `Rc<Interp>` from `&self`. Panics if `install_self` was
@@ -1931,6 +1955,20 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         match callee {
+            // A VM closure (`native → VM` bridge): a native higher-order stdlib
+            // function (e.g. `array.map`, a sort comparator, `recover`) is calling
+            // a user callback that the VM produced. Re-enter the VM to run it on a
+            // fresh Fiber. Upgrade the registered `vm` weak to an owned `Rc<Vm>`
+            // FIRST so no `RefCell` borrow is held across the await. A
+            // `Value::Closure` can only exist if the VM created it, so the VM is
+            // always registered here; a missing VM is a wiring bug (clear panic,
+            // not UB).
+            Value::Closure(_) => {
+                let vm = self
+                    .vm()
+                    .expect("VM not registered for closure call (Interp::set_vm not called)");
+                vm.call_value(callee, args, span).await
+            }
             Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
             Value::Function(func) => self.call_function(func, args, span).await,
             Value::Class(class) => self.construct(class, args, span).await,

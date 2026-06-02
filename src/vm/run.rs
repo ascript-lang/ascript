@@ -14,6 +14,7 @@
 use crate::ast::{BinOp, UnOp};
 use crate::error::AsError;
 use crate::interp::{Control, Interp};
+use crate::span::Span;
 use crate::value::Value;
 use crate::vm::fiber::Fiber;
 use crate::vm::opcode::Op;
@@ -40,6 +41,11 @@ impl Vm {
             self_weak: RefCell::new(Weak::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
+        // Register the VM on the shared interpreter so a native higher-order
+        // stdlib function (e.g. `array.map`, `recover`) can re-enter the VM to
+        // run a `Value::Closure` callback (the `native → VM` half of the bridge;
+        // see `Interp::call_value`'s `Closure` arm and `Vm::call_value`).
+        vm.interp.set_vm(Rc::downgrade(&vm));
         vm
     }
 
@@ -600,6 +606,74 @@ impl Vm {
                     ))
                 }
             }
+        }
+    }
+
+    /// Call ANY value, the single primitive both engines re-enter through.
+    ///
+    /// This is the bridge in BOTH directions:
+    /// - A `Value::Closure` (`native → VM`): a native higher-order stdlib function
+    ///   (`array.map`, a sort comparator, `recover`, …) invokes a user callback
+    ///   the VM produced. We build a fresh one-frame [`Fiber`] whose sole frame is
+    ///   the closure called with `args`, then drive it to completion. Each closure
+    ///   invocation gets its OWN Fiber, so the reentrant nesting (VM run → native
+    ///   HOF → `call_value` → `Vm::call_value` → `run(new fiber)`) is naturally
+    ///   recursive and self-contained.
+    /// - Anything else (`VM → native`): delegate to the shared
+    ///   [`Interp::call_value`] — identical to the `Op::Call` non-Closure arm.
+    ///
+    /// Arity / per-param contracts / rest collection use the SAME
+    /// [`check_call_args`](crate::interp::check_call_args) the tree-walker and the
+    /// `Op::Call` arm use, so a closure called from native code binds its args and
+    /// surfaces arity/contract panics byte-identically. The return-type contract is
+    /// enforced by `Op::Return` against the frame's `ret_span` (the call span),
+    /// exactly as for an in-VM call.
+    pub async fn call_value(
+        &self,
+        callee: Value,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match callee {
+            Value::Closure(closure) => {
+                // `what` mirrors the tree-walker's
+                // `func.name.as_deref().unwrap_or("function")` so an arity/contract
+                // panic message matches.
+                let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
+                // Arity + per-param contracts + rest collection, shared verbatim
+                // with the tree-walker and the `Op::Call` arm.
+                let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                // Build a one-frame Fiber whose sole frame is the closure, then
+                // place the bound params into its slots (cell slot → cell, plain
+                // slot → stack). `Fiber::new` already reserved `slot_count` Nil
+                // locals and allocated the cell vector, so we only overwrite the
+                // param slots; the rest stay Nil.
+                let mut fiber = Fiber::new(closure);
+                fiber.frame_mut().ret_span = span;
+                // Snapshot the cell `Rc`s for the param slots so we don't hold a
+                // frame borrow while also writing `fiber.stack` (plain slots).
+                let cells = fiber.frame().cells.clone();
+                for (slot, v) in bound.into_iter().enumerate() {
+                    if let Some(cell) = &cells[slot] {
+                        *cell.borrow_mut() = v;
+                    } else {
+                        fiber.stack[slot] = v;
+                    }
+                }
+                // Drive the fresh fiber to completion. A top-level closure body
+                // cannot `yield` (yield is only valid inside a generator, which is
+                // driven differently), so `Done(v)` is the only outcome; a `yield`
+                // here would be a compiler bug.
+                match self.run(&mut fiber).await? {
+                    RunOutcome::Done(v) => Ok(v),
+                    RunOutcome::Yielded(_) => {
+                        unreachable!("a closure called via Vm::call_value cannot yield")
+                    }
+                }
+            }
+            // Native callee: delegate to the shared dispatch (same as the
+            // `Op::Call` non-Closure arm).
+            other => self.interp.call_value(other, args, span).await,
         }
     }
 
@@ -1310,6 +1384,152 @@ mod tests {
             ),
             other => panic!("expected Panic, got {other:?}"),
         }
+    }
+
+    // ---- Vm::call_value bridge (native → VM closures), V4-T5 ---------------
+
+    /// Compile a program whose trailing expression evaluates to a closure, run it
+    /// on the VM, and return that `Value::Closure`. This is how a native
+    /// higher-order function would *receive* a user callback (e.g. the `f` arg of
+    /// `array.map`). The closure is self-contained (proto + captured upvalue
+    /// cells), so a fresh VM can later drive it via `Vm::call_value`.
+    fn compile_closure(src: &str) -> Value {
+        let chunk = crate::compile::compile_source(src).expect("compile ok");
+        match run_chunk(chunk).expect("run ok") {
+            RunOutcome::Done(v @ Value::Closure(_)) => v,
+            other => panic!("expected the program to yield a closure, got {other:?}"),
+        }
+    }
+
+    /// Run `body(vm)` on a current-thread runtime inside a `LocalSet` with a fresh
+    /// `Vm` over a fresh `Interp`, mirroring the production entry points. Returns
+    /// whatever the async body returns.
+    fn with_vm<F, Fut, T>(body: F) -> T
+    where
+        F: FnOnce(Rc<Vm>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let local = LocalSet::new();
+        local.block_on(&rt, async move {
+            let interp = Rc::new(Interp::new());
+            interp.install_self();
+            let vm = Vm::new(interp);
+            body(vm).await
+        })
+    }
+
+    #[test]
+    fn call_value_runs_a_vm_closure_with_native_supplied_args() {
+        // The exact `array.map` shape: a native caller hands the closure ONE arg
+        // per element. `(x) => x * 2` called with 21 → 42.
+        let f = compile_closure("(x) => x * 2");
+        let got = with_vm(|vm| async move {
+            vm.call_value(f, vec![Value::Number(21.0)], s())
+                .await
+                .expect("call ok")
+        });
+        assert!(matches!(got, Value::Number(n) if n == 42.0), "got {got:?}");
+    }
+
+    #[test]
+    fn call_value_invokes_a_closure_repeatedly_each_on_its_own_fiber() {
+        // A native HOF calls the SAME closure once per element; each invocation is
+        // an independent Fiber, so there is no cross-call state leakage.
+        let f = compile_closure("(x) => x + 1");
+        let got = with_vm(|vm| async move {
+            let mut out = Vec::new();
+            for n in [10.0, 20.0, 30.0] {
+                let v = vm
+                    .call_value(f.clone(), vec![Value::Number(n)], s())
+                    .await
+                    .expect("call ok");
+                out.push(v);
+            }
+            out
+        });
+        let nums: Vec<f64> = got
+            .iter()
+            .map(|v| match v {
+                Value::Number(n) => *n,
+                other => panic!("non-number: {other:?}"),
+            })
+            .collect();
+        assert_eq!(nums, vec![11.0, 21.0, 31.0]);
+    }
+
+    #[test]
+    fn call_value_closure_observes_its_captured_upvalue() {
+        // A closure capturing an outer `k` and applied to a native-supplied arg —
+        // exactly `let k = 10; array.map([..], (x) => x + k)`. The captured cell
+        // travels with the closure value, so a fresh VM driving it still sees k.
+        let f = compile_closure("let k = 10\nlet f = (x) => x + k\nf");
+        let got = with_vm(|vm| async move {
+            vm.call_value(f, vec![Value::Number(5.0)], s())
+                .await
+                .expect("call ok")
+        });
+        assert!(matches!(got, Value::Number(n) if n == 15.0), "got {got:?}");
+    }
+
+    #[test]
+    fn call_value_propagates_a_closure_panic() {
+        // A native HOF whose callback panics must see the SAME `Control::Panic`
+        // surface out of `call_value` (so e.g. `array.map` aborts identically).
+        // `(x) => x[9]` indexes a 1-element array out of bounds at runtime.
+        let f = compile_closure("(x) => x[9]");
+        let err = with_vm(|vm| async move {
+            let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Number(0.0)])));
+            vm.call_value(f, vec![arr], s())
+                .await
+                .expect_err("expected a panic")
+        });
+        match err {
+            Control::Panic(e) => assert!(
+                e.message.contains("out of bounds"),
+                "msg: {}",
+                e.message
+            ),
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_value_arity_mismatch_panics_like_the_tree_walker() {
+        // Calling a 1-param closure with 0 args from native code surfaces the
+        // shared `check_call_args` arity panic (same wording as the tree-walker).
+        let f = compile_closure("(x) => x");
+        let err = with_vm(|vm| async move {
+            vm.call_value(f, Vec::new(), s())
+                .await
+                .expect_err("expected an arity panic")
+        });
+        match err {
+            Control::Panic(e) => assert!(
+                e.message.contains("expected 1 argument(s), got 0"),
+                "msg: {}",
+                e.message
+            ),
+            other => panic!("expected Panic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_value_delegates_native_callees_to_the_interp() {
+        // A non-closure callee (here the `print` builtin) routes to the shared
+        // `Interp::call_value`, exactly like the `Op::Call` non-Closure arm.
+        let out = with_vm(|vm| async move {
+            let r = vm
+                .call_value(Value::Builtin(Rc::from("print")), vec![Value::Number(7.0)], s())
+                .await
+                .expect("call ok");
+            // print returns nil and writes to the shared sink.
+            assert!(matches!(r, Value::Nil), "print returns nil");
+            vm.interp().output()
+        });
+        assert_eq!(out, "7\n", "print wrote through the delegated path");
     }
 
     #[test]
