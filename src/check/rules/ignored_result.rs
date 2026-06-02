@@ -4,8 +4,8 @@
 //! type (statically known); a `?`/`!`/assignment/return consumes the result and
 //! is not flagged (those wrap the call, so `dropped_call` returns None).
 
-use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
-use crate::check::rules::dropped_call;
+use crate::check::diagnostic::{AsDiagnostic, Severity};
+use crate::check::rules::{code_range, dropped_call};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{Resolution, ResolveResult};
@@ -38,7 +38,7 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         );
         if is_local && result_fns.contains(&name) {
             out.push(AsDiagnostic {
-                range: ByteSpan::from(call.text_range()),
+                range: code_range(&call),
                 severity: Severity::Warning,
                 code: "ignored-result".to_string(),
                 message: format!(

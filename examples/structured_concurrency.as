@@ -52,7 +52,8 @@ async fn orphan() {
   await time.sleep(10)
   array.push(dropLog, "orphan ran")
 }
-orphan()
+// Deliberate: this drop demonstrates M17 cancel-on-drop of an un-awaited, un-held async call.
+orphan() // ascript-ignore[unawaited-future]
 await time.sleep(60)
 check("un-awaited un-held call is cancelled (not orphaned)", len(dropLog) == 0)
 print("done")

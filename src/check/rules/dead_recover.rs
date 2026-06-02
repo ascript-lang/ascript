@@ -4,7 +4,8 @@
 //! assignments (a typed-field assignment can panic). Such a body can only produce
 //! values that never panic, so the recover does nothing.
 
-use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
+use crate::check::diagnostic::{AsDiagnostic, Severity};
+use crate::check::rules::code_range;
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::ResolveResult;
@@ -29,7 +30,7 @@ pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<
         };
         if body_cannot_panic(arrow) {
             out.push(AsDiagnostic {
-                range: ByteSpan::from(call.text_range()),
+                range: code_range(call),
                 severity: Severity::Hint,
                 code: "dead-recover".to_string(),
                 message: "this `recover` wraps a body that cannot panic; it has no effect"

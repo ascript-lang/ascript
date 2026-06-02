@@ -1,5 +1,5 @@
 //! Lint rules. Each is `fn(&ResolvedNode, &ResolveResult, &str) -> Vec<AsDiagnostic>`.
-use crate::check::diagnostic::AsDiagnostic;
+use crate::check::diagnostic::{AsDiagnostic, ByteSpan};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::resolve::types::ResolveResult;
 
@@ -38,4 +38,23 @@ pub fn dropped_call(expr_stmt: &ResolvedNode) -> Option<ResolvedNode> {
         .children()
         .find(|c| c.kind() == SyntaxKind::CallExpr)
         .cloned()
+}
+
+/// Byte span of `node` starting at its first *non-trivia* token (a CST node's
+/// `text_range()` begins at any leading whitespace/comment/newline trivia, which
+/// would misattribute a diagnostic — and its inline `ascript-ignore` suppression —
+/// to the *previous* source line). Falls back to the full range if (impossibly)
+/// there is no inner token.
+pub fn code_range(node: &ResolvedNode) -> ByteSpan {
+    let full = ByteSpan::from(node.text_range());
+    let start = node
+        .descendants_with_tokens()
+        .filter_map(|el| el.into_token().cloned())
+        .find(|t| !t.kind().is_trivia())
+        .map(|t| usize::from(t.text_range().start()))
+        .unwrap_or(full.start);
+    ByteSpan {
+        start,
+        end: full.end,
+    }
 }

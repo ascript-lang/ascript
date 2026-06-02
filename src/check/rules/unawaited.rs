@@ -4,8 +4,8 @@
 //! M17 leak class and almost always a bug. Conservative: only locally-declared
 //! async fns called by bare name (not methods, not stdlib detach like `task.spawn`).
 
-use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
-use crate::check::rules::dropped_call;
+use crate::check::diagnostic::{AsDiagnostic, Severity};
+use crate::check::rules::{code_range, dropped_call};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{Resolution, ResolveResult};
@@ -40,7 +40,7 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         );
         if is_local && async_fns.contains(&name) {
             out.push(AsDiagnostic {
-                range: ByteSpan::from(call.text_range()),
+                range: code_range(&call),
                 severity: Severity::Warning,
                 code: "unawaited-future".to_string(),
                 message: format!(
