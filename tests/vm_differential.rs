@@ -438,6 +438,107 @@ async fn vm_short_circuit_does_not_evaluate_rhs() {
     }
 }
 
+// ----- V2-T7: widen the differential gate -------------------------------------
+//
+// Two complementary widenings of the byte-identical gate:
+//
+//  1. SYNC MULTI-FEATURE SNIPPETS (`vm_run_sync_multi_feature_programs`): realistic
+//     multi-line programs that COMBINE the full V1+V2 feature set in one run —
+//     locals + reassignment + arithmetic + array/object literals + index/member
+//     reads + templates + short-circuit (`&&`/`||`/`??`) + `print`. The single-
+//     feature tests above prove each construct in isolation; these prove they
+//     compose correctly through the compiler + VM, byte-for-byte against the
+//     tree-walker. This is the V2 sync-subset gate.
+//
+//  2. GROWING-CORPUS SCAFFOLD (`SYNC_EXAMPLE_ALLOWLIST` + `vm_run_allowlisted_examples_*`):
+//     a curated allow-list of WHOLE `examples/*.as` files run end-to-end (file
+//     contents → VM stdout+exit == tree-walker stdout+exit). The list GROWS one
+//     slice at a time as the VM gains features:
+//       - V2  (now): only examples restricted to literals/locals/arithmetic/
+//                     containers/short-circuit/print qualify.
+//       - V3  adds `if`/`while`/`for` examples (e.g. ranges, factorial, ...).
+//       - V4  adds `fn` definitions/calls examples (functions, ...).
+//       - V5..V9 add closures, `?`/`!`/recover, async/await, generators,
+//                 classes/enums.
+//       - V10 FLIPS the gate to the ENTIRE `examples/` corpus and this allow-list
+//             is retired in favour of the whole-corpus runner.
+//     Add files here the moment the VM can run them; never remove the byte-
+//     identical assertion to make a file "pass".
+
+#[tokio::test]
+async fn vm_run_sync_multi_feature_programs() {
+    // Each program is a realistic SYNC snippet combining several V1+V2 features.
+    // All must be byte-identical to the tree-walker.
+    let programs = [
+        // (a) build an array via a local, index into it, print via a template.
+        "let xs = [10, 20, 30]\nlet i = 1\nprint(`xs[${i}] = ${xs[i]}`)",
+        // (b) object construction + member reads + arithmetic on fields.
+        "let p = {x: 3, y: 4}\nprint(p.x * p.x + p.y * p.y)",
+        // (c) nested data + short-circuit `??` defaulting on a missing key + print.
+        "let cfg = {name: \"svc\"}\nlet port = cfg.port ?? 8080\nprint(`${cfg.name}:${port}`)",
+        // (d) string building: templates + `+` concatenation across locals.
+        "let first = \"ada\"\nlet last = \"lovelace\"\nlet full = first + \" \" + last\nprint(`name=${full} len=${len(full)}`)",
+        // (e) let-chains with reassignment + computed prints.
+        "let total = 0\ntotal = total + 5\ntotal = total * 3\nprint(total)\nprint(total - 1)",
+        // (f) array of objects, index then member, arithmetic.
+        "let users = [{age: 30}, {age: 12}]\nprint(users[0].age + users[1].age)",
+        // (g) nested object/array, chained index+member, template render.
+        "let data = {items: [{n: \"a\"}, {n: \"b\"}]}\nprint(`first=${data.items[0].n} second=${data.items[1].n}`)",
+        // (h) short-circuit selecting an operand, fed into arithmetic.
+        "let a = 0\nlet b = 7\nlet pick = a || b\nprint(pick + 1)",
+        // (i) block scoping + outer reassignment + post-block read.
+        "let acc = 1\n{ let acc = 100\n print(acc) }\nacc = acc + 2\nprint(acc)",
+        // (j) equality/comparison results threaded through `&&`/`||` and printed.
+        "let n = 5\nprint(n > 0 && n < 10)\nprint(n == 5 || n == 6)",
+        // (k) computed index from arithmetic + range array.
+        "let r = 0..5\nlet idx = 1 + 2\nprint(r[idx])",
+        // (l) object with array field + len + template, multiple prints.
+        "let inv = {tags: [\"x\", \"y\", \"z\"]}\nprint(len(inv.tags))\nprint(`tags: ${inv.tags[0]}, ${inv.tags[2]}`)",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+/// Whole `examples/*.as` files (paths relative to the crate root) that the VM can
+/// run end-to-end TODAY. See the module note above: this list grows one VM slice
+/// at a time and is retired at V10 when the gate flips to the entire corpus.
+///
+/// V2 qualifiers: programs restricted to literals, locals (`let`/`const`/assign),
+/// block scoping, globals/bare-builtins, arithmetic/comparison/equality/range,
+/// short-circuit `&&`/`||`/`??`, array/object literals, index/member reads, and
+/// `print`. They must contain NO `fn`, control flow (`if`/`while`/`for`/`match`),
+/// `class`/`enum`, `import`, async/await, generators, `?`/`!`/recover, or
+/// destructuring/spread — those arrive in V3..V10.
+const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
+    "examples/hello.as",   // `print(1 + 2 * 3)` — literals + arithmetic + print.
+    "examples/numbers.as", // numeric-literal forms bound to locals, then printed.
+];
+
+#[tokio::test]
+async fn vm_run_allowlisted_examples_match_treewalker() {
+    // For each allow-listed example, the VM's stdout+exit must be byte-identical
+    // to the tree-walker's over the SAME file contents. This is the growing-corpus
+    // gate; it is currently small because the VM lacks `fn`/control-flow (V3/V4),
+    // so the sync multi-feature snippets above carry the bulk of the V2 gate.
+    let root = env!("CARGO_MANIFEST_DIR");
+    for rel in SYNC_EXAMPLE_ALLOWLIST {
+        let path = std::path::Path::new(root).join(rel);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read allow-listed example {rel}: {e}"));
+        let tw = ascript::run_source_exit(&src)
+            .await
+            .unwrap_or_else(|e| panic!("tree-walker failed on {rel}: {e:?}"));
+        let vm = ascript::vm_run_source(&src)
+            .await
+            .unwrap_or_else(|e| panic!("VM failed on {rel}: {e:?}"));
+        assert_eq!(
+            tw, vm,
+            "VM diverged from tree-walker for allow-listed example `{rel}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+        );
+    }
+}
+
 // ----- V2-T4b: array/object literals + index/member read ----------------------
 
 #[tokio::test]
