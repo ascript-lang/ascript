@@ -5,5 +5,7 @@
 
 pub mod cst;
 pub mod kind;
+pub mod lexer;
 
 pub use kind::SyntaxKind;
+pub use lexer::{lex, render, LexToken};
