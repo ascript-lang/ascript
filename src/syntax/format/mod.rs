@@ -81,7 +81,10 @@ struct Printer<'a> {
 
 impl Printer<'_> {
     fn source_file(&mut self, node: &ResolvedNode) {
-        let stmts: Vec<&ResolvedNode> = node.children().collect();
+        let stmts: Vec<&ResolvedNode> = node
+            .children()
+            .filter(|c| !matches!(c.kind(), SyntaxKind::Error | SyntaxKind::Tombstone))
+            .collect();
         for (i, stmt) in stmts.iter().enumerate() {
             if i > 0 {
                 let lead = self.comments.leading.get(&stmt.text_range());
@@ -151,6 +154,58 @@ impl Printer<'_> {
             Block => self.block(node),
             FnDecl => self.fn_decl(node),
             ClassDecl => self.class_decl(node),
+            IfStmt => {
+                self.out.text("if (");
+                let parts: Vec<&ResolvedNode> = node.children().collect();
+                if let Some(cond) = parts.iter().copied().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(cond);
+                }
+                self.out.text(") ");
+                let blocks: Vec<&ResolvedNode> =
+                    parts.iter().copied().filter(|c| c.kind() == Block).collect();
+                if let Some(then) = blocks.first() {
+                    self.block_inline(then);
+                }
+                if let Some(elif) = parts.iter().copied().find(|c| c.kind() == IfStmt) {
+                    self.out.text(" else ");
+                    self.stmt(elif);
+                } else if let Some(els) = blocks.get(1) {
+                    self.out.text(" else ");
+                    self.block(els);
+                } else {
+                    self.out.newline();
+                }
+            }
+            WhileStmt => {
+                self.out.text("while (");
+                if let Some(cond) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(cond);
+                }
+                self.out.text(") ");
+                if let Some(b) = node.children().find(|c| c.kind() == Block) {
+                    self.block(b);
+                }
+            }
+            ForStmt => self.for_stmt(node),
+            BreakStmt => {
+                self.out.text("break");
+                self.out.newline();
+            }
+            ContinueStmt => {
+                self.out.text("continue");
+                self.out.newline();
+            }
+            EnumDecl => self.enum_decl(node),
+            ImportStmt => {
+                self.out.text(&normalize_import(node));
+                self.out.newline();
+            }
+            ExportStmt => {
+                self.out.text("export ");
+                if let Some(inner) = node.children().next() {
+                    self.stmt(inner);
+                }
+            }
             _ => {
                 self.out.text(&node.text().to_string());
                 self.out.newline();
@@ -159,13 +214,18 @@ impl Printer<'_> {
     }
 
     fn block(&mut self, node: &ResolvedNode) {
+        self.block_inline(node);
+        self.out.newline();
+    }
+
+    fn block_inline(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         self.out.text("{");
         self.out.newline();
         self.out.indent();
         let stmts: Vec<&ResolvedNode> = node
             .children()
-            .filter(|c| c.kind() != Error && c.kind() != Tombstone)
+            .filter(|c| !matches!(c.kind(), Error | Tombstone))
             .collect();
         for (i, s) in stmts.iter().enumerate() {
             if i > 0 {
@@ -186,7 +246,6 @@ impl Printer<'_> {
         }
         self.out.dedent();
         self.out.text("}");
-        self.out.newline();
     }
 
     fn fn_decl(&mut self, node: &ResolvedNode) {
@@ -290,6 +349,63 @@ impl Printer<'_> {
             }
         }
         self.out.text(")");
+    }
+
+    fn for_stmt(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("for ");
+        if node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == AwaitKw)
+        {
+            self.out.text("await ");
+        }
+        self.out.text("(");
+        if let Some(var) = first_ident_text(node) {
+            self.out.text(&var);
+        }
+        let kw = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| matches!(t.kind(), InKw | OfKw))
+            .map(|t| t.text().to_string())
+            .unwrap_or_else(|| "of".into());
+        self.out.text(&format!(" {kw} "));
+        if let Some(it) = node.children().find(|c| is_expr_kind(c.kind())) {
+            self.expr(it);
+        }
+        self.out.text(") ");
+        if let Some(b) = node.children().find(|c| c.kind() == Block) {
+            self.block(b);
+        }
+    }
+
+    fn enum_decl(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("enum ");
+        if let Some(name) = first_ident_text(node) {
+            self.out.text(&name);
+        }
+        self.out.text(" {");
+        self.out.newline();
+        self.out.indent();
+        for v in node.children().filter(|c| c.kind() == EnumVariant) {
+            self.emit_leading(v);
+            if let Some(name) = first_ident_text(v) {
+                self.out.text(&name);
+            }
+            if let Some(val) = v.children().find(|c| is_expr_kind(c.kind())) {
+                self.out.text(" = ");
+                self.expr(val);
+            }
+            self.out.text(",");
+            self.out.newline();
+            self.emit_trailing(v);
+        }
+        self.out.dedent();
+        self.out.text("}");
+        self.out.newline();
     }
 
     fn expr(&mut self, node: &ResolvedNode) {
@@ -641,6 +757,38 @@ fn range_op(node: &ResolvedNode) -> &'static str {
     }
 }
 
+fn normalize_import(node: &ResolvedNode) -> String {
+    use SyntaxKind::*;
+    let src = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == Str)
+        .map(|t| t.text().to_string())
+        .unwrap_or_default();
+    if let Some(list) = node.children().find(|c| c.kind() == ImportList) {
+        let names: Vec<String> = list
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == Ident)
+            .map(|t| t.text().to_string())
+            .collect();
+        format!("import {{ {} }} from {}", names.join(", "), src)
+    } else {
+        // Namespace import: `import * as alias from "..."`.
+        // Tokens in order: Star, Ident("as"), Ident(alias), Ident("from"), Str.
+        // We want the ident that immediately follows the "as" ident.
+        let idents: Vec<String> = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == Ident)
+            .map(|t| t.text().to_string())
+            .collect();
+        // idents[0] = "as", idents[1] = alias, idents[2] = "from"
+        let alias = idents.get(1).cloned().unwrap_or_default();
+        format!("import * as {alias} from {src}")
+    }
+}
+
 fn member_name(node: &ResolvedNode) -> String {
     node.children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -717,6 +865,19 @@ mod tests {
         assert_eq!(fmt("f()?\n"), "f()?\n");
         assert_eq!(fmt("g()!\n"), "g()!\n");
         assert_eq!(fmt("await  f()\n"), "await f()\n");
+    }
+
+    #[test]
+    fn formats_statements() {
+        assert_eq!(fmt("if(x){return 1}else{return 2}\n"),
+            "if (x) {\n  return 1\n} else {\n  return 2\n}\n");
+        assert_eq!(fmt("while(x){ x=0 }\n"), "while (x) {\n  x = 0\n}\n");
+        assert_eq!(fmt("for(i in 1..6){print(i)}\n"),
+            "for (i in 1..6) {\n  print(i)\n}\n");
+        assert_eq!(fmt("x=5\n"), "x = 5\n");
+        assert_eq!(fmt("break\n"), "break\n");
+        assert_eq!(fmt(r#"import * as t from "std/task""#), "import * as t from \"std/task\"\n");
+        assert_eq!(fmt("enum E{A,B=2}\n"), "enum E {\n  A,\n  B = 2,\n}\n");
     }
 
     #[test]
