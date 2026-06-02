@@ -12,8 +12,8 @@ use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_templat
 use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, AssignExpr, AstNode, BinaryExpr, Block, BreakStmt, CallExpr, ContinueStmt, Expr,
-    IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef, ObjectExpr, OptMemberExpr, ParenExpr,
-    RangeExpr, SourceFile, Stmt, TemplateExpr, UnaryExpr, WhileStmt,
+    ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef, ObjectExpr, OptMemberExpr,
+    ParenExpr, RangeExpr, SourceFile, Stmt, TemplateExpr, UnaryExpr, WhileStmt,
 };
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
@@ -50,6 +50,25 @@ fn node_span(node: &impl AstNode) -> Span {
 fn range_span(node: &crate::syntax::cst::ResolvedNode) -> Span {
     let range = node.text_range();
     Span::new(usize::from(range.start()), usize::from(range.end()))
+}
+
+/// The span of an AST node starting at its first *non-trivia* token. A CST node's
+/// `text_range()` begins at any leading whitespace/comment/newline trivia, so a
+/// raw `node_span` would point at the preceding source. This trims to the real
+/// code start so the span matches the tree-walker's (which anchors at the AST
+/// node's own start) byte-for-byte — needed for diagnostics parity, e.g. the
+/// for-range bounds check anchoring at the START bound. Mirrors
+/// `crate::check::rules::code_range`.
+fn node_code_span(node: &impl AstNode) -> Span {
+    let syntax = node.syntax();
+    let full = range_span(syntax);
+    let start = syntax
+        .descendants_with_tokens()
+        .filter_map(|el| el.into_token().cloned())
+        .find(|t| !t.kind().is_trivia())
+        .map(|t| usize::from(t.text_range().start()))
+        .unwrap_or(full.start);
+    Span::new(start, full.end)
 }
 
 /// Map a short-circuiting binary operator to the conditional-jump opcode whose
@@ -99,10 +118,14 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
         )
     })?;
 
+    // Scratch temporaries are allocated ABOVE the named-local window, so seed the
+    // temp cursor from the same slot count the chunk was sized with.
+    let next_temp = chunk.slot_count;
     let mut compiler = Compiler {
         chunk,
         resolved,
         loops: Vec::new(),
+        next_temp,
     };
 
     // V2 supports a sequence of statements whose meaningful tail is an
@@ -171,9 +194,17 @@ fn stmt_span(stmt: &Stmt) -> Span {
 /// `break`/`continue` inside it (including nested in `if`s) target THIS loop. The
 /// stack's `last` is always the innermost loop.
 struct LoopCtx {
-    /// The code offset to which `continue` jumps back (for `while`, the start of
-    /// the condition re-test).
-    continue_target: usize,
+    /// The already-emitted code offset a `continue` jumps to, when it is known
+    /// BEFORE the body is compiled. For `while` this is the condition re-test
+    /// (a backward `LOOP`). For a `for`-range the increment is emitted AFTER the
+    /// body, so its offset is not yet known while the body compiles — there the
+    /// target is `None` and each `continue` records a forward `Jump` patch site in
+    /// `continue_sites` instead.
+    continue_target: Option<usize>,
+    /// Forward `Jump` patch sites emitted by each `continue` when
+    /// `continue_target` is `None` (the target lies AHEAD of the body — e.g. a
+    /// `for`-range increment). Patched to the increment once it is emitted.
+    continue_sites: Vec<usize>,
     /// Forward `Jump` patch sites emitted by each `break`, patched to land just
     /// after the loop once it is fully compiled.
     break_sites: Vec<usize>,
@@ -184,6 +215,14 @@ struct Compiler {
     resolved: ResolveResult,
     /// Stack of enclosing loops; `break`/`continue` target the innermost (`last`).
     loops: Vec<LoopCtx>,
+    /// The next free *scratch* slot index. The resolver allocates slots only for
+    /// NAMED bindings; this allocator hands out additional anonymous slots ABOVE
+    /// the resolver's frame window for compiler-internal temporaries (e.g. the
+    /// hoisted for-range `end` bound, evaluated once). It is seeded from the
+    /// resolver's frame `slot_count` (so it never collides with a named local) and
+    /// each `alloc_temp` bumps both this cursor and the chunk's `slot_count` so
+    /// `Fiber::new` reserves the temp.
+    next_temp: u16,
 }
 
 impl Compiler {
@@ -327,6 +366,7 @@ impl Compiler {
             Stmt::Block(block) => self.compile_block(block),
             Stmt::IfStmt(if_stmt) => self.compile_if(if_stmt),
             Stmt::WhileStmt(while_stmt) => self.compile_while(while_stmt),
+            Stmt::ForStmt(for_stmt) => self.compile_for(for_stmt),
             Stmt::BreakStmt(break_stmt) => self.compile_break(break_stmt),
             Stmt::ContinueStmt(continue_stmt) => self.compile_continue(continue_stmt),
             other => Err(CompileError::new(
@@ -422,7 +462,8 @@ impl Compiler {
         // Push this loop's context BEFORE compiling the body so any `break`/
         // `continue` nested in the body (including inside `if`s) targets it.
         self.loops.push(LoopCtx {
-            continue_target: cond_start,
+            continue_target: Some(cond_start),
+            continue_sites: Vec::new(),
             break_sites: Vec::new(),
         });
         self.compile_block(&body)?;
@@ -462,13 +503,226 @@ impl Compiler {
     /// tree-walker's runtime rejection message).
     fn compile_continue(&mut self, continue_stmt: &ContinueStmt) -> Result<(), CompileError> {
         let span = node_span(continue_stmt);
+        // Determine the innermost loop's continue mode WITHOUT holding a borrow
+        // across the emit (the forward-site path mutates `self.loops`).
         let target = self
             .loops
             .last()
             .ok_or_else(|| CompileError::new("'continue' outside of a loop", span))?
             .continue_target;
-        self.chunk.emit_loop(Op::Loop, target, span);
+        match target {
+            // Backward `LOOP` to an already-emitted target (e.g. `while`'s cond
+            // re-test).
+            Some(target) => self.chunk.emit_loop(Op::Loop, target, span),
+            // The target lies AHEAD (e.g. a `for`-range increment emitted after the
+            // body): emit a forward `Jump` and record it for later patching.
+            None => {
+                let site = self.chunk.emit_jump(Op::Jump, span);
+                self.loops
+                    .last_mut()
+                    .expect("loop context present (checked above)")
+                    .continue_sites
+                    .push(site);
+            }
+        }
         Ok(())
+    }
+
+    /// Allocate a fresh anonymous scratch slot ABOVE the resolver's named-local
+    /// window. Bumps both the temp cursor and the chunk's `slot_count` so
+    /// `Fiber::new` reserves the slot as a `Nil` local. Used for compiler-internal
+    /// temporaries that have no source name — e.g. the for-range `end` bound,
+    /// hoisted into a slot so it is evaluated exactly once before the loop.
+    fn alloc_temp(&mut self) -> Result<u16, CompileError> {
+        let slot = self.next_temp;
+        let next = slot.checked_add(1).ok_or_else(|| {
+            CompileError::new(
+                "too many local slots (scratch temporaries exceed 65535)",
+                Span::new(0, 0),
+            )
+        })?;
+        self.next_temp = next;
+        // Grow the reserved local window if this temp pushed past it.
+        if next > self.chunk.slot_count {
+            self.chunk.slot_count = next;
+        }
+        Ok(slot)
+    }
+
+    /// Compile a `for (i in start..end) { body }` RANGE loop. Mirrors the
+    /// tree-walker's `Stmt::ForRange` exactly: evaluate `start` and `end` (BOTH
+    /// must be numbers, else a Tier-2 panic at the START bound's span), evaluate
+    /// `end` ONCE before the loop, then iterate `i` from `start` while `i < end`
+    /// (EXCLUSIVE), binding the loop var each iteration. `break` exits, `continue`
+    /// runs the increment then re-tests, `return` returns.
+    ///
+    /// Lowering:
+    /// ```text
+    ///   <start>; <end>             ; start below, end on top
+    ///   CHECK_NUMBERS              ; both-numbers guard @ start.span (peek-only)
+    ///   SET_LOCAL end_slot         ; end_slot = alloc_temp(); end evaluated once
+    ///   SET_LOCAL var_slot         ; i = start (var_slot from the resolver LoopVar)
+    /// cond_start:
+    ///   GET_LOCAL var_slot; GET_LOCAL end_slot; LT
+    ///   exit = JUMP_IF_FALSE       ; exit when i >= end
+    ///   <body block>               ; loop ctx: continue_target = increment below
+    ///   increment:                 ; continue lands here → run i += 1 then re-test
+    ///   GET_LOCAL var_slot; CONST 1.0; ADD; SET_LOCAL var_slot
+    ///   LOOP cond_start
+    /// exit:
+    ///   patch(break_sites...)      ; each `break` lands here
+    /// ```
+    /// The INCLUSIVE form `for (i in 0..=5)` is REJECTED here: the legacy parser
+    /// (the differential oracle) rejects `..=` in a for-range head outright
+    /// ("expected RParen, found DotDotEq"), so inclusive for-range is unsupported
+    /// in the tree-walker. The VM must not invent behavior the oracle lacks, so an
+    /// `..=` for-range is a documented `CompileError` (both engines reject it).
+    ///
+    /// A for-of (`for (x of iterable)`, no range tail) is V3-T4; it returns a
+    /// documented deferral here.
+    fn compile_for(&mut self, for_stmt: &ForStmt) -> Result<(), CompileError> {
+        let span = node_span(for_stmt);
+
+        // `for await` is async iteration (V8); not a range loop.
+        if for_stmt.await_token().is_some() {
+            return Err(CompileError::new(
+                "for await (async iteration) not yet supported (V8)",
+                span,
+            ));
+        }
+
+        let body = for_stmt
+            .body()
+            .ok_or_else(|| CompileError::new("for statement missing body", span))?;
+
+        // The CST nests the `start .. end` bounds in a single `RangeExpr` child
+        // (the for-head's sole expression). A for-RANGE is `in` + a `RangeExpr`
+        // iterable; the iterator-driven `for (x of ...)` form — INCLUDING `for (x
+        // of a..b)`, which iterates the materialized range ARRAY, a different
+        // construct — is V3-T4.
+        let iter = for_stmt
+            .iter()
+            .ok_or_else(|| CompileError::new("for statement missing iterable/start bound", span))?;
+        let is_in = for_stmt.op() == Some(SyntaxKind::InKw);
+        let Expr::RangeExpr(range) = &iter else {
+            return Err(CompileError::new(
+                "for-of (iterator-based for) not yet supported (V3-T4)",
+                span,
+            ));
+        };
+        if !is_in {
+            return Err(CompileError::new(
+                "for-of (iterator-based for) not yet supported (V3-T4)",
+                span,
+            ));
+        }
+
+        // Inclusive `..=` for-range is rejected by the legacy parser (the oracle),
+        // so the VM rejects it too — never silently treat it as exclusive.
+        if range.op() == Some(SyntaxKind::DotDotEq) {
+            return Err(CompileError::new(
+                "inclusive for-range (`..=`) is not supported (the interpreter rejects it)",
+                span,
+            ));
+        }
+
+        let start = range
+            .start()
+            .ok_or_else(|| CompileError::new("for-range missing start bound", span))?;
+        let end = range
+            .end()
+            .ok_or_else(|| CompileError::new("for-range missing end bound", span))?;
+
+        let var_slot = self.for_loop_var_slot(for_stmt)?;
+        let end_slot = self.alloc_temp()?;
+        // Anchor the bounds-numbers panic at the START bound's CODE start (trivia
+        // trimmed), byte-identical to the tree-walker's `AsError::at(_, start.span)`.
+        let start_span = node_code_span(&start);
+
+        // Evaluate start then end (start below, end on top), guard both are
+        // numbers (panic anchored at the START bound's span, matching the
+        // tree-walker), then store end ONCE and seed `i = start`.
+        self.compile_expr(&start)?;
+        self.compile_expr(&end)?;
+        self.chunk.emit(Op::CheckNumbers, start_span);
+        self.chunk.emit_u16(Op::SetLocal, end_slot, span);
+        self.chunk.emit_u16(Op::SetLocal, var_slot, span);
+
+        // Condition: re-test `i < end` each iteration.
+        let cond_start = self.chunk.code.len();
+        self.chunk.emit_u16(Op::GetLocal, var_slot, span);
+        self.chunk.emit_u16(Op::GetLocal, end_slot, span);
+        self.chunk.emit(Op::Lt, span);
+        let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
+
+        // The continue target is the INCREMENT (so `continue` runs `i += 1` then
+        // re-tests, exactly like the tree-walker's `Flow::Continue` falling through
+        // to `i += 1.0`). The increment is emitted AFTER the body, so its offset
+        // is not yet known: push the ctx with `continue_target: None` so each
+        // `continue` records a forward `Jump` site, then patch them all to the
+        // increment below.
+        self.loops.push(LoopCtx {
+            continue_target: None,
+            continue_sites: Vec::new(),
+            break_sites: Vec::new(),
+        });
+        self.compile_block(&body)?;
+
+        // Increment: `i = i + 1`. This is where every `continue` lands — at the
+        // CURRENT end of code, which is exactly what `patch_jump` targets — so
+        // patch every recorded forward `continue` site here, BEFORE emitting the
+        // increment instructions.
+        let continue_sites = std::mem::take(
+            &mut self
+                .loops
+                .last_mut()
+                .expect("for-range loop context present")
+                .continue_sites,
+        );
+        for site in continue_sites {
+            self.chunk.patch_jump(site);
+        }
+        self.chunk.emit_u16(Op::GetLocal, var_slot, span);
+        let one = self.chunk.add_const(Value::Number(1.0));
+        self.chunk.emit_u16(Op::Const, one, span);
+        self.chunk.emit(Op::Add, span);
+        self.chunk.emit_u16(Op::SetLocal, var_slot, span);
+
+        // Back-edge to re-test the condition.
+        self.chunk.emit_loop(Op::Loop, cond_start, span);
+        let ctx = self
+            .loops
+            .pop()
+            .expect("for-range loop context pushed before body must still be present");
+
+        // Loop exit: `i >= end` lands here; every `break` does too.
+        self.chunk.patch_jump(exit);
+        for site in ctx.break_sites {
+            self.chunk.patch_jump(site);
+        }
+        Ok(())
+    }
+
+    /// The local slot for a for-range loop variable. The resolver declares the
+    /// `LoopVar` binding with `decl_range` set to the whole `ForStmt`'s
+    /// `text_range()` (see `resolve_stmt`'s `ForStmt` arm), so we match the binding
+    /// by that range — the same scheme `let_slot` uses.
+    fn for_loop_var_slot(&self, for_stmt: &ForStmt) -> Result<u16, CompileError> {
+        let span = node_span(for_stmt);
+        let decl_range: TextRange = for_stmt.syntax().text_range();
+        let binding = self
+            .resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == decl_range)
+            .ok_or_else(|| {
+                CompileError::new(
+                    "for-loop variable has no resolver binding (compiler bug)",
+                    span,
+                )
+            })?;
+        u16::try_from(binding.slot)
+            .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
     }
 
     /// Compile a `let`/`const` declaration: evaluate the initializer (or push
@@ -1401,5 +1655,64 @@ mod tests {
         // The key const should contain a real newline, rendered as the escaped
         // form `a\nb` by the disassembler's `{:?}`-style string const printer.
         assert!(text.contains("a\\nb"), "key not unescaped in:\n{text}");
+    }
+
+    // ---- V3-T3: for-range + compiler scratch slots -----------------------
+
+    #[test]
+    fn for_range_reserves_a_scratch_slot_above_named_locals() {
+        // The loop var `i` is the single named local (slot 0). The hoisted `end`
+        // bound takes a SCRATCH slot ABOVE it, so the chunk reserves ≥2 slots even
+        // though only one source name exists.
+        let chunk = compile_source("for (i in 0..3) { print(i) }").expect("compiles");
+        assert!(
+            chunk.slot_count >= 2,
+            "for-range should reserve a scratch slot for the hoisted end bound (got {})",
+            chunk.slot_count
+        );
+    }
+
+    #[test]
+    fn for_range_emits_check_numbers_guard_and_loop() {
+        // The lowering must include the eager bounds guard (CHECK_NUMBERS), the
+        // exclusive comparison (LT), and a backward LOOP back-edge.
+        let chunk = compile_source("for (i in 0..3) { print(i) }").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("CHECK_NUMBERS"), "no bounds guard in:\n{text}");
+        assert!(text.contains("LT"), "no exclusive comparison in:\n{text}");
+        assert!(text.contains("LOOP"), "no loop back-edge in:\n{text}");
+    }
+
+    #[test]
+    fn for_range_inclusive_is_rejected() {
+        // `..=` for-range is rejected (the tree-walker's parser rejects it), never
+        // silently treated as exclusive.
+        let err = compile_source("for (i in 0..=3) { print(i) }").unwrap_err();
+        assert!(err.message.contains("inclusive for-range"), "got {err:?}");
+    }
+
+    #[test]
+    fn for_of_is_deferred() {
+        // The iterator-driven `for (x of ...)` form is V3-T4.
+        let err = compile_source("for (x of [1, 2, 3]) { print(x) }").unwrap_err();
+        assert!(err.message.contains("for-of"), "got {err:?}");
+    }
+
+    #[test]
+    fn for_of_over_range_value_is_deferred() {
+        // `for (x of 0..5)` iterates the materialized range ARRAY — a for-OF, not a
+        // for-RANGE — so it is deferred to V3-T4 even though the iterable is a
+        // RangeExpr.
+        let err = compile_source("for (x of 0..5) { print(x) }").unwrap_err();
+        assert!(err.message.contains("for-of"), "got {err:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn for_range_accumulates() {
+        // 1+2+3+4 = 10; the trailing read proves the outer local survived the loop.
+        assert_eq!(
+            eval_number("let sum = 0\nfor (i in 1..5) { sum = sum + i }\nsum").await,
+            10.0
+        );
     }
 }

@@ -754,3 +754,119 @@ async fn vm_break_continue_outside_loop_match_treewalker() {
         );
     }
 }
+
+// ----- V3-T3: for-range loop (+ compiler scratch slots) -----------------------
+
+#[tokio::test]
+async fn vm_for_range_matches_treewalker() {
+    // `for (i in start..end)` is half-open (EXCLUSIVE) on both engines: `i` runs
+    // from `start` while `i < end`, the loop var rebinds each iteration, `break`
+    // exits, `continue` runs the increment then re-tests. All byte-identical.
+    let cases = [
+        // basic ascending count: 0,1,2.
+        "for (i in 0..3) { print(i) }",
+        // empty when start == end.
+        "for (i in 5..5) { print(i) }\nprint(\"done\")",
+        // empty when start > end (i < end false up front).
+        "for (i in 5..3) { print(i) }\nprint(\"done\")",
+        // accumulate into an outer local: 1+2+3+4 = 10.
+        "let sum = 0\nfor (i in 1..5) { sum = sum + i }\nprint(sum)",
+        // break at i == 3 → 0,1,2.
+        "for (i in 0..10) { if (i == 3) { break }\n print(i) }",
+        // continue skips i == 2 (the increment still runs) → 0,1,3,4.
+        "for (i in 0..5) { if (i == 2) { continue }\n print(i) }",
+        // non-zero start.
+        "for (i in 2..6) { print(i) }",
+        // single iteration.
+        "for (i in 7..8) { print(i) }",
+        // bounds from local + arithmetic expressions (end evaluated once).
+        "let lo = 1\nlet hi = 4\nfor (i in lo..hi) { print(i) }",
+        // body with a block-scoped local (fresh slot each iteration).
+        "for (i in 0..3) { let sq = i * i\n print(sq) }",
+        // for between other statements: the stack must stay balanced.
+        "print(\"start\")\nfor (i in 0..2) { print(i) }\nprint(\"end\")",
+        // nested for-range: prints a grid of i*10 + j.
+        "for (i in 0..2) { for (j in 0..3) { print(i * 10 + j) } }",
+        // nested with inner break: inner stops at j == 2 each outer iter.
+        "for (i in 0..2) { for (j in 0..5) { if (j == 2) { break }\n print(i * 10 + j) } }",
+        // nested with inner continue: inner skips j == 1.
+        "for (i in 0..2) { for (j in 0..3) { if (j == 1) { continue }\n print(i * 10 + j) } }",
+        // trailing expression value after a loop (proves locals survive).
+        "let last = 0\nfor (i in 0..4) { last = i }\nlast",
+        // loop var reused as a read inside arithmetic.
+        "for (i in 0..3) { print(i + 100) }",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_for_range_bounds_error_matches_treewalker() {
+    // Non-number bounds raise the SAME Tier-2 panic (`for-range bounds must be
+    // numbers`) at the SAME span (the START bound) on both engines. The VM emits a
+    // CHECK_NUMBERS guard anchored at `start.span`, byte-identical to the
+    // tree-walker's `Stmt::ForRange` eval check.
+    for src in [
+        // non-number END bound (start is a number → guard fires on end).
+        "for (i in 0..\"x\") { print(i) }",
+        // non-number START bound.
+        "for (i in \"x\"..3) { print(i) }",
+        // both non-number.
+        "for (i in true..false) { print(i) }",
+        // nil end.
+        "for (i in 0..nil) { print(i) }",
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        match (tw, vm) {
+            (Err(tw_err), Err(vm_err)) => {
+                assert_eq!(
+                    tw_err.message, vm_err.message,
+                    "for-range bounds panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                    tw_err.message, vm_err.message
+                );
+                assert_eq!(
+                    tw_err.message, "for-range bounds must be numbers",
+                    "unexpected message for `{src}`: {:?}",
+                    tw_err.message
+                );
+                assert_eq!(
+                    tw_err.span, vm_err.span,
+                    "for-range bounds panic span diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                    tw_err.span, vm_err.span
+                );
+            }
+            (tw, vm) => panic!(
+                "expected BOTH engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+            ),
+        }
+    }
+}
+
+#[tokio::test]
+async fn vm_for_range_inclusive_rejected_like_treewalker() {
+    // FINDING: the legacy parser (the differential oracle) REJECTS `..=` in a
+    // for-range head ("expected RParen, found DotDotEq") — inclusive for-range is
+    // unsupported by the tree-walker. The VM must not invent inclusive behavior it
+    // lacks: an `..=` for-range is rejected at compile time. Both engines surface
+    // an `Err(AsError)` from the public entry points; the messages legitimately
+    // differ (a parse error vs a compile-time rejection), so we only assert BOTH
+    // reject — never that the VM silently runs it (which would be a bug: a silent
+    // exclusive loop). A divergence to "both accept" would be the real bug.
+    for src in [
+        "for (i in 0..=3) { print(i) }",
+        "for (i in 0..=0) { print(i) }",
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        assert!(
+            tw.is_err(),
+            "tree-walker should REJECT inclusive for-range `{src}`, got {tw:?}"
+        );
+        assert!(
+            vm.is_err(),
+            "VM should REJECT inclusive for-range `{src}` (no silent exclusive run), got {vm:?}"
+        );
+    }
+}

@@ -106,6 +106,13 @@ pub enum Op {
     /// `a b -- [a, a+1, .. b)` — eager half-open `array<number>` (step 1). Mirrors
     /// the tree-walker's `BinOp::Range`; both bounds must be `Number`.
     Range,
+    /// `a b -- a b` (peek-only) — verify the top TWO stack values are both
+    /// `Value::Number`, otherwise raise the Tier-2 panic carried at this op's span.
+    /// Used to lower the for-range bounds check eagerly (before the loop) so the
+    /// VM reports `for-range bounds must be numbers` at the START bound's span,
+    /// byte-identically to the tree-walker's `Stmt::ForRange`. Leaves both operands
+    /// in place so the surrounding lowering can store them into slots.
+    CheckNumbers,
 
     // ---- control flow -----------------------------------------------------
     /// `JUMP(i16)` — unconditional relative jump.
@@ -227,6 +234,7 @@ impl Op {
             x if x == Gt as u8 => Gt,
             x if x == Ge as u8 => Ge,
             x if x == Range as u8 => Range,
+            x if x == CheckNumbers as u8 => CheckNumbers,
 
             x if x == Jump as u8 => Jump,
             x if x == JumpIfFalse as u8 => JumpIfFalse,
@@ -286,9 +294,9 @@ impl Op {
 
             // Zero-operand ops.
             Nil | True | False | Pop | Dup | Add | Sub | Mul | Div | Mod | Pow | Neg | Not
-            | Eq | Ne | Lt | Le | Gt | Ge | Range | Return | Spread | GetIndex | SetIndex
-            | InstanceOf | Await | Yield | MakeGenerator | Propagate | Unwrap | GetIter
-            | IterNext => 0,
+            | Eq | Ne | Lt | Le | Gt | Ge | Range | CheckNumbers | Return | Spread | GetIndex
+            | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate | Unwrap
+            | GetIter | IterNext => 0,
         }
     }
 
@@ -339,6 +347,7 @@ mod tests {
         Op::Gt,
         Op::Ge,
         Op::Range,
+        Op::CheckNumbers,
         Op::Jump,
         Op::JumpIfFalse,
         Op::JumpIfTrue,

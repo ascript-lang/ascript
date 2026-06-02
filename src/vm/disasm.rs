@@ -162,6 +162,7 @@ fn op_name(op: Op) -> &'static str {
         Gt => "GT",
         Ge => "GE",
         Range => "RANGE",
+        CheckNumbers => "CHECK_NUMBERS",
         Jump => "JUMP",
         JumpIfFalse => "JUMP_IF_FALSE",
         JumpIfTrue => "JUMP_IF_TRUE",

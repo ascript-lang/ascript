@@ -353,6 +353,25 @@ impl Vm {
                     }
                 }
 
+                Op::CheckNumbers => {
+                    // Peek-only bounds guard for for-range: the top two stack
+                    // values (start below, end on top) must both be numbers.
+                    // Leaves them in place so the surrounding lowering can store
+                    // them into slots. The op's span is the START bound's span, so
+                    // the panic is byte-identical to the tree-walker's
+                    // `Stmt::ForRange` ("for-range bounds must be numbers" at
+                    // `start.span`).
+                    let end_ok = matches!(fiber.peek(0), Value::Number(_));
+                    let start_ok = matches!(fiber.peek(1), Value::Number(_));
+                    if !(end_ok && start_ok) {
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            "for-range bounds must be numbers".to_string(),
+                        ));
+                    }
+                }
+
                 Op::Return => {
                     let result = fiber.pop();
                     return Ok(RunOutcome::Done(result));
