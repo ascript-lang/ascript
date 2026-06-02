@@ -104,6 +104,9 @@ impl Resolver {
     }
 
     fn declare(&mut self, name: &str, kind: BindingKind, decl_range: TextRange) -> u32 {
+        // Shadowing is detected within the current function frame's scope stack
+        // only; an inner fn shadowing an outer-fn binding is intentionally not
+        // flagged (conservative).
         let shadows = self.resolve_local(name).and_then(|outer_slot| {
             self.frame_ref()
                 .bindings
@@ -647,6 +650,36 @@ mod tests {
 
     fn res(src: &str) -> ResolveResult {
         resolve(&parse_to_tree(src))
+    }
+
+    #[test]
+    fn namespace_import_alias_binds_alias_not_from() {
+        // `import * as t from "std/task"` binds the alias `t` (kind Import), not
+        // the soft keyword `from`.
+        let r = res("import * as t from \"std/task\"\n");
+        assert!(
+            r.bindings
+                .iter()
+                .any(|b| b.name == "t" && b.kind == BindingKind::Import),
+            "alias `t` should be bound as an Import"
+        );
+        assert!(
+            !r.bindings.iter().any(|b| b.name == "from"),
+            "`from` must not be bound"
+        );
+    }
+
+    #[test]
+    fn use_in_nested_fn_counts() {
+        // `x` is read only inside a nested fn, exercising the upvalue/capture path;
+        // the read must still bump the binding's use_count.
+        let r = res("let x = 1\nfn f() { return x }\n");
+        let x = r
+            .bindings
+            .iter()
+            .find(|b| b.name == "x")
+            .expect("binding x exists");
+        assert!(x.use_count >= 1, "nested read should count, got {}", x.use_count);
     }
 
     #[test]

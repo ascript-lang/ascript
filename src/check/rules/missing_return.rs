@@ -41,9 +41,13 @@ pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<
     out
 }
 
-/// `: nil` (or `nil?`) return type → no value required.
+/// A return type is "nullable" (no value strictly required) when it mentions the
+/// `nil` keyword (`: nil`, `: T | nil`) or carries the optional suffix (`: T?`).
 fn returns_nil(ret_type: &ResolvedNode) -> bool {
-    ret_type.text().to_string().contains("nil")
+    ret_type
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .any(|t| matches!(t.kind(), SyntaxKind::NilKw | SyntaxKind::Question))
 }
 
 /// Conservative: a block DEFINITELY returns if its last statement is a `return`,
@@ -140,5 +144,21 @@ mod tests {
     fn no_flag_when_ends_in_expression() {
         // ends in a match/expr statement — treated as a possible value (no FP)
         assert!(!has("fn f(x): number { match x { _ => 0 } }\nf(1)\n", "missing-return"));
+    }
+    #[test]
+    fn nullable_return_exempt() {
+        // `?` suffix makes nil acceptable, so falling off the end is fine.
+        assert!(!has("fn f(): number? { let x = 1 }\nf()\n", "missing-return"));
+    }
+    #[test]
+    fn nil_return_exempt() {
+        // `: nil` requires no value.
+        assert!(!has("fn f(): nil { let x = 1 }\nf()\n", "missing-return"));
+    }
+    #[test]
+    fn substring_type_not_exempt() {
+        // a plain non-nullable type (no NilKw / Question token) still flags when
+        // the body cannot return a value.
+        assert!(has("fn f(): number { let x = 1 }\nf()\n", "missing-return"));
     }
 }
