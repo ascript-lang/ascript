@@ -206,7 +206,19 @@ fn if_stmt(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // if
-    expr(p); // condition
+    // AScript requires parentheses around the condition: `if (cond) { ... }`
+    if p.at(LParen) {
+        p.bump(); // (
+        expr(p); // condition
+        if p.at(RParen) {
+            p.bump(); // )
+        } else {
+            p.error("expected ')' after if condition");
+        }
+    } else {
+        p.error("expected '(' before if condition");
+        expr(p); // recover by parsing expr anyway
+    }
     if p.at(LBrace) {
         block(p);
     } else {
@@ -229,7 +241,19 @@ fn while_stmt(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // while
-    expr(p);
+    // AScript requires parentheses around the condition: `while (cond) { ... }`
+    if p.at(LParen) {
+        p.bump(); // (
+        expr(p); // condition
+        if p.at(RParen) {
+            p.bump(); // )
+        } else {
+            p.error("expected ')' after while condition");
+        }
+    } else {
+        p.error("expected '(' before while condition");
+        expr(p); // recover by parsing expr anyway
+    }
     if p.at(LBrace) {
         block(p);
     } else {
@@ -560,9 +584,10 @@ mod tests {
 
     #[test]
     fn if_else_with_block() {
-        let p = parse("if x { return 1 } else { return 2 }");
+        // AScript requires parentheses around the condition: `if (cond) { ... }`
+        let p = parse("if (x) { return 1 } else { return 2 }");
         assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
-        let shape = tree_shape("if x { return 1 } else { return 2 }");
+        let shape = tree_shape("if (x) { return 1 } else { return 2 }");
         assert!(shape.contains(&SyntaxKind::IfStmt));
         assert!(shape.contains(&SyntaxKind::Block));
         assert!(shape.contains(&SyntaxKind::ReturnStmt));
@@ -570,8 +595,9 @@ mod tests {
 
     #[test]
     fn while_loop() {
-        assert!(parse("while x { x = 0 }").errors.is_empty());
-        assert!(tree_shape("while x { x = 0 }").contains(&SyntaxKind::WhileStmt));
+        // AScript requires parentheses around the condition: `while (cond) { ... }`
+        assert!(parse("while (x) { x = 0 }").errors.is_empty());
+        assert!(tree_shape("while (x) { x = 0 }").contains(&SyntaxKind::WhileStmt));
     }
 
     #[test]
