@@ -292,29 +292,30 @@ impl Printer<'_> {
         self.out.text(")");
     }
 
-    /// Format an expression (representative subset for 4a).
     fn expr(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         match node.kind() {
-            Literal | NameRef => {
-                // Emit only the non-trivia token text (the node may contain
-                // leading-whitespace trivia tokens in the lossless tree).
+            Literal => self.out.text(&self.literal_text(node)),
+            NameRef => {
                 let tok_text = node
                     .children_with_tokens()
                     .filter_map(|el| el.into_token())
                     .find(|t| !t.kind().is_trivia())
                     .map(|t| t.text().to_string())
-                    .unwrap_or_else(|| node.text().to_string());
+                    .unwrap_or_else(|| node.text().to_string().trim().to_string());
                 self.out.text(&tok_text);
             }
+            UnaryExpr => {
+                let op = leading_op(node);
+                self.out.text(&op);
+                if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(e);
+                }
+            }
             BinaryExpr => {
-                let kids: Vec<&ResolvedNode> = node.children().collect();
-                let op = node
-                    .children_with_tokens()
-                    .filter_map(|el| el.into_token())
-                    .find(|t| !t.kind().is_trivia() && is_binary_op(t.kind()))
-                    .map(|t| t.text().to_string())
-                    .unwrap_or_default();
+                let kids: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_expr_kind(c.kind())).collect();
+                let op = binary_op(node);
                 if let Some(l) = kids.first() {
                     self.expr(l);
                 }
@@ -323,8 +324,212 @@ impl Printer<'_> {
                     self.expr(r);
                 }
             }
-            _ => self.out.text(&node.text().to_string()),
+            ParenExpr => {
+                self.out.text("(");
+                if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(e);
+                }
+                self.out.text(")");
+            }
+            CallExpr => {
+                let kids: Vec<&ResolvedNode> = node.children().collect();
+                if let Some(callee) =
+                    kids.iter().copied().find(|c| is_expr_kind(c.kind()))
+                {
+                    self.expr(callee);
+                }
+                if let Some(args) = kids.iter().copied().find(|c| c.kind() == ArgList) {
+                    self.arg_list(args);
+                }
+            }
+            MemberExpr => {
+                if let Some(o) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(o);
+                }
+                self.out.text(".");
+                self.out.text(&member_name(node));
+            }
+            OptMemberExpr => {
+                if let Some(o) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(o);
+                }
+                self.out.text("?.");
+                self.out.text(&member_name(node));
+            }
+            IndexExpr => {
+                let kids: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_expr_kind(c.kind())).collect();
+                if let Some(o) = kids.first() {
+                    self.expr(o);
+                }
+                self.out.text("[");
+                if let Some(i) = kids.get(1) {
+                    self.expr(i);
+                }
+                self.out.text("]");
+            }
+            ArrayExpr => self.comma_seq("[", "]", node),
+            ObjectExpr => self.object_expr(node),
+            SpreadElem => {
+                self.out.text("...");
+                if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(e);
+                }
+            }
+            TemplateExpr => {
+                // templates verbatim (interpolation preserved)
+                self.out.text(node.text().to_string().trim())
+            }
+            TryExpr => self.unary_postfix(node, "?"),
+            UnwrapExpr => self.unary_postfix(node, "!"),
+            TernaryExpr => {
+                let kids: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_expr_kind(c.kind())).collect();
+                if let Some(c) = kids.first() {
+                    self.expr(c);
+                }
+                self.out.text(" ? ");
+                if let Some(t) = kids.get(1) {
+                    self.expr(t);
+                }
+                self.out.text(" : ");
+                if let Some(e) = kids.get(2) {
+                    self.expr(e);
+                }
+            }
+            AwaitExpr => {
+                self.out.text("await ");
+                if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(e);
+                }
+            }
+            YieldExpr => {
+                self.out.text("yield");
+                if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+                    self.out.text(" ");
+                    self.expr(e);
+                }
+            }
+            AssignExpr => {
+                let kids: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_expr_kind(c.kind())).collect();
+                if let Some(t) = kids.first() {
+                    self.expr(t);
+                }
+                self.out.text(&format!(" {} ", assign_op(node)));
+                if let Some(v) = kids.get(1) {
+                    self.expr(v);
+                }
+            }
+            ArrowExpr => self.arrow_expr(node),
+            MatchExpr => self.match_expr(node),
+            RangeExpr => {
+                let kids: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_expr_kind(c.kind())).collect();
+                if let Some(s) = kids.first() {
+                    self.expr(s);
+                }
+                self.out.text(range_op(node));
+                if let Some(e) = kids.get(1) {
+                    self.expr(e);
+                }
+            }
+            _ => self.out.text(node.text().to_string().trim()),
         }
+    }
+
+    fn unary_postfix(&mut self, node: &ResolvedNode, op: &str) {
+        if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
+            self.expr(e);
+        }
+        self.out.text(op);
+    }
+
+    fn arg_list(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("(");
+        let items: Vec<&ResolvedNode> = node
+            .children()
+            .filter(|c| is_expr_kind(c.kind()) || c.kind() == SpreadElem)
+            .collect();
+        for (i, it) in items.iter().enumerate() {
+            if i > 0 {
+                self.out.text(", ");
+            }
+            self.expr(it);
+        }
+        self.out.text(")");
+    }
+
+    fn comma_seq(&mut self, open: &str, close: &str, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text(open);
+        let items: Vec<&ResolvedNode> = node
+            .children()
+            .filter(|c| is_expr_kind(c.kind()) || c.kind() == SpreadElem)
+            .collect();
+        for (i, it) in items.iter().enumerate() {
+            if i > 0 {
+                self.out.text(", ");
+            }
+            self.expr(it);
+        }
+        self.out.text(close);
+    }
+
+    fn object_expr(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        self.out.text("{");
+        let items: Vec<&ResolvedNode> = node
+            .children()
+            .filter(|c| matches!(c.kind(), ObjectField | SpreadElem))
+            .collect();
+        for (i, it) in items.iter().enumerate() {
+            if i > 0 {
+                self.out.text(", ");
+            }
+            match it.kind() {
+                ObjectField => {
+                    self.out.text(&self.object_key(it));
+                    self.out.text(": ");
+                    if let Some(v) = it.children().find(|c| is_expr_kind(c.kind())) {
+                        self.expr(v);
+                    }
+                }
+                SpreadElem => self.expr(it),
+                _ => {}
+            }
+        }
+        self.out.text("}");
+    }
+
+    // --- 4a/4b-pending stubs (real impls in later tasks) ---
+    fn literal_text(&self, node: &ResolvedNode) -> String {
+        // T5 adds canonical re-quoting; for now return the literal's token text.
+        node.children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| !t.kind().is_trivia())
+            .map(|t| t.text().to_string())
+            .unwrap_or_else(|| node.text().to_string().trim().to_string())
+    }
+
+    fn object_key(&self, node: &ResolvedNode) -> String {
+        // T5 adds quote/ident-key normalization; for now the first ident/str token.
+        node.children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| matches!(t.kind(), SyntaxKind::Ident | SyntaxKind::Str))
+            .map(|t| t.text().to_string())
+            .unwrap_or_default()
+    }
+
+    fn arrow_expr(&mut self, node: &ResolvedNode) {
+        // T3 implements full arrows; 4a-style fallback: verbatim trimmed text.
+        self.out.text(node.text().to_string().trim());
+    }
+
+    fn match_expr(&mut self, node: &ResolvedNode) {
+        // T3 implements match; fallback: verbatim trimmed text.
+        self.out.text(node.text().to_string().trim());
     }
 }
 
@@ -399,6 +604,52 @@ fn is_binary_op(kind: SyntaxKind) -> bool {
         | Lt | Le | Gt | Ge | AmpAmp | PipePipe | QuestionQuestion)
 }
 
+fn leading_op(node: &ResolvedNode) -> String {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| !t.kind().is_trivia())
+        .map(|t| t.text().to_string())
+        .unwrap_or_default()
+}
+
+fn binary_op(node: &ResolvedNode) -> String {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| is_binary_op(t.kind()))
+        .map(|t| t.text().to_string())
+        .unwrap_or_default()
+}
+
+fn assign_op(node: &ResolvedNode) -> String {
+    use SyntaxKind::*;
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| matches!(t.kind(), Eq | PlusEq | MinusEq | StarEq | SlashEq))
+        .map(|t| t.text().to_string())
+        .unwrap_or_else(|| "=".into())
+}
+
+fn range_op(node: &ResolvedNode) -> &'static str {
+    if node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == SyntaxKind::DotDotEq)
+    {
+        "..="
+    } else {
+        ".."
+    }
+}
+
+fn member_name(node: &ResolvedNode) -> String {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .filter(|t| t.kind() == SyntaxKind::Ident)
+        .last()
+        .map(|t| t.text().to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +704,19 @@ mod tests {
         let greet_c = out.find("// the greet method").expect("method comment present");
         assert!(name_c < name_pos && name_pos < greet_c,
             "each comment must travel with its member:\n{out}");
+    }
+
+    #[test]
+    fn formats_expressions() {
+        assert_eq!(fmt("f( 1,2 )\n"), "f(1, 2)\n");
+        assert_eq!(fmt("a . b [ c ]\n"), "a.b[c]\n");
+        assert_eq!(fmt("a?.b\n"), "a?.b\n");
+        assert_eq!(fmt("[ 1 ,2, 3 ]\n"), "[1, 2, 3]\n");
+        assert_eq!(fmt("- x\n"), "-x\n");
+        assert_eq!(fmt("a ?b: c\n"), "a ? b : c\n");
+        assert_eq!(fmt("f()?\n"), "f()?\n");
+        assert_eq!(fmt("g()!\n"), "g()!\n");
+        assert_eq!(fmt("await  f()\n"), "await f()\n");
     }
 
     #[test]
