@@ -117,6 +117,26 @@ impl Vm {
                     let top = fiber.peek(0).clone();
                     fiber.push(top);
                 }
+                Op::Swap => {
+                    // `a b -- b a`. Both operands are compiler-produced, so the
+                    // stack always has the two values (a non-empty stack is a
+                    // compiler invariant, not user-reachable).
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    fiber.push(b);
+                    fiber.push(a);
+                }
+                Op::Rot3 => {
+                    // `a b c -- b c a` (the value 3rd from the top rotates to the
+                    // top). Compiler-produced three-value group; never user-reachable
+                    // with fewer than three on the stack.
+                    let c = fiber.pop();
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    fiber.push(b);
+                    fiber.push(c);
+                    fiber.push(a);
+                }
 
                 Op::Add
                 | Op::Sub
@@ -584,6 +604,22 @@ impl Vm {
                     let obj = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = crate::interp::index_get(&obj, &idx, span, span)?;
+                    fiber.push(v);
+                }
+
+                Op::SetIndex => {
+                    // `obj idx val -- val` — store `obj[idx] = val`. The operands
+                    // were pushed obj-then-idx-then-val, so pop val, idx, obj. The
+                    // shared `index_set` dispatch (with the tree-walker) anchors
+                    // every panic at the op's span; the VM has a single instruction
+                    // span, so it is passed for both the receiver-span and
+                    // index-span parameters. Leaves the assigned value on the stack
+                    // (assignment is an expression).
+                    let val = fiber.pop();
+                    let idx = fiber.pop();
+                    let obj = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::index_set(&obj, &idx, val, span, span)?;
                     fiber.push(v);
                 }
 

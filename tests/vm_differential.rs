@@ -622,6 +622,14 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     // `task_race_resolves_a_vm_produced_future` unit tests in `src/vm/run.rs`).
     // Those examples are added to this allowlist when `import` lands (V12).
     "examples/async.as",
+    // V9-T5 assignment qualifiers (verified byte-identical by running both engines
+    // over the file). All three exercise compound assignment (`+=`/`*=`) — now
+    // supported — over the V1..V4 base (locals, arithmetic, `fn`, closures/arrows,
+    // `for`-range, `if`/`else`, `continue`, index/member reads, arrays/objects).
+    // No `import`/`match`/`class`/`enum`/spread/`?`-operator/destructuring.
+    "examples/functions.as", // recursion + `for`-range + `+=` counter + arrow.
+    "examples/factorial.as", // `*=` accumulator in a for-range + `if`/`else`.
+    "examples/data.as",      // `+=` aggregation over an array of objects.
 ];
 
 #[tokio::test]
@@ -2917,4 +2925,204 @@ async fn vm_schema_parse_failure_on_tagged_object_literal_matches_treewalker() {
     // A failing `.parse` yields `[nil, err]`; the error message must be identical.
     let src = "let s = {__kind: \"string\"}\nlet r = s.minLength(5).parse(\"hi\")\nprint(r[0])\nprint(r[1].message)";
     assert_vm_run_matches_treewalker(src).await;
+}
+
+// ===========================================================================
+// V9-T5: deferred assignment forms — compound (+= -= *= /=) + index/member
+// assignment (a[i]=x, a.k=x). Differential: every case must be byte-identical to
+// the tree-walker (the oracle). The tree-walker desugars `a OP= b` to the literal
+// `a = (a OP b)` (so the target's sub-expressions are evaluated TWICE for a
+// compound assignment); the VM reproduces that exactly (no receiver caching). The
+// value is evaluated BEFORE the receiver/index in BOTH engines.
+// ===========================================================================
+
+#[tokio::test]
+async fn vm_compound_assign_on_local() {
+    for src in [
+        "let x = 10\nx += 5\nprint(x)",
+        "let x = 10\nx -= 3\nprint(x)",
+        "let x = 10\nx *= 2\nprint(x)",
+        "let x = 12\nx /= 4\nprint(x)",
+        // chained on the same local
+        "let x = 1\nx += 2\nx *= 3\nx -= 4\nprint(x)",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_compound_assign_on_array_element_and_object_field() {
+    for src in [
+        "let a = [1, 2, 3]\na[1] += 10\nprint(a[1])",
+        "let a = [1, 2, 3]\na[0] -= 5\nprint(a[0])",
+        "let a = [2, 4, 6]\na[2] *= 3\nprint(a[2])",
+        "let a = [20, 8, 6]\na[1] /= 2\nprint(a[1])",
+        "let o = {n: 1}\no.n += 5\nprint(o.n)",
+        "let o = {n: 10}\no.n -= 3\no.n *= 2\nprint(o.n)",
+        // index by string key on an object
+        "let o = {n: 1}\no[\"n\"] += 9\nprint(o.n)",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_index_assignment_array_and_object() {
+    for src in [
+        "let a = [1, 2, 3]\na[0] = 99\nprint(a[0])",
+        "let a = [1, 2, 3]\na[2] = 7\nprint(a[2])",
+        // add a new key to an object via index assignment
+        "let o = {}\no[\"k\"] = 7\nprint(o.k)",
+        // overwrite existing key
+        "let o = {k: 1}\no[\"k\"] = 2\nprint(o[\"k\"])",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_member_assignment_object_and_instance() {
+    for src in [
+        "let o = {a: 1}\no.a = 2\nprint(o.a)",
+        // add a new field to an object
+        "let o = {}\no.x = 5\nprint(o.x)",
+        // instance field set inside + outside init
+        "class P { name: string\n fn init(n) { self.name = n } }\n\
+         let p = P(\"a\")\np.name = \"b\"\nprint(p.name)",
+        // compound on a typed instance field (number contract holds)
+        "class C { n: number\n fn init() { self.n = 1 } }\n\
+         let c = C()\nc.n += 41\nprint(c.n)",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_typed_instance_field_violation_panic_matches_treewalker() {
+    // Assigning a string to a `number`-typed field is a Tier-2 contract panic.
+    // Both engines must produce the identical message AND span.
+    let src = "class C { n: number\n fn init() { self.n = 1 } }\n\
+               let c = C()\nc.n = \"oops\"\nprint(c.n)";
+    let tw = ascript::run_source(src).await.expect_err("tree-walker errors");
+    let vm = ascript::vm_run_source(src).await.expect_err("vm errors");
+    assert_eq!(
+        tw.message, vm.message,
+        "panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+        tw.message, vm.message
+    );
+    assert_eq!(
+        tw.span, vm.span,
+        "panic span diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+        tw.span, vm.span
+    );
+}
+
+#[tokio::test]
+async fn vm_compound_assign_single_eval_order_matches_treewalker() {
+    // CRITICAL: the tree-walker desugars `a[i] OP= b` to `a[i] = (a[i] OP b)`, so
+    // it evaluates the receiver+index TWICE (read side + store side) and the rhs
+    // once, in the order: receiver, index, rhs, receiver, index. The VM must print
+    // these side effects in the EXACT same order/count. We assert byte-identical
+    // stdout (which captures every `print` from the side-effecting helpers).
+    // The side-effecting helpers are nested in a driver fn so they capture the
+    // mutated container as an UPVALUE (the VM does not yet support a nested fn
+    // referencing a top-level `let` as a bare global — a separate V4 deferral
+    // unrelated to assignment).
+    for src in [
+        // index compound: order a, i, b, a, i
+        "fn run() {\n let arr = [1, 2, 3]\n\
+         fn a() { print(\"a\")\n return arr }\n\
+         fn i() { print(\"i\")\n return 1 }\n\
+         fn b() { print(\"b\")\n return 100 }\n\
+         a()[i()] += b()\n print(arr[1]) }\nrun()",
+        // member compound: order a, b, a
+        "fn run() {\n let holder = {n: 5}\n\
+         fn obj() { print(\"obj\")\n return holder }\n\
+         fn rhs() { print(\"rhs\")\n return 7 }\n\
+         obj().n += rhs()\n print(holder.n) }\nrun()",
+        // plain index assign: order val, recv, idx
+        "fn run() {\n let base = [1, 2, 3]\n\
+         fn recv() { print(\"recv\")\n return base }\n\
+         fn idx() { print(\"idx\")\n return 0 }\n\
+         fn val() { print(\"val\")\n return 9 }\n\
+         recv()[idx()] = val()\n print(base[0]) }\nrun()",
+        // plain member assign: order val, obj
+        "fn run() {\n let o = {}\n\
+         fn obj() { print(\"obj\")\n return o }\n\
+         fn val() { print(\"val\")\n return 5 }\n\
+         obj().x = val()\n print(o.x) }\nrun()",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_assignment_is_an_expression() {
+    for src in [
+        // index assignment yields the assigned value
+        "let a = [0]\nprint(a[0] = 5)",
+        // member assignment yields the assigned value
+        "let o = {}\nprint(o.k = 9)",
+        // local assignment yields the assigned value
+        "let x = 0\nprint(x = 3)",
+        // compound assignment yields the NEW value
+        "let x = 10\nprint(x += 5)",
+        "let a = [1]\nprint(a[0] += 41)",
+        // chained assignment (right-associative): both bound to the value
+        "let x = 0\nlet y = 0\nx = y = 7\nprint(x)\nprint(y)",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_compound_assign_on_upvalue_counter() {
+    // A closure increments a captured (upvalue) variable via `+=`. Both engines
+    // must thread the by-reference cell identically.
+    let src = "fn counter() {\n let n = 0\n return () => { n += 1\n return n } }\n\
+               let next = counter()\nprint(next())\nprint(next())\nprint(next())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_index_assign_oob_and_wrong_type_panics_match_treewalker() {
+    // Out-of-bounds and wrong-index-type index assignment are Tier-2 panics with
+    // byte-identical message AND span on both engines (shared `index_set`). These
+    // all anchor at the tree-walker's `index_span` (the whole `a[i]` expr), which
+    // the VM's single `SET_INDEX` op span reproduces exactly.
+    for src in [
+        "let a = [1, 2, 3]\na[9] = 0\nprint(a)",   // OOB
+        "let a = [1, 2, 3]\na[-1] = 0\nprint(a)",  // negative index
+        "let a = [1, 2, 3]\na[1.5] = 0\nprint(a)", // non-integer index
+        "let o = {}\no[5] = 1\nprint(o)",          // non-string object key
+    ] {
+        let tw = ascript::run_source(src).await.expect_err("tree-walker errors");
+        let vm = ascript::vm_run_source(src).await.expect_err("vm errors");
+        assert_eq!(
+            tw.message, vm.message,
+            "panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+            tw.message, vm.message
+        );
+        assert_eq!(
+            tw.span, vm.span,
+            "panic span diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+            tw.span, vm.span
+        );
+    }
+
+    // Index-assigning a non-container (`n[0] = 1` where `n` is a number) is also a
+    // Tier-2 panic with a byte-identical MESSAGE. The tree-walker anchors this one
+    // case at the RECEIVER's span (`obj_span`), whereas the VM's single `SET_INDEX`
+    // op span is the whole-expr span (chosen to match the far-more-common OOB /
+    // wrong-type / object-key cases above). This is the SAME documented single-VM-
+    // span limitation as `Op::SetProp`'s "cannot set property" path, so message-
+    // equality is asserted here, not span-equality.
+    let src = "let n = 5\nn[0] = 1\nprint(n)";
+    let tw = ascript::run_source(src).await.expect_err("tree-walker errors");
+    let vm = ascript::vm_run_source(src).await.expect_err("vm errors");
+    assert_eq!(
+        tw.message, vm.message,
+        "panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+        tw.message, vm.message
+    );
 }

@@ -2817,31 +2817,11 @@ impl Interp {
             ExprKind::Index { object, index } => {
                 let obj = self.eval_expr(object, env).await?;
                 let idx = self.eval_expr(index, env).await?;
-                match obj {
-                    Value::Array(arr) => {
-                        let i = array_index(&idx, target.span)?;
-                        let mut arr = arr.borrow_mut();
-                        if i >= arr.len() {
-                            return Err(AsError::at(
-                                format!("index {} out of bounds (len {})", i, arr.len()),
-                                target.span,
-                            )
-                            .into());
-                        }
-                        arr[i] = value.clone();
-                        Ok(value)
-                    }
-                    Value::Object(map) => match idx {
-                        Value::Str(key) => {
-                            map.borrow_mut().insert(key.to_string(), value.clone());
-                            Ok(value)
-                        }
-                        _ => Err(AsError::at("object index must be a string", target.span).into()),
-                    },
-                    _ => Err(
-                        AsError::at("cannot index-assign a non-array value", object.span).into(),
-                    ),
-                }
+                // Shared index-write dispatch (with the VM's `Op::SetIndex`) so the
+                // two engines apply identical index-assignment semantics + panic
+                // messages. `object.span` anchors the non-array error; `target.span`
+                // (the whole index expr) anchors OOB / object-index-type errors.
+                Ok(index_set(&obj, &idx, value, object.span, target.span)?)
             }
             ExprKind::Member { object, name } => {
                 let obj = self.eval_expr(object, env).await?;
@@ -3127,6 +3107,58 @@ pub(crate) fn index_get(
             _ => Err(AsError::at("object index must be a string", index_span)),
         },
         _ => Err(AsError::at("cannot index this value", obj_span)),
+    }
+}
+
+/// Pure index-write dispatch (`obj[idx] = value`) shared by the tree-walker
+/// (`assign_to`'s `Index` arm) and the bytecode VM (`Op::SetIndex`) so the two
+/// engines cannot drift on index-assignment semantics or panic messages. There
+/// is one implementation. Returns the assigned value (assignment is an
+/// expression).
+///
+/// Semantics (mirroring the original inline `assign_to` arm exactly):
+/// - `Array`: the index must be a non-negative integer `Number` (via
+///   [`array_index`], anchored at `index_span`); an out-of-bounds index is a
+///   Tier-2 panic (arrays do NOT grow), `"index {i} out of bounds (len {n})"`
+///   at `index_span`.
+/// - `Object`: the index must be a `Str` key (a new key is inserted); a
+///   non-string index panics `"object index must be a string"` at `index_span`.
+/// - anything else: `"cannot index-assign a non-array value"` at `obj_span`.
+///
+/// `obj_span` is the receiver's span (the tree-walker's `object.span`);
+/// `index_span` is the whole index-expression's span (the tree-walker's
+/// `target.span`). The VM passes its single instruction span for both.
+pub(crate) fn index_set(
+    obj: &Value,
+    idx: &Value,
+    value: Value,
+    obj_span: Span,
+    index_span: Span,
+) -> Result<Value, AsError> {
+    match obj {
+        Value::Array(arr) => {
+            let i = array_index(idx, index_span)?;
+            let mut arr = arr.borrow_mut();
+            if i >= arr.len() {
+                return Err(AsError::at(
+                    format!("index {} out of bounds (len {})", i, arr.len()),
+                    index_span,
+                ));
+            }
+            arr[i] = value.clone();
+            Ok(value)
+        }
+        Value::Object(map) => match idx {
+            Value::Str(key) => {
+                map.borrow_mut().insert(key.to_string(), value.clone());
+                Ok(value)
+            }
+            _ => Err(AsError::at("object index must be a string", index_span)),
+        },
+        _ => Err(AsError::at(
+            "cannot index-assign a non-array value",
+            obj_span,
+        )),
     }
 }
 

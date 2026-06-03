@@ -540,103 +540,187 @@ impl Compiler {
         }
     }
 
-    /// Lower an assignment expression `target = value`. V2 supports only a plain
-    /// `=` to a local-binding target (a `NameRef` resolving to `Local(slot)`).
+    /// Lower an assignment expression `target <op> value`, where `<op>` is either a
+    /// plain `=` or a compound `+=`/`-=`/`*=`/`/=`, and the target is a `NameRef`
+    /// (local/upvalue), a `MemberExpr` (`a.k`), or an `IndexExpr` (`a[i]`).
     ///
-    /// Stack convention: `SET_LOCAL` POPS the value and stores it (clean stack
-    /// discipline). Assignment is an *expression* that yields the assigned value,
-    /// so we compile the value, `DUP` it (leaving the result copy on the stack),
-    /// then `SET_LOCAL`. Used as a statement, the surrounding `POP` discards the
-    /// leftover copy. This mirrors the tree-walker's `ExprKind::Assign`, which
-    /// evaluates the value and returns it as the expression result.
+    /// **Evaluation order mirrors the tree-walker byte-for-byte.** The tree-walker
+    /// evaluates the assignment's *value* first (`ExprKind::Assign` evals `value`),
+    /// THEN evaluates the target's receiver/index in `assign_to`. A compound
+    /// `a OP= b` is a *literal desugar* to `a = (a OP b)` (parser `make_binary`),
+    /// so the tree-walker evaluates the target's sub-expressions **TWICE** — once
+    /// reading the current value (the desugared binary's lhs) and once for the
+    /// store (`assign_to`). We reproduce exactly this (verified: `a()[i()] += b()`
+    /// prints `a i b a i`). So this lowering does NOT cache the receiver/index in a
+    /// scratch slot — that would diverge.
     ///
-    /// Compound assignment (`+=`/`-=`/`*=`/`/=`) and non-`NameRef` targets
-    /// (index/member) are later deferrals (V9+).
+    /// Phases (in emission/eval order):
+    /// 1. Push the value-to-store. Plain: compile `value`. Compound: compile the
+    ///    target as a *read*, then `value`, then the binop (`ADD`/`SUB`/`MUL`/`DIV`).
+    /// 2. Store to the target, leaving the stored value on the stack (assignment is
+    ///    an expression). The store re-evaluates the receiver/index, which now sit
+    ///    ABOVE the value on the stack; `SWAP`/`ROT3` reorder them into the layout
+    ///    `SET_PROP`/`SET_INDEX` consume (`[recv, val]` / `[recv, idx, val]`):
+    ///    - `NameRef`:  `DUP`; `SET_LOCAL`/`SET_UPVALUE`. (no receiver to eval)
+    ///    - `MemberExpr`: eval object; `SWAP`; `SET_PROP <name>`. Stack:
+    ///      `[val] -> [val,obj] -> [obj,val] -> [val]`. Eval order: val, obj.
+    ///    - `IndexExpr`: eval object; eval index; `ROT3`; `SET_INDEX`. Stack:
+    ///      `[val] -> [val,obj] -> [val,obj,idx] -> [obj,idx,val] -> [val]`. Eval
+    ///      order: val, obj, idx.
     fn compile_assign(&mut self, assign: &AssignExpr) -> Result<(), CompileError> {
         let span = node_span(assign);
-        // Only a plain `=` operator is supported; reject compound assignment.
-        let is_plain_eq = assign
+        // Map the assignment operator token to its compound binop, or `None` for a
+        // plain `=`. (The CST `AssignExpr` carries the operator as a child token.)
+        let assign_op = assign
             .syntax()
             .children_with_tokens()
             .filter_map(|e| e.into_token())
-            .any(|t| t.kind() == SyntaxKind::Eq);
-        if !is_plain_eq {
-            return Err(CompileError::new(
-                "compound assignment (+=/-=/*=//=) not yet supported (V9)",
-                span,
-            ));
-        }
-
-        let target = assign
-            .target()
-            .ok_or_else(|| CompileError::new("assignment missing target", span))?;
-        // Member assignment `obj.field = value` (V9): used pervasively in class
-        // method bodies (`self.x = id`). Lowering mirrors the tree-walker's
-        // `assign_to` `Member` arm (`SET_PROP` carries the field type contract and
-        // leaves the assigned value as the expression's result):
-        //   <obj> ; <value> ; SET_PROP <name>   ; ( obj value -- value )
-        if let Expr::MemberExpr(m) = &target {
-            let object = m
-                .expr()
-                .ok_or_else(|| CompileError::new("member assignment missing object", span))?;
-            let field = m
-                .ident_token()
-                .map(|t| t.text().to_string())
-                .ok_or_else(|| CompileError::new("member assignment missing field name", span))?;
-            let value = assign
-                .value()
-                .ok_or_else(|| CompileError::new("assignment missing value", span))?;
-            self.compile_expr(&object)?;
-            self.compile_expr(&value)?;
-            let name_idx = self.chunk.add_const(Value::Str(field.into()));
-            // The op's span is the value's TRIVIA-TRIMMED span so a field-type
-            // contract panic anchors EXACTLY where the tree-walker's does
-            // (`assign_to` uses `value.span`, the AST node's own start — past any
-            // leading whitespace). See #132 / `node_code_span`.
-            self.chunk
-                .emit_u16(Op::SetProp, name_idx, node_code_span(&value));
-            return Ok(());
-        }
-        let Expr::NameRef(name_ref) = &target else {
-            return Err(CompileError::new(
-                "assignment to non-identifier targets (index) not yet supported (V9-T5)",
-                node_span(&target),
-            ));
-        };
-        // The store target: either a frame-local slot (cell-aware) or an upvalue
-        // (a captured outer variable, mutated by reference via SET_UPVALUE).
-        enum Target {
-            Local(u16),
-            Upvalue(u16),
-        }
-        let store = match self.resolved.uses.get(&name_ref.syntax().text_range()) {
-            Some(Resolution::Local(slot)) => Target::Local(
-                u16::try_from(*slot)
-                    .map_err(|_| CompileError::new("local slot index exceeds 65535", span))?,
-            ),
-            Some(Resolution::Upvalue(idx)) => Target::Upvalue(
-                u16::try_from(*idx)
-                    .map_err(|_| CompileError::new("upvalue index exceeds 65535", span))?,
-            ),
-            _ => {
+            .map(|t| t.kind())
+            .find(|k| {
+                matches!(
+                    k,
+                    SyntaxKind::Eq
+                        | SyntaxKind::PlusEq
+                        | SyntaxKind::MinusEq
+                        | SyntaxKind::StarEq
+                        | SyntaxKind::SlashEq
+                )
+            })
+            .ok_or_else(|| CompileError::new("assignment missing operator", span))?;
+        let compound = match assign_op {
+            SyntaxKind::Eq => None,
+            SyntaxKind::PlusEq => Some(Op::Add),
+            SyntaxKind::MinusEq => Some(Op::Sub),
+            SyntaxKind::StarEq => Some(Op::Mul),
+            SyntaxKind::SlashEq => Some(Op::Div),
+            other => {
                 return Err(CompileError::new(
-                    "assignment to a non-local target not yet supported (V4)",
-                    node_span(&target),
+                    format!("unexpected assignment operator {other:?}"),
+                    span,
                 ))
             }
         };
 
+        let target = assign
+            .target()
+            .ok_or_else(|| CompileError::new("assignment missing target", span))?;
         let value = assign
             .value()
             .ok_or_else(|| CompileError::new("assignment missing value", span))?;
-        self.compile_expr(&value)?;
-        // Leave the assigned value as the expression's result, then store a copy.
-        self.chunk.emit(Op::Dup, span);
-        match store {
-            Target::Local(slot) => self.emit_set_local(slot, span),
-            Target::Upvalue(idx) => self.chunk.emit_u16(Op::SetUpvalue, idx, span),
+
+        // Phase 1: push the value-to-store. For a compound `a OP= b`, this is the
+        // desugared `(a OP b)`: read the target, push `b`, then the binop. The
+        // binop's span mirrors the tree-walker's desugared `Binary` node span
+        // (`Span::new(target.start, value.end)` from `make_binary`), trivia-trimmed
+        // for byte-identical Tier-2 type-panic anchoring (#132).
+        if let Some(binop) = compound {
+            self.compile_target_read(&target)?;
+            self.compile_expr(&value)?;
+            let binop_span =
+                Span::new(node_code_span(&target).start, node_code_span(&value).end);
+            self.chunk.emit(binop, binop_span);
+        } else {
+            self.compile_expr(&value)?;
+        }
+
+        // Phase 2: store to the target, leaving the assigned value on the stack.
+        match &target {
+            Expr::NameRef(name_ref) => {
+                // The store target: a frame-local slot (cell-aware) or an upvalue
+                // (a captured outer variable, mutated by reference). `DUP` first so
+                // a copy remains as the expression's result after the popping store.
+                let store = match self.resolved.uses.get(&name_ref.syntax().text_range()) {
+                    Some(Resolution::Local(slot)) => {
+                        let slot = u16::try_from(*slot).map_err(|_| {
+                            CompileError::new("local slot index exceeds 65535", span)
+                        })?;
+                        (true, slot)
+                    }
+                    Some(Resolution::Upvalue(idx)) => {
+                        let idx = u16::try_from(*idx).map_err(|_| {
+                            CompileError::new("upvalue index exceeds 65535", span)
+                        })?;
+                        (false, idx)
+                    }
+                    _ => {
+                        return Err(CompileError::new(
+                            "assignment to a non-local target not yet supported (V4)",
+                            node_span(&target),
+                        ))
+                    }
+                };
+                self.chunk.emit(Op::Dup, span);
+                let (is_local, slot) = store;
+                if is_local {
+                    self.emit_set_local(slot, span);
+                } else {
+                    self.chunk.emit_u16(Op::SetUpvalue, slot, span);
+                }
+            }
+            Expr::MemberExpr(m) => {
+                // `obj.field = value` (used pervasively as `self.x = id`). Mirrors
+                // the tree-walker's `assign_to` `Member` arm: it evaluates `value`
+                // first (already on the stack), THEN the receiver `object`; `SWAP`
+                // reorders to `[obj, value]` for `SET_PROP`, which carries the
+                // declared field-type contract and leaves the assigned value.
+                let object = m
+                    .expr()
+                    .ok_or_else(|| CompileError::new("member assignment missing object", span))?;
+                let field = m.ident_token().map(|t| t.text().to_string()).ok_or_else(|| {
+                    CompileError::new("member assignment missing field name", span)
+                })?;
+                self.compile_expr(&object)?;
+                self.chunk.emit(Op::Swap, span);
+                let name_idx = self.chunk.add_const(Value::Str(field.into()));
+                // The op's span is the value's TRIVIA-TRIMMED span so a field-type
+                // contract panic anchors EXACTLY where the tree-walker's does
+                // (`assign_to`/`set_member` uses `value.span`). See #132.
+                self.chunk
+                    .emit_u16(Op::SetProp, name_idx, node_code_span(&value));
+            }
+            Expr::IndexExpr(ix) => {
+                // `obj[idx] = value`. Mirrors the tree-walker's `assign_to` `Index`
+                // arm: it evaluates `value` first (already on the stack), THEN the
+                // receiver `object` and the `index`; `ROT3` reorders to
+                // `[obj, idx, value]` for `SET_INDEX` (shared `index_set` dispatch).
+                let object = ix
+                    .base()
+                    .ok_or_else(|| CompileError::new("index assignment missing receiver", span))?;
+                let index = ix
+                    .index()
+                    .ok_or_else(|| CompileError::new("index assignment missing index", span))?;
+                self.compile_expr(&object)?;
+                self.compile_expr(&index)?;
+                self.chunk.emit(Op::Rot3, span);
+                // The op's span is the whole index expr's TRIVIA-TRIMMED span so the
+                // OOB / object-index-type panic anchors where the tree-walker's does
+                // (`index_set(.., target.span)`). See #132.
+                self.chunk.emit(Op::SetIndex, node_code_span(ix));
+            }
+            _ => {
+                return Err(CompileError::new(
+                    "invalid assignment target",
+                    node_span(&target),
+                ))
+            }
         }
         Ok(())
+    }
+
+    /// Compile a *read* of an assignment target (`NameRef`/`MemberExpr`/`IndexExpr`)
+    /// — the lhs load for a compound `a OP= b`. Identical to compiling the target as
+    /// an ordinary expression (so the receiver/index sub-expressions are evaluated
+    /// exactly as the tree-walker re-evaluates them via the desugared `(a OP b)`).
+    fn compile_target_read(&mut self, target: &Expr) -> Result<(), CompileError> {
+        match target {
+            Expr::NameRef(_) | Expr::MemberExpr(_) | Expr::IndexExpr(_) => {
+                self.compile_expr(target)
+            }
+            _ => Err(CompileError::new(
+                "invalid compound-assignment target",
+                node_span(target),
+            )),
+        }
     }
 
     /// Compile a non-expression statement. V2 supports `let`/`const`
@@ -3007,9 +3091,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_compound_assignment() {
-        let err = compile_source("let x = 1\nx += 2").unwrap_err();
-        assert!(err.message.contains("compound assignment"), "got {err:?}");
+    fn compound_assignment_lowers_to_load_binop_store() {
+        // `x += 2` desugars (like the tree-walker) to `x = (x + 2)`: load the
+        // current value, push the rhs, ADD, then store back (DUP + SET_LOCAL so the
+        // assignment expression yields the new value).
+        let chunk = compile_source("let x = 1\nx += 2\nx").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("ADD"), "expected ADD for `+=`, got:\n{text}");
+        assert!(
+            text.contains("SET_LOCAL"),
+            "expected SET_LOCAL store, got:\n{text}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3088,11 +3180,25 @@ mod tests {
     }
 
     #[test]
-    fn index_assignment_is_deferred() {
-        // Index ASSIGNMENT routes through compile_assign (target is not a NameRef
-        // and not a Member); deferred to V9-T5.
-        let err = compile_source("let a = [1]\na[0] = 9").unwrap_err();
-        assert!(err.message.contains("index"), "got {err:?}");
+    fn index_assignment_compiles_to_set_index() {
+        // Index ASSIGNMENT `a[0] = 9` lowers to `<value> <obj> <idx> ROT3
+        // SET_INDEX` (value-first eval order mirrors the tree-walker; ROT3 reorders
+        // into the `[obj, idx, value]` layout SET_INDEX consumes).
+        let chunk = compile_source("let a = [1]\na[0] = 9").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("SET_INDEX"), "expected SET_INDEX, got:\n{text}");
+        assert!(text.contains("ROT3"), "expected ROT3, got:\n{text}");
+    }
+
+    #[test]
+    fn member_assignment_evaluates_value_before_receiver() {
+        // `o.a = 9` lowers to `<value> <obj> SWAP SET_PROP "a"` — value FIRST, then
+        // the receiver (matching the tree-walker's `assign_to`), with SWAP putting
+        // them in `[obj, value]` order for SET_PROP.
+        let chunk = compile_source("let o = {a: 1}\no.a = 9").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("SET_PROP"), "expected SET_PROP, got:\n{text}");
+        assert!(text.contains("SWAP"), "expected SWAP, got:\n{text}");
     }
 
     #[test]

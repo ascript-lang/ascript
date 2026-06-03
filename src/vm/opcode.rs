@@ -40,6 +40,15 @@ pub enum Op {
     Pop,
     /// Duplicate the top of stack.
     Dup,
+    /// `a b -- b a` — swap the top two stack values. Used by assignment lowering
+    /// to reorder a value-then-receiver evaluation (tree-walker order) into the
+    /// `[receiver, value]` layout `SET_PROP` consumes.
+    Swap,
+    /// `a b c -- b c a` — rotate the top three values left (the value 3rd from the
+    /// top moves to the top). Used by index-assignment lowering to reorder a
+    /// value-then-receiver-then-index evaluation (tree-walker order) into the
+    /// `[receiver, index, value]` layout `SET_INDEX` consumes.
+    Rot3,
 
     // ---- locals / upvalues ------------------------------------------------
     /// `GET_LOCAL(u16)` — push the value in local slot `n`.
@@ -280,6 +289,8 @@ impl Op {
             x if x == False as u8 => False,
             x if x == Pop as u8 => Pop,
             x if x == Dup as u8 => Dup,
+            x if x == Swap as u8 => Swap,
+            x if x == Rot3 as u8 => Rot3,
 
             x if x == GetLocal as u8 => GetLocal,
             x if x == SetLocal as u8 => SetLocal,
@@ -375,10 +386,10 @@ impl Op {
             CallMethod => 3,
 
             // Zero-operand ops.
-            Nil | True | False | Pop | Dup | Add | Sub | Mul | Div | Mod | Pow | Neg | Not
-            | Eq | Ne | Lt | Le | Gt | Ge | Range | CheckNumbers | Return | Spread | GetIndex
-            | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate | Unwrap
-            | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen => 0,
+            Nil | True | False | Pop | Dup | Swap | Rot3 | Add | Sub | Mul | Div | Mod | Pow
+            | Neg | Not | Eq | Ne | Lt | Le | Gt | Ge | Range | CheckNumbers | Return | Spread
+            | GetIndex | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate
+            | Unwrap | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen => 0,
         }
     }
 
@@ -407,6 +418,8 @@ mod tests {
         Op::False,
         Op::Pop,
         Op::Dup,
+        Op::Swap,
+        Op::Rot3,
         Op::GetLocal,
         Op::SetLocal,
         Op::GetUpvalue,

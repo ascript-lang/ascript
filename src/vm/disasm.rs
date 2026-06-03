@@ -146,6 +146,8 @@ fn op_name(op: Op) -> &'static str {
         False => "FALSE",
         Pop => "POP",
         Dup => "DUP",
+        Swap => "SWAP",
+        Rot3 => "ROT3",
         GetLocal => "GET_LOCAL",
         SetLocal => "SET_LOCAL",
         GetUpvalue => "GET_UPVALUE",
