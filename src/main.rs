@@ -12,8 +12,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a .as program (tree-walker) or a compiled .aso program (VM)
+    /// Run a .as program (bytecode VM) or a compiled .aso program (VM)
     Run {
+        /// Run a `.as` file on the legacy tree-walker engine instead of the
+        /// bytecode VM (the differential oracle / debugging escape hatch). Must
+        /// precede the file. Equivalent to `ASCRIPT_ENGINE=tree-walker`; the flag
+        /// takes precedence over the env var. Ignored for `.aso` (always VM).
+        #[arg(long = "tree-walker")]
+        tree_walker: bool,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
@@ -65,15 +71,28 @@ enum Command {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { file, args } => {
+        Command::Run {
+            tree_walker,
+            file,
+            args,
+        } => {
             let path = std::path::Path::new(&file);
             // A `.aso` file is compiled bytecode → run it on the VM (no compile step).
-            // A `.as` file runs through the tree-walker (the production path until the
-            // VM cutover). The dispatch is purely by extension.
-            let result = if path.extension().and_then(|e| e.to_str()) == Some("aso") {
+            // A `.as` file is compiled to bytecode and run on the VM as well (this is
+            // the production path post-cutover). The tree-walker is kept as the
+            // differential oracle and remains reachable as a debugging escape hatch
+            // via EITHER the `--tree-walker` flag OR `ASCRIPT_ENGINE=tree-walker`,
+            // which route `.as` back to `run_file`. The flag takes precedence over the
+            // env var; unset/absent (default) = VM. `.aso` is always the VM.
+            let is_aso = path.extension().and_then(|e| e.to_str()) == Some("aso");
+            let use_tree_walker = tree_walker
+                || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
+            let result = if is_aso {
                 ascript::run_aso_file(path, &args).await
-            } else {
+            } else if use_tree_walker {
                 ascript::run_file(path, &args).await
+            } else {
+                ascript::run_file_on_vm(path, &args).await
             };
             match result {
                 // Output already streamed live (OutputSink::Live).

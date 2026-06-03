@@ -134,6 +134,28 @@ fn reports_usage_without_args() {
 }
 
 #[test]
+fn run_tree_walker_flag_works() {
+    // `--tree-walker` routes a `.as` file to the legacy tree-walker oracle (the
+    // debugging escape hatch). Output must match the default VM run.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let vm = Command::new(bin)
+        .args(["run", "examples/hello.as"])
+        .output()
+        .unwrap();
+    let tw = Command::new(bin)
+        .args(["run", "--tree-walker", "examples/hello.as"])
+        .output()
+        .unwrap();
+    assert!(vm.status.success() && tw.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&vm.stdout),
+        String::from_utf8_lossy(&tw.stdout),
+        "--tree-walker output must match the default VM run"
+    );
+    assert_eq!(vm.status.code(), tw.status.code());
+}
+
+#[test]
 fn run_error_shows_source_caret() {
     let file = std::env::temp_dir().join(format!("ascript_diag_{}.as", std::process::id()));
     std::fs::write(&file, "let x = 1\nprint(missing)\n").unwrap();

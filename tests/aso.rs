@@ -277,6 +277,105 @@ fn corrupt_aso_entry_errors_clearly() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// .as cutover: `run <file.as>` now executes on the bytecode VM (tree-walker kept
+// as the differential oracle, reachable via ASCRIPT_ENGINE=tree-walker).
+// ---------------------------------------------------------------------------
+
+/// Repo root (CARGO_MANIFEST_DIR) so tests can run the real `examples/*.as`.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Run the binary from the repo root (so relative `examples/...` paths resolve),
+/// optionally setting `ASCRIPT_ENGINE`. Returns (stdout, exit_code).
+fn run_root(args: &[&str], engine: Option<&str>) -> (String, i32) {
+    let mut cmd = Command::new(bin());
+    cmd.args(args).current_dir(repo_root());
+    match engine {
+        Some(v) => {
+            cmd.env("ASCRIPT_ENGINE", v);
+        }
+        None => {
+            cmd.env_remove("ASCRIPT_ENGINE");
+        }
+    }
+    let out = cmd.output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+/// The cutover gate: `run <file.as>` (now VM) is byte-identical to the same
+/// program built + run as `.aso` (VM) AND to the tree-walker (oracle escape hatch),
+/// across a hello, an imports example, and a class/compute example.
+#[test]
+fn run_as_on_vm_matches_aso_and_tree_walker() {
+    for example in ["examples/hello.as", "examples/modules/main.as", "examples/oop.as"] {
+        // Default (no env): VM path.
+        let (vm_out, vm_code) = run_root(&["run", example], None);
+        // Oracle escape hatch: tree-walker.
+        let (tw_out, tw_code) = run_root(&["run", example], Some("tree-walker"));
+        assert_eq!(
+            vm_out, tw_out,
+            "{example}: VM stdout must match tree-walker oracle"
+        );
+        assert_eq!(vm_code, tw_code, "{example}: VM exit must match tree-walker");
+
+        // And byte-identical to the built .aso (VM, no compile step at run time).
+        let dir = unique_dir("cutover");
+        let src = std::fs::read_to_string(repo_root().join(example)).unwrap();
+        write(&dir, "prog.as", &src);
+        // hello/oop are self-contained; modules/main imports siblings, so copy them.
+        if example == "examples/modules/main.as" {
+            let moddir = repo_root().join("examples/modules");
+            for entry in std::fs::read_dir(&moddir).unwrap() {
+                let p = entry.unwrap().path();
+                if p.extension().and_then(|e| e.to_str()) == Some("as") {
+                    let name = p.file_name().unwrap().to_str().unwrap();
+                    if name != "main.as" {
+                        std::fs::copy(&p, dir.join(name)).unwrap();
+                    }
+                }
+            }
+        }
+        build(&dir, "prog.as");
+        let (aso_out, aso_code) = run(&dir, &["run", "prog.aso"]);
+        assert_eq!(aso_out, vm_out, "{example}: .aso stdout must match VM .as run");
+        assert_eq!(aso_code, vm_code, "{example}: .aso exit must match VM .as run");
+    }
+}
+
+/// The oracle escape hatch stays CLI-reachable: `ASCRIPT_ENGINE=tree-walker`
+/// routes `.as` back to the tree-walker and still produces correct output.
+#[test]
+fn ascript_engine_tree_walker_escape_hatch_works() {
+    let (out, code) = run_root(&["run", "examples/hello.as"], Some("tree-walker"));
+    assert_eq!(out, "7\n");
+    assert_eq!(code, 0);
+}
+
+/// A Tier-2 panic in a `.as` program run on the VM renders a proper diagnostic
+/// (source attached: file path + line/col) and exits non-zero.
+#[test]
+fn run_as_on_vm_panic_shows_diagnostic() {
+    let dir = unique_dir("panic");
+    write(&dir, "boom.as", "let y = nil\nprint(y.field)\n");
+    let out = Command::new(bin())
+        .args(["run", "boom.as"])
+        .current_dir(&dir)
+        .env_remove("ASCRIPT_ENGINE")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code().unwrap_or(-1), 1, "panic should exit 1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("boom.as") && stderr.contains("cannot read property"),
+        "diagnostic should name the file and the error; got: {stderr}"
+    );
+}
+
 #[test]
 fn build_refuses_compile_error() {
     let dir = unique_dir("builderr");

@@ -295,6 +295,67 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
     }
 }
 
+/// Run a `.as` source file on the bytecode VM (the production `run` path).
+///
+/// This mirrors [`run_aso_file`] exactly EXCEPT the [`vm::Chunk`] comes from
+/// compiling the source ([`compile::compile_source`]) instead of deserializing a
+/// `.aso`. Output streams live (`OutputSink::Live`); CLI args are forwarded; and
+/// relative file imports resolve against the file's parent directory. Returns the
+/// process exit code, mirroring [`run_file`]/[`run_aso_file`].
+///
+/// Unlike [`run_aso_file`] (whose chunk carries spans into the original `.aso`
+/// build source), the source is attached to a Tier-2 panic here so its diagnostic
+/// renders against the file the user just ran.
+pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: path.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+
+    let interp = Rc::new(Interp::new_live());
+    interp.set_cli_args(script_args);
+    interp.install_self();
+    let vm = Vm::new(interp.clone());
+    // Resolve relative imports against the source file's directory.
+    if let Some(dir) = path.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        params: Vec::new(),
+        ret: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await; // drain spawned tasks (structured join)
+                 // End-of-program cycle collection (V13-T3): see `run_aso_file`.
+    crate::gc::collect();
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok(0),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        // Attach the source so the panic's diagnostic points at this file.
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok(0),
+        Err(crate::interp::Control::Exit(code)) => Ok(code),
+    }
+}
+
 /// Shared body for [`vm_run_source`] (specialize = true) and
 /// [`vm_run_source_generic`] (specialize = false). `specialize` is the kill-switch
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
