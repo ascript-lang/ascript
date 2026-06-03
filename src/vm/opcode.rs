@@ -151,6 +151,20 @@ pub enum Op {
     /// `read_member(recv, name)` (which can error first — nil receiver, …) → THEN
     /// `call_value`. Two inline operands: a `u16` const index then a `u8` argc.
     CallMethod,
+    /// `CALL_METHOD_SPREAD(u16 name)` — the dynamic-arity counterpart of
+    /// [`Op::CallMethod`]: a method call `recv.<name>(...args)` whose argument list
+    /// contains a `...spread`, so the argc cannot be known statically. The arguments
+    /// arrived as a single runtime `Value::Array` (built by the array/spread builder
+    /// ops) sitting on top of the receiver `[..., recv, argsArray]`. The op pops the
+    /// args array, flattens its elements, pops the receiver, and dispatches EXACTLY
+    /// like [`Op::CallMethod`] (the schema fluent-method hook, else the METHOD
+    /// inline-cache compiled-method fast path, else `read_member` → `call_value`),
+    /// applying arity + per-param contracts to the FLATTENED arg list via the shared
+    /// `check_call_args`. The single `u16` operand is the method-name const index
+    /// (`consts[name]`, a `Str`); there is no inline argc operand (it is dynamic).
+    /// Like `CALL_METHOD`, it has its own method IC keyed by this op's bytecode
+    /// offset, so the compiled-method fast path applies here too.
+    CallMethodSpread,
     /// Return TOS from the current frame.
     Return,
     /// `CLOSURE(u16)` — build a closure from `protos[idx]`, capturing upvalues.
@@ -445,6 +459,7 @@ impl Op {
 
             x if x == Call as u8 => Call,
             x if x == CallMethod as u8 => CallMethod,
+            x if x == CallMethodSpread as u8 => CallMethodSpread,
             x if x == Return as u8 => Return,
             x if x == Closure as u8 => Closure,
 
@@ -512,7 +527,7 @@ impl Op {
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | Closure | NewArray | NewObject
             | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import
-            | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey => 2,
+            | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey | CallMethodSpread => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -590,6 +605,7 @@ mod tests {
         Op::Loop,
         Op::Call,
         Op::CallMethod,
+        Op::CallMethodSpread,
         Op::Return,
         Op::Closure,
         Op::NewArray,

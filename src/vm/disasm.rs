@@ -94,6 +94,12 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
             let argc = chunk.read_u8(at + 3);
             let _ = write!(line, "{idx:>5} {argc} ; .{}", const_repr(chunk, idx));
         }
+        // u16 method-name const index (argc is dynamic — the args arrive as a
+        // single runtime array on the stack) → show the method name.
+        Op::CallMethodSpread => {
+            let idx = chunk.read_u16(at + 1);
+            let _ = write!(line, "{idx:>5} ; .{}(...args)", const_repr(chunk, idx));
+        }
         // u16 proto-table index → show the proto and (if any) its name.
         Op::Closure => {
             let idx = chunk.read_u16(at + 1);
@@ -209,6 +215,7 @@ fn op_name(op: Op) -> &'static str {
         Loop => "LOOP",
         Call => "CALL",
         CallMethod => "CALL_METHOD",
+        CallMethodSpread => "CALL_METHOD_SPREAD",
         Return => "RETURN",
         Closure => "CLOSURE",
         NewArray => "NEW_ARRAY",

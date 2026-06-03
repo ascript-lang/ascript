@@ -3129,17 +3129,19 @@ impl Compiler {
             return Ok(());
         }
 
-        // A spread in a member-method call `recv.m(...args)` would need a
-        // CALL_METHOD variant that flattens a runtime-length arg list while keeping
-        // the schema-hook / `read_member` receiver dispatch. No example/test in the
-        // gated corpus hits this (the spread examples use bare-name calls); rather
-        // than diverge, reject it with a clear error. (Bare-name and `super.m(...)`
-        // spread calls ARE supported.)
+        // A spread in a member-method call `recv.m(...args)` makes the argc dynamic
+        // (V12 #177). Evaluate the receiver, build the flattened runtime args array
+        // (the SAME NEW_ARRAY + spread builder machinery as a free-call spread), then
+        // emit CALL_METHOD_SPREAD (which pops `[recv, argsArray]`, flattens, and
+        // dispatches EXACTLY like CALL_METHOD — schema hook / IC compiled-method /
+        // `read_member`→`call_value`). Receiver is evaluated BEFORE the args, then
+        // dispatched — the same eval order as a static-argc method call.
         if self.arg_list_has_spread(call) {
-            return Err(CompileError::new(
-                "spread in a member-method call (recv.m(...args)) not yet supported",
-                span,
-            ));
+            self.compile_expr(&object)?;
+            self.compile_spread_args(call, span)?;
+            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            self.chunk.emit_u16(Op::CallMethodSpread, name_idx, span);
+            return Ok(());
         }
 
         // Receiver, then args (left to right).
@@ -4252,13 +4254,17 @@ mod tests {
     }
 
     #[test]
-    fn member_method_spread_is_rejected() {
-        // Spread in a member-method call is a documented deferral (clean error,
-        // no divergence) — bare-name and `super.m(...)` spread calls ARE supported.
-        let err = compile_source("let o = {}\nlet a = [1]\no.m(...a)").unwrap_err();
+    fn member_method_spread_uses_call_method_spread_op() {
+        // Spread in a member-method call `recv.m(...a)` lowers to the args-array
+        // builder + `CALL_METHOD_SPREAD` (dynamic arity), the method-call analogue of
+        // `CALL_SPREAD` (V12 #177). The receiver is evaluated, the flattened args
+        // array is built (`SPREAD_ARGS`), then the op dispatches like `CALL_METHOD`.
+        let chunk = compile_source("let o = {}\nlet a = [1]\no.m(...a)").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("SPREAD_ARGS"), "expected SPREAD_ARGS in:\n{text}");
         assert!(
-            err.message.contains("spread in a member-method call"),
-            "got {err:?}"
+            text.contains("CALL_METHOD_SPREAD"),
+            "expected CALL_METHOD_SPREAD in:\n{text}"
         );
     }
 

@@ -572,114 +572,67 @@ impl Vm {
                     }
                     let recv = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    // Resolve `proto` out of the fiber so the chunk's method IC can be
-                    // consulted without holding a fiber borrow across the dispatch.
-                    let proto = fiber.frame().closure.proto.clone();
-                    // Schema fluent-method hook (same predicate the tree-walker uses).
-                    if crate::stdlib::schema::is_schema_value(&recv)
-                        && crate::stdlib::schema::is_schema_method(&name)
+                    // The entire dispatch (schema hook → IC compiled-method fast path
+                    // → `read_member`→`call_value` fallback) is shared with
+                    // `Op::CallMethodSpread` — see `dispatch_method`. It either pushes
+                    // the result or pushes a frame (the IC in-frame fast path) and lets
+                    // the run loop continue.
+                    self.dispatch_method(fiber, recv, &name, args, fault_ip, span)
+                        .await?;
+                }
+
+                Op::CallMethodSpread => {
+                    // A method call `recv.<name>(...args)` whose argument list contains
+                    // a spread (dynamic arity). Mirrors `Op::CallMethod` EXACTLY for
+                    // dispatch — the only difference is how the arg list is obtained:
+                    // the args arrived as a single runtime `Value::Array` (built by the
+                    // array/spread builder ops), sitting on top of the receiver
+                    // `[..., recv, argsArray]`. Pop the args array and flatten it into
+                    // a positional `Vec`, then pop the receiver — yielding the SAME
+                    // `(recv, args)` shape `Op::CallMethod` produces — and dispatch via
+                    // the shared `dispatch_method`. Arity/contracts apply to the
+                    // FLATTENED list, byte-identical to the tree-walker's
+                    // `eval_call_args` (spread flatten) → method dispatch.
+                    //
+                    // ORDERING NOTE: identical to `Op::CallMethod` — the compiler
+                    // already evaluated the receiver and the (spread-flattened) args
+                    // onto the stack, so a member-read error does NOT preempt arg side
+                    // effects. This is the SAME documented deviation as `Op::CallMethod`.
+                    let name = match &fiber.frame().closure.proto.chunk.consts
+                        [fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize]
                     {
-                        let mut sargs = Vec::with_capacity(args.len() + 1);
-                        sargs.push(recv);
-                        sargs.extend(args);
-                        let v = self.interp.call_schema(&name, &sargs, span).await?;
-                        fiber.push(v);
-                    } else if let Some((closure, def_class)) = self
-                        .specialize
-                        .then(|| self.ic_resolve_method(&proto.chunk, fault_ip, &recv, &name))
-                        .flatten()
-                    {
-                        // METHOD inline-cache fast path (V11-T3): the receiver is a
-                        // VM instance whose `name` resolves (up the chain) to a
-                        // COMPILED method and is NOT shadowed by an instance field.
-                        // Skip the BoundMethod allocation + `find_compiled_method`
-                        // walk and invoke the compiled closure directly with `recv`
-                        // bound as `self` — byte-identical to the generic
-                        // `vm_read_member → BoundMethod → call_value → bound_method_is_vm
-                        // → invoke_compiled_method` path (same closure, same
-                        // defining class).
-                        //
-                        // V11-T6 TUNING: for a plain (non-async, non-generator)
-                        // method, push a frame onto THIS fiber and continue the run
-                        // loop in place — exactly like the `Op::Call` VM-closure arm.
-                        // This avoids both the fresh `Fiber` allocation AND the
-                        // recursive `self.run(&mut fiber).await` that
-                        // `invoke_compiled_method` incurs, which is what kept the
-                        // method-dispatch benchmark below the 2× gate. The result is
-                        // byte-identical: same arity/contract check (`check_call_args`),
-                        // same slot binding (self→0, args→1..), same `def_class` for
-                        // `super`, same return-contract check at `Op::Return`. Async /
-                        // generator methods still take the `invoke_compiled_method`
-                        // path (they cannot run in-frame).
-                        if !closure.proto.is_async && !closure.proto.is_generator {
-                            // Arity + per-param contracts + rest, shared verbatim.
-                            let what =
-                                closure.proto.chunk.name.as_deref().unwrap_or("method");
-                            let bound = crate::interp::check_call_args(
-                                &closure.proto.params,
-                                args,
-                                span,
-                                what,
-                            )?;
-                            // New frame window at the top of the current stack.
-                            let slot_base = fiber.stack.len();
-                            let slot_count = closure.proto.chunk.slot_count as usize;
-                            let cells = super::fiber::alloc_cells(
-                                slot_count,
-                                &closure.proto.chunk.cell_slots,
-                            );
-                            fiber.stack.resize(slot_base + slot_count, Value::Nil);
-                            // self -> slot 0 (cell-aware).
-                            if let Some(cell) = &cells[0] {
-                                *cell.borrow_mut() = recv;
-                            } else {
-                                fiber.stack[slot_base] = recv;
-                            }
-                            // bound args -> slots 1..n+1 (cell-aware).
-                            for (i, v) in bound.into_iter().enumerate() {
-                                let slot = i + 1;
-                                if let Some(cell) = &cells[slot] {
-                                    *cell.borrow_mut() = v;
-                                } else {
-                                    fiber.stack[slot_base + slot] = v;
-                                }
-                            }
-                            fiber.frames.push(super::fiber::CallFrame {
-                                closure,
-                                ip: 0,
-                                slot_base,
-                                cells,
-                                ret_span: span,
-                                def_class: Some(def_class),
-                            });
-                            // Continue the loop in the new frame; RETURN pops it and
-                            // pushes the result onto the caller's stack.
-                        } else {
-                            let v = self
-                                .invoke_compiled_method(
-                                    closure,
-                                    recv,
-                                    args,
-                                    span,
-                                    Some(def_class),
-                                )
-                                .await?;
-                            fiber.push(v);
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "CALL_METHOD_SPREAD name is not a string constant: {other:?}"
+                                ),
+                            ))
                         }
-                    } else {
-                        // Fallback: read the member, then call it. `vm_read_member`
-                        // yields a VM `BoundMethod` for an Instance method on a VM
-                        // class (dispatched to COMPILED code by `call_value`), else
-                        // the SAME dispatch the tree-walker runs (a BoundMethod /
-                        // GeneratorMethod / NativeMethod / Builtin / … bound to
-                        // `recv`); `call_value` invokes it (VM-aware for V9 classes,
-                        // shared with the tree-walker otherwise). This also covers an
-                        // instance FIELD that happens to hold a callable (a field
-                        // shadows a method — the IC fast path declines those).
-                        let callee_v = self.vm_read_member(&recv, &name, span)?;
-                        let v = self.call_value(callee_v, args, span).await?;
-                        fiber.push(v);
-                    }
+                    };
+                    // Pop the runtime args array (built by NEW_ARRAY + spread ops) and
+                    // re-materialize its elements as a positional `Vec`. (The builder
+                    // always produces a `Value::Array`; a non-array OPERAND was already
+                    // rejected by `SPREAD_ARGS` with the byte-identical message.)
+                    let args = match fiber.pop() {
+                        Value::Array(a) => a.borrow().iter().cloned().collect::<Vec<_>>(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "CALL_METHOD_SPREAD args are not an array: {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ))
+                        }
+                    };
+                    let recv = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    self.dispatch_method(fiber, recv, &name, args, fault_ip, span)
+                        .await?;
                 }
 
                 Op::Template => {
@@ -2230,6 +2183,118 @@ impl Vm {
     /// resolves via `find_compiled_method` and RECORDS the result keyed by the
     /// receiver's CLASS IDENTITY (`Rc` pointer) — never the field shape, because two
     /// distinct classes may share a field layout but resolve methods differently.
+    /// The SHARED method-dispatch body for `Op::CallMethod` and
+    /// `Op::CallMethodSpread`. Both ops produce the SAME `(recv, args)` (CallMethod
+    /// from a static argc; CallMethodSpread from a flattened runtime args array),
+    /// then call this with the method `name`, the op's bytecode offset `fault_ip`
+    /// (which keys the per-site method IC), and the trivia-trimmed call `span`.
+    ///
+    /// Dispatch mirrors the tree-walker's `eval_chain` Member-callee Call arm:
+    ///   1. Schema fluent-method hook (`is_schema_value` + `is_schema_method`) →
+    ///      `call_schema(name, [recv, ...args])`.
+    ///   2. METHOD inline-cache fast path (V11-T3/T6): a VM instance whose `name`
+    ///      resolves up the chain to a COMPILED method (not shadowed by a field).
+    ///      For a plain method, push a frame onto THIS fiber and continue the run
+    ///      loop in place (no fresh Fiber, no recursive `run`); for async/generator
+    ///      methods, `invoke_compiled_method`.
+    ///   3. Generic fallback: `vm_read_member(recv, name)` → `call_value`.
+    ///
+    /// On every path EXCEPT the plain-method in-frame fast path it pushes the result
+    /// onto the stack; the fast path pushes a `CallFrame` and the run loop continues
+    /// (RETURN pops it and pushes the result onto the caller's stack). The behavior
+    /// is byte-identical between the two callers — the only difference upstream is
+    /// how the arg list was obtained.
+    async fn dispatch_method(
+        &self,
+        fiber: &mut Fiber,
+        recv: Value,
+        name: &str,
+        args: Vec<Value>,
+        fault_ip: usize,
+        span: Span,
+    ) -> Result<(), Control> {
+        // Resolve the calling frame's `proto` so the chunk's method IC (keyed by this
+        // op's bytecode offset) can be consulted without holding a fiber borrow
+        // across the dispatch.
+        let proto = fiber.frame().closure.proto.clone();
+        // (1) Schema fluent-method hook (same predicate the tree-walker uses).
+        if crate::stdlib::schema::is_schema_value(&recv)
+            && crate::stdlib::schema::is_schema_method(name)
+        {
+            let mut sargs = Vec::with_capacity(args.len() + 1);
+            sargs.push(recv);
+            sargs.extend(args);
+            let v = self.interp.call_schema(name, &sargs, span).await?;
+            fiber.push(v);
+            return Ok(());
+        }
+        // (2) METHOD inline-cache fast path (V11-T3): the receiver is a VM instance
+        // whose `name` resolves (up the chain) to a COMPILED method and is NOT
+        // shadowed by an instance field. Byte-identical to the generic
+        // `vm_read_member → BoundMethod → call_value → invoke_compiled_method` path.
+        if let Some((closure, def_class)) = self
+            .specialize
+            .then(|| self.ic_resolve_method(&proto.chunk, fault_ip, &recv, name))
+            .flatten()
+        {
+            // V11-T6 TUNING: for a plain (non-async, non-generator) method, push a
+            // frame onto THIS fiber and continue the run loop in place — exactly like
+            // the `Op::Call` VM-closure arm. Same arity/contract check, slot binding
+            // (self→0, args→1..), `def_class` for `super`, and return-contract check.
+            if !closure.proto.is_async && !closure.proto.is_generator {
+                let what = closure.proto.chunk.name.as_deref().unwrap_or("method");
+                let bound =
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                let slot_base = fiber.stack.len();
+                let slot_count = closure.proto.chunk.slot_count as usize;
+                let cells =
+                    super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
+                fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                // self -> slot 0 (cell-aware).
+                if let Some(cell) = &cells[0] {
+                    *cell.borrow_mut() = recv;
+                } else {
+                    fiber.stack[slot_base] = recv;
+                }
+                // bound args -> slots 1..n+1 (cell-aware).
+                for (i, v) in bound.into_iter().enumerate() {
+                    let slot = i + 1;
+                    if let Some(cell) = &cells[slot] {
+                        *cell.borrow_mut() = v;
+                    } else {
+                        fiber.stack[slot_base + slot] = v;
+                    }
+                }
+                fiber.frames.push(super::fiber::CallFrame {
+                    closure,
+                    ip: 0,
+                    slot_base,
+                    cells,
+                    ret_span: span,
+                    def_class: Some(def_class),
+                });
+                // Continue the loop in the new frame; RETURN pops it and pushes the
+                // result onto the caller's stack.
+            } else {
+                let v = self
+                    .invoke_compiled_method(closure, recv, args, span, Some(def_class))
+                    .await?;
+                fiber.push(v);
+            }
+            return Ok(());
+        }
+        // (3) Fallback: read the member, then call it. `vm_read_member` yields a VM
+        // `BoundMethod` for an Instance method on a VM class (dispatched to COMPILED
+        // code by `call_value`), else the SAME dispatch the tree-walker runs (a
+        // BoundMethod / GeneratorMethod / NativeMethod / Builtin / … bound to
+        // `recv`). This also covers an instance FIELD holding a callable (a field
+        // shadows a method — the IC fast path declines those).
+        let callee_v = self.vm_read_member(&recv, name, span)?;
+        let v = self.call_value(callee_v, args, span).await?;
+        fiber.push(v);
+        Ok(())
+    }
+
     fn ic_resolve_method(
         &self,
         chunk: &crate::vm::chunk::Chunk,

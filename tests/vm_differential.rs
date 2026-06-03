@@ -643,6 +643,60 @@ async fn vm_closure_into_stdlib_hof_matches_treewalker() {
     }
 }
 
+#[tokio::test]
+async fn vm_method_call_spread_matches_treewalker() {
+    // V12 #177: spread in a member-method call `recv.m(...args)`. The VM lowers this
+    // to `CALL_METHOD_SPREAD name` — evaluate the receiver, build the flattened
+    // runtime args-array (the SAME machinery as free-call `CALL_SPREAD`), then
+    // dispatch EXACTLY like `CALL_METHOD` (schema hook → IC compiled-method →
+    // `read_member`→`call_value`). Every form must be byte-identical to the
+    // tree-walker.
+    let programs = [
+        // (1) Object closure field called with a fully-spread arg list.
+        "let o = { add: (a, b, c) => a + b + c }\nlet args = [1, 2, 3]\nprint(o.add(...args))",
+        // (2) Instance method (compiled, IC fast-path) with a fully-spread list.
+        "class Calc {\n  fn sum(a, b, c) { return a + b + c }\n}\n\
+         let c = Calc()\nlet args = [10, 20, 30]\nprint(c.sum(...args))",
+        // (3) Mixed positional + spread: `inst.m(1, ...[2, 3])`.
+        "class Calc {\n  fn sum(a, b, c) { return a + b + c }\n}\n\
+         let c = Calc()\nprint(c.sum(1, ...[2, 3]))",
+        // (4) Mixed with the spread NOT last (a trailing positional after a spread).
+        "let o = { f: (a, b, c, d) => a * 1000 + b * 100 + c * 10 + d }\n\
+         print(o.f(1, ...[2, 3], 4))",
+        // (5) Two spreads in one call.
+        "let o = { f: (a, b, c, d) => `${a}${b}${c}${d}` }\n\
+         print(o.f(...[1, 2], ...[3, 4]))",
+        // (6) Empty spread (a zero-element array) — argc resolves to 0 dynamically.
+        "let o = { f: () => 42 }\nprint(o.f(...[]))",
+        // (7) Inherited method via the chain (defining-class dispatch) + spread.
+        "class Base {\n  fn combine(a, b) { return a - b }\n}\n\
+         class Derived extends Base {}\n\
+         let d = Derived()\nprint(d.combine(...[9, 4]))",
+        // (8) Stdlib module-namespace method with spread (the stdlib_completeness repro).
+        "import * as math from \"std/math\"\nprint(math.min(...[3, 1, 2]))\nprint(math.max(...[3, 1, 2]))",
+        // (9) Receiver is itself a call result (receiver evaluated once, then spread).
+        "fn mk() { return { g: (a, b) => a + b } }\nprint(mk().g(...[5, 7]))",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_method_call_spread_errors_match_treewalker() {
+    // A non-array operand spread into a METHOD call is the SAME Tier-2 panic as a
+    // free call: `can only spread an array as call arguments, got {type}`, anchored
+    // at the operand span. Both engines must agree on message AND span.
+    let cases = [
+        "let o = { add: (a, b) => a + b }\no.add(...42)",
+        "let o = { add: (a, b) => a + b }\no.add(...\"hi\")",
+        "let o = { add: (a, b) => a + b }\no.add(1, ...nil)",
+    ];
+    for expr in cases {
+        assert_vm_error_matches_treewalker(expr).await;
+    }
+}
+
 // ----- V2-T7: widen the differential gate -------------------------------------
 //
 // Two complementary widenings of the byte-identical gate:
@@ -709,11 +763,6 @@ async fn vm_run_sync_multi_feature_programs() {
 /// `import`, which deleted the whole `V12Import` category and unskipped 24 files).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
-    /// The example uses spread in a member-method call (`recv.m(...args)`), which
-    /// the VM compiler does not lower yet (only free-call spread `f(...args)` is
-    /// supported). Surfaced by import compiling; tracked as V12 #177. The guard
-    /// asserts the VM still errors here.
-    V12MethodCallSpread,
     /// The example's output is inherently NON-DETERMINISTIC across two runs (an
     /// ephemeral UDP port, `crypto.randomBytes`, `time.sleep` measured ms / a live
     /// `now` timestamp, or a live network event stream). The VM is byte-identical
@@ -770,13 +819,13 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     // middleware closures) ALSO run on the VM now, but each stays skipped for a
     // DIFFERENT, now-surfaced reason — see below.
     //
-    // ---- member-method-call spread `recv.m(...args)` (V12 #177) ----------------
-    // The VM compiler lowers free-call spread `f(...args)` but not method-call
-    // spread `recv.m(...args)` yet, so this errors at run time on the VM.
-    (
-        "examples/stdlib_completeness.as",
-        SkipReason::V12MethodCallSpread,
-    ),
+    // ---- member-method-call spread `recv.m(...args)` (V12 #177) — NOW FIXED -----
+    // `stdlib_completeness.as` used `math.min(...[..])` / `math.max(...[..])` — a
+    // spread in a module-namespace member call. The VM now lowers method-call spread
+    // to `CALL_METHOD_SPREAD` (shared dispatch with `CALL_METHOD`), so the file runs
+    // byte-identically and has been UNSKIPPED into the whole-corpus gate (its golden
+    // is recorded).
+    //
     // ---- Inherently nondeterministic output (NOT a VM divergence) -------------
     // Deterministic output is byte-identical; the differing bytes are an ephemeral
     // UDP port / `crypto.randomBytes` / sleep-ms + live `now` / a live network
@@ -940,18 +989,14 @@ async fn vm_run_whole_corpus_matches_treewalker() {
 #[tokio::test]
 async fn vm_whole_corpus_skips_are_still_justified() {
     // Guard that keeps the skip list HONEST so it can only shrink, never rot:
-    //  - V12FromDefaults / V12MethodCallSpread: stdlib `import` now COMPILES
-    //    (V12-T1), so the file runs far enough to hit its remaining VM gap — the VM
-    //    must STILL fail to MATCH the tree-walker (it errors at run time, it does
-    //    NOT silently produce identical output). When the tracked gap (#157/#177)
-    //    lands this guard fails, forcing the entry to be deleted and the file moved
-    //    into the must-run set. (The V12 #176 stdlib-Closure gap is FIXED, so that
-    //    reason no longer exists — `streams_and_testing.as` left the skip list.)
-    //  - Nondeterministic / SharedExternalState / LongRunningServer /
-    //    V12FromDefaultsServerHang: documented-only (random/time/network bytes, a
-    //    shared-/tmp race, a forever-blocking server, or a #157-induced round-trip
-    //    hang that never terminates), so they are not executed; we only assert the
-    //    file exists so a rename is caught.
+    //  - As each tracked VM gap lands (V12-T1 `import`, #176 stdlib-Closure, #157
+    //    `.from` defaults, #177 method-call spread), the file runs byte-identically
+    //    and its skip is DELETED, moving the file into the must-run whole-corpus
+    //    gate. (`stdlib_completeness.as` left the skip list when #177 landed.)
+    //  - Nondeterministic / SharedExternalState / LongRunningServer: documented-only
+    //    (random/time/network bytes, a shared-/tmp race, or a forever-blocking
+    //    server), so they are not executed; we only assert the file exists so a
+    //    rename is caught.
     //  - Every skip entry must name a real corpus file (no stale paths).
     let root = env!("CARGO_MANIFEST_DIR");
     let corpus = all_corpus_examples();
@@ -960,27 +1005,9 @@ async fn vm_whole_corpus_skips_are_still_justified() {
             corpus.iter().any(|c| c == rel),
             "skip-list entry `{rel}` is not a real corpus example (stale path?)"
         );
-        let src = std::fs::read_to_string(std::path::Path::new(root).join(rel))
+        let _src = std::fs::read_to_string(std::path::Path::new(root).join(rel))
             .unwrap_or_else(|e| panic!("read skipped example {rel}: {e}"));
         match reason {
-            SkipReason::V12MethodCallSpread => {
-                // `import` now compiles, so this no longer compile-errors; instead
-                // it must still DIVERGE — the VM run must NOT match the tree-walker
-                // (it errors at run time on the tracked gap), proving the skip is
-                // load-bearing. The tree-walker runs it fine.
-                let tw = ascript::run_source_exit(&src).await;
-                let vm = ascript::vm_run_source(&src).await;
-                let still_diverges = match (&tw, &vm) {
-                    (Ok(a), Ok(b)) => a != b,
-                    _ => true,
-                };
-                assert!(
-                    still_diverges,
-                    "skipped `{rel}` now MATCHES the tree-walker on the VM — its V12 \
-                     skip is stale; delete the EXAMPLE_SKIPS entry and let the \
-                     whole-corpus gate run it"
-                );
-            }
             SkipReason::Nondeterministic
             | SkipReason::SharedExternalState
             | SkipReason::LongRunningServer => {
