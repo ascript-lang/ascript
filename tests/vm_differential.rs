@@ -2801,8 +2801,8 @@ async fn vm_enum_no_variant_error() {
 // unknown static member ALL match the tree-walker byte-for-byte. The two `.from`
 // sub-features that depend on tree-walker-only class state — DEFAULTED fields
 // (`FieldSchema.default`) and NESTED-class coercion (`Class.def_env`) — currently
-// DIVERGE on the VM and are deferred to V12 (see the two `#[ignore]`d reproducers
-// below for the precise root cause). Mirrored from examples/shape_validation.as.
+// DIVERGE on the VM and are deferred to V12 (tracked separately — they need the
+// global-env / CST->AST default bridge). Mirrored from examples/shape_validation.as.
 #[tokio::test]
 async fn vm_class_from_valid_constructs_instance() {
     // A valid object validates into an instance whose fields read back; `.from`
@@ -2821,37 +2821,12 @@ async fn vm_class_from_optional_field_without_default() {
     assert_vm_run_matches_treewalker(src).await;
 }
 
-// DOCUMENTED VM DIVERGENCE (deferred to V12 — needs the global-env / CST→AST
-// bridge). `.from` is powered by `Interp::validate_into`, which reads TWO pieces
-// of TREE-WALKER-only class state that the VM compiler intentionally does NOT
-// populate (see `src/compile/mod.rs` `compile_class`):
-//   1. `FieldSchema.default` (the AST default Expr) — the VM stores `None` and
-//      evals defaults via compiled THUNK closures at construct time, so
-//      `validate_into` (which re-evals `fs.default`) sees no default → a
-//      DEFAULTED field stays nil and trips its own type contract.
-//   2. `Class.def_env` (a tree-walker `Environment`) — the VM has no
-//      Environment-based globals (user classes live in cell slots/upvalues), so
-//      `compile_class` uses an empty `global_env()` placeholder; `validate_into`
-//      / `coerce_field` then can't resolve a NESTED class name (`Address`) to
-//      coerce a raw sub-object into an instance → contract violation.
-// Both are the V12 import / global-environment bridge; fixing them needs
-// CST→legacy-AST-Expr lowering for defaults AND a populated def_env, neither of
-// which exists yet. Recorded here (NOT silently dropped) as ignored reproducers
-// that PASS on the tree-walker and currently DIVERGE on the VM.
-#[tokio::test]
-#[ignore = "V12: .from default-eval needs FieldSchema.default + def_env (VM uses thunks + empty env)"]
-async fn vm_class_from_applies_defaults_diverges_until_v12() {
-    let src = "class User {\n  id: number\n  name: string\n  role: string = \"guest\"\n}\nlet u = User.from({id: 1, name: \"Ada\"})\nprint(u.role)";
-    assert_vm_run_matches_treewalker(src).await;
-}
-
-#[tokio::test]
-#[ignore = "V12: .from nested-class coercion needs a populated def_env (VM has no Environment globals)"]
-async fn vm_class_from_nested_class_field_diverges_until_v12() {
-    let src = "class Address {\n  street: string\n  zip: number\n}\nclass User {\n  name: string\n  address: Address\n}\nlet u = User.from({name: \"Ada\", address: {street: \"1 Way\", zip: 90210}})\nprint(u.name)\nprint(u.address.zip)";
-    assert_vm_run_matches_treewalker(src).await;
-}
-
+// NOTE: two `.from` sub-features (DEFAULTED fields + NESTED-class coercion) diverge
+// on the VM and are tracked for V12 (task: VM .from defaults + nested-class via the
+// def_env / CST->AST-default bridge). They depend on `validate_into` reading
+// `FieldSchema.default` + `Class.def_env`, which the VM compiler does not populate
+// yet (defaults are compiled thunks; user classes live in slots, not an Environment).
+// Reproducers live in the V12 task description, not as `#[ignore]`d tests here.
 #[tokio::test]
 async fn vm_class_from_recovered_shape_mismatch_matches_treewalker() {
     // A wrong-typed field is a RECOVERABLE field-path panic; caught by `recover`
