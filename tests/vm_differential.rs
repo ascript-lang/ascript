@@ -2693,3 +2693,97 @@ async fn vm_three_level_inheritance_chain() {
     let src = "class A {\n  fn who() { return \"A\" }\n}\nclass B extends A {\n  fn who() { return super.who() + \"B\" }\n}\nclass C extends B {\n  fn who() { return super.who() + \"C\" }\n}\nprint(C().who())";
     assert_vm_run_matches_treewalker(src).await;
 }
+
+// ----- V9-T3: enums + variants ------------------------------------------------
+
+#[tokio::test]
+async fn vm_enum_decl_and_variant_access() {
+    // Declaring an enum binds a `Value::Enum`; `Color.Red` reads a `Value::EnumVariant`
+    // whose display is `Color.Red` — byte-identical to the tree-walker.
+    for src in [
+        "enum Color { Red, Green, Blue }\nprint(Color.Red)",
+        "enum Color { Red, Green, Blue }\nprint(Color.Green)",
+        "enum Color { Red, Green, Blue }\nprint(Color.Blue)",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_enum_variant_equality() {
+    // Variants are interned per enum: the SAME variant is `==`, a DIFFERENT variant
+    // is not, and variants from DIFFERENT enums never compare equal. The EQ op uses
+    // `Value` `PartialEq` (Rc::ptr_eq for `EnumVariant`), unchanged from the tree-walker.
+    for src in [
+        "enum Color { Red, Green }\nprint(Color.Red == Color.Red)",
+        "enum Color { Red, Green }\nprint(Color.Red == Color.Green)",
+        "enum Color { Red, Green }\nprint(Color.Red != Color.Green)",
+        // Cross-enum: even same-named variants are never equal.
+        "enum A { X, Y }\nenum B { X, Y }\nprint(A.X == B.X)",
+        // A variant is never equal to its backing value.
+        "enum Status { Ok = 200 }\nprint(Status.Ok == 200)",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_enum_type_of() {
+    // `type(Color)` → "enum"; `type(Color.Red)` → "enum variant".
+    for src in [
+        "enum Color { Red, Green }\nprint(type(Color))",
+        "enum Color { Red, Green }\nprint(type(Color.Red))",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_enum_backing_value_and_name() {
+    // Number- and string-backed variants: `.value` yields the backing literal,
+    // `.name` the variant's name string; an unbacked variant's `.value` is `nil`.
+    for src in [
+        "enum Status { Ok = 200, NotFound = 404 }\nprint(Status.Ok.value)",
+        "enum Status { Ok = 200, NotFound = 404 }\nprint(Status.NotFound.value)",
+        "enum Status { Ok = 200 }\nprint(Status.Ok.name)",
+        "enum Mode { Read = \"r\", Write = \"w\" }\nprint(Mode.Read.value)",
+        "enum Mode { Read = \"r\", Write = \"w\" }\nprint(Mode.Write.value)",
+        // Unbacked variant → `.value` is nil.
+        "enum Color { Red, Green }\nprint(Color.Red.value)",
+        "enum Color { Red, Green }\nprint(Color.Green.name)",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_enum_variant_in_let_and_fn() {
+    // A variant stored in a local, passed to a function, returned, and compared.
+    for src in [
+        "enum Color { Red, Green, Blue }\nlet c = Color.Green\nprint(c)",
+        "enum Color { Red, Green, Blue }\nlet c = Color.Green\nprint(c == Color.Green)",
+        "enum Color { Red, Green }\nfn name(x) { return x.name }\nlet c = Color.Red\nprint(name(c))",
+        "enum Color { Red, Green }\nfn isRed(x) { return x == Color.Red }\nprint(isRed(Color.Red))\nprint(isRed(Color.Green))",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_enum_in_conditional() {
+    // A variant used in an `if` condition (full `match` is V10).
+    for src in [
+        "enum Color { Red, Green }\nlet c = Color.Red\nif (c == Color.Red) { print(\"red\") }",
+        "enum Color { Red, Green }\nlet c = Color.Green\nif (c == Color.Red) { print(\"red\") } else { print(\"other\") }",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_enum_no_variant_error() {
+    // Accessing a missing variant raises the SAME Tier-2 panic message on both
+    // engines (shared `read_member` on `Value::Enum`).
+    let src = "enum Color { Red, Green }\nprint(Color.Purple)";
+    assert_vm_run_error_matches_treewalker(src).await;
+}

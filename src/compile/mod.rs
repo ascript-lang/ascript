@@ -12,7 +12,7 @@ use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_templat
 use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
-    ClassDecl, ContinueStmt, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal,
+    ClassDecl, ContinueStmt, EnumDecl, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal,
     MemberExpr, MethodDecl, NameRef, ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt,
     SourceFile, Stmt, TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt,
     YieldExpr,
@@ -654,6 +654,7 @@ impl Compiler {
             Stmt::FnDecl(fn_decl) => self.compile_fn_decl(fn_decl),
             Stmt::ReturnStmt(ret) => self.compile_return(ret),
             Stmt::ClassDecl(class_decl) => self.compile_class(class_decl),
+            Stmt::EnumDecl(enum_decl) => self.compile_enum(enum_decl),
             other => Err(CompileError::new(
                 "statement kind not yet supported in V2",
                 stmt_span(other),
@@ -1115,6 +1116,119 @@ impl Compiler {
             .find(|b| b.decl_range == decl_range)
             .ok_or_else(|| {
                 CompileError::new("class declaration has no resolver binding (compiler bug)", span)
+            })?;
+        u16::try_from(binding.slot)
+            .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// Compile an `enum Name { A, B = 1, ... }` declaration. Mirrors the
+    /// tree-walker's `Stmt::Enum`: build a [`crate::value::EnumDef`] whose
+    /// `variants` map each name to an interned [`crate::value::EnumVariant`]
+    /// (`enum_name`, `name`, backing `value`). The whole `Value::Enum` is an
+    /// immutable def, so — unlike a class, whose method closures need runtime
+    /// upvalues — it is fully constructible at COMPILE time: build it, store it as
+    /// a (non-dedupable) constant, `Const`-load it, and bind it to the enum's slot.
+    ///
+    /// Because `Value::Enum`/`Value::EnumVariant` are NOT dedupable in the const
+    /// pool (`const_is_dedupable` excludes them), each `Const` load returns the SAME
+    /// `Rc`, so the interned-variant identity that drives `Color.Red == Color.Red`
+    /// (`Rc::ptr_eq` in `Value`'s `PartialEq`) holds byte-identically.
+    ///
+    /// Variant access (`Color.Red`) and `.name`/`.value` are handled at runtime by
+    /// `GetProp` → the SHARED `Interp::read_member` (via `Vm::vm_read_member`), which
+    /// already maps `Value::Enum` → its `EnumVariant` and `Value::EnumVariant` →
+    /// `.name`/`.value` — no new opcode is needed.
+    fn compile_enum(&mut self, enum_decl: &EnumDecl) -> Result<(), CompileError> {
+        let span = node_span(enum_decl);
+        let name = enum_decl
+            .ident_token()
+            .map(|t| t.text().to_string())
+            .ok_or_else(|| CompileError::new("enum declaration has no name", span))?;
+
+        // Build the variant map in declaration order (mirrors the tree-walker's
+        // `IndexMap` insertion order). Each backing value is a compile-time
+        // constant: the spec restricts an enum variant's backing to a number/string
+        // literal (`enum Status { Ok = 200 }`), so we const-evaluate it here.
+        let mut variants = indexmap::IndexMap::new();
+        for variant in enum_decl.enum_variants() {
+            let v_span = node_span(&variant);
+            let v_name = variant
+                .ident_token()
+                .map(|t| t.text().to_string())
+                .ok_or_else(|| CompileError::new("enum variant has no name", v_span))?;
+            let backing = match variant.expr() {
+                Some(expr) => self.const_eval_enum_backing(&expr)?,
+                None => Value::Nil,
+            };
+            let value = Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+                enum_name: name.clone(),
+                name: v_name.clone(),
+                value: backing,
+            }));
+            variants.insert(v_name, value);
+        }
+
+        let def = Value::Enum(Rc::new(crate::value::EnumDef {
+            name: name.clone(),
+            variants,
+        }));
+        let cp_idx = self.chunk.add_const(def);
+        self.chunk.emit_u16(Op::Const, cp_idx, span);
+
+        // Bind to the enum's name slot. The resolver records a `BindingKind::Enum`
+        // binding keyed by the EnumDecl node's `text_range()` (hoisted, like classes
+        // and functions — see `hoist_decls`).
+        let slot = self.enum_decl_slot(enum_decl)?;
+        self.emit_set_local(slot, span);
+        Ok(())
+    }
+
+    /// Const-evaluate an enum variant's backing expression. The spec limits a
+    /// backing value to a number/string literal (with `nil`/bool also lowered as
+    /// plain literals, and `-N` as a negated number literal — the only constant
+    /// unary form). Anything else is rejected rather than silently dropped; a
+    /// non-constant backing has no tree-walker-faithful compile-time value.
+    fn const_eval_enum_backing(&self, expr: &Expr) -> Result<Value, CompileError> {
+        match expr {
+            Expr::Literal(lit) => literal_const_value(lit),
+            Expr::ParenExpr(p) => {
+                let inner = p.expr().ok_or_else(|| {
+                    CompileError::new("empty parenthesized expression", node_span(p))
+                })?;
+                self.const_eval_enum_backing(&inner)
+            }
+            Expr::UnaryExpr(un) if un.op() == Some(SyntaxKind::Minus) => {
+                let operand = un
+                    .expr()
+                    .ok_or_else(|| CompileError::new("unary minus has no operand", node_span(un)))?;
+                match self.const_eval_enum_backing(&operand)? {
+                    Value::Number(n) => Ok(Value::Number(-n)),
+                    _ => Err(CompileError::new(
+                        "enum variant backing value must be a number or string literal",
+                        node_span(un),
+                    )),
+                }
+            }
+            other => Err(CompileError::new(
+                "enum variant backing value must be a number or string literal",
+                node_span(other),
+            )),
+        }
+    }
+
+    /// The enclosing-frame local slot for an `enum Name` declaration. The resolver
+    /// records a `BindingKind::Enum` binding keyed by the EnumDecl node's
+    /// `text_range()` (see `resolve_stmt`/`hoist_decls`), exactly as for classes.
+    fn enum_decl_slot(&self, enum_decl: &EnumDecl) -> Result<u16, CompileError> {
+        let span = node_span(enum_decl);
+        let decl_range: TextRange = enum_decl.syntax().text_range();
+        let binding = self
+            .resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == decl_range)
+            .ok_or_else(|| {
+                CompileError::new("enum declaration has no resolver binding (compiler bug)", span)
             })?;
         u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
@@ -2076,35 +2190,7 @@ impl Compiler {
 
     fn compile_literal(&mut self, lit: &Literal) -> Result<(), CompileError> {
         let span = node_span(lit);
-        let kind = lit
-            .op()
-            .ok_or_else(|| CompileError::new("malformed literal (no token)", span))?;
-        // Read the literal *token*'s text directly — `node.text()` would include
-        // leading/trailing trivia (whitespace/comments) attached to the node.
-        let text = literal_token_text(lit)
-            .ok_or_else(|| CompileError::new("malformed literal (no token text)", span))?;
-        let value = match kind {
-            SyntaxKind::Number => {
-                let n = parse_number_text(&text).ok_or_else(|| {
-                    // The lexer already validated the token, so this is a
-                    // compiler bug rather than a user error if it ever fires.
-                    CompileError::new(format!("malformed number literal {text:?}"), span)
-                })?;
-                Value::Number(n)
-            }
-            SyntaxKind::Str => {
-                Value::Str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str()))
-            }
-            SyntaxKind::TrueKw => Value::Bool(true),
-            SyntaxKind::FalseKw => Value::Bool(false),
-            SyntaxKind::NilKw => Value::Nil,
-            other => {
-                return Err(CompileError::new(
-                    format!("literal token {other:?} not yet supported in V1"),
-                    span,
-                ))
-            }
-        };
+        let value = literal_const_value(lit)?;
         let idx = self.chunk.add_const(value);
         self.chunk.emit_u16(Op::Const, idx, span);
         Ok(())
@@ -2564,6 +2650,42 @@ fn object_field_key(field: &crate::syntax::ast::ObjectField) -> Option<String> {
         // Ident key: raw identifier text, used verbatim.
         _ => Some(tok.text().to_string()),
     }
+}
+
+/// Build the runtime [`Value`] for a `Literal` node (Number/Str/`true`/`false`/
+/// `nil`), reading the value TOKEN's text directly (trivia-free). Shared by the
+/// literal compiler (`compile_literal`) and the enum-backing const-evaluator
+/// (`const_eval_enum_backing`).
+fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
+    let span = node_span(lit);
+    let kind = lit
+        .op()
+        .ok_or_else(|| CompileError::new("malformed literal (no token)", span))?;
+    // Read the literal *token*'s text directly — `node.text()` would include
+    // leading/trailing trivia (whitespace/comments) attached to the node.
+    let text = literal_token_text(lit)
+        .ok_or_else(|| CompileError::new("malformed literal (no token text)", span))?;
+    let value = match kind {
+        SyntaxKind::Number => {
+            let n = parse_number_text(&text).ok_or_else(|| {
+                // The lexer already validated the token, so this is a
+                // compiler bug rather than a user error if it ever fires.
+                CompileError::new(format!("malformed number literal {text:?}"), span)
+            })?;
+            Value::Number(n)
+        }
+        SyntaxKind::Str => Value::Str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str())),
+        SyntaxKind::TrueKw => Value::Bool(true),
+        SyntaxKind::FalseKw => Value::Bool(false),
+        SyntaxKind::NilKw => Value::Nil,
+        other => {
+            return Err(CompileError::new(
+                format!("literal token {other:?} not yet supported in V1"),
+                span,
+            ))
+        }
+    };
+    Ok(value)
 }
 
 /// The text of a `Literal` node's value token (Number/Str/keyword), excluding
