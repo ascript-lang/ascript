@@ -195,10 +195,33 @@ pub enum Op {
     Import,
 
     // ---- iteration --------------------------------------------------------
-    /// `iterable -- iterator` — obtain an iterator for `for`/`for await`.
+    /// `iterable -- iterable` — validate that TOS is async-iterable for a
+    /// `for await` loop and leave it in place (to be stashed in a slot and driven
+    /// lazily by [`Op::IterNext`]). Mirrors the tree-walker's `exec_for_await`
+    /// dispatch (`src/interp.rs`): a `Value::Generator` and a native stream handle
+    /// (WebSocket `recv` / SSE `next`, via `native_stream_method`) are accepted;
+    /// ANY OTHER value raises the Tier-2 panic `value of type {t} is not
+    /// async-iterable` (`t` = `interp::type_name`) anchored at this op's span (the
+    /// iterable expression's trivia-trimmed code span).
     GetIter,
-    /// `iterator -- iterator value done` — advance the iterator.
+    /// `iterable -- value done:bool` — drive one lazy `for await` step over the
+    /// async-iterable on TOS, pushing the produced `value` (below) and a `done`
+    /// boolean (on top). Mirrors `exec_for_await` exactly: a `Value::Generator` is
+    /// driven by an (awaiting) `resume(nil)` — `Some(v) -> v,false`, `None ->
+    /// nil,true`; a native stream calls its `recv`/`next` method for a `[value,
+    /// err]` pair — a non-nil `err` is the Tier-2 panic `for await stream error:
+    /// {msg}`, a `nil` value ends the stream (`nil,true`), else `value,false`. An
+    /// async generator's body may `await` internally: `resume` drives the backing
+    /// Fiber through `Op::Await` before producing the yielded value, so await+yield
+    /// fuse transparently. The op is async (it awaits the step).
     IterNext,
+    /// `iterable --` — close the async-iterable on TOS. Mirrors the tree-walker's
+    /// `g.close()` on a `break`/early-`return` out of a `for await` over a
+    /// generator (drops the backing Fiber / marks it done so it is reclaimed
+    /// promptly); a no-op for a native stream handle (it is reclaimed at scope
+    /// end). Emitted only on the `break`/`return` exits of a `for await` loop, never
+    /// on natural exhaustion.
+    IterClose,
     /// `iterable -- snapshot:array` — materialize the SYNC for-of snapshot.
     /// Mirrors the tree-walker's `Stmt::ForOf` (sync) `items` build exactly:
     /// an `Array` yields a *clone* of its current elements (so later mutation of
@@ -320,6 +343,7 @@ impl Op {
 
             x if x == GetIter as u8 => GetIter,
             x if x == IterNext as u8 => IterNext,
+            x if x == IterClose as u8 => IterClose,
             x if x == IterSnapshot as u8 => IterSnapshot,
             x if x == ArrayLen as u8 => ArrayLen,
 
@@ -354,7 +378,7 @@ impl Op {
             Nil | True | False | Pop | Dup | Add | Sub | Mul | Div | Mod | Pow | Neg | Not
             | Eq | Ne | Lt | Le | Gt | Ge | Range | CheckNumbers | Return | Spread | GetIndex
             | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate | Unwrap
-            | GetIter | IterNext | IterSnapshot | ArrayLen => 0,
+            | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen => 0,
         }
     }
 
@@ -436,6 +460,7 @@ mod tests {
         Op::Import,
         Op::GetIter,
         Op::IterNext,
+        Op::IterClose,
         Op::IterSnapshot,
         Op::ArrayLen,
         Op::GetLocalCell,

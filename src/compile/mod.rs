@@ -1139,15 +1139,19 @@ impl Compiler {
     fn compile_for(&mut self, for_stmt: &ForStmt) -> Result<(), CompileError> {
         let span = node_span(for_stmt);
 
-        // `for await` is async iteration (V7); neither a range loop nor a sync
-        // for-of.
-        if for_stmt.await_token().is_some() {
-            return Err(CompileError::new("for await: V7", span));
-        }
-
         let body = for_stmt
             .body()
             .ok_or_else(|| CompileError::new("for statement missing body", span))?;
+
+        // `for await (x of e)` is async iteration over a generator / native stream;
+        // it is NEVER a range loop (the `await` token is the discriminator, exactly
+        // like the tree-walker's `Stmt::ForOf { for_await: true }`).
+        if for_stmt.await_token().is_some() {
+            let iter = for_stmt.iter().ok_or_else(|| {
+                CompileError::new("for await statement missing iterable", span)
+            })?;
+            return self.compile_for_await(for_stmt, &iter, &body);
+        }
 
         // The CST head holds the iterable/bounds expression plus an `in`/`of`
         // operator. A for-RANGE is `in` + a `RangeExpr` iterable; the
@@ -1400,6 +1404,117 @@ impl Compiler {
         for site in ctx.break_sites {
             self.chunk.patch_jump(site);
         }
+        Ok(())
+    }
+
+    /// Compile a `for await (x of iterable) { body }` ASYNC for-of. Mirrors the
+    /// tree-walker's `Stmt::ForOf { for_await: true }` → `exec_for_await`
+    /// (`src/interp.rs`) exactly: the iterable must be async-iterable — a
+    /// `Value::Generator` (driven LAZILY via an awaiting `resume`) or a native
+    /// stream handle (WebSocket `recv` / SSE `next`); ANY OTHER value is the Tier-2
+    /// panic `value of type {t} is not async-iterable` at the iterable's span
+    /// (raised by `GET_ITER`). Each produced value binds `x` in a fresh child scope
+    /// and runs the body; `break`/early `return` CLOSE the generator (the
+    /// tree-walker's `g.close()`), `continue` advances to the next value, natural
+    /// exhaustion (`None`/end-of-stream) ends the loop without closing.
+    ///
+    /// Unlike sync for-of there is NO snapshot — generators are lazy and cannot be
+    /// materialized up front. The iterable is stashed in a scratch slot and driven
+    /// one step per iteration by `ITER_NEXT` (async).
+    ///
+    /// Lowering:
+    /// ```text
+    ///   <iterable>                 ; iterable on top
+    ///   GET_ITER                   ; validate async-iterable (panic @ iter.span)
+    ///   SET_LOCAL it_slot          ; it_slot = alloc_temp(); the live iterator
+    /// cond_start:
+    ///   GET_LOCAL it_slot; ITER_NEXT   ; -> value, done   (async step)
+    ///   exit = JUMP_IF_TRUE        ; done==true → exit (pops `done`, leaves value)
+    ///   <fresh cells>              ; per-iteration capture freshness
+    ///   SET_LOCAL var_slot         ; x = value (pops the value left by ITER_NEXT)
+    ///   <body block>               ; loop ctx: continue → cond_start, break → exit
+    ///   LOOP cond_start
+    /// exit:                        ; natural exhaustion lands here with the leftover
+    ///   POP                        ;   `value` (nil) on the stack — discard it
+    ///   patch(break_sites...)      ; each `break` jumps to break_exit (closes first)
+    ///   ...
+    /// ```
+    /// On `done`, `ITER_NEXT` pushed `value=nil` (below) and `done=true` (on top);
+    /// `JUMP_IF_TRUE` pops only `done`, so the `nil` value remains and is discarded
+    /// by the `POP` at the exit label. A `break` cannot reach that `POP` (it has no
+    /// leftover value), so breaks jump to a SEPARATE `break_exit` that first
+    /// `ITER_CLOSE`s the iterator then merges into the common tail.
+    fn compile_for_await(
+        &mut self,
+        for_stmt: &ForStmt,
+        iter: &Expr,
+        body: &Block,
+    ) -> Result<(), CompileError> {
+        let span = node_span(for_stmt);
+
+        let var_slot = self.for_loop_var_slot(for_stmt)?;
+        let it_slot = self.alloc_temp()?;
+        // Cell slots to refresh per iteration: the loop var `x` (if captured) plus
+        // any captured `let`/`fn` declared in the loop BODY.
+        let refresh_slots = self.loop_refresh_slots(body, Some(var_slot));
+
+        // Anchor the "not async-iterable" panic at the iterable expression's CODE
+        // span (trivia-trimmed), byte-identical to the tree-walker's `AsError::at(_,
+        // span)` where `span = iter.span`.
+        let iter_span = node_code_span(iter);
+
+        // Evaluate the iterable, validate it is async-iterable, stash it.
+        self.compile_expr(iter)?;
+        self.chunk.emit(Op::GetIter, iter_span);
+        self.chunk.emit_u16(Op::SetLocal, it_slot, span);
+
+        // Condition: drive one lazy step; `done` exits the loop.
+        let cond_start = self.chunk.code.len();
+        self.chunk.emit_u16(Op::GetLocal, it_slot, span);
+        // ITER_NEXT is anchored at the iterable's span so a generator-body panic or
+        // a stream error surfaces at the loop's iterable, matching the tree-walker's
+        // `exec_for_await` error sites.
+        self.chunk.emit(Op::IterNext, iter_span);
+        let exit = self.chunk.emit_jump(Op::JumpIfTrue, span);
+
+        // Top of the iteration: fresh cells for captured bindings, then bind the
+        // loop var to the produced value (SET_LOCAL pops it — clean stack).
+        self.emit_fresh_cells(&refresh_slots, span);
+        self.emit_set_local(var_slot, span);
+
+        // The continue target is `cond_start` (re-drive the iterator), exactly like
+        // the tree-walker's `Flow::Continue` looping back to the next `resume`.
+        self.loops.push(LoopCtx {
+            continue_target: Some(cond_start),
+            continue_sites: Vec::new(),
+            break_sites: Vec::new(),
+        });
+        self.compile_block(body)?;
+
+        // Back-edge to re-test (drive the next step).
+        self.chunk.emit_loop(Op::Loop, cond_start, span);
+        let ctx = self
+            .loops
+            .pop()
+            .expect("for-await loop context pushed before body must still be present");
+
+        // Natural-exhaustion exit: ITER_NEXT left a leftover `value` (nil) below the
+        // popped `done`, so discard it here.
+        self.chunk.patch_jump(exit);
+        self.chunk.emit(Op::Pop, span);
+        let tail = self.chunk.emit_jump(Op::Jump, span);
+
+        // Break exit: a `break` jumps here with NO leftover value on the stack (it
+        // left the loop mid-body). Close the iterator (`g.close()` — the
+        // tree-walker's behavior on break), then merge into the common tail.
+        for site in ctx.break_sites {
+            self.chunk.patch_jump(site);
+        }
+        self.chunk.emit_u16(Op::GetLocal, it_slot, span);
+        self.chunk.emit(Op::IterClose, span);
+
+        // Common tail: both exits converge here.
+        self.chunk.patch_jump(tail);
         Ok(())
     }
 
@@ -2576,10 +2691,28 @@ mod tests {
     }
 
     #[test]
-    fn for_await_is_deferred() {
-        // `for await` (async iteration) is V7.
-        let err = compile_source("for await (x of [1, 2]) { print(x) }").unwrap_err();
-        assert!(err.message.contains("for await: V7"), "got {err:?}");
+    fn for_await_emits_iter_protocol() {
+        // `for await` lowers to the lazy async-iteration protocol (GET_ITER /
+        // ITER_NEXT / ITER_CLOSE), NOT a snapshot.
+        let chunk = compile_source("fn* g() { yield 1 }\nfor await (x of g()) { print(x) }")
+            .expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("GET_ITER"), "no GET_ITER in:\n{text}");
+        assert!(text.contains("ITER_NEXT"), "no ITER_NEXT in:\n{text}");
+        assert!(
+            !text.contains("ITER_SNAPSHOT"),
+            "for await must not snapshot:\n{text}"
+        );
+    }
+
+    #[test]
+    fn for_await_break_emits_iter_close() {
+        // A `break` out of a `for await` over a generator closes the iterator,
+        // mirroring the tree-walker's `g.close()`.
+        let chunk =
+            compile_source("fn* g() { yield 1 }\nfor await (x of g()) { break }").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("ITER_CLOSE"), "no ITER_CLOSE on break in:\n{text}");
     }
 
     #[tokio::test(flavor = "current_thread")]

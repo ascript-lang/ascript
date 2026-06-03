@@ -849,9 +849,147 @@ impl Vm {
                     return Ok(RunOutcome::Yielded(v));
                 }
 
-                // V8-T4/T5 fill these in (for-of / for-await over generators, async
-                // generators); the V8 core covers MAKE_GENERATOR (in the CALL arm) +
-                // YIELD + resume above.
+                Op::GetIter => {
+                    // `for await` async-iterable validation: TOS must be a
+                    // `Value::Generator` (driven by `resume`) or a native stream
+                    // handle (WebSocket `recv` / SSE `next`). ANYTHING ELSE is the
+                    // Tier-2 panic `value of type {t} is not async-iterable`,
+                    // byte-identical to the tree-walker's `exec_for_await` (the
+                    // `other =>` and the Native-with-no-stream-method arms both
+                    // produce this message). We PEEK (leave the value in place): the
+                    // compiler immediately stores it into a scratch slot to drive
+                    // lazily across iterations.
+                    let ok = match fiber.peek(0) {
+                        Value::Generator(_) => true,
+                        Value::Native(n) => {
+                            crate::interp::native_stream_method(n.kind).is_some()
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        let t = crate::interp::type_name(fiber.peek(0));
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("value of type {t} is not async-iterable"),
+                        ));
+                    }
+                }
+
+                Op::IterNext => {
+                    // Drive one lazy `for await` step over the async-iterable on TOS.
+                    // Pop it into an owned local BEFORE any `.await` so no `fiber`
+                    // RefCell borrow is held across the suspension point
+                    // (`await_holding_refcell_ref` stays clean), then push back the
+                    // produced `value` and a `done` boolean. Byte-identical to
+                    // `exec_for_await` (`src/interp.rs`).
+                    // The op's span (the iterable expression's code span), captured
+                    // before any borrow/await so a native-stream call has a site.
+                    let op_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let iterable = fiber.pop();
+                    match iterable {
+                        Value::Generator(g) => {
+                            // `resume(nil)` drives the backing Fiber to its next
+                            // `Op::Yield` (awaiting any inner futures along the way —
+                            // this is how an async generator's await+yield fuse).
+                            // `Some(v)` -> a value; `None` -> done.
+                            match g.resume(Value::Nil).await? {
+                                Some(v) => {
+                                    fiber.push(v);
+                                    fiber.push(Value::Bool(false));
+                                }
+                                None => {
+                                    fiber.push(Value::Nil);
+                                    fiber.push(Value::Bool(true));
+                                }
+                            }
+                        }
+                        Value::Native(n) => {
+                            // A native stream: call its `recv`/`next` method for a
+                            // `[value, err]` pair (a non-nil `err` is a Tier-2 panic,
+                            // a nil `value` ends the stream), mirroring
+                            // `exec_for_await`'s `Value::Native` arm exactly.
+                            // `GetIter` already validated the handle, so a missing
+                            // stream method here is a wiring bug — surface it as a
+                            // defensive Tier-2 panic rather than an `unwrap`.
+                            let method = match crate::interp::native_stream_method(n.kind) {
+                                Some(m) => m,
+                                None => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!(
+                                            "value of type {} is not async-iterable",
+                                            crate::interp::type_name(&Value::Native(n))
+                                        ),
+                                    ))
+                                }
+                            };
+                            let bound =
+                                Value::NativeMethod(Rc::new(crate::value::NativeMethod {
+                                    receiver: n,
+                                    method: method.to_string(),
+                                }));
+                            // Box this edge: `call_value` may re-enter `run`, so
+                            // the recursive future needs a finite size.
+                            let pair =
+                                Box::pin(self.call_value(bound, Vec::new(), op_span)).await?;
+                            let (value, err) = match &pair {
+                                Value::Array(a) if a.borrow().len() == 2 => {
+                                    let b = a.borrow();
+                                    (b[0].clone(), b[1].clone())
+                                }
+                                // Defensive: a non-pair return ends iteration.
+                                _ => {
+                                    fiber.push(Value::Nil);
+                                    fiber.push(Value::Bool(true));
+                                    continue;
+                                }
+                            };
+                            if err != Value::Nil {
+                                let msg = crate::interp::error_message(&err);
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("for await stream error: {msg}"),
+                                ));
+                            }
+                            if value == Value::Nil {
+                                fiber.push(Value::Nil);
+                                fiber.push(Value::Bool(true));
+                            } else {
+                                fiber.push(value);
+                                fiber.push(Value::Bool(false));
+                            }
+                        }
+                        other => {
+                            // GetIter validated the iterable, so this is unreachable
+                            // in practice; surface defensively rather than panic the
+                            // host.
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "value of type {} is not async-iterable",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                Op::IterClose => {
+                    // Close the async-iterable on TOS on a `break`/early-`return` out
+                    // of a `for await` over a generator — `g.close()` drops the
+                    // backing Fiber so it is reclaimed promptly, byte-identical to
+                    // the tree-walker. A native stream is reclaimed at scope end, so
+                    // closing it is a no-op here.
+                    let iterable = fiber.pop();
+                    if let Value::Generator(g) = iterable {
+                        g.close();
+                    }
+                }
+
                 other => {
                     return Err(self.panic_at(
                         fiber,

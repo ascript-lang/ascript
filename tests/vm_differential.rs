@@ -2436,3 +2436,83 @@ async fn vm_generator_yield_used_as_statement() {
 }
 
 
+
+// ---- V8-T4/T5: for-of / for-await over generators + async generators ------
+//
+// The tree-walker (`src/interp.rs`) only iterates a GENERATOR via `for await`
+// (`exec_for_await` → `g.resume`); a SYNC `for (x of gen)` is the "not iterable"
+// panic (sync for-of snapshots only Array/Str). The VM mirrors this exactly:
+// `GET_ITER`/`ITER_NEXT` drive a generator lazily for `for await`, while the sync
+// `ITER_SNAPSHOT` panics on a generator. break/early-return close the generator.
+
+#[tokio::test]
+async fn vm_sync_for_of_over_generator_is_not_iterable() {
+    // SYNC `for (x of gen)` is NOT iterable in the tree-walker — generators are
+    // driven only by `for await`. Both engines raise the same Tier-2 panic.
+    let src = "fn* g() { yield 1\n yield 2\n yield 3 }\nfor (x of g()) { print(x) }";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_over_sync_generator() {
+    // `for await (x of gen)` drives the generator via resume until done.
+    let src = "fn* g() { yield 1\n yield 2 }\nfor await (x of g()) { print(x) }";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_over_three_yields() {
+    let src = "fn* g() { yield 1\n yield 2\n yield 3 }\nfor await (x of g()) { print(x) }";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_over_async_generator() {
+    // An async generator BOTH awaits internally AND yields: resume drives the
+    // backing Fiber through Op::Await before producing the yielded value.
+    let src = "async fn pick() { return 5 }\nasync fn* g() { let a = await pick()\n yield a\n yield a + 1 }\nfor await (x of g()) { print(x) }";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_generator_with_looping_body() {
+    // A generator whose body is a loop computing each yielded value.
+    let src = "fn* range2(n) { for (i in 0..n) { yield i * 10 } }\nfor await (x of range2(3)) { print(x) }";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_break_closes_generator() {
+    // `break` out of a for-await over a generator stops iteration (and closes the
+    // generator, byte-identically to the tree-walker).
+    let src = "fn* g() { yield 1\n yield 2\n yield 3 }\nfor await (x of g()) { print(x)\n if (x == 2) { break } }\nprint(\"done\")";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_continue_skips() {
+    // `continue` advances to the next yielded value.
+    let src = "fn* g() { yield 1\n yield 2\n yield 3\n yield 4 }\nfor await (x of g()) { if (x == 2) { continue }\n print(x) }";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_empty_generator() {
+    // An empty generator yields nothing: the body never runs.
+    let src = "fn* g() {}\nfor await (x of g()) { print(x) }\nprint(\"after\")";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_over_non_iterable_panics() {
+    // `for await` over a plain number is the "not async-iterable" Tier-2 panic.
+    let src = "for await (x of 5) { print(x) }";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_for_await_accumulates_into_outer() {
+    // The loop body mutates an outer local; the result survives the loop.
+    let src = "fn* g() { yield 10\n yield 20\n yield 30 }\nlet sum = 0\nfor await (x of g()) { sum = sum + x }\nprint(sum)";
+    assert_vm_run_matches_treewalker(src).await;
+}

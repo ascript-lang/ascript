@@ -249,7 +249,11 @@ impl GeneratorHandle {
         let vm = vm_weak
             .upgrade()
             .expect("VM dropped while a generator is still live (wiring bug)");
-        let outcome = vm.run(&mut fiber).await;
+        // `Vm::run` may re-enter `resume` (a `for await` inside a generator body
+        // drives a sub-generator via `Op::IterNext`), forming the async cycle
+        // run → resume → resume_vm → run. Box this edge so the recursive future has
+        // a finite size (the same indirection `#[async_recursion]` injects).
+        let outcome = Box::pin(vm.run(&mut fiber)).await;
         match outcome {
             Ok(crate::vm::RunOutcome::Yielded(v)) => {
                 // Still suspended: put the fiber back for the next resume.

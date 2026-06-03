@@ -3115,7 +3115,7 @@ pub(crate) fn index_get(
 /// iteration, or `None` if the handle kind is not an async-iterable stream.
 /// Both methods follow the `[value, err]` contract ending in a `nil` value.
 #[allow(unused_variables)]
-fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> {
+pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> {
     #[cfg(feature = "net")]
     {
         use crate::value::NativeKind::*;
