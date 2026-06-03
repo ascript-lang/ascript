@@ -8,6 +8,7 @@ pub mod contract;
 pub mod dead_recover;
 pub mod ignored_result;
 pub mod missing_return;
+pub mod range_step;
 pub mod shadowing;
 pub mod unawaited;
 pub mod undefined;
@@ -27,6 +28,7 @@ pub static ALL: &[Rule] = &[
     ignored_result::check,
     dead_recover::check,
     contract::check,
+    range_step::check,
 ];
 
 /// The `CallExpr` directly dropped by an `ExprStmt` (result unused). `None` if the

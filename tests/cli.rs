@@ -1663,3 +1663,48 @@ fn stepped_value_range_panic_underlines_step_clause_both_engines() {
         "VM and tree-walker rendered different carets:\n--- vm ---\n{vm}\n--- tw ---\n{tw}"
     );
 }
+
+#[test]
+fn check_range_step_lint_and_allow_suppression() {
+    // Phase 7: the `range-step` static lint surfaces a statically-detectable bad
+    // range (here `step 0`) at author-time, matching the runtime panic text. It is
+    // configurable: `--allow range-step` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file =
+        std::env::temp_dir().join(format!("ascript_range_step_lint_{}.as", std::process::id()));
+    std::fs::write(&file, "for (i in 1..10 step 0){}\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"range-step\""),
+        "expected a range-step diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("step must be a finite, non-zero number"),
+        "expected the runtime-matching message, got:\n{stdout}"
+    );
+
+    // `--allow range-step` suppresses it (and the code is a known/configurable rule).
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("range-step")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"range-step\""),
+        "--allow range-step should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}

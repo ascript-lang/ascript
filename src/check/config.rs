@@ -36,6 +36,7 @@ pub const RULE_CODES: &[&str] = &[
     "ignored-result",
     "dead-recover",
     "contract-mismatch",
+    "range-step",
 ];
 
 /// Per-code severity overrides plus global warning promotion.
