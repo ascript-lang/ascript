@@ -1385,28 +1385,34 @@ async fn vm_for_range_bounds_error_matches_treewalker() {
 }
 
 #[tokio::test]
-async fn vm_for_range_inclusive_rejected_like_treewalker() {
-    // FINDING: the legacy parser (the differential oracle) REJECTS `..=` in a
-    // for-range head ("expected RParen, found DotDotEq") — inclusive for-range is
-    // unsupported by the tree-walker. The VM must not invent inclusive behavior it
-    // lacks: an `..=` for-range is rejected at compile time. Both engines surface
-    // an `Err(AsError)` from the public entry points; the messages legitimately
-    // differ (a parse error vs a compile-time rejection), so we only assert BOTH
-    // reject — never that the VM silently runs it (which would be a bug: a silent
-    // exclusive loop). A divergence to "both accept" would be the real bug.
-    for src in [
-        "for (i in 0..=3) { print(i) }",
-        "for (i in 0..=0) { print(i) }",
+async fn vm_for_range_inclusive_staged_rollout() {
+    // RANGES FEATURE, Phase 1 (legacy parser flipped in Task 3): the legacy
+    // front-end now PARSES `..=` in a for-range head into the dedicated
+    // `ForRange { inclusive, .. }` node, but the Phase-1 placeholder eval in
+    // `src/interp.rs` still iterates exclusively (real inclusive semantics land
+    // in Phase 2 / Task 5). The VM/CST front-end is untouched until Task 4 and
+    // still REJECTS `..=` in a for-range at compile time.
+    //
+    // So during this staged window the engines legitimately DIVERGE on an `..=`
+    // for-range: the tree-walker accepts-and-runs-exclusive; the VM rejects. This
+    // is intended and temporary — Phase 2 (Tasks 5/6) makes BOTH iterate
+    // inclusively and re-converges them. Asserting the staged reality here keeps
+    // the gate honest without pretending the feature has fully landed.
+    for (src, exclusive_out) in [
+        ("for (i in 0..=3) { print(i) }", "0\n1\n2\n"),
+        ("for (i in 0..=0) { print(i) }", ""),
     ] {
         let tw = ascript::run_source(src).await;
         let vm = ascript::vm_run_source(src).await;
-        assert!(
-            tw.is_err(),
-            "tree-walker should REJECT inclusive for-range `{src}`, got {tw:?}"
+        assert_eq!(
+            tw.as_deref().ok(),
+            Some(exclusive_out),
+            "tree-walker should PARSE `..=` for-range and run the Phase-1 \
+             exclusive placeholder for `{src}`, got {tw:?}"
         );
         assert!(
             vm.is_err(),
-            "VM should REJECT inclusive for-range `{src}` (no silent exclusive run), got {vm:?}"
+            "VM should still REJECT `..=` for-range until Task 4 for `{src}`, got {vm:?}"
         );
     }
 }

@@ -656,21 +656,19 @@ impl<'a> Parser<'a> {
                 // over a `..` range it would be a non-iterable Tier-2 error, but
                 // a range is never async-iterable so keep it ForOf for the error).
                 if !for_await {
-                    if let ExprKind::Binary {
-                        op: BinOp::Range,
-                        lhs,
-                        rhs,
+                    if let ExprKind::Range {
+                        start,
+                        end,
+                        inclusive,
+                        step,
                     } = iter.kind
                     {
                         return Ok(Stmt::ForRange {
                             var,
-                            start: *lhs,
-                            end: *rhs,
-                            // PHASE 1 placeholder — the parser starts producing
-                            // `..=`/`step` in Task 3; for now always exclusive,
-                            // no step (current behavior).
-                            inclusive: false,
-                            step: None,
+                            start: *start,
+                            end: *end,
+                            inclusive,
+                            step: step.map(|s| *s),
                             body,
                         });
                     }
@@ -1199,17 +1197,41 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
-    /// The range operator `..` (grammar PREC.range = 7): binds tighter than
+    /// The range operator `..`/`..=` (grammar PREC.range = 7): binds tighter than
     /// comparison but looser than additive (`1+1..5` parses as `(1+1)..5`).
-    /// Left-associative, like the other binary levels.
+    /// Produces a dedicated `ExprKind::Range` node carrying `inclusive` and an
+    /// optional contextual `step <expr>` suffix. Not chained: `a..b..c` is not a
+    /// thing — a single `start..end` (with optional `step`) per range.
     fn range(&mut self) -> Result<Expr, AsError> {
-        let mut left = self.additive()?;
-        while *self.peek() == Tok::DotDot {
+        let left = self.additive()?;
+        let inclusive = match self.peek() {
+            Tok::DotDot => false,
+            Tok::DotDotEq => true,
+            _ => return Ok(left),
+        };
+        self.advance();
+        let right = self.additive()?;
+        // Contextual `step <expr>`: only consumed when the identifier `step`
+        // directly follows the range end. The step expression runs to the
+        // natural range boundary (the `)` of a for-header or end of a `let`
+        // initializer), so parse it at the additive level (tighter than `..`,
+        // so a bare `step 2` is `Range{..,step:2}` and not re-entered as a range).
+        let step = if matches!(self.peek(), Tok::Ident(s) if s == "step") {
             self.advance();
-            let right = self.additive()?;
-            left = Self::make_binary(left, BinOp::Range, right);
-        }
-        Ok(left)
+            Some(Box::new(self.additive()?))
+        } else {
+            None
+        };
+        let span = Span::new(left.span.start, right.span.end);
+        Ok(Expr {
+            kind: ExprKind::Range {
+                start: Box::new(left),
+                end: Box::new(right),
+                inclusive,
+                step,
+            },
+            span,
+        })
     }
 
     /// Parse a single `match`-arm pattern (one alternative of a `|` group),
@@ -1290,31 +1312,21 @@ impl<'a> Parser<'a> {
         // Otherwise parse a value-expression (at the match precedence level —
         // `coalesce` excludes `|`, `if`, `=>`) and classify it.
         let start = self.coalesce()?;
-        // Inclusive range `a..=b`: the expression parser stops before `..=`.
-        if *self.peek() == Tok::DotDotEq {
-            self.advance();
-            let end = self.coalesce()?;
-            return Ok(Pattern::Range {
-                start: Box::new(start),
-                end: Box::new(end),
-                inclusive: true,
-                // PHASE 1 placeholder — pattern `step` parsing lands later.
-                step: None,
-            });
-        }
-        // Exclusive range `a..b` parses as a `BinOp::Range` binary expression.
-        if let ExprKind::Binary {
-            op: BinOp::Range,
-            lhs,
-            rhs,
+        // A range pattern: `a..b`, `a..=b`, optionally `… step k`. The expression
+        // parser (`range()`) produces a dedicated `ExprKind::Range` for both the
+        // exclusive and inclusive forms and already consumed any trailing `step`.
+        if let ExprKind::Range {
+            start: lo,
+            end,
+            inclusive,
+            step,
         } = start.kind
         {
             return Ok(Pattern::Range {
-                start: lhs,
-                end: rhs,
-                inclusive: false,
-                // PHASE 1 placeholder — pattern `step` parsing lands later.
-                step: None,
+                start: lo,
+                end,
+                inclusive,
+                step,
             });
         }
         // A lone identifier → Option-C resolved at match time.
@@ -1765,6 +1777,42 @@ mod tests {
             Stmt::Expr(e) => e.to_string(),
             _ => panic!("expected an expression statement"),
         }
+    }
+
+    #[test]
+    fn parses_inclusive_and_step_ranges() {
+        for src in [
+            "for (i in 1..=5) {}",
+            "for (i in 1..10 step 2) {}",
+            "for (i in 10..1 step -2) {}",
+            "let xs = 1..=5",
+            "let ys = 1..10 step 2",
+        ] {
+            let toks = lex(src).unwrap();
+            assert!(parse(&toks).is_ok(), "failed to parse: {src}");
+        }
+    }
+
+    #[test]
+    fn for_range_carries_inclusive_and_step() {
+        let toks = lex("for (i in 1..=10 step 2) {}").unwrap();
+        match &parse(&toks).unwrap()[0] {
+            Stmt::ForRange {
+                inclusive, step, ..
+            } => {
+                assert!(*inclusive, "expected inclusive ..= range");
+                assert!(step.is_some(), "expected a step expression");
+            }
+            o => panic!("expected ForRange, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn value_range_produces_range_node() {
+        assert_eq!(sexpr("1..=5"), "1..=5");
+        assert_eq!(sexpr("1..10 step 2"), "1..10 step 2");
+        // `step` only binds immediately after a range end — `f(step)` is a call.
+        assert_eq!(sexpr("step"), "step");
     }
 
     #[test]
