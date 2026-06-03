@@ -347,6 +347,83 @@ fn run_as_on_vm_matches_aso_and_tree_walker() {
     }
 }
 
+/// WS3 Deliverable 1 — the comprehensive all-features showcase example. The
+/// three execution paths must agree byte-for-byte: VM-from-source (`run .as`),
+/// the built `.aso` (VM bytecode), and the tree-walker oracle (`--tree-walker`).
+///
+/// Gated on `data`: the example imports `std/json` to showcase serialization,
+/// which is unavailable under `--no-default-features` (the import would error
+/// identically on both engines, with no exit-0 reference output to compare). The
+/// VM-vs-tree-walker parity for the bare-language constructs in this file is
+/// still covered by the whole-corpus differential in `tests/vm_differential.rs`.
+#[cfg(feature = "data")]
+#[test]
+fn all_features_example_aso_vm_and_tree_walker_agree() {
+    let example = "examples/all_features.as";
+
+    // VM from source vs the tree-walker oracle.
+    let (vm_out, vm_code) = run_root(&["run", example], None);
+    let (tw_out, tw_code) = run_root(&["run", example], Some("tree-walker"));
+    assert_eq!(vm_out, tw_out, "{example}: VM stdout must match tree-walker");
+    assert_eq!(vm_code, tw_code, "{example}: VM exit must match tree-walker");
+    assert_eq!(vm_code, 0, "{example}: should exit 0");
+    assert!(
+        vm_out.ends_with("all_features ok\n"),
+        "{example}: should end with the success line, got tail: {:?}",
+        &vm_out[vm_out.len().saturating_sub(40)..]
+    );
+
+    // Build to .aso and run the bytecode: must match the VM-from-source run.
+    let dir = unique_dir("allfeatures");
+    let src = std::fs::read_to_string(repo_root().join(example)).unwrap();
+    write(&dir, "prog.as", &src);
+    build(&dir, "prog.as");
+    assert!(dir.join("prog.aso").exists(), "prog.aso should exist");
+    let (aso_out, aso_code) = run(&dir, &["run", "prog.aso"]);
+    assert_eq!(aso_out, vm_out, "{example}: .aso stdout must match VM .as run");
+    assert_eq!(aso_code, vm_code, "{example}: .aso exit must match VM .as run");
+}
+
+/// WS3 Deliverable 2 — the multi-file local-import application (`examples/app/`):
+/// `main.as` imports `shapes.as` (which TRANSITIVELY imports `util.as`) plus a
+/// namespace import of `util.as`. Building the entry point must resolve the local
+/// imports, and the resulting `.aso` (VM) must be byte-identical to both the
+/// VM-from-source run and the tree-walker oracle.
+#[test]
+fn local_import_app_example_aso_vm_and_tree_walker_agree() {
+    let entry = "examples/app/main.as";
+
+    // VM from source vs the tree-walker oracle (relative ./imports resolve from
+    // the repo root because run_root sets cwd to the repo root).
+    let (vm_out, vm_code) = run_root(&["run", entry], None);
+    let (tw_out, tw_code) = run_root(&["run", entry], Some("tree-walker"));
+    assert_eq!(vm_out, tw_out, "{entry}: VM stdout must match tree-walker");
+    assert_eq!(vm_code, tw_code, "{entry}: VM exit must match tree-walker");
+    assert_eq!(vm_code, 0, "{entry}: should exit 0");
+    assert!(
+        vm_out.ends_with("app ok\n"),
+        "{entry}: should end with the success line, got: {vm_out:?}"
+    );
+
+    // Copy the whole app/ module set into a unique temp dir, build each module +
+    // the entry, then run the entry `.aso` — mirrors the existing transitive
+    // file-import tests. The built `.aso` must match the VM-from-source run.
+    let dir = unique_dir("appimport");
+    let appdir = repo_root().join("examples/app");
+    for name in ["util.as", "shapes.as", "main.as"] {
+        std::fs::copy(appdir.join(name), dir.join(name)).unwrap();
+    }
+    // Build leaf-first so each dependency's `.aso` exists when the next is built;
+    // building `main.as` resolves its (already-built) local imports.
+    build(&dir, "util.as");
+    build(&dir, "shapes.as");
+    build(&dir, "main.as");
+    assert!(dir.join("main.aso").exists(), "main.aso should exist");
+    let (aso_out, aso_code) = run(&dir, &["run", "main.aso"]);
+    assert_eq!(aso_out, vm_out, "{entry}: .aso stdout must match VM .as run");
+    assert_eq!(aso_code, vm_code, "{entry}: .aso exit must match VM .as run");
+}
+
 /// The oracle escape hatch stays CLI-reachable: `ASCRIPT_ENGINE=tree-walker`
 /// routes `.as` back to the tree-walker and still produces correct output.
 #[test]

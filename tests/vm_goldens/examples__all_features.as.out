@@ -1,0 +1,43 @@
+# exit: none
+values: 42 3.5 hello true nil
+array: [1, 2, 3]
+object: {a: 1, b: 2}
+tmpl: hello, world! n=42 sum=3
+nested: inner world done
+escapes: tab[	]nl-next
+quote="q" backslash=\
+add: 5
+square: 25
+params: hi, Ada / hey, Ada
+rest sum: 10
+closure: 1 2 3
+mutual recursion: true false
+if/elif/else: A B C
+while/break/continue acc: 4
+for-range sum: 10
+for-of: xyz
+ternary: pos
+class: Rex (4 legs, guest), a dog says woof
+from(): Cat (4 legs, guest) / nickname: nil
+enum match: 2 3
+match: zero small lucky big 500 other
+array match: empty one:9 head 1 rest 2
+object match: GET /u POST (+2 fields)
+array destructure: 10 [20, 30, 40]
+object destructure: 1 2 {r: 3, s: 4}
+array spread: [1, 2, 3, 4, 5]
+object spread: {x: 1, y: 20, z: 3}
+call spread: 15
+result ok: 10
+result err: divide by zero
+unwrap !: 5
+recover: divide by zero
+optional type: 4 -1
+generator for-await: [1, 2, 3, 4]
+generator next: 1 2 3
+async: 42 [2, 4, 6]
+math: 7 9 3
+array: [10, 20, 30] 10
+json: {"k":1,"list":[true,null]}
+forward-ref const: 42
+all_features ok

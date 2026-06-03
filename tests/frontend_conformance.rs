@@ -189,7 +189,7 @@ fn interpreter_parses_examples_dir() {
     // covers `examples/ranges.as` (range-as-expression + let-without-init).
     use std::fs;
     let mut count = 0;
-    for dir in ["examples", "examples/modules"] {
+    for dir in ["examples", "examples/modules", "examples/app"] {
         for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir}: {e}")) {
             let path = entry.unwrap().path();
             if path.extension().and_then(|s| s.to_str()) == Some("as") {

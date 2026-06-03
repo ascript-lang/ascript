@@ -17,7 +17,7 @@ fn language() -> tree_sitter::Language {
 
 fn example_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for dir in ["examples", "examples/modules"] {
+    for dir in ["examples", "examples/modules", "examples/app"] {
         let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir}: {e}"));
         for entry in entries {
             let path = entry.unwrap().path();
