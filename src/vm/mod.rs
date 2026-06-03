@@ -7,6 +7,7 @@
 pub mod chunk;
 pub mod disasm;
 pub mod fiber;
+pub mod ic;
 pub mod opcode;
 pub mod run;
 pub mod shape;

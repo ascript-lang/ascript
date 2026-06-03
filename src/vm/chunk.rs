@@ -10,7 +10,10 @@
 use crate::span::Span;
 use crate::syntax::resolve::types::UpvalueDescriptor;
 use crate::value::Value;
+use crate::vm::ic::{InlineCache, MethodCache};
 use crate::vm::opcode::Op;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 /// A compiled class definition referenced by an `Op::Class` operand.
@@ -81,8 +84,21 @@ pub struct Chunk {
     pub cell_slots: Vec<u32>,
     /// Number of local slots this frame needs (stack window size).
     pub slot_count: u16,
-    /// Number of reserved inline-cache slots (parallel IC array length; V11).
+    /// Number of reserved inline-cache slots (V11). Counted by the compiler at
+    /// each `GET_PROP`/`SET_PROP`/`CALL_METHOD` site; kept as a metric/sanity
+    /// bound. The caches themselves are keyed by the op's bytecode offset (see
+    /// [`Chunk::field_ic`]/[`Chunk::method_ic`]) rather than a dense slot index,
+    /// so adding ICs leaves the bytecode and disassembly BYTE-IDENTICAL (no new
+    /// inline operand). The maps below start empty (cold) and fill on first run.
     pub ic_count: u16,
+    /// Field-read/write inline caches (`GET_PROP`/`SET_PROP`), keyed by the op's
+    /// bytecode offset within `code`. Lazily populated; a missing entry is `Cold`.
+    /// `RefCell` because the run loop mutates a cache through a `&self` chunk
+    /// borrow (the VM runs on `&self`); never shared across threads (`!Send`).
+    pub field_ics: RefCell<HashMap<usize, InlineCache>>,
+    /// Method-dispatch inline caches (`CALL_METHOD`), keyed by the op's bytecode
+    /// offset. Lazily populated; a missing entry is `Cold`.
+    pub method_ics: RefCell<HashMap<usize, MethodCache>>,
     /// Optional name (function name / `<script>`), for the disassembler & traces.
     pub name: Option<String>,
 }
@@ -245,6 +261,41 @@ impl Chunk {
     /// Read the `i16` little-endian (jump) operand starting at byte `at`.
     pub fn read_i16(&self, at: usize) -> i16 {
         i16::from_le_bytes([self.code[at], self.code[at + 1]])
+    }
+
+    // ---- inline caches (V11) ---------------------------------------------
+
+    /// The current field IC for the op at bytecode offset `op_off`. A site that
+    /// has never been executed has no map entry and reads as [`InlineCache::Cold`].
+    /// `InlineCache` is `Copy`, so this returns by value (no borrow held).
+    pub fn field_ic(&self, op_off: usize) -> InlineCache {
+        self.field_ics
+            .borrow()
+            .get(&op_off)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Store the updated field IC for the op at bytecode offset `op_off`.
+    pub fn set_field_ic(&self, op_off: usize, ic: InlineCache) {
+        self.field_ics.borrow_mut().insert(op_off, ic);
+    }
+
+    /// The current method IC for the `CALL_METHOD` op at bytecode offset
+    /// `op_off`, cloned out so no borrow is held across the call. A never-run site
+    /// reads as [`MethodCache::Cold`].
+    pub fn method_ic(&self, op_off: usize) -> MethodCache {
+        self.method_ics
+            .borrow()
+            .get(&op_off)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store the updated method IC for the `CALL_METHOD` op at bytecode offset
+    /// `op_off`.
+    pub fn set_method_ic(&self, op_off: usize, ic: MethodCache) {
+        self.method_ics.borrow_mut().insert(op_off, ic);
     }
 
     // ---- spans ------------------------------------------------------------

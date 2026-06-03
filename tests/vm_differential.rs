@@ -3973,3 +3973,335 @@ async fn record_vm_goldens() {
     }
     eprintln!("recorded {wrote} goldens from the tree-walker into {}", dir.display());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  V11-T3: INLINE-CACHE differential tests.
+//
+//  These hammer the GET_PROP/SET_PROP/CALL_METHOD inline caches across the full
+//  state machine (cold→mono→poly→mega), through mutation-during-loop, with a
+//  field that shadows a method, and with a schema receiver (which must bypass the
+//  field IC). Every program's stdout must stay BYTE-IDENTICAL to the tree-walker
+//  — the ICs are a pure fast path in front of the generic member/dispatch logic,
+//  so any divergence is a guard bug (do NOT relax the assertion to make it pass).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn ic_monomorphic_field_read_hot_loop() {
+    // One shape seen at the GET_PROP site for thousands of iterations → the IC
+    // sits in Mono and the running sum must equal the tree-walker's.
+    assert_vm_run_matches_treewalker(
+        r#"
+        let total = 0
+        for (i in 0..1000) {
+          let o = { x: i, y: i + 1 }
+          total = total + o.x + o.y
+        }
+        print(total)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_polymorphic_field_read_two_to_four_shapes() {
+    // The SAME GET_PROP site sees 2..4 distinct object SHAPES (different key
+    // layouts) → the IC promotes Mono→Poly. The read must pick the right index
+    // per shape.
+    assert_vm_run_matches_treewalker(
+        r#"
+        fn val(o) { return o.v }
+        let total = 0
+        for (i in 0..400) {
+          let o = nil
+          let m = i % 4
+          if (m == 0) { o = { v: i } }
+          else if (m == 1) { o = { a: 1, v: i } }
+          else if (m == 2) { o = { a: 1, b: 2, v: i } }
+          else { o = { a: 1, b: 2, c: 3, v: i } }
+          total = total + val(o)
+        }
+        print(total)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_megamorphic_field_read_five_plus_shapes() {
+    // >4 distinct shapes at one GET_PROP site → the IC saturates to Mega and
+    // always takes the generic path; the result must still match exactly.
+    assert_vm_run_matches_treewalker(
+        r#"
+        fn val(o) { return o.v }
+        let total = 0
+        for (i in 0..600) {
+          let o = nil
+          let m = i % 6
+          if (m == 0) { o = { v: i } }
+          else if (m == 1) { o = { a: 1, v: i } }
+          else if (m == 2) { o = { a: 1, b: 2, v: i } }
+          else if (m == 3) { o = { a: 1, b: 2, c: 3, v: i } }
+          else if (m == 4) { o = { a: 1, b: 2, c: 3, d: 4, v: i } }
+          else { o = { a: 1, b: 2, c: 3, d: 4, e: 5, v: i } }
+          total = total + val(o)
+        }
+        print(total)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_set_prop_reassign_existing_field_in_loop() {
+    // Reassigning an EXISTING object field keeps the shape, so the SET_PROP IC
+    // fast path writes in place. The accumulated value must match.
+    assert_vm_run_matches_treewalker(
+        r#"
+        let o = { count: 0, tag: "n" }
+        for (i in 0..500) {
+          o.count = o.count + i
+        }
+        print(o.count)
+        print(o.tag)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_set_prop_adds_new_key_invalidates_then_recaches() {
+    // Adding a NEW key transitions the object's shape; a subsequent read of an
+    // existing field must still be correct (the old cache entry misses on the
+    // new shape and re-resolves).
+    assert_vm_run_matches_treewalker(
+        r#"
+        fn x(o) { return o.x }
+        let total = 0
+        for (i in 0..300) {
+          let o = { x: i }
+          total = total + x(o)
+          o.y = i * 2          // shape transition
+          total = total + x(o) // x is still at index 0 under the new shape
+        }
+        print(total)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_mutation_during_loop_object_field() {
+    // A long-lived object whose field is mutated each iteration AND read through
+    // the same GET_PROP — the IC must observe the latest value every time.
+    assert_vm_run_matches_treewalker(
+        r#"
+        let acc = { sum: 0 }
+        let seen = 0
+        for (i in 0..1000) {
+          acc.sum = acc.sum + i
+          seen = acc.sum
+        }
+        print(seen)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_instance_field_read_and_write_hot() {
+    // Instance field GET_PROP/SET_PROP in a loop — the field IC fast-paths the
+    // declared field reads/writes; the field-type contract still applies.
+    assert_vm_run_matches_treewalker(
+        r#"
+        class Point {
+          x: number
+          y: number
+          fn init(x, y) { self.x = x; self.y = y }
+          fn sum() { return self.x + self.y }
+        }
+        let total = 0
+        for (i in 0..1000) {
+          let p = Point(i, i + 1)
+          p.x = p.x + 1
+          total = total + p.x + p.y
+        }
+        print(total)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_method_dispatch_monomorphic_hot() {
+    // One receiver class at the CALL_METHOD site for many iterations → the method
+    // IC sits in Mono and dispatches the compiled method directly.
+    assert_vm_run_matches_treewalker(
+        r#"
+        class Counter {
+          n: number = 0
+          fn bump(d) { self.n = self.n + d; return self.n }
+        }
+        let c = Counter()
+        let last = 0
+        for (i in 0..1000) { last = c.bump(i) }
+        print(last)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_method_dispatch_polymorphic_across_classes() {
+    // The SAME CALL_METHOD site sees TWO different classes (which can even share a
+    // field layout) — the method IC keys on CLASS identity, so each dispatches its
+    // own `kind`/`area` and the totals must match.
+    assert_vm_run_matches_treewalker(
+        r#"
+        class Sq {
+          s: number
+          fn init(s) { self.s = s }
+          fn area() { return self.s * self.s }
+        }
+        class Rec {
+          s: number
+          fn init(s) { self.s = s }
+          fn area() { return self.s * 2 }
+        }
+        fn area_of(shape) { return shape.area() }
+        let total = 0
+        for (i in 0..400) {
+          let shape = nil
+          if (i % 2 == 0) { shape = Sq(i) } else { shape = Rec(i) }
+          total = total + area_of(shape)
+        }
+        print(total)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_method_dispatch_through_inheritance() {
+    // An inherited method resolved up the chain must cache + dispatch from the
+    // correct defining class (so a `super`-style resolution stays correct).
+    assert_vm_run_matches_treewalker(
+        r#"
+        class Animal {
+          name: string
+          fn init(name) { self.name = name }
+          fn speak() { return self.name + " makes a sound" }
+        }
+        class Dog extends Animal {
+          fn init(name) { super.init(name) }
+        }
+        let out = ""
+        for (i in 0..50) {
+          let d = Dog("Rex")
+          out = d.speak()
+        }
+        print(out)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_field_shadows_method_is_not_fast_pathed() {
+    // An object/instance member that is a FIELD holding a callable must be read as
+    // a field (NOT dispatched as a method) — the IC fast path must decline. Here a
+    // class field holds a closure; calling it must invoke the closure WITHOUT
+    // `self`-binding, exactly like the tree-walker.
+    assert_vm_run_matches_treewalker(
+        r#"
+        class Holder {
+          op: fn
+          fn init() { self.op = (a, b) => a + b }
+        }
+        let h = Holder()
+        let total = 0
+        for (i in 0..100) { total = total + h.op(i, 1) }
+        print(total)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_method_name_read_without_call_returns_bound_method() {
+    // GET_PROP of a METHOD name (no call) must yield a bound method, not a wrong
+    // field value — the field IC must miss on a method name. We exercise the bound
+    // method by calling it after the read.
+    assert_vm_run_matches_treewalker(
+        r#"
+        class Box {
+          v: number
+          fn init(v) { self.v = v }
+          fn get() { return self.v }
+        }
+        let b = Box(41)
+        let m = b.get      // method-named GET_PROP (no call) → bound method
+        print(m())
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_schema_value_member_access_bypasses_field_ic() {
+    // A schema value is a tagged Object `{__kind: "<kind>", ...}`; reading a stored
+    // constraint field on it must go through the GENERIC path (the field IC bypasses
+    // schema receivers via `is_schema_value`). We build the tagged object directly
+    // (the VM does not yet support `import`), then read its fields in a hot loop so
+    // the GET_PROP site would WANT to cache — it must not, and the output must match
+    // the tree-walker regardless.
+    assert_vm_run_matches_treewalker(
+        r#"
+        let total = 0
+        for (i in 0..200) {
+          let s = { __kind: "string", minLength: i }
+          total = total + s.minLength
+        }
+        print(total)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_optional_chain_nil_receiver_short_circuits() {
+    // `?.` on a nil receiver must short-circuit to nil WITHOUT consulting the IC
+    // or resolving a field, byte-identically to the tree-walker.
+    assert_vm_run_matches_treewalker(
+        r#"
+        let o = nil
+        print(o?.missing)
+        let p = { a: 1 }
+        print(p?.a)
+        "#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn ic_mixed_object_and_instance_same_site() {
+    // The same GET_PROP `.v` site sees BOTH a plain object and an instance across
+    // iterations (poly across an object shape and an instance shape). The read
+    // must resolve the right index for each.
+    assert_vm_run_matches_treewalker(
+        r#"
+        class Cell {
+          v: number
+          fn init(v) { self.v = v }
+        }
+        fn val(o) { return o.v }
+        let total = 0
+        for (i in 0..400) {
+          let o = nil
+          if (i % 2 == 0) { o = { v: i } } else { o = Cell(i) }
+          total = total + val(o)
+        }
+        print(total)
+        "#,
+    )
+    .await;
+}

@@ -496,6 +496,9 @@ impl Vm {
                     }
                     let recv = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    // Resolve `proto` out of the fiber so the chunk's method IC can be
+                    // consulted without holding a fiber borrow across the dispatch.
+                    let proto = fiber.frame().closure.proto.clone();
                     // Schema fluent-method hook (same predicate the tree-walker uses).
                     if crate::stdlib::schema::is_schema_value(&recv)
                         && crate::stdlib::schema::is_schema_method(&name)
@@ -505,6 +508,22 @@ impl Vm {
                         sargs.extend(args);
                         let v = self.interp.call_schema(&name, &sargs, span).await?;
                         fiber.push(v);
+                    } else if let Some((closure, def_class)) =
+                        self.ic_resolve_method(&proto.chunk, fault_ip, &recv, &name)
+                    {
+                        // METHOD inline-cache fast path (V11-T3): the receiver is a
+                        // VM instance whose `name` resolves (up the chain) to a
+                        // COMPILED method and is NOT shadowed by an instance field.
+                        // Skip the BoundMethod allocation + `find_compiled_method`
+                        // walk and invoke the compiled closure directly with `recv`
+                        // bound as `self` — byte-identical to the generic
+                        // `vm_read_member → BoundMethod → call_value → bound_method_is_vm
+                        // → invoke_compiled_method` path (same closure, same
+                        // defining class).
+                        let v = self
+                            .invoke_compiled_method(closure, recv, args, span, Some(def_class))
+                            .await?;
+                        fiber.push(v);
                     } else {
                         // Fallback: read the member, then call it. `vm_read_member`
                         // yields a VM `BoundMethod` for an Instance method on a VM
@@ -512,7 +531,9 @@ impl Vm {
                         // the SAME dispatch the tree-walker runs (a BoundMethod /
                         // GeneratorMethod / NativeMethod / Builtin / … bound to
                         // `recv`); `call_value` invokes it (VM-aware for V9 classes,
-                        // shared with the tree-walker otherwise).
+                        // shared with the tree-walker otherwise). This also covers an
+                        // instance FIELD that happens to hold a callable (a field
+                        // shadows a method — the IC fast path declines those).
                         let callee_v = self.vm_read_member(&recv, &name, span)?;
                         let v = self.call_value(callee_v, args, span).await?;
                         fiber.push(v);
@@ -845,14 +866,27 @@ impl Vm {
                     };
                     let obj = fiber.pop();
                     if op == Op::GetPropOpt && obj == Value::Nil {
+                        // `?.` short-circuit guard: a nil receiver never consults
+                        // the IC (and never resolves a field), matching the generic
+                        // path's nil short-circuit exactly.
                         fiber.push(Value::Nil);
                     } else {
                         let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                        // VM-aware member read: an Instance method on a VM class
-                        // becomes a `BoundMethod` (compiled-closure-backed); fields
-                        // and every non-VM receiver go through the shared
-                        // `Interp::read_member`.
-                        let v = self.vm_read_member(&obj, &name, span)?;
+                        // Try the field inline cache (fast path for FIELD reads on a
+                        // shaped Object/Instance). On a hit it returns the cached
+                        // field's value, which is byte-identical to `vm_read_member`
+                        // (whose Object/Instance field arm clones the same stored
+                        // value). On a miss it returns `None` and we fall to the SAME
+                        // generic member read — which also handles methods (→
+                        // BoundMethod), non-shaped receivers, enum/native/nil, etc.
+                        // Resolve `proto` out of the fiber so the chunk borrow does
+                        // not collide with the later `fiber.push`.
+                        let proto = fiber.frame().closure.proto.clone();
+                        let cached = self.ic_get_field(&proto.chunk, fault_ip, &obj, &name);
+                        let v = match cached {
+                            Some(v) => v,
+                            None => self.vm_read_member(&obj, &name, span)?,
+                        };
                         fiber.push(v);
                     }
                 }
@@ -1531,12 +1565,10 @@ impl Vm {
                     // the tree-walker's `value_span` for the contract panic; reuse it
                     // for the "cannot set property" error too (single VM span).
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                    let v = self.interp.set_member(&obj, &name, value, span, span)?;
-                    // `obj.newkey = v` on an object may have ADDED a key →
-                    // transition its shape (reassign keeps the layout/shape).
-                    if let Value::Object(cell) = &obj {
-                        self.resync_object_shape(cell);
-                    }
+                    // Resolve `proto` out of the fiber so the chunk IC borrow does not
+                    // collide with the later `fiber.push`.
+                    let proto = fiber.frame().closure.proto.clone();
+                    let v = self.vm_set_prop(&proto.chunk, fault_ip, &obj, &name, value, span)?;
                     fiber.push(v);
                 }
 
@@ -1878,6 +1910,145 @@ impl Vm {
     /// `Method` carried by the `BoundMethod` is never executed by the VM — its body
     /// is empty — it exists only to satisfy the frozen `value.rs` `BoundMethod`
     /// shape; method dispatch always runs the COMPILED closure.
+    /// FIELD inline-cache fast path for `GET_PROP` (V11-T3). Returns `Some(value)`
+    /// when `name` resolves to a FIELD of a shaped `Object`/`Instance` — either
+    /// from a cache HIT (`recv.shape == cached.shape` → read `get_index(idx)`) or
+    /// after a fresh generic field resolution that is then RECORDED into the cache.
+    /// Returns `None` when the field fast path does not apply — in which case the
+    /// caller MUST take the generic `vm_read_member` path (which resolves methods,
+    /// enums, natives, nil, non-shaped receivers, …). The returned value is always
+    /// byte-identical to what `vm_read_member` would return for the same input.
+    ///
+    /// GUARDS (force `None`, i.e. generic path):
+    /// - a receiver that is not an `Object`/`Instance` (modules, strings, enums,
+    ///   classes, generators, nil → handled by `read_member`);
+    /// - a shape of `0` (unset — a tree-walker-built value the IC cannot key on);
+    /// - a SCHEMA-VALUE object (`is_schema_value`): never cached, so a schema
+    ///   object's member access always flows through the generic path;
+    /// - a name that is NOT a field (`get_index_of` → `None`): on an Instance this
+    ///   is a METHOD (→ BoundMethod via generic) or a missing field; either way the
+    ///   IC neither caches nor answers, so it can never return a wrong value for a
+    ///   method-named access.
+    fn ic_get_field(
+        &self,
+        chunk: &crate::vm::chunk::Chunk,
+        op_off: usize,
+        obj: &Value,
+        name: &str,
+    ) -> Option<Value> {
+        match obj {
+            Value::Object(cell) => {
+                let shape = cell.shape.get();
+                if shape == 0 || crate::stdlib::schema::is_schema_value(obj) {
+                    return None;
+                }
+                // Cache hit: read the field directly by its stable index.
+                let ic = chunk.field_ic(op_off);
+                if let Some(idx) = ic.lookup(shape) {
+                    let map = cell.map.borrow();
+                    // The index is keyed by shape (V11-T2: shape ⇒ key layout), so
+                    // it is always in range for an object of that shape.
+                    if let Some((_k, v)) = map.get_index(idx as usize) {
+                        return Some(v.clone());
+                    }
+                    // Defensive: a stale/out-of-range index never feeds a wrong
+                    // value — fall through to re-resolve generically below.
+                }
+                // Miss: resolve the field index generically and RECORD it.
+                let map = cell.map.borrow();
+                match map.get_index_of(name) {
+                    Some(idx) => {
+                        let v = map.get_index(idx).map(|(_, v)| v.clone());
+                        drop(map);
+                        let mut ic = chunk.field_ic(op_off);
+                        ic.record(shape, idx as u32);
+                        chunk.set_field_ic(op_off, ic);
+                        v
+                    }
+                    // Not a field on this object → generic path (returns nil).
+                    None => None,
+                }
+            }
+            Value::Instance(inst) => {
+                let b = inst.borrow();
+                let shape = b.shape_id.get();
+                if shape == 0 {
+                    return None;
+                }
+                // Cache hit: read the field directly by its stable index.
+                let ic = chunk.field_ic(op_off);
+                if let Some(idx) = ic.lookup(shape) {
+                    if let Some((_k, v)) = b.fields.get_index(idx as usize) {
+                        return Some(v.clone());
+                    }
+                    // Defensive fall-through (see Object arm).
+                }
+                // Miss: resolve generically and record IF it is a FIELD. A
+                // method-named access yields `None` here → generic path →
+                // BoundMethod (never cached, never mis-answered).
+                match b.fields.get_index_of(name) {
+                    Some(idx) => {
+                        let v = b.fields.get_index(idx).map(|(_, v)| v.clone());
+                        drop(b);
+                        let mut ic = chunk.field_ic(op_off);
+                        ic.record(shape, idx as u32);
+                        chunk.set_field_ic(op_off, ic);
+                        v
+                    }
+                    None => None,
+                }
+            }
+            // Every other receiver kind: generic path.
+            _ => None,
+        }
+    }
+
+    /// METHOD inline-cache fast path for `CALL_METHOD` (V11-T3). Returns
+    /// `Some((closure, defining_class))` when `recv` is a VM `Instance` whose
+    /// `name` resolves up the class chain to a COMPILED method AND is NOT shadowed
+    /// by an instance field — exactly the case the generic
+    /// `vm_read_member → BoundMethod → bound_method_is_vm` path would dispatch to
+    /// the same compiled closure. Returns `None` (→ generic path) for every other
+    /// receiver, a schema value, a name that is an instance FIELD (a field shadows
+    /// a method), or a name with no compiled method.
+    ///
+    /// On a hit it serves the cached `(closure, defining_class)`; on a miss it
+    /// resolves via `find_compiled_method` and RECORDS the result keyed by the
+    /// receiver's CLASS IDENTITY (`Rc` pointer) — never the field shape, because two
+    /// distinct classes may share a field layout but resolve methods differently.
+    fn ic_resolve_method(
+        &self,
+        chunk: &crate::vm::chunk::Chunk,
+        op_off: usize,
+        recv: &Value,
+        name: &str,
+    ) -> Option<(Rc<Closure>, Rc<crate::value::Class>)> {
+        let Value::Instance(inst) = recv else {
+            return None;
+        };
+        // A field SHADOWS a method — never fast-path a field-named access (it is
+        // not a method dispatch; the generic path reads the field instead).
+        let (class, has_field) = {
+            let b = inst.borrow();
+            (b.class.clone(), b.fields.contains_key(name))
+        };
+        if has_field {
+            return None;
+        }
+        let class_id = Rc::as_ptr(&class) as usize;
+        // Cache hit: serve the resolved compiled method for this exact class.
+        let ic = chunk.method_ic(op_off);
+        if let Some(hit) = ic.lookup(class_id) {
+            return Some(hit);
+        }
+        // Miss: resolve the compiled method up the chain and record it.
+        let resolved = self.find_compiled_method(&class, name)?;
+        let mut ic = chunk.method_ic(op_off);
+        ic.record(class_id, resolved.0.clone(), resolved.1.clone());
+        chunk.set_method_ic(op_off, ic);
+        Some(resolved)
+    }
+
     fn vm_read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, Control> {
         if let Value::Instance(inst) = obj {
             let (class, has_field) = {
@@ -1946,6 +2117,100 @@ impl Vm {
         let keys: Vec<String> = obj.map.borrow().keys().cloned().collect();
         let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
         obj.shape.set(shape);
+    }
+
+    /// Recompute and store an `Instance`'s `shape_id` from its CURRENT field keys.
+    /// Called after a `SET_PROP` that may have ADDED an (undeclared) field — which
+    /// the runtime allows (`set_member` inserts unconditionally). Re-deriving the
+    /// shape keeps the GET_PROP/SET_PROP field IC sound: a changed field LAYOUT
+    /// yields a changed shape, so any cache entry keyed by the OLD shape simply
+    /// MISSES (and re-resolves) instead of reading a stale index. Reassigning an
+    /// existing field leaves the layout — and thus the shape — unchanged.
+    fn resync_instance_shape(&self, inst: &Rc<RefCell<crate::value::Instance>>) {
+        let keys: Vec<String> = inst.borrow().fields.keys().cloned().collect();
+        let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
+        inst.borrow().shape_id.set(shape);
+    }
+
+    /// `SET_PROP` with the field inline cache (V11-T3). Stores `obj.<name> = value`
+    /// and returns `value`, BYTE-IDENTICALLY to the generic `set_member` path:
+    ///
+    /// - **Object, existing field, cache hit (shape unchanged):** write the value
+    ///   in place at the cached index via `get_index_mut`. This is identical to
+    ///   `IndexMap::insert` of an EXISTING key (same slot, same position), so the
+    ///   shape does not change and no resync is needed. Objects carry no field-type
+    ///   contracts, so there is nothing to check.
+    /// - **Object, miss:** fall to `set_member` (which may ADD a key), then resync
+    ///   the object's shape and RECORD the (now-existing) field's index for next
+    ///   time. Adding a key transitions the shape, so a prior cache entry for the
+    ///   old shape correctly misses.
+    /// - **Instance (always):** go through `set_member` so the declared FIELD-TYPE
+    ///   CONTRACT is applied exactly as the tree-walker (same panic message/span) —
+    ///   the IC never bypasses the contract. Then resync the instance shape (a set
+    ///   may have added an undeclared field) and record the field's index.
+    /// - **Any other receiver:** `set_member` raises the same Tier-2 "cannot set
+    ///   property" panic.
+    fn vm_set_prop(
+        &self,
+        chunk: &crate::vm::chunk::Chunk,
+        op_off: usize,
+        obj: &Value,
+        name: &str,
+        value: Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        match obj {
+            Value::Object(cell) => {
+                let shape = cell.shape.get();
+                // Fast path: a shaped, non-schema object whose key already exists
+                // at the cached index — write in place (no layout/shape change).
+                if shape != 0 && !crate::stdlib::schema::is_schema_value(obj) {
+                    let ic = chunk.field_ic(op_off);
+                    if let Some(idx) = ic.lookup(shape) {
+                        let mut map = cell.map.borrow_mut();
+                        if let Some((_k, slot)) = map.get_index_mut(idx as usize) {
+                            *slot = value.clone();
+                            return Ok(value);
+                        }
+                        // Defensive: stale index → fall through to generic set.
+                    }
+                }
+                // Generic store (may add a key), then resync shape + record index.
+                let v = self.interp.set_member(obj, name, value, span, span)?;
+                self.resync_object_shape(cell);
+                let new_shape = cell.shape.get();
+                if new_shape != 0 && !crate::stdlib::schema::is_schema_value(obj) {
+                    if let Some(idx) = cell.map.borrow().get_index_of(name) {
+                        let mut ic = chunk.field_ic(op_off);
+                        ic.record(new_shape, idx as u32);
+                        chunk.set_field_ic(op_off, ic);
+                    }
+                }
+                Ok(v)
+            }
+            Value::Instance(inst) => {
+                // ALWAYS run the contract check via the shared `set_member`.
+                let v = self.interp.set_member(obj, name, value, span, span)?;
+                // A set may have added an undeclared field → re-derive the shape so
+                // the field IC stays sound, then record this field's index.
+                self.resync_instance_shape(inst);
+                let recorded = {
+                    let b = inst.borrow();
+                    let new_shape = b.shape_id.get();
+                    (new_shape != 0)
+                        .then(|| b.fields.get_index_of(name).map(|idx| (new_shape, idx)))
+                        .flatten()
+                };
+                if let Some((new_shape, idx)) = recorded {
+                    let mut ic = chunk.field_ic(op_off);
+                    ic.record(new_shape, idx as u32);
+                    chunk.set_field_ic(op_off, ic);
+                }
+                Ok(v)
+            }
+            // Non-settable receiver: shared Tier-2 panic (byte-identical).
+            _ => self.interp.set_member(obj, name, value, span, span),
+        }
     }
 
     /// Construct an instance of a VM-registered class (V9). Mirrors the
@@ -2031,6 +2296,13 @@ impl Vm {
             )
             .into());
         }
+        // Re-derive the shape from the instance's ACTUAL fields now that defaults +
+        // `init` have populated them. The base shape set above reflects the FULL
+        // declared schema, but `fields` only holds what was actually inserted (and
+        // in insertion order), so a field IC keying on `shape_id` must see the real
+        // layout — otherwise two instances sharing the base shape but with different
+        // actual layouts could read a wrong index. (V11-T3 IC soundness.)
+        self.resync_instance_shape(&instance);
         Ok(inst_val)
     }
 
