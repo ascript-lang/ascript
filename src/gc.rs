@@ -787,4 +787,282 @@ mod tests {
         assert_eq!(reclaimed, 0, "maybe_collect must skip below the growth threshold");
         drop(v);
     }
+
+    // ───────────────────── V13-T6 CRITICAL GATE ─────────────────────
+    //
+    // Deterministic native-resource `Drop` is PRESERVED after the Rc→Cc cycle-GC
+    // migration. The whole design rests on: OS resources (TCP/file/DB/child/timer/
+    // socket/terminal handles) are NOT embedded in `Value` and NOT on the Cc graph.
+    // They live in `Interp.resources` (a plain `HashMap<u64, ResourceState>`) keyed
+    // by a handle id; the script-visible `Value::Native(Rc<NativeObject>)` is a cheap
+    // clonable handle carrying only `{ id, kind, fields }` — no OS resource, no
+    // `Drop` impl (verified: there is NO `impl Drop for NativeObject`).
+    //
+    // CONSEQUENCES this gate pins down, by EXECUTION:
+    //   (A) A resource-table entry is freed at a DETERMINISTIC point — `take_resource`
+    //       (explicit `close()`/`kill()`/EOF or scope-driven reclamation) — and NOT by
+    //       a cycle collection. Closing/taking the resource frees the OS handle right
+    //       then, with NO `gc::collect()` in sight.
+    //   (B) Even when the `Value::Native` HANDLE is captured INTO a reference cycle
+    //       (an Object that references itself and holds the handle), the OS resource
+    //       is freed via the resource model independently of when the Cc cycle is
+    //       collected — because `Value::Native` traces as a NO-OP (`_ => {}` in
+    //       `Value::trace`), so the handle is invisible to the collector and the
+    //       table entry is never owned by / trapped in the cycle. Collecting the
+    //       cycle later drops only the `Rc<NativeObject>` (id+kind+fields) — never the
+    //       OS resource, which the resource model already reclaimed. No double-free,
+    //       no panic.
+    //
+    // This MATCHES the tree-walker exactly: it uses the SAME `Interp` resource table,
+    // the SAME `register_resource`/`take_resource`, and the SAME `Rc<NativeObject>`
+    // (Native STAYS on `Rc`, not `Cc`, in both engines). So Drop timing is identical
+    // before and after the GC, and identical between tree-walker and VM.
+    //
+    // We probe with the always-present (`--no-default-features`-safe) `ResourceState`
+    // variants — `Closed` and `Interval` (a real `tokio::time::Interval`, an OS-backed
+    // timer resource). Table-entry presence (`resource_count`) is the observable: an
+    // entry present ⇒ the resource is alive; an entry gone ⇒ its `Drop` has run.
+
+    use crate::interp::{Interp, ResourceState};
+
+    /// (A) The resource-table entry — and thus the OS resource's `Drop` — is freed at
+    /// `take_resource` (close/scope), IMMEDIATELY, with NO collection. The GC did not
+    /// take over resource lifetime.
+    #[tokio::test]
+    async fn native_resource_drop_is_immediate_at_close_not_at_collection() {
+        let interp = Interp::new();
+        let baseline = interp.resource_count();
+
+        // Register a real OS-backed resource (a tokio Interval timer) behind a
+        // Value::Native handle, exactly as std/time does.
+        let handle = interp.register_resource(
+            crate::value::NativeKind::Interval,
+            indexmap::IndexMap::new(),
+            ResourceState::Interval(Box::new(tokio::time::interval(
+                std::time::Duration::from_secs(1),
+            ))),
+        );
+        let id = match &handle {
+            Value::Native(n) => n.id,
+            _ => unreachable!("register_resource yields a Native handle"),
+        };
+        assert_eq!(
+            interp.resource_count(),
+            baseline + 1,
+            "the live resource is in the table"
+        );
+
+        // Explicit close == `take_resource` (the close()/kill()/EOF path). This drops
+        // the underlying OS resource RIGHT NOW. Crucially: NO gc::collect() is called.
+        let taken = interp.take_resource(id);
+        assert!(
+            matches!(taken, Some(ResourceState::Interval(_))),
+            "close takes the live resource out of the table"
+        );
+        // `taken` drops here at end of statement → OS timer Drop fires deterministically.
+        drop(taken);
+
+        assert_eq!(
+            interp.resource_count(),
+            baseline,
+            "resource is reclaimed at close — immediately, WITHOUT any cycle collection"
+        );
+
+        // A subsequent collection is irrelevant to the resource (it's already gone)
+        // and must be a harmless no-op for it: the script handle is still around but
+        // is just an Rc<id> off the Cc graph.
+        super::collect();
+        assert_eq!(
+            interp.resource_count(),
+            baseline,
+            "collection does not resurrect or double-free the closed resource"
+        );
+
+        // The Value::Native handle is still a valid (now-dangling) id — it is NOT
+        // freed by the collector and dropping it does nothing to the table.
+        drop(handle);
+        assert_eq!(interp.resource_count(), baseline);
+    }
+
+    /// (A') Dropping the `Value::Native` HANDLE alone does NOT free the table entry —
+    /// the resource model (close/scope), not handle refcount, governs the OS
+    /// resource's lifetime. (This is the SAME pre-GC behavior: `NativeObject` has no
+    /// `Drop`.) The entry is reclaimed deterministically by `take_resource`, and is
+    /// otherwise reclaimed when the whole `Interp` drops — never by the GC.
+    #[test]
+    fn dropping_native_handle_does_not_free_resource_table_entry() {
+        let interp = Interp::new();
+        let baseline = interp.resource_count();
+
+        let handle = interp.register_resource(
+            crate::value::NativeKind::Interval,
+            indexmap::IndexMap::new(),
+            ResourceState::Closed,
+        );
+        let id = match &handle {
+            Value::Native(n) => n.id,
+            _ => unreachable!(),
+        };
+        assert_eq!(interp.resource_count(), baseline + 1);
+
+        // Drop the only script-visible handle. The Rc<NativeObject> is freed, but the
+        // table entry persists — handle refcount does NOT drive resource lifetime.
+        drop(handle);
+        assert_eq!(
+            interp.resource_count(),
+            baseline + 1,
+            "table entry outlives the handle Rc — lifetime is resource-model-governed"
+        );
+        // A collection cannot reach the table (it's plain Rust state, not Cc), so it
+        // cannot free the entry either.
+        super::collect();
+        assert_eq!(
+            interp.resource_count(),
+            baseline + 1,
+            "collection never touches the resource table"
+        );
+        // Deterministic reclamation is via take_resource (the close path).
+        assert!(interp.take_resource(id).is_some());
+        assert_eq!(interp.resource_count(), baseline);
+    }
+
+    /// (B) ADVERSARIAL: a `Value::Native` handle captured INTO a reference cycle.
+    /// Build a self-referential Object that ALSO holds the native handle, drop the
+    /// external reference (the cycle is now unreachable but kept alive by its own
+    /// internal edge), close the resource via the resource model, and prove:
+    ///   - closing frees the OS resource DETERMINISTICALLY at the close point, while
+    ///     the cycle is still uncollected (the resource is NOT held hostage by the
+    ///     Cc cycle), AND
+    ///   - collecting the cycle afterwards is a clean no-op for the resource: it drops
+    ///     only the Rc<NativeObject> handle (id+kind+fields, off the Cc graph) — no
+    ///     double-free, no panic.
+    #[tokio::test]
+    async fn native_handle_trapped_in_cycle_still_drops_resource_deterministically() {
+        let interp = Interp::new();
+        let baseline = interp.resource_count();
+
+        // A real OS-backed resource in the table.
+        let handle = interp.register_resource(
+            crate::value::NativeKind::Interval,
+            indexmap::IndexMap::new(),
+            ResourceState::Interval(Box::new(tokio::time::interval(
+                std::time::Duration::from_secs(1),
+            ))),
+        );
+        let id = match &handle {
+            Value::Native(n) => n.id,
+            _ => unreachable!(),
+        };
+        assert_eq!(interp.resource_count(), baseline + 1);
+
+        // Clean GC baseline so the reclaim count below is attributable to THIS cycle.
+        super::collect();
+        let tracked_before = gcmodule::count_thread_tracked();
+
+        // Build the adversarial cycle: an Object that (1) holds the Native handle and
+        // (2) references ITSELF. Internal self-edge ⇒ refcounting alone can never free
+        // it; only the cycle collector can. The native handle is trapped inside.
+        let obj = {
+            let mut m = IndexMap::new();
+            m.insert("conn".to_string(), handle.clone());
+            Value::Object(ObjectCell::new(m))
+        };
+        if let Value::Object(o) = &obj {
+            o.borrow_mut().insert("self".to_string(), obj.clone());
+        }
+        // Drop every external reference to the cycle AND the standalone handle. The
+        // cycle is now unreachable but still LIVE (self-edge keeps refcount > 0); the
+        // collector has NOT run yet.
+        drop(obj);
+        drop(handle);
+
+        // The OS resource is STILL in the table — proving it is NOT owned by the Cc
+        // cycle (the cycle holds only an Rc<NativeObject> handle, off the Cc graph).
+        assert_eq!(
+            interp.resource_count(),
+            baseline + 1,
+            "resource is not trapped in the (still-uncollected) cycle"
+        );
+
+        // Close via the resource model — DETERMINISTIC: the OS resource's Drop fires
+        // here, while the cycle is STILL uncollected. The GC has no say in this.
+        let taken = interp.take_resource(id);
+        assert!(matches!(taken, Some(ResourceState::Interval(_))));
+        drop(taken);
+        assert_eq!(
+            interp.resource_count(),
+            baseline,
+            "OS resource freed at close, NOT held hostage by the live Cc cycle"
+        );
+
+        // NOW collect the cycle. It must reclaim the cyclic Object (≥1 node) and must
+        // NOT double-free / panic: the handle it still holds is just an Rc<id> whose
+        // table entry was already reclaimed above.
+        let reclaimed = super::collect();
+        assert!(
+            reclaimed >= 1,
+            "the self-referential Object cycle is reclaimed (got {reclaimed})"
+        );
+        assert_eq!(
+            gcmodule::count_thread_tracked(),
+            tracked_before,
+            "tracked count returns to baseline — the cycle (holding the handle) is gone"
+        );
+        // Resource table is unaffected by the collection (entry already reclaimed at
+        // close); no double-free, no resurrection.
+        assert_eq!(interp.resource_count(), baseline);
+    }
+
+    /// (B') The mirror of (B) where the cycle is NEVER explicitly closed and is left
+    /// to the collector. Here the resource entry is governed by the resource model's
+    /// other deterministic endpoint — the owning `Interp`'s `Drop`. Collecting the
+    /// cycle drops the `Rc<NativeObject>` but, since the table entry was NOT taken,
+    /// the entry persists until `Interp` drop. This is IDENTICAL to the tree-walker:
+    /// a never-closed native handle's table entry lives until interp teardown in both.
+    /// We assert no double-free / panic on collecting a cycle that holds a handle to a
+    /// STILL-LIVE table entry.
+    #[test]
+    fn collecting_cycle_with_handle_to_live_resource_is_safe() {
+        let interp = Interp::new();
+        let baseline = interp.resource_count();
+
+        let handle = interp.register_resource(
+            crate::value::NativeKind::Interval,
+            indexmap::IndexMap::new(),
+            ResourceState::Closed,
+        );
+        assert_eq!(interp.resource_count(), baseline + 1);
+
+        super::collect();
+        let tracked_before = gcmodule::count_thread_tracked();
+
+        let obj = {
+            let mut m = IndexMap::new();
+            m.insert("conn".to_string(), handle.clone());
+            Value::Object(ObjectCell::new(m))
+        };
+        if let Value::Object(o) = &obj {
+            o.borrow_mut().insert("self".to_string(), obj.clone());
+        }
+        drop(obj);
+        drop(handle);
+
+        // Collect the unreachable cycle WITHOUT having closed the resource. The cycle
+        // (and the Rc<NativeObject> it carries) is reclaimed; the OS resource's table
+        // entry is NOT freed by this (it lives until Interp drop) — and there is no
+        // double-free or panic.
+        let reclaimed = super::collect();
+        assert!(reclaimed >= 1, "the cycle is reclaimed (got {reclaimed})");
+        assert_eq!(gcmodule::count_thread_tracked(), tracked_before);
+        assert_eq!(
+            interp.resource_count(),
+            baseline + 1,
+            "never-closed resource entry persists past collection — freed at Interp drop, \
+             exactly like the tree-walker"
+        );
+
+        // Interp drop is the other deterministic endpoint: the table (and its entry)
+        // is freed when the Interp goes out of scope here. No panic.
+        drop(interp);
+    }
 }
