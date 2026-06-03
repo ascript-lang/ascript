@@ -573,20 +573,16 @@ async fn vm_destructure_type_errors_match_treewalker() {
 //     compose correctly through the compiler + VM, byte-for-byte against the
 //     tree-walker. This is the V2 sync-subset gate.
 //
-//  2. GROWING-CORPUS SCAFFOLD (`SYNC_EXAMPLE_ALLOWLIST` + `vm_run_allowlisted_examples_*`):
-//     a curated allow-list of WHOLE `examples/*.as` files run end-to-end (file
-//     contents → VM stdout+exit == tree-walker stdout+exit). The list GROWS one
-//     slice at a time as the VM gains features:
-//       - V2  (now): only examples restricted to literals/locals/arithmetic/
-//                     containers/short-circuit/print qualify.
-//       - V3  adds `if`/`while`/`for` examples (e.g. ranges, factorial, ...).
-//       - V4  adds `fn` definitions/calls examples (functions, ...).
-//       - V5..V9 add closures, `?`/`!`/recover, async/await, generators,
-//                 classes/enums.
-//       - V10 FLIPS the gate to the ENTIRE `examples/` corpus and this allow-list
-//             is retired in favour of the whole-corpus runner.
-//     Add files here the moment the VM can run them; never remove the byte-
-//     identical assertion to make a file "pass".
+//  2. WHOLE-CORPUS OPT-OUT GATE (`vm_run_whole_corpus_matches_treewalker`): the
+//     CENTRAL VM correctness proof (oracle #1). At V10 the VM is language-complete,
+//     so the old curated allow-list is RETIRED and the gate FLIPS to an opt-OUT
+//     model: it enumerates EVERY `examples/*.as` AND `examples/advanced/*.as` file,
+//     runs each through BOTH engines, and asserts byte-identical stdout+exit —
+//     EXCEPT for an explicit, per-file-documented SKIP list (`EXAMPLE_SKIPS`). The
+//     goal is the MAXIMUM set the VM supports running byte-identically, with the
+//     skip list shrinking toward zero as V12 (import) lands. NEVER relax the byte-
+//     identical assertion or add a skip without a real, documented reason: a
+//     divergence is a real VM/compiler bug, not something to paper over.
 
 #[tokio::test]
 async fn vm_run_sync_multi_feature_programs() {
@@ -623,162 +619,265 @@ async fn vm_run_sync_multi_feature_programs() {
     }
 }
 
-/// Whole `examples/*.as` files (paths relative to the crate root) that the VM can
-/// run end-to-end TODAY. See the module note above: this list grows one VM slice
-/// at a time and is retired at V10 when the gate flips to the entire corpus.
-///
-/// V2 qualifiers: programs restricted to literals, locals (`let`/`const`/assign),
-/// block scoping, globals/bare-builtins, arithmetic/comparison/equality/range,
-/// short-circuit `&&`/`||`/`??`, array/object literals, index/member reads, and
-/// `print`. They must contain NO `fn`, control flow (`if`/`while`/`for`/`match`),
-/// `class`/`enum`, `import`, async/await, generators, `?`/`!`/recover, or
-/// destructuring/spread — those arrive in V3..V10.
-///
-/// V3 qualifiers (added now that the VM supports control flow): examples that
-/// also use `if`/`else`/`while`/`for (i in a..b)`/`for (x of …)`/ternary, but
-/// STILL contain NO `fn`, `match`, `class`/`enum`, `import`, async/await,
-/// generators, `?`/`!`/recover, destructuring/spread, OR compound assignment
-/// (`+=`/`-=`/`*=`/`/=`, deferred to V9). NOTE: `for (i in <value>)` over a NAME
-/// bound to a range/array value now qualifies — the VM routes `in` over a
-/// non-`RangeExpr` to the for-of path (matching the legacy parser's `in` overload),
-/// so a range-VALUE for-in iterates fine (V3-T4b).
-///
-/// V4 qualifiers (added now that the VM supports user functions — definitions,
-/// calls, recursion, mutual/forward refs, closures, params/rest/contracts): an
-/// example that ALSO uses `fn`/arrows/calls now qualifies, provided it STILL
-/// contains none of V7..V12: async/await, generators, `match`, `class`/`enum`,
-/// `import`, destructuring/spread, OR compound assignment (`+=`/`-=`/`*=`/`/=`,
-/// V9). The set of files that match byte-identically is established empirically
-/// (run both engines over each `examples/*.as` and keep only the ones that
-/// agree); see the audit note below each entry.
-///
-/// V6 qualifiers (added now that the VM supports the error model — `?` propagate,
-/// `!` unwrap, `recover`, panic unwinding, diagnostics parity): an example that
-/// ALSO uses `?`/`!`/`recover`/`Ok`/`Err` now qualifies, provided it STILL
-/// contains none of V7..V12 (async/await, generators, `match`, `class`/`enum`,
-/// `import`, destructuring/spread, compound assignment, member-method CALLS).
-/// Verified empirically by running both engines over every `examples/*.as` and
-/// keeping only the byte-identical agreers. Deliberately EXCLUDED, with the
-/// verified reason (from that scan):
-///   - `functions.as` — uses `+=` (line 9; V9 compound assignment).
-///   - `factorial.as` — uses `*=` (V9 compound assignment).
-///   - `data.as`      — uses `+=` (V9 compound assignment).
-///   - `typed.as`     — uses `+=` (V9) and async/await (V7).
-///   - `validation.as`— uses `import` (V12) AND destructuring `let [u, e1] = …`
-///     (V10), so the VM rejects it at compile time (it does NOT diverge): it
-///     exercises `?`/`!`/recover only via the stdlib `std/schema` it imports.
-///   - every other function-heavy example uses `import` (V12), `match` (V10),
-///     `class`/`enum` (V9), async/generators (V7/V8), destructuring/spread (V10),
-///     or compound assignment (V9) — none of which the VM compiles yet, so they
-///     ERROR (rather than diverge) and are correctly not on the list.
-const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
-    "examples/hello.as",   // `print(1 + 2 * 3)` — literals + arithmetic + print.
-    "examples/numbers.as", // numeric-literal forms bound to locals, then printed.
-    // V3 control-flow qualifier:
-    "examples/strings.as", // string literals + escapes through print.
-    // V3-T4b: range/array VALUE for-in (`for (i in r)`) routes to for-of; also uses
-    // `let` w/o initializer, typed decl, `len`, and a literal-range for-in.
-    "examples/ranges.as",
-    // V4 function qualifier: typed locals with the `T?` nullable suffix, a `fn`
-    // with optional (`string?`) params + return type, calls, and `assert`. No
-    // `import`/compound-assign/`match`/`class`/`?`-operator — byte-identical
-    // (verified by running both engines over the file).
-    "examples/optional_types.as",
-    // V6 error-model qualifiers (verified byte-identical by running both engines):
-    // `safeDivide` returns `Ok`/`Err` Result pairs, `compute` chains `?`
-    // propagation through two calls, a ternary reuses `?`, and `recover` wraps a
-    // function that out-of-bounds-indexes (a Tier-2 panic → `[nil, err]`). No
-    // `import`/`match`/`class`/destructuring/compound-assign — all V6 features.
-    "examples/result.as",
-    // `!` force-unwrap on Result pairs (success yields the value; an error pair
-    // panics, caught by `recover` which round-trips the `.message`), plus arrows,
-    // `assert`, and `Ok`/`Err`. All V6 — byte-identical on both engines.
-    "examples/force_unwrap.as",
-    // V7 async qualifier (verified byte-identical by running both engines): uses
-    // only `async fn`, an `async (n) =>` arrow, an `async x =>` bare arrow, and
-    // `await` (incl. `await 5` identity). NO `import`/`task`/`match`/`class`, so
-    // it compiles + runs end-to-end on the VM today. The async arrows correctly
-    // pick up `is_async` in `compile_fn_proto` (the parser bumps the `async`
-    // token INSIDE the `ArrowExpr` node, so it is a direct token child), so they
-    // eager-spawn a `Value::Future` exactly like `async fn`.
-    //
-    // DEFERRED to the V12 gate: the structured-concurrency examples
-    // (`concurrency.as`, `structured_concurrency.as`) use `import * as task` /
-    // `time`, and the VM compiler does NOT support `import` until V12. The
-    // underlying machinery is already sound — the VM produces ordinary
-    // `Value::Future`s (cancel-on-drop `SharedFuture`s) that the native
-    // `task.gather`/`race`/`timeout`/`spawn` ops await/select over (de-risked by
-    // the `task_gather_awaits_vm_produced_futures_in_order` /
-    // `task_race_resolves_a_vm_produced_future` unit tests in `src/vm/run.rs`).
-    // Those examples are added to this allowlist when `import` lands (V12).
-    "examples/async.as",
-    // V9-T5 assignment qualifiers (verified byte-identical by running both engines
-    // over the file). All three exercise compound assignment (`+=`/`*=`) — now
-    // supported — over the V1..V4 base (locals, arithmetic, `fn`, closures/arrows,
-    // `for`-range, `if`/`else`, `continue`, index/member reads, arrays/objects).
-    // No `import`/`match`/`class`/`enum`/spread/`?`-operator/destructuring.
-    "examples/functions.as", // recursion + `for`-range + `+=` counter + arrow.
-    "examples/factorial.as", // `*=` accumulator in a for-range + `if`/`else`.
-    "examples/data.as",      // `+=` aggregation over an array of objects.
-    // V9-T6 class/enum qualifiers (verified byte-identical by running BOTH engines
-    // over the file). Now that the VM supports classes/enums/super/methods/typed-
-    // fields/`.from`/compound+index+member assignment (V9-T1..T5), these compile +
-    // run end-to-end. They contain NO `match` (V10), destructuring/spread (V10),
-    // `import` (V12), or `.from`-with-defaults-or-nested-class (V12) — so they
-    // qualify.
-    //
-    // `typed.as`: typed `fn` params/return contracts, `for (d of dims)` + `+=`
-    // accumulation, a runtime contract breach caught by `recover` (the `.message`
-    // round-trips identically), and an `async fn` whose `future<number>` result is
-    // `await`ed. All V4/V6/V7/V9 features the VM supports.
-    "examples/typed.as",
-    // `typed_fields.as`: a `class` with required (`id: number`), optional
-    // (`nickname: string?`), and defaulted (`role: string = "guest"`) typed fields,
-    // an `init` that sets `self.id`/`self.name`, instance construction, and `assert`
-    // over the resulting fields (incl. the applied default and the `nil` optional).
-    "examples/typed_fields.as",
-    // `object_destructuring.as`: object destructuring — shorthand, `as` rename,
-    // quoted key, missing → nil — over both an object literal AND a class instance
-    // (`Point.from({...})`), reading the instance's FIELDS (V10-T1 + V9-T4).
-    "examples/object_destructuring.as",
-    // `spread.as`: spread in array/object literals + call args (V10-T2).
-    "examples/spread.as",
-    // `rest.as`: rest params + spread in literals/calls incl. a forwarding
-    // round-trip (`wrap(...args)` → `sum(...args)`) (V10-T2 + V4-T4).
-    "examples/rest.as",
-    // V10-T3/T4 adds the full `match` expression (all patterns, guards, Option-C,
-    // |-alternatives), so the two match-driven examples now qualify end-to-end.
-    "examples/pattern_matching.as", // every pattern kind + guards + Option-C + |.
-    "examples/oop.as",              // enum-variant patterns in a method's `match`.
-    // DELIBERATELY EXCLUDED (verified by the empirical scan — these ERROR at VM
-    // compile time, they do NOT diverge, so they correctly never qualify):
-    //   - `shape_validation.as` — `import` (V12) AND `.from` with a nested-class
-    //     field + an Object→`map<K,Class>` boundary coercion + field defaults (V12,
-    //     task #157). The VM rejects it at compile time.
-    //   - every stdlib-heavy example — `import` (V12).
+/// Why a file is SKIPPED by the whole-corpus opt-out gate. Every skip carries a
+/// one-line, machine-checkable reason; the gate ENFORCES that the skip is still
+/// justified (see `vm_whole_corpus_skips_are_still_justified`) so a skip cannot
+/// silently outlive its reason — when V12 lands and the VM compiles `import`, the
+/// `V12Import` skips will start FAILING the guard and must be deleted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// The example imports a stdlib module (`import * as …` / `import { … }`). The
+    /// VM compiler does not lower `import` yet (V12), so these ERROR at VM compile
+    /// time (they do NOT diverge). Deferred to the V12 gate; the guard asserts the
+    /// VM still rejects each one, so the moment `import` lands these flip to
+    /// must-run and the skip is removed.
+    V12Import,
+    /// The example is `.from`-with-defaults / nested-class-coercion dependent
+    /// (task #157) ON TOP OF importing a stdlib module. Its DISTINGUISHING V12
+    /// blocker is the `.from` divergence, so it is documented separately even
+    /// though `import` also gates it today.
+    V12FromDefaults,
+    /// A network-peer / long-running SERVER example: it calls a forever-blocking
+    /// `serve`/accept loop that needs a separate client process (and never
+    /// terminates on its own). It cannot run headless in a unit test — it hangs
+    /// EVEN the tree-walker oracle — so it is excluded the same way the CLI/
+    /// conformance suites leave the server/peer examples out of their run set.
+    LongRunningServer,
+}
+
+/// The explicit, per-file SKIP list for the whole-corpus opt-out gate. EVERY entry
+/// has a one-line reason. The list is the documented complement of "every example
+/// the VM runs byte-identically TODAY"; it shrinks toward ~zero as V12 (import +
+/// `.from` defaults) lands. Adding an entry requires a real reason — NEVER skip a
+/// file just to make the gate green.
+const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
+    // ---- V12: import (the VM compiler does not lower `import` yet) ------------
+    ("examples/cli_toolkit.as", SkipReason::V12Import),
+    ("examples/concurrency.as", SkipReason::V12Import),
+    ("examples/concurrency_toolkit.as", SkipReason::V12Import),
+    ("examples/core_types.as", SkipReason::V12Import),
+    ("examples/datetime.as", SkipReason::V12Import),
+    ("examples/generators.as", SkipReason::V12Import),
+    ("examples/generators_test.as", SkipReason::V12Import),
+    ("examples/host_info.as", SkipReason::V12Import),
+    ("examples/logging.as", SkipReason::V12Import),
+    ("examples/net.as", SkipReason::V12Import),
+    ("examples/regex.as", SkipReason::V12Import),
+    ("examples/serialization.as", SkipReason::V12Import),
+    ("examples/stdlib.as", SkipReason::V12Import),
+    ("examples/stdlib_completeness.as", SkipReason::V12Import),
+    ("examples/streams_and_testing.as", SkipReason::V12Import),
+    ("examples/structured_concurrency.as", SkipReason::V12Import),
+    ("examples/system.as", SkipReason::V12Import),
+    ("examples/tui.as", SkipReason::V12Import),
+    ("examples/typed_parse.as", SkipReason::V12Import),
+    ("examples/validation.as", SkipReason::V12Import),
+    ("examples/advanced/crypto_and_compress.as", SkipReason::V12Import),
+    ("examples/advanced/data_pipeline.as", SkipReason::V12Import),
+    ("examples/advanced/datetime_intl.as", SkipReason::V12Import),
+    ("examples/advanced/fs_toolkit.as", SkipReason::V12Import),
+    ("examples/advanced/http_client.as", SkipReason::V12Import),
+    ("examples/advanced/process_streams.as", SkipReason::V12Import),
+    ("examples/advanced/sqlite_crud.as", SkipReason::V12Import),
+    ("examples/advanced/sse_client.as", SkipReason::V12Import),
+    ("examples/advanced/stream_pipeline.as", SkipReason::V12Import),
+    ("examples/advanced/tui_dashboard.as", SkipReason::V12Import),
+    ("examples/advanced/typed_api.as", SkipReason::V12Import),
+    ("examples/advanced/typed_http.as", SkipReason::V12Import),
+    ("examples/advanced/ws_client.as", SkipReason::V12Import),
+    // ---- V12: import + `.from` defaults / nested-class coercion (task #157) ----
+    // Imports `std/schema` AND validates into a class with a nested-class field +
+    // field defaults + an Object→`map<K,Class>` boundary coercion — the exact
+    // `.from` divergence deferred to V12 (task #157). Both blockers apply; the
+    // `.from` one is its distinguishing V12 gap.
+    ("examples/shape_validation.as", SkipReason::V12FromDefaults),
+    // ---- Network-peer / long-running servers (cannot run headless) ------------
+    // Forever-serving HTTP API: blocks on `serve` awaiting a client in a separate
+    // process; it does not terminate on its own and hangs even the tree-walker.
+    (
+        "examples/advanced/http_server.as",
+        SkipReason::LongRunningServer,
+    ),
+    // Forever-running WebSocket echo server: blocks on an `accept` loop awaiting a
+    // peer; same headless-impossible / hangs-the-oracle situation.
+    (
+        "examples/advanced/ws_server.as",
+        SkipReason::LongRunningServer,
+    ),
 ];
 
-#[tokio::test]
-async fn vm_run_allowlisted_examples_match_treewalker() {
-    // For each allow-listed example, the VM's stdout+exit must be byte-identical
-    // to the tree-walker's over the SAME file contents. This is the growing-corpus
-    // gate; it is currently small because the VM lacks `fn`/control-flow (V3/V4),
-    // so the sync multi-feature snippets above carry the bulk of the V2 gate.
+/// Enumerate EVERY `examples/*.as` and `examples/advanced/*.as` file, paths
+/// relative to the crate root, sorted for deterministic ordering.
+fn all_corpus_examples() -> Vec<String> {
     let root = env!("CARGO_MANIFEST_DIR");
-    for rel in SYNC_EXAMPLE_ALLOWLIST {
-        let path = std::path::Path::new(root).join(rel);
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read allow-listed example {rel}: {e}"));
+    let mut out = Vec::new();
+    for dir in ["examples", "examples/advanced"] {
+        let p = std::path::Path::new(root).join(dir);
+        let rd = std::fs::read_dir(&p).unwrap_or_else(|e| panic!("read_dir {dir}: {e}"));
+        for entry in rd {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|x| x.to_str()) == Some("as") {
+                out.push(format!(
+                    "{dir}/{}",
+                    path.file_name().unwrap().to_string_lossy()
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn skip_reason(rel: &str) -> Option<SkipReason> {
+    EXAMPLE_SKIPS
+        .iter()
+        .find(|(p, _)| *p == rel)
+        .map(|(_, r)| *r)
+}
+
+#[tokio::test]
+async fn vm_run_whole_corpus_matches_treewalker() {
+    // THE CENTRAL VM CORRECTNESS PROOF (oracle #1). For EVERY corpus example that
+    // is not on the documented `EXAMPLE_SKIPS` list, the VM's stdout+exit must be
+    // byte-identical to the tree-walker's over the SAME file contents. A divergence
+    // here is a real VM/compiler bug — NEVER relax this assertion or skip a file to
+    // make it pass.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut ran = 0usize;
+    let mut skipped = 0usize;
+    for rel in all_corpus_examples() {
+        if skip_reason(&rel).is_some() {
+            skipped += 1;
+            continue;
+        }
+        let path = std::path::Path::new(root).join(&rel);
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read example {rel}: {e}"));
         let tw = ascript::run_source_exit(&src)
             .await
-            .unwrap_or_else(|e| panic!("tree-walker failed on {rel}: {e:?}"));
+            .unwrap_or_else(|e| panic!("tree-walker failed on non-skipped {rel}: {e:?}"));
         let vm = ascript::vm_run_source(&src)
             .await
-            .unwrap_or_else(|e| panic!("VM failed on {rel}: {e:?}"));
+            .unwrap_or_else(|e| panic!("VM failed on non-skipped {rel}: {e:?}"));
         assert_eq!(
             tw, vm,
-            "VM diverged from tree-walker for allow-listed example `{rel}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+            "VM diverged from tree-walker for example `{rel}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
         );
+        ran += 1;
+    }
+    // Sanity: the gate must actually exercise the bulk of the corpus, and the
+    // arithmetic must add up (no file silently missing from either set).
+    assert_eq!(
+        ran + skipped,
+        all_corpus_examples().len(),
+        "every corpus example must be either run or skipped"
+    );
+    assert!(
+        ran >= 18,
+        "expected the VM to run >=18 examples byte-identically, ran {ran}"
+    );
+    eprintln!("whole-corpus gate: {ran} examples byte-identical, {skipped} skipped");
+}
+
+#[tokio::test]
+async fn vm_whole_corpus_skips_are_still_justified() {
+    // Guard that keeps the skip list HONEST so it can only shrink, never rot:
+    //  - V12Import / V12FromDefaults: the VM must STILL reject the file at compile
+    //    time (it errors, it does NOT silently diverge). When `import` (V12) lands
+    //    these will start COMPILING and this guard fails — forcing the entry to be
+    //    deleted and the file moved into the must-run set.
+    //  - LongRunningServer: documented-only (it would hang the oracle), so it is
+    //    not executed; we only assert the file exists so a rename is caught.
+    //  - Every skip entry must name a real corpus file (no stale paths).
+    let root = env!("CARGO_MANIFEST_DIR");
+    let corpus = all_corpus_examples();
+    for (rel, reason) in EXAMPLE_SKIPS {
+        assert!(
+            corpus.iter().any(|c| c == rel),
+            "skip-list entry `{rel}` is not a real corpus example (stale path?)"
+        );
+        let src = std::fs::read_to_string(std::path::Path::new(root).join(rel))
+            .unwrap_or_else(|e| panic!("read skipped example {rel}: {e}"));
+        match reason {
+            SkipReason::V12Import | SkipReason::V12FromDefaults => {
+                // The VM must still FAIL to run this (compile-time reject), proving
+                // the skip is load-bearing. The tree-walker runs it fine.
+                let vm = ascript::vm_run_source(&src).await;
+                assert!(
+                    vm.is_err(),
+                    "skipped `{rel}` now RUNS on the VM — its V12 skip is stale; \
+                     delete the EXAMPLE_SKIPS entry and let the whole-corpus gate run it"
+                );
+            }
+            SkipReason::LongRunningServer => {
+                // Documented-only; not executed (would block on a peer). Existence
+                // is already asserted above.
+            }
+        }
+    }
+}
+
+// ----- V10-T5: test-suite differential (a spread of import-free constructs) ----
+//
+// The whole-corpus gate above is the CORE of the V10 differential, but most of the
+// corpus is currently `import`-gated (V12). This suite adds breadth at the level
+// the VM fully supports: a representative spread of LANGUAGE constructs in one
+// self-contained `.as` program each (no `import`), run VM-vs-tree-walker
+// byte-identically. It complements the corpus gate (whole programs) and the
+// snippet tests (single features) with realistic combinations of the language-
+// complete feature set: closures, recursion, error model, async, generators,
+// classes/enums/super/`.from`, destructuring/spread, and `match`.
+
+#[tokio::test]
+async fn vm_test_suite_differential_constructs() {
+    let programs = [
+        // (1) recursion + closures + higher-order functions.
+        "fn make_adder(n) { return (x) => x + n }\n\
+         let add10 = make_adder(10)\n\
+         fn fib(n) { if (n < 2) { return n } return fib(n - 1) + fib(n - 2) }\n\
+         print(add10(5))\nprint(fib(10))",
+        // (2) error model: `?` propagation + `!` unwrap + recover.
+        "fn parse(ok) { if (ok) { return Ok(42) } return Err(\"bad\") }\n\
+         fn use_it(ok) { let v = parse(ok)?\n return v + 1 }\n\
+         print(use_it(true))\n\
+         let r = recover(() => parse(false)!)\n\
+         print(r[1].message)",
+        // (3) async/await: a chain of awaited async fns.
+        "async fn double(n) { return n * 2 }\n\
+         async fn run() { let a = await double(5)\n let b = await double(a)\n return b }\n\
+         async fn main() { print(await run()) }\n\
+         await main()",
+        // (4) generators: `fn*` + `for await` consumption + `.next()`.
+        "fn* counter(n) { let i = 0\n while (i < n) { yield i * i\n i = i + 1 } }\n\
+         let total = 0\n for await (v in counter(4)) { total = total + v }\n print(total)\n\
+         let g = counter(2)\n print(g.next())\n print(g.next())\n print(g.next())",
+        // (5) classes + inheritance + super + method dispatch.
+        "class Animal {\n  name: string\n  fn init(n) { self.name = n }\n  fn speak() { return `${self.name} makes a sound` }\n}\n\
+         class Dog extends Animal {\n  fn speak() { return `${super.speak()} (woof)` }\n}\n\
+         let d = Dog(\"Rex\")\n print(d.speak())\n print(d.name)",
+        // (6) enums + match with variant patterns, plus a guard on a bound ident.
+        "enum Shape { Circle, Square, Other }\n\
+         fn classify(s) { return match s {\n  Shape.Circle => \"circle\",\n  Shape.Square => \"square\",\n  _ => \"other\"\n } }\n\
+         fn bucket(n) { return match n {\n  x if x < 0 => \"neg\",\n  0 => \"zero\",\n  _ => \"pos\"\n } }\n\
+         print(classify(Shape.Circle))\n print(classify(Shape.Other))\n print(bucket(-3))\n print(bucket(0))\n print(bucket(9))",
+        // (7) destructuring (array + object + rest) + spread (literals + calls).
+        "let [a, b, ...rest] = [1, 2, 3, 4, 5]\n\
+         let {x, y as why} = {x: 10, y: 20}\n\
+         let merged = [...rest, a, b]\n\
+         fn sum(...ns) { let t = 0\n for (n of ns) { t = t + n } return t }\n\
+         print(a + b)\n print(x + why)\n print(merged)\n print(sum(...merged))",
+        // (8) `.from` typed-parse on a simple class + field reads.
+        "class Point {\n  x: number\n  y: number\n}\n\
+         let p = Point.from({x: 3, y: 4})\n print(p.x * p.x + p.y * p.y)",
+        // (9) match on array/object patterns with binding + nesting.
+        "fn head(xs) { return match xs {\n  [] => \"empty\",\n  [only] => `one:${only}`,\n  [first, ...tail] => `first:${first} rest:${len(tail)}`\n } }\n\
+         print(head([]))\n print(head([7]))\n print(head([1, 2, 3]))",
+        // (10) ternary + short-circuit + compound assignment in a loop.
+        "let acc = 0\n for (i in 0..6) { acc += i % 2 == 0 ? i : 0 }\n\
+         let flag = acc > 0 && acc < 100\n print(acc)\n print(flag)",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
     }
 }
 
