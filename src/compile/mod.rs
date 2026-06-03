@@ -11,7 +11,7 @@
 use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_template_body};
 use crate::span::Span;
 use crate::syntax::ast::{
-    ArrayExpr, ArrowExpr, AssignExpr, AstNode, BinaryExpr, Block, BreakStmt, CallExpr,
+    ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
     ContinueStmt, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef,
     ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, Stmt, TemplateExpr,
     TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt,
@@ -467,6 +467,7 @@ impl Compiler {
             Expr::TryExpr(t) => self.compile_try(t),
             Expr::UnwrapExpr(u) => self.compile_unwrap(u),
             Expr::ArrowExpr(arrow) => self.compile_arrow(arrow),
+            Expr::AwaitExpr(a) => self.compile_await(a),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
                 node_span(other),
@@ -1928,6 +1929,21 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("! operator missing operand", span))?;
         self.compile_expr(&inner)?;
         self.chunk.emit(Op::Unwrap, span);
+        Ok(())
+    }
+
+    /// Lower `await expr`: compile the inner expression, then emit `AWAIT`. The op
+    /// drives a `Value::Future` to completion (re-surfacing any panic/propagation
+    /// raised in the spawned task at THIS site) and is identity on a non-future —
+    /// byte-identical to the tree-walker's `ExprKind::Await`. The op's span is the
+    /// `AwaitExpr`'s trivia-trimmed code span.
+    fn compile_await(&mut self, a: &AwaitExpr) -> Result<(), CompileError> {
+        let span = node_code_span(a);
+        let inner = a
+            .expr()
+            .ok_or_else(|| CompileError::new("await missing operand", span))?;
+        self.compile_expr(&inner)?;
+        self.chunk.emit(Op::Await, span);
         Ok(())
     }
 

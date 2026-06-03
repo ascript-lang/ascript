@@ -2127,3 +2127,109 @@ async fn vm_run_error_model_uncaught_panic_programs() {
         assert_vm_run_error_matches_treewalker(src).await;
     }
 }
+
+// ---- async / await (V7: eager-spawn + AWAIT, model 2a) -------------------------
+//
+// The risk-concentration slice. Each program drives a top-level `await` (the
+// tree-walker runs top-level `await` directly — see `examples/async.as`); the VM
+// driver (`vm_run_source`) drains the LocalSet the SAME way as `run_source`
+// (`local.run_until(...).await; local.await;`), so an `async fn`'s eagerly-spawned
+// task completes and its output is captured identically. Single-threaded LocalSet
+// ⇒ deterministic ordering ⇒ byte-identical stdout on both engines.
+
+#[tokio::test]
+async fn vm_async_await_basic_matches_treewalker() {
+    let programs = [
+        // Simplest: call an async fn, await its result, print it.
+        "async fn work() { return 1 }\nprint(await work())",
+        // Await stored in a let, then printed.
+        "async fn work() { return 42 }\nlet r = await work()\nprint(r)",
+        // Async fn returning a string.
+        "async fn greet() { return \"hi\" }\nprint(await greet())",
+        // Async fn that takes an arg and uses it.
+        "async fn dbl(n) { return n * 2 }\nprint(await dbl(21))",
+        // Async arrow (expression body) — also is_async.
+        "let g = async (n) => n + 1\nprint(await g(9))",
+        // Async arrow, paren-less single param.
+        "let h = async x => x - 1\nprint(await h(8))",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_await_non_future_is_identity_matches_treewalker() {
+    // `await` on a non-future is identity (back-compat: `await 5 == 5`), on both
+    // engines.
+    for src in [
+        "print(await 5)",
+        "print(await \"x\")",
+        "print(await (1 + 2))",
+        "print(await true)",
+        "let x = await nil\nprint(type(x))",
+    ] {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_await_in_arithmetic_and_multiple_matches_treewalker() {
+    let programs = [
+        // Await inside arithmetic, parenthesized.
+        "async fn two() { return 2 }\nprint((await two()) + 10)",
+        // Multiple awaits of the SAME async fn (two distinct spawned tasks).
+        "async fn one() { return 1 }\nprint((await one()) + (await one()))",
+        // Await feeding another async call's argument.
+        "async fn inc(n) { return n + 1 }\nprint(await inc(await inc(0)))",
+        // A sequence of async calls preserving deterministic ordering: each prints
+        // as it is awaited, so stdout order is fixed and identical on both engines.
+        "async fn step(label, n) { print(label)\n return n }\n\
+         let a = await step(\"a\", 1)\n\
+         let b = await step(\"b\", 2)\n\
+         print(a + b)",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_async_panic_resurfaces_at_await_matches_treewalker() {
+    // A panic raised in an `async fn` body crosses the spawned-task boundary and
+    // RE-EMERGES at the awaiting site with the IDENTICAL message + span on both
+    // engines (`!` on a failure pair is a recoverable Tier-2 panic; uncaught here,
+    // it escapes to the driver).
+    let panic_cases = [
+        // `!` on an error pair inside an async fn, awaited and uncaught.
+        "async fn boom() { return [nil, \"e\"]! }\nprint(await boom())",
+        // `!` on a NON-pair value inside an async fn.
+        "async fn bad() { return 7! }\nprint(await bad())",
+        // Error-object pair: the panic carries `error_message` (the `.message`).
+        "async fn v() { return [nil, {message: \"invalid\"}]! }\nprint(await v())",
+    ];
+    for src in panic_cases {
+        assert_vm_run_error_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_async_contract_violation_surfaces_lazily_at_await() {
+    // Async arity/contract errors surface LAZILY: the spawned task runs the
+    // arity/contract check (`check_call_args`) when it is driven, the error resolves
+    // into the SharedFuture, and it re-emerges at the `await` site — byte-identical
+    // message + span on both engines.
+    let lazy_cases = [
+        // Param type contract violated (string passed to `n: number`), awaited.
+        "async fn f(n: number) { return n }\nprint(await f(\"x\"))",
+        // Too few args to an async fn, awaited.
+        "async fn g(a, b) { return a + b }\nprint(await g(1))",
+        // Too many args to an async fn, awaited.
+        "async fn h(a) { return a }\nprint(await h(1, 2))",
+        // Return-type contract violated in an async fn, awaited.
+        "async fn r(): number { return \"nope\" }\nprint(await r())",
+    ];
+    for src in lazy_cases {
+        assert_vm_run_error_matches_treewalker(src).await;
+    }
+}

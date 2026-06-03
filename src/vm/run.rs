@@ -49,9 +49,8 @@ impl Vm {
         vm
     }
 
-    /// Recover an owned `Rc<Vm>` from `&self`.
-    // used by V7 (spawn): no caller yet in V1.
-    #[allow(dead_code)]
+    /// Recover an owned `Rc<Vm>` from `&self`. Used by the async-fn eager-spawn in
+    /// the `Op::Call` arm (V7) to hand an owned VM into the `'static` spawned task.
     pub fn rc(&self) -> Rc<Vm> {
         self.self_weak
             .borrow()
@@ -193,6 +192,52 @@ impl Vm {
                     // frame's first local slots (the CALL convention).
                     let callee_idx = fiber.stack.len() - argc - 1;
                     match fiber.stack[callee_idx].clone() {
+                        // An `async fn` closure is NOT run inline: it is scheduled
+                        // eagerly (M17 model 2a), exactly like the tree-walker's
+                        // `is_async` branch of `call_function`. We build a body future
+                        // that re-enters the VM via `Vm::call_value` (which sets up a
+                        // fresh one-frame fiber, binds args via `check_call_args`, and
+                        // runs to Done), `spawn_local` it onto the current-thread
+                        // LocalSet, and hand back a `Value::Future` IMMEDIATELY; the
+                        // caller `await`s it later. Because `call_value` runs the arity
+                        // /contract check INSIDE the spawned task, an async arity or
+                        // contract violation surfaces LAZILY — it resolves into the
+                        // SharedFuture and re-emerges at the `await` site — byte-
+                        // identical to the tree-walker. AWAIT DISCIPLINE: the closure
+                        // and its args move into the `'static` spawned task; `vm` is an
+                        // owned `Rc<Vm>`; no `fiber` RefCell borrow is held across the
+                        // spawn/await below.
+                        Value::Closure(callee) if callee.proto.is_async => {
+                            let call_span =
+                                fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            // Pop the `argc` args into an owned vec (top of stack is
+                            // the LAST arg), then drop the callee value beneath them.
+                            let mut args = vec![Value::Nil; argc];
+                            for slot in args.iter_mut().rev() {
+                                *slot = fiber.pop();
+                            }
+                            fiber.pop(); // the callee value at callee_idx
+                            // Reuse the shared M17 dance (mirrors `call_function`'s
+                            // async branch and `BoundMethod`'s): an owned `Rc<Vm>`
+                            // (Vm self-weak, installed at `Vm::new`) drives the body;
+                            // the task resolves the CELL (never a `SharedFuture` clone)
+                            // so cancel-on-drop works; the inflight guard provides
+                            // backpressure (reused from the shared interp).
+                            let vm = self.rc();
+                            let fut = crate::task::SharedFuture::new();
+                            let cell = fut.cell();
+                            let guard = self.interp.inflight_guard();
+                            let handle = tokio::task::spawn_local(async move {
+                                let _g = guard;
+                                let r = vm
+                                    .call_value(Value::Closure(callee), args, call_span)
+                                    .await;
+                                cell.resolve(r);
+                            });
+                            fut.set_abort(handle.abort_handle());
+                            self.interp.maybe_yield_for_inflight().await;
+                            fiber.push(Value::Future(fut));
+                        }
                         Value::Closure(callee) => {
                             // The call-site span anchors arity/contract/return
                             // panics exactly where the tree-walker's do.
@@ -653,7 +698,27 @@ impl Vm {
                     }
                 }
 
-                // V2–V10 fill these in; the V1 smoke only exercises the subset above.
+                Op::Await => {
+                    // `await expr`. Mirrors the tree-walker's `ExprKind::Await`
+                    // EXACTLY: if the operand is a `Value::Future`, drive it to
+                    // completion (`f.get().await`) — a panic/propagation raised in
+                    // the spawned task re-surfaces HERE (cross-task propagation),
+                    // byte-identical to the tree-walker; otherwise `await` on a
+                    // non-future is identity (`await 5 == 5`). Pop the operand into
+                    // an owned local BEFORE the await so no `fiber` RefCell borrow is
+                    // held across the suspension point (`await_holding_refcell_ref`
+                    // stays clean).
+                    let v = fiber.pop();
+                    match v {
+                        Value::Future(f) => {
+                            let r = f.get().await?;
+                            fiber.push(r);
+                        }
+                        other => fiber.push(other),
+                    }
+                }
+
+                // V8–V10 fill these in; the V7 slice covers the async subset above.
                 other => {
                     return Err(self.panic_at(
                         fiber,
@@ -1243,13 +1308,14 @@ mod tests {
 
     #[test]
     fn unimplemented_op_panics() {
-        // `AWAIT` is not implemented until a later VM slice; an unimplemented op
-        // must surface a span-carrying "not yet implemented" Tier-2 panic.
-        // (JUMP/JUMP_IF_*/JUMP_IF_NOT_NIL are now implemented as of V2-T6.)
+        // `YIELD` is not implemented until a later VM slice (generators); an
+        // unimplemented op must surface a span-carrying "not yet implemented"
+        // Tier-2 panic. (JUMP/JUMP_IF_* are implemented as of V2-T6; AWAIT as of
+        // V7.)
         let mut c = Chunk::new();
-        let await_span = Span::new(2, 4);
+        let yield_span = Span::new(2, 4);
         c.emit(Op::Nil, s());
-        c.emit(Op::Await, await_span);
+        c.emit(Op::Yield, yield_span);
         c.emit(Op::Return, s());
         match run_chunk(c) {
             Err(Control::Panic(e)) => {
@@ -1258,10 +1324,24 @@ mod tests {
                     "message was: {}",
                     e.message
                 );
-                assert_eq!(e.span, Some(await_span));
+                assert_eq!(e.span, Some(yield_span));
             }
             other => panic!("expected Panic, got {other:?}"),
         }
+    }
+
+    // ---- await exec arm (V7) ---------------------------------------------
+
+    #[test]
+    fn await_non_future_is_identity() {
+        // `await 5` is identity on a non-future, exactly like the tree-walker's
+        // `ExprKind::Await` (`other => Ok(other)`).
+        let mut c = Chunk::new();
+        let k = c.add_const(Value::Number(5.0));
+        c.emit_u16(Op::Const, k, s());
+        c.emit(Op::Await, s());
+        c.emit(Op::Return, s());
+        assert_eq!(expect_number(c), 5.0);
     }
 
     // ---- jump exec arms (V2-T6) -------------------------------------------
