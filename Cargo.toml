@@ -31,7 +31,7 @@ regex = { version = "1.12.3", optional = true }
 base64 = { version = "0.22", optional = true }
 hex = { version = "0.4", optional = true }
 csv = { version = "1", optional = true }
-# NOT feature-gated: the CLI's `ascript.toml [lint]` parser (in `src/cli/`) needs
+# NOT feature-gated: the CLI's `ascript.toml [lint]` parser (in `src/lint_config_toml.rs`) needs
 # `toml` unconditionally so `--no-default-features` still builds the config layer.
 # `src/check/` stays toml-free and feature-independent.
 toml = "0.8"
