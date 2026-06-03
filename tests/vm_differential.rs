@@ -4780,3 +4780,60 @@ async fn three_way_smoke_basic_constructs() {
         assert_three_way_matches(src).await;
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  V12-T3: bytecode verifier — every chunk the compiler emits must VERIFY OK.
+//
+//  The verifier (`ascript::vm::verify`) is the load-time guard for `.aso`: it walks
+//  the code stream and proves decode integrity, operand ranges, jump-target landing,
+//  and stack-depth balance. The compiler emits valid bytecode by construction, so
+//  the verifier MUST accept the chunk for every corpus example that compiles — both
+//  the freshly-compiled chunk and the one round-tripped through `.aso`. A regression
+//  in either the compiler or the verifier trips this gate.
+// ─────────────────────────────────────────────────────────────────────────────
+/// Whether a chunk (and every nested proto) has a literals-only const pool, so the
+/// V12-T2 `.aso` writer can serialize it without panicking. Object-rest stores an
+/// `Array`-of-keys const, which is not yet serializable — those chunks are still
+/// verified in-memory but skip the round-trip step.
+fn chunk_is_serializable(chunk: &ascript::vm::chunk::Chunk) -> bool {
+    if chunk.check_consts_literal_only().is_err() {
+        return false;
+    }
+    chunk.protos.iter().all(|p| chunk_is_serializable(&p.chunk))
+}
+
+#[test]
+fn verifier_accepts_all_compiled_corpus_chunks() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut verified = 0usize;
+    for rel in all_corpus_examples() {
+        let path = std::path::Path::new(root).join(&rel);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        // Only chunks the compiler actually produces are in scope; an example the VM
+        // compiler cannot yet compile (a documented gap) is skipped here — it has no
+        // chunk to verify.
+        let chunk = match ascript::compile::compile_source(&src) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // 1) the freshly-compiled chunk verifies.
+        ascript::vm::verify::verify(&chunk)
+            .unwrap_or_else(|e| panic!("verifier rejected compiled `{rel}`: {e}"));
+        // 2) IF the chunk is `.aso`-serializable (its const pool — including every
+        //    nested proto — is literals-only; object-rest stores an Array-of-keys
+        //    const that the V12-T2 writer does not yet serialize, a separate
+        //    documented gap), it must survive an `.aso` round-trip AND re-verify on
+        //    load.
+        if chunk_is_serializable(&chunk) {
+            let bytes = chunk.to_bytes();
+            ascript::vm::chunk::Chunk::from_bytes_verified(&bytes)
+                .unwrap_or_else(|e| panic!("from_bytes_verified rejected `{rel}`: {e}"));
+        }
+        verified += 1;
+    }
+    assert!(
+        verified >= 20,
+        "expected the verifier corpus gate to cover >=20 examples, covered {verified}"
+    );
+    eprintln!("verifier corpus gate: {verified} compiled chunks verify OK (fresh + .aso round-trip)");
+}

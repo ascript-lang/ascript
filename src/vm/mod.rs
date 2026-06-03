@@ -14,6 +14,7 @@ pub mod opcode;
 pub mod run;
 pub mod shape;
 pub mod value_ext;
+pub mod verify;
 
 pub use chunk::{Chunk, FnProto};
 pub use disasm::{disasm, disasm_at};
