@@ -299,6 +299,145 @@ fn repl_buffers_multiline_class() {
     assert!(stdout.contains('7'), "expected 7; stdout: {stdout}");
 }
 
+/// Feed `input` to `ascript repl` (optionally with `--tree-walker`) over piped
+/// stdin and return `(stdout, stderr)`. Used by the WS2 VM-REPL tests below.
+fn run_repl_session(input: &str, tree_walker: bool) -> (String, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let mut cmd = Command::new(bin);
+    cmd.arg("repl");
+    if tree_walker {
+        cmd.arg("--tree-walker");
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn repl_vm_persists_bindings_across_lines() {
+    let (out, _) = run_repl_session("let x = 1\nx + 1\n", false);
+    assert!(out.contains('2'), "expected 2; stdout: {out}");
+}
+
+#[test]
+fn repl_vm_persists_fn_and_class_across_lines() {
+    let (out, _) = run_repl_session("fn sq(n) { return n * n }\nsq(5)\n", false);
+    assert!(out.contains("25"), "fn persistence; stdout: {out}");
+
+    let (out2, _) = run_repl_session(
+        "class P {\n  x: number\n  y: number\n}\nlet p = P.from({x: 3, y: 4})\np.x + p.y\n",
+        false,
+    );
+    assert!(out2.contains('7'), "class persistence; stdout: {out2}");
+}
+
+#[test]
+fn repl_vm_trailing_expr_prints_value_statements_print_nothing() {
+    // A bare trailing expression prints its value.
+    let (out, _) = run_repl_session("3 + 4\n", false);
+    assert_eq!(out.trim(), "7", "trailing expr; stdout: {out:?}");
+
+    // A `let` statement prints nothing.
+    let (out2, _) = run_repl_session("let z = 9\n", false);
+    assert_eq!(out2.trim(), "", "statement prints nothing; stdout: {out2:?}");
+
+    // A trailing `nil` expression prints nothing.
+    let (out3, _) = run_repl_session("nil\n", false);
+    assert_eq!(out3.trim(), "", "nil prints nothing; stdout: {out3:?}");
+}
+
+#[test]
+fn repl_vm_redefinition_across_lines_errors_matching_reference() {
+    // The tree-walker REPL rejects a re-`let` of the same name (already defined);
+    // the VM REPL must match: report the error AND keep the first binding.
+    let (out, err) = run_repl_session("let x = 1\nlet x = 2\nx\n", false);
+    let combined = format!("{out}{err}");
+    assert!(
+        combined.contains("already defined"),
+        "expected 'already defined'; out={out:?} err={err:?}"
+    );
+    // The first binding survives the failed redefinition.
+    assert!(out.contains('1'), "first binding survives; stdout: {out:?}");
+}
+
+#[test]
+fn repl_vm_panic_recovers_and_keeps_prior_bindings() {
+    // A bad line (undefined var) reports an error but the loop continues with the
+    // prior bindings intact.
+    let (out, err) = run_repl_session("let a = 10\nb\na + 1\n", false);
+    let combined = format!("{out}{err}");
+    assert!(
+        combined.contains("undefined variable 'b'"),
+        "expected the panic diagnostic; out={out:?} err={err:?}"
+    );
+    assert!(
+        out.contains("11"),
+        "prior binding survives the panic; stdout: {out:?}"
+    );
+}
+
+#[test]
+fn repl_vm_exit_ends_the_session() {
+    // `exit()` ends the REPL: the line after it is never evaluated.
+    let (out, _) = run_repl_session("let z = 1\nexit()\nz + 100\n", false);
+    assert!(
+        !out.contains("101"),
+        "exit() must end the session before the next line; stdout: {out:?}"
+    );
+}
+
+#[test]
+fn repl_vm_builtins_and_print_work() {
+    let (out, _) = run_repl_session("print(1 + 2)\n", false);
+    assert!(out.contains('3'), "print works; stdout: {out:?}");
+
+    // A bare builtin reference is first-class (yields the builtin value).
+    let (out2, _) = run_repl_session("let p = print\np(\"hi\")\n", false);
+    assert!(out2.contains("hi"), "first-class builtin; stdout: {out2:?}");
+}
+
+#[test]
+fn repl_vm_buffers_multiline_input() {
+    // Multi-line buffering (unclosed delimiters) still works on the VM REPL.
+    let input = "fn add(a, b) {\n  return a + b\n}\nadd(2, 3)\n";
+    let (out, _) = run_repl_session(input, false);
+    assert!(out.contains('5'), "multiline buffering; stdout: {out:?}");
+}
+
+#[test]
+fn repl_tree_walker_flag_still_works() {
+    let (out, _) = run_repl_session("let x = 21\nx * 2\n", true);
+    assert!(out.contains("42"), "legacy REPL; stdout: {out:?}");
+}
+
+#[test]
+fn repl_vm_matches_tree_walker_on_a_shared_session() {
+    // A session valid in both engines must produce identical stdout.
+    let session = "let x = 1\nx + 1\nfn sq(n) { return n * n }\nsq(5)\nlet y = x + sq(3)\ny\nexit()\n";
+    let (vm_out, _) = run_repl_session(session, false);
+    let (tw_out, _) = run_repl_session(session, true);
+    assert_eq!(
+        vm_out, tw_out,
+        "VM-REPL and tree-walker-REPL must agree on stdout"
+    );
+}
+
 #[test]
 fn fmt_subcommand_rewrites_in_place_and_is_idempotent() {
     let file = std::env::temp_dir().join(format!("ascript_fmt_{}.as", std::process::id()));

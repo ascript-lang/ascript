@@ -34,7 +34,14 @@ enum Command {
         out: Option<String>,
     },
     /// Start the interactive REPL
-    Repl,
+    Repl {
+        /// Run the REPL on the legacy tree-walker engine instead of the bytecode
+        /// VM (the differential oracle / debugging escape hatch). Equivalent to
+        /// `ASCRIPT_ENGINE=tree-walker`; the flag takes precedence over the env
+        /// var. Default → the bytecode VM (the production path post-cutover).
+        #[arg(long = "tree-walker")]
+        tree_walker: bool,
+    },
     /// Format .as source files
     Fmt { files: Vec<String> },
     /// Statically check .as files (syntax + lints)
@@ -117,13 +124,25 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Command::Repl => match ascript::repl::run_repl().await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("repl error: {}", e);
-                ExitCode::from(1)
+        Command::Repl { tree_walker } => {
+            // Default → the bytecode VM REPL (production path). The legacy
+            // tree-walker REPL stays reachable via `--tree-walker` OR
+            // `ASCRIPT_ENGINE=tree-walker` (flag takes precedence).
+            let use_tree_walker = tree_walker
+                || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
+            let result = if use_tree_walker {
+                ascript::repl::run_repl_tree_walker().await
+            } else {
+                ascript::repl::run_repl_vm().await
+            };
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("repl error: {}", e);
+                    ExitCode::from(1)
+                }
             }
-        },
+        }
         Command::Fmt { files } => {
             let mut code = ExitCode::SUCCESS;
             for file in &files {
