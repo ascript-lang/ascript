@@ -15,7 +15,46 @@ use crate::vm::ic::{InlineCache, MethodCache};
 use crate::vm::opcode::Op;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
+
+/// A trivial pass-through [`Hasher`] for the offset-keyed VM side maps
+/// (`field_ics`/`method_ics`/`arith_caches`/`global_caches`).
+///
+/// V11-T6 PERF: those maps are consulted on EVERY `GET_PROP`/`SET_PROP`/
+/// `CALL_METHOD`/arithmetic/`GET_GLOBAL` op, keyed by the op's bytecode OFFSET — a
+/// dense, distinct, already-well-distributed `usize`. The default `HashMap` hashes
+/// it with SipHash, which costs more than the `f64` add behind a specialized
+/// arithmetic site, leaving a few-percent overhead on tight monomorphic numeric
+/// loops vs the kill-switch-off (generic) path. Hashing the offset to ITSELF
+/// removes that overhead while keeping the byte-identical offset-keyed side-map
+/// design (no bytecode change, no new dependency). Single-key inserts/lookups, so
+/// collisions are impossible (each offset is unique within one chunk).
+#[derive(Default)]
+pub struct OffsetHasher(u64);
+
+impl Hasher for OffsetHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // The maps are only ever keyed by `usize` (a bytecode offset), whose
+        // `Hash` impl issues one `write_usize`. This byte path is never taken in
+        // practice; fold defensively so a stray key still hashes deterministically.
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = i as u64;
+    }
+}
+
+/// A `HashMap<usize, V>` keyed by bytecode offset, hashed by [`OffsetHasher`].
+type OffsetMap<V> = HashMap<usize, V, BuildHasherDefault<OffsetHasher>>;
 
 /// A compiled class definition referenced by an `Op::Class` operand.
 ///
@@ -96,21 +135,21 @@ pub struct Chunk {
     /// bytecode offset within `code`. Lazily populated; a missing entry is `Cold`.
     /// `RefCell` because the run loop mutates a cache through a `&self` chunk
     /// borrow (the VM runs on `&self`); never shared across threads (`!Send`).
-    pub field_ics: RefCell<HashMap<usize, InlineCache>>,
+    pub field_ics: RefCell<OffsetMap<InlineCache>>,
     /// Method-dispatch inline caches (`CALL_METHOD`), keyed by the op's bytecode
     /// offset. Lazily populated; a missing entry is `Cold`.
-    pub method_ics: RefCell<HashMap<usize, MethodCache>>,
+    pub method_ics: RefCell<OffsetMap<MethodCache>>,
     /// PEP-659 adaptive arithmetic state (`ADD`/`SUB`/`MUL`/…), keyed by the op's
     /// bytecode offset (V11-T4). A site warms up then specializes to a guarded
     /// `ADD_NUMBER`/`ADD_DECIMAL`/`CONCAT_STR`-style fast path; a guard miss
     /// deopts. Lazily populated; a missing entry is the default (generic, warmup
     /// 0). Same offset-keyed side-map pattern as the inline caches → bytecode and
     /// disassembly stay byte-identical.
-    pub arith_caches: RefCell<HashMap<usize, ArithCache>>,
+    pub arith_caches: RefCell<OffsetMap<ArithCache>>,
     /// PEP-659 adaptive global-resolution cache (`GET_GLOBAL`), keyed by the op's
     /// bytecode offset (V11-T4). Caches the resolved builtin value guarded by the
     /// global-table version. Lazily populated; a missing entry is `Cold`.
-    pub global_caches: RefCell<HashMap<usize, GlobalCache>>,
+    pub global_caches: RefCell<OffsetMap<GlobalCache>>,
     /// Optional name (function name / `<script>`), for the disassembler & traces.
     pub name: Option<String>,
 }

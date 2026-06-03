@@ -576,10 +576,74 @@ impl Vm {
                         // `vm_read_member → BoundMethod → call_value → bound_method_is_vm
                         // → invoke_compiled_method` path (same closure, same
                         // defining class).
-                        let v = self
-                            .invoke_compiled_method(closure, recv, args, span, Some(def_class))
-                            .await?;
-                        fiber.push(v);
+                        //
+                        // V11-T6 TUNING: for a plain (non-async, non-generator)
+                        // method, push a frame onto THIS fiber and continue the run
+                        // loop in place — exactly like the `Op::Call` VM-closure arm.
+                        // This avoids both the fresh `Fiber` allocation AND the
+                        // recursive `self.run(&mut fiber).await` that
+                        // `invoke_compiled_method` incurs, which is what kept the
+                        // method-dispatch benchmark below the 2× gate. The result is
+                        // byte-identical: same arity/contract check (`check_call_args`),
+                        // same slot binding (self→0, args→1..), same `def_class` for
+                        // `super`, same return-contract check at `Op::Return`. Async /
+                        // generator methods still take the `invoke_compiled_method`
+                        // path (they cannot run in-frame).
+                        if !closure.proto.is_async && !closure.proto.is_generator {
+                            // Arity + per-param contracts + rest, shared verbatim.
+                            let what =
+                                closure.proto.chunk.name.as_deref().unwrap_or("method");
+                            let bound = crate::interp::check_call_args(
+                                &closure.proto.params,
+                                args,
+                                span,
+                                what,
+                            )?;
+                            // New frame window at the top of the current stack.
+                            let slot_base = fiber.stack.len();
+                            let slot_count = closure.proto.chunk.slot_count as usize;
+                            let cells = super::fiber::alloc_cells(
+                                slot_count,
+                                &closure.proto.chunk.cell_slots,
+                            );
+                            fiber.stack.resize(slot_base + slot_count, Value::Nil);
+                            // self -> slot 0 (cell-aware).
+                            if let Some(cell) = &cells[0] {
+                                *cell.borrow_mut() = recv;
+                            } else {
+                                fiber.stack[slot_base] = recv;
+                            }
+                            // bound args -> slots 1..n+1 (cell-aware).
+                            for (i, v) in bound.into_iter().enumerate() {
+                                let slot = i + 1;
+                                if let Some(cell) = &cells[slot] {
+                                    *cell.borrow_mut() = v;
+                                } else {
+                                    fiber.stack[slot_base + slot] = v;
+                                }
+                            }
+                            fiber.frames.push(super::fiber::CallFrame {
+                                closure,
+                                ip: 0,
+                                slot_base,
+                                cells,
+                                ret_span: span,
+                                def_class: Some(def_class),
+                            });
+                            // Continue the loop in the new frame; RETURN pops it and
+                            // pushes the result onto the caller's stack.
+                        } else {
+                            let v = self
+                                .invoke_compiled_method(
+                                    closure,
+                                    recv,
+                                    args,
+                                    span,
+                                    Some(def_class),
+                                )
+                                .await?;
+                            fiber.push(v);
+                        }
                     } else {
                         // Fallback: read the member, then call it. `vm_read_member`
                         // yields a VM `BoundMethod` for an Instance method on a VM
