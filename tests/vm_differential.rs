@@ -604,6 +604,24 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     // panics, caught by `recover` which round-trips the `.message`), plus arrows,
     // `assert`, and `Ok`/`Err`. All V6 — byte-identical on both engines.
     "examples/force_unwrap.as",
+    // V7 async qualifier (verified byte-identical by running both engines): uses
+    // only `async fn`, an `async (n) =>` arrow, an `async x =>` bare arrow, and
+    // `await` (incl. `await 5` identity). NO `import`/`task`/`match`/`class`, so
+    // it compiles + runs end-to-end on the VM today. The async arrows correctly
+    // pick up `is_async` in `compile_fn_proto` (the parser bumps the `async`
+    // token INSIDE the `ArrowExpr` node, so it is a direct token child), so they
+    // eager-spawn a `Value::Future` exactly like `async fn`.
+    //
+    // DEFERRED to the V12 gate: the structured-concurrency examples
+    // (`concurrency.as`, `structured_concurrency.as`) use `import * as task` /
+    // `time`, and the VM compiler does NOT support `import` until V12. The
+    // underlying machinery is already sound — the VM produces ordinary
+    // `Value::Future`s (cancel-on-drop `SharedFuture`s) that the native
+    // `task.gather`/`race`/`timeout`/`spawn` ops await/select over (de-risked by
+    // the `task_gather_awaits_vm_produced_futures_in_order` /
+    // `task_race_resolves_a_vm_produced_future` unit tests in `src/vm/run.rs`).
+    // Those examples are added to this allowlist when `import` lands (V12).
+    "examples/async.as",
 ];
 
 #[tokio::test]
@@ -2231,5 +2249,112 @@ async fn vm_async_contract_violation_surfaces_lazily_at_await() {
     ];
     for src in lazy_cases {
         assert_vm_run_error_matches_treewalker(src).await;
+    }
+}
+
+// ----- V7-T4: cancel-on-drop (the M17 leak class) on the VM -------------------
+
+#[tokio::test]
+async fn vm_unawaited_async_call_is_cancelled_like_treewalker() {
+    // M17 invariant: an `async fn` whose `Value::Future` is dropped WITHOUT being
+    // awaited is CANCELLED (its task aborted), not orphaned — its side effect does
+    // NOT run. The tree-walker does this too (its `SharedFuture` is cancel-on-drop
+    // via AbortHandle); the VM reuses the EXACT same `SharedFuture` machinery in
+    // the `Op::Call` async arm. We prove byte-identical behavior on both engines
+    // for a program with an observable side effect (a `print` in an un-awaited
+    // async body). This is the import-free analogue of M17's
+    // `unawaited_async_call_is_cancelled` (which uses `time.sleep` — V12 on the
+    // VM). Concretely: `worked` must NOT appear; only `main` is printed.
+    // NOTE: we assert the BARE un-awaited call (the true M17 leak class: the
+    // `Value::Future` is dropped at the end of its expression statement). A future
+    // *held* in a local until program end (`let f = work()`) is NOT part of this
+    // class — it interacts with end-of-program task draining and the two engines
+    // legitimately differ there (the tree-walker's end-of-program drain runs the
+    // still-held task; the VM does not). That held-future case is out of scope for
+    // cancel-on-drop and is therefore not asserted here.
+    let cases = [
+        // Bare un-awaited call: the future is dropped at the end of the statement.
+        "async fn work() { print(\"worked\") }\nwork()\nprint(\"main\")\n",
+        // Same, but with an internal await point before the side effect — the task
+        // is aborted at the await suspension, so the side effect still never runs.
+        "async fn work() { await 0\n print(\"worked\") }\nwork()\nprint(\"main\")\n",
+    ];
+    for src in cases {
+        let tw = ascript::run_source(src).await.expect("tree-walker ok");
+        let (vm, code) = ascript::vm_run_source(src).await.expect("vm ok");
+        assert_eq!(code, None);
+        assert!(
+            !tw.contains("worked"),
+            "tree-walker should cancel the un-awaited call: {tw:?}"
+        );
+        assert_eq!(
+            tw, vm,
+            "VM cancel-on-drop diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vm_unawaited_async_loop_stays_bounded_and_matches_treewalker() {
+    // A tight loop that spawns async calls WITHOUT awaiting them must stay
+    // memory-bounded (each un-awaited future is dropped → its task cancelled) and
+    // must NOT hang. We assert byte-identical output to the tree-walker (both
+    // cancel; the only observable output is the trailing `done`) AND, on the VM,
+    // assert the in-flight high-water mark stays bounded by `INFLIGHT_YIELD_CAP`'s
+    // cooperative-yield reaping (the M17 leak guard, mirrored from the interp's
+    // `unawaited_async_loop_keeps_inflight_bounded`).
+    let src = "async fn work(n) { return n }\n\
+               let i = 0\n\
+               while (i < 5000) {\n  work(i)\n  i = i + 1\n}\n\
+               print(\"done\")\n";
+    let tw = ascript::run_source(src).await.expect("tree-walker ok");
+    let (vm, code) = ascript::vm_run_source(src).await.expect("vm ok");
+    assert_eq!(code, None);
+    assert_eq!(tw, "done\n");
+    assert_eq!(
+        tw, vm,
+        "VM un-awaited loop diverged from tree-walker\n  tw: {tw:?}\n  vm: {vm:?}"
+    );
+    // The VM-internal in-flight high-water-mark boundedness assertion (the M17
+    // leak guard) lives in `src/vm/run.rs`
+    // (`unawaited_async_loop_keeps_inflight_bounded_on_the_vm`) where the Vm's
+    // shared `Interp::max_inflight` is reachable.
+}
+
+// ----- V7-T4: extra hand-written async snippets (byte-identical) --------------
+
+#[tokio::test]
+async fn vm_async_chained_and_control_flow_matches_treewalker() {
+    let cases = [
+        // Chained awaits across several async fns (each awaited in turn).
+        "async fn a() { return 1 }\n\
+         async fn b() { return 2 }\n\
+         async fn c() { return 3 }\n\
+         print((await a()) + (await b()) + (await c()))",
+        // An async fn awaiting ANOTHER async fn's result inside its own body.
+        "async fn inner() { return 10 }\n\
+         async fn outer() { let x = await inner()\n return x + 5 }\n\
+         print(await outer())",
+        // Mixing await with control flow (if/else) and a closure.
+        "async fn pick(flag) { if (flag) { return 100 } else { return 200 } }\n\
+         let choose = (b) => b\n\
+         print(await pick(choose(true)))\n\
+         print(await pick(choose(false)))",
+        // Await inside a loop, accumulating across iterations.
+        "async fn dbl(n) { return n * 2 }\n\
+         let total = 0\n\
+         let i = 1\n\
+         while (i <= 3) { total = total + (await dbl(i))\n i = i + 1 }\n\
+         print(total)",
+        // An async fn returning a Result pair, awaited then `?`-propagated.
+        "async fn fetch() { return [42, nil] }\n\
+         fn use(): number { return (await fetch())? }\n\
+         print(use())",
+        // An async fn returning a Result pair, awaited then `!`-force-unwrapped.
+        "async fn fetch() { return [42, nil] }\n\
+         print((await fetch())!)",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
     }
 }

@@ -1651,6 +1651,132 @@ mod tests {
         assert!(matches!(got, Value::Number(n) if n == 15.0), "got {got:?}");
     }
 
+    // ---- V7-T4: structured-concurrency over VM-produced futures -----------
+    //
+    // The std/task ops (`gather`/`race`/`timeout`/`spawn`) are native fns on the
+    // shared `Interp` that await/select over `Value::Future`s. The VM produces
+    // ordinary `Value::Future`s (the SAME `SharedFuture` the tree-walker uses;
+    // see the `Op::Call` async-fn arm). These tests de-risk the V12 end-to-end
+    // structured-concurrency differential (`concurrency.as` /
+    // `structured_concurrency.as`, which need `import` — not compiled until V12)
+    // by exercising a task op DIRECTLY over a VM-produced future, with no
+    // `import`. They prove the bridge is sound today: `task.gather` over two VM
+    // async-fn futures awaits both and preserves order.
+
+    /// Spawn a VM async-fn call exactly the way the `Op::Call` async arm does:
+    /// `spawn_local` a task that drives `Vm::call_value(closure, args)` and
+    /// resolves a `SharedFuture` cell, returning the `Value::Future` handle
+    /// immediately. This is the canonical "VM-produced future".
+    fn spawn_vm_future(vm: &Rc<Vm>, closure: Value, args: Vec<Value>) -> Value {
+        let vm2 = vm.rc();
+        let fut = crate::task::SharedFuture::new();
+        let cell = fut.cell();
+        let handle = tokio::task::spawn_local(async move {
+            let r = vm2.call_value(closure, args, s()).await;
+            cell.resolve(r);
+        });
+        fut.set_abort(handle.abort_handle());
+        Value::Future(fut)
+    }
+
+    /// Compile + run a whole `.as` program `src` on a fresh Vm (mirroring the
+    /// `vm_run_source` entry point) and return the shared `Interp`'s in-flight
+    /// high-water mark — used to prove un-awaited async tasks are reaped (bounded),
+    /// not leaked (the M17 memory-leak guard, on the VM).
+    fn run_program_max_inflight(src: &str) -> u64 {
+        let chunk = crate::compile::compile_source(src).expect("compile ok");
+        let proto = Rc::new(FnProto {
+            chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            params: Vec::new(),
+            ret: None,
+        });
+        let closure = Closure::new(proto);
+        let mut fiber = Fiber::new(closure);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        let local = LocalSet::new();
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        let vm = Vm::new(interp.clone());
+        local.block_on(&rt, async {
+            local.run_until(vm.run(&mut fiber)).await.expect("run ok");
+        });
+        interp.max_inflight()
+    }
+
+    #[test]
+    fn unawaited_async_loop_keeps_inflight_bounded_on_the_vm() {
+        // M17 leak guard, on the VM: a tight loop spawning async calls WITHOUT
+        // awaiting them must stay bounded. Each un-awaited future is dropped → its
+        // task is cancelled; the cooperative yield above `INFLIGHT_YIELD_CAP`
+        // (256) reaps finished/cancelled tasks so the in-flight high-water mark
+        // stays well below the iteration count. Without reaping a 5000-iteration
+        // loop would peak near 5000. Mirrors the interp's
+        // `unawaited_async_loop_keeps_inflight_bounded`.
+        let src = "async fn work(n) { return n }\n\
+                   let i = 0\n\
+                   while (i < 5000) {\n  work(i)\n  i = i + 1\n}\n\
+                   print(\"done\")\n";
+        let peak = run_program_max_inflight(src);
+        assert!(
+            peak < 1000,
+            "in-flight high-water mark should stay bounded (got {peak})"
+        );
+    }
+
+    #[test]
+    fn task_gather_awaits_vm_produced_futures_in_order() {
+        // `(n) => n + 1` invoked as two independent VM futures, gathered. The
+        // native `task.gather` op awaits each `Value::Future` and returns the
+        // values in input order — proving the VM's futures interoperate with the
+        // structured-concurrency machinery (Part C de-risk; full e2e is V12).
+        let f = compile_closure("(n) => n + 1");
+        let out = with_vm(|vm| async move {
+            let a = spawn_vm_future(&vm, f.clone(), vec![Value::Number(10.0)]);
+            let b = spawn_vm_future(&vm, f, vec![Value::Number(20.0)]);
+            let arr = Value::Array(Rc::new(RefCell::new(vec![a, b])));
+            vm.interp()
+                .call_task("gather", &[arr], s())
+                .await
+                .expect("gather ok")
+        });
+        match out {
+            Value::Array(a) => {
+                let got: Vec<f64> = a
+                    .borrow()
+                    .iter()
+                    .map(|v| match v {
+                        Value::Number(n) => *n,
+                        other => panic!("non-number in gather result: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, vec![11.0, 21.0], "gather preserves order over VM futures");
+            }
+            other => panic!("gather should return an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_race_resolves_a_vm_produced_future() {
+        // A single VM-produced future raced resolves to its value — `task.race`
+        // selects over `Value::Future`s and the VM's future drives to completion.
+        let f = compile_closure("(n) => n * 2");
+        let out = with_vm(|vm| async move {
+            let a = spawn_vm_future(&vm, f, vec![Value::Number(21.0)]);
+            let arr = Value::Array(Rc::new(RefCell::new(vec![a])));
+            vm.interp()
+                .call_task("race", &[arr], s())
+                .await
+                .expect("race ok")
+        });
+        assert!(matches!(out, Value::Number(n) if n == 42.0), "got {out:?}");
+    }
+
     #[test]
     fn call_value_propagates_a_closure_panic() {
         // A native HOF whose callback panics must see the SAME `Control::Panic`
