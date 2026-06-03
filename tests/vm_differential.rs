@@ -3745,3 +3745,210 @@ async fn vm_match_corpus_examples() {
         );
     }
 }
+
+// ============================================================================
+// ORACLE #2 — RECORDED GOLDENS (V10-T6)
+// ============================================================================
+//
+// The whole-corpus gate above (`vm_run_whole_corpus_matches_treewalker`) is a
+// LIVE differential: it compares the VM against the tree-walker, both running
+// right now. That gate is only meaningful while the tree-walker still exists.
+//
+// At the eventual cutover the tree-walker is DELETED. Oracle #1 then has no
+// reference engine to diff against. The recorded goldens below are oracle #2:
+// stdout + exit code captured FROM THE TREE-WALKER (the current source of
+// truth) and committed under `tests/vm_goldens/`. After the tree-walker is
+// gone, the VM must keep reproducing these byte-for-byte. They are the
+// post-cutover reference.
+//
+// SCOPE: exactly the corpus examples the VM runs byte-identically today — i.e.
+// `all_corpus_examples()` minus `EXAMPLE_SKIPS` (the same set oracle #1 runs).
+// The golden set therefore GROWS automatically as V12 unblocks `import`
+// examples and entries leave `EXAMPLE_SKIPS`: a newly-unskipped example fails
+// `vm_recorded_goldens_cover_the_byte_identical_set` (missing golden) until its
+// `.out` is recorded. The set never silently shrinks.
+//
+// REGENERATION (intentional only — never automatic):
+//   cargo test --test vm_differential record_vm_goldens -- --ignored --nocapture
+// That re-records every golden FROM THE TREE-WALKER. Run it ONLY when you have
+// deliberately changed example output (or unblocked new examples) and have
+// confirmed the new output is correct, then commit the changed `.out` files.
+// The checker test (`vm_matches_recorded_goldens`) does NOT auto-regenerate —
+// auto-regeneration would defeat the entire point of a frozen reference.
+
+/// Directory holding the committed golden `.out` files, one per byte-identical
+/// corpus example.
+fn vm_goldens_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vm_goldens")
+}
+
+/// Map a corpus-relative example path (e.g. `examples/advanced/foo.as`) to its
+/// golden file path. The relative path is flattened with `__` so the goldens
+/// live in a single flat directory while staying collision-free across
+/// `examples/` and `examples/advanced/`.
+fn golden_path_for(rel: &str) -> std::path::PathBuf {
+    let flat = rel.replace('/', "__");
+    vm_goldens_dir().join(format!("{flat}.out"))
+}
+
+/// Encode (stdout, exit) into the on-disk golden format. The first line is a
+/// machine-readable header `# exit: none` or `# exit: <N>`; everything after
+/// the first `\n` is the verbatim stdout (which may contain anything, including
+/// `#`/newlines). This keeps the exit code unambiguous without escaping stdout.
+fn encode_golden(out: &str, exit: Option<i32>) -> String {
+    let header = match exit {
+        None => "# exit: none".to_string(),
+        Some(n) => format!("# exit: {n}"),
+    };
+    format!("{header}\n{out}")
+}
+
+/// Inverse of [`encode_golden`]. Returns `(stdout, exit)`.
+fn decode_golden(text: &str) -> (String, Option<i32>) {
+    let (header, body) = text
+        .split_once('\n')
+        .unwrap_or_else(|| panic!("golden missing header line: {text:?}"));
+    let exit = header
+        .strip_prefix("# exit: ")
+        .unwrap_or_else(|| panic!("golden header malformed: {header:?}"));
+    let exit = match exit {
+        "none" => None,
+        n => Some(
+            n.parse::<i32>()
+                .unwrap_or_else(|e| panic!("golden exit code `{n}` not an integer: {e}")),
+        ),
+    };
+    (body.to_string(), exit)
+}
+
+/// The set of examples for which a golden must exist: every corpus example NOT
+/// on the `EXAMPLE_SKIPS` list (the byte-identical set, identical to oracle #1's
+/// run set). Sorted, deterministic.
+fn byte_identical_examples() -> Vec<String> {
+    all_corpus_examples()
+        .into_iter()
+        .filter(|rel| skip_reason(rel).is_none())
+        .collect()
+}
+
+/// ORACLE #2 — the recorded goldens checker. For every byte-identical corpus
+/// example, run it through the VM and assert stdout+exit equals the committed
+/// golden recorded from the tree-walker. This is the assertion that must keep
+/// holding AFTER the tree-walker is deleted.
+///
+/// On drift this fails LOUDLY with the example name and a stdout/exit diff. It
+/// does NOT regenerate the golden — see the regeneration note above.
+#[tokio::test]
+async fn vm_matches_recorded_goldens() {
+    let mut checked = 0usize;
+    for rel in byte_identical_examples() {
+        let gpath = golden_path_for(&rel);
+        let golden_text = std::fs::read_to_string(&gpath).unwrap_or_else(|e| {
+            panic!(
+                "missing recorded golden for byte-identical example `{rel}` \
+                 (expected at {}): {e}\n\
+                 If this example was just unblocked (left EXAMPLE_SKIPS), record \
+                 its golden from the tree-walker with:\n  \
+                 cargo test --test vm_differential record_vm_goldens -- --ignored --nocapture",
+                gpath.display()
+            )
+        });
+        let (want_out, want_exit) = decode_golden(&golden_text);
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&rel),
+        )
+        .unwrap_or_else(|e| panic!("read example {rel}: {e}"));
+        let (got_out, got_exit) = ascript::vm_run_source(&src)
+            .await
+            .unwrap_or_else(|e| panic!("VM failed on `{rel}` (golden expected it to run): {e:?}"));
+        assert_eq!(
+            (got_out.as_str(), got_exit),
+            (want_out.as_str(), want_exit),
+            "VM output drifted from the recorded golden for `{rel}`.\n\
+             This means the VM no longer reproduces the tree-walker's frozen \
+             reference output. Either the VM regressed (fix it) OR the change \
+             is intentional (then regenerate the golden from the tree-walker — \
+             see the regeneration note in tests/vm_differential.rs — and commit \
+             the updated {}).\n  golden stdout: {want_out:?}\n  vm stdout:     {got_out:?}\n  \
+             golden exit: {want_exit:?}\n  vm exit:     {got_exit:?}",
+            golden_path_for(&rel).display()
+        );
+        checked += 1;
+    }
+    // The goldens must actually cover the bulk of the corpus — guard against a
+    // silently-empty golden dir making the check vacuous.
+    assert!(
+        checked >= 18,
+        "expected >=18 recorded goldens checked against the VM, checked {checked}"
+    );
+    eprintln!("oracle #2: {checked} recorded goldens reproduced by the VM");
+}
+
+/// Guard that keeps oracle #2 HONEST: there must be exactly one golden file per
+/// byte-identical example and NO stale golden files (e.g. for an example that
+/// was renamed or re-skipped). Combined with `vm_matches_recorded_goldens`
+/// (which fails on a MISSING golden), this pins the golden set to the
+/// byte-identical set exactly.
+#[test]
+fn vm_recorded_goldens_cover_the_byte_identical_set() {
+    use std::collections::BTreeSet;
+    let expected: BTreeSet<std::path::PathBuf> = byte_identical_examples()
+        .iter()
+        .map(|rel| golden_path_for(rel))
+        .collect();
+    let dir = vm_goldens_dir();
+    let mut found = BTreeSet::new();
+    for entry in std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+    {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|x| x.to_str()) == Some("out") {
+            found.insert(path);
+        }
+    }
+    let missing: Vec<_> = expected.difference(&found).collect();
+    let stale: Vec<_> = found.difference(&expected).collect();
+    assert!(
+        missing.is_empty(),
+        "byte-identical examples without a recorded golden (record from the \
+         tree-walker with `cargo test --test vm_differential record_vm_goldens \
+         -- --ignored --nocapture`): {missing:?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "stale golden files with no matching byte-identical example (delete \
+         them, or fix the path): {stale:?}"
+    );
+}
+
+/// REGENERATOR (ignored by default — run intentionally only). Re-records every
+/// golden FROM THE TREE-WALKER (the current source of truth) into
+/// `tests/vm_goldens/`. The goldens are oracle #2's frozen post-cutover
+/// reference, so this is deliberately NOT part of the normal test run.
+///
+///   cargo test --test vm_differential record_vm_goldens -- --ignored --nocapture
+///
+/// After running, `git diff tests/vm_goldens/` shows exactly what changed;
+/// commit it only when the new output is intended.
+#[tokio::test]
+#[ignore = "regenerates committed goldens from the tree-walker; run intentionally"]
+async fn record_vm_goldens() {
+    let dir = vm_goldens_dir();
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut wrote = 0usize;
+    for rel in byte_identical_examples() {
+        let src = std::fs::read_to_string(std::path::Path::new(root).join(&rel))
+            .unwrap_or_else(|e| panic!("read example {rel}: {e}"));
+        // RECORD FROM THE TREE-WALKER — the source of truth the VM must match.
+        let (out, exit) = ascript::run_source_exit(&src)
+            .await
+            .unwrap_or_else(|e| panic!("tree-walker failed recording golden for {rel}: {e:?}"));
+        let gpath = golden_path_for(&rel);
+        std::fs::write(&gpath, encode_golden(&out, exit))
+            .unwrap_or_else(|e| panic!("write golden {}: {e}", gpath.display()));
+        eprintln!("recorded golden: {} <- {rel}", gpath.display());
+        wrote += 1;
+    }
+    eprintln!("recorded {wrote} goldens from the tree-walker into {}", dir.display());
+}
