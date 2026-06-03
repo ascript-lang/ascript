@@ -7,6 +7,7 @@ pub mod diagnostics;
 pub mod env;
 pub mod error;
 pub mod fmt;
+pub mod gc;
 pub mod interp;
 pub(crate) mod lex_literals;
 pub mod lexer;

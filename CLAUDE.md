@@ -234,6 +234,21 @@ and `Generator` (identity-equal, a consumer-driven `GeneratorHandle`). Mutable c
 `Rc<RefCell<...>>`. There is a separate
 hashable `MapKey` (numbers canonicalized: −0.0→+0.0, NaN unified) for `Map` keys.
 
+**Cycle-collecting GC (`src/gc.rs`, V13).** The spec adopts [`gcmodule`] (a refcounting `Cc<T>` +
+Bacon–Rajan trial-deletion cycle collector) to reclaim reference cycles (`a.push(a)`). `gcmodule` is
+an **unconditional, default-on, CORE dependency** (NOT a stdlib feature — it must build under
+`--no-default-features`). The migration is phased: **V13-T1 (done)** adds the dep + `gcmodule::Trace`
+impls for the cycle-capable types (`Value`, `ObjectCell`, `Instance`, `Closure`, `MapKey`, plus the
+`indexmap` collections via free `trace_index_map`/`trace_index_set` helpers — `indexmap` is foreign
+so no blanket impl is possible) while **keeping everything on `Rc` — NO migration**; the `Trace`
+impls compile and are exercised by `gc::tests` but are not yet load-bearing. **V13-T2** is the one-pass
+`Rc→Cc` migration of the cycle-capable variants (`Array`/`Object`/`Map`/`Set`/`Instance`/`Closure` +
+the closure upvalue cell). **Invariant:** native-resource handles (`Native`/`NativeMethod`) and the
+acyclic/immutable handles (`Str`/`Builtin`/`Regex`/`Enum`/`Class`/`Function`'s captured
+`Environment`/`Future`/`Generator`) **STAY on `Rc`** and have **no-op `Trace`** — the GC must never
+trace into a native resource, because those rely on deterministic `Drop` to reclaim fds. When touching
+`Value` variants, mirror any new cycle-capable container in `Value::trace`.
+
 **Object/instance SHAPES (hidden classes, V11-T2).** `Value::Object` is `Rc<ObjectCell>` where
 `ObjectCell { map: RefCell<IndexMap<String,Value>>, shape: Cell<u32> }` — the wrapper exists ONLY to
 carry a `shape` id beside the entry map. `ObjectCell` has `borrow()`/`borrow_mut()` helpers that

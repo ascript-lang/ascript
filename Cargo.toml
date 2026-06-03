@@ -16,6 +16,11 @@ rust_decimal = { version = "1", features = ["maths"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 async-recursion = "1"
 indexmap = "2"
+# Cyclic GC (Bacon–Rajan trial-deletion over refcounted `Cc<T>`). CORE runtime,
+# NOT feature-gated: the GC must be present in --no-default-features too. V13-T1
+# adds the dep + `Trace` impls only; the actual Rc→Cc migration of cycle-capable
+# Value variants is V13-T2. Native resources STAY on Rc (deterministic Drop).
+gcmodule = "0.3"
 cstree = { version = "0.14", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.6"
