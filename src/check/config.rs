@@ -7,11 +7,11 @@
 //! (`ascript check --deny-warnings`). The `ascript.toml` `[lint]` table
 //! (discovered + parsed in the CLI binary's `lint_config_toml` module) also
 //! seeds this same `LintConfig`; the CLI flags are overlaid on top, so the net
-//! precedence is inline `// ascript-ignore[code]` suppression (runs first, in
-//! `analyze.rs`, and config cannot resurrect a diagnostic the source suppressed)
-//! > CLI flag > `ascript.toml [lint]` > rule default. `syntax-error` is accepted
-//! as a known code but is immune (always `Error`). [`RULE_CODES`] is the single
-//! source of truth for validating rule codes.
+//! precedence is: inline `// ascript-ignore[code]` suppression (runs first, in
+//! `analyze.rs`, and config cannot resurrect a diagnostic the source suppressed),
+//! then CLI flag, then `ascript.toml [lint]`, then rule default. `syntax-error`
+//! is accepted as a known code but is immune (always `Error`). [`RULE_CODES`] is
+//! the single source of truth for validating rule codes.
 
 use crate::check::diagnostic::Severity;
 use std::collections::HashMap;
