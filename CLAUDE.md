@@ -249,6 +249,20 @@ calls `resync_object_shape`, reassigning an existing key keeps the shape — V11
 on this). The **tree-walker never touches the registry** — its objects/instances stay shape `0`. The
 change is additive/behavior-preserving (the whole-corpus differential + goldens stay byte-identical).
 
+**`--no-specialize` KILL SWITCH + three-way differential (V11-T5).** The `Vm` carries a
+`specialize: bool` (default `true`; `Vm::new` → specializing, `Vm::new_generic` /
+`Vm::with_specialize(interp, false)` → generic). When `false`, EVERY specialization fast path is
+skipped: the field/method inline caches (`GET_PROP`/`SET_PROP`/`CALL_METHOD`, via `ic_get_field` /
+`ic_resolve_method` / `vm_set_prop`), the PEP-659 adaptive arithmetic (`eval_binop_adaptive`), and
+the `GET_GLOBAL` cache all gate their consult AND record behind `if self.specialize`, falling through
+to the generic lookup with no warmup/specialize/deopt. The two modes MUST be byte-identical (both
+correct) — the only difference is speed. `vm_run_source` (specialize) and `vm_run_source_generic`
+(generic) are the test entry points; the eventual CLI `--no-specialize` maps to the generic one. The
+**THREE-WAY DIFFERENTIAL** (`tests/vm_differential.rs`, `three_way_*`) asserts
+`tree-walker == specialized-VM == generic-VM` byte-for-byte over the whole corpus + recorded goldens +
+an IC/adaptive/property/method/arithmetic-heavy program set, in BOTH feature configs. If generic and
+specialized EVER diverge, a specialization GUARD is wrong — do NOT relax the assertion, fix the guard.
+
 ### Standard library (`src/stdlib/`)
 Each `std/*` module is native Rust over the `Value` model. Two routing entry points in
 `src/stdlib/mod.rs`:

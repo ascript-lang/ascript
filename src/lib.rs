@@ -189,6 +189,30 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
 /// the production path remains the tree-walker.
 #[doc(hidden)]
 pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_with(src, true).await
+}
+
+/// Like [`vm_run_source`] but with the VM's specialization fast paths DISABLED —
+/// the `--no-specialize` kill switch (V11-T5). All inline caches and PEP-659
+/// adaptive sites are skipped; every dispatch takes the generic path.
+///
+/// This is the "generic VM" half of the THREE-WAY DIFFERENTIAL: a non-specializing
+/// VM run MUST be byte-identical to both the specializing VM ([`vm_run_source`])
+/// and the tree-walker ([`run_source_exit`]). If generic and specialized ever
+/// diverge, a specialization guard is wrong — the safety net catches it instantly.
+#[doc(hidden)]
+pub async fn vm_run_source_generic(src: &str) -> Result<(String, Option<i32>), AsError> {
+    vm_run_source_with(src, false).await
+}
+
+/// Shared body for [`vm_run_source`] (specialize = true) and
+/// [`vm_run_source_generic`] (specialize = false). `specialize` is the kill-switch
+/// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
+/// `specialize = false` here.
+async fn vm_run_source_with(
+    src: &str,
+    specialize: bool,
+) -> Result<(String, Option<i32>), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;
@@ -212,7 +236,7 @@ pub async fn vm_run_source(src: &str) -> Result<(String, Option<i32>), AsError> 
 
     let interp = Rc::new(Interp::new());
     interp.install_self();
-    let vm = Vm::new(interp.clone());
+    let vm = Vm::with_specialize(interp.clone(), specialize);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();

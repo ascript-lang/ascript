@@ -52,12 +52,39 @@ pub struct Vm {
     /// order), keyed by the class's `Rc` identity (`Rc::as_ptr`) like the method
     /// tables. Computed once per class so every instance shares the same base id.
     class_base_shapes: RefCell<HashMap<usize, u32>>,
+    /// **The `--no-specialize` KILL SWITCH (V11-T5).** When `true` (the default),
+    /// every specialization fast path is active: the polymorphic field/method
+    /// inline caches (`GET_PROP`/`SET_PROP`/`CALL_METHOD`) and the PEP-659 adaptive
+    /// arithmetic + `GET_GLOBAL` caches are consulted and recorded in front of the
+    /// generic path. When `false`, ALL of those fast paths are skipped — every
+    /// property read/write, method dispatch, arithmetic op, and global resolve goes
+    /// straight through the generic lookup with NO IC/adaptive consult or record.
+    ///
+    /// The two modes MUST produce byte-identical results (both correct); the only
+    /// difference is speed. The three-way differential in `tests/vm_differential.rs`
+    /// asserts `generic-VM == specialized-VM == tree-walker` over the whole corpus,
+    /// so any IC/adaptive guard bug makes generic and specialized diverge instantly.
+    specialize: bool,
 }
 
 impl Vm {
     /// Build a VM over `interp` and install its self-`Weak` (mirroring
     /// [`Interp::install_self`]).
     pub fn new(interp: Rc<Interp>) -> Rc<Self> {
+        Self::with_specialize(interp, true)
+    }
+
+    /// Build a NON-specializing ("generic") VM — the `--no-specialize` kill switch
+    /// (V11-T5). All inline-cache and adaptive fast paths are disabled; every
+    /// dispatch takes the generic path. Used by `vm_run_source_generic` and the
+    /// three-way differential to prove the fast paths never change a result.
+    pub fn new_generic(interp: Rc<Interp>) -> Rc<Self> {
+        Self::with_specialize(interp, false)
+    }
+
+    /// Shared constructor: build a VM with `specialize` set explicitly and install
+    /// its self-`Weak` (mirroring [`Interp::install_self`]).
+    pub fn with_specialize(interp: Rc<Interp>, specialize: bool) -> Rc<Self> {
         let vm = Rc::new(Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
@@ -65,6 +92,7 @@ impl Vm {
             class_defaults: RefCell::new(HashMap::new()),
             shapes: RefCell::new(crate::vm::shape::ShapeRegistry::new()),
             class_base_shapes: RefCell::new(HashMap::new()),
+            specialize,
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -230,16 +258,22 @@ impl Vm {
                     // version is constant 0) re-resolves. Correctness: the cached
                     // value is exactly what the resolve below produces, and the
                     // version guard invalidates it on any future global mutation.
+                    // KILL SWITCH (V11-T5): with specialization OFF, NEVER consult
+                    // or record the global cache — always re-resolve the name
+                    // generically. The resolved value is identical either way (a
+                    // bare builtin), so generic and specialized stay byte-identical.
                     let version = self.global_version();
                     let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
-                    if let Some(v) = cache.get(version) {
+                    if let Some(v) = cache.get(version).filter(|_| self.specialize) {
                         fiber.push(v);
                     } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
                         let v = Value::Builtin(name);
-                        fiber.frame().closure.proto.chunk.set_global_cache(
-                            fault_ip,
-                            crate::vm::adapt::GlobalCache::set(v.clone(), version),
-                        );
+                        if self.specialize {
+                            fiber.frame().closure.proto.chunk.set_global_cache(
+                                fault_ip,
+                                crate::vm::adapt::GlobalCache::set(v.clone(), version),
+                            );
+                        }
                         fiber.push(v);
                     } else {
                         return Err(self.panic_at(
@@ -528,8 +562,10 @@ impl Vm {
                         sargs.extend(args);
                         let v = self.interp.call_schema(&name, &sargs, span).await?;
                         fiber.push(v);
-                    } else if let Some((closure, def_class)) =
-                        self.ic_resolve_method(&proto.chunk, fault_ip, &recv, &name)
+                    } else if let Some((closure, def_class)) = self
+                        .specialize
+                        .then(|| self.ic_resolve_method(&proto.chunk, fault_ip, &recv, &name))
+                        .flatten()
                     {
                         // METHOD inline-cache fast path (V11-T3): the receiver is a
                         // VM instance whose `name` resolves (up the chain) to a
@@ -902,7 +938,14 @@ impl Vm {
                         // Resolve `proto` out of the fiber so the chunk borrow does
                         // not collide with the later `fiber.push`.
                         let proto = fiber.frame().closure.proto.clone();
-                        let cached = self.ic_get_field(&proto.chunk, fault_ip, &obj, &name);
+                        // KILL SWITCH (V11-T5): only consult/record the field IC
+                        // when specialization is ON. Generic mode always takes the
+                        // shared `vm_read_member` path (same value, byte-identical).
+                        let cached = if self.specialize {
+                            self.ic_get_field(&proto.chunk, fault_ip, &obj, &name)
+                        } else {
+                            None
+                        };
                         let v = match cached {
                             Some(v) => v,
                             None => self.vm_read_member(&obj, &name, span)?,
@@ -2164,6 +2207,15 @@ impl Vm {
         use crate::vm::adapt::{ArithCache, ArithKind};
 
         let chunk = &fiber.frame().closure.proto.chunk;
+        // KILL SWITCH (V11-T5): with specialization OFF, never observe/specialize/
+        // deopt — go straight through the shared generic `apply_binop`. The result
+        // and every panic message are identical to the specialized fast path (which
+        // only ever runs `apply_binop`'s own arms behind a guard), so generic and
+        // specialized stay byte-identical; the only difference is speed.
+        if !self.specialize {
+            let span = chunk.span_at(fault_ip);
+            return crate::interp::apply_binop(op, a, b, span);
+        }
         // Only `+ - * /`-style arithmetic participates; comparisons, equality and
         // range have no monomorphic fast path here (they go straight to generic).
         let arith_op = matches!(
@@ -2279,9 +2331,10 @@ impl Vm {
         match obj {
             Value::Object(cell) => {
                 let shape = cell.shape.get();
-                // Fast path: a shaped, non-schema object whose key already exists
-                // at the cached index — write in place (no layout/shape change).
-                if shape != 0 && !crate::stdlib::schema::is_schema_value(obj) {
+                // Fast path (specialize ON only): a shaped, non-schema object whose
+                // key already exists at the cached index — write in place (no
+                // layout/shape change). KILL SWITCH (V11-T5): skipped when OFF.
+                if self.specialize && shape != 0 && !crate::stdlib::schema::is_schema_value(obj) {
                     let ic = chunk.field_ic(op_off);
                     if let Some(idx) = ic.lookup(shape) {
                         let mut map = cell.map.borrow_mut();
@@ -2296,7 +2349,10 @@ impl Vm {
                 let v = self.interp.set_member(obj, name, value, span, span)?;
                 self.resync_object_shape(cell);
                 let new_shape = cell.shape.get();
-                if new_shape != 0 && !crate::stdlib::schema::is_schema_value(obj) {
+                if self.specialize
+                    && new_shape != 0
+                    && !crate::stdlib::schema::is_schema_value(obj)
+                {
                     if let Some(idx) = cell.map.borrow().get_index_of(name) {
                         let mut ic = chunk.field_ic(op_off);
                         ic.record(new_shape, idx as u32);
@@ -2311,14 +2367,15 @@ impl Vm {
                 // A set may have added an undeclared field → re-derive the shape so
                 // the field IC stays sound, then record this field's index.
                 self.resync_instance_shape(inst);
-                let recorded = {
+                // KILL SWITCH (V11-T5): only record the field IC when specialize ON.
+                let recorded = self.specialize.then(|| {
                     let b = inst.borrow();
                     let new_shape = b.shape_id.get();
                     (new_shape != 0)
                         .then(|| b.fields.get_index_of(name).map(|idx| (new_shape, idx)))
                         .flatten()
-                };
-                if let Some((new_shape, idx)) = recorded {
+                });
+                if let Some(Some((new_shape, idx))) = recorded {
                     let mut ic = chunk.field_ic(op_off);
                     ic.record(new_shape, idx as u32);
                     chunk.set_field_ic(op_off, ic);
@@ -3729,6 +3786,80 @@ mod tests {
         interp.install_self();
         let vm = Vm::new(interp);
         (vm, fiber)
+    }
+
+    /// Like [`adaptive_harness`] but builds a NON-specializing VM (the
+    /// `--no-specialize` kill switch). Used to prove the fast paths never run.
+    fn generic_adaptive_harness(op: Op) -> (Rc<Vm>, Fiber) {
+        let mut c = Chunk::new();
+        c.emit(op, Span::new(0, 3));
+        c.emit(Op::Return, s());
+        let proto = Rc::new(FnProto {
+            chunk: c,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            params: Vec::new(),
+            ret: None,
+        });
+        let closure = Closure::new(proto);
+        let fiber = Fiber::new(closure);
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        let vm = Vm::new_generic(interp);
+        (vm, fiber)
+    }
+
+    // ---- V11-T5 KILL SWITCH (--no-specialize) -----------------------------
+
+    #[test]
+    fn kill_switch_never_specializes_arithmetic_and_stays_correct() {
+        // With specialization OFF, driving FAR past the warmup threshold must leave
+        // the arith cache COLD (never warmed, never specialized) — yet every result
+        // is byte-identical to the specializing path's result.
+        let (vm, fiber) = generic_adaptive_harness(Op::Add);
+        for i in 0..(WARMUP_THRESHOLD + 50) {
+            let v = vm
+                .eval_binop_adaptive(
+                    &fiber,
+                    0,
+                    BinOp::Add,
+                    Value::Number(i as f64),
+                    Value::Number(1.0),
+                )
+                .expect("ok");
+            assert_eq!(v, Value::Number(i as f64 + 1.0));
+        }
+        // The cache MUST still be at its default cold state — the generic path
+        // never observes (no warmup candidate, count 0) and never specializes.
+        assert_eq!(
+            fiber.frame().closure.proto.chunk.arith_cache(0),
+            ArithCache::default(),
+            "kill switch must leave the arith cache cold (no warmup/specialize)"
+        );
+    }
+
+    #[test]
+    fn kill_switch_default_constructor_specializes() {
+        // The DEFAULT `Vm::new` specializes; only `new_generic` disables it. This
+        // pins the default so a future refactor cannot silently flip the switch.
+        let (vm, fiber) = adaptive_harness(Op::Add);
+        for _ in 0..WARMUP_THRESHOLD {
+            vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Number(1.0))
+                .expect("ok");
+        }
+        assert!(
+            fiber
+                .frame()
+                .closure
+                .proto
+                .chunk
+                .arith_cache(0)
+                .specialized()
+                .is_some(),
+            "default Vm::new must specialize a hot monomorphic site"
+        );
     }
 
     #[test]

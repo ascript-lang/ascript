@@ -4344,3 +4344,218 @@ async fn ic_mixed_object_and_instance_same_site() {
     )
     .await;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  V11-T5: THE THREE-WAY DIFFERENTIAL (the specialization SAFETY NET).
+//
+//  The `--no-specialize` kill switch (`Vm::new_generic` / `vm_run_source_generic`,
+//  `specialize = false`) disables EVERY specialization fast path: the polymorphic
+//  field/method inline caches (GET_PROP/SET_PROP/CALL_METHOD) and the PEP-659
+//  adaptive arithmetic + GET_GLOBAL caches. A non-specializing run takes only the
+//  generic dispatch — no IC consult/record, no adaptive warmup/specialize/deopt.
+//
+//  THE INVARIANT, asserted byte-for-byte over the whole corpus + goldens + an
+//  IC/adaptive/property/method/arithmetic-HEAVY program set:
+//
+//      tree-walker  ==  specialized-VM  ==  generic-VM
+//
+//  Both VM modes MUST be correct and identical; the only legitimate difference is
+//  SPEED. If `generic` and `specialized` ever diverge, a specialization GUARD is
+//  WRONG — that is precisely the bug this net exists to catch. Do NOT "fix" such a
+//  failure by relaxing the assertion: investigate the guard.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run `src` on all THREE engines and assert byte-identical outcomes:
+/// tree-walker == specialized-VM == generic-VM. The outcome of each engine is
+/// normalized to `Ok((stdout, exit))` or `Err(rendered-message)`, so a faulting
+/// program (panic) compares too — a panic in one engine but not the others is
+/// itself a divergence and fails the assertion.
+async fn assert_three_way_matches(src: &str) {
+    let tw = ascript::run_source_exit(src).await;
+    let spec = ascript::vm_run_source(src).await;
+    let generic = ascript::vm_run_source_generic(src).await;
+
+    let norm = |r: &Result<(String, Option<i32>), ascript::error::AsError>| match r {
+        Ok((out, code)) => Ok((out.clone(), *code)),
+        Err(e) => Err(e.to_string()),
+    };
+    let (tw_n, spec_n, gen_n) = (norm(&tw), norm(&spec), norm(&generic));
+
+    // The load-bearing assertion of the whole task: generic == specialized.
+    assert_eq!(
+        spec_n, gen_n,
+        "SPECIALIZATION DIVERGENCE (generic VM != specialized VM) — a real guard \
+         bug surfaced by the kill switch.\n  src: {src:?}\n  specialized: {spec_n:?}\n  \
+         generic:     {gen_n:?}"
+    );
+    // And both VM modes must equal the tree-walker (the ground truth).
+    assert_eq!(
+        tw_n, spec_n,
+        "VM (specialized) diverged from the tree-walker.\n  src: {src:?}\n  \
+         tree-walker: {tw_n:?}\n  vm:          {spec_n:?}"
+    );
+    assert_eq!(
+        tw_n, gen_n,
+        "VM (generic / --no-specialize) diverged from the tree-walker.\n  src: {src:?}\n  \
+         tree-walker: {tw_n:?}\n  vm:          {gen_n:?}"
+    );
+}
+
+#[tokio::test]
+async fn three_way_whole_corpus_generic_equals_specialized_equals_treewalker() {
+    // THE central safety net over the WHOLE corpus (same non-skipped set as oracle
+    // #1). For every non-skipped example, all three engines must agree byte-for-byte.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut ran = 0usize;
+    for rel in all_corpus_examples() {
+        if skip_reason(&rel).is_some() {
+            continue;
+        }
+        let path = std::path::Path::new(root).join(&rel);
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read example {rel}: {e}"));
+
+        let tw = ascript::run_source_exit(&src)
+            .await
+            .unwrap_or_else(|e| panic!("tree-walker failed on non-skipped {rel}: {e:?}"));
+        let spec = ascript::vm_run_source(&src)
+            .await
+            .unwrap_or_else(|e| panic!("specialized VM failed on non-skipped {rel}: {e:?}"));
+        let generic = ascript::vm_run_source_generic(&src)
+            .await
+            .unwrap_or_else(|e| panic!("generic VM failed on non-skipped {rel}: {e:?}"));
+
+        assert_eq!(
+            spec, generic,
+            "SPECIALIZATION DIVERGENCE on `{rel}` (generic VM != specialized VM) — a \
+             real guard bug.\n  specialized: {spec:?}\n  generic:     {generic:?}"
+        );
+        assert_eq!(
+            tw, spec,
+            "specialized VM diverged from tree-walker on `{rel}`\n  tw: {tw:?}\n  vm: {spec:?}"
+        );
+        assert_eq!(
+            tw, generic,
+            "generic VM diverged from tree-walker on `{rel}`\n  tw: {tw:?}\n  vm: {generic:?}"
+        );
+        ran += 1;
+    }
+    assert!(
+        ran >= 18,
+        "expected the three-way gate to run >=18 examples, ran {ran}"
+    );
+    eprintln!("three-way whole-corpus gate: {ran} examples generic==specialized==tree-walker");
+}
+
+#[tokio::test]
+async fn three_way_recorded_goldens_generic_equals_specialized() {
+    // Oracle #2 (recorded goldens) in three-way form: the generic VM must reproduce
+    // the SAME committed golden the specialized VM does — both equal the tree-walker
+    // snapshot. A generic-only drift from the golden is a specialization bug too.
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut checked = 0usize;
+    for rel in byte_identical_examples() {
+        let gpath = golden_path_for(&rel);
+        let golden_text = std::fs::read_to_string(&gpath).unwrap_or_else(|e| {
+            panic!("missing recorded golden for `{rel}`: {e} (record with record_vm_goldens)")
+        });
+        let (want_out, want_exit) = decode_golden(&golden_text);
+
+        let path = std::path::Path::new(root).join(&rel);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+
+        let spec = ascript::vm_run_source(&src)
+            .await
+            .unwrap_or_else(|e| panic!("specialized VM failed on `{rel}`: {e:?}"));
+        let generic = ascript::vm_run_source_generic(&src)
+            .await
+            .unwrap_or_else(|e| panic!("generic VM failed on `{rel}`: {e:?}"));
+
+        assert_eq!(
+            spec, generic,
+            "SPECIALIZATION DIVERGENCE on golden `{rel}`\n  specialized: {spec:?}\n  generic: {generic:?}"
+        );
+        assert_eq!(
+            (want_out.clone(), want_exit),
+            spec,
+            "specialized VM drifted from recorded golden `{rel}`"
+        );
+        assert_eq!(
+            (want_out, want_exit),
+            generic,
+            "generic VM drifted from recorded golden `{rel}`"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 18,
+        "expected >=18 goldens checked three-way, checked {checked}"
+    );
+    eprintln!("three-way goldens: {checked} reproduced by BOTH generic and specialized VM");
+}
+
+#[tokio::test]
+async fn three_way_ic_and_adaptive_heavy_programs() {
+    // Programs deliberately constructed to exercise the IC and adaptive fast paths
+    // through their full state machines under BOTH modes: field reads/writes that
+    // go cold→mono→poly→mega, method dispatch (mono / polymorphic-across-classes /
+    // inherited / field-shadows-method), key-adding mutation that invalidates the
+    // shape, schema receivers (which bypass the field IC), optional chaining, plus
+    // arithmetic that warms up to Number/Decimal/concat and then DEOPTs on a mixed
+    // operand. With specialization OFF none of this machinery runs — yet the output
+    // MUST be byte-identical to the specialized run (and the tree-walker).
+    let progs: &[&str] = &[
+        // Monomorphic field read in a hot loop (Mono IC).
+        "let o = { v: 7 }\nlet t = 0\nfor (i in range(0, 2000)) { t = t + o.v }\nprint(t)",
+        // Polymorphic field read across several shapes at one site (Poly→Mega).
+        "fn pick(i) { if (i % 3 == 0) { return { a: i } }\n if (i % 3 == 1) { return { a: i, b: 1 } }\n return { a: i, b: 1, c: 2 } }\n\
+         let s = 0\nfor (i in range(0, 600)) { s = s + pick(i).a }\nprint(s)",
+        // SET_PROP reassign existing field (in-place) then add a new key (shape change).
+        "let o = { x: 0 }\nfor (i in range(0, 500)) { o.x = o.x + i }\no.y = 99\nprint(o.x)\nprint(o.y)",
+        // Instance field hot read+write through declared-field contracts.
+        "class P { x: number\n fn init(v) { self.x = v } }\nlet p = P(0)\nfor (i in range(0, 1000)) { p.x = p.x + 1 }\nprint(p.x)",
+        // Monomorphic method dispatch in a hot loop (method IC Mono).
+        "class C { fn bump(n) { return n + 1 } }\nlet c = C()\nlet t = 0\nfor (i in range(0, 1500)) { t = c.bump(t) }\nprint(t)",
+        // Polymorphic method dispatch across distinct classes at one call site.
+        "class A { fn k() { return 1 } }\nclass B { fn k() { return 2 } }\n\
+         fn pick(i) { if (i % 2 == 0) { return A() } return B() }\n\
+         let s = 0\nfor (i in range(0, 800)) { s = s + pick(i).k() }\nprint(s)",
+        // Inherited method dispatch (resolves up the chain, ANCESTOR defining class).
+        "class Animal { fn speak() { return 1 } }\nclass Dog extends Animal {}\n\
+         let d = Dog()\nlet s = 0\nfor (i in range(0, 500)) { s = s + d.speak() }\nprint(s)",
+        // A field SHADOWS a method — the IC must NOT fast-path it (reads the field).
+        "class K { fn v() { return 1 } }\nlet k = K()\nk.v = 42\nprint(k.v)",
+        // Optional chain with nil receiver short-circuits (never consults the IC).
+        "let o = nil\nprint(o?.x)\nlet p = { x: 5 }\nprint(p?.x)",
+        // Mixed Object/Instance at the SAME GET_PROP site (interleaved shapes).
+        "class Cell { v: number\n fn init(n) { self.v = n } }\n\
+         fn val(o) { return o.v }\n\
+         let total = 0\nfor (i in range(0, 400)) {\n let o = nil\n if (i % 2 == 0) { o = { v: i } } else { o = Cell(i) }\n total = total + val(o)\n }\nprint(total)",
+        // Adaptive arithmetic: warm up to Number, stay Number (Number fast path).
+        "let t = 0\nfor (i in range(0, 3000)) { t = t + i * 2 - 1 }\nprint(t)",
+        // Adaptive arithmetic across kinds at one offset (number then concat → deopt).
+        "fn add(a, b) { return a + b }\nprint(add(1, 2))\nprint(add(\"x\", \"y\"))\nprint(add(3, 4))\nprint(add(\"p\", \"q\"))",
+        // GET_GLOBAL cache: a builtin referenced repeatedly in a hot loop.
+        "let t = 0\nfor (i in range(0, 1000)) { t = t + len([1, 2, 3]) }\nprint(t)",
+    ];
+    for src in progs {
+        assert_three_way_matches(src).await;
+    }
+}
+
+#[tokio::test]
+async fn three_way_smoke_basic_constructs() {
+    // A small spread of language constructs so the three-way invariant is checked
+    // even outside the corpus/IC sets (arithmetic, strings, control flow, errors).
+    let progs: &[&str] = &[
+        "print(1 + 2 * 3 - 4 / 2)",
+        "print(`x=${1 + 1} y=${\"a\" + \"b\"}`)",
+        "let a = [1, 2, 3]\nprint(a[1])\nprint(len(a))",
+        "fn f(n: number) { return n }\nprint(f(\"bad\"))", // contract panic — same on all three
+        "fn parse(ok) { if (ok) { return Ok(1) } return Err(\"e\") }\nfn u(ok) { let v = parse(ok)?\n return v }\nprint(u(true))",
+        "exit(3)",
+    ];
+    for src in progs {
+        assert_three_way_matches(src).await;
+    }
+}
