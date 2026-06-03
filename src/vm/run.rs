@@ -1126,6 +1126,92 @@ impl Vm {
                     fiber.push(Value::Object(Rc::new(RefCell::new(remaining))));
                 }
 
+                Op::MatchArray => {
+                    // `subject -- ok:bool`. Pop the subject; push whether it is an
+                    // Array whose length is exactly `len` (exact == 1) or at least
+                    // `len` (exact == 0, the `...rest` case). A non-array → false.
+                    // Mirrors the tree-walker's `Pattern::Array` length/type guard.
+                    let len = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let exact = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) == 1;
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::Array(a) => {
+                            let n = a.borrow().len();
+                            if exact {
+                                n == len
+                            } else {
+                                n >= len
+                            }
+                        }
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchObject => {
+                    // `subject -- ok:bool`. Pop the subject; push whether it is an
+                    // Object or Instance. Mirrors the head guard of the tree-walker's
+                    // `Pattern::Object` (any other value is a structural mismatch).
+                    let subject = fiber.pop();
+                    let ok = matches!(subject, Value::Object(_) | Value::Instance(_));
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchHasKey => {
+                    // `subject -- ok:bool`. Pop the subject (an Object/Instance per
+                    // `MatchObject`) and push whether it has the field `consts[idx]`.
+                    // Mirrors the per-entry `fields.get(key)` presence check. Popping
+                    // (not peeking) avoids orphaning the subject on a missing-key
+                    // fail-jump; the matched path reloads the subject temp.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("MATCH_HAS_KEY operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::Object(o) => o.borrow().contains_key(key.as_ref()),
+                        Value::Instance(i) => i.borrow().fields.contains_key(key.as_ref()),
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchRange => {
+                    // `subject lo hi -- ok:bool` (hi on top). Pop all three; push
+                    // whether the subject is a Number in `[lo, hi)` (or `[lo, hi]` when
+                    // inclusive). A non-number subject OR bound → false, mirroring the
+                    // tree-walker's `Pattern::Range` (never a panic).
+                    let inclusive = fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
+                    let hi = fiber.pop();
+                    let lo = fiber.pop();
+                    let subject = fiber.pop();
+                    let ok = match (&subject, &lo, &hi) {
+                        (Value::Number(n), Value::Number(lo), Value::Number(hi)) => {
+                            *n >= *lo && if inclusive { *n <= *hi } else { *n < *hi }
+                        }
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchNoArm => {
+                    // No arm matched: raise the Tier-2 panic at this op's span (the
+                    // `MatchExpr`'s code span), byte-identical to the tree-walker's
+                    // `AsError::at("no matching arm in match expression", expr.span)`.
+                    return Err(self.panic_at(
+                        fiber,
+                        fault_ip,
+                        "no matching arm in match expression".to_string(),
+                    ));
+                }
+
                 Op::GetUpvalue => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let v = fiber.frame().closure.upvalues[idx].borrow().clone();

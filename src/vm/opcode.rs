@@ -356,6 +356,39 @@ pub enum Op {
     /// SOURCE keys). The source has already been validated; any other value is a
     /// compiler bug.
     ObjectRest,
+
+    // ---- match pattern tests (V10-T3/T4) ----------------------------------
+    /// `MATCH_ARRAY(u16 len, u8 exact)` — `subject -- ok:bool`. Pop the subject and
+    /// push `true` iff it is a `Value::Array` whose length is exactly `len` (when
+    /// `exact == 1`) or at least `len` (when `exact == 0`, i.e. the pattern has a
+    /// `...rest`). Any non-array subject pushes `false`. Mirrors the tree-walker's
+    /// `Pattern::Array` length/type guard (a non-array or wrong-length array is a
+    /// structural mismatch, never a panic). The matched sub-elements are read
+    /// separately by reloading the subject temp and applying `ARRAY_ELEM`/`ARRAY_REST`.
+    MatchArray,
+    /// `MATCH_OBJECT` — `subject -- ok:bool`. Pop the subject and push `true` iff it
+    /// is a `Value::Object` or `Value::Instance`. Any other value pushes `false`.
+    /// Mirrors the type guard at the head of the tree-walker's `Pattern::Object`.
+    MatchObject,
+    /// `MATCH_HAS_KEY(u16 const)` — `subject -- ok:bool`. Pop the subject (an
+    /// Object/Instance per `MATCH_OBJECT`) and push `true` iff it has the field
+    /// `consts[const]` (a `Str`). Mirrors the per-entry `fields.get(key)` presence
+    /// check (a missing key is a structural mismatch). The subject is popped (not
+    /// peeked) so a missing-key fail-jump leaves NO orphaned value on the stack; the
+    /// matched-key path reloads the subject temp for the sub-value read.
+    MatchHasKey,
+    /// `MATCH_RANGE(u8 inclusive)` — `subject lo hi -- ok:bool` (hi on top). Pop the
+    /// three operands and push `true` iff the subject is a `Value::Number` `n`, `lo`
+    /// and `hi` are `Value::Number`s, and `n >= lo && (n <= hi if inclusive else
+    /// n < hi)`. Any non-number among the three pushes `false`. Mirrors the
+    /// tree-walker's `Pattern::Range` EXACTLY (non-number subject/bound → no match,
+    /// never a panic).
+    MatchRange,
+    /// `MATCH_NO_ARM` — unconditionally raise the Tier-2 panic `no matching arm in
+    /// match expression` at this op's span (the `MatchExpr`'s code span). Emitted at
+    /// the fall-through end of a `match` when no arm matched, byte-identical to the
+    /// tree-walker's `AsError::at("no matching arm in match expression", expr.span)`.
+    MatchNoArm,
 }
 
 impl Op {
@@ -460,6 +493,12 @@ impl Op {
             x if x == ArrayRest as u8 => ArrayRest,
             x if x == ObjectRest as u8 => ObjectRest,
 
+            x if x == MatchArray as u8 => MatchArray,
+            x if x == MatchObject as u8 => MatchObject,
+            x if x == MatchHasKey as u8 => MatchHasKey,
+            x if x == MatchRange as u8 => MatchRange,
+            x if x == MatchNoArm as u8 => MatchNoArm,
+
             _ => return None,
         })
     }
@@ -473,16 +512,16 @@ impl Op {
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | Closure | NewArray | NewObject
             | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import
-            | ArrayElem | ObjectKey | ArrayRest | ObjectRest => 2,
+            | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
 
             // u8-operand ops.
-            Call => 1,
+            Call | MatchRange => 1,
 
             // u16 + u8 operand op.
-            CallMethod => 3,
+            CallMethod | MatchArray => 3,
 
             // Zero-operand ops.
             Nil | True | False | Pop | Dup | Swap | Rot3 | Add | Sub | Mul | Div | Mod | Pow
@@ -490,7 +529,7 @@ impl Op {
             | SpreadArgs | AppendArray | AppendObject | SpreadObject | CallSpread | GetIndex
             | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate
             | Unwrap | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen
-            | CheckArrayDestructure | CheckObjectDestructure => 0,
+            | CheckArrayDestructure | CheckObjectDestructure | MatchObject | MatchNoArm => 0,
         }
     }
 
@@ -591,6 +630,11 @@ mod tests {
         Op::ObjectKey,
         Op::ArrayRest,
         Op::ObjectRest,
+        Op::MatchArray,
+        Op::MatchObject,
+        Op::MatchHasKey,
+        Op::MatchRange,
+        Op::MatchNoArm,
     ];
 
     #[test]

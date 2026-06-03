@@ -746,10 +746,12 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     // `rest.as`: rest params + spread in literals/calls incl. a forwarding
     // round-trip (`wrap(...args)` → `sum(...args)`) (V10-T2 + V4-T4).
     "examples/rest.as",
+    // V10-T3/T4 adds the full `match` expression (all patterns, guards, Option-C,
+    // |-alternatives), so the two match-driven examples now qualify end-to-end.
+    "examples/pattern_matching.as", // every pattern kind + guards + Option-C + |.
+    "examples/oop.as",              // enum-variant patterns in a method's `match`.
     // DELIBERATELY EXCLUDED (verified by the empirical scan — these ERROR at VM
     // compile time, they do NOT diverge, so they correctly never qualify):
-    //   - `oop.as`              — uses `match` (V10) in `shapeName`.
-    //   - `pattern_matching.as` — `match` (V10).
     //   - `shape_validation.as` — `import` (V12) AND `.from` with a nested-class
     //     field + an Object→`map<K,Class>` boundary coercion + field defaults (V12,
     //     task #157). The VM rejects it at compile time.
@@ -3410,6 +3412,237 @@ async fn vm_run_spread_examples_match_treewalker() {
         assert_eq!(
             tw, vm,
             "VM diverged from tree-walker for `{rel}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+        );
+    }
+}
+
+// ============================================================================
+// V10-T3/T4: match expression — all pattern kinds, guards, Option-C, |-alts.
+// Every case must be byte-identical between the tree-walker and the VM. The
+// tree-walker is the ground truth (`src/interp.rs` match_pattern + the Match
+// eval): first matching arm wins (top-to-bottom; within an arm any |-alt that
+// matches AND whose guard passes runs it); a failed guard falls through to the
+// next |-alt then the next arm; no arm matches → the Tier-2 panic
+// "no matching arm in match expression".
+// ============================================================================
+
+/// Run `src` (a full program) on both engines and assert byte-identical
+/// stdout+exit, OR (when both error) byte-identical panic message. This is the
+/// match differential — covers both success programs and the no-arm panic.
+async fn assert_vm_match_parity(src: &str) {
+    let tw = ascript::run_source(src).await;
+    let vm = ascript::vm_run_source(src).await;
+    match (tw, vm) {
+        (Ok(tw_out), Ok((vm_out, code))) => {
+            assert_eq!(code, None, "no exit code expected for `{src}`");
+            assert_eq!(
+                tw_out, vm_out,
+                "VM stdout diverged from tree-walker for `{src}`\n  tw: {tw_out:?}\n  vm: {vm_out:?}"
+            );
+        }
+        (Err(tw_err), Err(vm_err)) => {
+            assert_eq!(
+                tw_err.message, vm_err.message,
+                "VM panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, vm_err.message
+            );
+        }
+        (tw, vm) => panic!(
+            "VM/tree-walker outcome shape diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn vm_match_value_wildcard() {
+    let cases = [
+        r#"let x = 1; print(match x { 1 => "one", 2 => "two", _ => "other" })"#,
+        r#"let x = 2; print(match x { 1 => "one", 2 => "two", _ => "other" })"#,
+        r#"let x = 9; print(match x { 1 => "one", 2 => "two", _ => "other" })"#,
+        r#"print(match "sat" { "sat" => 1, "sun" => 2, _ => 0 })"#,
+        r#"print(match true { true => "t", false => "f" })"#,
+        r#"print(match nil { nil => "nil!", _ => "no" })"#,
+        // match as a sub-expression value, used in arithmetic.
+        r#"let n = 3; print((match n { 3 => 10, _ => 0 }) + 5)"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_option_c_compare_vs_bind() {
+    let cases = [
+        // `k` IS defined → compare (switch-like). `other` is a fall-through bind.
+        r#"let k = 5; let v = 5; print(match v { k => "matched k", other => other })"#,
+        r#"let k = 5; let v = 9; print(match v { k => "matched k", other => other })"#,
+        // A bare-ident pattern that is NOT defined → binds the subject.
+        r#"let v = 42; print(match v { captured => captured })"#,
+        // Defined-name compare against a non-equal subject falls to the bind arm,
+        // and the bound name is usable in the body.
+        r#"const NOT_FOUND = 404; print(match 200 { NOT_FOUND => "nf", other => other })"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_ranges() {
+    let cases = [
+        r#"print(match 5 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#,
+        r#"print(match 10 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#,  // 10 excluded from 0..10
+        r#"print(match 100 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#, // 100 included in ..=100
+        r#"print(match 500 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#,
+        // Range against a non-number subject → no match (falls to default).
+        r#"print(match "x" { 0..10 => "n", _ => "other" })"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_or_alternatives() {
+    let cases = [
+        r#"print(match "b" { "a" | "b" | "c" => "abc", _ => "?" })"#,
+        r#"print(match "z" { "a" | "b" | "c" => "abc", _ => "?" })"#,
+        r#"print(match 2 { 1 | 2 | 3 => "low", 4 | 5 => "mid", _ => "hi" })"#,
+        r#"print(match 5 { 1 | 2 | 3 => "low", 4 | 5 => "mid", _ => "hi" })"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_guards() {
+    let cases = [
+        r#"print(match 200 { x if x > 100 => "big", x => "small" })"#,
+        r#"print(match 50 { x if x > 100 => "big", x => "small" })"#,
+        // Guard failure falls through to the next arm.
+        r#"print(match 5 { n if n > 10 => "a", n if n > 3 => "b", _ => "c" })"#,
+        r#"print(match 2 { n if n > 10 => "a", n if n > 3 => "b", _ => "c" })"#,
+        // Guard on a defined-name compare.
+        r#"let t = 7; print(match 7 { t if false => "no", _ => "yes" })"#,
+        // Guard combined with |-alternatives: a failed guard tries the NEXT arm,
+        // not the next alt (mirror the tree-walker's `continue`).
+        r#"print(match 4 { 4 | 5 if false => "x", _ => "fallthrough" })"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_array_patterns() {
+    let cases = [
+        r#"fn d(a) { return match a { [] => "empty", [x] => "one", [x, y] => "two", [first, ...rest] => "many" } }
+print(d([])); print(d([1])); print(d([1, 2])); print(d([1, 2, 3]))"#,
+        // bind values used in the body.
+        r#"print(match [1, 2, 3] { [a, b, c] => a + b + c, _ => 0 })"#,
+        r#"print(match [10] { [x] => x, _ => -1 })"#,
+        // rest captures the tail (as an array).
+        r#"print(match [1, 2, 3, 4] { [head, ...tail] => tail, _ => nil })"#,
+        // discard rest `...`.
+        r#"print(match [1, 2, 3] { [first, ...] => first, _ => nil })"#,
+        // nested value pattern inside the array.
+        r#"print(match [1, nil] { [v, nil] => v, [_, e] => e, _ => "?" })"#,
+        r#"print(match [1, "boom"] { [v, nil] => v, [_, e] => e, _ => "?" })"#,
+        // array pattern against a non-array → no match.
+        r#"print(match 5 { [x] => x, _ => "not array" })"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_object_patterns() {
+    let cases = [
+        // shorthand bind, sub-pattern value compare, rest.
+        r#"fn f(o) { return match o { {type: "a", value} => value, {type} => type, _ => "none" } }
+print(f({type: "a", value: 99})); print(f({type: "b"})); print(f({other: 1}))"#,
+        // sub-pattern renames via `key: subpat`.
+        r#"print(match {role: "admin"} { {role: "admin"} => "is admin", {role: r} => r, _ => "no role" })"#,
+        r#"print(match {role: "guest", name: "Sam"} { {role: r, name: n} => n, {role: r} => r, _ => "?" })"#,
+        // object rest collects leftover keys.
+        r#"print(match {type: "click", x: 1, y: 2, target: "b"} { {type: t, ...extra} => extra, _ => nil })"#,
+        // missing required key → no match, falls through.
+        r#"print(match {a: 1} { {b} => b, _ => "no b" })"#,
+        // object pattern against a non-object → no match.
+        r#"print(match 5 { {a} => a, _ => "not object" })"#,
+        // instance fields match an object pattern.
+        r#"class P { fn init(x) { self.x = x } }
+print(match P(7) { {x} => x, _ => "?" })"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_nested_patterns() {
+    let cases = [
+        r#"print(match {items: [1, 2, 3]} { {items: [first, ...]} => first, _ => nil })"#,
+        r#"print(match {items: []} { {items: [first, ...]} => first, _ => "empty" })"#,
+        // nested object inside array.
+        r#"print(match [{k: "v"}] { [{k}] => k, _ => "?" })"#,
+        // deep nesting with a guard.
+        r#"print(match {a: {b: 5}} { {a: {b}} if b > 3 => "big b", _ => "small" })"#,
+        r#"print(match {a: {b: 1}} { {a: {b}} if b > 3 => "big b", _ => "small" })"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_no_arm_panics_identically() {
+    // No arm matches → both engines raise the SAME Tier-2 panic message.
+    let cases = [
+        r#"print(match 5 { 1 => "a", 2 => "b" })"#,
+        r#"print(match "x" { "a" => 1, "b" => 2 })"#,
+        r#"print(match [1, 2, 3] { [] => "e", [x] => "one" })"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_enum_variant_patterns() {
+    // Enum-variant patterns are `LiteralPat`s holding a member expr (`Shape.Circle`)
+    // → a value compare against the resolved variant value.
+    let cases = [
+        r#"enum Shape { Circle, Square, Triangle }
+fn name(s) { return match s { Shape.Circle => "circle", Shape.Square => "square", _ => "other" } }
+print(name(Shape.Circle)); print(name(Shape.Square)); print(name(Shape.Triangle))"#,
+    ];
+    for src in cases {
+        assert_vm_match_parity(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_match_corpus_examples() {
+    // The two corpus examples that exercise `match` end-to-end must now produce
+    // byte-identical stdout+exit on the VM. `pattern_matching.as` covers every
+    // pattern kind; `oop.as` covers enum-variant patterns inside a method.
+    let root = env!("CARGO_MANIFEST_DIR");
+    for rel in ["examples/pattern_matching.as", "examples/oop.as"] {
+        let path = std::path::Path::new(root).join(rel);
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read example {rel}: {e}"));
+        let tw = ascript::run_source_exit(&src)
+            .await
+            .unwrap_or_else(|e| panic!("tree-walker failed on {rel}: {e:?}"));
+        let vm = ascript::vm_run_source(&src)
+            .await
+            .unwrap_or_else(|e| panic!("VM failed on {rel}: {e:?}"));
+        assert_eq!(
+            tw, vm,
+            "VM diverged from tree-walker for `{rel}`\n  tw: {tw:?}\n  vm: {vm:?}"
         );
     }
 }

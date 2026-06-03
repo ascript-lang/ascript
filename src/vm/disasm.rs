@@ -106,9 +106,16 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
         }
         // u16 const-pool index (a destructure key, or the bound-keys array) →
         // show the referenced value.
-        Op::ObjectKey | Op::ObjectRest => {
+        Op::ObjectKey | Op::ObjectRest | Op::MatchHasKey => {
             let idx = chunk.read_u16(at + 1);
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
+        }
+        // u16 expected length + u8 exact-match flag (1 = exact, 0 = >=).
+        Op::MatchArray => {
+            let len = chunk.read_u16(at + 1);
+            let exact = chunk.read_u8(at + 3);
+            let cmp = if exact == 1 { "==" } else { ">=" };
+            let _ = write!(line, "{len:>5} {exact} ; len {cmp} {len}");
         }
         // Other u16-operand ops: just show the operand (no special comment).
         _ if width == 2 => {
@@ -224,6 +231,11 @@ fn op_name(op: Op) -> &'static str {
         ObjectKey => "OBJECT_KEY",
         ArrayRest => "ARRAY_REST",
         ObjectRest => "OBJECT_REST",
+        MatchArray => "MATCH_ARRAY",
+        MatchObject => "MATCH_OBJECT",
+        MatchHasKey => "MATCH_HAS_KEY",
+        MatchRange => "MATCH_RANGE",
+        MatchNoArm => "MATCH_NO_ARM",
     }
 }
 

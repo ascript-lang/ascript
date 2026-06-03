@@ -13,9 +13,9 @@ use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
     ClassDecl, ContinueStmt, EnumDecl, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal,
-    MemberExpr, MethodDecl, NameRef, ObjectExpr, ObjectField, OptMemberExpr, ParenExpr, RangeExpr,
-    ReturnStmt, SourceFile, SpreadElem, Stmt, TemplateExpr, TernaryExpr, TryExpr, UnaryExpr,
-    UnwrapExpr, WhileStmt, YieldExpr,
+    MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef, ObjectExpr, ObjectField, OptMemberExpr,
+    ParenExpr, RangeExpr, ReturnStmt, SourceFile, SpreadElem, Stmt, TemplateExpr, TernaryExpr,
+    TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
@@ -482,10 +482,7 @@ impl Compiler {
             Expr::ArrowExpr(arrow) => self.compile_arrow(arrow),
             Expr::AwaitExpr(a) => self.compile_await(a),
             Expr::YieldExpr(y) => self.compile_yield(y),
-            other => Err(CompileError::new(
-                "expression kind not yet supported in V2",
-                node_span(other),
-            )),
+            Expr::MatchExpr(m) => self.compile_match(m),
         }
     }
 
@@ -2249,6 +2246,410 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile a `match subject { arm... }` EXPRESSION. Mirrors the tree-walker's
+    /// `ExprKind::Match` + `match_pattern` BYTE-FOR-BYTE: the subject is evaluated
+    /// once; arms are tested top-to-bottom; within an arm each `|`-alternative is
+    /// tried in order; an alternative whose pattern matches AND whose guard passes
+    /// runs that arm's body (the match's value). A **failed guard falls through to
+    /// the NEXT alternative** (the tree-walker `continue`s its per-pattern loop),
+    /// then to the next arm once all alternatives are exhausted. No arm matches →
+    /// the Tier-2 panic `no matching arm in match expression` at the match span.
+    ///
+    /// Lowering:
+    /// ```text
+    ///   <subject>; SET_LOCAL subj_temp        ; eval the subject ONCE
+    ///   ; per arm, per |-alternative:
+    ///     <pattern tests against subj_temp>    ; each test: push bool;
+    ///                                           ; JUMP_IF_FALSE next_alt
+    ///     ; (pattern binds happen eagerly into the resolver's arm-local slots
+    ///     ;  during the tests above)
+    ///     <guard>? ; JUMP_IF_FALSE next_alt    ; guard failure → next alternative
+    ///     <body>; JUMP match_end               ; arm matched → push value, done
+    ///   next_alt:                              ; the next alternative / next arm
+    ///   ...
+    ///   MATCH_NO_ARM                           ; reached only if nothing matched
+    ///   match_end:                             ; ONE body value on the stack
+    /// ```
+    /// Exactly one body runs, each body pushes one value, and the no-match path
+    /// diverges (panics) — so the net stack effect is +1.
+    fn compile_match(&mut self, m: &MatchExpr) -> Result<(), CompileError> {
+        let span = node_code_span(m);
+        let subject = m
+            .subject()
+            .ok_or_else(|| CompileError::new("match expression missing subject", span))?;
+
+        // Evaluate the subject ONCE into a temp slot (read once per pattern test).
+        let subj_temp = self.alloc_temp()?;
+        self.compile_expr(&subject)?;
+        self.chunk.emit_u16(Op::SetLocal, subj_temp, span);
+
+        // Forward jumps from each matched arm body to the match end.
+        let mut end_jumps: Vec<usize> = Vec::new();
+
+        for arm in m.match_arms() {
+            // The `|`-alternatives. With alternatives the parser wraps them in an
+            // `OrPat`; `MatchArm::pats()` returns the typed `Pat`s directly only when
+            // there is NO `OrPat`. So gather the alternative pattern NODES robustly:
+            // an `OrPat` child's pattern children, else the arm's direct pattern.
+            let alts = self.arm_alternatives(&arm)?;
+            let guard = arm.match_guard();
+
+            for alt in &alts {
+                // Fail sites for THIS alternative — a failed pattern test or a failed
+                // guard jumps here, to the start of the next alternative / next arm.
+                let mut fail_sites: Vec<usize> = Vec::new();
+                // Emit the pattern test (binds eagerly; appends fail-jump sites).
+                self.compile_pattern_test(alt, subj_temp, span, &mut fail_sites)?;
+                // Guard (if any): evaluated AFTER the binds, in the arm scope. A
+                // falsy guard falls through to the next alternative (tree-walker
+                // `continue`), so it shares the alternative's fail target.
+                if let Some(g) = &guard {
+                    let gexpr = g
+                        .expr()
+                        .ok_or_else(|| CompileError::new("match guard missing condition", span))?;
+                    self.compile_expr(&gexpr)?;
+                    fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+                }
+                // Matched (+ guard passed): run the body and jump to the end.
+                let body = arm
+                    .body()
+                    .ok_or_else(|| CompileError::new("match arm missing body", span))?;
+                self.compile_expr(&body)?;
+                end_jumps.push(self.chunk.emit_jump(Op::Jump, span));
+                // The next alternative / next arm begins here: patch every fail jump
+                // of THIS alternative to land at the current position.
+                for site in fail_sites {
+                    self.chunk.patch_jump(site);
+                }
+            }
+        }
+
+        // No arm matched → panic, byte-identical to the tree-walker.
+        self.chunk.emit(Op::MatchNoArm, span);
+
+        // All matched-arm bodies converge here with one value on the stack.
+        for site in end_jumps {
+            self.chunk.patch_jump(site);
+        }
+        Ok(())
+    }
+
+    /// Gather an arm's `|`-alternative pattern NODES. The parser wraps two-or-more
+    /// alternatives in an `OrPat` node (`MatchArm = Pat ('|' Pat)*`), so the
+    /// alternatives are that `OrPat`'s pattern children; a single-pattern arm has
+    /// the pattern as a direct child. Returns the raw `ResolvedNode`s (we resolve
+    /// binds/compares per node via the resolver, keyed by `text_range`).
+    fn arm_alternatives(
+        &self,
+        arm: &MatchArm,
+    ) -> Result<Vec<ResolvedNode>, CompileError> {
+        use SyntaxKind::*;
+        let mut out: Vec<ResolvedNode> = Vec::new();
+        for child in arm.syntax().children() {
+            match child.kind() {
+                OrPat => {
+                    for sub in child.children().filter(|c| is_pattern_kind(c.kind())) {
+                        out.push(sub.clone());
+                    }
+                }
+                k if is_pattern_kind(k) => out.push(child.clone()),
+                _ => {}
+            }
+        }
+        if out.is_empty() {
+            return Err(CompileError::new(
+                "match arm has no pattern",
+                range_span(arm.syntax()),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Emit a test for `pat` against the value in local slot `subj_temp`. Each
+    /// structural check pushes a boolean and is followed by a `JUMP_IF_FALSE` whose
+    /// site is appended to `fail_sites` (the caller patches them to the
+    /// next-alternative target). Binds happen eagerly into the resolver's arm-local
+    /// slots — a later sub-test failing just discards them (the arm's slots are
+    /// overwritten / never read), matching the tree-walker's partial-bind-then-fail.
+    fn compile_pattern_test(
+        &mut self,
+        pat: &ResolvedNode,
+        subj_temp: u16,
+        span: Span,
+        fail_sites: &mut Vec<usize>,
+    ) -> Result<(), CompileError> {
+        use SyntaxKind::*;
+        match pat.kind() {
+            // `_` always matches: no test, no bind.
+            WildcardPat => Ok(()),
+            // A bare ident (Option-C) OR a value expression.
+            LiteralPat => self.compile_literal_pattern(pat, subj_temp, span, fail_sites),
+            RangePat => self.compile_range_pattern(pat, subj_temp, span, fail_sites),
+            ArrayPat => self.compile_array_pattern(pat, subj_temp, span, fail_sites),
+            ObjectPat => self.compile_object_pattern(pat, subj_temp, span, fail_sites),
+            other => Err(CompileError::new(
+                format!("unsupported match pattern kind {other:?}"),
+                range_span(pat),
+            )),
+        }
+    }
+
+    /// A `LiteralPat` — either a bare-ident pattern (Option-C: COMPARE if the
+    /// resolver resolved the ident as a use, BIND if the resolver allocated a
+    /// pattern slot for it) or a value expression (eval + `==`). The resolver is the
+    /// single source of truth for the bind-vs-compare decision so the VM and checker
+    /// agree EXACTLY (`resolve_pattern`'s `LiteralPat` arm).
+    fn compile_literal_pattern(
+        &mut self,
+        pat: &ResolvedNode,
+        subj_temp: u16,
+        span: Span,
+        fail_sites: &mut Vec<usize>,
+    ) -> Result<(), CompileError> {
+        // Is this a single bare `NameRef`? If so it is subject to Option-C.
+        if let Some(name_ref) = bare_ident_name_ref(pat) {
+            let key = name_ref.text_range();
+            // The resolver records a `use` (Resolution) for a COMPARE ident; for a
+            // BIND it records NO use and instead allocated a PatternBind slot whose
+            // `decl_range` is the LiteralPat node's `text_range()`.
+            if let Some(res) = self.resolved.uses.get(&key).cloned() {
+                // COMPARE: load subject, push the resolved value, `==`, fail if false.
+                self.emit_get_local_temp(subj_temp, span);
+                self.emit_resolution_read(&res, span)?;
+                self.chunk.emit(Op::Eq, span);
+                fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+                return Ok(());
+            }
+            // BIND: store the subject into the pattern slot (always matches).
+            let slot = self.pattern_bind_slot(pat, range_span(pat))?;
+            self.emit_get_local_temp(subj_temp, span);
+            self.emit_set_local(slot, span);
+            return Ok(());
+        }
+        // A value expression (literal / member like `Shape.Circle` / etc.): eval and
+        // compare for equality, exactly like the tree-walker's `Pattern::Value`.
+        let inner = pat.children().find(|c| is_expr_kind(c.kind())).ok_or_else(|| {
+            CompileError::new("literal pattern has no value expression", range_span(pat))
+        })?;
+        let inner_expr = Expr::cast(inner.clone()).ok_or_else(|| {
+            CompileError::new("literal pattern value is not an expression", range_span(pat))
+        })?;
+        self.emit_get_local_temp(subj_temp, span);
+        self.compile_expr(&inner_expr)?;
+        self.chunk.emit(Op::Eq, span);
+        fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+        Ok(())
+    }
+
+    /// A `RangePat` `start..end` / `start..=end`. Mirrors the tree-walker's
+    /// `Pattern::Range`: a non-number subject OR non-number bound is a (non-panic)
+    /// mismatch. Lowering: push subject, lo, hi; `MATCH_RANGE inclusive` → bool.
+    fn compile_range_pattern(
+        &mut self,
+        pat: &ResolvedNode,
+        subj_temp: u16,
+        span: Span,
+        fail_sites: &mut Vec<usize>,
+    ) -> Result<(), CompileError> {
+        let exprs: Vec<ResolvedNode> = pat
+            .children()
+            .filter(|c| is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        if exprs.len() != 2 {
+            return Err(CompileError::new(
+                "range pattern must have a start and end bound",
+                range_span(pat),
+            ));
+        }
+        let inclusive = pat
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == SyntaxKind::DotDotEq);
+        let lo = Expr::cast(exprs[0].clone())
+            .ok_or_else(|| CompileError::new("range start is not an expression", range_span(pat)))?;
+        let hi = Expr::cast(exprs[1].clone())
+            .ok_or_else(|| CompileError::new("range end is not an expression", range_span(pat)))?;
+        self.emit_get_local_temp(subj_temp, span);
+        self.compile_expr(&lo)?;
+        self.compile_expr(&hi)?;
+        self.chunk
+            .emit_u8(Op::MatchRange, u8::from(inclusive), span);
+        fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+        Ok(())
+    }
+
+    /// An `ArrayPat` `[p0, p1, ...rest]`. Mirrors the tree-walker's `Pattern::Array`:
+    /// the subject must be an Array of the right length (exact without a rest, `>=`
+    /// the fixed count with one), then each fixed position is tested recursively and
+    /// the optional `...rest` collects the tail.
+    fn compile_array_pattern(
+        &mut self,
+        pat: &ResolvedNode,
+        subj_temp: u16,
+        span: Span,
+        fail_sites: &mut Vec<usize>,
+    ) -> Result<(), CompileError> {
+        use SyntaxKind::*;
+        let fixed: Vec<ResolvedNode> = pat
+            .children()
+            .filter(|c| is_pattern_kind(c.kind()))
+            .cloned()
+            .collect();
+        let rest: Option<ResolvedNode> =
+            pat.children().find(|c| c.kind() == PatRest).cloned();
+        let fixed_len = u16::try_from(fixed.len()).map_err(|_| {
+            CompileError::new("array pattern has too many elements", range_span(pat))
+        })?;
+
+        // Length/type test: `MATCH_ARRAY fixed_len, exact?` → bool.
+        self.emit_get_local_temp(subj_temp, span);
+        self.chunk.emit_u16_u8(
+            Op::MatchArray,
+            fixed_len,
+            u8::from(rest.is_none()),
+            span,
+        );
+        fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+
+        // Each fixed position: extract `subject[i]` into a fresh temp, recurse.
+        for (i, sub) in fixed.iter().enumerate() {
+            let i = u16::try_from(i).map_err(|_| {
+                CompileError::new("array pattern index exceeds 65535", range_span(pat))
+            })?;
+            let elem_temp = self.alloc_temp()?;
+            self.emit_get_local_temp(subj_temp, span);
+            self.chunk.emit_u16(Op::ArrayElem, i, span);
+            self.chunk.emit_u16(Op::SetLocal, elem_temp, span);
+            self.compile_pattern_test(sub, elem_temp, span, fail_sites)?;
+        }
+
+        // `...rest`: bind the tail (`subject[fixed_len..]`) into the rest slot. A
+        // bare `...` (no name) is a discard — collect nothing.
+        if let Some(rest) = rest {
+            if rest.children_with_tokens().any(|el| {
+                el.as_token().map(|t| t.kind() == Ident).unwrap_or(false)
+            }) {
+                let slot = self.pattern_bind_slot(&rest, range_span(&rest))?;
+                self.emit_get_local_temp(subj_temp, span);
+                self.chunk.emit_u16(Op::ArrayRest, fixed_len, span);
+                self.emit_set_local(slot, span);
+            }
+        }
+        Ok(())
+    }
+
+    /// An `ObjectPat` `{k0, k1: sub, ...rest}`. Mirrors the tree-walker's
+    /// `Pattern::Object`: the subject must be an Object/Instance; each entry's key
+    /// must be present (`MATCH_HAS_KEY`), then the entry binds (shorthand) or tests a
+    /// sub-pattern on `subject[key]`; the optional `...rest` collects leftover keys.
+    fn compile_object_pattern(
+        &mut self,
+        pat: &ResolvedNode,
+        subj_temp: u16,
+        span: Span,
+        fail_sites: &mut Vec<usize>,
+    ) -> Result<(), CompileError> {
+        use SyntaxKind::*;
+        // Type test: `MATCH_OBJECT` → bool.
+        self.emit_get_local_temp(subj_temp, span);
+        self.chunk.emit(Op::MatchObject, span);
+        fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+
+        // Bound keys (in source order) for the object-rest exclusion set.
+        let mut bound_keys: Vec<Value> = Vec::new();
+
+        for entry in pat.children().filter(|c| c.kind() == ObjPatEntry) {
+            let key = bind_entry_key(entry).ok_or_else(|| {
+                CompileError::new("object pattern entry has no key", range_span(entry))
+            })?;
+            bound_keys.push(Value::Str(Rc::from(key.as_str())));
+            let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+
+            // Presence test: `MATCH_HAS_KEY key` (pops the subject, pushes bool).
+            self.emit_get_local_temp(subj_temp, span);
+            self.chunk.emit_u16(Op::MatchHasKey, key_idx, span);
+            fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+
+            // A sub-pattern (`key: subpat`) tests `subject[key]`; a shorthand `{key}`
+            // is ALWAYS a bind (documented Option-C exception).
+            if let Some(subpat) = entry.children().find(|c| is_pattern_kind(c.kind())) {
+                let val_temp = self.alloc_temp()?;
+                self.emit_get_local_temp(subj_temp, span);
+                self.chunk.emit_u16(Op::ObjectKey, key_idx, span);
+                self.chunk.emit_u16(Op::SetLocal, val_temp, span);
+                self.compile_pattern_test(subpat, val_temp, span, fail_sites)?;
+            } else {
+                let slot = self.pattern_bind_slot(entry, range_span(entry))?;
+                self.emit_get_local_temp(subj_temp, span);
+                self.chunk.emit_u16(Op::ObjectKey, key_idx, span);
+                self.emit_set_local(slot, span);
+            }
+        }
+
+        // `...rest`: bind leftover (unbound) keys into the rest slot. A bare `...`
+        // (no name) is a discard.
+        if let Some(rest) = pat.children().find(|c| c.kind() == PatRest) {
+            if rest.children_with_tokens().any(|el| {
+                el.as_token().map(|t| t.kind() == Ident).unwrap_or(false)
+            }) {
+                let slot = self.pattern_bind_slot(rest, range_span(rest))?;
+                let keys = Value::Array(Rc::new(std::cell::RefCell::new(bound_keys)));
+                let keys_idx = self.chunk.add_const(keys);
+                self.emit_get_local_temp(subj_temp, span);
+                self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);
+                self.emit_set_local(slot, span);
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a SCRATCH temp slot (`alloc_temp`). Temps are never resolver cell slots,
+    /// so they are always plain `GET_LOCAL` (never the cell variant).
+    fn emit_get_local_temp(&mut self, slot: u16, span: Span) {
+        self.chunk.emit_u16(Op::GetLocal, slot, span);
+    }
+
+    /// Emit the read for a resolved name USE (an Option-C compare ident): the same
+    /// dispatch as `compile_name_ref`'s `uses` arm (local / upvalue / bare builtin
+    /// global). A compare ident only ever resolves to one of those (the resolver
+    /// only records a `use` here when the name was already in scope).
+    fn emit_resolution_read(
+        &mut self,
+        res: &Resolution,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        match res {
+            Resolution::Local(slot) => {
+                let slot = u16::try_from(*slot).map_err(|_| {
+                    CompileError::new("local slot index exceeds 65535", span)
+                })?;
+                self.emit_get_local(slot, span);
+                Ok(())
+            }
+            Resolution::Upvalue(idx) => {
+                let idx = u16::try_from(*idx)
+                    .map_err(|_| CompileError::new("upvalue index exceeds 65535", span))?;
+                self.chunk.emit_u16(Op::GetUpvalue, idx, span);
+                Ok(())
+            }
+            Resolution::Global(name)
+                if crate::interp::BUILTIN_NAMES.contains(&name.as_str()) =>
+            {
+                let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                self.chunk.emit_u16(Op::GetGlobal, idx, span);
+                Ok(())
+            }
+            Resolution::Global(name) => Err(CompileError::new(
+                format!("bare global reference '{name}' not yet supported (V4)"),
+                span,
+            )),
+            Resolution::Unresolved => {
+                Err(CompileError::new("undefined name in match pattern", span))
+            }
+        }
+    }
+
     /// Compile a lexical `Block` `{ ... }`. Blocks do NOT push a runtime scope:
     /// the resolver allocates DISTINCT frame-flat slots for block-scoped bindings
     /// (and for shadowing — an inner `let x` gets a different slot than the outer
@@ -2984,6 +3385,61 @@ fn object_field_key(field: &crate::syntax::ast::ObjectField) -> Option<String> {
         SyntaxKind::Str => Some(unescape_str_body(strip_quotes(tok.text()))),
         // Ident key: raw identifier text, used verbatim.
         _ => Some(tok.text().to_string()),
+    }
+}
+
+/// Whether a `SyntaxKind` is a match-pattern node kind. Mirrors the resolver's
+/// `is_pattern` (minus `IdentPat`, which the parser never produces — bare idents
+/// are `LiteralPat`); `OrPat` is handled by the caller, not as a leaf pattern.
+fn is_pattern_kind(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(kind, WildcardPat | LiteralPat | RangePat | ArrayPat | ObjectPat)
+}
+
+/// Whether a `SyntaxKind` is an expression node kind. Mirrors the resolver's
+/// `is_expr` so the compiler picks the same Expr children inside patterns.
+fn is_expr_kind(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        kind,
+        Literal
+            | NameRef
+            | UnaryExpr
+            | BinaryExpr
+            | ParenExpr
+            | CallExpr
+            | ArgList
+            | MemberExpr
+            | IndexExpr
+            | ArrowExpr
+            | AssignExpr
+            | ArrayExpr
+            | ObjectExpr
+            | TemplateExpr
+            | OptMemberExpr
+            | TryExpr
+            | UnwrapExpr
+            | TernaryExpr
+            | AwaitExpr
+            | YieldExpr
+            | MatchExpr
+            | RangeExpr
+    )
+}
+
+/// If a `LiteralPat` is EXACTLY a single bare `NameRef`, return that NameRef node
+/// (so the caller can look up the resolver's Option-C classification by its
+/// `text_range`). Mirrors the resolver's `bare_ident_pattern` shape check.
+fn bare_ident_name_ref(pat: &ResolvedNode) -> Option<ResolvedNode> {
+    let mut exprs = pat.children().filter(|c| is_expr_kind(c.kind()));
+    let first = exprs.next()?;
+    if exprs.next().is_some() {
+        return None;
+    }
+    if first.kind() == SyntaxKind::NameRef {
+        Some(first.clone())
+    } else {
+        None
     }
 }
 
