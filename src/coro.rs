@@ -30,7 +30,7 @@ use crate::value::Value;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::task::Poll;
 
 thread_local! {
@@ -43,62 +43,136 @@ thread_local! {
 /// `Control` error if it panicked / propagated). `!Send` like the whole runtime.
 type BodyFuture = Pin<Box<dyn Future<Output = Result<Value, Control>>>>;
 
-/// The runtime handle behind `Value::Generator`. Owns the body future and the
-/// value-passing slots. Identity equality (`Rc::ptr_eq`), like other handles.
+/// The two interchangeable engines behind a [`GeneratorHandle`].
+///
+/// `Body` is the original tree-walker generator: a polled body future driven via
+/// the `CURRENT_GEN` stack + `poll_fn` parking. `Vm` is the bytecode VM
+/// generator: a *Suspended Fiber* whose frames stay live between yields (no
+/// `poll_fn`, no `CURRENT_GEN` — `yield` is the `Op::Yield` opcode and `resume`
+/// drives `Vm::run` to the next yield). The two share one `resume`/`close`
+/// dispatch so the interp's `GeneratorMethod` plumbing is engine-agnostic.
+enum GenImpl {
+    /// Tree-walker path (UNCHANGED from the original `GeneratorHandle`).
+    Body {
+        /// The body future, taken out during a poll and put back if it is still
+        /// pending. `None` once the generator has finished (or been closed).
+        body: RefCell<Option<BodyFuture>>,
+        /// Producer -> consumer: the value a `yield` handed out this poll.
+        out: RefCell<Option<Value>>,
+        /// Consumer -> producer: the value `next(v)` passed in, returned by `yield`.
+        inp: RefCell<Option<Value>>,
+        /// First `resume` only starts the body; later ones feed `inp` in.
+        started: Cell<bool>,
+    },
+    /// Bytecode VM path: a Suspended Fiber. The `Fiber` lives in an `Option` so it
+    /// can be *moved out* across the `Vm::run(&mut fiber).await` (the
+    /// take-out-then-await-then-return pattern that keeps a `RefCell` borrow off
+    /// the await — `clippy::await_holding_refcell_ref` stays clean). `None` while
+    /// running (taken out) or once done/closed.
+    Vm {
+        fiber: RefCell<Option<crate::vm::Fiber>>,
+        vm: Weak<crate::vm::Vm>,
+        /// First `resume` starts the fiber from ip 0 and ignores its `input`;
+        /// later resumes push `input` as the suspended `yield` expression's value.
+        started: Cell<bool>,
+        /// Once the fiber returned / errored / was closed: further resumes are
+        /// the `None` done sentinel.
+        done: Cell<bool>,
+    },
+}
+
+/// The runtime handle behind `Value::Generator`. Wraps either engine (tree-walker
+/// body future or VM Suspended Fiber). Identity equality (`Rc::ptr_eq`), like
+/// other handles.
 pub struct GeneratorHandle {
-    /// The body future, taken out during a poll and put back if it is still
-    /// pending. `None` once the generator has finished (or been closed).
-    body: RefCell<Option<BodyFuture>>,
-    /// Producer -> consumer: the value a `yield` handed out this poll.
-    out: RefCell<Option<Value>>,
-    /// Consumer -> producer: the value `next(v)` passed in, returned by `yield`.
-    inp: RefCell<Option<Value>>,
-    /// First `resume` only starts the body; later ones feed `inp` in.
-    started: Cell<bool>,
+    inner: GenImpl,
 }
 
 impl GeneratorHandle {
-    /// Build a handle around an already-constructed body future. The body does not
-    /// run until the first [`resume`](Self::resume).
+    /// Build a (tree-walker) handle around an already-constructed body future. The
+    /// body does not run until the first [`resume`](Self::resume).
     pub fn new(body: BodyFuture) -> Self {
         GeneratorHandle {
-            body: RefCell::new(Some(body)),
-            out: RefCell::new(None),
-            inp: RefCell::new(None),
-            started: Cell::new(false),
+            inner: GenImpl::Body {
+                body: RefCell::new(Some(body)),
+                out: RefCell::new(None),
+                inp: RefCell::new(None),
+                started: Cell::new(false),
+            },
         }
     }
 
-    /// Producer side, called from inside the body via the `yield` expression. Parks
-    /// the value in `out` and suspends the body future until the consumer's next
-    /// `resume` deposits a value in `inp`, which becomes `yield`'s result.
+    /// Build a VM-backed handle around a NOT-STARTED [`Fiber`](crate::vm::Fiber)
+    /// (its sole frame is the generator closure with args bound, ip 0). `vm` is a
+    /// weak ref to the VM that drives it (upgraded to an owned `Rc` before each
+    /// `Vm::run` await). The fiber does not run until the first
+    /// [`resume`](Self::resume).
+    pub fn new_vm(fiber: crate::vm::Fiber, vm: Weak<crate::vm::Vm>) -> Self {
+        GeneratorHandle {
+            inner: GenImpl::Vm {
+                fiber: RefCell::new(Some(fiber)),
+                vm,
+                started: Cell::new(false),
+                done: Cell::new(false),
+            },
+        }
+    }
+
+    /// Producer side, called from inside a TREE-WALKER body via the `yield`
+    /// expression. Parks the value in `out` and suspends the body future until the
+    /// consumer's next `resume` deposits a value in `inp`, which becomes `yield`'s
+    /// result.
+    ///
+    /// # Panics
+    /// If called on a VM-backed handle (a VM `yield` is the `Op::Yield` opcode, not
+    /// this method — a wiring bug if it ever reaches here).
     pub async fn yield_(&self, v: Value) -> Value {
-        *self.out.borrow_mut() = Some(v);
-        std::future::poll_fn(|_cx| match self.inp.borrow_mut().take() {
+        let (out, inp) = match &self.inner {
+            GenImpl::Body { out, inp, .. } => (out, inp),
+            GenImpl::Vm { .. } => {
+                unreachable!("GeneratorHandle::yield_ called on a VM-backed generator (use Op::Yield)")
+            }
+        };
+        *out.borrow_mut() = Some(v);
+        std::future::poll_fn(|_cx| match inp.borrow_mut().take() {
             Some(r) => Poll::Ready(r),
             None => Poll::Pending,
         })
         .await
     }
 
-    /// Consumer side. Resumes the body with `input` (the very first call only
-    /// starts the body and ignores `input`) and drives it to its next `yield`.
-    /// Returns `Ok(Some(v))` for a yielded value, `Ok(None)` when the body is done,
-    /// or `Err(c)` if the body panicked / propagated (surfaced to the consumer).
-    ///
-    /// `self` is an `Rc` so the handle can push itself onto `CURRENT_GEN` for the
-    /// duration of each poll (so a nested `yield` finds it).
+    /// Consumer side. Resumes the generator with `input` (the very first call only
+    /// starts it and ignores `input`) and drives it to its next `yield`. Returns
+    /// `Ok(Some(v))` for a yielded value, `Ok(None)` when done, or `Err(c)` on a
+    /// panic / propagation (surfaced to the consumer). Dispatches on the engine.
     pub async fn resume(self: &Rc<Self>, input: Value) -> Result<Option<Value>, Control> {
-        if self.started.get() {
-            *self.inp.borrow_mut() = Some(input);
+        match &self.inner {
+            GenImpl::Body { .. } => self.resume_body(input).await,
+            GenImpl::Vm { .. } => self.resume_vm(input).await,
+        }
+    }
+
+    /// The tree-walker resume path — BYTE-IDENTICAL to the pre-refactor `resume`.
+    async fn resume_body(self: &Rc<Self>, input: Value) -> Result<Option<Value>, Control> {
+        let (body, out, inp, started) = match &self.inner {
+            GenImpl::Body {
+                body,
+                out,
+                inp,
+                started,
+            } => (body, out, inp, started),
+            GenImpl::Vm { .. } => unreachable!("resume_body on a VM generator"),
+        };
+        if started.get() {
+            *inp.borrow_mut() = Some(input);
         } else {
-            self.started.set(true);
+            started.set(true);
         }
         let this = self.clone();
         std::future::poll_fn(move |cx| {
             // Take the body OUT so the `body` borrow is not held across `poll`
             // (poll re-enters script evaluation, which may borrow these cells).
-            let mut fut = match this.body.borrow_mut().take() {
+            let mut fut = match body.borrow_mut().take() {
                 Some(f) => f,
                 None => return Poll::Ready(Ok(None)), // already finished/closed
             };
@@ -116,8 +190,8 @@ impl GeneratorHandle {
                 Poll::Ready(Err(c)) => Poll::Ready(Err(c)),
                 Poll::Pending => {
                     // Keep the future for the next resume.
-                    *this.body.borrow_mut() = Some(fut);
-                    match this.out.borrow_mut().take() {
+                    *body.borrow_mut() = Some(fut);
+                    match out.borrow_mut().take() {
                         // A `yield` produced a value.
                         Some(v) => Poll::Ready(Ok(Some(v))),
                         // A real I/O `.await` inside the body is pending: forward it
@@ -131,10 +205,84 @@ impl GeneratorHandle {
         .await
     }
 
-    /// Close the generator: drop the body future so no more values are produced.
-    /// A subsequent `resume` returns `Ok(None)`. Used by `gen.close()`.
+    /// The VM resume path: drive the Suspended Fiber to its next `Op::Yield`.
+    ///
+    /// AWAIT DISCIPLINE: the `Fiber` is *moved out* of its `RefCell<Option<..>>`
+    /// before `Vm::run(&mut fiber).await` and put back after, so no `RefCell`
+    /// borrow is ever held across the await. The `vm` weak is upgraded to an owned
+    /// `Rc<Vm>` first, also outside any borrow. Mirrors the
+    /// take-out-then-await-then-return pattern the rest of the runtime uses for
+    /// native resources.
+    async fn resume_vm(&self, input: Value) -> Result<Option<Value>, Control> {
+        let (fiber_cell, vm_weak, started, done) = match &self.inner {
+            GenImpl::Vm {
+                fiber,
+                vm,
+                started,
+                done,
+            } => (fiber, vm, started, done),
+            GenImpl::Body { .. } => unreachable!("resume_vm on a tree-walker generator"),
+        };
+        if done.get() {
+            return Ok(None);
+        }
+        // Take the fiber out (no borrow held across the await below). `None` here
+        // means a re-entrant resume of a generator already running — a misuse the
+        // surface language cannot express, treated as done.
+        let mut fiber = match fiber_cell.borrow_mut().take() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if started.get() {
+            // The value `next(v)` passed in becomes the result of the `yield`
+            // expression that suspended us: push it where the bytecode after
+            // `Op::Yield` expects the yield expression's value on TOS.
+            fiber.push(input);
+        } else {
+            // First resume: start the fiber from ip 0; `input` is ignored (matches
+            // the tree-walker's first-next semantics).
+            started.set(true);
+        }
+        // Upgrade the weak VM to an owned Rc before the await. The VM outlives any
+        // live generator (the handle is reachable only while a program runs), so a
+        // failed upgrade is a wiring bug.
+        let vm = vm_weak
+            .upgrade()
+            .expect("VM dropped while a generator is still live (wiring bug)");
+        let outcome = vm.run(&mut fiber).await;
+        match outcome {
+            Ok(crate::vm::RunOutcome::Yielded(v)) => {
+                // Still suspended: put the fiber back for the next resume.
+                *fiber_cell.borrow_mut() = Some(fiber);
+                Ok(Some(v))
+            }
+            Ok(crate::vm::RunOutcome::Done(_ret)) => {
+                // The generator body returned: iteration ends. The return value is
+                // DISCARDED (matches the tree-walker — `next()` returns nil at
+                // completion, not the body's return value). Fiber stays taken out.
+                done.set(true);
+                Ok(None)
+            }
+            Err(c) => {
+                // A panic / propagation: surface to the consumer; the generator is
+                // done (fiber stays taken out).
+                done.set(true);
+                Err(c)
+            }
+        }
+    }
+
+    /// Close the generator: no more values are produced; a subsequent `resume`
+    /// returns `Ok(None)`. Used by `gen.close()`. For the tree-walker that drops
+    /// the body future; for the VM that drops the Fiber and marks it done.
     pub fn close(&self) {
-        *self.body.borrow_mut() = None;
+        match &self.inner {
+            GenImpl::Body { body, .. } => *body.borrow_mut() = None,
+            GenImpl::Vm { fiber, done, .. } => {
+                done.set(true);
+                *fiber.borrow_mut() = None;
+            }
+        }
     }
 }
 

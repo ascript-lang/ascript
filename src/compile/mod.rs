@@ -14,7 +14,7 @@ use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
     ContinueStmt, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef,
     ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, Stmt, TemplateExpr,
-    TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt,
+    TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
@@ -468,6 +468,7 @@ impl Compiler {
             Expr::UnwrapExpr(u) => self.compile_unwrap(u),
             Expr::ArrowExpr(arrow) => self.compile_arrow(arrow),
             Expr::AwaitExpr(a) => self.compile_await(a),
+            Expr::YieldExpr(y) => self.compile_yield(y),
             other => Err(CompileError::new(
                 "expression kind not yet supported in V2",
                 node_span(other),
@@ -1524,12 +1525,19 @@ impl Compiler {
             .expr()
             .ok_or_else(|| CompileError::new("call expression missing callee", span))?;
 
-        // Member calls (`a.m(...)`) need the receiver-bound dispatch and are a V9
-        // deferral; reject them here rather than silently compiling a GET_PROP +
-        // CALL that could diverge from the tree-walker's method semantics.
-        if matches!(&callee, Expr::MemberExpr(_) | Expr::OptMemberExpr(_)) {
+        // A plain member call `recv.m(args)` lowers to CALL_METHOD, which mirrors
+        // the tree-walker's `eval_chain` Member-callee Call arm (schema fluent hook
+        // + `read_member` → `call_value`). This is what makes the generator
+        // consumer API (`gen.next(v)` / `gen.close()`) work — and array/string/
+        // instance methods generally. An OPTIONAL member call `recv?.m(args)` needs
+        // the nil-receiver short-circuit-the-whole-call semantics and is a full-V9
+        // deferral; reject it here rather than diverge.
+        if let Expr::MemberExpr(m) = &callee {
+            return self.compile_method_call(call, m, span);
+        }
+        if matches!(&callee, Expr::OptMemberExpr(_)) {
             return Err(CompileError::new(
-                "method calls (a.m(...)) not yet supported (V9)",
+                "optional method calls (a?.m(...)) not yet supported (V9)",
                 node_span(&callee),
             ));
         }
@@ -1552,6 +1560,44 @@ impl Compiler {
         }
 
         self.chunk.emit_u8(Op::Call, argc, span);
+        Ok(())
+    }
+
+    /// Lower a plain member call `recv.<name>(args)` to `CALL_METHOD name, argc`.
+    /// The receiver is compiled first, then the args left-to-right, then the op
+    /// (which pops `argc` args + the receiver and dispatches — schema hook or
+    /// `read_member` → `call_value`, mirroring the tree-walker's `eval_chain`).
+    ///
+    /// Argument handling matches `compile_call`'s (each `arg` is compiled via
+    /// `compile_expr`, left to right; the `arg_list().exprs()` iterator is the
+    /// same one CALL uses).
+    fn compile_method_call(
+        &mut self,
+        call: &CallExpr,
+        m: &MemberExpr,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        let object = m
+            .expr()
+            .ok_or_else(|| CompileError::new("method call missing receiver", span))?;
+        let name = m
+            .ident_token()
+            .ok_or_else(|| CompileError::new("method call missing method name", span))?
+            .text()
+            .to_string();
+        // Receiver, then args (left to right).
+        self.compile_expr(&object)?;
+        let mut argc: u8 = 0;
+        if let Some(arg_list) = call.arg_list() {
+            for arg in arg_list.exprs() {
+                self.compile_expr(&arg)?;
+                argc = argc.checked_add(1).ok_or_else(|| {
+                    CompileError::new("too many call arguments (max 255)", span)
+                })?;
+            }
+        }
+        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        self.chunk.emit_u16_u8(Op::CallMethod, name_idx, argc, span);
         Ok(())
     }
 
@@ -1944,6 +1990,24 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("await missing operand", span))?;
         self.compile_expr(&inner)?;
         self.chunk.emit(Op::Await, span);
+        Ok(())
+    }
+
+    /// Lower a `yield expr` (or bare `yield`) into the operand push followed by
+    /// `Op::Yield`. The operand is compiled onto the stack (a bare `yield` pushes
+    /// `NIL`); `Op::Yield` pops it as the yielded value (suspending the Fiber and
+    /// surfacing it to the consumer's `next()`), and the value the consumer's
+    /// `next(v)` injects becomes this `yield` expression's result (pushed back by
+    /// `GeneratorHandle::resume_vm`). The span is the `YieldExpr`'s trivia-trimmed
+    /// code span. `yield` is only valid inside a generator body; the resolver/
+    /// front-end reject a top-level `yield`, so no extra guard is needed here.
+    fn compile_yield(&mut self, y: &YieldExpr) -> Result<(), CompileError> {
+        let span = node_code_span(y);
+        match y.expr() {
+            Some(inner) => self.compile_expr(&inner)?,
+            None => self.chunk.emit(Op::Nil, span),
+        }
+        self.chunk.emit(Op::Yield, span);
         Ok(())
     }
 

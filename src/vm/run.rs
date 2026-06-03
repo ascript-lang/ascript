@@ -192,6 +192,65 @@ impl Vm {
                     // frame's first local slots (the CALL convention).
                     let callee_idx = fiber.stack.len() - argc - 1;
                     match fiber.stack[callee_idx].clone() {
+                        // A generator closure (`fn*` / `async fn*`) is NOT run and
+                        // NOT spawned: calling it builds a NOT-STARTED Fiber for the
+                        // closure (args bound into its slots, ip 0) and wraps it in a
+                        // VM-backed `GeneratorHandle`, pushing a `Value::Generator`
+                        // immediately. The body runs only when the consumer calls
+                        // `gen.next()` (→ `GeneratorHandle::resume`), exactly like the
+                        // tree-walker's `is_generator` branch of `call_function`.
+                        // Both sync and async generators take this path (the async-
+                        // generator yield+await fusion is V8-T5; for now we build the
+                        // generator the same way). Arg binding reuses the SAME
+                        // `check_call_args` the tree-walker / plain-call path uses, so
+                        // arity/contract panics are byte-identical and surface eagerly
+                        // at the call (the tree-walker also binds args eagerly when
+                        // building the generator). AWAIT DISCIPLINE: no await here;
+                        // the fiber is built synchronously and handed to the handle.
+                        Value::Closure(callee) if callee.proto.is_generator => {
+                            let call_span =
+                                fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let what = callee
+                                .proto
+                                .chunk
+                                .name
+                                .as_deref()
+                                .unwrap_or("function");
+                            // Pop the args, then drop the callee value beneath them.
+                            let mut args = vec![Value::Nil; argc];
+                            for slot in args.iter_mut().rev() {
+                                *slot = fiber.pop();
+                            }
+                            fiber.pop(); // the callee value at callee_idx
+                            // Bind args (arity + per-param contracts + rest) — shared
+                            // with every other call path. A mismatch is a Tier-2
+                            // panic at the call site, eager (like the tree-walker).
+                            let bound = crate::interp::check_call_args(
+                                &callee.proto.params,
+                                args,
+                                call_span,
+                                what,
+                            )?;
+                            // Build a NOT-STARTED one-frame Fiber for the closure and
+                            // place the bound params into its slots (cell slot → cell,
+                            // plain slot → stack). `Fiber::new` reserved the locals
+                            // and the cell vector. We do NOT run it.
+                            let mut gfiber = Fiber::new(callee);
+                            gfiber.frame_mut().ret_span = call_span;
+                            let cells = gfiber.frame().cells.clone();
+                            for (slot, v) in bound.into_iter().enumerate() {
+                                if let Some(cell) = &cells[slot] {
+                                    *cell.borrow_mut() = v;
+                                } else {
+                                    gfiber.stack[slot] = v;
+                                }
+                            }
+                            let handle = crate::coro::GeneratorHandle::new_vm(
+                                gfiber,
+                                Rc::downgrade(&self.rc()),
+                            );
+                            fiber.push(Value::Generator(Rc::new(handle)));
+                        }
                         // An `async fn` closure is NOT run inline: it is scheduled
                         // eagerly (M17 model 2a), exactly like the tree-walker's
                         // `is_async` branch of `call_function`. We build a body future
@@ -315,6 +374,62 @@ impl Vm {
                                 self.interp.call_value(other, args, span).await?;
                             fiber.push(result);
                         }
+                    }
+                }
+
+                Op::CallMethod => {
+                    // A method call `recv.<name>(args)`. Mirrors the tree-walker's
+                    // `eval_chain` Call arm for a `Member` callee: the schema
+                    // fluent-method hook, else `read_member(recv, name)` →
+                    // `call_value`. The receiver sits below its args on the stack.
+                    //
+                    // ORDERING NOTE: the tree-walker reads the member BEFORE
+                    // evaluating the call args (so a member-read error preempts arg
+                    // side effects). Here the compiler already evaluated the args
+                    // (they are on the stack), so a member-read error does NOT
+                    // preempt arg side effects. This sub-case (a side-effecting arg
+                    // AND an erroring member read) is the documented deviation
+                    // deferred to the full V9 method-call slice; the generator
+                    // consumer API (`gen.next(v)`/`gen.close()`) and the rest of the
+                    // gated corpus do not hit it. Everything else is byte-identical.
+                    let name = match &fiber.frame().closure.proto.chunk.consts
+                        [fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize]
+                    {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CALL_METHOD name is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) as usize;
+                    // Pop the args (top is the LAST arg), then the receiver beneath.
+                    let mut args = vec![Value::Nil; argc];
+                    for slot in args.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let recv = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    // Schema fluent-method hook (same predicate the tree-walker uses).
+                    if crate::stdlib::schema::is_schema_value(&recv)
+                        && crate::stdlib::schema::is_schema_method(&name)
+                    {
+                        let mut sargs = Vec::with_capacity(args.len() + 1);
+                        sargs.push(recv);
+                        sargs.extend(args);
+                        let v = self.interp.call_schema(&name, &sargs, span).await?;
+                        fiber.push(v);
+                    } else {
+                        // Fallback: read the member, then call it. `read_member` is
+                        // the SAME dispatch the tree-walker runs (it yields a
+                        // BoundMethod / GeneratorMethod / NativeMethod / Builtin /
+                        // … bound to `recv`), and `call_value` invokes it — both
+                        // shared with the tree-walker.
+                        let callee_v = self.interp.read_member(&recv, &name, span)?;
+                        let v = self.interp.call_value(callee_v, args, span).await?;
+                        fiber.push(v);
                     }
                 }
 
@@ -718,7 +833,25 @@ impl Vm {
                     }
                 }
 
-                // V8–V10 fill these in; the V7 slice covers the async subset above.
+                Op::Yield => {
+                    // `yield expr`. The Fiber model makes this trivial: the yielded
+                    // value is on TOS; pop it and return `RunOutcome::Yielded(v)`
+                    // WITHOUT unwinding any frames — the frame stack stays live in
+                    // the Fiber and `ip` is already past this op, so the next
+                    // `resume` continues exactly here. The consumer's `next(v)`
+                    // (driven via `GeneratorHandle::resume_vm`) pushes its `v` back
+                    // onto the Fiber's stack, where the bytecode after `Op::Yield`
+                    // expects the yield expression's value — that is the value-
+                    // injection mechanism. `yield` with no operand pushed a `Nil`
+                    // (the compiler emits NIL), so the popped value is `nil`.
+                    let v = fiber.pop();
+                    fiber.state = crate::vm::FiberState::Suspended;
+                    return Ok(RunOutcome::Yielded(v));
+                }
+
+                // V8-T4/T5 fill these in (for-of / for-await over generators, async
+                // generators); the V8 core covers MAKE_GENERATOR (in the CALL arm) +
+                // YIELD + resume above.
                 other => {
                     return Err(self.panic_at(
                         fiber,
@@ -1308,14 +1441,16 @@ mod tests {
 
     #[test]
     fn unimplemented_op_panics() {
-        // `YIELD` is not implemented until a later VM slice (generators); an
-        // unimplemented op must surface a span-carrying "not yet implemented"
-        // Tier-2 panic. (JUMP/JUMP_IF_* are implemented as of V2-T6; AWAIT as of
-        // V7.)
+        // An opcode with no exec arm must surface a span-carrying "not yet
+        // implemented" Tier-2 panic. `MAKE_GENERATOR` is never emitted by the
+        // compiler (a `fn*` CALL builds the generator directly in the CALL arm,
+        // mirroring the tree-walker), so it remains unimplemented — a good probe
+        // for the catch-all guard. (JUMP/JUMP_IF_* land in V2-T6, AWAIT in V7,
+        // YIELD in V8.)
         let mut c = Chunk::new();
-        let yield_span = Span::new(2, 4);
+        let op_span = Span::new(2, 4);
         c.emit(Op::Nil, s());
-        c.emit(Op::Yield, yield_span);
+        c.emit(Op::MakeGenerator, op_span);
         c.emit(Op::Return, s());
         match run_chunk(c) {
             Err(Control::Panic(e)) => {
@@ -1324,7 +1459,7 @@ mod tests {
                     "message was: {}",
                     e.message
                 );
-                assert_eq!(e.span, Some(yield_span));
+                assert_eq!(e.span, Some(op_span));
             }
             other => panic!("expected Panic, got {other:?}"),
         }

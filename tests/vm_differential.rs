@@ -2358,3 +2358,81 @@ async fn vm_async_chained_and_control_flow_matches_treewalker() {
         assert_vm_run_matches_treewalker(src).await;
     }
 }
+
+// ---- V8: generators (fn* / yield / next / close) ------------------------
+//
+// A VM generator is a Suspended Fiber (see `src/coro.rs` `GenImpl::Vm`): calling
+// a `fn*` closure builds a not-started Fiber and returns a `Value::Generator`;
+// `gen.next(v)` resumes it to the next `Op::Yield` (or completion → nil), and
+// `next(v)` injects `v` as the suspended `yield` expression's value. Every case
+// below asserts byte-identical stdout against the tree-walker.
+
+#[tokio::test]
+async fn vm_generator_basic_yields_then_done() {
+    // The yielded values 1,2,3, then nil/done. next() returns the value (or nil
+    // at completion) — matching the tree-walker's next() return shape.
+    let src = "fn* g() { yield 1\n yield 2\n yield 3 }\nlet it = g()\nprint(it.next())\nprint(it.next())\nprint(it.next())\nprint(it.next())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_generator_value_injection() {
+    // The value `next(5)` passes in becomes the result of `yield 1`, so `x == 5`
+    // and the second yield produces 15.
+    let src = "fn* g() { let x = yield 1\n yield x + 10 }\nlet it = g()\nprint(it.next())\nprint(it.next(5))";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_generator_first_next_ignores_input() {
+    // The very first next(v) only starts the body and ignores `v` (first-next
+    // semantics) — identical to the tree-walker.
+    let src = "fn* g() { let x = yield 1\n yield x }\nlet it = g()\nprint(it.next(99))\nprint(it.next(7))";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_generator_early_close() {
+    // After one value, close() stops the generator; subsequent next() returns nil.
+    let src = "fn* g() { yield 1\n yield 2 }\nlet it = g()\nprint(it.next())\nit.close()\nprint(it.next())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_generator_empty_first_next_is_nil() {
+    // An empty generator's first next() is the done sentinel (nil).
+    let src = "fn* g() {}\nlet it = g()\nprint(it.next())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_generator_return_value_is_discarded() {
+    // A generator's `return x` value is DISCARDED — next() returns nil at
+    // completion, not the body's return value. Mirror the tree-walker.
+    let src = "fn* g() { yield 1\n return 42 }\nlet it = g()\nprint(it.next())\nprint(it.next())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_generator_computed_sequence() {
+    // A generator over a computed sequence: yield the running square.
+    let src = "fn* squares(n) { let i = 0\n while (i < n) { yield i * i\n i = i + 1 } }\nlet it = squares(4)\nprint(it.next())\nprint(it.next())\nprint(it.next())\nprint(it.next())\nprint(it.next())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_generator_params_and_closure_capture() {
+    // A generator capturing an outer variable and using a param.
+    let src = "let base = 100\nfn* g(step) { yield base + step\n yield base + step * 2 }\nlet it = g(5)\nprint(it.next())\nprint(it.next())\nprint(it.next())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_generator_yield_used_as_statement() {
+    // `yield` as a bare statement (its injected value discarded by the POP) —
+    // exercises the statement-expression stack balance for Op::Yield.
+    let src = "fn* g() { yield 1\n yield 2\n yield 3 }\nlet it = g()\nlet total = 0\ntotal = total + it.next()\ntotal = total + it.next()\ntotal = total + it.next()\nprint(total)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+

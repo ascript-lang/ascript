@@ -133,6 +133,15 @@ pub enum Op {
     /// `CALL(u8)` — call with `argc` arguments already on the stack above the
     /// callee.
     Call,
+    /// `CALL_METHOD(u16 name, u8 argc)` — a method call `recv.<name>(args)`.
+    /// The receiver sits below its `argc` arguments on the stack
+    /// (`[..., recv, arg0, .., arg{argc-1}]`); `name` is `consts[name]` (a `Str`).
+    /// Mirrors the tree-walker's `eval_chain` Call arm for a `Member` callee
+    /// EXACTLY: the schema fluent-method hook (receiver is a schema value AND
+    /// `name` is a schema method → `call_schema`), else the fallback
+    /// `read_member(recv, name)` (which can error first — nil receiver, …) → THEN
+    /// `call_value`. Two inline operands: a `u16` const index then a `u8` argc.
+    CallMethod,
     /// Return TOS from the current frame.
     Return,
     /// `CLOSURE(u16)` — build a closure from `protos[idx]`, capturing upvalues.
@@ -282,6 +291,7 @@ impl Op {
             x if x == Loop as u8 => Loop,
 
             x if x == Call as u8 => Call,
+            x if x == CallMethod as u8 => CallMethod,
             x if x == Return as u8 => Return,
             x if x == Closure as u8 => Closure,
 
@@ -336,6 +346,9 @@ impl Op {
 
             // u8-operand ops.
             Call => 1,
+
+            // u16 + u8 operand op.
+            CallMethod => 3,
 
             // Zero-operand ops.
             Nil | True | False | Pop | Dup | Add | Sub | Mul | Div | Mod | Pow | Neg | Not
@@ -399,6 +412,7 @@ mod tests {
         Op::JumpIfNotNil,
         Op::Loop,
         Op::Call,
+        Op::CallMethod,
         Op::Return,
         Op::Closure,
         Op::NewArray,

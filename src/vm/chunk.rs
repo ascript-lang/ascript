@@ -93,6 +93,15 @@ impl Chunk {
         self.code.push(operand);
     }
 
+    /// Emit an op with a `u16` little-endian operand followed by a `u8` operand
+    /// (e.g. `CALL_METHOD name, argc`). The `u16` comes first, then the `u8`.
+    pub fn emit_u16_u8(&mut self, op: Op, a: u16, b: u8, span: Span) {
+        self.record_span(span);
+        self.code.push(op as u8);
+        self.code.extend_from_slice(&a.to_le_bytes());
+        self.code.push(b);
+    }
+
     /// Emit a jump op with a placeholder `i16` displacement of `0`. Returns the
     /// offset of the operand bytes (the *patch site*) for a later
     /// [`Chunk::patch_jump`].

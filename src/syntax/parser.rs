@@ -595,8 +595,13 @@ fn unary(p: &mut Parser) -> CompletedMarker {
         YieldKw => {
             let m = p.start();
             p.bump(); // yield
+            // `yield`'s operand is parsed at the LOWEST (assignment/expression)
+            // precedence, matching the tree-walker's `assignment()` (spec §7, like
+            // JS `yield`): `yield a + b` is `yield (a + b)` and `yield x = 1` is
+            // `yield (x = 1)`. (Contrast `await`, which is a UNARY-precedence prefix
+            // — `await x` then a binary tail: `await a + b` is `(await a) + b`.)
             if can_start_expr(p) {
-                let _ = unary(p);
+                let _ = expr_returning(p);
             }
             p.complete(m, YieldExpr)
         }
