@@ -4,18 +4,21 @@
 //! is wired into `analyze_with_config` and the `ascript check` CLI flags
 //! `--deny`/`--warn`/`--allow <rule>` (repeatable). `deny_warnings` additionally
 //! promotes all surviving warnings for exit-code purposes
-//! (`ascript check --deny-warnings`). Inline `// ascript-ignore[code]`
-//! suppression runs first (see `analyze.rs`) and config cannot resurrect a
-//! diagnostic the source suppressed. The future `ascript.toml` config will build
-//! the same `LintConfig`. [`RULE_CODES`] is the single source of truth for
-//! validating rule codes.
+//! (`ascript check --deny-warnings`). The `ascript.toml` `[lint]` table
+//! (discovered + parsed in the CLI binary's `lint_config_toml` module) also
+//! seeds this same `LintConfig`; the CLI flags are overlaid on top, so the net
+//! precedence is inline `// ascript-ignore[code]` suppression (runs first, in
+//! `analyze.rs`, and config cannot resurrect a diagnostic the source suppressed)
+//! > CLI flag > `ascript.toml [lint]` > rule default. `syntax-error` is accepted
+//! as a known code but is immune (always `Error`). [`RULE_CODES`] is the single
+//! source of truth for validating rule codes.
 
 use crate::check::diagnostic::Severity;
 use std::collections::HashMap;
 
 /// The complete set of lint rule codes the checker can emit. This is the single
 /// source of truth for validating `--deny`/`--warn`/`--allow` flags (and the
-/// future `ascript.toml`). It is feature-independent.
+/// `ascript.toml [lint]` table). It is feature-independent.
 ///
 /// `syntax-error` is included so `--allow syntax-error` is accepted as a *known*
 /// code rather than rejected as unknown — but it is a NO-OP: `analyze_with_config`

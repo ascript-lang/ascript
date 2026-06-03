@@ -84,16 +84,64 @@ Neutral on purpose: ariadne, the LSP, and `--json` all derive from this. `RuleCo
 ### Severity & exit codes (DECIDED)
 
 - **Syntax errors** → `Error`; `ascript check` exits **non-zero**.
-- **Lints** default severities: correctness-ish lints (undefined var, unreachable, unawaited future, ignored Result) → `Warning`; style lints (unused binding/import, shadowing) → `Warning`; contract mismatches → `Warning`.
+- **Lints** default severities — the full rule-code list (the single source of truth is `RULE_CODES` in `check/config.rs`):
+
+  | Rule code            | Default severity | Notes |
+  |----------------------|------------------|-------|
+  | `syntax-error`       | **Error**        | immune to config (always Error) |
+  | `undefined-variable` | Warning          | |
+  | `unused-binding`     | Warning          | fixable |
+  | `unused-import`      | Warning          | fixable |
+  | `shadowing`          | **Hint**         | legal/intentional, so off-by-default-ish |
+  | `unreachable-code`   | Warning          | |
+  | `missing-return`     | Warning          | |
+  | `unawaited-future`   | Warning          | flagship lint |
+  | `ignored-result`     | Warning          | |
+  | `dead-recover`       | **Hint**         | best-effort |
+  | `contract-mismatch`  | Warning          | conservative, zero-false-positive |
+
 - **CI exit policy (DECIDED):** non-zero on `Error` **always**; non-zero on `Warning` **only** under `--deny-warnings` (or `--deny <rule>`) — ruff/clippy convention.
+- **Exit codes:** `0` = clean (no Error-severity diagnostic, and no surviving Warning under `deny_warnings`); `1` = lint failure (an `Error`-severity diagnostic — including a `--deny`'d rule — or a surviving Warning under `deny_warnings`); `2` = usage error (unknown rule code in a flag or in `ascript.toml`, or malformed/ill-typed `ascript.toml`).
 
 ### Suppression (DECIDED)
 
 Inline comments — `// ascript-ignore[rule-code]` on the line above (or the same line as) the offending node suppresses that rule there; `// ascript-ignore-file[rule-code]` at the top suppresses file-wide. The checker reads these from the **CST trivia** (comments are in the tree — Plan 1/2). Multiple codes comma-separated; bare `// ascript-ignore` suppresses all rules at that site.
 
-### Configuration
+### Configuration (SHIPPED)
 
-A `[lint]` table in an optional `ascript.toml` at the project root: `deny`/`warn`/`allow` lists by rule code, mirroring CLI flags (`--deny`, `--warn`, `--allow`). CLI flags override the file. No config file → sensible defaults (above). Keep it minimal (YAGNI): no per-directory configs in v1.
+Per-rule severity is configurable two ways, both **shipped**: repeatable CLI flags and an optional `ascript.toml` `[lint]` table.
+
+**CLI flags** (all repeatable):
+
+- `--deny <rule>` — force a rule to `Error` severity (a match fails the run, non-zero exit).
+- `--warn <rule>` — force a rule to `Warning` severity.
+- `--allow <rule>` — suppress a rule entirely (drop its diagnostics).
+- `--deny-warnings` — treat every surviving `Warning` as a failure for exit-code purposes (additive; see below).
+
+**`ascript.toml` `[lint]` table** — discovered by walking **up** from the checked file's parent directory to the filesystem root; the first `ascript.toml` found wins (a bare/relative file anchors the walk at the cwd). Discovery is per-file, so a file is governed by the config nearest to it. No `ascript.toml` in the chain → defaults (below).
+
+```toml
+[lint]
+deny = ["unused-binding", "ignored-result"]   # force to Error
+warn = ["unawaited-future"]                    # force to Warning
+allow = ["shadowing"]                          # suppress entirely
+deny_warnings = true                           # all surviving warnings fail the run
+```
+
+The `deny`/`warn`/`allow` keys are arrays of rule codes; `deny_warnings` is a boolean. A malformed TOML, a `[lint]` field of the wrong type, or an unknown rule code is a clear, file-named **usage error** (exit 2).
+
+**Precedence** (highest to lowest):
+
+1. **Inline suppression** — `// ascript-ignore[code]` (see *Suppression*) **always wins**; config can never resurrect a diagnostic the source suppressed.
+2. **CLI flag** — `--deny`/`--warn`/`--allow`.
+3. **`ascript.toml [lint]`** — seeds the config; a CLI flag for the same rule overrides it.
+4. **Rule default** severity.
+
+`deny_warnings` is **additive**: it is ON if *either* `--deny-warnings` is passed *or* the file's `ascript.toml` sets `deny_warnings = true`; neither can turn the other off.
+
+`syntax-error` is **immune**: it is accepted as a known rule code (so `--allow syntax-error` / `deny = ["syntax-error"]` don't error as unknown), but configuring it is a **no-op** — it is always `Error`, never downgraded or dropped.
+
+Keep it minimal (YAGNI): the only config surface is `[lint]` severity, discovered per-file; no other knobs in v1.
 
 ### Autofix (DECIDED)
 
@@ -132,12 +180,13 @@ Best-effort verification of the gradual type contracts where the answer is **dec
 ```
 ascript check [FILES]...        # default: human (ariadne) output
   --json                        # machine-readable diagnostics (editors/CI)
-  --deny <rule|warnings>        # treat as error (non-zero exit)
-  --warn <rule>  --allow <rule> # adjust severity
-  --fix                         # apply safe autofixes to the working tree
+  --deny <rule>                 # force a rule to Error (repeatable)
+  --warn <rule>                 # force a rule to Warning (repeatable)
+  --allow <rule>                # suppress a rule entirely (repeatable)
+  --deny-warnings               # treat all surviving warnings as failures
 ```
-- No files → check all `*.as` under the cwd (or per config), like `fmt`.
-- Exit: non-zero on any `Error` (always) and on `Warning` only under `--deny-warnings`/`--deny <rule>`.
+- `--deny`/`--warn`/`--allow`/`--deny-warnings` and the `ascript.toml [lint]` table are **shipped** — see *Configuration* for the full precedence chain (inline-ignore > CLI > toml > default), the rule-code list, and the `syntax-error` immunity. `--fix` autofix *application* is still future work (the diagnostic model already carries `fix` data).
+- Exit: `0` clean / `1` lint failure (an `Error`, incl. a `--deny`'d rule, or a surviving Warning under `deny_warnings`) / `2` usage error (unknown rule code, malformed `ascript.toml`).
 - Reuses ariadne (already a dependency, already used for runtime diagnostics) so terminal output matches the look of runtime panics.
 
 ## Runtime invariant interaction
@@ -148,7 +197,7 @@ The checker is the **tooling** consumer of the error-recovering parser (front-en
 
 - **Per-rule unit tests**: each rule module has `(source → expected diagnostics)` table tests (code + span + message), including **negative** cases (no false positives) — especially dense for `contract-mismatch`.
 - **Suppression tests**: `// ascript-ignore[code]` silences exactly that rule at that site and nowhere else.
-- **CLI integration tests** (`tests/check.rs`): clean-exit (zero), syntax-error-exit (non-zero) with rule named, `--json` array shape, the corpus zero-false-positive guard, and `--deny-warnings` exit behavior (warning-only file exits 0 without it, non-zero with it). `--fix` autofix *application* and the `--deny <rule>`/`--warn <rule>`/`--allow <rule>` config flags are recorded future work (the diagnostic model already carries `fix` data and `LintConfig` already implements the severity overrides — neither is wired to the CLI yet).
+- **CLI integration tests** (`tests/check.rs`): clean-exit (zero), syntax-error-exit (non-zero) with rule named, `--json` array shape, the corpus zero-false-positive guard, `--deny-warnings` exit behavior (warning-only file exits 0 without it, non-zero with it), the `--deny`/`--warn`/`--allow <rule>` flags + `ascript.toml [lint]` config (precedence, unknown-rule/malformed-toml usage errors → exit 2, `syntax-error` immunity). `--fix` autofix *application* remains recorded future work (the diagnostic model already carries `fix` data; the apply path isn't wired to the CLI yet).
 - **LSP parity test**: `check::analyze` and the LSP adapter agree (same diagnostics, mapped).
 - **Corpus smoke**: `ascript check examples/**/*.as` reports **zero** diagnostics on the (clean) example corpus — a regression guard that the checker doesn't false-positive on idiomatic code. (Any example that legitimately should warn gets a suppression or is fixed.)
 - **Clippy clean in both feature configs**; the core builds with `--no-default-features` (the whole point — checking without the `lsp`/stdlib features).

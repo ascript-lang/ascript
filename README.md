@@ -63,9 +63,36 @@ The default build includes the full standard library. Trim it with Cargo feature
 ascript run program.as     # run a program
 ascript repl               # interactive REPL
 ascript fmt file.as        # format in place
+ascript check file.as      # static check (syntax + lints)
 ascript test file.as       # run test(name, fn) cases
 ascript lsp                # language server over stdio
 ```
+
+### Checking
+
+`ascript check` statically checks `.as` files (syntax errors + lints) and reports
+**all** diagnostics with an exit code suited to CI: `0` clean, `1` on a lint failure,
+`2` on a usage error (e.g. an unknown rule).
+
+Per-rule severity is configurable via repeatable CLI flags and/or an `ascript.toml`:
+
+```bash
+ascript check src/*.as --deny unused-binding --allow shadowing --deny-warnings
+```
+
+```toml
+# ascript.toml (discovered by walking up from the checked file)
+[lint]
+deny = ["unused-binding", "ignored-result"]
+warn = ["unawaited-future"]
+allow = ["shadowing"]
+deny_warnings = true
+```
+
+Precedence is inline `// ascript-ignore[code]` > CLI flag > `ascript.toml` > rule
+default; `syntax-error` is always an error. See the
+[checker design spec](docs/superpowers/specs/2026-06-02-checker-design.md) for the
+full rule-code list and details.
 
 ### Hello, world
 
