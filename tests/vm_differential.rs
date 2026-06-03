@@ -2516,3 +2516,97 @@ async fn vm_for_await_accumulates_into_outer() {
     let src = "fn* g() { yield 10\n yield 20\n yield 30 }\nlet sum = 0\nfor await (x of g()) { sum = sum + x }\nprint(sum)";
     assert_vm_run_matches_treewalker(src).await;
 }
+
+// ---- classes (V9-T1): decl, instances, fields, methods, self ------------
+//
+// Construction convention (verified against examples/typed_fields.as,
+// examples/oop.as): positional args are passed to `init(...)`; fields are
+// assigned via `self.field = arg` inside `init`. Field defaults apply BEFORE
+// `init` runs. The differential harness compares VM vs tree-walker stdout (and
+// panic message+span) byte-for-byte; the construction/dispatch is mirrored
+// exactly from the tree-walker (`construct`/`invoke_method`/`read_member`/
+// `set_member`).
+
+#[tokio::test]
+async fn vm_class_basic_method_and_fields() {
+    // Two typed fields set in init; a method reading them via self.
+    let src = "class Point {\n  x: number\n  y: number\n  fn init(x, y) { self.x = x\n self.y = y }\n  fn sum() { return self.x + self.y }\n}\nlet p = Point(3, 4)\nprint(p.sum())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_field_read_via_member() {
+    // Read a field directly off the instance (not through a method).
+    let src = "class Point {\n  x: number\n  y: number\n  fn init(x, y) { self.x = x\n self.y = y }\n}\nlet p = Point(10, 20)\nprint(p.x)\nprint(p.y)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_field_defaults_apply() {
+    // A defaulted field (`role`) and an optional field (`nickname`) — construct
+    // without those args; the default applies, the optional stays nil. Mirrors
+    // examples/typed_fields.as.
+    let src = "class User {\n  id: number\n  name: string\n  nickname: string?\n  role: string = \"guest\"\n  fn init(id, name) { self.id = id\n self.name = name }\n}\nlet u = User(1, \"Ada\")\nprint(u.id)\nprint(u.name)\nprint(u.nickname)\nprint(u.role)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_method_calls_method_via_self() {
+    // A method that calls another method through self, threading state.
+    let src = "class Counter {\n  n: number\n  fn init(start) { self.n = start }\n  fn bump() { self.n = self.n + 1 }\n  fn twice() { self.bump()\n self.bump()\n return self.n }\n}\nlet c = Counter(0)\nprint(c.twice())\nprint(c.n)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_no_init_no_args() {
+    // A class with no init, constructed with no args, fields written later via
+    // member assignment; a method reads them.
+    let src = "class Bag {\n  items: number\n  fn total() { return self.items }\n}\nlet b = Bag()\nb.items = 7\nprint(b.total())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_method_returns_closure_capturing_self() {
+    // A method returns a closure that captures `self` — the closure observes the
+    // instance's field through the captured receiver (self is a cell slot).
+    let src = "class Box {\n  v: number\n  fn init(v) { self.v = v }\n  fn getter() { return () => self.v }\n}\nlet b = Box(99)\nlet g = b.getter()\nprint(g())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_typed_field_violation_in_init_panics() {
+    // Assigning a wrong-typed value to a typed field INSIDE init is a Tier-2
+    // contract panic — identical message + span on both engines.
+    let src = "class Point {\n  x: number\n  fn init(x) { self.x = x }\n}\nlet p = Point(\"oops\")";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_typed_field_violation_via_member_panics() {
+    // Assigning a wrong-typed value to a typed field via `obj.f = wrong` is a
+    // Tier-2 contract panic — identical message + span.
+    let src = "class Point {\n  x: number\n  fn init(x) { self.x = x }\n}\nlet p = Point(1)\np.x = true";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_no_init_with_args_panics() {
+    // A class with no init given args is the same Tier-2 panic on both engines.
+    let src = "class Empty {\n  v: number\n}\nlet e = Empty(1, 2)";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_init_arity_violation_panics() {
+    // Wrong arg count to init surfaces the SAME arity panic (message + span).
+    let src = "class Point {\n  x: number\n  y: number\n  fn init(x, y) { self.x = x\n self.y = y }\n}\nlet p = Point(1)";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_string_field_and_template() {
+    // A string field interpolated in a template method (exercises Display + the
+    // method dispatch + self field read in one program).
+    let src = "class Greeter {\n  name: string\n  fn init(name) { self.name = name }\n  fn hello() { return `hi ${self.name}` }\n}\nprint(Greeter(\"Ada\").hello())";
+    assert_vm_run_matches_treewalker(src).await;
+}

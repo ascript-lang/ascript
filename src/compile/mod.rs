@@ -12,16 +12,17 @@ use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_templat
 use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
-    ContinueStmt, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal, MemberExpr, NameRef,
-    ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, Stmt, TemplateExpr,
-    TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
+    ClassDecl, ContinueStmt, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal,
+    MemberExpr, MethodDecl, NameRef, ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt,
+    SourceFile, Stmt, TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt,
+    YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
 use crate::syntax::{parse_to_tree, resolve::resolve};
 use crate::value::Value;
-use crate::vm::chunk::{Chunk, FnProto};
+use crate::vm::chunk::{Chunk, ClassProto, FnProto};
 use crate::vm::opcode::Op;
 use cstree::text::TextRange;
 use std::collections::HashSet;
@@ -557,9 +558,36 @@ impl Compiler {
         let target = assign
             .target()
             .ok_or_else(|| CompileError::new("assignment missing target", span))?;
+        // Member assignment `obj.field = value` (V9): used pervasively in class
+        // method bodies (`self.x = id`). Lowering mirrors the tree-walker's
+        // `assign_to` `Member` arm (`SET_PROP` carries the field type contract and
+        // leaves the assigned value as the expression's result):
+        //   <obj> ; <value> ; SET_PROP <name>   ; ( obj value -- value )
+        if let Expr::MemberExpr(m) = &target {
+            let object = m
+                .expr()
+                .ok_or_else(|| CompileError::new("member assignment missing object", span))?;
+            let field = m
+                .ident_token()
+                .map(|t| t.text().to_string())
+                .ok_or_else(|| CompileError::new("member assignment missing field name", span))?;
+            let value = assign
+                .value()
+                .ok_or_else(|| CompileError::new("assignment missing value", span))?;
+            self.compile_expr(&object)?;
+            self.compile_expr(&value)?;
+            let name_idx = self.chunk.add_const(Value::Str(field.into()));
+            // The op's span is the value's TRIVIA-TRIMMED span so a field-type
+            // contract panic anchors EXACTLY where the tree-walker's does
+            // (`assign_to` uses `value.span`, the AST node's own start — past any
+            // leading whitespace). See #132 / `node_code_span`.
+            self.chunk
+                .emit_u16(Op::SetProp, name_idx, node_code_span(&value));
+            return Ok(());
+        }
         let Expr::NameRef(name_ref) = &target else {
             return Err(CompileError::new(
-                "assignment to non-identifier targets (index/member) not yet supported (V9)",
+                "assignment to non-identifier targets (index) not yet supported (V9-T5)",
                 node_span(&target),
             ));
         };
@@ -613,6 +641,7 @@ impl Compiler {
             Stmt::ContinueStmt(continue_stmt) => self.compile_continue(continue_stmt),
             Stmt::FnDecl(fn_decl) => self.compile_fn_decl(fn_decl),
             Stmt::ReturnStmt(ret) => self.compile_return(ret),
+            Stmt::ClassDecl(class_decl) => self.compile_class(class_decl),
             other => Err(CompileError::new(
                 "statement kind not yet supported in V2",
                 stmt_span(other),
@@ -877,6 +906,262 @@ impl Compiler {
             })?;
         u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// Compile a class declaration (V9-T1). Mirrors the tree-walker's
+    /// `Stmt::Class` build: a [`crate::value::Class`] with the field schemas
+    /// (`FieldDecl` → [`crate::value::FieldSchema`], same lowering) and a method
+    /// table. The crux is that `value.rs`'s `Class`/`Method` is FROZEN and holds a
+    /// TREE-WALKER body (`Vec<Stmt>`), which the VM cannot run — so the VM compiles
+    /// each method body to its OWN [`FnProto`]/closure and dispatches THOSE; the
+    /// built `Value::Class.methods` map is left EMPTY and the compiled method
+    /// closures are registered in the VM's per-class side table (keyed by the
+    /// class's `Rc` identity) at runtime by `Op::Class`.
+    ///
+    /// Lowering:
+    /// ```text
+    ///   <default thunk closure 0> .. <default thunk closure D-1>  ; one per defaulted field
+    ///   <method closure 0> .. <method closure M-1>                ; one per method
+    ///   CLASS <class_proto_idx>   ; pops D+M closures, registers them, pushes the class
+    ///   SET_LOCAL <name slot>     ; bind the class to its name (like `fn name`)
+    /// ```
+    ///
+    /// Superclass (`extends`), `super`, and `instanceof` are V9-T2: a class with an
+    /// `extends` clause is deferred here with a clear error. Each method is compiled
+    /// with `self` already declared by the resolver as the method frame's slot 0
+    /// (see `resolve_function`'s `MethodDecl` branch); the receiver is bound into
+    /// slot 0 at the method CALL (`Vm::invoke_compiled_method`).
+    fn compile_class(&mut self, class_decl: &ClassDecl) -> Result<(), CompileError> {
+        let span = node_span(class_decl);
+        let name = class_decl
+            .ident_token()
+            .map(|t| t.text().to_string())
+            .ok_or_else(|| CompileError::new("class declaration has no name", span))?;
+
+        // V9-T2: superclass (`class X extends Y`). `extends` is a SOFT keyword
+        // parsed as an `Ident` token, so a class with a superclass has the direct
+        // idents `[ClassName, "extends", SuperName]`. Detect the literal `extends`
+        // ident and defer with a clear error.
+        if class_decl
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == SyntaxKind::Ident && t.text() == "extends")
+        {
+            return Err(CompileError::new(
+                "class inheritance (extends/super/instanceof) not yet supported in the VM (V9-T2)",
+                span,
+            ));
+        }
+
+        // Field schemas, in declaration order (mirrors the tree-walker's
+        // `Stmt::Class` field_map build: name → FieldSchema{ty, default}).
+        let mut field_map: indexmap::IndexMap<String, crate::value::FieldSchema> =
+            indexmap::IndexMap::new();
+        // Defaulted fields get a 0-arg thunk closure emitted (in declaration order)
+        // BEFORE the method closures; `Op::Class` runs them at construct time so a
+        // mutable default (e.g. `[]`) yields a FRESH value per instance, exactly
+        // like the tree-walker (which evals the default expr per `construct`).
+        let mut default_fields: Vec<String> = Vec::new();
+        for field in class_decl.field_decls() {
+            let fname = field
+                .ident_token()
+                .map(|t| t.text().to_string())
+                .ok_or_else(|| CompileError::new("field declaration has no name", span))?;
+            let mut ty = field
+                .r#type()
+                .as_ref()
+                .map(|t| cst_type(t.syntax()))
+                .unwrap_or(None)
+                .ok_or_else(|| {
+                    CompileError::new(format!("field '{fname}' has no type annotation"), span)
+                })?;
+            // The `name?: T` marker form (a `?` token between the ident and the
+            // `:`) lowers to the SAME `Type::Optional` as `name: T?` — mirror the
+            // tree-walker/legacy parser.
+            let marker_optional = field
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == SyntaxKind::Question);
+            if marker_optional && !matches!(ty, crate::ast::Type::Optional(_)) {
+                ty = crate::ast::Type::Optional(Box::new(ty));
+            }
+            let default = field.expr();
+            if default.is_some() {
+                default_fields.push(fname.clone());
+            }
+            // The default Expr is NOT stored on the FieldSchema for the VM (the VM
+            // evals defaults via thunk closures); store `None` so the runtime
+            // construct path knows the schema carries the type only. The thunk is
+            // the source of truth for the value.
+            field_map.insert(
+                fname,
+                crate::value::FieldSchema {
+                    ty,
+                    default: None,
+                },
+            );
+        }
+
+        // Build the (method-less) class value. `def_env` is unused by the VM (it
+        // never evals against a tree-walker Environment); use the global env as an
+        // inert placeholder so the field stays well-typed.
+        let class = Rc::new(crate::value::Class {
+            name: name.clone(),
+            superclass: None,
+            fields: field_map,
+            methods: indexmap::IndexMap::new(),
+            def_env: crate::interp::global_env(),
+        });
+
+        // Emit the default-field thunk closures (declaration order) FIRST, then the
+        // method closures, so the stack below `CLASS` is
+        // `[..thunks.., ..methods..]` and `Op::Class` pops them in reverse.
+        for field in class_decl.field_decls() {
+            if let Some(default) = field.expr() {
+                let proto = self.compile_default_thunk(&default)?;
+                let idx = self.chunk.add_proto(proto);
+                self.chunk.emit_u16(Op::Closure, idx, span);
+            }
+        }
+        let mut method_names: Vec<String> = Vec::new();
+        for method in class_decl.method_decls() {
+            let mname = method
+                .ident_token()
+                .map(|t| t.text().to_string())
+                .ok_or_else(|| CompileError::new("method declaration has no name", span))?;
+            let proto = self.compile_method_proto(&method)?;
+            let idx = self.chunk.add_proto(proto);
+            self.chunk.emit_u16(Op::Closure, idx, span);
+            method_names.push(mname);
+        }
+
+        let class_proto = Rc::new(ClassProto {
+            class,
+            default_fields,
+            method_names,
+        });
+        let cp_idx = self.chunk.add_class_proto(class_proto);
+        self.chunk.emit_u16(Op::Class, cp_idx, span);
+
+        // Bind the class value to its name's slot in the enclosing frame (the
+        // resolver records a `BindingKind::Class` binding whose `decl_range` is the
+        // ClassDecl node's `text_range()` — hoisted, see `hoist_decls`).
+        let slot = self.class_decl_slot(class_decl)?;
+        self.emit_set_local(slot, span);
+        Ok(())
+    }
+
+    /// The enclosing-frame local slot for a `class Name` declaration. The resolver
+    /// records a `BindingKind::Class` binding keyed by the ClassDecl node's
+    /// `text_range()` (see `resolve_stmt`/`hoist_decls`).
+    fn class_decl_slot(&self, class_decl: &ClassDecl) -> Result<u16, CompileError> {
+        let span = node_span(class_decl);
+        let decl_range: TextRange = class_decl.syntax().text_range();
+        let binding = self
+            .resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == decl_range)
+            .ok_or_else(|| {
+                CompileError::new("class declaration has no resolver binding (compiler bug)", span)
+            })?;
+        u16::try_from(binding.slot)
+            .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// Compile a method body (a `MethodDecl`) to its own [`FnProto`]. A method is a
+    /// function with an implicit `self` receiver at slot 0 (declared by the
+    /// resolver). The receiver is bound into slot 0 by the method-CALL path; the
+    /// declared params occupy slots `1..n+1`. `compile_fn_proto` already builds the
+    /// `params`/`ret`/`arity` from the param nodes (which EXCLUDE `self`), so the
+    /// proto's `arity` is the user-visible arg count.
+    fn compile_method_proto(
+        &mut self,
+        method: &MethodDecl,
+    ) -> Result<Rc<FnProto>, CompileError> {
+        // A generator method (`fn*`) is out of scope for V9-T1.
+        if method
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == SyntaxKind::Star)
+        {
+            return Err(CompileError::new(
+                "generator methods (fn*) not yet supported in the VM",
+                node_span(method),
+            ));
+        }
+        self.compile_fn_proto(method.syntax())
+    }
+
+    /// Compile a field default expression into a zero-argument thunk [`FnProto`]
+    /// (`<default>; RETURN`). The thunk is run at construct time so a mutable
+    /// default yields a fresh value per instance (matching the tree-walker, which
+    /// re-evals the default per `construct`).
+    ///
+    /// The default expression is resolved (by the whole-tree resolver) in the
+    /// class's ENCLOSING frame, so it may reference globals/builtins (works:
+    /// `GET_GLOBAL`) but NOT enclosing locals/upvalues — those would resolve to the
+    /// wrong slot in this standalone thunk frame. A default referencing an
+    /// enclosing local is therefore deferred with a clear error (V9 polish). Real
+    /// defaults are overwhelmingly literals/constants.
+    fn compile_default_thunk(&mut self, default: &Expr) -> Result<Rc<FnProto>, CompileError> {
+        let span = node_span(default);
+        // Reject a default that captures an enclosing local/upvalue (see above).
+        self.assert_no_local_capture(default.syntax())?;
+
+        let mut body_chunk = Chunk::new();
+        body_chunk.name = Some("<field default>".to_string());
+
+        let saved_chunk = std::mem::replace(&mut self.chunk, body_chunk);
+        let saved_loops = std::mem::take(&mut self.loops);
+        let saved_next_temp = self.next_temp;
+        let saved_cells = std::mem::take(&mut self.cur_cells);
+        self.next_temp = 0;
+
+        let result = self.compile_expr(default);
+
+        let body_chunk = std::mem::replace(&mut self.chunk, saved_chunk);
+        self.loops = saved_loops;
+        self.next_temp = saved_next_temp;
+        self.cur_cells = saved_cells;
+        let mut body_chunk = match result {
+            Ok(()) => body_chunk,
+            Err(e) => return Err(e),
+        };
+        body_chunk.emit(Op::Return, span);
+
+        Ok(Rc::new(FnProto {
+            chunk: body_chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            params: Vec::new(),
+            ret: None,
+        }))
+    }
+
+    /// Error if any `NameRef` under `node` resolves to a `Local`/`Upvalue` — used
+    /// to keep a field-default thunk self-contained (it may only reference
+    /// globals/builtins, never an enclosing local).
+    fn assert_no_local_capture(&self, node: &ResolvedNode) -> Result<(), CompileError> {
+        for descendant in node.descendants() {
+            if descendant.kind() == SyntaxKind::NameRef {
+                match self.resolved.uses.get(&descendant.text_range()) {
+                    Some(Resolution::Local(_)) | Some(Resolution::Upvalue(_)) => {
+                        return Err(CompileError::new(
+                            "a class field default referencing an enclosing local is not yet supported in the VM",
+                            range_span(node),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Compile an arrow expression `(params) => body` (an EXPRESSION): build its
@@ -2609,15 +2894,18 @@ mod tests {
 
     #[test]
     fn index_assignment_is_deferred() {
-        // Index ASSIGNMENT routes through compile_assign (target is not a NameRef).
+        // Index ASSIGNMENT routes through compile_assign (target is not a NameRef
+        // and not a Member); deferred to V9-T5.
         let err = compile_source("let a = [1]\na[0] = 9").unwrap_err();
-        assert!(err.message.contains("index/member"), "got {err:?}");
+        assert!(err.message.contains("index"), "got {err:?}");
     }
 
     #[test]
-    fn member_assignment_is_deferred() {
-        let err = compile_source("let o = {a: 1}\no.a = 9").unwrap_err();
-        assert!(err.message.contains("index/member"), "got {err:?}");
+    fn member_assignment_compiles_to_set_prop() {
+        // Member ASSIGNMENT `o.a = 9` lowers to `<obj> <value> SET_PROP "a"` (V9).
+        let chunk = compile_source("let o = {a: 1}\no.a = 9").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("SET_PROP"), "expected SET_PROP, got:\n{text}");
     }
 
     #[test]

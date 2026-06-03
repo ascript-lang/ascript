@@ -2845,29 +2845,48 @@ impl Interp {
             }
             ExprKind::Member { object, name } => {
                 let obj = self.eval_expr(object, env).await?;
-                match obj {
-                    Value::Object(map) => {
-                        map.borrow_mut().insert(name.clone(), value.clone());
-                        Ok(value)
-                    }
-                    Value::Instance(inst) => {
-                        let class = inst.borrow().class.clone();
-                        if let Some(schema) = lookup_field_schema(&class, name) {
-                            if !check_type(&value, &schema.ty) {
-                                return Err(contract_panic(&schema.ty, &value, value_span));
-                            }
-                        }
-                        inst.borrow_mut().fields.insert(name.clone(), value.clone());
-                        Ok(value)
-                    }
-                    _ => Err(AsError::at(
-                        format!("cannot set property '{}' on this value", name),
-                        object.span,
-                    )
-                    .into()),
-                }
+                self.set_member(&obj, name, value, object.span, value_span)
             }
             _ => Err(AsError::at("invalid assignment target", target.span).into()),
+        }
+    }
+
+    /// Set a member `obj.<name> = value`, applying a declared field-type contract
+    /// on an `Instance` field. Shared by the tree-walker's `assign_to` `Member` arm
+    /// and the bytecode VM's `Op::SetProp` so the two engines apply the field
+    /// contract and panic byte-identically. Returns the assigned value (assignment
+    /// is an expression). `value_span` anchors the contract panic exactly where the
+    /// tree-walker's does; `obj_span` anchors the "cannot set property" error.
+    pub(crate) fn set_member(
+        &self,
+        obj: &Value,
+        name: &str,
+        value: Value,
+        obj_span: Span,
+        value_span: Span,
+    ) -> Result<Value, Control> {
+        match obj {
+            Value::Object(map) => {
+                map.borrow_mut().insert(name.to_string(), value.clone());
+                Ok(value)
+            }
+            Value::Instance(inst) => {
+                let class = inst.borrow().class.clone();
+                if let Some(schema) = lookup_field_schema(&class, name) {
+                    if !check_type(&value, &schema.ty) {
+                        return Err(contract_panic(&schema.ty, &value, value_span));
+                    }
+                }
+                inst.borrow_mut()
+                    .fields
+                    .insert(name.to_string(), value.clone());
+                Ok(value)
+            }
+            _ => Err(AsError::at(
+                format!("cannot set property '{}' on this value", name),
+                obj_span,
+            )
+            .into()),
         }
     }
 }

@@ -18,8 +18,9 @@ use crate::span::Span;
 use crate::value::Value;
 use crate::vm::fiber::Fiber;
 use crate::vm::opcode::Op;
-use crate::vm::value_ext::RunOutcome;
+use crate::vm::value_ext::{Closure, RunOutcome};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 /// The bytecode virtual machine.
@@ -30,6 +31,19 @@ use std::rc::{Rc, Weak};
 pub struct Vm {
     interp: Rc<Interp>,
     self_weak: RefCell<Weak<Vm>>,
+    /// Per-class compiled-method table (V9). `value.rs`'s `Class`/`Method` is
+    /// frozen and holds a TREE-WALKER body the VM cannot run, so the VM compiles
+    /// each method to a `Value::Closure` and stores it HERE instead — keyed by the
+    /// class's `Rc` IDENTITY (`Rc::as_ptr` address) → method name → compiled
+    /// closure. A class's `Value::Class.methods` map is left empty; method dispatch
+    /// goes through this table (`compiled_method`). The key is stable because the
+    /// `Rc<Class>` is created once at compile time and shared by every instance.
+    class_methods: RefCell<HashMap<usize, HashMap<String, Rc<Closure>>>>,
+    /// Per-class field-default thunk table (V9): class `Rc` identity → field name →
+    /// a zero-arg closure that produces the field's default value. Run once per
+    /// constructed instance (so a mutable default yields a fresh value each time,
+    /// matching the tree-walker's per-construct default eval).
+    class_defaults: RefCell<HashMap<usize, HashMap<String, Rc<Closure>>>>,
 }
 
 impl Vm {
@@ -39,6 +53,8 @@ impl Vm {
         let vm = Rc::new(Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
+            class_methods: RefCell::new(HashMap::new()),
+            class_defaults: RefCell::new(HashMap::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -359,10 +375,13 @@ impl Vm {
                         }
                         other => {
                             // Native callee (Builtin/Function/Class/BoundMethod/...):
-                            // delegate to the shared `call_value`. Pop the args and
-                            // the callee into owned locals BEFORE the await so no
-                            // borrow of `fiber` is held across the suspension point
-                            // (`await_holding_refcell_ref` stays clean).
+                            // delegate to the VM-aware `call_value`, which routes a
+                            // VM class constructor / VM bound method to COMPILED code
+                            // (V9) and everything else to the shared `Interp`
+                            // dispatch. Pop the args and the callee into owned locals
+                            // BEFORE the await so no borrow of `fiber` is held across
+                            // the suspension point (`await_holding_refcell_ref` stays
+                            // clean).
                             let mut args = vec![Value::Nil; argc];
                             for slot in args.iter_mut().rev() {
                                 *slot = fiber.pop();
@@ -370,8 +389,7 @@ impl Vm {
                             let _callee = fiber.pop(); // the Value at callee_idx
                             let span =
                                 fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                            let result =
-                                self.interp.call_value(other, args, span).await?;
+                            let result = self.call_value(other, args, span).await?;
                             fiber.push(result);
                         }
                     }
@@ -422,13 +440,15 @@ impl Vm {
                         let v = self.interp.call_schema(&name, &sargs, span).await?;
                         fiber.push(v);
                     } else {
-                        // Fallback: read the member, then call it. `read_member` is
-                        // the SAME dispatch the tree-walker runs (it yields a
-                        // BoundMethod / GeneratorMethod / NativeMethod / Builtin /
-                        // … bound to `recv`), and `call_value` invokes it — both
-                        // shared with the tree-walker.
-                        let callee_v = self.interp.read_member(&recv, &name, span)?;
-                        let v = self.interp.call_value(callee_v, args, span).await?;
+                        // Fallback: read the member, then call it. `vm_read_member`
+                        // yields a VM `BoundMethod` for an Instance method on a VM
+                        // class (dispatched to COMPILED code by `call_value`), else
+                        // the SAME dispatch the tree-walker runs (a BoundMethod /
+                        // GeneratorMethod / NativeMethod / Builtin / … bound to
+                        // `recv`); `call_value` invokes it (VM-aware for V9 classes,
+                        // shared with the tree-walker otherwise).
+                        let callee_v = self.vm_read_member(&recv, &name, span)?;
+                        let v = self.call_value(callee_v, args, span).await?;
                         fiber.push(v);
                     }
                 }
@@ -584,7 +604,11 @@ impl Vm {
                         fiber.push(Value::Nil);
                     } else {
                         let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                        let v = self.interp.read_member(&obj, &name, span)?;
+                        // VM-aware member read: an Instance method on a VM class
+                        // becomes a `BoundMethod` (compiled-closure-backed); fields
+                        // and every non-VM receiver go through the shared
+                        // `Interp::read_member`.
+                        let v = self.vm_read_member(&obj, &name, span)?;
                         fiber.push(v);
                     }
                 }
@@ -990,6 +1014,90 @@ impl Vm {
                     }
                 }
 
+                Op::SetProp => {
+                    // `obj value -- value` — store `obj.<name> = value`, applying a
+                    // declared field-type contract on an Instance field. The SAME
+                    // `set_member` the tree-walker's `assign_to` Member arm uses, so
+                    // the field contract panic (message + span) is byte-identical.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("SET_PROP operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let value = fiber.pop();
+                    let obj = fiber.pop();
+                    // The op's span is the VALUE's span (see the compiler), matching
+                    // the tree-walker's `value_span` for the contract panic; reuse it
+                    // for the "cannot set property" error too (single VM span).
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = self.interp.set_member(&obj, &name, value, span, span)?;
+                    fiber.push(v);
+                }
+
+                Op::Class => {
+                    // Build a class value (V9). The compiler emitted, just below this
+                    // op, one closure per defaulted field (declaration order) then
+                    // one closure per method (declaration order); the class proto
+                    // carries the prebuilt `Rc<Class>` and the parallel name lists.
+                    // Register the default thunks and method closures in the VM side
+                    // tables keyed by the class's `Rc` identity, then push the class.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let cp = fiber.frame().closure.proto.chunk.class_protos[idx].clone();
+                    let n_methods = cp.method_names.len();
+                    let n_defaults = cp.default_fields.len();
+                    // Pop method closures (top = LAST method), then default thunks.
+                    let mut methods = vec![Value::Nil; n_methods];
+                    for slot in methods.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let mut defaults = vec![Value::Nil; n_defaults];
+                    for slot in defaults.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let key = Rc::as_ptr(&cp.class) as usize;
+                    let mut method_map: HashMap<String, Rc<Closure>> = HashMap::new();
+                    for (name, mv) in cp.method_names.iter().zip(methods) {
+                        match mv {
+                            Value::Closure(c) => {
+                                method_map.insert(name.clone(), c);
+                            }
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("class method '{name}' is not a closure: {other:?}"),
+                                ))
+                            }
+                        }
+                    }
+                    let mut default_map: HashMap<String, Rc<Closure>> = HashMap::new();
+                    for (name, dv) in cp.default_fields.iter().zip(defaults) {
+                        match dv {
+                            Value::Closure(c) => {
+                                default_map.insert(name.clone(), c);
+                            }
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "field default '{name}' thunk is not a closure: {other:?}"
+                                    ),
+                                ))
+                            }
+                        }
+                    }
+                    self.class_methods.borrow_mut().insert(key, method_map);
+                    self.class_defaults.borrow_mut().insert(key, default_map);
+                    fiber.push(Value::Class(cp.class.clone()));
+                }
+
                 other => {
                     return Err(self.panic_at(
                         fiber,
@@ -1020,6 +1128,7 @@ impl Vm {
     /// surfaces arity/contract panics byte-identically. The return-type contract is
     /// enforced by `Op::Return` against the frame's `ret_span` (the call span),
     /// exactly as for an in-VM call.
+    #[async_recursion::async_recursion(?Send)]
     pub async fn call_value(
         &self,
         callee: Value,
@@ -1063,9 +1172,216 @@ impl Vm {
                     }
                 }
             }
+            // A class constructor (V9): build an instance VM-side (defaults via
+            // thunks + compiled `init`) so the init method runs as COMPILED code.
+            Value::Class(class) if self.is_vm_class(&class) => {
+                self.vm_construct(class, args, span).await
+            }
+            // A bound method (V9) on a VM-registered class: run the COMPILED method
+            // closure with `self` bound to the receiver (slot 0).
+            Value::BoundMethod(bm) if self.bound_method_is_vm(&bm).is_some() => {
+                let closure = self.bound_method_is_vm(&bm).expect("checked above");
+                self.invoke_compiled_method(closure, bm.receiver.clone(), args, span)
+                    .await
+            }
             // Native callee: delegate to the shared dispatch (same as the
             // `Op::Call` non-Closure arm).
             other => self.interp.call_value(other, args, span).await,
+        }
+    }
+
+    /// Whether `class` is a VM-registered class (it has a compiled-method table).
+    /// A class minted by the tree-walker (e.g. via a native module) is NOT here, so
+    /// it falls through to the shared `Interp` dispatch.
+    fn is_vm_class(&self, class: &Rc<crate::value::Class>) -> bool {
+        let key = Rc::as_ptr(class) as usize;
+        self.class_methods.borrow().contains_key(&key)
+    }
+
+    /// The compiled method closure for `(class identity, name)`, if registered.
+    fn compiled_method(
+        &self,
+        class: &Rc<crate::value::Class>,
+        name: &str,
+    ) -> Option<Rc<Closure>> {
+        let key = Rc::as_ptr(class) as usize;
+        self.class_methods
+            .borrow()
+            .get(&key)
+            .and_then(|m| m.get(name))
+            .cloned()
+    }
+
+    /// If `bm` is a bound method on a VM-registered class, return its compiled
+    /// method closure; else `None` (so a tree-walker BoundMethod delegates).
+    fn bound_method_is_vm(
+        &self,
+        bm: &crate::value::BoundMethod,
+    ) -> Option<Rc<Closure>> {
+        if let Value::Instance(inst) = &bm.receiver {
+            let class = inst.borrow().class.clone();
+            return self.compiled_method(&class, &bm.name);
+        }
+        None
+    }
+
+    /// VM member read (V9). For an `Instance` of a VM-registered class, a method
+    /// name resolves to a `Value::BoundMethod` carrying the receiver + class +
+    /// method name (the compiled closure is looked up at CALL time via
+    /// `bound_method_is_vm`); a field name reads the stored field; anything else
+    /// (and any non-VM receiver) delegates to the shared `Interp::read_member` so
+    /// the two engines share field/enum/native member-access semantics. The dummy
+    /// `Method` carried by the `BoundMethod` is never executed by the VM — its body
+    /// is empty — it exists only to satisfy the frozen `value.rs` `BoundMethod`
+    /// shape; method dispatch always runs the COMPILED closure.
+    fn vm_read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, Control> {
+        if let Value::Instance(inst) = obj {
+            let (class, has_field) = {
+                let b = inst.borrow();
+                (b.class.clone(), b.fields.contains_key(name))
+            };
+            if !has_field {
+                if let Some(_closure) = self.compiled_method(&class, name) {
+                    let bm = crate::value::BoundMethod {
+                        receiver: obj.clone(),
+                        method: Rc::new(crate::value::Method {
+                            params: Vec::new(),
+                            ret: None,
+                            body: Vec::new(),
+                            is_async: false,
+                        }),
+                        defining_class: class,
+                        name: name.to_string(),
+                    };
+                    return Ok(Value::BoundMethod(Rc::new(bm)));
+                }
+            }
+        }
+        // Field / non-VM receiver: shared dispatch (also yields the correct
+        // nil-field / nil-receiver behavior, byte-identical to the tree-walker).
+        self.interp.read_member(obj, name, span).map_err(Control::from)
+    }
+
+    /// Construct an instance of a VM-registered class (V9). Mirrors the
+    /// tree-walker's `construct`: create the instance, apply field DEFAULTS (each
+    /// via its compiled thunk closure, so a mutable default is fresh per instance),
+    /// checking each default against its field-type contract, then run the compiled
+    /// `init` method (if present) with the args; a class with no `init` rejects any
+    /// args, byte-identically.
+    #[async_recursion::async_recursion(?Send)]
+    async fn vm_construct(
+        &self,
+        class: Rc<crate::value::Class>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let instance = Rc::new(RefCell::new(crate::value::Instance {
+            class: class.clone(),
+            fields: indexmap::IndexMap::new(),
+        }));
+        let inst_val = Value::Instance(instance.clone());
+
+        // Apply field defaults in declaration order (the field schema is insertion
+        // ordered, matching the source). Run each default's compiled thunk to get a
+        // fresh value, check the contract, then store it. The contract panic span
+        // is the construct call site (`span`), matching `construct`.
+        let key = Rc::as_ptr(&class) as usize;
+        let default_names: Vec<String> = self
+            .class_defaults
+            .borrow()
+            .get(&key)
+            .map(|m| {
+                // Preserve declared field order (schema order), not HashMap order.
+                class
+                    .fields
+                    .keys()
+                    .filter(|k| m.contains_key(*k))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for fname in default_names {
+            let thunk = self
+                .class_defaults
+                .borrow()
+                .get(&key)
+                .and_then(|m| m.get(&fname))
+                .cloned();
+            let Some(thunk) = thunk else { continue };
+            let dv = self
+                .call_value(Value::Closure(thunk), Vec::new(), span)
+                .await?;
+            if let Some(schema) = class.fields.get(&fname) {
+                if !crate::interp::check_type(&dv, &schema.ty) {
+                    return Err(crate::interp::contract_panic(&schema.ty, &dv, span));
+                }
+            }
+            instance.borrow_mut().fields.insert(fname, dv);
+        }
+
+        // Run the compiled `init`, if any.
+        if let Some(init) = self.compiled_method(&class, "init") {
+            self.invoke_compiled_method(init, inst_val.clone(), args, span)
+                .await?;
+        } else if !args.is_empty() {
+            return Err(AsError::at(
+                format!(
+                    "{} has no init but was given {} argument(s)",
+                    class.name,
+                    args.len()
+                ),
+                span,
+            )
+            .into());
+        }
+        Ok(inst_val)
+    }
+
+    /// Invoke a COMPILED method closure with `self`=`receiver` bound to slot 0 and
+    /// the arguments bound to slots `1..n+1`. The method proto's `arity`/`params`
+    /// EXCLUDE `self` (the resolver declares `self` as the method frame's slot 0,
+    /// the compiler builds the params from the user params), so arity + per-param
+    /// contracts use the SAME `check_call_args` every other call path uses — the
+    /// arg contract panic is byte-identical. Drives a fresh one-frame Fiber to
+    /// completion (a non-generator/non-async method body cannot `yield`). Async
+    /// methods are out of scope for V9-T1 (deferred — a sync `init`/method is the
+    /// T1 surface).
+    #[async_recursion::async_recursion(?Send)]
+    async fn invoke_compiled_method(
+        &self,
+        closure: Rc<Closure>,
+        receiver: Value,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let what = closure.proto.chunk.name.as_deref().unwrap_or("method");
+        // Bind the user args (arity + per-param contracts + rest) against the
+        // method's declared params (which EXCLUDE self) — shared with every call
+        // path. The bound values land in slots 1.. (self is slot 0).
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+        let mut fiber = Fiber::new(closure);
+        fiber.frame_mut().ret_span = span;
+        let cells = fiber.frame().cells.clone();
+        // self -> slot 0 (cell-aware, in case a nested closure captured self).
+        if let Some(cell) = &cells[0] {
+            *cell.borrow_mut() = receiver;
+        } else {
+            fiber.stack[0] = receiver;
+        }
+        // bound args -> slots 1..n+1.
+        for (i, v) in bound.into_iter().enumerate() {
+            let slot = i + 1;
+            if let Some(cell) = &cells[slot] {
+                *cell.borrow_mut() = v;
+            } else {
+                fiber.stack[slot] = v;
+            }
+        }
+        match self.run(&mut fiber).await? {
+            RunOutcome::Done(v) => Ok(v),
+            RunOutcome::Yielded(_) => {
+                unreachable!("a non-generator method cannot yield")
+            }
         }
     }
 

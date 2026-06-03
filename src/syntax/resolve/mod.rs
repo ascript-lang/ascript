@@ -545,6 +545,16 @@ impl Resolver {
             scope_base: self.scopes.len(),
         });
         self.push_scope();
+        // A method (`MethodDecl`) has an implicit `self` receiver bound as the
+        // FIRST local (slot 0), BEFORE its params. The slot-based VM binds the
+        // receiver into slot 0 at the method CALL, so a `self` reference in a
+        // method body must resolve to `Local(0)` (not a `Global`). It is declared
+        // as `BindingKind::Param` so it is EXEMPT from the unused-binding lint
+        // exactly like a parameter (a method that never reads `self` is fine). The
+        // declaration range is the method node itself (there is no `self` token).
+        if node_kind == MethodDecl {
+            self.declare("self", BindingKind::Param, key);
+        }
         if let Some(params) = node.children().find(|c| c.kind() == ParamList) {
             for p in params.children().filter(|c| c.kind() == Param) {
                 if let Some(name) = ident_text(p) {

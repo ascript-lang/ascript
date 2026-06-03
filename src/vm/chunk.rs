@@ -13,6 +13,41 @@ use crate::value::Value;
 use crate::vm::opcode::Op;
 use std::rc::Rc;
 
+/// A compiled class definition referenced by an `Op::Class` operand.
+///
+/// The compiler builds the [`crate::value::Class`] (name, superclass, field
+/// schemas) at compile time, but the class's METHODS are compiled to
+/// [`FnProto`]s and dispatched as VM `Value::Closure`s — which [`Value::Class`]
+/// cannot hold (its `methods` map is the tree-walker `Rc<Method>` shape, frozen).
+/// So `Op::Class` carries the prebuilt `Rc<Class>` plus the *names* of its
+/// methods (in declaration order); at runtime the matching method closures are
+/// already on the stack (one `Op::Closure` per method emitted just before
+/// `Op::Class`), and the VM registers them in its per-class compiled-method side
+/// table keyed by the class's `Rc` identity (see `Vm::register_class_methods`).
+/// Field DEFAULTS are likewise compiled to zero-arg thunk closures (one per
+/// defaulted field), pushed before the method closures, and run at construct time.
+pub struct ClassProto {
+    /// The prebuilt class value (name, superclass, field schemas). Its `methods`
+    /// map is left EMPTY — compiled methods live in the VM side table.
+    pub class: Rc<crate::value::Class>,
+    /// The defaulted-field names, in declaration order, paired with the stack
+    /// position of their default thunk closures (pushed first, before methods).
+    pub default_fields: Vec<String>,
+    /// The method names, in declaration order, matching the method closures
+    /// pushed immediately before `Op::Class` (after the default thunks).
+    pub method_names: Vec<String>,
+}
+
+impl std::fmt::Debug for ClassProto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassProto")
+            .field("class", &self.class.name)
+            .field("default_fields", &self.default_fields)
+            .field("method_names", &self.method_names)
+            .finish()
+    }
+}
+
 /// A compiled function body (or top-level script body) plus its metadata.
 #[derive(Debug, Default)]
 pub struct Chunk {
@@ -23,6 +58,8 @@ pub struct Chunk {
     pub consts: Vec<Value>,
     /// Nested function prototypes referenced by `CLOSURE` operands.
     pub protos: Vec<Rc<FnProto>>,
+    /// Compiled class definitions referenced by `CLASS` operands (V9).
+    pub class_protos: Vec<Rc<ClassProto>>,
     /// `(code offset, span)` pairs, one per instruction, sorted ascending by
     /// offset (emission is monotonic).
     pub spans: Vec<(usize, Span)>,
@@ -173,6 +210,17 @@ impl Chunk {
         let idx = self.protos.len();
         let idx = u16::try_from(idx).expect("proto table exceeded u16::MAX");
         self.protos.push(p);
+        idx
+    }
+
+    /// Append a class definition, returning its index.
+    ///
+    /// # Panics
+    /// If the class-proto table would exceed `u16::MAX` entries.
+    pub fn add_class_proto(&mut self, p: Rc<ClassProto>) -> u16 {
+        let idx = self.class_protos.len();
+        let idx = u16::try_from(idx).expect("class-proto table exceeded u16::MAX");
+        self.class_protos.push(p);
         idx
     }
 
