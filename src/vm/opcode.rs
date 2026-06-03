@@ -85,6 +85,17 @@ pub enum Op {
     /// immutable — the compiler never lowers an assignment to a builtin, the
     /// tree-walker rejects it earlier with "cannot assign to immutable binding".)
     SetGlobal,
+    /// `IMMUTABLE_ERROR(u16 name)` — UNCONDITIONALLY raise the Tier-2 panic
+    /// `cannot assign to immutable binding '<name>'` (name = `consts[idx]`, a `Str`)
+    /// anchored at this op's span (the assignment TARGET's span). Emitted by the
+    /// assignment lowering IN PLACE of a store when the target's resolved binding is
+    /// IMMUTABLE (`const`/`fn`/`class`/`enum`/`import`/loop-var, or a const-pattern
+    /// bind). Because it is emitted at the store position AFTER the value is
+    /// evaluated, it fires with the SAME runtime timing as the tree-walker's
+    /// `Environment::assign` immutable error: the RHS side-effects run first, dead /
+    /// never-reached assignments never trigger it, and the message + span match
+    /// byte-for-byte. No stack contract (it always diverges).
+    ImmutableError,
 
     // ---- arithmetic / logic ----------------------------------------------
     /// `a b -- (a + b)`.
@@ -448,6 +459,7 @@ impl Op {
             x if x == GetGlobal as u8 => GetGlobal,
             x if x == DefineGlobal as u8 => DefineGlobal,
             x if x == SetGlobal as u8 => SetGlobal,
+            x if x == ImmutableError as u8 => ImmutableError,
 
             x if x == Add as u8 => Add,
             x if x == Sub as u8 => Sub,
@@ -542,10 +554,10 @@ impl Op {
         match self {
             // u16-operand ops.
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
-            | SetUpvalue | CloseUpvalue | GetGlobal | DefineGlobal | SetGlobal | Closure | NewArray
-            | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template
-            | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey
-            | CallMethodSpread | DefineExport => 2,
+            | SetUpvalue | CloseUpvalue | GetGlobal | DefineGlobal | SetGlobal | ImmutableError
+            | Closure | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method
+            | GetSuper | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest
+            | MatchHasKey | CallMethodSpread | DefineExport => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -601,6 +613,7 @@ mod tests {
         Op::GetGlobal,
         Op::DefineGlobal,
         Op::SetGlobal,
+        Op::ImmutableError,
         Op::Add,
         Op::Sub,
         Op::Mul,

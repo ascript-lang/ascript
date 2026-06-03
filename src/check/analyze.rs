@@ -60,6 +60,20 @@ pub fn analyze_with_config(src: &str, config: &LintConfig) -> Analysis {
     // Build the typed CST (consumes `parsed`), resolve names, and run lint rules.
     let tree = tree_builder::build_tree(parsed);
     let resolved = resolve::resolve(&tree);
+    // Surface resolver diagnostics (e.g. a same-scope REDECLARATION of a top-level
+    // binding: `let x; let x`, `fn f; fn f`, `fn f; let f`). The tree-walker rejects
+    // these at runtime (`'<name>' is already defined in this scope`); the static
+    // checker flags them as `duplicate-binding` errors so `ascript check` catches them
+    // up front.
+    for d in &resolved.diagnostics {
+        diagnostics.push(AsDiagnostic {
+            range: ByteSpan::from(d.range),
+            severity: Severity::Error,
+            code: "duplicate-binding".to_string(),
+            message: d.message.clone(),
+            fix: None,
+        });
+    }
     for rule in crate::check::rules::ALL {
         diagnostics.extend(rule(&tree, &resolved, src));
     }
@@ -254,6 +268,33 @@ mod tests {
             "expected no diagnostics, got {:?}",
             a.diagnostics
         );
+    }
+
+    #[test]
+    fn flags_top_level_redeclaration_as_duplicate_binding() {
+        // A same-scope top-level redeclaration is surfaced from the resolver as a
+        // `duplicate-binding` error (the tree-walker rejects it at runtime).
+        for src in [
+            "let x = 1\nlet x = 2\nprint(x)\n",
+            "let x = 1\nconst x = 2\nprint(x)\n",
+            "fn f() { return 1 }\nfn f() { return 2 }\nprint(f())\n",
+            "fn f() { return 1 }\nlet f = 2\nprint(f)\n",
+        ] {
+            let codes: Vec<_> = analyze(src).diagnostics.into_iter().map(|d| d.code).collect();
+            assert!(
+                codes.contains(&"duplicate-binding".to_string()),
+                "expected duplicate-binding for {src:?}, got {codes:?}"
+            );
+        }
+        // A valid program (no redeclaration) and a BLOCK-scoped shadow are NOT flagged.
+        assert!(!analyze("let x = 1\nprint(x)\n")
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "duplicate-binding"));
+        assert!(!analyze("let x = 1\n{ let x = 2\n print(x) }\nprint(x)\n")
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "duplicate-binding"));
     }
 
     #[test]

@@ -587,6 +587,19 @@ impl Vm {
                         }
                     };
                     let v = fiber.pop();
+                    // A REDECLARATION (the name is already a module global — e.g.
+                    // `let x; let x`, `fn f; fn f`, `fn f; let f`) is the tree-walker's
+                    // runtime same-scope `Environment::define` rejection, fired when the
+                    // SECOND define executes. It uses `AsError::new` (NO span — span
+                    // `None`), so we match byte-for-byte (message + absent span). Because
+                    // this fires on EXECUTION, a redeclaration in dead/unreached code (an
+                    // un-entered block, an uncalled function — those are slot-locals, not
+                    // globals, anyway) never triggers, exactly like the tree-walker.
+                    if self.user_globals.borrow().contains_key(name.as_ref()) {
+                        return Err(Control::Panic(AsError::new(format!(
+                            "'{name}' is already defined in this scope"
+                        ))));
+                    }
                     self.define_user_global(name, v);
                 }
 
@@ -624,6 +637,32 @@ impl Vm {
                             format!("cannot assign to undefined variable '{name}'"),
                         ));
                     }
+                }
+
+                Op::ImmutableError => {
+                    // Unconditionally raise the tree-walker's immutable-binding panic.
+                    // Emitted at the store position of an assignment whose target is an
+                    // immutable binding (const/fn/class/enum/import/loop-var/const-pattern
+                    // bind), AFTER the RHS has been evaluated — so the timing (RHS
+                    // side-effects first; dead/unreached assignments never trigger),
+                    // message, and span all match the tree-walker's `Environment::assign`
+                    // immutable error byte-for-byte.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("IMMUTABLE_ERROR operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    return Err(self.panic_at(
+                        fiber,
+                        fault_ip,
+                        format!("cannot assign to immutable binding '{name}'"),
+                    ));
                 }
 
                 Op::Call | Op::CallSpread => {

@@ -82,6 +82,13 @@ struct Resolver {
     /// tree-walker's single shared module `Environment`. Inner shadowing still wins
     /// because `resolve_local`/`resolve_upvalue` run BEFORE this set is consulted.
     module_globals: HashSet<String>,
+    /// Per-module-global REASSIGNABILITY, collected up front (in
+    /// `collect_module_globals`) so it is known BEFORE the resolution walk reaches any
+    /// assignment — even one inside a function body that textually PRECEDES the
+    /// global's declaration. A top-level `let` is mutable; `const`/`fn`/`class`/`enum`/
+    /// `import` are immutable. Used to record immutable-assign targets for the
+    /// guaranteed-panic store lowering.
+    module_global_mutable: HashMap<String, bool>,
     /// Per-name read-use counters for module globals (the slot-based `bump_use`
     /// cannot count them — they have no file-frame slot). Mirrored into each global
     /// binding's `use_count` in `finish` so the checker's `unused-binding`/
@@ -99,6 +106,7 @@ impl Resolver {
             frames: Vec::new(),
             scopes: Vec::new(),
             module_globals: HashSet::new(),
+            module_global_mutable: HashMap::new(),
             global_uses: HashMap::new(),
             global_bindings: Vec::new(),
         }
@@ -132,27 +140,62 @@ impl Resolver {
         self.frames.len() == 1 && self.scopes.len() == self.frame_ref().scope_base + 1
     }
 
+    /// Whether a binding of `kind` is REASSIGNABLE. Only `let` and `param` are
+    /// mutable; `const`/`fn`/`class`/`enum`/`import`/loop-var are immutable (mirroring
+    /// the tree-walker's `Environment::define(..., mutable)` flag). A `PatternBind`'s
+    /// mutability depends on whether it was destructured from a `let` or a `const`, so
+    /// callers pass that through `declare_binding_mut` instead of relying on this.
+    fn kind_is_mutable(kind: BindingKind) -> bool {
+        matches!(kind, BindingKind::Let | BindingKind::Param)
+    }
+
     /// Declare a binding, routing DIRECT-child top-level names (those in
     /// `module_globals`) to a global binding (no slot, not entered into a scope) and
     /// everything else to a normal frame-slot `declare`. Returns the assigned slot
     /// for slot-locals; for a global it returns `u32::MAX` (never used — a global has
-    /// no slot, and its references lower to `GET_GLOBAL`, not `GET_LOCAL`).
+    /// no slot, and its references lower to `GET_GLOBAL`, not `GET_LOCAL`). The
+    /// binding's mutability is derived from `kind`; use `declare_binding_mut` for a
+    /// pattern bind whose mutability comes from its enclosing `let`/`const`.
     fn declare_binding(&mut self, name: &str, kind: BindingKind, decl_range: TextRange) -> u32 {
+        let mutable = Self::kind_is_mutable(kind);
+        self.declare_binding_mut(name, kind, decl_range, mutable)
+    }
+
+    fn declare_binding_mut(
+        &mut self,
+        name: &str,
+        kind: BindingKind,
+        decl_range: TextRange,
+        mutable: bool,
+    ) -> u32 {
         if self.at_module_top() && self.module_globals.contains(name) {
-            self.declare_global(name, kind, decl_range);
+            self.declare_global(name, kind, decl_range, mutable);
             u32::MAX
         } else {
-            self.declare(name, kind, decl_range)
+            self.declare_mut(name, kind, decl_range, mutable)
         }
     }
 
     /// Record a module-scope user-global binding for the checker. It has NO file-frame
     /// slot and is NOT entered into the scope map (so `resolve_local`/`resolve_upvalue`
-    /// never find it — a reference falls through to `Resolution::Global`). A repeated
-    /// declaration of the same global name (e.g. a re-`let`) records once; the first
-    /// declaration's range is canonical (mirrors the single shared module env).
-    fn declare_global(&mut self, name: &str, kind: BindingKind, decl_range: TextRange) {
+    /// never find it — a reference falls through to `Resolution::Global`). A REPEATED
+    /// declaration of the same global name (`let x; let x`, `fn f; fn f`, …) is a
+    /// same-scope redeclaration: the tree-walker rejects it at RUNTIME when the second
+    /// define executes (`'<name>' is already defined in this scope`), so we (a) keep
+    /// the FIRST binding canonical for the checker's use-counting, and (b) emit a
+    /// resolve diagnostic so `ascript check` flags it statically. The COMPILER lowers
+    /// every top-level define-site to `DEFINE_GLOBAL` regardless (it keys on
+    /// `module_globals`, not this binding), so the second `DEFINE_GLOBAL` runtime-errors
+    /// byte-identically.
+    fn declare_global(&mut self, name: &str, kind: BindingKind, decl_range: TextRange, mutable: bool) {
+        // Record EVERY top-level define-site (incl. a redeclaration) so the compiler
+        // lowers each to `DEFINE_GLOBAL`; the second site runtime-errors.
+        self.result.global_decl_ranges.insert(decl_range);
         if self.global_bindings.iter().any(|b| b.name == name) {
+            self.result.diagnostics.push(ResolveDiagnostic {
+                message: format!("'{name}' is already defined in this scope"),
+                range: decl_range,
+            });
             return;
         }
         self.global_bindings.push(Binding {
@@ -164,11 +207,23 @@ impl Resolver {
             mutated: false,
             use_count: 0,
             shadows: None,
+            mutable,
             is_global: true,
         });
     }
 
     fn declare(&mut self, name: &str, kind: BindingKind, decl_range: TextRange) -> u32 {
+        let mutable = Self::kind_is_mutable(kind);
+        self.declare_mut(name, kind, decl_range, mutable)
+    }
+
+    fn declare_mut(
+        &mut self,
+        name: &str,
+        kind: BindingKind,
+        decl_range: TextRange,
+        mutable: bool,
+    ) -> u32 {
         // Shadowing is detected within the current function frame's scope stack
         // only; an inner fn shadowing an outer-fn binding is intentionally not
         // flagged (conservative). A frame-local that shadows a MODULE-SCOPE
@@ -204,6 +259,7 @@ impl Resolver {
             mutated: false,
             use_count: 0,
             shadows,
+            mutable,
             is_global: false,
         });
         self.scopes
@@ -343,22 +399,24 @@ impl Resolver {
         use SyntaxKind::*;
         match node.kind() {
             LetStmt => {
+                // A `const` (incl. const-destructure) is immutable; `let` is mutable.
+                let mutable = let_kind(node) == BindingKind::Let;
                 if let Some(arr) = node.children().find(|c| c.kind() == ArrayBindPat) {
-                    self.collect_pattern_global_names(arr);
+                    self.collect_pattern_global_names(arr, mutable);
                 } else if let Some(obj) = node.children().find(|c| c.kind() == ObjectBindPat) {
-                    self.collect_pattern_global_names(obj);
+                    self.collect_pattern_global_names(obj, mutable);
                 } else if let Some(name) = ident_text(node) {
-                    self.module_globals.insert(name);
+                    self.register_global(name, mutable);
                 }
             }
             FnDecl => {
                 if let Some(name) = fn_name(node) {
-                    self.module_globals.insert(name);
+                    self.register_global(name, false);
                 }
             }
             ClassDecl | EnumDecl => {
                 if let Some(name) = ident_text(node) {
-                    self.module_globals.insert(name);
+                    self.register_global(name, false);
                 }
             }
             ImportStmt => {
@@ -373,7 +431,15 @@ impl Resolver {
         }
     }
 
-    fn collect_pattern_global_names(&mut self, pat: &ResolvedNode) {
+    /// Register a module-global NAME and its reassignability. The FIRST registration
+    /// wins for mutability (a redeclaration is a runtime error anyway), so this never
+    /// downgrades an already-recorded global.
+    fn register_global(&mut self, name: String, mutable: bool) {
+        self.module_global_mutable.entry(name.clone()).or_insert(mutable);
+        self.module_globals.insert(name);
+    }
+
+    fn collect_pattern_global_names(&mut self, pat: &ResolvedNode, mutable: bool) {
         use SyntaxKind::*;
         for entry in pat.children() {
             match entry.kind() {
@@ -385,12 +451,12 @@ impl Resolver {
                         .last()
                         .map(|t| t.text().to_string());
                     if let Some(name) = local {
-                        self.module_globals.insert(name);
+                        self.register_global(name, mutable);
                     }
                 }
                 RestBind => {
                     if let Some(name) = ident_text(entry) {
-                        self.module_globals.insert(name);
+                        self.register_global(name, mutable);
                     }
                 }
                 _ => {}
@@ -400,10 +466,11 @@ impl Resolver {
 
     fn collect_import_global_names(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
+        // Imported names are IMMUTABLE bindings (tree-walker `define(..., false)`).
         if let Some(list) = node.children().find(|c| c.kind() == ImportList) {
             for t in list.children_with_tokens().filter_map(|el| el.into_token()) {
                 if t.kind() == Ident {
-                    self.module_globals.insert(t.text().to_string());
+                    self.register_global(t.text().to_string(), false);
                 }
             }
         } else {
@@ -415,7 +482,7 @@ impl Resolver {
                 .collect();
             if let Some(pos) = idents.iter().position(|t| t == "as") {
                 if let Some(alias) = idents.get(pos + 1) {
-                    self.module_globals.insert(alias.clone());
+                    self.register_global(alias.clone(), false);
                 }
             }
         }
@@ -573,18 +640,20 @@ impl Resolver {
 
     fn declare_let_bindings(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
+        // A `const` destructuring binds IMMUTABLE pattern names; `let` binds mutable.
+        let mutable = let_kind(node) == BindingKind::Let;
         if let Some(arr) = node.children().find(|c| c.kind() == ArrayBindPat) {
-            self.declare_pattern_names(arr);
+            self.declare_pattern_names(arr, mutable);
         } else if let Some(obj) = node.children().find(|c| c.kind() == ObjectBindPat) {
-            self.declare_pattern_names(obj);
+            self.declare_pattern_names(obj, mutable);
         } else if let Some(name) = ident_text(node) {
             self.declare_binding(&name, let_kind(node), node.text_range());
         }
     }
 
     /// Declare every name introduced by a binding pattern (BindEntry's local/key,
-    /// RestBind's name).
-    fn declare_pattern_names(&mut self, pat: &ResolvedNode) {
+    /// RestBind's name). `mutable` is the enclosing `let` (true) / `const` (false).
+    fn declare_pattern_names(&mut self, pat: &ResolvedNode, mutable: bool) {
         use SyntaxKind::*;
         for entry in pat.children() {
             match entry.kind() {
@@ -597,12 +666,22 @@ impl Resolver {
                         .last()
                         .map(|t| t.text().to_string());
                     if let Some(name) = local {
-                        self.declare_binding(&name, BindingKind::PatternBind, entry.text_range());
+                        self.declare_binding_mut(
+                            &name,
+                            BindingKind::PatternBind,
+                            entry.text_range(),
+                            mutable,
+                        );
                     }
                 }
                 RestBind => {
                     if let Some(name) = ident_text(entry) {
-                        self.declare_binding(&name, BindingKind::PatternBind, entry.text_range());
+                        self.declare_binding_mut(
+                            &name,
+                            BindingKind::PatternBind,
+                            entry.text_range(),
+                            mutable,
+                        );
                     }
                 }
                 _ => {}
@@ -746,7 +825,7 @@ impl Resolver {
                 if let Some(target) = children.next() {
                     if target.kind() == NameRef {
                         let name = ident_text(target).unwrap_or_default();
-                        self.mark_mutated(&name);
+                        self.mark_mutated_target(&name, target.text_range());
                     }
                     self.resolve_expr(target);
                 }
@@ -762,13 +841,33 @@ impl Resolver {
         }
     }
 
-    fn mark_mutated(&mut self, name: &str) {
+    /// Mark the binding `name` resolves to as `mutated`, and — if that binding is
+    /// IMMUTABLE — record the assignment target's `range` in
+    /// `immutable_assign_targets` so the compiler lowers the store to a guaranteed
+    /// `cannot assign to immutable binding` panic (runtime-timed). Resolution order
+    /// mirrors `resolve_name`: nearest enclosing frame local/upvalue, then a
+    /// module-scope user-global. A name that is NOT an in-scope binding (a bare /
+    /// undefined global) records nothing — it takes the undefined-variable path.
+    fn mark_mutated_target(&mut self, name: &str, range: TextRange) {
         for fi in (0..self.frames.len()).rev() {
             if let Some(slot) = self.resolve_local_in(fi, name) {
                 if let Some(b) = self.frames[fi].bindings.iter_mut().find(|b| b.slot == slot) {
                     b.mutated = true;
+                    if !b.mutable {
+                        self.result.immutable_assign_targets.insert(range);
+                    }
                 }
                 return;
+            }
+        }
+        // Not a local/upvalue: a module-scope user-global (a top-level `const`/`fn`/…
+        // is immutable; a top-level `let` is mutable). The mutability map is collected
+        // UP FRONT, so this is correct even for an assignment inside a function body
+        // that textually PRECEDES the global's declaration. A name that is not a
+        // module global at all is a bare/undefined global — record nothing.
+        if let Some(&mutable) = self.module_global_mutable.get(name) {
+            if !mutable {
+                self.result.immutable_assign_targets.insert(range);
             }
         }
     }
@@ -947,6 +1046,10 @@ impl Resolver {
             b.use_count = self.global_uses.get(&b.name).copied().unwrap_or(0);
             self.result.bindings.push(b);
         }
+        // Expose the module-global NAME set so the compiler can lower every top-level
+        // define-site to DEFINE_GLOBAL (incl. a redeclaration's second site, which the
+        // VM runtime-rejects), independent of any per-declaration binding range.
+        self.result.module_globals = self.module_globals;
         self.result
     }
 }

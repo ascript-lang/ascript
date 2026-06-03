@@ -158,7 +158,10 @@ impl Effect {
 /// Whether an op terminates its straight-line path (the run loop never falls
 /// through to the next instruction after it).
 fn is_unconditional_terminator(op: Op) -> bool {
-    matches!(op, Op::Return | Op::Jump | Op::Loop | Op::Yield | Op::MatchNoArm)
+    matches!(
+        op,
+        Op::Return | Op::Jump | Op::Loop | Op::Yield | Op::MatchNoArm | Op::ImmutableError
+    )
 }
 
 /// The stack effect of `op` given its already-decoded operands.
@@ -273,6 +276,9 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         MatchArray | MatchObject | MatchHasKey => Effect::new(1, 1),
         MatchRange => Effect::new(3, 1),
         MatchNoArm => Effect::new(0, 0),
+        // IMMUTABLE_ERROR always diverges (raises a Tier-2 panic); like MATCH_NO_ARM
+        // it never produces a value, so it has no net stack effect.
+        ImmutableError => Effect::new(0, 0),
 
         // DEFINE_GLOBAL pops the value and binds it as a module-scope user-global.
         DefineGlobal => Effect::new(1, 0),
@@ -406,8 +412,8 @@ fn check_operands(
         Const => check_const(chunk.read_u16(operand_at) as usize)?,
 
         // ---- name-const (must be a Str) ----
-        GetGlobal | DefineGlobal | SetGlobal | GetProp | SetProp | GetPropOpt | Method | GetSuper
-        | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport => {
+        GetGlobal | DefineGlobal | SetGlobal | ImmutableError | GetProp | SetProp | GetPropOpt
+        | Method | GetSuper | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport => {
             check_name_const(chunk.read_u16(operand_at) as usize)?
         }
 
@@ -585,7 +591,7 @@ fn verify_stack_balance(
                 push_fallthrough(&mut work, &resolve, next_off, depth_out, off)?;
             }
             // Frame terminators: no in-chunk successor.
-            Op::Return | Op::Yield | Op::MatchNoArm => {}
+            Op::Return | Op::Yield | Op::MatchNoArm | Op::ImmutableError => {}
             // PROPAGATE may return from the frame OR fall through; the fall-through
             // path is the one with a stack effect we track (net 0). The return path
             // leaves the chunk, so only the fall-through is an in-chunk successor.

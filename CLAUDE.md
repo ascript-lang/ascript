@@ -289,6 +289,28 @@ through the lazily-built `class_env` (`def_env`), which is seeded from `user_glo
 `ASO_FORMAT_VERSION` bumped 3→4 (new opcode + ImportDesc layout). The whole-corpus three-way differential
 stays byte-identical.
 
+**Redeclaration + const immutability (WS1 follow-ups, both RUNTIME-timed).** The tree-walker enforces
+both via `Environment::define`/`assign` at RUNTIME — so a redeclaration / const-reassignment in
+dead/un-entered/uncalled code never errors, and an RHS side-effect runs before the error. The VM matches
+exactly. (a) **Redeclaration** (`let x; let x`, `let x; const x`, `fn f; fn f`, `fn f; let f`): the
+resolver records EVERY top-level define-site range in `ResolveResult::global_decl_ranges` (deduping only
+the checker `bindings` + a `duplicate-binding` resolve diagnostic surfaced by `check/analyze.rs`); the
+compiler lowers every such site to `DEFINE_GLOBAL` (keyed on the RANGE, NOT the name — so a same-named
+BLOCK/fn-body `let`, which has its own range NOT in the set, stays a slot-local exactly as the resolver
+classified it); `Op::DefineGlobal` errors `'<name>' is already defined in this scope` (span `None`, via
+`AsError::new` — NOT `panic_at` — to match the tree-walker's span-less error) when the name is already in
+`user_globals`. (b) **Const immutability** at EVERY scope: each `Binding` carries `mutable` (a `let`/
+`param` is mutable; `const`/`fn`/`class`/`enum`/`import`/loop-var, and a const-DESTRUCTURE pattern bind,
+are immutable — pattern-bind mutability is threaded from the enclosing `let`/`const`). The resolver's
+`mark_mutated_target` records an assignment whose target resolves to an immutable binding into
+`ResolveResult::immutable_assign_targets` (consulting `module_global_mutable`, collected UP FRONT, so a
+const reassignment inside a function body that textually PRECEDES the const's declaration is still caught);
+the compiler emits `Op::ImmutableError <name>` (a new opcode, `is_unconditional_terminator`) at the STORE
+position — i.e. AFTER the RHS is compiled — so it raises `cannot assign to immutable binding '<name>'`
+(anchored at the target span) with the tree-walker's exact runtime TIMING (RHS first, dead stores never
+fire) without any runtime const-flag tracking. `.aso` `ASO_FORMAT_VERSION` bumped 4→5 (new opcode). Both
+fixes keep the whole-corpus three-way differential byte-identical and add no perf-gate regression.
+
 **`--no-specialize` KILL SWITCH + three-way differential (V11-T5).** The `Vm` carries a
 `specialize: bool` (default `true`; `Vm::new` → specializing, `Vm::new_generic` /
 `Vm::with_specialize(interp, false)` → generic). When `false`, EVERY specialization fast path is

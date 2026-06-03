@@ -1058,6 +1058,24 @@ impl Compiler {
         // Phase 2: store to the target, leaving the assigned value on the stack.
         match &target {
             Expr::NameRef(name_ref) => {
+                // An assignment to an IMMUTABLE binding (const/fn/class/enum/import/
+                // loop-var/const-pattern bind) is the runtime panic `cannot assign to
+                // immutable binding '<name>'`. The resolver recorded such targets; we
+                // emit IMMUTABLE_ERROR at the store position (AFTER the RHS, already on
+                // the stack, was evaluated) so the RHS side-effects run first and a
+                // dead/unreached assignment never triggers — matching the tree-walker's
+                // runtime timing, message, and target span exactly.
+                let target_range = name_ref.syntax().text_range();
+                if self.resolved.immutable_assign_targets.contains(&target_range) {
+                    let name = name_ref
+                        .ident_token()
+                        .map(|t| t.text().to_string())
+                        .unwrap_or_default();
+                    let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    self.chunk
+                        .emit_u16(Op::ImmutableError, idx, node_code_span(name_ref));
+                    return Ok(());
+                }
                 // The store target: a frame-local slot (cell-aware), an upvalue (a
                 // captured outer variable, mutated by reference), or a MODULE-SCOPE
                 // user-global (`Resolution::Global` — a top-level `let` reassigned at
@@ -1416,8 +1434,8 @@ impl Compiler {
         // forward-referenced fn), so use the cell-aware store: the cell, allocated nil
         // at frame entry and captured by the closure's own body, is filled HERE —
         // late-binding-correct.
-        let decl_range: TextRange = fn_decl.syntax().text_range();
-        if let Some(name) = self.global_binding_name(decl_range) {
+        if self.is_global_decl_site(fn_decl.syntax().text_range()) {
+            let name = fn_name_token_text(fn_decl.syntax()).unwrap_or_default();
             self.emit_define_global(&name, span);
         } else {
             let slot = self.fn_decl_slot(fn_decl)?;
@@ -1641,8 +1659,8 @@ impl Compiler {
         // (DEFINE_GLOBAL); otherwise bind the class value to its name's slot in the
         // enclosing frame (the resolver records a `BindingKind::Class` binding whose
         // `decl_range` is the ClassDecl node's `text_range()`).
-        let decl_range: TextRange = class_decl.syntax().text_range();
-        if let Some(name) = self.global_binding_name(decl_range) {
+        if self.is_global_decl_site(class_decl.syntax().text_range()) {
+            let name = cst_first_ident(class_decl.syntax()).unwrap_or_default();
             self.emit_define_global(&name, span);
         } else {
             let slot = self.class_decl_slot(class_decl)?;
@@ -1727,9 +1745,8 @@ impl Compiler {
         // (DEFINE_GLOBAL); otherwise bind to the enum's name slot. The resolver
         // records a `BindingKind::Enum` binding keyed by the EnumDecl node's
         // `text_range()`.
-        let decl_range: TextRange = enum_decl.syntax().text_range();
-        if let Some(gname) = self.global_binding_name(decl_range) {
-            self.emit_define_global(&gname, span);
+        if self.is_global_decl_site(enum_decl.syntax().text_range()) {
+            self.emit_define_global(&name, span);
         } else {
             let slot = self.enum_decl_slot(enum_decl)?;
             self.emit_set_local(slot, span);
@@ -2817,8 +2834,8 @@ impl Compiler {
 
         // A DIRECT-child top-level `let`/`const` is a module-scope user-global: emit
         // `<init>; DEFINE_GLOBAL name` (late-bound) instead of a frame-slot store.
-        let decl_range: TextRange = let_stmt.syntax().text_range();
-        if let Some(name) = self.global_binding_name(decl_range) {
+        if self.is_global_decl_site(let_stmt.syntax().text_range()) {
+            let name = cst_first_ident(let_stmt.syntax()).unwrap_or_default();
             match let_stmt.expr() {
                 Some(init) => self.compile_expr(&init)?,
                 None => self.chunk.emit(Op::Nil, span),
@@ -2838,15 +2855,15 @@ impl Compiler {
         Ok(())
     }
 
-    /// If the binding declared at `decl_range` is a MODULE-SCOPE user-global, return
-    /// its name; else `None`. Used by the declaration compilers to choose
-    /// `DEFINE_GLOBAL` over a frame-slot store.
-    fn global_binding_name(&self, decl_range: TextRange) -> Option<String> {
-        self.resolved
-            .bindings
-            .iter()
-            .find(|b| b.decl_range == decl_range && b.is_global)
-            .map(|b| b.name.clone())
+    /// Whether the declaration at `decl_range` binds a MODULE-SCOPE user-global, per
+    /// the resolver's classification (`global_decl_ranges`). The declaration compilers
+    /// use this to choose `DEFINE_GLOBAL` over a frame-slot store. Range-keyed, so it
+    /// distinguishes a DIRECT-child top-level decl (a global) from a same-named decl
+    /// inside a top-level bare `{ }` block or a function body (a slot-local) — exactly
+    /// as the resolver decided. A REDECLARATION (`let x; let x`) has BOTH sites in the
+    /// set, so both lower to `DEFINE_GLOBAL` and the second runtime-errors.
+    fn is_global_decl_site(&self, decl_range: TextRange) -> bool {
+        self.resolved.global_decl_ranges.contains(&decl_range)
     }
 
     /// Emit `DEFINE_GLOBAL <name>` (pops TOS, binds it as the module-scope global
@@ -2905,8 +2922,18 @@ impl Compiler {
         entry: &ResolvedNode,
         span: Span,
     ) -> Result<(), CompileError> {
-        let decl_range = entry.text_range();
-        if let Some(name) = self.global_binding_name(decl_range) {
+        // A top-level destructuring pattern bind is a module global (its decl_range is
+        // the ENTRY node, matching the resolver's `declare_pattern_names`). The bound
+        // LOCAL name is the entry's LAST Ident token (`key as local` → `local`; plain
+        // `key` or a `...rest` → that single name).
+        if self.is_global_decl_site(entry.text_range()) {
+            let name = entry
+                .descendants_with_tokens()
+                .filter_map(|el| el.into_token().cloned())
+                .filter(|t| t.kind() == SyntaxKind::Ident)
+                .last()
+                .map(|t| t.text().to_string())
+                .unwrap_or_default();
             self.emit_define_global(&name, span);
             return Ok(());
         }

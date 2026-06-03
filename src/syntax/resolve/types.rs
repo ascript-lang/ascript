@@ -38,6 +38,12 @@ pub struct Binding {
     pub use_count: u32,
     /// If this binding shadows an outer binding, the outer's decl range.
     pub shadows: Option<TextRange>,
+    /// Whether this binding is REASSIGNABLE (a `let`/`param`), as opposed to an
+    /// immutable binding (`const`/`fn`/`class`/`enum`/`import`/`loop var`, and a
+    /// pattern binding destructured from a `const`). Mirrors the tree-walker's
+    /// `Environment::define(..., mutable)` flag — an assignment to an immutable
+    /// binding is the runtime panic `cannot assign to immutable binding '<name>'`.
+    pub mutable: bool,
     /// A MODULE-SCOPE USER-GLOBAL: a DIRECT-child top-level binding of the
     /// `SourceFile` (`let`/`const`/`fn`/`class`/`enum`/`import`). Such a binding has
     /// NO file-frame slot (`slot` is meaningless for it); its references resolve to
@@ -73,4 +79,25 @@ pub struct ResolveResult {
     pub diagnostics: Vec<ResolveDiagnostic>,
     /// Every binding declared anywhere (across all frames), for the checker.
     pub bindings: Vec<Binding>,
+    /// Text ranges of assignment-target `NameRef`s whose resolved binding is
+    /// IMMUTABLE (`const`/`fn`/`class`/`enum`/`import`/loop-var, or a const-pattern
+    /// bind). The compiler lowers such an assignment to a guaranteed-panic store
+    /// (`cannot assign to immutable binding '<name>'`) anchored at the target span —
+    /// runtime-timed (only panics if reached), matching the tree-walker's
+    /// `Environment::assign` immutable error. A name that is NOT an in-scope binding
+    /// (a bare/undefined global) is NOT recorded here (it gets the undefined-variable
+    /// path instead).
+    pub immutable_assign_targets: std::collections::HashSet<TextRange>,
+    /// The names of every DIRECT-child top-level binding of the `SourceFile` — the
+    /// MODULE-SCOPE user-globals. Used to classify a top-level reassignment target and
+    /// (with `immutable_assign_targets`) the const checks.
+    pub module_globals: std::collections::HashSet<String>,
+    /// The `decl_range` of EVERY DIRECT-child top-level declaration site that binds a
+    /// module global — including a REDECLARATION's second site (`let x; let x`), which
+    /// `module_globals`/`bindings` dedupe away. The compiler keys on this to lower a
+    /// declaration to `DEFINE_GLOBAL` IFF its range is here (so a same-named BLOCK or
+    /// function-body `let` — which has its OWN range, NOT in this set — stays a frame
+    /// slot-local, exactly as the resolver classified it). The redeclaration's second
+    /// `DEFINE_GLOBAL` runtime-errors `'<name>' is already defined in this scope`.
+    pub global_decl_ranges: std::collections::HashSet<TextRange>,
 }

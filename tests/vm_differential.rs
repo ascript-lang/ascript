@@ -5111,3 +5111,95 @@ async fn vm_inner_let_shadows_top_level_global() {
     )
     .await;
 }
+
+// ---- Binding semantics: redeclaration + const immutability ------------------
+//
+// Both are RUNTIME-timed in the tree-walker (via `Environment::define` /
+// `Environment::assign`): a same-scope redeclaration errors when the SECOND define
+// executes; a const reassignment errors when the assignment executes — so dead /
+// never-reached cases run fine. The VM matches byte-for-byte (message AND span;
+// the redeclaration error carries no span, the immutable error carries the target
+// span). `assert_vm_run_error_matches_treewalker` checks message + span; the
+// success helper checks stdout.
+
+#[tokio::test]
+async fn vm_top_level_redeclaration_errors_match_treewalker() {
+    // let/let, let/const, fn/fn, fn/let — all the same-scope redeclaration error,
+    // fired at runtime when the SECOND define executes (same message, no span).
+    assert_vm_run_error_matches_treewalker("let x = 1\nlet x = 2\nprint(x)").await;
+    assert_vm_run_error_matches_treewalker("let x = 1\nconst x = 2\nprint(x)").await;
+    assert_vm_run_error_matches_treewalker("fn f() { return 1 }\nfn f() { return 2 }\nprint(f())")
+        .await;
+    assert_vm_run_error_matches_treewalker("fn f() { return 1 }\nlet f = 2\nprint(f)").await;
+}
+
+#[tokio::test]
+async fn vm_redeclaration_runtime_timing_matches_treewalker() {
+    // The first `print` runs BEFORE the redeclaration error (runtime timing): the
+    // tree-walker and VM both emit "before\n" then fail identically. The error
+    // helper only fires when BOTH error; this program errors, so use the run-error
+    // helper which (because both partial-print "before" to the LIVE sink under the
+    // CLI, but CAPTURE under run_source) compares the panic itself.
+    assert_vm_run_error_matches_treewalker("let x = 1\nprint(\"before\")\nlet x = 2").await;
+}
+
+#[tokio::test]
+async fn vm_dead_code_redeclaration_runs_fine_matches_treewalker() {
+    // A redeclaration inside an UN-ENTERED block / UNCALLED function is fine on both
+    // engines (those `let`s are block/fn slot-locals, not module globals; and even a
+    // genuine same-scope dup in dead code never executes its second define).
+    assert_vm_run_matches_treewalker("if (false) { let y = 1\n let y = 2 }\nprint(\"ok\")").await;
+    assert_vm_run_matches_treewalker("fn g() { let z = 1\n let z = 2 }\nprint(\"ok\")").await;
+}
+
+#[tokio::test]
+async fn vm_const_reassignment_errors_match_treewalker() {
+    // Executed const reassignment → immutable error on both engines (message +
+    // target span). Covers a top-level const, a const inside a function, and a
+    // compound `+=` on a const.
+    assert_vm_run_error_matches_treewalker("const k = 1\nk = 2\nprint(k)").await;
+    assert_vm_run_error_matches_treewalker("fn f() { const c = 1\n c = 2\n return c }\nprint(f())")
+        .await;
+    assert_vm_run_error_matches_treewalker(
+        "fn f() { const c = 1\n c += 2\n return c }\nprint(f())",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_immutable_binding_kinds_error_match_treewalker() {
+    // Every immutable binding kind: fn name, class name, loop var, const-destructure
+    // bind — reassigning any is the immutable error on both engines.
+    assert_vm_run_error_matches_treewalker("fn f() { return 1 }\nf = 2\nprint(f)").await;
+    assert_vm_run_error_matches_treewalker("class C {}\nC = 3\nprint(C)").await;
+    assert_vm_run_error_matches_treewalker("for (i in 0..3) { i = 9\n print(i) }").await;
+    assert_vm_run_error_matches_treewalker("const [a, b] = [1, 2]\na = 9\nprint(a)").await;
+}
+
+#[tokio::test]
+async fn vm_dead_const_reassignment_runs_fine_matches_treewalker() {
+    // A const reassignment that is NEVER REACHED runs fine on both engines (runtime
+    // timing — only an EXECUTED assignment errors).
+    assert_vm_run_matches_treewalker("const k = 1\nif (false) { k = 2 }\nprint(\"ok\")").await;
+    assert_vm_run_matches_treewalker("const k = 1\nfn g() { k = 2 }\nprint(\"ok\")").await;
+}
+
+#[tokio::test]
+async fn vm_const_reassign_runs_rhs_first_matches_treewalker() {
+    // The RHS side-effect runs BEFORE the const-assign error (the immutable check is
+    // at the store, after value evaluation) — byte-identical on both engines.
+    assert_vm_run_error_matches_treewalker(
+        "const k = 1\nfn side() { print(\"rhs ran\")\n return 9 }\nk = side()",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_mutable_let_and_param_reassign_still_work() {
+    // Regression guard: a mutable `let` (top-level + local) and a `param` reassign
+    // fine — the immutable check must NOT over-trigger.
+    assert_vm_run_matches_treewalker("let x = 1\nx = 2\nprint(x)").await;
+    assert_vm_run_matches_treewalker("fn f() { let y = 1\n y = 5\n return y }\nprint(f())").await;
+    assert_vm_run_matches_treewalker("fn f(a) { a = 5\n return a }\nprint(f(1))").await;
+    assert_vm_run_matches_treewalker("let [a, b] = [1, 2]\na = 9\nprint(a)").await;
+}

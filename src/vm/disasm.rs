@@ -72,7 +72,7 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
 
     match op {
         // u16 const-pool index → show the referenced value.
-        Op::Const | Op::GetGlobal | Op::DefineGlobal | Op::SetGlobal => {
+        Op::Const | Op::GetGlobal | Op::DefineGlobal | Op::SetGlobal | Op::ImmutableError => {
             let idx = chunk.read_u16(at + 1);
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
         }
@@ -193,6 +193,7 @@ fn op_name(op: Op) -> &'static str {
         GetGlobal => "GET_GLOBAL",
         DefineGlobal => "DEFINE_GLOBAL",
         SetGlobal => "SET_GLOBAL",
+        ImmutableError => "IMMUTABLE_ERROR",
         Add => "ADD",
         Sub => "SUB",
         Mul => "MUL",
