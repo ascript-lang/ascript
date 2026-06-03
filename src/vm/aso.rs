@@ -53,7 +53,7 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///
 /// History:
 /// - 1: initial `.aso` format (V12-T2).
-pub const ASO_FORMAT_VERSION: u32 = 1;
+pub const ASO_FORMAT_VERSION: u32 = 2;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -936,6 +936,16 @@ fn write_class_proto(w: &mut Writer, cp: &ClassProto) -> Result<(), AsoError> {
     for m in &cp.method_names {
         w.str(m);
     }
+    // Per-default capture plan (parallel to default_fields): the free names each
+    // default expression captures + their upvalue index in that field's thunk.
+    w.len(cp.default_captures.len());
+    for caps in &cp.default_captures {
+        w.len(caps.len());
+        for (name, idx) in caps {
+            w.str(name);
+            w.u16(*idx);
+        }
+    }
     w.u8(u8::from(cp.has_super));
     Ok(())
 }
@@ -952,11 +962,24 @@ fn read_class_proto(r: &mut Reader) -> Result<ClassProto, AsoError> {
     for _ in 0..n {
         method_names.push(r.str()?);
     }
+    let n = r.len()?;
+    let mut default_captures = Vec::with_capacity(n);
+    for _ in 0..n {
+        let m = r.len()?;
+        let mut caps = Vec::with_capacity(m);
+        for _ in 0..m {
+            let name = r.str()?;
+            let idx = r.u16()?;
+            caps.push((name, idx));
+        }
+        default_captures.push(caps);
+    }
     let has_super = r.u8()? != 0;
     Ok(ClassProto {
         class: Rc::new(class),
         default_fields,
         method_names,
+        default_captures,
         has_super,
     })
 }

@@ -696,21 +696,19 @@ impl Compiler {
                 self.chunk.emit_u16(Op::GetUpvalue, idx, span);
                 Ok(())
             }
-            // A bare reference to a builtin name is a first-class builtin value:
-            // `GET_GLOBAL <name>` resolves it to `Value::Builtin` at runtime, the
-            // same value the tree-walker reads from its global env. This makes
-            // `let p = print; p("hi")` work identically.
-            Some(Resolution::Global(name))
-                if crate::interp::BUILTIN_NAMES.contains(&name.as_str()) =>
-            {
+            // A bare reference to a free (global) name lowers to `GET_GLOBAL <name>`,
+            // resolved at RUNTIME — exactly like the tree-walker, which looks the name
+            // up in its global env when the `Ident` is evaluated. For a builtin name
+            // this yields the first-class `Value::Builtin` (so `let p = print; p("hi")`
+            // works); for any other free name the runtime handler raises the
+            // byte-identical `undefined variable '<name>'` panic IF AND WHEN it is
+            // actually evaluated (so an unreferenced free name in dead code is not a
+            // compile error, matching the tree-walker's deferred semantics).
+            Some(Resolution::Global(name)) => {
                 let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetGlobal, idx, span);
                 Ok(())
             }
-            Some(Resolution::Global(name)) => Err(CompileError::new(
-                format!("bare global reference '{name}' not yet supported (V4)"),
-                span,
-            )),
             Some(Resolution::Unresolved) | None => Err(CompileError::new(
                 "undefined name",
                 span,
@@ -1337,9 +1335,15 @@ impl Compiler {
         // Emit the default-field thunk closures (declaration order) FIRST, then the
         // method closures, so the stack below `CLASS` is
         // `[..thunks.., ..methods..]` and `Op::Class` pops them in reverse.
+        let mut default_captures: Vec<Vec<(String, u16)>> = Vec::new();
         for field in class_decl.field_decls() {
             if let Some(default) = field.expr() {
-                let proto = self.compile_default_thunk(&default)?;
+                let proto = self.compile_default_thunk(field.syntax(), &default)?;
+                // Record the enclosing-scope names this default captures (upvalues of
+                // its thunk frame), so `Op::Class` can mirror them into the class's
+                // `def_env` for the shared `.from`/typed-parse path. Empty for the
+                // common literal default.
+                default_captures.push(self.default_capture_names(&default));
                 let idx = self.chunk.add_proto(proto);
                 self.chunk.emit_u16(Op::Closure, idx, span);
             }
@@ -1360,6 +1364,7 @@ impl Compiler {
             class,
             default_fields,
             method_names,
+            default_captures,
             has_super,
         });
         let cp_idx = self.chunk.add_class_proto(class_proto);
@@ -1731,25 +1736,83 @@ impl Compiler {
     /// default yields a fresh value per instance (matching the tree-walker, which
     /// re-evals the default per `construct`).
     ///
-    /// The default expression is resolved (by the whole-tree resolver) in the
-    /// class's ENCLOSING frame, so it may reference globals/builtins (works:
-    /// `GET_GLOBAL`) but NOT enclosing locals/upvalues — those would resolve to the
-    /// wrong slot in this standalone thunk frame. A default referencing an
-    /// enclosing local is therefore deferred with a clear error (V9 polish). Real
-    /// defaults are overwhelmingly literals/constants.
-    fn compile_default_thunk(&mut self, default: &Expr) -> Result<Rc<FnProto>, CompileError> {
+    /// The enclosing-scope names a field default captures, paired with the upvalue
+    /// index they occupy in the default's thunk frame. Walks the default's `NameRef`
+    /// descendants and keeps the distinct ones resolving to an `Upvalue` (a captured
+    /// enclosing local). `Op::Class` reads `thunk.upvalues[idx]`'s value and binds
+    /// `name -> value` into the class's `def_env`, so the SHARED `validate_into`
+    /// (`.from`/typed-parse) resolves the same enclosing binding the construct-time
+    /// thunk closes over. Globals/builtins are NOT included (they resolve via
+    /// `GET_GLOBAL` / the env's parent chain, not an upvalue).
+    fn default_capture_names(&self, default: &Expr) -> Vec<(String, u16)> {
+        let mut out: Vec<(String, u16)> = Vec::new();
+        for node in default.syntax().descendants() {
+            if node.kind() != SyntaxKind::NameRef {
+                continue;
+            }
+            if let Some(Resolution::Upvalue(idx)) = self.resolved.uses.get(&node.text_range()) {
+                let name = crate::syntax::resolve::ident_text(node).unwrap_or_default();
+                let idx = match u16::try_from(*idx) {
+                    Ok(i) => i,
+                    Err(_) => continue,
+                };
+                if !out.iter().any(|(n, i)| n == &name && *i == idx) {
+                    out.push((name, idx));
+                }
+            }
+        }
+        out
+    }
+
+    /// The default expression has its OWN resolver frame (keyed by the `FieldDecl`,
+    /// see `resolve_field_default`): a global/builtin reference resolves to a
+    /// `GET_GLOBAL`, and a reference to an enclosing-scope local (a module-top-level
+    /// `const`, or a function local for a class declared inside a function) resolves
+    /// to an `Upvalue` of THIS thunk frame. The thunk's `chunk.upvalues` capture plan
+    /// drives the enclosing `Op::Closure` to wire the upvalue cells at runtime, so a
+    /// default capturing an enclosing local works through the SAME closure machinery
+    /// as any nested function — the construct-time thunk closes over those cells.
+    fn compile_default_thunk(
+        &mut self,
+        field: &ResolvedNode,
+        default: &Expr,
+    ) -> Result<Rc<FnProto>, CompileError> {
         let span = node_span(default);
-        // Reject a default that captures an enclosing local/upvalue (see above).
-        self.assert_no_local_capture(default.syntax())?;
+
+        // The default's resolver frame (keyed by the FieldDecl) carries its upvalue
+        // capture plan and any captured-local cell slots, exactly like a function
+        // body's frame. A default with no free references has an empty frame.
+        let frame = self
+            .resolved
+            .frames
+            .get(&(SyntaxKind::FieldDecl, field.text_range()));
+        let (upvalues, cell_slots, slot_count) = match frame {
+            Some(f) => (
+                f.upvalues.clone(),
+                f.cell_slots.clone(),
+                u16::try_from(f.slot_count).map_err(|_| {
+                    CompileError::new("too many local slots in field default (max 65535)", span)
+                })?,
+            ),
+            None => (Vec::new(), Vec::new(), 0),
+        };
 
         let mut body_chunk = Chunk::new();
         body_chunk.name = Some("<field default>".to_string());
+        body_chunk.slot_count = slot_count;
+        body_chunk.upvalues = upvalues;
+        body_chunk.cell_slots = cell_slots;
 
         let saved_chunk = std::mem::replace(&mut self.chunk, body_chunk);
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_next_temp = self.next_temp;
-        let saved_cells = std::mem::take(&mut self.cur_cells);
-        self.next_temp = 0;
+        // Swap in this frame's cell slots so the body's name reads emit the
+        // cell-aware opcodes for ITS captured locals (none, in practice).
+        let saved_cells = std::mem::replace(
+            &mut self.cur_cells,
+            self.chunk.cell_slots.iter().copied().collect(),
+        );
+        self.next_temp = slot_count;
 
         let result = self.compile_expr(default);
 
@@ -1772,26 +1835,6 @@ impl Compiler {
             params: Vec::new(),
             ret: None,
         }))
-    }
-
-    /// Error if any `NameRef` under `node` resolves to a `Local`/`Upvalue` — used
-    /// to keep a field-default thunk self-contained (it may only reference
-    /// globals/builtins, never an enclosing local).
-    fn assert_no_local_capture(&self, node: &ResolvedNode) -> Result<(), CompileError> {
-        for descendant in node.descendants() {
-            if descendant.kind() == SyntaxKind::NameRef {
-                match self.resolved.uses.get(&descendant.text_range()) {
-                    Some(Resolution::Local(_)) | Some(Resolution::Upvalue(_)) => {
-                        return Err(CompileError::new(
-                            "a class field default referencing an enclosing local is not yet supported in the VM",
-                            range_span(node),
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Compile an arrow expression `(params) => body` (an EXPRESSION): build its
@@ -3019,17 +3062,14 @@ impl Compiler {
                 self.chunk.emit_u16(Op::GetUpvalue, idx, span);
                 Ok(())
             }
-            Resolution::Global(name)
-                if crate::interp::BUILTIN_NAMES.contains(&name.as_str()) =>
-            {
+            // An Option-C compare ident that resolves to a global: lower to a runtime
+            // `GET_GLOBAL` (builtin value, or the byte-identical `undefined variable`
+            // panic at evaluation), mirroring `compile_name_ref`'s `uses` arm.
+            Resolution::Global(name) => {
                 let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetGlobal, idx, span);
                 Ok(())
             }
-            Resolution::Global(name) => Err(CompileError::new(
-                format!("bare global reference '{name}' not yet supported (V4)"),
-                span,
-            )),
             Resolution::Unresolved => {
                 Err(CompileError::new("undefined name in match pattern", span))
             }
@@ -4030,15 +4070,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_call_to_non_builtin_global() {
-        // `foo` is a free name; the resolver classifies it Global("foo"), which is
-        // not in BUILTIN_NAMES and has no user-global runtime binding (top-level
-        // lets are frame-locals) — so compiling the callee defers it (V4). A call
-        // to a closure/local/upvalue callee, by contrast, now compiles (V4-T3).
-        let err = compile_source("foo(1)").unwrap_err();
+    fn call_to_non_builtin_global_compiles_and_defers_to_runtime() {
+        // `foo` is a free name; the resolver classifies it Global("foo"), not in
+        // BUILTIN_NAMES and with no user-global runtime binding (top-level lets are
+        // frame-locals). It compiles to `GET_GLOBAL foo` so the runtime raises the
+        // byte-identical `undefined variable 'foo'` panic when evaluated — matching
+        // the tree-walker's deferred semantics (the production `run .as` path).
+        let chunk = compile_source("foo(1)").expect("compiles (deferred to runtime)");
+        let text = disasm(&chunk);
         assert!(
-            err.message.contains("bare global reference 'foo' not yet supported (V4)"),
-            "got {err:?}"
+            text.contains("GET_GLOBAL") && text.contains("foo"),
+            "missing GET_GLOBAL foo in:\n{text}"
         );
     }
 
@@ -4056,14 +4098,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bare_non_builtin_global_reference() {
-        // `foo` is a free name → resolver classifies it Global("foo"); not a
-        // builtin, and there are no user globals (top-level lets are locals), so
-        // this is a documented V4 deferral rather than a runtime undefined.
-        let err = compile_source("foo").unwrap_err();
+    fn bare_non_builtin_global_reference_compiles_and_defers_to_runtime() {
+        // `foo` is a free name → resolver classifies it Global("foo"); not a builtin
+        // and no user globals exist (top-level lets are locals). It lowers to
+        // `GET_GLOBAL foo`, deferring the `undefined variable 'foo'` panic to runtime
+        // exactly like the tree-walker (so dead-code free names are not compile errors).
+        let chunk = compile_source("foo").expect("compiles (deferred to runtime)");
+        let text = disasm(&chunk);
         assert!(
-            err.message.contains("bare global reference 'foo' not yet supported (V4)"),
-            "got {err:?}"
+            text.contains("GET_GLOBAL") && text.contains("foo"),
+            "missing GET_GLOBAL foo in:\n{text}"
         );
     }
 

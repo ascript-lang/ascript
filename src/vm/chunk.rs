@@ -76,6 +76,16 @@ pub struct ClassProto {
     /// The defaulted-field names, in declaration order, paired with the stack
     /// position of their default thunk closures (pushed first, before methods).
     pub default_fields: Vec<String>,
+    /// For each defaulted field (parallel to `default_fields`, declaration order),
+    /// the free names its default expression captures from an enclosing scope,
+    /// paired with the captured value's upvalue index within that field's thunk
+    /// closure. At construct time the thunk reads these via `GET_UPVALUE`; the
+    /// SHARED `validate_into` (`.from`/typed-parse) instead resolves the default
+    /// AST against the class's `def_env`, so `Op::Class` copies each captured
+    /// `name -> thunk.upvalues[idx]` cell value into `def_env` — making both paths
+    /// resolve the SAME enclosing binding (e.g. a module-top-level `const`).
+    /// Normally empty (a literal default captures nothing).
+    pub default_captures: Vec<Vec<(String, u16)>>,
     /// The method names, in declaration order, matching the method closures
     /// pushed immediately before `Op::Class` (after the default thunks).
     pub method_names: Vec<String>,

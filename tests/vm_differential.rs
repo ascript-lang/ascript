@@ -4837,3 +4837,60 @@ fn verifier_accepts_all_compiled_corpus_chunks() {
     );
     eprintln!("verifier corpus gate: {verified} compiled chunks verify OK (fresh + .aso round-trip)");
 }
+
+// ---------------------------------------------------------------------------
+// Class field default capturing an enclosing local (fix: class field default
+// may reference an enclosing local — module-top-level const or a function
+// local for a class declared inside a function). The VM compiles the default
+// into a thunk closure that captures the enclosing binding via the SAME upvalue
+// machinery as any nested closure; the `.from`/typed-parse path resolves the
+// same binding via the class `def_env` mirror. Both must match the tree-walker.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn vm_field_default_captures_module_const_construct() {
+    // The thunk runs at CONSTRUCT time and must read the module-top-level const.
+    assert_vm_run_matches_treewalker(
+        "const ROLE = \"admin\"\nclass Base {\n  role: string = ROLE\n  fn init() {}\n}\nlet b = Base()\nprint(b.role)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_field_default_captures_module_const_from() {
+    // The `.from` path reads `FieldSchema.default` against `def_env`; the const
+    // must be mirrored into `def_env` so it resolves.
+    assert_vm_run_matches_treewalker(
+        "const ROLE = \"admin\"\nclass Base {\n  id: number = 5\n  role: string = ROLE\n}\nlet b = Base.from({})\nprint(b.role)\nprint(b.id)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_field_default_captures_function_local() {
+    // A class declared INSIDE a function whose field default references a function
+    // local — proves general enclosing-scope capture (not just module top level).
+    assert_vm_run_matches_treewalker(
+        "fn make() {\n  let role = \"fnrole\"\n  class Inner {\n    role: string = role\n  }\n  return Inner.from({})\n}\nprint(make().role)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_field_default_captures_const_in_array_default() {
+    // The captured const used inside a (supported) array-literal default — proves
+    // capture works for a non-trivial default form, not just a bare ident.
+    assert_vm_run_matches_treewalker(
+        "const X = 7\nclass Base {\n  vals: array<number> = [X, X]\n  fn init() {}\n}\nlet b = Base()\nprint(b.vals[0])\nprint(b.vals[1])\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_literal_field_default_still_matches_treewalker() {
+    // Regression guard: a plain literal default (no capture) is unchanged.
+    assert_vm_run_matches_treewalker(
+        "class Base {\n  role: string = \"guest\"\n  fn init() {}\n}\nprint(Base().role)\n",
+    )
+    .await;
+}

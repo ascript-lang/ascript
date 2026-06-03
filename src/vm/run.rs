@@ -2085,9 +2085,30 @@ impl Vm {
                         }
                     }
                     let mut default_map: HashMap<String, Cc<Closure>> = HashMap::new();
-                    for (name, dv) in cp.default_fields.iter().zip(defaults) {
+                    for (i, (name, dv)) in
+                        cp.default_fields.iter().zip(defaults).enumerate()
+                    {
                         match dv {
                             Value::Closure(c) => {
+                                // Mirror the enclosing-scope names this default
+                                // captures into `def_env` (read from the thunk's
+                                // captured upvalue cells), so the SHARED
+                                // `validate_into` (`.from`/typed-parse) resolves the
+                                // same binding the construct-time thunk closes over.
+                                // The construct path still runs the thunk unchanged.
+                                if let Some(caps) = cp.default_captures.get(i) {
+                                    for (cap_name, up_idx) in caps {
+                                        if let Some(cell) = c.upvalues.get(*up_idx as usize) {
+                                            let val = cell.borrow().clone();
+                                            if def_env
+                                                .define(cap_name, val.clone(), false)
+                                                .is_err()
+                                            {
+                                                let _ = def_env.assign(cap_name, val);
+                                            }
+                                        }
+                                    }
+                                }
                                 default_map.insert(name.clone(), c);
                             }
                             other => {

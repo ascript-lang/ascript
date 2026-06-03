@@ -476,15 +476,56 @@ impl Resolver {
         self.record_superclass_use(node);
         for member in node.children() {
             match member.kind() {
-                FieldDecl => {
-                    for e in member.children().filter(|c| is_expr(c.kind())) {
-                        self.resolve_expr(e);
-                    }
-                }
+                FieldDecl => self.resolve_field_default(member),
                 MethodDecl => self.resolve_function(member),
                 _ => {}
             }
         }
+    }
+
+    /// Resolve a field's default expression in its OWN frame, keyed by the
+    /// `FieldDecl`'s range. The VM compiles each default into a standalone 0-arg
+    /// thunk closure (run at CONSTRUCT time); giving the default its own frame
+    /// means a name it references that lives in an enclosing scope (e.g. a
+    /// module-top-level `const`, or a function local for a class declared inside a
+    /// function) resolves to an `Upvalue` of the thunk frame and is captured by the
+    /// SAME upvalue machinery every other closure uses (`UpvalueDescriptor` +
+    /// `Op::Closure` cell capture). A default with no free references (the common
+    /// case — a literal like `= "guest"`) produces an empty frame with no upvalues,
+    /// so corpus programs are byte-identical to before this change.
+    fn resolve_field_default(&mut self, member: &ResolvedNode) {
+        let default = member.children().find(|c| is_expr(c.kind()));
+        let Some(default) = default else { return };
+        let key = member.text_range();
+        self.frames.push(Frame {
+            bindings: Vec::new(),
+            next_slot: 0,
+            key,
+            upvalues: Vec::new(),
+            scope_base: self.scopes.len(),
+        });
+        self.push_scope();
+        self.resolve_expr(default);
+        self.pop_scope();
+        let frame = self.frames.pop().unwrap();
+        self.result.bindings.extend(frame.bindings.iter().cloned());
+        // See `resolve_file`: every captured local is a by-reference cell. (A field
+        // default never declares its own locals, so `cell_slots` is normally empty;
+        // it is computed uniformly for consistency with other frames.)
+        let cell_slots: Vec<u32> = frame
+            .bindings
+            .iter()
+            .filter(|b| b.captured)
+            .map(|b| b.slot)
+            .collect();
+        self.result.frames.insert(
+            (SyntaxKind::FieldDecl, frame.key),
+            FrameInfo {
+                slot_count: frame.next_slot,
+                upvalues: frame.upvalues,
+                cell_slots,
+            },
+        );
     }
 
     fn resolve_expr(&mut self, node: &ResolvedNode) {
