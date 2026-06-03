@@ -246,6 +246,8 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Propagate => Effect::new(1, 1),
         Unwrap => Effect::new(1, 1),
         Import => Effect::new(0, 0),
+        // DEFINE_EXPORT pops the exported value and records it in the module map.
+        DefineExport => Effect::new(1, 0),
 
         // ---- iteration ----
         // GET_ITER peeks (validates) the iterable, leaves it in place.
@@ -402,7 +404,7 @@ fn check_operands(
 
         // ---- name-const (must be a Str) ----
         GetGlobal | SetGlobal | GetProp | SetProp | GetPropOpt | Method | GetSuper
-        | ObjectKey | MatchHasKey | CallMethodSpread => {
+        | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport => {
             check_name_const(chunk.read_u16(operand_at) as usize)?
         }
 

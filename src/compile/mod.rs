@@ -12,7 +12,8 @@ use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_templat
 use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
-    ClassDecl, ContinueStmt, EnumDecl, Expr, FnDecl, ForStmt, IfStmt, ImportStmt, IndexExpr,
+    ClassDecl, ContinueStmt, EnumDecl, ExportStmt, Expr, FnDecl, ForStmt, IfStmt, ImportStmt,
+    IndexExpr,
     LetStmt, Literal,
     MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef, ObjectExpr, ObjectField, OptMemberExpr,
     ParenExpr, RangeExpr, ReturnStmt, SourceFile, SpreadElem, Stmt, TemplateExpr, TernaryExpr,
@@ -492,10 +493,10 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     Ok(compiler.chunk)
 }
 
-/// The span of a `Stmt`, by reading its wrapped CST node (the enum does not
-/// expose a single `syntax()` accessor, so we match each variant).
-fn stmt_span(stmt: &Stmt) -> Span {
-    let node = match stmt {
+/// The wrapped CST node of a `Stmt` (the enum does not expose a single `syntax()`
+/// accessor, so we match each variant).
+fn stmt_node(stmt: &Stmt) -> &ResolvedNode {
+    match stmt {
         Stmt::LetStmt(n) => n.syntax(),
         Stmt::ExprStmt(n) => n.syntax(),
         Stmt::Block(n) => n.syntax(),
@@ -510,8 +511,22 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::ClassDecl(n) => n.syntax(),
         Stmt::ImportStmt(n) => n.syntax(),
         Stmt::ExportStmt(n) => n.syntax(),
-    };
-    range_span(node)
+    }
+}
+
+/// The span of a `Stmt`, by reading its wrapped CST node.
+fn stmt_span(stmt: &Stmt) -> Span {
+    range_span(stmt_node(stmt))
+}
+
+/// The `TextRange` of a `Stmt`'s wrapped CST node.
+fn stmt_range(stmt: &Stmt) -> TextRange {
+    stmt_node(stmt).text_range()
+}
+
+/// The `SyntaxKind` of a `Stmt`'s wrapped CST node.
+fn inner_range_kind(stmt: &Stmt) -> SyntaxKind {
+    stmt_node(stmt).kind()
 }
 
 /// A single enclosing loop's patch context, pushed while compiling a loop body so
@@ -903,6 +918,7 @@ impl Compiler {
             Stmt::ClassDecl(class_decl) => self.compile_class(class_decl),
             Stmt::EnumDecl(enum_decl) => self.compile_enum(enum_decl),
             Stmt::ImportStmt(import_stmt) => self.compile_import(import_stmt),
+            Stmt::ExportStmt(export_stmt) => self.compile_export(export_stmt),
             other => Err(CompileError::new(
                 "statement kind not yet supported in V2",
                 stmt_span(other),
@@ -1510,14 +1526,10 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("import statement missing module path", span))?;
         let source = unescape_str_body(strip_quotes(str_tok.text()));
 
-        // V12-T1 scope: stdlib only. File-module imports need module loading
-        // (resolve a `.as`/`.aso` path, parse+compile+run it) — deferred to V12-T4.
-        if !source.starts_with("std/") {
-            return Err(CompileError::new(
-                format!("import of a file module '{source}' is not yet supported by the VM (V12-T4)"),
-                span,
-            ));
-        }
+        // Both `std/*` (builtin) and FILE (`./mod`, `../mod`, `mod.as`/`mod.aso`)
+        // sources compile to the SAME `Op::Import` + descriptor; the VM's run loop
+        // distinguishes them at load time (std → `import_std`; file → the VM
+        // file-module loader, V12-T4). The compiler is source-agnostic here.
 
         let import_range: TextRange = import_stmt.syntax().text_range();
 
@@ -1566,6 +1578,93 @@ impl Compiler {
 
         let idx = self.chunk.add_import(desc);
         self.chunk.emit_u16(Op::Import, idx, span);
+        Ok(())
+    }
+
+    /// Compile an `export <decl>` statement (V12-T4). Mirrors the tree-walker's
+    /// `Stmt::Export`: run the inner declaration (which binds its name(s) into local
+    /// slots), then RECORD each declared name into the module's export map. The VM
+    /// has no module Environment, so the recorded value is read back from the
+    /// binding's slot (`GET_LOCAL`/`GET_LOCAL_CELL`) and stored via `DEFINE_EXPORT`.
+    ///
+    /// Lowering, for `export fn f() {}`:
+    /// ```text
+    ///   <compile the inner decl>   ; binds `f` into its slot
+    ///   GET_LOCAL[_CELL] f_slot    ; push the bound value
+    ///   DEFINE_EXPORT "f"          ; record name→value in the module map (pops it)
+    /// ```
+    /// The exported NAMES match the tree-walker's `exported_names`: the decl's
+    /// directly-declared bindings (a fn/class/enum name, a `let` name, or each
+    /// destructured pattern binding incl. a `...rest`). Re-exports / `export { … }`
+    /// lists are not a surface form in this grammar (export wraps a declaration), so
+    /// there is nothing else to handle.
+    fn compile_export(&mut self, export_stmt: &ExportStmt) -> Result<(), CompileError> {
+        let span = node_span(export_stmt);
+        let inner = export_stmt
+            .stmt()
+            .ok_or_else(|| CompileError::new("export statement missing a declaration", span))?;
+        let inner_range = stmt_range(&inner);
+
+        // Compile the inner declaration first — it binds the name(s) into local slots.
+        self.compile_stmt(&inner)?;
+
+        // Collect (slot, name) for each name the inner decl declares at MODULE scope,
+        // matching the tree-walker's `exported_names`:
+        //   - fn/class/enum/let: the single binding whose `decl_range == inner_range`.
+        //   - destructuring let: each `PatternBind` whose `decl_range` lies within the
+        //     `LetStmt` range (the destructure TARGETS; pattern binds never come from
+        //     the initializer expression).
+        // For a destructuring let there is no single binding at `inner_range`, so we
+        // detect that case by the inner node's kind and gather the pattern binds.
+        use crate::syntax::resolve::types::BindingKind;
+        let inner_kind = inner_range_kind(&inner);
+        let mut exports: Vec<(u16, String)> = Vec::new();
+        if inner_kind == SyntaxKind::LetStmt {
+            // Try the simple-let/const binding first.
+            if let Some(b) = self.resolved.bindings.iter().find(|b| {
+                b.decl_range == inner_range
+                    && matches!(b.kind, BindingKind::Let | BindingKind::Const)
+            }) {
+                if let Ok(slot) = u16::try_from(b.slot) {
+                    exports.push((slot, b.name.clone()));
+                }
+            } else {
+                // Destructuring let: each pattern target.
+                for b in &self.resolved.bindings {
+                    if b.kind == BindingKind::PatternBind
+                        && inner_range.contains_range(b.decl_range)
+                    {
+                        if let Ok(slot) = u16::try_from(b.slot) {
+                            exports.push((slot, b.name.clone()));
+                        }
+                    }
+                }
+            }
+        } else {
+            // fn/class/enum: a single binding whose decl_range is the decl node range.
+            if let Some(b) = self
+                .resolved
+                .bindings
+                .iter()
+                .find(|b| b.decl_range == inner_range)
+            {
+                if let Ok(slot) = u16::try_from(b.slot) {
+                    exports.push((slot, b.name.clone()));
+                }
+            }
+        }
+
+        // Deduplicate by name preserving first occurrence (a single decl never
+        // declares the same name twice, but be defensive against overlap).
+        let mut seen = std::collections::HashSet::new();
+        for (slot, name) in exports {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            self.emit_get_local(slot, span);
+            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            self.chunk.emit_u16(Op::DefineExport, name_idx, span);
+        }
         Ok(())
     }
 
@@ -4542,13 +4641,30 @@ mod tests {
     }
 
     #[test]
-    fn file_module_import_is_deferred_compile_error() {
-        // Non-`std/` (file module) imports are deferred to V12-T4: a CompileError.
-        let err = compile_source("import { x } from \"./other.as\"\n").unwrap_err();
+    fn file_module_import_compiles_to_import_op() {
+        // V12-T4: a FILE (`./…`) import now compiles to the SAME `Op::Import` +
+        // descriptor as a stdlib import (the run loop resolves the file at load
+        // time). Earlier (V12-T1) this was a deferral CompileError.
+        let chunk = compile_source("import { x } from \"./other.as\"\n").expect("compiles");
+        assert_eq!(chunk.imports.len(), 1, "one import descriptor");
+        match &chunk.imports[0] {
+            ImportDesc::Named { source, names } => {
+                assert_eq!(source, "./other.as");
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].0, "x");
+            }
+            other => panic!("expected a Named file import, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_decl_compiles_to_define_export() {
+        // V12-T4: `export <decl>` compiles the decl then a DEFINE_EXPORT per name.
+        let chunk = compile_source("export fn f() { return 1 }\n").expect("compiles");
+        let text = disasm(&chunk);
         assert!(
-            err.message.contains("file module") && err.message.contains("V12-T4"),
-            "expected file-module deferral error, got: {}",
-            err.message
+            text.contains("DEFINE_EXPORT"),
+            "export should emit DEFINE_EXPORT in:\n{text}"
         );
     }
 

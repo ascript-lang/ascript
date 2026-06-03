@@ -403,6 +403,17 @@ pub enum Op {
     /// the fall-through end of a `match` when no arm matched, byte-identical to the
     /// tree-walker's `AsError::at("no matching arm in match expression", expr.span)`.
     MatchNoArm,
+
+    // ---- module exports (V12-T4) ------------------------------------------
+    /// `DEFINE_EXPORT(u16 const)` — `value -- ` (pops one). Record `consts[const]`
+    /// (a `Str` export name) → the popped value into the VM's CURRENT module-export
+    /// map. Emitted by `export <decl>` after the decl has bound its name into a
+    /// local slot: the compiler pushes the bound value (`GET_LOCAL`/`GET_LOCAL_CELL`)
+    /// then `DEFINE_EXPORT name`. Mirrors the tree-walker's `Stmt::Export`, which
+    /// records the exported name into `Interp::current_exports`. When the top-level
+    /// chunk is the entry program (not an imported module) the recorded exports are
+    /// simply unused, exactly as the tree-walker discards a main program's exports.
+    DefineExport,
 }
 
 impl Op {
@@ -514,6 +525,8 @@ impl Op {
             x if x == MatchRange as u8 => MatchRange,
             x if x == MatchNoArm as u8 => MatchNoArm,
 
+            x if x == DefineExport as u8 => DefineExport,
+
             _ => return None,
         })
     }
@@ -527,7 +540,8 @@ impl Op {
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | Closure | NewArray | NewObject
             | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import
-            | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey | CallMethodSpread => 2,
+            | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey | CallMethodSpread
+            | DefineExport => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -651,6 +665,7 @@ mod tests {
         Op::MatchHasKey,
         Op::MatchRange,
         Op::MatchNoArm,
+        Op::DefineExport,
     ];
 
     #[test]

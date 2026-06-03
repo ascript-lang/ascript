@@ -116,6 +116,12 @@ const TAG_NUMBER: u8 = 2;
 const TAG_STR: u8 = 3;
 const TAG_DECIMAL: u8 = 4;
 const TAG_ENUM: u8 = 5;
+/// An `Array` whose elements are themselves literal constants. Emitted by the
+/// compiler for the object-rest bound-key list (`let {a, ...rest} = obj` lowers
+/// to an `Op::ObjectRest` whose operand is a const-pool `Array` of key `Str`s).
+/// The array is mutable at runtime (`Rc<RefCell<Vec<Value>>>`) but its *contents*
+/// at compile time are a literal key list, so it round-trips byte-stably.
+const TAG_ARRAY: u8 = 6;
 
 // ---- type tags ---------------------------------------------------------------
 
@@ -357,7 +363,15 @@ fn literal_kind(v: &Value) -> Result<&'static str, &'static str> {
         Value::Builtin(_) => Err("builtin"),
         Value::Function(_) => Err("function"),
         Value::Closure(_) => Err("closure"),
-        Value::Array(_) => Err("array"),
+        // An Array constant is serializable iff every element is itself a literal
+        // (the compiler only ever pools the object-rest bound-key list, an array
+        // of `Str`s; recurse so a non-literal element is still rejected cleanly).
+        Value::Array(a) => {
+            for e in a.borrow().iter() {
+                literal_kind(e)?;
+            }
+            Ok("array")
+        }
         Value::Object(_) => Err("object"),
         Value::Map(_) => Err("map"),
         Value::Bytes(_) => Err("bytes"),
@@ -519,6 +533,17 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
                 }
             }
         }
+        Value::Array(a) => {
+            // Only literal-element arrays are poolable (the object-rest key list).
+            // Each element is re-checked via `write_value`, so a non-literal
+            // element surfaces as `NonLiteralConst` rather than silently encoding.
+            w.u8(TAG_ARRAY);
+            let elems = a.borrow();
+            w.len(elems.len());
+            for e in elems.iter() {
+                write_value(w, e)?;
+            }
+        }
         other => {
             let kind = literal_kind(other).err().unwrap_or("non-literal");
             return Err(AsoError::NonLiteralConst(kind));
@@ -559,6 +584,14 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
                 );
             }
             Value::Enum(Rc::new(crate::value::EnumDef { name, variants }))
+        }
+        TAG_ARRAY => {
+            let n = r.len()?;
+            let mut elems = Vec::with_capacity(n);
+            for _ in 0..n {
+                elems.push(read_value(r)?);
+            }
+            Value::Array(Rc::new(std::cell::RefCell::new(elems)))
         }
         other => return Err(AsoError::BadConst(other)),
     };
@@ -1308,8 +1341,43 @@ run()
     #[test]
     fn non_literal_const_self_check_fails() {
         let mut c = Chunk::new();
+        // An Object is never poolable.
         c.consts
-            .push(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![]))));
-        assert_eq!(c.check_consts_literal_only(), Err("array"));
+            .push(Value::Object(crate::value::ObjectCell::new(indexmap::IndexMap::new())));
+        assert_eq!(c.check_consts_literal_only(), Err("object"));
+    }
+
+    #[test]
+    fn array_of_str_const_roundtrips() {
+        // The object-rest bound-key list is an `Array` of literal `Str`s; it must
+        // pass the literal-only check and round-trip byte-stably.
+        let mut c = Chunk::new();
+        let keys = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+            Value::Str(std::rc::Rc::from("a")),
+            Value::Str(std::rc::Rc::from("b")),
+        ])));
+        c.add_const(keys);
+        assert_eq!(c.check_consts_literal_only(), Ok(()));
+        let rt = Chunk::from_bytes(&c.to_bytes()).expect("decode");
+        match &rt.consts[0] {
+            Value::Array(a) => {
+                let a = a.borrow();
+                assert_eq!(a.len(), 2);
+                assert!(matches!(&a[0], Value::Str(s) if &**s == "a"));
+                assert!(matches!(&a[1], Value::Str(s) if &**s == "b"));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_const_with_nonliteral_element_rejected() {
+        // An array containing a non-literal element is still rejected.
+        let mut c = Chunk::new();
+        c.consts
+            .push(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+                Value::Object(crate::value::ObjectCell::new(indexmap::IndexMap::new())),
+            ]))));
+        assert_eq!(c.check_consts_literal_only(), Err("object"));
     }
 }

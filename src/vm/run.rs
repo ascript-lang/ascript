@@ -23,6 +23,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
+/// A module's export collector (V12-T4): an insertion-ordered name→value map behind
+/// shared interior mutability, so `Op::DefineExport` records into it and an importer
+/// reads it back (the namespace form clones it into a `Value::Object`).
+type ModuleExports = Rc<RefCell<indexmap::IndexMap<String, Value>>>;
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -77,6 +82,24 @@ pub struct Vm {
     /// asserts `generic-VM == specialized-VM == tree-walker` over the whole corpus,
     /// so any IC/adaptive guard bug makes generic and specialized diverge instantly.
     specialize: bool,
+    /// The CURRENT module's export collector (V12-T4). `Op::DefineExport` records
+    /// each `export`ed top-level binding here. While running an imported file module
+    /// (`Vm::run_file_module`), this points at THAT module's fresh exports map; while
+    /// running the entry program it points at a throwaway map (a main program's
+    /// exports are unused, mirroring the tree-walker). Swapped on a stack-discipline
+    /// basis around a nested module run so transitive imports collect into the right
+    /// module. Insertion-ordered so a namespace import reflects declaration order.
+    module_exports: RefCell<ModuleExports>,
+    /// Cache of already-loaded FILE modules (V12-T4), keyed by canonical path →
+    /// the module's exports map. Mirrors the tree-walker's `Interp::modules` cache:
+    /// a module's top-level runs at most once; repeated `import`s reuse the cached
+    /// exports. Inserted BEFORE the module body runs so a circular import resolves to
+    /// the (then partially-populated) in-progress entry instead of re-running.
+    file_modules: RefCell<HashMap<std::path::PathBuf, ModuleExports>>,
+    /// The directory of the module currently executing (V12-T4), used to resolve a
+    /// relative file import (`from "./mod"`). Mirrors `Interp::module_dir`. Swapped
+    /// around a nested module run and restored after.
+    module_dir: RefCell<std::path::PathBuf>,
 }
 
 impl Vm {
@@ -106,6 +129,9 @@ impl Vm {
             class_base_shapes: RefCell::new(HashMap::new()),
             class_env: RefCell::new(None),
             specialize,
+            module_exports: RefCell::new(Rc::new(RefCell::new(indexmap::IndexMap::new()))),
+            file_modules: RefCell::new(HashMap::new()),
+            module_dir: RefCell::new(std::env::current_dir().unwrap_or_else(|_| ".".into())),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -114,6 +140,14 @@ impl Vm {
         // see `Interp::call_value`'s `Closure` arm and `Vm::call_value`).
         vm.interp.set_vm(Rc::downgrade(&vm));
         vm
+    }
+
+    /// Set the directory used to resolve relative FILE imports from the ENTRY
+    /// program (V12-T4). The entry program is not loaded via `load_file_module`, so
+    /// its `module_dir` must be seeded here before `run` (e.g. to the `.aso`/`.as`
+    /// file's parent directory) so `import ... from "./mod"` resolves correctly.
+    pub fn set_module_dir(&self, dir: std::path::PathBuf) {
+        *self.module_dir.borrow_mut() = dir;
     }
 
     /// Recover an owned `Rc<Vm>` from `&self`. Used by the async-fn eager-spawn in
@@ -139,6 +173,192 @@ impl Vm {
         let mut slot = self.class_env.borrow_mut();
         slot.get_or_insert_with(|| crate::interp::global_env().child())
             .clone()
+    }
+
+    /// Resolve, load, and run a FILE module on the VM, returning its exports map
+    /// (V12-T4). Mirrors the tree-walker's `Interp::load_module` + the `.aso`/`.as`
+    /// precedence rule:
+    ///
+    /// - `source` is resolved relative to the CURRENT module's directory
+    ///   (`self.module_dir`). The extension defaults to `.as` if absent.
+    /// - Both `mod.aso` (compiled) and `mod.as` (source) are considered. The `.aso`
+    ///   is PREFERRED when there is no source present OR the `.aso` is at least as new
+    ///   as the source (`aso_mtime >= src_mtime`) — Python's rule. Otherwise (source
+    ///   newer, or `.aso` absent) the source is compiled fresh. A present-but-stale or
+    ///   version-mismatched / unverifiable `.aso` falls back to recompiling the source
+    ///   when source is present, else surfaces a clear error.
+    /// - The module top-level runs on a fresh fiber with `module_exports` and
+    ///   `module_dir` swapped to this module; `Op::DefineExport` collects its exports.
+    /// - The result is cached by canonical path; a repeated import reuses it (and a
+    ///   circular import resolves to the in-progress entry, populated so far).
+    ///
+    /// `fault_ip`/`fiber` anchor any error at the importing `Op::Import` site.
+    #[async_recursion::async_recursion(?Send)]
+    async fn load_file_module(
+        &self,
+        source: &str,
+        fault_ip: usize,
+        fiber: &Fiber,
+    ) -> Result<ModuleExports, Control> {
+        use std::path::PathBuf;
+
+        // Resolve the requested module path relative to the importer's dir; default
+        // the extension to `.as` (so `./mod` finds `mod.as`/`mod.aso`).
+        let requested = self.module_dir.borrow().join(source);
+        let stem_path: PathBuf = if requested.extension().is_some() {
+            // An explicit `.aso`/`.as` extension — honor it literally.
+            requested.clone()
+        } else {
+            requested.with_extension("as")
+        };
+        let as_path = stem_path.with_extension("as");
+        let aso_path = stem_path.with_extension("aso");
+
+        // Canonical cache key: prefer the source path's canonical form, else the
+        // `.aso`'s, else the requested path (so a missing-file error is reported
+        // against a stable key and the cache dedups regardless of which file exists).
+        let canon = as_path
+            .canonicalize()
+            .or_else(|_| aso_path.canonicalize())
+            .unwrap_or_else(|_| stem_path.clone());
+
+        if let Some(entry) = self.file_modules.borrow().get(&canon) {
+            return Ok(entry.clone()); // cached (or in-progress: circular import)
+        }
+
+        // Decide whether to load the `.aso` or compile the `.as`, by mtime.
+        let src_meta = std::fs::metadata(&as_path).ok();
+        let aso_meta = std::fs::metadata(&aso_path).ok();
+        let src_mtime = src_meta.as_ref().and_then(|m| m.modified().ok());
+        let aso_mtime = aso_meta.as_ref().and_then(|m| m.modified().ok());
+
+        // Prefer `.aso` when present AND (no source, OR aso is at least as new).
+        let prefer_aso = aso_meta.is_some()
+            && match (aso_mtime, src_mtime) {
+                (_, None) => true,                 // no source: must use .aso
+                (Some(a), Some(s)) => a >= s,      // .aso fresh enough
+                (None, Some(_)) => false,          // can't read .aso mtime: recompile
+            };
+
+        let chunk: crate::vm::chunk::Chunk = if prefer_aso {
+            match std::fs::read(&aso_path) {
+                Ok(bytes) => match crate::vm::chunk::Chunk::from_bytes_verified(&bytes) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Stale/invalid `.aso`: recompile from source if present,
+                        // else surface a clear error.
+                        if src_meta.is_some() {
+                            self.compile_module_file(&as_path, fault_ip, fiber)?
+                        } else {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "cannot load compiled module {}: {} (and no source to recompile)",
+                                    aso_path.display(),
+                                    e
+                                ),
+                            ));
+                        }
+                    }
+                },
+                Err(e) => {
+                    return Err(self.panic_at(
+                        fiber,
+                        fault_ip,
+                        format!("cannot read compiled module {}: {}", aso_path.display(), e),
+                    ))
+                }
+            }
+        } else if src_meta.is_some() {
+            self.compile_module_file(&as_path, fault_ip, fiber)?
+        } else {
+            return Err(self.panic_at(
+                fiber,
+                fault_ip,
+                format!(
+                    "cannot find module '{source}' (looked for {} and {})",
+                    as_path.display(),
+                    aso_path.display()
+                ),
+            ));
+        };
+
+        // Build a fresh exports map and cache it BEFORE running the body so a
+        // circular import resolves to this (in-progress) entry rather than re-running.
+        let exports: ModuleExports = Rc::new(RefCell::new(indexmap::IndexMap::new()));
+        self.file_modules
+            .borrow_mut()
+            .insert(canon.clone(), exports.clone());
+
+        // Swap in this module's exports + dir for the duration of its top-level run.
+        let module_dir = canon
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let prev_exports = self.module_exports.replace(exports.clone());
+        let prev_dir = self.module_dir.replace(module_dir);
+
+        // Run the module's top-level on its own fiber. Build a zero-arg top-level
+        // closure exactly like `vm_run_source_with`.
+        let proto = Rc::new(crate::vm::chunk::FnProto {
+            chunk,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            params: Vec::new(),
+            ret: None,
+        });
+        let closure = Closure::new(proto);
+        let mut module_fiber = Fiber::new(closure);
+        let run_result = self.run(&mut module_fiber).await;
+
+        // Restore the importer's exports/dir regardless of outcome.
+        self.module_exports.replace(prev_exports);
+        self.module_dir.replace(prev_dir);
+
+        match run_result {
+            Ok(RunOutcome::Done(_)) => Ok(exports),
+            Ok(RunOutcome::Yielded(_)) => Err(self.panic_at(
+                fiber,
+                fault_ip,
+                "module top-level unexpectedly yielded".to_string(),
+            )),
+            Err(c) => {
+                // On failure, drop the half-built cache entry so a retry can re-run.
+                self.file_modules.borrow_mut().remove(&canon);
+                Err(c)
+            }
+        }
+    }
+
+    /// Compile a module's `.as` source file to a [`Chunk`], mapping a read or
+    /// compile error to a Tier-2 panic anchored at the importing site.
+    fn compile_module_file(
+        &self,
+        as_path: &std::path::Path,
+        fault_ip: usize,
+        fiber: &Fiber,
+    ) -> Result<crate::vm::chunk::Chunk, Control> {
+        let src = std::fs::read_to_string(as_path).map_err(|e| {
+            self.panic_at(
+                fiber,
+                fault_ip,
+                format!("cannot read module {}: {}", as_path.display(), e),
+            )
+        })?;
+        crate::compile::compile_source(&src).map_err(|e| {
+            self.panic_at(
+                fiber,
+                fault_ip,
+                format!(
+                    "compile error in module {}: {}",
+                    as_path.display(),
+                    e.message
+                ),
+            )
+        })
     }
 
     /// Drive `fiber` until it returns (or panics). V1 runs the synchronous
@@ -1126,26 +1346,57 @@ impl Vm {
                 }
 
                 Op::Import => {
-                    // V12-T1: stdlib `import`. Read the descriptor (cloned out of the
-                    // chunk so no chunk borrow is held), resolve the `std/*` module
-                    // via the SAME `load_std_module` the tree-walker uses, and bind
-                    // its exports / namespace Object into the recorded local slots —
-                    // byte-identical to the tree-walker's `Stmt::Import` arm. The op
-                    // leaves nothing on the stack.
+                    // Read the descriptor (cloned out of the chunk so no chunk borrow
+                    // is held). For a `std/*` source resolve via the SAME
+                    // `load_std_module` the tree-walker uses (V12-T1); for a FILE
+                    // source (`./mod`, `../mod`, …) resolve+compile/load+run the file
+                    // module on the VM and bind its `export`ed values (V12-T4). The op
+                    // leaves nothing on the stack — byte-identical to the tree-walker's
+                    // `Stmt::Import` arm.
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let desc = fiber.frame().closure.proto.chunk.imports[idx].clone();
-                    let entry = self.interp.import_std(desc.source())?;
+                    let source = desc.source().to_string();
+
+                    // Resolve the export accessor once: a closure that, given an export
+                    // name, returns its value (or None if absent), plus an ordered list
+                    // of export names for the namespace form. For std we wrap the
+                    // `ModuleEntry`; for a file module we use its IndexMap directly.
+                    let exports: ModuleExports =
+                        if source.starts_with("std/") {
+                            let entry = self.interp.import_std(&source)?;
+                            // Materialize the std module's exports into an ordered map
+                            // so both import forms share one code path. The std export
+                            // set is unordered (a HashSet); order is irrelevant for the
+                            // named form and matches the tree-walker's unordered
+                            // namespace object for the namespace form.
+                            let mut m = indexmap::IndexMap::new();
+                            for name in entry.exports.borrow().iter() {
+                                m.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
+                            }
+                            Rc::new(RefCell::new(m))
+                        } else {
+                            self.load_file_module(&source, fault_ip, fiber).await?
+                        };
+
                     match desc {
                         crate::vm::chunk::ImportDesc::Named { source, names } => {
                             for (name, slot, is_cell) in names {
-                                if !entry.exports.borrow().contains(&name) {
-                                    return Err(self.panic_at(
-                                        fiber,
-                                        fault_ip,
-                                        format!("module '{source}' has no export '{name}'"),
-                                    ));
-                                }
-                                let v = entry.env.get(&name).unwrap_or(Value::Nil);
+                                let v = {
+                                    let ex = exports.borrow();
+                                    match ex.get(&name) {
+                                        Some(v) => v.clone(),
+                                        None => {
+                                            drop(ex);
+                                            return Err(self.panic_at(
+                                                fiber,
+                                                fault_ip,
+                                                format!(
+                                                    "module '{source}' has no export '{name}'"
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                };
                                 if is_cell {
                                     fiber.set_local_cell(slot as usize, v);
                                 } else {
@@ -1156,13 +1407,7 @@ impl Vm {
                         crate::vm::chunk::ImportDesc::Namespace {
                             slot, is_cell, ..
                         } => {
-                            let mut map = indexmap::IndexMap::new();
-                            for name in entry.exports.borrow().iter() {
-                                map.insert(
-                                    name.clone(),
-                                    entry.env.get(name).unwrap_or(Value::Nil),
-                                );
-                            }
+                            let map = exports.borrow().clone();
                             let ns = Value::Object(crate::value::ObjectCell::new(map));
                             if is_cell {
                                 fiber.set_local_cell(slot as usize, ns);
@@ -1171,6 +1416,31 @@ impl Vm {
                             }
                         }
                     }
+                }
+
+                Op::DefineExport => {
+                    // `value -- `. Pop the exported binding's value and record it
+                    // under its name (`consts[idx]`, a Str) in the CURRENT module's
+                    // export map. Mirrors the tree-walker's `Stmt::Export`. When the
+                    // top-level chunk is the entry program the recorded map is a
+                    // throwaway (its exports are unused), exactly as the tree-walker
+                    // discards the main program's `current_exports`.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.to_string(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "DEFINE_EXPORT name const is not a string: {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    };
+                    let v = fiber.pop();
+                    self.module_exports.borrow().borrow_mut().insert(name, v);
                 }
 
                 Op::CheckArrayDestructure => {

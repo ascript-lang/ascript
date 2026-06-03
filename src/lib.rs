@@ -205,6 +205,86 @@ pub async fn vm_run_source_generic(src: &str) -> Result<(String, Option<i32>), A
     vm_run_source_with(src, false).await
 }
 
+/// Compile a `.as` source file to a verified bytecode [`Chunk`] and write it to
+/// `out` as a `.aso` file (VM plan V12-T4 — `ascript build`).
+///
+/// Returns the path written on success. A parse/resolve/compile error surfaces as
+/// an [`AsError`] (with the file's source attached for diagnostics); the `.aso` is
+/// only written when compilation succeeds. The chunk is verified before writing so
+/// a produced `.aso` always passes [`vm::Chunk::from_bytes_verified`].
+pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf, AsError> {
+    let src = std::fs::read_to_string(file)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", file.display(), e)))?;
+    let src_info = Rc::new(SourceInfo {
+        path: file.display().to_string(),
+        text: src.clone(),
+    });
+    let chunk = crate::compile::compile_source(&src)
+        .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // Defensive: verify before writing so a produced `.aso` is always loadable.
+    crate::vm::verify::verify(&chunk).map_err(|e| {
+        AsError::new(format!("internal: produced bytecode failed verification: {e}"))
+            .with_source(src_info)
+    })?;
+    let bytes = chunk.to_bytes();
+    let out_path = match out {
+        Some(p) => p.to_path_buf(),
+        None => file.with_extension("aso"),
+    };
+    std::fs::write(&out_path, &bytes)
+        .map_err(|e| AsError::new(format!("cannot write {}: {}", out_path.display(), e)))?;
+    Ok(out_path)
+}
+
+/// Run a compiled `.aso` file on the VM (VM plan V12-T4). Reads the bytes, verifies
+/// the header + bytecode via [`vm::Chunk::from_bytes_verified`] (a version mismatch
+/// or verify failure becomes a clear [`AsError`]), then runs its top-level on the
+/// VM — NO compile step. Relative file imports resolve against the `.aso`'s parent
+/// directory. Returns the process exit code, mirroring [`run_file`].
+pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, AsError> {
+    use crate::vm::chunk::FnProto;
+    use crate::vm::value_ext::{Closure, RunOutcome};
+    use crate::vm::Vm;
+
+    let bytes = std::fs::read(path)
+        .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes).map_err(|e| {
+        AsError::new(format!("cannot load {}: {}", path.display(), e))
+    })?;
+
+    let interp = Rc::new(Interp::new_live());
+    interp.set_cli_args(script_args);
+    interp.install_self();
+    let vm = Vm::new(interp.clone());
+    // Resolve relative imports against the .aso's directory.
+    if let Some(dir) = path.parent() {
+        vm.set_module_dir(dir.to_path_buf());
+    }
+
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        params: Vec::new(),
+        ret: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(vm.run(&mut fiber)).await;
+    local.await; // drain spawned tasks
+    match result {
+        Ok(RunOutcome::Done(_)) => Ok(0),
+        Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
+        Err(crate::interp::Control::Panic(e)) => Err(e),
+        Err(crate::interp::Control::Propagate(_)) => Ok(0),
+        Err(crate::interp::Control::Exit(code)) => Ok(code),
+    }
+}
+
 /// Shared body for [`vm_run_source`] (specialize = true) and
 /// [`vm_run_source_generic`] (specialize = false). `specialize` is the kill-switch
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to

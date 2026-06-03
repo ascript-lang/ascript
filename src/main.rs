@@ -10,13 +10,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a .as program
+    /// Run a .as program (tree-walker) or a compiled .aso program (VM)
     Run {
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Compile a .as program to bytecode (.aso)
+    Build {
+        file: String,
+        /// Output path (defaults to `<file-stem>.aso`).
+        #[arg(long, short)]
+        out: Option<String>,
     },
     /// Start the interactive REPL
     Repl,
@@ -46,10 +53,32 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Run { file, args } => {
-            match ascript::run_file(std::path::Path::new(&file), &args).await {
-                // Output already streamed live by `run_file` (OutputSink::Live).
+            let path = std::path::Path::new(&file);
+            // A `.aso` file is compiled bytecode → run it on the VM (no compile step).
+            // A `.as` file runs through the tree-walker (the production path until the
+            // VM cutover). The dispatch is purely by extension.
+            let result = if path.extension().and_then(|e| e.to_str()) == Some("aso") {
+                ascript::run_aso_file(path, &args).await
+            } else {
+                ascript::run_file(path, &args).await
+            };
+            match result {
+                // Output already streamed live (OutputSink::Live).
                 // `code` is 0 for normal exit or whatever `exit(n)` requested.
                 Ok(code) => ExitCode::from(code as u8),
+                Err(e) => {
+                    ascript::diagnostics::report(&e);
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Command::Build { file, out } => {
+            let out_path = out.as_deref().map(std::path::Path::new);
+            match ascript::build_file(std::path::Path::new(&file), out_path) {
+                Ok(written) => {
+                    println!("compiled {} -> {}", file, written.display());
+                    ExitCode::SUCCESS
+                }
                 Err(e) => {
                     ascript::diagnostics::report(&e);
                     ExitCode::from(1)
