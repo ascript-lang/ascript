@@ -234,6 +234,21 @@ and `Generator` (identity-equal, a consumer-driven `GeneratorHandle`). Mutable c
 `Rc<RefCell<...>>`. There is a separate
 hashable `MapKey` (numbers canonicalized: −0.0→+0.0, NaN unified) for `Map` keys.
 
+**Object/instance SHAPES (hidden classes, V11-T2).** `Value::Object` is `Rc<ObjectCell>` where
+`ObjectCell { map: RefCell<IndexMap<String,Value>>, shape: Cell<u32> }` — the wrapper exists ONLY to
+carry a `shape` id beside the entry map. `ObjectCell` has `borrow()`/`borrow_mut()` helpers that
+forward to `map`, so the ~150 read/write sites (`o.borrow()`/`o.borrow_mut()`) are unchanged;
+construction uses `ObjectCell::new(map)` (shape defaults to `0`). `Instance` gained
+`shape_id: Cell<u32>` (also default `0`). A *shape* identifies an object's ordered key-LAYOUT; the
+per-VM `ShapeRegistry` (`src/vm/shape.rs`, lives on `Vm` behind a `RefCell`) assigns ids via a
+transition tree (`add_key(shape,key)→child`, memoized). Two objects with the same insertion-ordered
+keys share a shape; different keys OR order differ; shape `0` is the empty layout. The **VM** assigns
+shapes (object literals → `object_shape_for` on the final keys; instances → `class_base_shape` cached
+per class by `Rc::as_ptr`; adding a NEW key via `SET_PROP`/`SET_INDEX`/`APPEND_OBJECT`/`SPREAD_OBJECT`
+calls `resync_object_shape`, reassigning an existing key keeps the shape — V11-T3 inline caches rely
+on this). The **tree-walker never touches the registry** — its objects/instances stay shape `0`. The
+change is additive/behavior-preserving (the whole-corpus differential + goldens stay byte-identical).
+
 ### Standard library (`src/stdlib/`)
 Each `std/*` module is native Rust over the `Value` model. Two routing entry points in
 `src/stdlib/mod.rs`:

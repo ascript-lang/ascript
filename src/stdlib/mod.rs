@@ -453,7 +453,7 @@ pub(crate) fn want_object(
     v: &Value,
     span: Span,
     ctx: &str,
-) -> Result<Rc<std::cell::RefCell<indexmap::IndexMap<String, Value>>>, Control> {
+) -> Result<Rc<crate::value::ObjectCell>, Control> {
     match v {
         Value::Object(o) => Ok(o.clone()),
         _ => Err(AsError::at(

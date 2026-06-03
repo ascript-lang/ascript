@@ -778,7 +778,7 @@ fn bytes_value(b: Vec<u8>) -> Value {
 }
 
 fn obj(map: IndexMap<String, Value>) -> Value {
-    Value::Object(Rc::new(RefCell::new(map)))
+    Value::Object(crate::value::ObjectCell::new(map))
 }
 
 /// Pull `opts.<key>` (an object) when present and non-nil.

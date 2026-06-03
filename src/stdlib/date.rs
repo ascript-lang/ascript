@@ -12,8 +12,6 @@ use crate::span::Span;
 use crate::value::Value;
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use indexmap::IndexMap;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -59,7 +57,7 @@ fn make_instant(epoch_ms: i64) -> Value {
         Value::Number(dt.weekday().num_days_from_sunday() as f64),
     );
     o.insert("iso".into(), Value::Str(dt.to_rfc3339().into()));
-    Value::Object(Rc::new(RefCell::new(o)))
+    Value::Object(crate::value::ObjectCell::new(o))
 }
 
 /// Read the canonical `epochMs` field from an instant object (Tier-2 panic if absent).

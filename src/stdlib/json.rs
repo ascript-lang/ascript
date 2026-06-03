@@ -71,7 +71,7 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
             for (k, v) in o {
                 m.insert(k.clone(), to_ascript(v));
             }
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         }
     }
 }
@@ -319,7 +319,7 @@ mod tests {
         let obj = {
             let mut m = IndexMap::new();
             m.insert("n".to_string(), Value::Number(2.0));
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         };
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
         // out is the pair [resultString, nil]; the result string is the JSON

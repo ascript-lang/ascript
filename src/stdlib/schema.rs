@@ -130,7 +130,7 @@ impl From<Control> for ParseFail {
 fn make_schema(kind: &str) -> Value {
     let mut m: IndexMap<String, Value> = IndexMap::new();
     m.insert("__kind".to_string(), Value::Str(kind.into()));
-    Value::Object(Rc::new(RefCell::new(m)))
+    Value::Object(crate::value::ObjectCell::new(m))
 }
 
 /// Build a `{path, message}` error detail object for the Tier-1 err slot.
@@ -138,7 +138,7 @@ fn err_obj(path: &str, message: String) -> Value {
     let mut m: IndexMap<String, Value> = IndexMap::new();
     m.insert("path".to_string(), Value::Str(path.into()));
     m.insert("message".to_string(), Value::Str(message.into()));
-    Value::Object(Rc::new(RefCell::new(m)))
+    Value::Object(crate::value::ObjectCell::new(m))
 }
 
 /// Extract the `__kind` field from a schema Object, or return `None` if the
@@ -271,7 +271,7 @@ fn type_to_schema(
             let mut m: IndexMap<String, Value> = IndexMap::new();
             m.insert("__kind".to_string(), Value::Str("optional".into()));
             m.insert("inner".to_string(), inner_schema);
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         }
         // array<T> → {__kind:"array", elem: type_to_schema(T)}
         Type::Array(elem) => {
@@ -279,7 +279,7 @@ fn type_to_schema(
             let mut m: IndexMap<String, Value> = IndexMap::new();
             m.insert("__kind".to_string(), Value::Str("array".into()));
             m.insert("elem".to_string(), elem_schema);
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         }
         // map<K,V> → {__kind:"map", key: type_to_schema(K), val: type_to_schema(V)}
         Type::Map(k, v) => {
@@ -289,7 +289,7 @@ fn type_to_schema(
             m.insert("__kind".to_string(), Value::Str("map".into()));
             m.insert("key".to_string(), key_schema);
             m.insert("val".to_string(), val_schema);
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         }
         // Union(A, B) → {__kind:"union", options:[schema_A, schema_B]}
         // Flattened so nested Union(Union(A,B),C) → options:[A,B,C].
@@ -320,7 +320,7 @@ fn type_to_schema(
                 "options".to_string(),
                 Value::Array(Rc::new(RefCell::new(opts))),
             );
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         }
         // Named class type: a field declared `fieldName: SomeClass`. Resolve the
         // class in `def_env` and recurse to a nested object schema. On a cycle
@@ -341,10 +341,10 @@ fn type_to_schema(
                 m.insert("__kind".to_string(), Value::Str("object".into()));
                 m.insert(
                     "fields".to_string(),
-                    Value::Object(Rc::new(RefCell::new(IndexMap::new()))),
+                    Value::Object(crate::value::ObjectCell::new(IndexMap::new())),
                 );
                 m.insert("strict".to_string(), Value::Bool(false));
-                Value::Object(Rc::new(RefCell::new(m)))
+                Value::Object(crate::value::ObjectCell::new(m))
             }
         },
         // Result<T>, Tuple, Future — accept-all (no clean schema mapping)
@@ -374,12 +374,12 @@ fn class_to_object_schema_inner(
         );
     }
 
-    let fields_obj = Value::Object(Rc::new(RefCell::new(fields)));
+    let fields_obj = Value::Object(crate::value::ObjectCell::new(fields));
     let mut m: IndexMap<String, Value> = IndexMap::new();
     m.insert("__kind".to_string(), Value::Str("object".into()));
     m.insert("fields".to_string(), fields_obj);
     m.insert("strict".to_string(), Value::Bool(false));
-    Value::Object(Rc::new(RefCell::new(m)))
+    Value::Object(crate::value::ObjectCell::new(m))
 }
 
 /// Build an object schema from a class's merged field schema (the `fromClass`
@@ -751,7 +751,7 @@ impl Interp {
                                 .await?;
                             out.insert(field_name.clone(), parsed);
                         }
-                        return Ok(Value::Object(Rc::new(RefCell::new(out))));
+                        return Ok(Value::Object(crate::value::ObjectCell::new(out)));
                     }
                     _ => {
                         return Err(ParseFail::Mismatch(err_obj(
@@ -944,7 +944,7 @@ impl Interp {
                 let mut m: IndexMap<String, Value> = IndexMap::new();
                 m.insert("__kind".to_string(), Value::Str("literal".into()));
                 m.insert("value".to_string(), v);
-                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                Ok(Value::Object(crate::value::ObjectCell::new(m)))
             }
 
             // ── 6b composite constructors ─────────────────────────────────────
@@ -955,7 +955,7 @@ impl Interp {
                 let mut m: IndexMap<String, Value> = IndexMap::new();
                 m.insert("__kind".to_string(), Value::Str("array".into()));
                 m.insert("elem".to_string(), elem);
-                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                Ok(Value::Object(crate::value::ObjectCell::new(m)))
             }
 
             // schema.object(fieldsObj) → {__kind:"object", fields, strict:false}
@@ -965,7 +965,7 @@ impl Interp {
                 m.insert("__kind".to_string(), Value::Str("object".into()));
                 m.insert("fields".to_string(), fields);
                 m.insert("strict".to_string(), Value::Bool(false));
-                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                Ok(Value::Object(crate::value::ObjectCell::new(m)))
             }
 
             // schema.strict(objSchema) → clone with strict:true
@@ -979,7 +979,7 @@ impl Interp {
                             Value::Object(o) => {
                                 let mut m: IndexMap<String, Value> = o.borrow().clone();
                                 m.insert("strict".to_string(), Value::Bool(true));
-                                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                                Ok(Value::Object(crate::value::ObjectCell::new(m)))
                             }
                             _ => unreachable!(),
                         }
@@ -999,7 +999,7 @@ impl Interp {
                 m.insert("__kind".to_string(), Value::Str("map".into()));
                 m.insert("key".to_string(), key);
                 m.insert("val".to_string(), val);
-                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                Ok(Value::Object(crate::value::ObjectCell::new(m)))
             }
 
             // schema.optional(innerSchema) → {__kind:"optional", inner}
@@ -1008,7 +1008,7 @@ impl Interp {
                 let mut m: IndexMap<String, Value> = IndexMap::new();
                 m.insert("__kind".to_string(), Value::Str("optional".into()));
                 m.insert("inner".to_string(), inner);
-                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                Ok(Value::Object(crate::value::ObjectCell::new(m)))
             }
 
             // schema.union(list) → {__kind:"union", options:[...]}
@@ -1017,7 +1017,7 @@ impl Interp {
                 let mut m: IndexMap<String, Value> = IndexMap::new();
                 m.insert("__kind".to_string(), Value::Str("union".into()));
                 m.insert("options".to_string(), options);
-                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                Ok(Value::Object(crate::value::ObjectCell::new(m)))
             }
 
             // schema.oneOf(list) → {__kind:"oneOf", values:[...]}
@@ -1027,7 +1027,7 @@ impl Interp {
                 let mut m: IndexMap<String, Value> = IndexMap::new();
                 m.insert("__kind".to_string(), Value::Str("oneOf".into()));
                 m.insert("values".to_string(), values);
-                Ok(Value::Object(Rc::new(RefCell::new(m))))
+                Ok(Value::Object(crate::value::ObjectCell::new(m)))
             }
 
             // ── 6c constraint refiners ────────────────────────────────────────
@@ -1042,7 +1042,7 @@ impl Interp {
                     Value::Object(o) => {
                         let mut m = o.borrow().clone();
                         m.insert("min".to_string(), n);
-                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                        Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
                     _ => Err(AsError::at(
                         "schema.min: first argument must be a schema object",
@@ -1060,7 +1060,7 @@ impl Interp {
                     Value::Object(o) => {
                         let mut m = o.borrow().clone();
                         m.insert("max".to_string(), n);
-                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                        Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
                     _ => Err(AsError::at(
                         "schema.max: first argument must be a schema object",
@@ -1078,7 +1078,7 @@ impl Interp {
                     Value::Object(o) => {
                         let mut m = o.borrow().clone();
                         m.insert("minLength".to_string(), n);
-                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                        Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
                     _ => Err(AsError::at(
                         "schema.minLength: first argument must be a schema object",
@@ -1096,7 +1096,7 @@ impl Interp {
                     Value::Object(o) => {
                         let mut m = o.borrow().clone();
                         m.insert("maxLength".to_string(), n);
-                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                        Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
                     _ => Err(AsError::at(
                         "schema.maxLength: first argument must be a schema object",
@@ -1118,7 +1118,7 @@ impl Interp {
                     Value::Object(o) => {
                         let mut m = o.borrow().clone();
                         m.insert("pattern".to_string(), pat);
-                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                        Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
                     _ => Err(AsError::at(
                         "schema.pattern: first argument must be a schema object",
@@ -1144,7 +1144,7 @@ impl Interp {
                         let mut m = o.borrow().clone();
                         m.insert("refine".to_string(), f);
                         m.insert("refineMessage".to_string(), msg);
-                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                        Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
                     _ => Err(AsError::at(
                         "schema.refine: first argument must be a schema object",
@@ -1165,7 +1165,7 @@ impl Interp {
                     Value::Object(o) => {
                         let mut m = o.borrow().clone();
                         m.insert("default".to_string(), v);
-                        Ok(Value::Object(Rc::new(RefCell::new(m))))
+                        Ok(Value::Object(crate::value::ObjectCell::new(m)))
                     }
                     _ => Err(AsError::at(
                         "schema.default: first argument must be a schema object",
@@ -1284,11 +1284,11 @@ mod tests {
         let bogus = {
             let mut m: IndexMap<String, Value> = IndexMap::new();
             m.insert("__kind".to_string(), Value::Str("widget".into()));
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         };
         assert!(!is_schema_value(&bogus));
         // An object with no __kind, and non-object values, must NOT match.
-        let plain = Value::Object(Rc::new(RefCell::new(IndexMap::new())));
+        let plain = Value::Object(crate::value::ObjectCell::new(IndexMap::new()));
         assert!(!is_schema_value(&plain));
         assert!(!is_schema_value(&Value::Number(1.0)));
         assert!(!is_schema_value(&Value::Str("string".into())));
@@ -1343,7 +1343,7 @@ mod tests {
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("__kind".to_string(), Value::Str("literal".into()));
         m.insert("value".to_string(), Value::Number(5.0));
-        let lit = Value::Object(Rc::new(RefCell::new(m)));
+        let lit = Value::Object(crate::value::ObjectCell::new(m));
         assert_eq!(schema_kind(&lit).as_deref(), Some("literal"));
         assert_eq!(obj_field(&lit, "value"), Some(Value::Number(5.0)));
     }
@@ -1429,7 +1429,7 @@ mod tests {
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("__kind".to_string(), Value::Str("literal".into()));
         m.insert("value".to_string(), Value::Number(5.0));
-        let lit = Value::Object(Rc::new(RefCell::new(m)));
+        let lit = Value::Object(crate::value::ObjectCell::new(m));
         let result = interp
             .parse_value(&lit, &Value::Number(5.0), "", false, sp())
             .await;
@@ -1492,7 +1492,7 @@ mod tests {
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("__kind".to_string(), Value::Str("literal".into()));
         m.insert("value".to_string(), Value::Number(5.0));
-        let lit = Value::Object(Rc::new(RefCell::new(m)));
+        let lit = Value::Object(crate::value::ObjectCell::new(m));
         let err = mismatch(
             interp
                 .parse_value(&lit, &Value::Number(6.0), "", false, sp())
@@ -1513,7 +1513,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("a".to_string(), Value::Number(1.0));
-        let bad = Value::Object(Rc::new(RefCell::new(m)));
+        let bad = Value::Object(crate::value::ObjectCell::new(m));
         let err = interp
             .parse_value(&bad, &Value::Nil, "", false, sp())
             .await
@@ -1606,7 +1606,7 @@ mod tests {
             let mut m: IndexMap<String, Value> = IndexMap::new();
             m.insert("__kind".to_string(), Value::Str("literal".into()));
             m.insert("value".to_string(), Value::Number(5.0));
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         };
         // 5 == 5 → ok
         let pair = interp
@@ -1649,7 +1649,7 @@ mod tests {
         let bad_obj = {
             let mut m: IndexMap<String, Value> = IndexMap::new();
             m.insert("a".to_string(), Value::Number(1.0));
-            Value::Object(Rc::new(RefCell::new(m)))
+            Value::Object(crate::value::ObjectCell::new(m))
         };
         // Non-Object schema args must ALSO panic (string / number / nil).
         let candidates = [
@@ -1743,7 +1743,7 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v.clone());
         }
-        Value::Object(Rc::new(RefCell::new(m)))
+        Value::Object(crate::value::ObjectCell::new(m))
     }
 
     fn make_value_obj(pairs: &[(&str, Value)]) -> Value {
@@ -1751,7 +1751,7 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v.clone());
         }
-        Value::Object(Rc::new(RefCell::new(m)))
+        Value::Object(crate::value::ObjectCell::new(m))
     }
 
     #[tokio::test]
@@ -2566,7 +2566,7 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v.clone());
         }
-        Value::Object(Rc::new(RefCell::new(m)))
+        Value::Object(crate::value::ObjectCell::new(m))
     }
 
     #[tokio::test]

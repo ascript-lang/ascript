@@ -97,7 +97,7 @@ impl Interp {
             ops_per_sec
         };
         obj.insert("opsPerSec".to_string(), Value::Number(ops));
-        Ok(Value::Object(Rc::new(RefCell::new(obj))))
+        Ok(Value::Object(crate::value::ObjectCell::new(obj)))
     }
 
     /// `bench.compare({name: fn, ...}, iterations?) -> array<{name, avgMs, opsPerSec}>`
@@ -153,7 +153,7 @@ impl Interp {
                 obj.insert("name".to_string(), Value::Str(name.into()));
                 obj.insert("avgMs".to_string(), Value::Number(avg_ms));
                 obj.insert("opsPerSec".to_string(), Value::Number(ops_per_sec));
-                Value::Object(Rc::new(RefCell::new(obj)))
+                Value::Object(crate::value::ObjectCell::new(obj))
             })
             .collect();
 

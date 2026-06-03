@@ -41,7 +41,7 @@ fn arr(v: Vec<Value>) -> Value {
 }
 
 fn obj(m: IndexMap<String, Value>) -> Value {
-    Value::Object(Rc::new(RefCell::new(m)))
+    Value::Object(crate::value::ObjectCell::new(m))
 }
 
 fn bytes_val(v: Vec<u8>) -> Value {

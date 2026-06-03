@@ -44,6 +44,14 @@ pub struct Vm {
     /// constructed instance (so a mutable default yields a fresh value each time,
     /// matching the tree-walker's per-construct default eval).
     class_defaults: RefCell<HashMap<usize, HashMap<String, Rc<Closure>>>>,
+    /// Per-VM hidden-class registry (V11-T2). Assigns a `shape_id` to every
+    /// object/instance key-LAYOUT via a transition tree; V11-T3 inline caches key
+    /// on these ids. Only VM code paths touch it (the tree-walker leaves shapes 0).
+    shapes: RefCell<crate::vm::shape::ShapeRegistry>,
+    /// Cache of each class's BASE shape (its declared-field layout, declaration
+    /// order), keyed by the class's `Rc` identity (`Rc::as_ptr`) like the method
+    /// tables. Computed once per class so every instance shares the same base id.
+    class_base_shapes: RefCell<HashMap<usize, u32>>,
 }
 
 impl Vm {
@@ -55,6 +63,8 @@ impl Vm {
             self_weak: RefCell::new(Weak::new()),
             class_methods: RefCell::new(HashMap::new()),
             class_defaults: RefCell::new(HashMap::new()),
+            shapes: RefCell::new(crate::vm::shape::ShapeRegistry::new()),
+            class_base_shapes: RefCell::new(HashMap::new()),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -622,7 +632,12 @@ impl Vm {
                     for (k, v) in pairs {
                         map.insert(k.to_string(), v);
                     }
-                    fiber.push(Value::Object(Rc::new(RefCell::new(map))));
+                    // Assign the object's hidden-class shape from its final ordered
+                    // keys (V11-T2). Pure metadata — does not change behavior.
+                    let cell = crate::value::ObjectCell::new(map);
+                    let shape = self.object_shape_for(cell.map.borrow().keys().map(|s| s.as_str()));
+                    cell.shape.set(shape);
+                    fiber.push(Value::Object(cell));
                 }
 
                 Op::Spread | Op::SpreadArgs => {
@@ -708,6 +723,9 @@ impl Vm {
                     match fiber.peek(0) {
                         Value::Object(obj) => {
                             obj.borrow_mut().insert(key.to_string(), val);
+                            // A new key may have been added → resync the shape.
+                            let obj = obj.clone();
+                            self.resync_object_shape(&obj);
                         }
                         other => {
                             return Err(self.panic_at(
@@ -739,10 +757,15 @@ impl Vm {
                                 .collect();
                             match fiber.peek(0) {
                                 Value::Object(obj) => {
-                                    let mut m = obj.borrow_mut();
-                                    for (k, v) in entries {
-                                        m.insert(k, v);
+                                    {
+                                        let mut m = obj.borrow_mut();
+                                        for (k, v) in entries {
+                                            m.insert(k, v);
+                                        }
                                     }
+                                    // The merge may have added keys → resync shape.
+                                    let obj = obj.clone();
+                                    self.resync_object_shape(&obj);
                                 }
                                 other => {
                                     return Err(self.panic_at(
@@ -795,6 +818,11 @@ impl Vm {
                     let obj = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = crate::interp::index_set(&obj, &idx, val, span, span)?;
+                    // Setting `obj[key] = v` on an object may have ADDED a key →
+                    // transition the shape (reassigning an existing key is a no-op).
+                    if let Value::Object(cell) = &obj {
+                        self.resync_object_shape(cell);
+                    }
                     fiber.push(v);
                 }
 
@@ -1123,7 +1151,7 @@ impl Vm {
                             ))
                         }
                     }
-                    fiber.push(Value::Object(Rc::new(RefCell::new(remaining))));
+                    fiber.push(Value::Object(crate::value::ObjectCell::new(remaining)));
                 }
 
                 Op::MatchArray => {
@@ -1504,6 +1532,11 @@ impl Vm {
                     // for the "cannot set property" error too (single VM span).
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = self.interp.set_member(&obj, &name, value, span, span)?;
+                    // `obj.newkey = v` on an object may have ADDED a key →
+                    // transition its shape (reassign keeps the layout/shape).
+                    if let Value::Object(cell) = &obj {
+                        self.resync_object_shape(cell);
+                    }
                     fiber.push(v);
                 }
 
@@ -1876,6 +1909,45 @@ impl Vm {
         self.interp.read_member(obj, name, span).map_err(Control::from)
     }
 
+    /// The BASE shape for `class`'s instances — the declared-field key layout in
+    /// declaration order, MERGED base-class first (mirrors `merged_field_schema`,
+    /// which is the order `vm_construct`/`construct` populate fields). Cached per
+    /// class by `Rc` identity so every instance of one class shares the same id.
+    fn class_base_shape(&self, class: &Rc<crate::value::Class>) -> u32 {
+        let key = Rc::as_ptr(class) as usize;
+        if let Some(&s) = self.class_base_shapes.borrow().get(&key) {
+            return s;
+        }
+        let schema = crate::value::merged_field_schema(class);
+        let shape = {
+            let mut reg = self.shapes.borrow_mut();
+            reg.shape_for(schema.keys().map(|k| k.as_str()))
+        };
+        self.class_base_shapes.borrow_mut().insert(key, shape);
+        shape
+    }
+
+    /// The shape id for an object literal's final ordered key list. Used by the
+    /// VM's `NEW_OBJECT`/`APPEND_OBJECT`/`SPREAD_OBJECT` arms once the entry map is
+    /// fully built.
+    fn object_shape_for<'a, I>(&self, keys: I) -> u32
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        self.shapes.borrow_mut().shape_for(keys)
+    }
+
+    /// Recompute and store the shape of `obj`'s ObjectCell from its CURRENT keys.
+    /// Called after a mutation that may have ADDED a key (reassigning an existing
+    /// key leaves the layout — and thus the shape — unchanged, which V11-T3's IC
+    /// validity relies on). Walks the full key list through the transition tree;
+    /// a no-op-cost path because shared prefixes are deduped.
+    fn resync_object_shape(&self, obj: &Rc<crate::value::ObjectCell>) {
+        let keys: Vec<String> = obj.map.borrow().keys().cloned().collect();
+        let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
+        obj.shape.set(shape);
+    }
+
     /// Construct an instance of a VM-registered class (V9). Mirrors the
     /// tree-walker's `construct`: create the instance, apply field DEFAULTS (each
     /// via its compiled thunk closure, so a mutable default is fresh per instance),
@@ -1892,6 +1964,9 @@ impl Vm {
         let instance = Rc::new(RefCell::new(crate::value::Instance {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
+            // Give the instance its class's BASE shape (the declared-field layout,
+            // in declaration order). V11-T3 inline caches key on this.
+            shape_id: std::cell::Cell::new(self.class_base_shape(&class)),
         }));
         let inst_val = Value::Instance(instance.clone());
 
@@ -3103,6 +3178,105 @@ mod tests {
             }
             other => panic!("expected Done([nil, \"boom\"]), got {other:?}"),
         }
+    }
+
+    /// Compile + run `src` on the VM and return the top-level program's value.
+    /// (Mirrors the production `vm_eval_source` path; used by the shape tests to
+    /// inspect the `shape_id` the VM assigned to the returned object/instance.)
+    fn eval_src(src: &str) -> Value {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build current-thread runtime");
+        rt.block_on(async { crate::vm_eval_source(src).await.expect("vm eval ok") })
+    }
+
+    fn obj_shape(v: &Value) -> u32 {
+        match v {
+            Value::Object(o) => o.shape.get(),
+            other => panic!("expected an Object, got {other:?}"),
+        }
+    }
+
+    // V11-T2: the VM assigns each object literal a hidden-class shape; two literals
+    // with the SAME ordered keys converge on the SAME id, a different key set
+    // differs, and key ORDER matters. We bundle them in one array so a single VM
+    // (hence one ShapeRegistry) assigns all the ids.
+    #[test]
+    fn vm_object_literals_share_shape_by_layout() {
+        // [{a,b}, {a,b}, {a,c}, {b,a}]
+        let v = eval_src("[{a: 1, b: 2}, {a: 9, b: 8}, {a: 1, c: 2}, {b: 1, a: 2}]");
+        let arr = match v {
+            Value::Array(a) => a.borrow().clone(),
+            other => panic!("expected array, got {other:?}"),
+        };
+        let s_ab1 = obj_shape(&arr[0]);
+        let s_ab2 = obj_shape(&arr[1]);
+        let s_ac = obj_shape(&arr[2]);
+        let s_ba = obj_shape(&arr[3]);
+        assert_eq!(s_ab1, s_ab2, "same ordered keys → same shape");
+        assert_ne!(s_ab1, s_ac, "different key set → different shape");
+        assert_ne!(s_ab1, s_ba, "different key ORDER → different shape");
+        assert_ne!(s_ab1, 0, "a non-empty object is not the empty shape");
+    }
+
+    #[test]
+    fn vm_empty_object_literal_is_shape_zero() {
+        // `{}` at statement position parses as a block, so bind it first.
+        let v = eval_src("let o = {}\no");
+        assert_eq!(obj_shape(&v), 0);
+    }
+
+    // Adding a NEW key via `o.newkey = v` transitions the shape; REASSIGNING an
+    // existing key keeps it (V11-T3's inline-cache validity relies on this). One
+    // VM (one registry) builds all three objects so the ids are comparable.
+    #[test]
+    fn vm_adding_key_transitions_shape_reassign_keeps_it() {
+        // Build {a}, then a mutated copy where `a` is reassigned, then one where a
+        // NEW key `b` is added — return all three to compare their live shapes.
+        let v = eval_src(
+            "let base = {a: 1}\n\
+             let reassigned = {a: 1}\n\
+             reassigned.a = 5\n\
+             let added = {a: 1}\n\
+             added.b = 9;\n\
+             [base, reassigned, added]",
+        );
+        let arr = match v {
+            Value::Array(a) => a.borrow().clone(),
+            other => panic!("expected array, got {other:?}"),
+        };
+        let s_base = obj_shape(&arr[0]);
+        let s_reassigned = obj_shape(&arr[1]);
+        let s_added = obj_shape(&arr[2]);
+        assert_eq!(
+            s_base, s_reassigned,
+            "reassigning an existing key keeps the shape"
+        );
+        assert_ne!(s_base, s_added, "adding a new key transitions the shape");
+        assert_ne!(s_added, 0);
+    }
+
+    // A class gives its instances a stable BASE shape (declared-field layout).
+    #[test]
+    fn vm_instance_has_class_base_shape() {
+        let v = eval_src(
+            "class P { x: number = 0\n y: number = 0\n }\n\
+             [P(), P()]",
+        );
+        let arr = match v {
+            Value::Array(a) => a.borrow().clone(),
+            other => panic!("expected array, got {other:?}"),
+        };
+        let s0 = match &arr[0] {
+            Value::Instance(i) => i.borrow().shape_id.get(),
+            other => panic!("expected instance, got {other:?}"),
+        };
+        let s1 = match &arr[1] {
+            Value::Instance(i) => i.borrow().shape_id.get(),
+            other => panic!("expected instance, got {other:?}"),
+        };
+        assert_eq!(s0, s1, "two instances of one class share the base shape");
+        assert_ne!(s0, 0, "a class with declared fields has a non-empty shape");
     }
 
     /// `expr?` where `expr` is not a 2-element array is a Tier-2 panic carrying

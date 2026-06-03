@@ -52,7 +52,7 @@ fn err_pair(msg: String) -> Value {
 }
 
 fn obj(map: indexmap::IndexMap<String, Value>) -> Value {
-    Value::Object(Rc::new(RefCell::new(map)))
+    Value::Object(crate::value::ObjectCell::new(map))
 }
 
 impl Interp {

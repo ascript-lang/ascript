@@ -99,7 +99,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         Value::Number(char_index(&s, whole.start())),
                     );
                     obj.insert("groups".to_string(), arr(groups));
-                    Ok(Value::Object(Rc::new(RefCell::new(obj))))
+                    Ok(Value::Object(crate::value::ObjectCell::new(obj)))
                 }
                 None => Ok(Value::Nil),
             }

@@ -78,7 +78,7 @@ pub(crate) fn make_pair(value: Value, err: Value) -> Value {
 pub(crate) fn make_error(msg: Value) -> Value {
     let mut map = indexmap::IndexMap::new();
     map.insert("message".to_string(), msg);
-    Value::Object(Rc::new(RefCell::new(map)))
+    Value::Object(crate::value::ObjectCell::new(map))
 }
 
 #[derive(Clone)]
@@ -1074,7 +1074,7 @@ impl Interp {
                         }
                         _ => {}
                     }
-                    let obj = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(remaining)));
+                    let obj = Value::Object(crate::value::ObjectCell::new(remaining));
                     env.define(rest_name, obj, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
@@ -1318,7 +1318,7 @@ impl Interp {
                         for name in entry.exports.borrow().iter() {
                             map.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
                         }
-                        env.define(alias, Value::Object(Rc::new(RefCell::new(map))), false)
+                        env.define(alias, Value::Object(crate::value::ObjectCell::new(map)), false)
                             .map_err(AsError::new)?;
                     }
                 }
@@ -1458,9 +1458,9 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                Ok(Value::Object(crate::value::ObjectCell::new(
                     map,
-                ))))
+                )))
             }
             ExprKind::Template { parts } => {
                 let mut out = String::new();
@@ -1703,7 +1703,7 @@ impl Interp {
                     }
                     bindings.push((
                         rest_name.clone(),
-                        Value::Object(Rc::new(RefCell::new(remaining))),
+                        Value::Object(crate::value::ObjectCell::new(remaining)),
                     ));
                 }
                 Ok(true)
@@ -2338,6 +2338,7 @@ impl Interp {
         let instance = std::rc::Rc::new(std::cell::RefCell::new(crate::value::Instance {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
+            shape_id: std::cell::Cell::new(0),
         }));
         let inst_val = Value::Instance(instance.clone());
         // Pre-populate declared-field defaults (merged base-class first so a
@@ -2470,6 +2471,7 @@ impl Interp {
             crate::value::Instance {
                 class: class.clone(),
                 fields: inst_fields,
+                shape_id: std::cell::Cell::new(0),
             },
         ))))
     }

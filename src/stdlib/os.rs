@@ -66,7 +66,7 @@ fn make_obj(pairs: &[(&str, Value)]) -> Value {
     for (k, v) in pairs {
         map.insert(k.to_string(), v.clone());
     }
-    Value::Object(Rc::new(RefCell::new(map)))
+    Value::Object(crate::value::ObjectCell::new(map))
 }
 
 pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {

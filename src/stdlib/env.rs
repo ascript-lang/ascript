@@ -11,8 +11,6 @@ use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
 use crate::value::Value;
 use indexmap::IndexMap;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -57,7 +55,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             for (k, v) in std::env::vars() {
                 m.insert(k, Value::Str(v.into()));
             }
-            Ok(Value::Object(Rc::new(RefCell::new(m))))
+            Ok(Value::Object(crate::value::ObjectCell::new(m)))
         }
         // loadDotenv(path?) -> [count, err]. Loads a `.env` file (default `.env`)
         // into the process env and returns the number of variables loaded.

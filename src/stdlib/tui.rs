@@ -429,7 +429,7 @@ impl Interp {
                     "height".to_string(),
                     Value::Number(state.back.height as f64),
                 );
-                Ok(Value::Object(Rc::new(std::cell::RefCell::new(map))))
+                Ok(Value::Object(crate::value::ObjectCell::new(map)))
             }
             "clear" => {
                 let mut state = self.terminal_mut(id).expect("checked present");
@@ -931,7 +931,7 @@ fn make_object(pairs: Vec<(&str, Value)>) -> Value {
     for (k, v) in pairs {
         m.insert(k.to_string(), v);
     }
-    Value::Object(Rc::new(std::cell::RefCell::new(m)))
+    Value::Object(crate::value::ObjectCell::new(m))
 }
 
 /// A readable name for a crossterm `KeyCode`. `Char(c)` becomes the single-char
@@ -1064,7 +1064,7 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
-        Value::Object(Rc::new(std::cell::RefCell::new(m)))
+        Value::Object(crate::value::ObjectCell::new(m))
     }
 
     fn arr(items: Vec<f64>) -> Value {

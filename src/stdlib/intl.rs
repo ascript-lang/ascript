@@ -332,7 +332,7 @@ mod tests {
         // depend on the `datetime` feature being enabled.
         let mut o: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         o.insert("epochMs".into(), Value::Number(1623760200000.0));
-        let inst = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(o)));
+        let inst = Value::Object(crate::value::ObjectCell::new(o));
         let us =
             str_of(call("formatDate", &[inst.clone(), s("en-US"), s("medium")], sp()).unwrap());
         let de =

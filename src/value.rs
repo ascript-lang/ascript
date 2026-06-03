@@ -6,9 +6,43 @@ use crate::ast::Stmt;
 use crate::env::Environment;
 use indexmap::{IndexMap, IndexSet};
 use rust_decimal::Decimal;
-use std::cell::RefCell;
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt;
 use std::rc::Rc;
+
+/// The heap payload behind `Value::Object`. Wraps the insertion-ordered key→value
+/// map together with a `shape` id (V11-T2 hidden classes). The `shape` identifies
+/// the object's key-LAYOUT in the VM's per-VM `ShapeRegistry`; V11-T3 inline caches
+/// validate `obj.shape == cached_shape` then read a value by index.
+///
+/// `shape` defaults to `0` (the empty/unset layout). The TREE-WALKER never reads or
+/// writes it (its objects keep shape 0); only VM code paths assign shapes. The
+/// `borrow`/`borrow_mut` helpers mirror the old `Rc<RefCell<IndexMap>>` API so the
+/// vast majority of access sites are unchanged.
+pub struct ObjectCell {
+    pub map: RefCell<IndexMap<String, Value>>,
+    pub shape: Cell<u32>,
+}
+
+impl ObjectCell {
+    /// Wrap an `IndexMap` into a shared `ObjectCell` with shape `0` (unset).
+    pub fn new(map: IndexMap<String, Value>) -> Rc<ObjectCell> {
+        Rc::new(ObjectCell {
+            map: RefCell::new(map),
+            shape: Cell::new(0),
+        })
+    }
+
+    /// Immutable borrow of the entry map (drop-in for the old `Rc<RefCell<…>>`).
+    pub fn borrow(&self) -> Ref<'_, IndexMap<String, Value>> {
+        self.map.borrow()
+    }
+
+    /// Mutable borrow of the entry map (drop-in for the old `Rc<RefCell<…>>`).
+    pub fn borrow_mut(&self) -> RefMut<'_, IndexMap<String, Value>> {
+        self.map.borrow_mut()
+    }
+}
 
 /// A hashable map key. Maps key on `nil`/`bool`/`number`/`decimal`/`string`
 /// (spec §11.2 + decimal extension). Number and Decimal are distinct key kinds.
@@ -91,6 +125,11 @@ pub struct Class {
 pub struct Instance {
     pub class: Rc<Class>,
     pub fields: IndexMap<String, Value>,
+    /// The instance's key-layout id (V11-T2 hidden classes). Defaults to `0`
+    /// (unset); the tree-walker leaves it at `0`, the VM assigns the class's base
+    /// shape (and transitions it if a field is added). `Cell` so a `&self` VM
+    /// method can update it without a mutable instance borrow.
+    pub shape_id: Cell<u32>,
 }
 
 pub struct BoundMethod {
@@ -287,7 +326,7 @@ pub enum Value {
     /// identity equality. Produced by the VM (V4+); inert in the tree-walker.
     Closure(Rc<crate::vm::value_ext::Closure>),
     Array(Rc<RefCell<Vec<Value>>>),
-    Object(Rc<RefCell<IndexMap<String, Value>>>),
+    Object(Rc<ObjectCell>),
     // IndexMap (not HashMap) is deliberate: insertion order is required for
     // deterministic keys/values/entries/display and to match `Object`.
     Map(Rc<RefCell<IndexMap<MapKey, Value>>>),
@@ -707,12 +746,10 @@ mod tests {
     #[test]
     fn objects_display_and_compare_by_identity() {
         use indexmap::IndexMap;
-        use std::cell::RefCell;
-        use std::rc::Rc;
         let mut m = IndexMap::new();
         m.insert("a".to_string(), Value::Number(1.0));
         m.insert("b".to_string(), Value::Str("x".into()));
-        let o = Value::Object(Rc::new(RefCell::new(m)));
+        let o = Value::Object(ObjectCell::new(m));
         assert_eq!(o.to_string(), "{a: 1, b: \"x\"}");
         assert_eq!(o.clone(), o);
         assert!(o.is_truthy());

@@ -84,7 +84,7 @@ mod tests {
         // TOML top level must be a table → an object.
         let mut m = indexmap::IndexMap::new();
         m.insert("k".to_string(), Value::Str("v".into()));
-        let obj = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(m)));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
         assert_eq!(out.to_string(), "[\"k = \\\"v\\\"\\n\", nil]");
     }
@@ -95,7 +95,7 @@ mod tests {
         // should emit `k = 1`, not `k = 1.0`.
         let mut m = indexmap::IndexMap::new();
         m.insert("k".to_string(), Value::Number(1.0));
-        let obj = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(m)));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
         assert_eq!(out.to_string(), "[\"k = 1\\n\", nil]");
     }

@@ -92,7 +92,6 @@ use crate::interp::{make_error, make_pair, Control, Interp, ResourceState};
 use crate::span::Span;
 use crate::value::{NativeKind, NativeMethod, Value};
 use indexmap::IndexMap;
-use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -153,7 +152,7 @@ fn err_pair(msg: String) -> Value {
 }
 
 fn obj(map: IndexMap<String, Value>) -> Value {
-    Value::Object(Rc::new(RefCell::new(map)))
+    Value::Object(crate::value::ObjectCell::new(map))
 }
 
 /// A parsed HTTP/1 request read off the socket.
@@ -536,12 +535,12 @@ impl Interp {
             }
             // Internal terminal "handler" used when no route matched: returns a 404.
             // (Runs after any middleware, so middleware still sees unmatched requests.)
-            "__not_found" => Ok(Value::Object(Rc::new(RefCell::new({
+            "__not_found" => Ok(Value::Object(crate::value::ObjectCell::new({
                 let mut m = IndexMap::new();
                 m.insert("status".to_string(), Value::Number(404.0));
                 m.insert("body".to_string(), Value::Str("not found".into()));
                 m
-            })))),
+            }))),
             _ => {
                 Err(AsError::at(format!("std/http/server has no function '{}'", func), span).into())
             }

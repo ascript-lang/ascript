@@ -9,6 +9,7 @@ pub mod disasm;
 pub mod fiber;
 pub mod opcode;
 pub mod run;
+pub mod shape;
 pub mod value_ext;
 
 pub use chunk::{Chunk, FnProto};

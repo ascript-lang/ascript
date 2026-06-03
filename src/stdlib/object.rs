@@ -126,7 +126,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             if let Some(c) = seen.get(&key) {
                 return c.clone();
             }
-            let out = Rc::new(RefCell::new(IndexMap::new()));
+            let out = crate::value::ObjectCell::new(IndexMap::new());
             let cloned = Value::Object(out.clone());
             seen.insert(key, cloned.clone());
             let src = rc.borrow().clone();
@@ -178,6 +178,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             let out = Rc::new(RefCell::new(Instance {
                 class,
                 fields: IndexMap::new(),
+                shape_id: std::cell::Cell::new(0),
             }));
             let cloned = Value::Instance(out.clone());
             seen.insert(key, cloned.clone());
@@ -258,7 +259,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     out.insert(k.clone(), val.clone());
                 }
             }
-            Ok(Value::Object(Rc::new(RefCell::new(out))))
+            Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }
         "fromEntries" => {
             let pairs = want_array(&arg(args, 0), span, &ctx("fromEntries"))?;
@@ -274,7 +275,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 let v = p.get(1).cloned().unwrap_or(Value::Nil);
                 out.insert(k.to_string(), v);
             }
-            Ok(Value::Object(Rc::new(RefCell::new(out))))
+            Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }
         "pick" => {
             let src = object_like_fields(&arg(args, 0), span, "object.pick")?;
@@ -286,7 +287,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     out.insert(k.to_string(), v.clone());
                 }
             }
-            Ok(Value::Object(Rc::new(RefCell::new(out))))
+            Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }
         "omit" => {
             let src = object_like_fields(&arg(args, 0), span, "object.omit")?;
@@ -301,7 +302,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .filter(|(k, _)| !drop_set.contains(*k))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            Ok(Value::Object(Rc::new(RefCell::new(out))))
+            Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }
         "deepEqual" => Ok(Value::Bool(deep_equal(&arg(args, 0), &arg(args, 1)))),
         "deepClone" => {
@@ -338,7 +339,7 @@ impl Interp {
                         .await?;
                     out.insert(k.clone(), mapped);
                 }
-                Ok(Value::Object(Rc::new(RefCell::new(out))))
+                Ok(Value::Object(crate::value::ObjectCell::new(out)))
             }
             _ => call(func, args, span),
         }
@@ -359,7 +360,7 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
-        Value::Object(Rc::new(RefCell::new(m)))
+        Value::Object(crate::value::ObjectCell::new(m))
     }
     fn obj_ref(pairs: &[(&str, Value)]) -> Value {
         obj(pairs.iter().map(|(k, v)| (*k, v.clone())).collect())
