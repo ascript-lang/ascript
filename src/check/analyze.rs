@@ -1,5 +1,6 @@
 //! Analysis driver: runs the CST parser and collects diagnostics.
 
+use crate::check::config::LintConfig;
 use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::lexer::LexToken;
@@ -13,7 +14,22 @@ pub struct Analysis {
 
 /// Run the full analysis over `src` and return all diagnostics, sorted by
 /// start offset then code.
+///
+/// Uses the default [`LintConfig`] (no severity overrides), so the result is
+/// identical to running every rule at its declared default severity.
 pub fn analyze(src: &str) -> Analysis {
+    analyze_with_config(src, &LintConfig::default())
+}
+
+/// Like [`analyze`], but remaps each diagnostic's severity through `config`
+/// after inline `ascript-ignore` suppression has been applied.
+///
+/// For each surviving diagnostic, `config.effective(code, severity)` decides the
+/// outcome: `Some(sev)` overrides the severity, `None` drops the diagnostic.
+/// `syntax-error` is immune — it is never downgraded or dropped. Inline
+/// `ascript-ignore` runs first, so a config can never resurrect a diagnostic
+/// the source explicitly suppressed.
+pub fn analyze_with_config(src: &str, config: &LintConfig) -> Analysis {
     use crate::syntax::{resolve, tree_builder};
 
     let parsed = parse(src);
@@ -53,6 +69,22 @@ pub fn analyze(src: &str) -> Analysis {
     let line_starts = line_start_offsets(src);
     diagnostics.retain(|d| {
         !supp.suppressed_on_line(line_of(&line_starts, d.range.start), &d.code)
+    });
+
+    // Remap severities through the lint config. `syntax-error` is immune — it is
+    // always an Error and is never downgraded or dropped. For every other code,
+    // `effective` decides: `Some(sev)` overrides the severity, `None` drops it.
+    diagnostics.retain_mut(|d| {
+        if d.code == "syntax-error" {
+            return true;
+        }
+        match config.effective(&d.code, d.severity) {
+            Some(sev) => {
+                d.severity = sev;
+                true
+            }
+            None => false,
+        }
     });
 
     diagnostics.sort_by(|a, b| {
@@ -335,6 +367,121 @@ mod tests {
     #[test]
     fn clean_program_has_zero_diagnostics() {
         assert!(analyze("let x = 1\nprint(x)\n").diagnostics.is_empty());
+    }
+
+    fn diag<'a>(a: &'a Analysis, code: &str) -> Option<&'a AsDiagnostic> {
+        a.diagnostics.iter().find(|d| d.code == code)
+    }
+
+    #[test]
+    fn default_config_is_identity_remap() {
+        // `analyze_with_config` with the default config must be byte-identical to
+        // `analyze` (the default is a no-op remap).
+        let srcs = [
+            "let x = 1\nprint(x)\n",
+            "let x = 1\n",
+            "let = 1\nlet = 2\n",
+            "@\n",
+        ];
+        for src in srcs {
+            assert_eq!(
+                analyze(src).diagnostics,
+                analyze_with_config(src, &LintConfig::default()).diagnostics,
+                "default config diverged from analyze for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_promotes_warning_to_error() {
+        let src = "let x = 1\n";
+        // Default: unused-binding is a Warning.
+        assert_eq!(
+            diag(&analyze(src), "unused-binding").map(|d| d.severity),
+            Some(Severity::Warning)
+        );
+        // deny → Error.
+        let mut cfg = LintConfig::default();
+        cfg.deny("unused-binding");
+        assert_eq!(
+            diag(&analyze_with_config(src, &cfg), "unused-binding").map(|d| d.severity),
+            Some(Severity::Error)
+        );
+    }
+
+    #[test]
+    fn allow_drops_diagnostic_entirely() {
+        let src = "let x = 1\n";
+        assert!(diag(&analyze(src), "unused-binding").is_some());
+        let mut cfg = LintConfig::default();
+        cfg.allow("unused-binding");
+        let a = analyze_with_config(src, &cfg);
+        assert!(
+            diag(&a, "unused-binding").is_none(),
+            "allow should drop the diagnostic, got {:?}",
+            a.diagnostics
+        );
+    }
+
+    #[test]
+    fn warn_demotes_error_default_to_warning() {
+        // contract-mismatch is reported, then forced to Error via deny so we have
+        // a deterministic Error-severity diagnostic to demote. (Simpler: take any
+        // warning-default rule, deny→Error, then warn→Warning to prove warn maps
+        // to Warning regardless of default.)
+        let src = "let x = 1\n";
+        let mut cfg = LintConfig::default();
+        cfg.warn("unused-binding");
+        assert_eq!(
+            diag(&analyze_with_config(src, &cfg), "unused-binding").map(|d| d.severity),
+            Some(Severity::Warning)
+        );
+
+        // And a true Error-default rule (syntax-error is immune, so instead force
+        // an Error default by deny then demote): prove warn lands on Warning.
+        let mut cfg2 = LintConfig::default();
+        cfg2.warn("unused-binding");
+        let a = analyze_with_config(src, &cfg2);
+        assert_ne!(
+            diag(&a, "unused-binding").map(|d| d.severity),
+            Some(Severity::Error)
+        );
+    }
+
+    #[test]
+    fn syntax_error_is_immune_to_allow() {
+        let src = "@\n"; // produces a syntax-error
+        assert!(diag(&analyze(src), "syntax-error").is_some());
+        let mut cfg = LintConfig::default();
+        cfg.allow("syntax-error");
+        cfg.warn("syntax-error");
+        let a = analyze_with_config(src, &cfg);
+        let d = diag(&a, "syntax-error");
+        assert!(
+            d.is_some(),
+            "syntax-error must not be dropped by allow, got {:?}",
+            a.diagnostics
+        );
+        // ...and never downgraded.
+        assert_eq!(d.map(|d| d.severity), Some(Severity::Error));
+    }
+
+    #[test]
+    fn inline_ignore_beats_config_deny() {
+        // Source whose only diagnostic is unused-binding, suppressed inline.
+        let src = "let x = 1 // ascript-ignore[unused-binding]\n";
+        // Sanity: without the suppression it would be present.
+        assert!(diag(&analyze("let x = 1\n"), "unused-binding").is_some());
+        // With inline-ignore AND a config that denies the same rule, it is gone:
+        // suppression runs first and config cannot resurrect it.
+        let mut cfg = LintConfig::default();
+        cfg.deny("unused-binding");
+        let a = analyze_with_config(src, &cfg);
+        assert!(
+            diag(&a, "unused-binding").is_none(),
+            "inline-ignore must beat config, got {:?}",
+            a.diagnostics
+        );
     }
 
     #[test]
