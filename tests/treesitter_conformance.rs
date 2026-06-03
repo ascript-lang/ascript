@@ -79,6 +79,34 @@ fn treesitter_parses_match_guard_ending_in_ident() {
 }
 
 #[test]
+fn treesitter_parses_inclusive_and_step_ranges() {
+    // `..=` (inclusive) and a trailing contextual `step <expr>` must parse in
+    // for-range, value, and match-pattern position — and `step` must stay an
+    // ordinary identifier when not immediately following a range end. Mirrors the
+    // hand-written parser's `parses_inclusive_and_step_ranges` test.
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        "for (i in 1..=5) {}",
+        "let xs = 1..10 step 2",
+        "let m = match n { 1..=10 => 1, _ => 0 }",
+        "for (i in 10..1 step -2) {}",
+        "let xs = 1..=5",
+        // `step` is contextual, NOT reserved: usable as an ordinary identifier.
+        "let step = 1",
+        "fn step(n) { return n }",
+        "let r = f(step)",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on range/step snippet: {src}"
+        );
+    }
+}
+
+#[test]
 fn interpreter_parser_accepts_all_examples() {
     let mut failures = Vec::new();
     for path in example_files() {

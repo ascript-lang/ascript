@@ -310,6 +310,7 @@ module.exports = grammar({
       $.assignment_expression,
       $.ternary_expression,
       $.binary_expression,
+      $.range_expression,
       $.unary_expression,
       $.await_expression,
       $.yield_expression,
@@ -331,7 +332,9 @@ module.exports = grammar({
         ['&&', PREC.and],
         ['==', PREC.equality], ['!=', PREC.equality],
         ['<', PREC.compare], ['<=', PREC.compare], ['>', PREC.compare], ['>=', PREC.compare],
-        ['..', PREC.range],
+        // NOTE: `..` / `..=` are NOT in this table — a range is its own
+        // `range_expression` node (carries `inclusive` + an optional contextual
+        // `step`), mirroring the hand-written parser's dedicated `ExprKind::Range`.
         ['+', PREC.add], ['-', PREC.add],
         ['*', PREC.mul], ['/', PREC.mul], ['%', PREC.mul],
       ];
@@ -348,6 +351,28 @@ module.exports = grammar({
       )));
       return choice(...left);
     },
+
+    // `start .. end` / `start ..= end`, with an optional trailing contextual
+    // `step <expr>`. A dedicated node (NOT a `binary_expression`) mirroring the
+    // hand-written parser's `ExprKind::Range`, which carries `inclusive` and an
+    // optional `step`. Left-associative at `PREC.range` so additive (`PREC.add`,
+    // tighter) binds the bounds: `1+1..5*2 step k+1` is `(1+1)..(5*2) step (k+1)`.
+    // `step` is NOT reserved (see `step_keyword`): it is recognized ONLY in this
+    // immediate trailing position, so `let step = 1` / `fn step(n)` keep `step`
+    // as an ordinary identifier. This rule is precedence-bounded but adds no new
+    // reserved word; the `step`-vs-identifier choice is settled by GLR (declared
+    // in `conflicts`).
+    range_expression: $ => prec.left(PREC.range, seq(
+      field('start', $._expression),
+      field('operator', choice('..', '..=')),
+      field('end', $._expression),
+      optional(seq($.step_keyword, field('step', $._expression))),
+    )),
+    // The contextual `step` soft-keyword. Modeled as an aliased identifier-shaped
+    // token (NOT a bare string literal) so tree-sitter's keyword extraction does
+    // NOT promote `step` into the reserved word set — it stays a normal identifier
+    // everywhere except immediately after a range's end bound.
+    step_keyword: _ => 'step',
 
     unary_expression: $ => prec.right(PREC.unary, seq(
       field('operator', choice('!', '-')),
@@ -399,9 +424,8 @@ module.exports = grammar({
       $.wildcard_pattern,
       $.array_pattern_match,
       $.object_pattern_match,
-      $.range_pattern,
       $.identifier_pattern,
-      $._match_subject, // literal / enum-variant / member / call value pattern
+      $._match_subject, // literal / enum-variant / member / call / RANGE value pattern
     ),
     wildcard_pattern: _ => '_',
     // A bare identifier pattern (Option C: compare-if-defined / bind-if-new,
@@ -414,20 +438,12 @@ module.exports = grammar({
     // ONLY in match-pattern position, so it does NOT affect arrow functions,
     // the ternary `?`/`:`, propagation, or ranges anywhere else.
     identifier_pattern: $ => prec(PREC.unary, $.identifier),
-    // Inclusive range `a..=b` — subject is a Number in `[a, b]`. The EXCLUSIVE
-    // range `a..b` is intentionally NOT a `range_pattern`: it parses as a `..`
-    // `binary_expression` reached through the `_match_subject` value-pattern
-    // branch (exactly how the hand-written parser recovers it — it inspects the
-    // value expression for a `BinOp::Range`). Only `..=` needs a dedicated rule
-    // because the `..=` token appears nowhere else in the grammar. Bounds are
-    // `_match_subject`s (value expressions, no object literal). Precedence-less
-    // and left-associative so it never perturbs the `..` binary operator or the
-    // ternary `?`/`:`.
-    range_pattern: $ => prec.left(seq(
-      field('start', $._match_subject),
-      '..=',
-      field('end', $._match_subject),
-    )),
+    // Range patterns `a..b` / `a..=b` (subject is a Number in the range) are NOT a
+    // dedicated pattern rule: a `range_expression` is reachable through the
+    // `_match_subject` value-pattern branch, exactly how the hand-written parser
+    // recovers them — it parses a value expression and inspects it for an
+    // `ExprKind::Range`. Both the exclusive (`..`) and inclusive (`..=`) forms,
+    // plus an optional trailing `step`, flow through that single value path.
     // `[p0, p1, …, (...name | ...)?]` — array pattern with nested sub-patterns
     // and an optional trailing rest collector. Distinct from `array_pattern`
     // (destructuring), whose elements are plain identifiers; here each element
@@ -563,6 +579,7 @@ module.exports = grammar({
     // interpreter, which parses the subject at coalesce precedence.
     _match_subject: $ => choice(
       $.binary_expression,
+      $.range_expression,
       $.unary_expression,
       $._postfix_expression,
     ),

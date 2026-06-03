@@ -69,6 +69,31 @@ fn cli_formatter_preserves_comments_end_to_end() {
 }
 
 #[test]
+fn formats_inclusive_and_step_ranges() {
+    // The CST formatter must preserve `..=` (inclusive) and the trailing
+    // contextual `step <expr>` in both value and for-range position, and stay
+    // idempotent. Regression for the formatter silently dropping `step`.
+    for (src, want) in [
+        ("let xs = 1..=10 step 2\n", "let xs = 1..=10 step 2\n"),
+        ("let ys = 1..10 step 2\n", "let ys = 1..10 step 2\n"),
+        ("let zs = 1..=5\n", "let zs = 1..=5\n"),
+        ("for (i in 1..=5) {\n}\n", "for (i in 1..=5) {\n}\n"),
+        ("for (i in 10..1 step -2) {\n}\n", "for (i in 10..1 step -2) {\n}\n"),
+        // `step` stays an ordinary identifier away from a range end.
+        ("let step = 1\n", "let step = 1\n"),
+    ] {
+        let once = ascript::syntax::format_tree(src);
+        assert_eq!(once, want, "unexpected format for {src:?}");
+        let twice = ascript::syntax::format_tree(&once);
+        assert_eq!(once, twice, "not idempotent for {src:?}");
+        assert!(
+            ascript::syntax::parser::parse(&once).errors.is_empty(),
+            "formatted range/step output does not reparse: {once:?}"
+        );
+    }
+}
+
+#[test]
 fn formats_nil_type_idempotently() {
     // `nil` as a type formats via the NamedType path (first non-trivia token
     // text) and round-trips. Regression for the missing `NilKw` arm in the CST
