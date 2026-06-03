@@ -27,8 +27,9 @@ print(err == nil ? `${report.tempC}°C in Lisbon` : "could not load weather")
 ## Why AScript
 
 The guiding model is **"Lua-simple language, Go/Deno-class standard library."** The core stays tiny —
-a tree-walking interpreter, ~10 value kinds, gradual contracts, no hidden control flow. The library
-does the heavy lifting, because Rust's crate ecosystem makes high-quality batteries cheap.
+~10 value kinds, gradual contracts, no hidden control flow — and runs on a register-light **bytecode
+VM** with inline caches and a cycle-collecting GC. The library does the heavy lifting, because Rust's
+crate ecosystem makes high-quality batteries cheap.
 
 Design priorities, in strict order: **simplicity → safety → familiarity → performance**.
 
@@ -60,13 +61,37 @@ The default build includes the full standard library. Trim it with Cargo feature
 ## Usage
 
 ```bash
-ascript run program.as     # run a program
+ascript run program.as     # run a program (compiles to bytecode, runs on the VM)
+ascript build program.as   # compile to bytecode → program.aso
+ascript run program.aso    # run compiled bytecode (no compile step)
 ascript repl               # interactive REPL
 ascript fmt file.as        # format in place
 ascript check file.as      # static check (syntax + lints)
 ascript test file.as       # run test(name, fn) cases
 ascript lsp                # language server over stdio
 ```
+
+### Runtime & performance
+
+`ascript run` compiles your program to bytecode and executes it on the **bytecode VM** — the default
+and only production engine. Call frames are heap-allocated, so deep recursion is bounded by heap, not
+the native stack. Adaptive specialization (inline caches + adaptive arithmetic) makes it roughly
+**2–3× faster** than the legacy tree-walker on compute-bound code (geomean ~2.5× in the repo's
+`std/bench` suite). Memory is managed by a **cycle-collecting GC**: acyclic data is freed immediately
+and deterministically, reference cycles are reclaimed by periodic collection, and native OS resources
+(files, sockets, child processes) are dropped immediately — never on the GC's schedule.
+
+```bash
+ascript build app.as            # → app.aso
+ascript build app.as -o out.aso # choose the output path
+ascript run app.aso             # run the compiled artifact
+```
+
+`.aso` files are a versioned, verified compilation cache / distributable artifact (not a stable
+cross-version format — a version bump rejects old files with a "recompile from source" error). The
+legacy tree-walker is retained as a differential oracle and a debugging escape hatch — run it with
+`ascript run file.as --tree-walker` (or `ASCRIPT_ENGINE=tree-walker`). See
+[Compilation & runtime](docs/content/runtime.md) for the full picture.
 
 ### Checking
 

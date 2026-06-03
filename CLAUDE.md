@@ -6,7 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AScript is a small, dynamically-typed scripting language (`.as` files) with JavaScript-flavored
 syntax, optional runtime-checked type contracts, and a batteries-included standard library. It is
-implemented as a single Rust binary `ascript` containing an async tree-walking interpreter.
+implemented as a single Rust binary `ascript`. The **default and production engine is an async
+bytecode VM** (CST front-end → resolver → bytecode compiler → `Chunk` → VM, with inline caches,
+adaptive arithmetic, and a cycle-collecting GC). The original async **tree-walking interpreter is
+retained** as a differential oracle and a `--tree-walker` debugging engine — kept byte-for-byte
+behavior-identical to the VM, not a second dialect.
 
 The design goal is **"Lua-simple language, Go/Deno-class standard library"**: the core stays tiny
 (~10 value kinds, gradual contracts, no hidden control flow) while the stdlib is deliberately rich.
@@ -151,9 +155,13 @@ cargo test <name>                        # run a single test by name substring
 cargo test --test cli                    # run one integration test file (tests/*.rs)
 cargo clippy --all-targets               # lint — must be clean in BOTH feature configs
 
-cargo run -- run examples/hello.as       # run a .as program
-cargo run -- repl                        # interactive REPL
+cargo run -- run examples/hello.as       # compile to bytecode + run on the VM (default engine)
+cargo run -- run file.as --tree-walker   # run on the legacy tree-walker (oracle/debug; flag precedes file)
+cargo run -- build file.as               # compile to bytecode → file.aso (-o to choose path)
+cargo run -- run file.aso                # run compiled bytecode (no compile step; always VM)
+cargo run -- repl                        # interactive REPL (VM; --tree-walker for the legacy engine)
 cargo run -- fmt file.as                 # format in place
+cargo run -- check file.as               # static check (syntax + lints)
 cargo run -- test file.as ...            # run a .as file's test(name, fn) registrations
 cargo run -- lsp                         # language server over stdio (LSP)
 ```
@@ -164,13 +172,27 @@ before considering work done.
 ## Architecture
 
 ### Pipeline
-`lexer` → `parser` (precedence-climbing) → `interp` (async tree-walker). The shared front-end
-(`lexer`, `token`, `ast`, `parser`, `span`) is also consumed by `fmt`, `repl`, and the `lsp` (which
-is static-analysis only and never instantiates the interpreter).
+**Two front-ends, two engines — same observable behavior.** The DEFAULT production path is the
+**bytecode VM**: a lossless **CST front-end** (`src/cst/` — trivia-preserving lexer + parser → typed
+AST) → resolver (scopes/upvalues/slots, classifies module top-level as user-globals) → bytecode
+compiler (`src/compile/`) → a `Chunk` → the async VM (`src/vm/`). `ascript run file.as` compiles and
+runs on the VM; `ascript build file.as` serializes the `Chunk` to a versioned, verified `.aso`
+(`src/vm/aso.rs` + `src/vm/verify.rs`) that `ascript run file.aso` loads with no compile step.
 
-Source flows as: `lexer::lex(src)` → `parser::parse(&tokens)` → `Interp::exec`/`load_module`. Every
-token and AST node carries a `Span` (byte offsets + line/col) so `diagnostics` (ariadne-backed) can
-point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_source`, `run_tests`.
+The LEGACY path is `lexer` → `parser` (precedence-climbing) → `interp` (async tree-walker). It is
+**retained as a differential oracle** (the VM is checked byte-for-byte against it over the whole
+corpus + recorded goldens, in both feature configs) and as a `--tree-walker` debug engine
+(`ascript run --tree-walker` / `ASCRIPT_ENGINE=tree-walker`; the flag must precede the file and is
+ignored for `.aso`). The legacy front-end (`lexer`, `token`, `ast`, `parser`, `span`) is also
+consumed by `fmt`, `repl`, and the `lsp` (which is static-analysis only and never instantiates the
+interpreter). When changing language *behavior*, both engines must stay byte-identical or the
+three-way/whole-corpus differential fails — fix the engine, don't relax the assertion.
+
+Source flows (legacy) as: `lexer::lex(src)` → `parser::parse(&tokens)` → `Interp::exec`/`load_module`.
+Every token and AST node carries a `Span` (byte offsets + line/col) so `diagnostics` (ariadne-backed)
+can point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_source`, `run_tests`
+(these route to the VM by default; `vm_run_source` / `vm_run_source_generic` are the VM test entry
+points).
 
 **REPL multi-line input**: `repl.rs` buffers lines while `is_incomplete` (positive delimiter-TOKEN
 depth, or unterminated string/template at EOF) on a `..` prompt, then execs the whole buffer against

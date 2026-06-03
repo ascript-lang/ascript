@@ -13,8 +13,25 @@ Execute a `.as` program. Imports resolve relative to the entry file.
 ascript run path/to/program.as
 ```
 
-The program's `print` output goes to stdout. A [panic](language/errors) (an unrecoverable error)
-prints a diagnostic with a source span and exits with a non-zero status.
+`run` compiles the program to bytecode and executes it on the [bytecode VM](runtime) — the default
+engine. The program's `print` output goes to stdout. A [panic](language/errors) (an unrecoverable
+error) prints a diagnostic with a source span and exits with a non-zero status.
+
+Pass `--tree-walker` (before the file) to run on the legacy tree-walker engine instead — a debugging
+and differential aid; see [Compilation & runtime](runtime).
+
+## `ascript build`
+
+Compile a `.as` program to a `.aso` bytecode file, then run the artifact with no compile step.
+
+```text
+ascript build program.as              # → program.aso
+ascript build program.as -o out.aso   # choose the output path
+ascript run program.aso               # run the compiled bytecode
+```
+
+`.aso` is a versioned, verified compilation cache — see [Compilation & runtime](runtime) for what it
+is, when to use it, and why it is not a stable cross-version format.
 
 ## `ascript repl`
 
@@ -30,6 +47,9 @@ input is complete, then runs the whole buffer at once. Press `Ctrl-C` to cancel 
 ```text
 ascript repl
 ```
+
+The REPL runs on the [bytecode VM](runtime); each entry is compiled and executed against the
+persistent session globals. Pass `--tree-walker` to use the legacy engine instead.
 
 ```text
 >> let xs = [1, 2, 3]
@@ -107,6 +127,21 @@ test("expected error is thrown", () => {
 
 `std/assert` is distinct from the global `assert(cond, msg?)` builtin — both work in test bodies,
 and they can coexist (import under a different alias if needed: `import * as A from "std/assert"`).
+
+## `ascript check`
+
+Statically check `.as` files — syntax errors plus a set of lints (unused bindings, shadowing,
+unawaited futures, ignored results, and more) — without running them. It shares its analysis core
+with the language server, so the diagnostics you see here match those in your editor.
+
+```text
+ascript check src/main.as src/util.as
+ascript check src/*.as --deny unused-binding --allow shadowing --deny-warnings
+```
+
+Lint levels can be tuned per invocation (`--deny`/`--warn`/`--allow`) or via an `ascript.toml`
+discovered by walking up from the checked file. A non-zero exit status indicates problems were
+found, which makes `ascript check` suitable for CI.
 
 ## `ascript lsp`
 
