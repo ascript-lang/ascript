@@ -1708,3 +1708,85 @@ fn check_range_step_lint_and_allow_suppression() {
 
     let _ = std::fs::remove_file(&file);
 }
+
+#[test]
+fn check_invalid_propagate_lint_and_allow_suppression() {
+    // The `invalid-propagate` static lint flags a postfix `?` inside a function
+    // whose declared return type is not a `Result`. Configurable: `--allow
+    // invalid-propagate` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_invalid_propagate_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "fn g(): Result<number> { return [1, nil] }\nfn f(): number { return g()? }\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"invalid-propagate\""),
+        "expected an invalid-propagate diagnostic, got:\n{stdout}"
+    );
+
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("invalid-propagate")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"invalid-propagate\""),
+        "--allow invalid-propagate should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_unresolved_import_lint_and_allow_suppression() {
+    // The `unresolved-import` static lint flags a `std/*` import whose specifier
+    // is not a known std module (here a `std/maths` typo). Configurable:
+    // `--allow unresolved-import` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_unresolved_import_{}.as", std::process::id()));
+    std::fs::write(&file, "import { abs } from \"std/maths\"\nprint(1)\n").unwrap();
+
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"unresolved-import\""),
+        "expected an unresolved-import diagnostic, got:\n{stdout}"
+    );
+
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("unresolved-import")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"unresolved-import\""),
+        "--allow unresolved-import should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}

@@ -7,12 +7,14 @@ use crate::syntax::resolve::types::{Resolution, ResolveResult};
 pub mod contract;
 pub mod dead_recover;
 pub mod ignored_result;
+pub mod invalid_propagate;
 pub mod missing_return;
 pub mod range_step;
 pub mod shadowing;
 pub mod unawaited;
 pub mod undefined;
 pub mod unreachable;
+pub mod unresolved_import;
 pub mod unused;
 
 pub type Rule = fn(&ResolvedNode, &ResolveResult, &str) -> Vec<AsDiagnostic>;
@@ -29,6 +31,8 @@ pub static ALL: &[Rule] = &[
     dead_recover::check,
     contract::check,
     range_step::check,
+    invalid_propagate::check,
+    unresolved_import::check,
 ];
 
 /// The `CallExpr` directly dropped by an `ExprStmt` (result unused). `None` if the
