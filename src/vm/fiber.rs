@@ -34,6 +34,12 @@ pub struct CallFrame {
     /// `return` statement's span). For the bottom (script) frame this is unused
     /// (the script body declares no return contract).
     pub ret_span: Span,
+    /// The class that DEFINED the method running in this frame (V9-T2), if any.
+    /// Set only for method frames (built by `invoke_compiled_method`); `None` for
+    /// plain function/script/closure frames. `Op::GetSuper` reads it to resolve a
+    /// `super.<name>` lookup starting at `def_class.superclass`, mirroring the
+    /// tree-walker's `bm.defining_class.superclass` super binding.
+    pub def_class: Option<Rc<crate::value::Class>>,
 }
 
 /// Build the per-slot cell vector for a frame from its proto's `cell_slots`
@@ -74,6 +80,7 @@ impl Fiber {
             slot_base: 0,
             cells,
             ret_span: Span::new(0, 0),
+            def_class: None,
         };
         Fiber {
             frames: vec![frame],

@@ -2610,3 +2610,86 @@ async fn vm_class_string_field_and_template() {
     let src = "class Greeter {\n  name: string\n  fn init(name) { self.name = name }\n  fn hello() { return `hi ${self.name}` }\n}\nprint(Greeter(\"Ada\").hello())";
     assert_vm_run_matches_treewalker(src).await;
 }
+
+// ---- inheritance, super (V9-T2): extends + super.method + super.init -----
+//
+// AScript has single inheritance via `extends` and `super.method(...)` (spec
+// §8.1). There is NO `instanceof`/`is` operator in the surface language (the
+// tree-walker has none either; the class name is used as a *type* in contracts,
+// which §5 already covers and the VM checks via the shared `check_type`). So
+// V9-T2 covers `extends` + `super` (method + init) + inherited fields/methods/
+// contracts; `instanceof`/`is` is N/A (no syntax to mirror). The differential
+// harness compares VM vs tree-walker byte-for-byte; semantics are mirrored from
+// the tree-walker (`find_method`/`merged_field_schema`/`invoke_method`'s super
+// binding) exactly.
+
+#[tokio::test]
+async fn vm_inheritance_method_override() {
+    // A subclass overrides a parent method; dispatch picks the subclass's.
+    let src = "class Animal {\n  fn speak() { return \"...\" }\n}\nclass Dog extends Animal {\n  fn speak() { return \"woof\" }\n}\nlet d = Dog()\nprint(d.speak())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_inheritance_inherited_method() {
+    // A subclass calls a method it does NOT define — resolved up the chain to the
+    // parent (the parent registered its compiled method in the VM side-table).
+    let src = "class Animal {\n  fn speak() { return \"animal noise\" }\n}\nclass Dog extends Animal {\n  fn bark() { return \"woof\" }\n}\nlet d = Dog()\nprint(d.speak())\nprint(d.bark())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_super_method_call() {
+    // `super.greet()` resolves greet starting at the DEFINING class's superclass,
+    // bound to the current self. Result is "A" + "B" = "AB".
+    let src = "class A {\n  fn greet() { return \"A\" }\n}\nclass B extends A {\n  fn greet() { return super.greet() + \"B\" }\n}\nprint(B().greet())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_super_init_then_own_fields() {
+    // `super.init(...)` runs the parent init on the same self, then the subclass
+    // sets its own field. Read both inherited and own fields after construction.
+    let src = "class Animal {\n  name: string\n  fn init(name) { self.name = name }\n}\nclass Dog extends Animal {\n  breed: string\n  fn init(name, breed) { super.init(name)\n self.breed = breed }\n}\nlet d = Dog(\"Rex\", \"Husky\")\nprint(d.name)\nprint(d.breed)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_super_method_chains_with_self() {
+    // The oop.as shape: super.describe() composed with a subclass override, and a
+    // subclass-only method. Mirrors examples/oop.as (sans the enum).
+    let src = "class Animal {\n  fn init(name) { self.name = name }\n  fn describe() { return `${self.name} is an animal` }\n}\nclass Dog extends Animal {\n  fn init(name) { super.init(name) }\n  fn describe() { return super.describe() + \", specifically a dog\" }\n  fn sound() { return \"woof\" }\n}\nlet d = Dog(\"Rex\")\nprint(d.describe())\nprint(d.sound())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_inherited_field_default_and_contract() {
+    // A defaulted field declared on the BASE class is applied at construct time
+    // for a subclass instance (merged_field_schema walks the chain base-first).
+    let src = "class Base {\n  kind: string = \"base\"\n  fn init() {}\n}\nclass Sub extends Base {\n  n: number\n  fn init(n) { super.init()\n self.n = n }\n}\nlet s = Sub(5)\nprint(s.kind)\nprint(s.n)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_inherited_field_contract_violation_panics() {
+    // Assigning a wrong-typed value to a field declared on the PARENT class is a
+    // Tier-2 contract panic on both engines (lookup_field_schema walks the chain).
+    let src = "class Base {\n  name: string\n  fn init(name) { self.name = name }\n}\nclass Sub extends Base {\n  fn init() { self.name = 42 }\n}\nlet s = Sub()";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_super_init_arity_violation_panics() {
+    // A wrong-arity `super.init(...)` surfaces the parent init's arity panic
+    // identically (the super-bound method runs the SAME check_call_args).
+    let src = "class Base {\n  fn init(a, b) { self.a = a\n self.b = b }\n}\nclass Sub extends Base {\n  fn init() { super.init(1) }\n}\nlet s = Sub()";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_three_level_inheritance_chain() {
+    // A three-deep chain: C extends B extends A. `super` and inherited-method
+    // resolution must walk more than one ancestor link.
+    let src = "class A {\n  fn who() { return \"A\" }\n}\nclass B extends A {\n  fn who() { return super.who() + \"B\" }\n}\nclass C extends B {\n  fn who() { return super.who() + \"C\" }\n}\nprint(C().who())";
+    assert_vm_run_matches_treewalker(src).await;
+}

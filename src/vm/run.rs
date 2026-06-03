@@ -368,6 +368,11 @@ impl Vm {
                                 slot_base,
                                 cells,
                                 ret_span: call_span,
+                                // A plain in-VM function/closure call is never a
+                                // method frame; only `invoke_compiled_method` sets a
+                                // `def_class` (so `super` is unavailable here, which
+                                // is correct — `super` only appears in method bodies).
+                                def_class: None,
                             });
                             // Continue the loop in the new frame (the run loop reads
                             // `fiber.frame()` at the top of each iteration). RETURN
@@ -1060,7 +1065,36 @@ impl Vm {
                     for slot in defaults.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
-                    let key = Rc::as_ptr(&cp.class) as usize;
+                    // For an `extends` clause, the superclass class-value was pushed
+                    // FIRST (it is the bottom of the group), so it pops LAST. Build a
+                    // FRESH `Rc<Class>` with `superclass` set (the prebuilt template
+                    // had `superclass: None`); the method/default tables are then
+                    // registered under the NEW class's identity key. Mirrors the
+                    // tree-walker's `Stmt::Class`, which sets `superclass` to the
+                    // resolved parent `Value::Class`.
+                    let class: Rc<crate::value::Class> = if cp.has_super {
+                        let sup = fiber.pop();
+                        let superclass = match sup {
+                            Value::Class(c) => c,
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("'{other}' is not a class"),
+                                ))
+                            }
+                        };
+                        Rc::new(crate::value::Class {
+                            name: cp.class.name.clone(),
+                            superclass: Some(superclass),
+                            fields: cp.class.fields.clone(),
+                            methods: cp.class.methods.clone(),
+                            def_env: cp.class.def_env.clone(),
+                        })
+                    } else {
+                        cp.class.clone()
+                    };
+                    let key = Rc::as_ptr(&class) as usize;
                     let mut method_map: HashMap<String, Rc<Closure>> = HashMap::new();
                     for (name, mv) in cp.method_names.iter().zip(methods) {
                         match mv {
@@ -1095,7 +1129,82 @@ impl Vm {
                     }
                     self.class_methods.borrow_mut().insert(key, method_map);
                     self.class_defaults.borrow_mut().insert(key, default_map);
-                    fiber.push(Value::Class(cp.class.clone()));
+                    fiber.push(Value::Class(class));
+                }
+
+                Op::GetSuper => {
+                    // `super.<name>` (V9-T2): resolve `name` starting at the CURRENT
+                    // method's DEFINING class's superclass, bound to `self` (slot 0).
+                    // Mirrors the tree-walker: `super` is a `Value::Super` whose
+                    // `start` is `defining_class.superclass`, and `read_member` on it
+                    // finds the method up that chain and produces a BoundMethod on
+                    // `self` (which the subsequent CALL invokes). The `defining_class`
+                    // we stamp onto the BoundMethod is the ANCESTOR that actually
+                    // declared the method, so a NESTED `super` resolves from the right
+                    // link too.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("GET_SUPER name is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    // The defining class of the running method (set by
+                    // `invoke_compiled_method`). Absent only if `super` somehow
+                    // appears outside a method frame — a compiler invariant violation.
+                    let def_class = match &fiber.frame().def_class {
+                        Some(c) => c.clone(),
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "'super' used outside of a method".to_string(),
+                            ))
+                        }
+                    };
+                    // self = slot 0, read cell-aware (it is a cell slot whenever a
+                    // nested closure captured it).
+                    let receiver = match &fiber.frame().cells[0] {
+                        Some(cell) => cell.borrow().clone(),
+                        None => fiber.local(0).clone(),
+                    };
+                    // Resolve up from the DEFINING class's superclass (NOT the
+                    // instance's class), matching `SuperRef { start: superclass }`.
+                    let start = def_class.superclass.clone();
+                    let bound = match start
+                        .as_ref()
+                        .and_then(|s| self.find_compiled_method(s, &name))
+                    {
+                        Some((_closure, found_class)) => Value::BoundMethod(Rc::new(
+                            crate::value::BoundMethod {
+                                receiver,
+                                method: Rc::new(crate::value::Method {
+                                    params: Vec::new(),
+                                    ret: None,
+                                    body: Vec::new(),
+                                    is_async: false,
+                                }),
+                                defining_class: found_class,
+                                name: name.to_string(),
+                            },
+                        )),
+                        None => {
+                            // Mirror the tree-walker's `Value::Super` member-read
+                            // error wording (with/without a superclass).
+                            let msg = if start.is_some() {
+                                format!("no superclass method '{name}'")
+                            } else {
+                                format!("no superclass method '{name}' (no superclass)")
+                            };
+                            return Err(Control::Panic(AsError::at(msg, span)));
+                        }
+                    };
+                    fiber.push(bound);
                 }
 
                 other => {
@@ -1181,8 +1290,17 @@ impl Vm {
             // closure with `self` bound to the receiver (slot 0).
             Value::BoundMethod(bm) if self.bound_method_is_vm(&bm).is_some() => {
                 let closure = self.bound_method_is_vm(&bm).expect("checked above");
-                self.invoke_compiled_method(closure, bm.receiver.clone(), args, span)
-                    .await
+                // The BoundMethod's `defining_class` is the class that actually
+                // declared the method (set by `vm_read_member` / `Op::GetSuper` via
+                // the chain walk), so a `super.<name>` inside it resolves correctly.
+                self.invoke_compiled_method(
+                    closure,
+                    bm.receiver.clone(),
+                    args,
+                    span,
+                    Some(bm.defining_class.clone()),
+                )
+                .await
             }
             // Native callee: delegate to the shared dispatch (same as the
             // `Op::Call` non-Closure arm).
@@ -1198,8 +1316,9 @@ impl Vm {
         self.class_methods.borrow().contains_key(&key)
     }
 
-    /// The compiled method closure for `(class identity, name)`, if registered.
-    fn compiled_method(
+    /// The compiled method closure for `(class identity, name)` looked up ON the
+    /// given class ONLY (no chain walk), if registered.
+    fn compiled_method_own(
         &self,
         class: &Rc<crate::value::Class>,
         name: &str,
@@ -1212,15 +1331,45 @@ impl Vm {
             .cloned()
     }
 
+    /// Walk the superclass chain from `class` upward, returning the first compiled
+    /// method named `name` plus the ANCESTOR class that DEFINED it. The VM method
+    /// side-table is keyed by `Rc::as_ptr(class)`, so walking the chain means
+    /// probing each ancestor's table in turn. Mirrors the tree-walker's
+    /// `value::find_method` (own class first, then up `superclass`), so an
+    /// inherited method runs the ancestor's COMPILED closure and a `super` lookup
+    /// gets the correct defining class.
+    fn find_compiled_method(
+        &self,
+        class: &Rc<crate::value::Class>,
+        name: &str,
+    ) -> Option<(Rc<Closure>, Rc<crate::value::Class>)> {
+        let mut cur = Some(class.clone());
+        while let Some(c) = cur {
+            if let Some(closure) = self.compiled_method_own(&c, name) {
+                return Some((closure, c));
+            }
+            cur = c.superclass.clone();
+        }
+        None
+    }
+
     /// If `bm` is a bound method on a VM-registered class, return its compiled
-    /// method closure; else `None` (so a tree-walker BoundMethod delegates).
+    /// method closure (resolved up the chain); else `None` (so a tree-walker
+    /// BoundMethod delegates).
     fn bound_method_is_vm(
         &self,
         bm: &crate::value::BoundMethod,
     ) -> Option<Rc<Closure>> {
         if let Value::Instance(inst) = &bm.receiver {
             let class = inst.borrow().class.clone();
-            return self.compiled_method(&class, &bm.name);
+            // Resolve from the method's DEFINING class (set by `vm_read_member` /
+            // `Op::GetSuper`) so an inherited or super-dispatched method runs the
+            // right ancestor's closure; fall back to the instance's class chain for
+            // a BoundMethod minted elsewhere.
+            return self
+                .find_compiled_method(&bm.defining_class, &bm.name)
+                .or_else(|| self.find_compiled_method(&class, &bm.name))
+                .map(|(closure, _)| closure);
         }
         None
     }
@@ -1241,7 +1390,10 @@ impl Vm {
                 (b.class.clone(), b.fields.contains_key(name))
             };
             if !has_field {
-                if let Some(_closure) = self.compiled_method(&class, name) {
+                // Walk the chain so an INHERITED method binds with the ANCESTOR
+                // class as `defining_class` (so a `super` inside it resolves from
+                // the right link), mirroring `value::find_method`.
+                if let Some((_closure, def_class)) = self.find_compiled_method(&class, name) {
                     let bm = crate::value::BoundMethod {
                         receiver: obj.clone(),
                         method: Rc::new(crate::value::Method {
@@ -1250,7 +1402,7 @@ impl Vm {
                             body: Vec::new(),
                             is_async: false,
                         }),
-                        defining_class: class,
+                        defining_class: def_class,
                         name: name.to_string(),
                     };
                     return Ok(Value::BoundMethod(Rc::new(bm)));
@@ -1281,47 +1433,55 @@ impl Vm {
         }));
         let inst_val = Value::Instance(instance.clone());
 
-        // Apply field defaults in declaration order (the field schema is insertion
-        // ordered, matching the source). Run each default's compiled thunk to get a
-        // fresh value, check the contract, then store it. The contract panic span
-        // is the construct call site (`span`), matching `construct`.
-        let key = Rc::as_ptr(&class) as usize;
-        let default_names: Vec<String> = self
-            .class_defaults
-            .borrow()
-            .get(&key)
-            .map(|m| {
-                // Preserve declared field order (schema order), not HashMap order.
-                class
-                    .fields
-                    .keys()
-                    .filter(|k| m.contains_key(*k))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        for fname in default_names {
-            let thunk = self
+        // Apply field defaults BASE-CLASS FIRST so a subclass default overrides a
+        // base one with the same name (mirrors the tree-walker's `construct`, which
+        // iterates `merged_field_schema` — base-first). For each class in the chain
+        // (deepest ancestor first), run its defaulted fields' compiled thunks (each
+        // thunk is registered under THAT class's identity key) to get a fresh value,
+        // check the contract, then store it. The contract panic span is the
+        // construct call site (`span`), matching `construct`.
+        let mut chain: Vec<Rc<crate::value::Class>> = Vec::new();
+        {
+            let mut cur = Some(class.clone());
+            while let Some(c) = cur {
+                cur = c.superclass.clone();
+                chain.push(c);
+            }
+        }
+        for c in chain.iter().rev() {
+            let key = Rc::as_ptr(c) as usize;
+            // Defaulted field names for THIS class, in declared (schema) order.
+            let default_names: Vec<String> = self
                 .class_defaults
                 .borrow()
                 .get(&key)
-                .and_then(|m| m.get(&fname))
-                .cloned();
-            let Some(thunk) = thunk else { continue };
-            let dv = self
-                .call_value(Value::Closure(thunk), Vec::new(), span)
-                .await?;
-            if let Some(schema) = class.fields.get(&fname) {
-                if !crate::interp::check_type(&dv, &schema.ty) {
-                    return Err(crate::interp::contract_panic(&schema.ty, &dv, span));
+                .map(|m| c.fields.keys().filter(|k| m.contains_key(*k)).cloned().collect())
+                .unwrap_or_default();
+            for fname in default_names {
+                let thunk = self
+                    .class_defaults
+                    .borrow()
+                    .get(&key)
+                    .and_then(|m| m.get(&fname))
+                    .cloned();
+                let Some(thunk) = thunk else { continue };
+                let dv = self
+                    .call_value(Value::Closure(thunk), Vec::new(), span)
+                    .await?;
+                if let Some(schema) = c.fields.get(&fname) {
+                    if !crate::interp::check_type(&dv, &schema.ty) {
+                        return Err(crate::interp::contract_panic(&schema.ty, &dv, span));
+                    }
                 }
+                instance.borrow_mut().fields.insert(fname, dv);
             }
-            instance.borrow_mut().fields.insert(fname, dv);
         }
 
-        // Run the compiled `init`, if any.
-        if let Some(init) = self.compiled_method(&class, "init") {
-            self.invoke_compiled_method(init, inst_val.clone(), args, span)
+        // Run the compiled `init`, if any — resolved up the chain (a subclass may
+        // inherit the base init). `def_class` is the class that DEFINED init, so a
+        // `super.init(...)` inside it resolves from the correct link.
+        if let Some((init, def_class)) = self.find_compiled_method(&class, "init") {
+            self.invoke_compiled_method(init, inst_val.clone(), args, span, Some(def_class))
                 .await?;
         } else if !args.is_empty() {
             return Err(AsError::at(
@@ -1353,6 +1513,7 @@ impl Vm {
         receiver: Value,
         args: Vec<Value>,
         span: Span,
+        def_class: Option<Rc<crate::value::Class>>,
     ) -> Result<Value, Control> {
         let what = closure.proto.chunk.name.as_deref().unwrap_or("method");
         // Bind the user args (arity + per-param contracts + rest) against the
@@ -1361,6 +1522,10 @@ impl Vm {
         let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
         let mut fiber = Fiber::new(closure);
         fiber.frame_mut().ret_span = span;
+        // Record the DEFINING class so a `super.<name>` in this method body
+        // (Op::GetSuper) resolves up from `def_class.superclass`, exactly like the
+        // tree-walker's `invoke_method` super binding.
+        fiber.frame_mut().def_class = def_class;
         let cells = fiber.frame().cells.clone();
         // self -> slot 0 (cell-aware, in case a nested closure captured self).
         if let Some(cell) = &cells[0] {

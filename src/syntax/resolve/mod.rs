@@ -438,8 +438,42 @@ impl Resolver {
         }
     }
 
+    /// Find the superclass `Ident` token of a `ClassDecl` (the one following the
+    /// soft keyword `extends`) and record a `Resolution` for it (keyed by the
+    /// token's `text_range`), classifying it as a Local/Upvalue/Global exactly as
+    /// `resolve_expr`'s `NameRef` arm would. No-op for a class without `extends`.
+    fn record_superclass_use(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        // Tokens after (and including) `extends`: [0] = "extends", [1] = SuperName.
+        let sup = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .skip_while(|t| !(t.kind() == Ident && t.text() == "extends"))
+            .filter(|t| t.kind() == Ident)
+            .nth(1);
+        let Some(sup) = sup else { return };
+        let name = sup.text().to_string();
+        let range = sup.text_range();
+        let resolution = if let Some(slot) = self.resolve_local(&name) {
+            self.bump_use(slot);
+            Resolution::Local(slot)
+        } else if let Some(idx) = self.resolve_upvalue(self.frames.len() - 1, &name) {
+            Resolution::Upvalue(idx)
+        } else {
+            Resolution::Global(name)
+        };
+        self.result.uses.insert(range, resolution);
+    }
+
     fn resolve_class(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
+        // `class X extends Y` — the superclass `Y` is a bare `Ident` TOKEN of the
+        // ClassDecl (not a `NameRef` node), following the soft keyword `extends`.
+        // Record a use-resolution for it (keyed by the token's text_range) so the
+        // VM compiler can fetch the parent class value lexically, exactly like the
+        // tree-walker's `env.get(sup_name)`. (The checker also benefits: the parent
+        // counts as used.)
+        self.record_superclass_use(node);
         for member in node.children() {
             match member.kind() {
                 FieldDecl => {

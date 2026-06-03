@@ -36,6 +36,12 @@ pub struct ClassProto {
     /// The method names, in declaration order, matching the method closures
     /// pushed immediately before `Op::Class` (after the default thunks).
     pub method_names: Vec<String>,
+    /// Whether this class has an `extends` clause (V9-T2). When true, the compiler
+    /// emits the superclass class-value expression FIRST (below the default thunks
+    /// and method closures); `Op::Class` pops it and builds a fresh `Rc<Class>`
+    /// whose `superclass` is that value. The prebuilt `class` field above is then a
+    /// TEMPLATE (its `superclass` is `None`) — only its name/field-schemas are used.
+    pub has_super: bool,
 }
 
 impl std::fmt::Debug for ClassProto {

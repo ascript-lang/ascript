@@ -50,6 +50,18 @@ fn node_span(node: &impl AstNode) -> Span {
     range_span(node.syntax())
 }
 
+/// Whether `expr` is the bare name `super` — the implicit super reference used as
+/// the receiver of `super.<name>(...)` (V9-T2). `super` is lexed as a plain
+/// `Ident` (not a reserved keyword), so it surfaces as a `NameRef`; matching by
+/// text mirrors the tree-walker, where `super` is a `Value::Super` bound in the
+/// method's call env. There is NO bare `super` value outside a `super.<name>(...)`
+/// call position (a bare `super` expression is a compile error via the normal
+/// name-resolution path, exactly as the tree-walker rejects `super` not used as a
+/// member receiver).
+fn is_super_receiver(expr: &Expr) -> bool {
+    matches!(expr, Expr::NameRef(n) if n.ident_token().map(|t| t.text().to_string()).as_deref() == Some("super"))
+}
+
 /// The span of a raw CST node, as byte offsets into the original source.
 fn range_span(node: &crate::syntax::cst::ResolvedNode) -> Span {
     let range = node.text_range();
@@ -940,19 +952,18 @@ impl Compiler {
 
         // V9-T2: superclass (`class X extends Y`). `extends` is a SOFT keyword
         // parsed as an `Ident` token, so a class with a superclass has the direct
-        // idents `[ClassName, "extends", SuperName]`. Detect the literal `extends`
-        // ident and defer with a clear error.
-        if class_decl
+        // idents `[ClassName, "extends", SuperName]` — the SuperName is the second
+        // `Ident` token, the one following `extends`. Capture it (if present); the
+        // resolver recorded a use-resolution for it (`record_superclass_use`), so it
+        // resolves lexically like any name reference (local/upvalue/global class).
+        let super_ident = class_decl
             .syntax()
             .children_with_tokens()
             .filter_map(|el| el.into_token())
-            .any(|t| t.kind() == SyntaxKind::Ident && t.text() == "extends")
-        {
-            return Err(CompileError::new(
-                "class inheritance (extends/super/instanceof) not yet supported in the VM (V9-T2)",
-                span,
-            ));
-        }
+            .skip_while(|t| !(t.kind() == SyntaxKind::Ident && t.text() == "extends"))
+            .filter(|t| t.kind() == SyntaxKind::Ident)
+            .nth(1); // [0] = "extends", [1] = SuperName
+        let has_super = super_ident.is_some();
 
         // Field schemas, in declaration order (mirrors the tree-walker's
         // `Stmt::Class` field_map build: name → FieldSchema{ty, default}).
@@ -1015,6 +1026,43 @@ impl Compiler {
             def_env: crate::interp::global_env(),
         });
 
+        // For an `extends` clause, emit the SUPERCLASS class-value FIRST (so it
+        // sits at the BOTTOM of the `[super?, ..thunks.., ..methods..]` group below
+        // `Op::Class`, which pops methods, then thunks, then the superclass last).
+        // The superclass name resolves lexically via the resolver's recorded use
+        // (`record_superclass_use`), the same Local/Upvalue/Global-class dispatch a
+        // `NameRef` uses — mirroring the tree-walker's `env.get(sup_name)`.
+        if let Some(sup) = &super_ident {
+            let sup_span = node_span(class_decl);
+            let key = sup.text_range();
+            match self.resolved.uses.get(&key) {
+                Some(Resolution::Local(slot)) => {
+                    let slot = u16::try_from(*slot).map_err(|_| {
+                        CompileError::new("local slot index exceeds 65535", sup_span)
+                    })?;
+                    self.emit_get_local(slot, sup_span);
+                }
+                Some(Resolution::Upvalue(idx)) => {
+                    let idx = u16::try_from(*idx).map_err(|_| {
+                        CompileError::new("upvalue index exceeds 65535", sup_span)
+                    })?;
+                    self.chunk.emit_u16(Op::GetUpvalue, idx, sup_span);
+                }
+                Some(Resolution::Global(gname)) => {
+                    return Err(CompileError::new(
+                        format!("superclass '{gname}' is not in scope as a class binding (V9)"),
+                        sup_span,
+                    ));
+                }
+                Some(Resolution::Unresolved) | None => {
+                    return Err(CompileError::new(
+                        format!("undefined superclass '{}'", sup.text()),
+                        sup_span,
+                    ));
+                }
+            }
+        }
+
         // Emit the default-field thunk closures (declaration order) FIRST, then the
         // method closures, so the stack below `CLASS` is
         // `[..thunks.., ..methods..]` and `Op::Class` pops them in reverse.
@@ -1041,6 +1089,7 @@ impl Compiler {
             class,
             default_fields,
             method_names,
+            has_super,
         });
         let cp_idx = self.chunk.add_class_proto(class_proto);
         self.chunk.emit_u16(Op::Class, cp_idx, span);
@@ -1985,6 +2034,30 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("method call missing method name", span))?
             .text()
             .to_string();
+
+        // `super.<name>(args)` (V9-T2): the receiver is the bare name `super`. This
+        // is NOT a value to evaluate — it is the implicit super reference. Emit
+        // `GET_SUPER name` (which resolves `name` up from the current method's
+        // DEFINING class's superclass, bound to `self` at slot 0, producing a
+        // BoundMethod), then the args, then a plain `CALL`. Mirrors the tree-walker:
+        // `super` is a `Value::Super` whose `read_member` walks from
+        // `defining_class.superclass`, and the resulting BoundMethod runs on `self`.
+        if is_super_receiver(&object) {
+            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            self.chunk.emit_u16(Op::GetSuper, name_idx, span);
+            let mut argc: u8 = 0;
+            if let Some(arg_list) = call.arg_list() {
+                for arg in arg_list.exprs() {
+                    self.compile_expr(&arg)?;
+                    argc = argc.checked_add(1).ok_or_else(|| {
+                        CompileError::new("too many call arguments (max 255)", span)
+                    })?;
+                }
+            }
+            self.chunk.emit_u8(Op::Call, argc, span);
+            return Ok(());
+        }
+
         // Receiver, then args (left to right).
         self.compile_expr(&object)?;
         let mut argc: u8 = 0;
