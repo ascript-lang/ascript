@@ -835,6 +835,14 @@ fn match_arm_binding_in_expr(expr: &Expr, name: &str, offset: usize) -> Option<S
             }
             None
         }
+        ExprKind::Range {
+            start, end, step, ..
+        } => match_arm_binding_in_expr(start, name, offset)
+            .or_else(|| match_arm_binding_in_expr(end, name, offset))
+            .or_else(|| {
+                step.as_ref()
+                    .and_then(|k| match_arm_binding_in_expr(k, name, offset))
+            }),
         ExprKind::Index { object, index } => match_arm_binding_in_expr(object, name, offset)
             .or_else(|| match_arm_binding_in_expr(index, name, offset)),
         ExprKind::Member { object, .. } | ExprKind::OptMember { object, .. } => {

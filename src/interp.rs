@@ -1126,6 +1126,11 @@ impl Interp {
                 var,
                 start,
                 end,
+                // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9).
+                // `inclusive=false, step=None` behaves exactly as today
+                // (ascending, exclusive, step 1); the new fields are wired later.
+                inclusive: _,
+                step: _,
                 body,
             } => {
                 let start_v = self.eval_expr(start, env).await?;
@@ -1545,6 +1550,33 @@ impl Interp {
                     self.eval_expr(els, env).await
                 }
             }
+            // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9).
+            // The parser does not yet produce `ExprKind::Range` (value ranges
+            // still lower through `Binary { op: BinOp::Range, .. }`); this arm
+            // exists only to keep the match exhaustive. It mirrors the exclusive,
+            // ascending, step-1 `BinOp::Range` eval in `apply_binop`
+            // (materialize to `array<number>`, `while i < hi`), ignoring
+            // `inclusive`/`step` until later phases wire them.
+            ExprKind::Range {
+                start,
+                end,
+                inclusive: _,
+                step: _,
+            } => {
+                let start_v = self.eval_expr(start, env).await?;
+                let end_v = self.eval_expr(end, env).await?;
+                let (lo, hi) = match (start_v, end_v) {
+                    (Value::Number(a), Value::Number(b)) => (a, b),
+                    _ => return Err(AsError::at("range bounds must be numbers", expr.span).into()),
+                };
+                let mut items = Vec::new();
+                let mut i = lo;
+                while i < hi {
+                    items.push(Value::Number(i));
+                    i += 1.0;
+                }
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
+            }
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
             ExprKind::Try(inner) => {
                 let v = self.eval_expr(inner, env).await?;
@@ -1636,6 +1668,9 @@ impl Interp {
                 start,
                 end,
                 inclusive,
+                // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9).
+                // Strided membership for `step` lands in Phase 5; ignored here.
+                step: _,
             } => {
                 let n = match subject {
                     Value::Number(n) => *n,

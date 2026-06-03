@@ -666,6 +666,11 @@ impl<'a> Parser<'a> {
                             var,
                             start: *lhs,
                             end: *rhs,
+                            // PHASE 1 placeholder — the parser starts producing
+                            // `..=`/`step` in Task 3; for now always exclusive,
+                            // no step (current behavior).
+                            inclusive: false,
+                            step: None,
                             body,
                         });
                     }
@@ -1293,6 +1298,8 @@ impl<'a> Parser<'a> {
                 start: Box::new(start),
                 end: Box::new(end),
                 inclusive: true,
+                // PHASE 1 placeholder — pattern `step` parsing lands later.
+                step: None,
             });
         }
         // Exclusive range `a..b` parses as a `BinOp::Range` binary expression.
@@ -1306,6 +1313,8 @@ impl<'a> Parser<'a> {
                 start: lhs,
                 end: rhs,
                 inclusive: false,
+                // PHASE 1 placeholder — pattern `step` parsing lands later.
+                step: None,
             });
         }
         // A lone identifier → Option-C resolved at match time.
