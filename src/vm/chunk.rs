@@ -97,6 +97,40 @@ impl std::fmt::Debug for ClassProto {
     }
 }
 
+/// What an `Op::Import` should bind. The `Op::Import(u16)` operand indexes the
+/// chunk's `imports` side table to one of these descriptors (the source string +
+/// the binding plan), keeping the const pool clean and the instruction stream a
+/// single u16-wide op. Mirrors the tree-walker's `ast::ImportNames`.
+///
+/// Each `(name, slot)` records an imported name (or the namespace alias) and the
+/// resolver-assigned local slot it binds into. The compiler resolves the slots
+/// from the resolver's `BindingKind::Import` bindings (matched by import-stmt
+/// `decl_range` + name), exactly as `let` resolves its slot.
+#[derive(Debug, Clone)]
+pub enum ImportDesc {
+    /// `import { a, b } from "std/x"` — bind each named export into its slot.
+    Named {
+        source: String,
+        /// `(export name, local slot, is_cell)` per imported name, in source order.
+        names: Vec<(String, u16, bool)>,
+    },
+    /// `import * as alias from "std/x"` — bind the namespace Object into `slot`.
+    Namespace {
+        source: String,
+        slot: u16,
+        is_cell: bool,
+    },
+}
+
+impl ImportDesc {
+    /// The module source string (`"std/…"`), for diagnostics / disassembly.
+    pub fn source(&self) -> &str {
+        match self {
+            ImportDesc::Named { source, .. } | ImportDesc::Namespace { source, .. } => source,
+        }
+    }
+}
+
 /// A compiled function body (or top-level script body) plus its metadata.
 #[derive(Debug, Default)]
 pub struct Chunk {
@@ -150,6 +184,10 @@ pub struct Chunk {
     /// bytecode offset (V11-T4). Caches the resolved builtin value guarded by the
     /// global-table version. Lazily populated; a missing entry is `Cold`.
     pub global_caches: RefCell<OffsetMap<GlobalCache>>,
+    /// Import descriptors referenced by `IMPORT` operands (V12). Each `Op::Import`
+    /// carries a u16 index into this table; the run loop reads the descriptor to
+    /// resolve the `std/*` module and bind its exports into the recorded slots.
+    pub imports: Vec<ImportDesc>,
     /// Optional name (function name / `<script>`), for the disassembler & traces.
     pub name: Option<String>,
 }
@@ -294,6 +332,17 @@ impl Chunk {
         let idx = self.class_protos.len();
         let idx = u16::try_from(idx).expect("class-proto table exceeded u16::MAX");
         self.class_protos.push(p);
+        idx
+    }
+
+    /// Append an import descriptor, returning its index (the `IMPORT` operand).
+    ///
+    /// # Panics
+    /// If the import table would exceed `u16::MAX` entries.
+    pub fn add_import(&mut self, desc: ImportDesc) -> u16 {
+        let idx = self.imports.len();
+        let idx = u16::try_from(idx).expect("import table exceeded u16::MAX");
+        self.imports.push(desc);
         idx
     }
 

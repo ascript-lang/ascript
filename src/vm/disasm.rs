@@ -104,6 +104,24 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
                 }
             }
         }
+        // u16 import-table index → show the module source and binding shape.
+        Op::Import => {
+            let idx = chunk.read_u16(at + 1);
+            let _ = write!(line, "{idx:>5}");
+            if let Some(desc) = chunk.imports.get(idx as usize) {
+                use crate::vm::chunk::ImportDesc;
+                match desc {
+                    ImportDesc::Named { source, names } => {
+                        let list: Vec<&str> =
+                            names.iter().map(|(n, _, _)| n.as_str()).collect();
+                        let _ = write!(line, " ; import {{{}}} from \"{source}\"", list.join(", "));
+                    }
+                    ImportDesc::Namespace { source, slot, .. } => {
+                        let _ = write!(line, " ; import * (slot {slot}) from \"{source}\"");
+                    }
+                }
+            }
+        }
         // u16 const-pool index (a destructure key, or the bound-keys array) →
         // show the referenced value.
         Op::ObjectKey | Op::ObjectRest | Op::MatchHasKey => {

@@ -1,0 +1,8 @@
+# exit: none
+health: request failed — net/http GET http://127.0.0.1:8787/health failed: error sending request for url (http://127.0.0.1:8787/health)
+user 1: request failed — net/http GET http://127.0.0.1:8787/users/1 failed: error sending request for url (http://127.0.0.1:8787/users/1)
+missing: request failed — net/http GET http://127.0.0.1:8787/users/999 failed: error sending request for url (http://127.0.0.1:8787/users/999)
+search: request failed — net/http GET http://127.0.0.1:8787/search?q=lovelace&page=2 failed: error sending request for url (http://127.0.0.1:8787/search?q=lovelace&page=2)
+echo: failed — net/http POST http://127.0.0.1:8787/echo failed: error sending request for url (http://127.0.0.1:8787/echo)
+admin (authed): request failed — net/http GET http://127.0.0.1:8787/admin/stats failed: error sending request for url (http://127.0.0.1:8787/admin/stats)
+admin (no token): request failed — net/http GET http://127.0.0.1:8787/admin/stats failed: error sending request for url (http://127.0.0.1:8787/admin/stats)

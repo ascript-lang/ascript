@@ -1,0 +1,12 @@
+# exit: none
+PASS  gather preserves input order
+PASS  race returns the first to finish
+PASS  race cancels the loser
+PASS  timeout passes a value through in time
+PASS  timeout returns an error past the deadline
+PASS  timeout cancels the timed-out work
+PASS  spawn returns before the work finishes
+PASS  spawn detaches: the task still runs
+PASS  an awaited spawned handle yields its value
+PASS  un-awaited un-held call is cancelled (not orphaned)
+done

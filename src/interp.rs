@@ -947,6 +947,16 @@ impl Interp {
         p
     }
 
+    /// Resolve a `std/*` module to its `ModuleEntry` for the bytecode VM. This is
+    /// the SAME `load_std_module` the tree-walker's `Stmt::Import` arm uses, so the
+    /// two engines bind byte-identical export values and error identically on an
+    /// unknown / feature-disabled module. The VM's `Op::Import` exec calls this;
+    /// non-`std/` (file-module) imports are a compile-time deferral (V12-T4) and
+    /// never reach here.
+    pub(crate) fn import_std(&self, source: &str) -> Result<ModuleEntry, Control> {
+        self.load_std_module(source)
+    }
+
     #[async_recursion(?Send)]
     pub async fn exec(&self, program: &[Stmt], env: &Environment) -> Result<Flow, Control> {
         for stmt in program {

@@ -1,0 +1,13 @@
+# exit: none
+4
+[3, 5, 5, 3]
+16
+brown, fox, quick, the
+[1, 4, 9, 16]
+9
+["name", "age"]
+true
+100
+2
+50
+cannot parse 'xyz' as a number

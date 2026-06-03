@@ -12,7 +12,8 @@ use crate::lex_literals::{parse_number_text, unescape_str_body, unescape_templat
 use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
-    ClassDecl, ContinueStmt, EnumDecl, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal,
+    ClassDecl, ContinueStmt, EnumDecl, Expr, FnDecl, ForStmt, IfStmt, ImportStmt, IndexExpr,
+    LetStmt, Literal,
     MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef, ObjectExpr, ObjectField, OptMemberExpr,
     ParenExpr, RangeExpr, ReturnStmt, SourceFile, SpreadElem, Stmt, TemplateExpr, TernaryExpr,
     TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
@@ -22,7 +23,7 @@ use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{ResolveResult, Resolution};
 use crate::syntax::{parse_to_tree, resolve::resolve};
 use crate::value::Value;
-use crate::vm::chunk::{Chunk, ClassProto, FnProto};
+use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc};
 use crate::vm::opcode::Op;
 use cstree::text::TextRange;
 use std::collections::HashSet;
@@ -736,6 +737,7 @@ impl Compiler {
             Stmt::ReturnStmt(ret) => self.compile_return(ret),
             Stmt::ClassDecl(class_decl) => self.compile_class(class_decl),
             Stmt::EnumDecl(enum_decl) => self.compile_enum(enum_decl),
+            Stmt::ImportStmt(import_stmt) => self.compile_import(import_stmt),
             other => Err(CompileError::new(
                 "statement kind not yet supported in V2",
                 stmt_span(other),
@@ -1313,6 +1315,120 @@ impl Compiler {
             })?;
         u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// Compile an `import` statement. V12-T1 handles **stdlib** imports only
+    /// (`source` starts with `"std/"`). Mirrors the tree-walker's `Stmt::Import`
+    /// arm (src/interp.rs): a named list binds each named export, a `* as alias`
+    /// binds the namespace Object; an unknown / feature-disabled module errors at
+    /// run time identically (via the shared `load_std_module`). A non-`std/` (file
+    /// module) source is a documented deferral to V12-T4 — a `CompileError` here.
+    ///
+    /// Lowering: a single `IMPORT(u16)` whose operand indexes the chunk's `imports`
+    /// side table to an [`ImportDesc`] (source + named-vs-namespace + the resolver-
+    /// assigned local slot(s)). The run loop resolves the module and binds the
+    /// exports/namespace into those slots — no value is left on the stack.
+    fn compile_import(&mut self, import_stmt: &ImportStmt) -> Result<(), CompileError> {
+        use SyntaxKind::*;
+        let span = node_span(import_stmt);
+
+        // The module source string literal (`from "std/…"`), unescaped exactly as
+        // the tree-walker decodes `Tok::Str`.
+        let str_tok = import_stmt
+            .str_token()
+            .ok_or_else(|| CompileError::new("import statement missing module path", span))?;
+        let source = unescape_str_body(strip_quotes(str_tok.text()));
+
+        // V12-T1 scope: stdlib only. File-module imports need module loading
+        // (resolve a `.as`/`.aso` path, parse+compile+run it) — deferred to V12-T4.
+        if !source.starts_with("std/") {
+            return Err(CompileError::new(
+                format!("import of a file module '{source}' is not yet supported by the VM (V12-T4)"),
+                span,
+            ));
+        }
+
+        let import_range: TextRange = import_stmt.syntax().text_range();
+
+        let desc = if let Some(list) = import_stmt.import_list() {
+            // Named import: `import { a, b } from "std/x"`. Collect the imported
+            // names from the list's Ident tokens, in source order, and resolve each
+            // to its `BindingKind::Import` slot.
+            let mut names = Vec::new();
+            for tok in list
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.kind() == Ident)
+            {
+                let name = tok.text().to_string();
+                let (slot, is_cell) = self.import_slot(&name, import_range, span)?;
+                names.push((name, slot, is_cell));
+            }
+            ImportDesc::Named { source, names }
+        } else {
+            // Namespace import: `import * as alias from "std/x"`. The statement is a
+            // flat token run where `as`/`from` also lex as Idents, so the alias is
+            // the Ident immediately following the soft-keyword `as` (NOT the last
+            // Ident, which is `from`) — exactly as the resolver picks it.
+            let idents: Vec<String> = import_stmt
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.kind() == Ident)
+                .map(|t| t.text().to_string())
+                .collect();
+            let alias = idents
+                .iter()
+                .position(|t| t == "as")
+                .and_then(|p| idents.get(p + 1))
+                .ok_or_else(|| {
+                    CompileError::new("namespace import missing an alias after 'as'", span)
+                })?;
+            let (slot, is_cell) = self.import_slot(alias, import_range, span)?;
+            ImportDesc::Namespace {
+                source,
+                slot,
+                is_cell,
+            }
+        };
+
+        let idx = self.chunk.add_import(desc);
+        self.chunk.emit_u16(Op::Import, idx, span);
+        Ok(())
+    }
+
+    /// Resolve the local slot an imported name / namespace alias binds into, plus
+    /// whether that slot is a heap cell (captured). The resolver records a
+    /// `BindingKind::Import` binding per imported name whose `decl_range` is the
+    /// ENTIRE ImportStmt range (see `declare_import_bindings`); several names share
+    /// that range, so we disambiguate by NAME as well.
+    fn import_slot(
+        &self,
+        name: &str,
+        import_range: TextRange,
+        span: Span,
+    ) -> Result<(u16, bool), CompileError> {
+        use crate::syntax::resolve::types::BindingKind;
+        let binding = self
+            .resolved
+            .bindings
+            .iter()
+            .find(|b| {
+                b.decl_range == import_range
+                    && b.kind == BindingKind::Import
+                    && b.name == name
+            })
+            .ok_or_else(|| {
+                CompileError::new(
+                    format!("import '{name}' has no resolver binding (compiler bug)"),
+                    span,
+                )
+            })?;
+        let slot = u16::try_from(binding.slot)
+            .map_err(|_| CompileError::new("local slot index exceeds 65535", span))?;
+        let is_cell = self.cur_cells.contains(&binding.slot);
+        Ok((slot, is_cell))
     }
 
     /// Compile a method body (a `MethodDecl`) to its own [`FnProto`]. A method is a
@@ -4214,5 +4330,66 @@ mod tests {
         // The CLOSURE op materializes a Value::Closure; `type()` reports it as
         // "function" (exercises CLOSURE exec + the type() builtin without CALL).
         assert_eq!(eval_string("let f = (x) => x\ntype(f)").await, "function");
+    }
+
+    // ---- V12-T1: stdlib import lowering --------------------------------------
+
+    #[test]
+    fn named_stdlib_import_emits_import_op() {
+        let chunk =
+            compile_source("import { abs } from \"std/math\"\n").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(
+            text.contains("IMPORT") && text.contains("std/math"),
+            "missing IMPORT std/math in:\n{text}"
+        );
+        assert_eq!(chunk.imports.len(), 1, "one import descriptor");
+        match &chunk.imports[0] {
+            ImportDesc::Named { source, names } => {
+                assert_eq!(source, "std/math");
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].0, "abs");
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_stdlib_import_emits_import_op() {
+        let chunk =
+            compile_source("import * as math from \"std/math\"\n").expect("compiles");
+        match &chunk.imports[0] {
+            ImportDesc::Namespace { source, .. } => assert_eq!(source, "std/math"),
+            other => panic!("expected Namespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_module_import_is_deferred_compile_error() {
+        // Non-`std/` (file module) imports are deferred to V12-T4: a CompileError.
+        let err = compile_source("import { x } from \"./other.as\"\n").unwrap_err();
+        assert!(
+            err.message.contains("file module") && err.message.contains("V12-T4"),
+            "expected file-module deferral error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn named_import_binds_and_calls_stdlib() {
+        // End-to-end: import a named stdlib function and call it on the VM.
+        assert_eq!(
+            eval_number("import { abs } from \"std/math\"\nabs(-5)").await,
+            5.0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn namespace_import_member_call_works() {
+        // The namespace Object binds; `math.abs(...)` is a member read + CALL.
+        assert_eq!(
+            eval_number("import * as math from \"std/math\"\nmath.abs(-7)").await,
+            7.0
+        );
     }
 }

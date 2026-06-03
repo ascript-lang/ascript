@@ -1,0 +1,13 @@
+# exit: none
+=== process.run ===
+stdout  = hello
+
+success = true
+code    = 0
+
+=== process.spawn (streaming through cat) ===
+read 3 line(s) back from cat:
+  -> line1
+  -> line2
+  -> line3
+child exit: success=true, code=0

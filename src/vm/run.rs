@@ -1150,6 +1150,54 @@ impl Vm {
                     fiber.fresh_cell(slot);
                 }
 
+                Op::Import => {
+                    // V12-T1: stdlib `import`. Read the descriptor (cloned out of the
+                    // chunk so no chunk borrow is held), resolve the `std/*` module
+                    // via the SAME `load_std_module` the tree-walker uses, and bind
+                    // its exports / namespace Object into the recorded local slots —
+                    // byte-identical to the tree-walker's `Stmt::Import` arm. The op
+                    // leaves nothing on the stack.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let desc = fiber.frame().closure.proto.chunk.imports[idx].clone();
+                    let entry = self.interp.import_std(desc.source())?;
+                    match desc {
+                        crate::vm::chunk::ImportDesc::Named { source, names } => {
+                            for (name, slot, is_cell) in names {
+                                if !entry.exports.borrow().contains(&name) {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!("module '{source}' has no export '{name}'"),
+                                    ));
+                                }
+                                let v = entry.env.get(&name).unwrap_or(Value::Nil);
+                                if is_cell {
+                                    fiber.set_local_cell(slot as usize, v);
+                                } else {
+                                    fiber.set_local(slot as usize, v);
+                                }
+                            }
+                        }
+                        crate::vm::chunk::ImportDesc::Namespace {
+                            slot, is_cell, ..
+                        } => {
+                            let mut map = indexmap::IndexMap::new();
+                            for name in entry.exports.borrow().iter() {
+                                map.insert(
+                                    name.clone(),
+                                    entry.env.get(name).unwrap_or(Value::Nil),
+                                );
+                            }
+                            let ns = Value::Object(crate::value::ObjectCell::new(map));
+                            if is_cell {
+                                fiber.set_local_cell(slot as usize, ns);
+                            } else {
+                                fiber.set_local(slot as usize, ns);
+                            }
+                        }
+                    }
+                }
+
                 Op::CheckArrayDestructure => {
                     // Peek the RHS on TOS and validate it is an Array, exactly like
                     // the tree-walker's `Stmt::LetDestructure` type check (which runs

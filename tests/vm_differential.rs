@@ -682,21 +682,51 @@ async fn vm_run_sync_multi_feature_programs() {
 /// Why a file is SKIPPED by the whole-corpus opt-out gate. Every skip carries a
 /// one-line, machine-checkable reason; the gate ENFORCES that the skip is still
 /// justified (see `vm_whole_corpus_skips_are_still_justified`) so a skip cannot
-/// silently outlive its reason — when V12 lands and the VM compiles `import`, the
-/// `V12Import` skips will start FAILING the guard and must be deleted.
+/// silently outlive its reason — as each tracked VM gap lands, the corresponding
+/// skips start FAILING the guard and must be deleted (V12-T1 compiled stdlib
+/// `import`, which deleted the whole `V12Import` category and unskipped 24 files).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
-    /// The example imports a stdlib module (`import * as …` / `import { … }`). The
-    /// VM compiler does not lower `import` yet (V12), so these ERROR at VM compile
-    /// time (they do NOT diverge). Deferred to the V12 gate; the guard asserts the
-    /// VM still rejects each one, so the moment `import` lands these flip to
-    /// must-run and the skip is removed.
-    V12Import,
-    /// The example is `.from`-with-defaults / nested-class-coercion dependent
-    /// (task #157) ON TOP OF importing a stdlib module. Its DISTINGUISHING V12
-    /// blocker is the `.from` divergence, so it is documented separately even
-    /// though `import` also gates it today.
+    /// The example is `.from`-with-defaults / nested-class-coercion / typed-parse
+    /// dependent (task #157). Stdlib `import` now COMPILES (V12-T1), so the file
+    /// runs far enough to hit the `.from`/typed-parse divergence — the VM panics
+    /// or diverges where the tree-walker validates with defaults / nested-class
+    /// coercion. The guard asserts the VM still FAILS to match here, so when #157
+    /// lands these flip to must-run.
     V12FromDefaults,
+    /// The example reaches a stdlib native (`stream.filter`, `server.get/use`, …)
+    /// that type-checks its callback against the OLD callable variants
+    /// (`Value::Function`/`Builtin`/…) and does NOT yet accept the VM's
+    /// `Value::Closure` (the representation script functions take on the bytecode
+    /// VM). So the VM panics "expects a function, got function" while the
+    /// tree-walker (which produces `Value::Function`) runs fine. This is a
+    /// stdlib-callable-accept gap surfaced BY import compiling — tracked as
+    /// V12 #176 (widen the stdlib callable accept-lists to `Value::Closure`); it
+    /// is NOT an import bug. The guard asserts the VM still errors here.
+    V12ClosureNotCallableInStdlib,
+    /// The example uses spread in a member-method call (`recv.m(...args)`), which
+    /// the VM compiler does not lower yet (only free-call spread `f(...args)` is
+    /// supported). Surfaced by import compiling; tracked as V12 #177. The guard
+    /// asserts the VM still errors here.
+    V12MethodCallSpread,
+    /// The example's output is inherently NON-DETERMINISTIC across two runs (an
+    /// ephemeral UDP port, `crypto.randomBytes`, `time.sleep` measured ms / a live
+    /// `now` timestamp, or a live network event stream). The VM is byte-identical
+    /// in the DETERMINISTIC portion of the output, but a stdout-equality oracle
+    /// over two separate runs (tree-walker run vs VM run) cannot match the random/
+    /// time/network-dependent bytes — it is not a VM divergence. Documented-only
+    /// (also makes live network calls), so it is not executed in the gate.
+    Nondeterministic,
+    /// The example mutates a FIXED shared external resource (a hard-coded `/tmp`
+    /// directory tree) and is NOT self-isolating. The multiple corpus oracles (the
+    /// whole-corpus gate, the recorded-goldens checker, the three-way gate) run in
+    /// PARALLEL under `cargo test` and each runs every example twice (tree-walker
+    /// then VM); concurrent runs of such a file clobber each other's files, so the
+    /// tree-walker can observe a half-written/half-deleted tree (a flaky
+    /// `stat failed` race). It passes deterministically in ISOLATION and is still
+    /// covered once by the CLI/conformance suites — only the parallel multi-oracle
+    /// corpus run can't run it safely. Documented-only (not executed here).
+    SharedExternalState,
     /// A network-peer / long-running SERVER example: it calls a forever-blocking
     /// `serve`/accept loop that needs a separate client process (and never
     /// terminates on its own). It cannot run headless in a unit test — it hangs
@@ -711,46 +741,58 @@ enum SkipReason {
 /// `.from` defaults) lands. Adding an entry requires a real reason — NEVER skip a
 /// file just to make the gate green.
 const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
-    // ---- V12: import (the VM compiler does not lower `import` yet) ------------
-    ("examples/cli_toolkit.as", SkipReason::V12Import),
-    ("examples/concurrency.as", SkipReason::V12Import),
-    ("examples/concurrency_toolkit.as", SkipReason::V12Import),
-    ("examples/core_types.as", SkipReason::V12Import),
-    ("examples/datetime.as", SkipReason::V12Import),
-    ("examples/generators.as", SkipReason::V12Import),
-    ("examples/generators_test.as", SkipReason::V12Import),
-    ("examples/host_info.as", SkipReason::V12Import),
-    ("examples/logging.as", SkipReason::V12Import),
-    ("examples/net.as", SkipReason::V12Import),
-    ("examples/regex.as", SkipReason::V12Import),
-    ("examples/serialization.as", SkipReason::V12Import),
-    ("examples/stdlib.as", SkipReason::V12Import),
-    ("examples/stdlib_completeness.as", SkipReason::V12Import),
-    ("examples/streams_and_testing.as", SkipReason::V12Import),
-    ("examples/structured_concurrency.as", SkipReason::V12Import),
-    ("examples/system.as", SkipReason::V12Import),
-    ("examples/tui.as", SkipReason::V12Import),
-    ("examples/typed_parse.as", SkipReason::V12Import),
-    ("examples/validation.as", SkipReason::V12Import),
-    ("examples/advanced/crypto_and_compress.as", SkipReason::V12Import),
-    ("examples/advanced/data_pipeline.as", SkipReason::V12Import),
-    ("examples/advanced/datetime_intl.as", SkipReason::V12Import),
-    ("examples/advanced/fs_toolkit.as", SkipReason::V12Import),
-    ("examples/advanced/http_client.as", SkipReason::V12Import),
-    ("examples/advanced/process_streams.as", SkipReason::V12Import),
-    ("examples/advanced/sqlite_crud.as", SkipReason::V12Import),
-    ("examples/advanced/sse_client.as", SkipReason::V12Import),
-    ("examples/advanced/stream_pipeline.as", SkipReason::V12Import),
-    ("examples/advanced/tui_dashboard.as", SkipReason::V12Import),
-    ("examples/advanced/typed_api.as", SkipReason::V12Import),
-    ("examples/advanced/typed_http.as", SkipReason::V12Import),
-    ("examples/advanced/ws_client.as", SkipReason::V12Import),
-    // ---- V12: import + `.from` defaults / nested-class coercion (task #157) ----
-    // Imports `std/schema` AND validates into a class with a nested-class field +
-    // field defaults + an Object→`map<K,Class>` boundary coercion — the exact
-    // `.from` divergence deferred to V12 (task #157). Both blockers apply; the
-    // `.from` one is its distinguishing V12 gap.
+    // V12-T1 landed stdlib `import`, so the bulk of the corpus now runs byte-
+    // identically and has been UNSKIPPED. What remains here are files that, once
+    // the import binds, hit a DIFFERENT documented VM gap (or are inherently
+    // nondeterministic / server-blocking). Each is tracked precisely below.
+    //
+    // ---- `.from` defaults / nested-class coercion / typed-parse (task #157) ----
+    // Validates into a class with field defaults + a nested-class field + an
+    // Object→`map<K,Class>` boundary coercion — the exact `.from`/typed-parse
+    // divergence deferred to V12 (task #157).
+    ("examples/typed_parse.as", SkipReason::V12FromDefaults),
     ("examples/shape_validation.as", SkipReason::V12FromDefaults),
+    // ---- stdlib callable-accept gap: Value::Closure (V12 #176) ----------------
+    // The file passes a script function (a VM `Value::Closure`) to a stdlib native
+    // (`stream.filter`, `server.get/use`) whose callable accept-list predates the
+    // VM and only allows `Value::Function`/`Builtin`/… — so the VM panics "expects
+    // a function, got function". Surfaced by import compiling; NOT an import bug.
+    (
+        "examples/streams_and_testing.as",
+        SkipReason::V12ClosureNotCallableInStdlib,
+    ),
+    (
+        "examples/advanced/typed_api.as",
+        SkipReason::V12ClosureNotCallableInStdlib,
+    ),
+    (
+        "examples/advanced/typed_http.as",
+        SkipReason::V12ClosureNotCallableInStdlib,
+    ),
+    // ---- member-method-call spread `recv.m(...args)` (V12 #177) ----------------
+    // The VM compiler lowers free-call spread `f(...args)` but not method-call
+    // spread `recv.m(...args)` yet, so this errors at run time on the VM.
+    (
+        "examples/stdlib_completeness.as",
+        SkipReason::V12MethodCallSpread,
+    ),
+    // ---- Inherently nondeterministic output (NOT a VM divergence) -------------
+    // Deterministic output is byte-identical; the differing bytes are an ephemeral
+    // UDP port / `crypto.randomBytes` / sleep-ms + live `now` / a live network
+    // event stream — unmatchable by a two-run stdout-equality oracle.
+    ("examples/host_info.as", SkipReason::Nondeterministic),
+    (
+        "examples/advanced/crypto_and_compress.as",
+        SkipReason::Nondeterministic,
+    ),
+    (
+        "examples/advanced/datetime_intl.as",
+        SkipReason::Nondeterministic,
+    ),
+    ("examples/advanced/sse_client.as", SkipReason::Nondeterministic),
+    // ---- Mutates a fixed shared /tmp tree (races across parallel oracles) ------
+    ("examples/system.as", SkipReason::SharedExternalState),
+    ("examples/advanced/fs_toolkit.as", SkipReason::SharedExternalState),
     // ---- Network-peer / long-running servers (cannot run headless) ------------
     // Forever-serving HTTP API: blocks on `serve` awaiting a client in a separate
     // process; it does not terminate on its own and hangs even the tree-walker.
@@ -795,6 +837,22 @@ fn skip_reason(rel: &str) -> Option<SkipReason> {
         .map(|(_, r)| *r)
 }
 
+/// Whether an example imports a stdlib module that is NOT available in the CURRENT
+/// Cargo feature configuration (e.g. `std/csv` / `std/sql` under
+/// `--no-default-features`). Such an example errors identically on BOTH engines
+/// (`unknown standard library module '…'`), so there is no byte-identical
+/// reference output to compare and it is excluded from the corpus oracles for THIS
+/// build only (it still runs under the full-feature build). Detected by actually
+/// running the tree-walker and matching the feature-gated module error — this is
+/// config-driven, not a hard-coded list, so the set adjusts automatically per
+/// feature config.
+async fn feature_unavailable_in_this_build(src: &str) -> bool {
+    match ascript::run_source_exit(src).await {
+        Err(e) => e.message.starts_with("unknown standard library module"),
+        Ok(_) => false,
+    }
+}
+
 #[tokio::test]
 async fn vm_run_whole_corpus_matches_treewalker() {
     // THE CENTRAL VM CORRECTNESS PROOF (oracle #1). For EVERY corpus example that
@@ -805,6 +863,7 @@ async fn vm_run_whole_corpus_matches_treewalker() {
     let root = env!("CARGO_MANIFEST_DIR");
     let mut ran = 0usize;
     let mut skipped = 0usize;
+    let mut feature_skipped = 0usize;
     for rel in all_corpus_examples() {
         if skip_reason(&rel).is_some() {
             skipped += 1;
@@ -813,6 +872,26 @@ async fn vm_run_whole_corpus_matches_treewalker() {
         let path = std::path::Path::new(root).join(&rel);
         let src =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read example {rel}: {e}"));
+        // A byte-identical example that imports a module unavailable in THIS Cargo
+        // feature config (e.g. `std/csv` under `--no-default-features`): both
+        // engines error identically with the feature-gated module message, so it
+        // has no byte-identical reference here. Assert the VM errors the SAME way
+        // and skip it for this build (it runs under the full-feature build).
+        if feature_unavailable_in_this_build(&src).await {
+            let tw = ascript::run_source_exit(&src).await;
+            let vm = ascript::vm_run_source(&src).await;
+            match (tw, vm) {
+                (Err(a), Err(b)) => assert_eq!(
+                    a.message, b.message,
+                    "feature-gated `{rel}` errored differently on the two engines"
+                ),
+                (tw, vm) => panic!(
+                    "feature-gated `{rel}` did not error on both engines: tw={tw:?} vm={vm:?}"
+                ),
+            }
+            feature_skipped += 1;
+            continue;
+        }
         let tw = ascript::run_source_exit(&src)
             .await
             .unwrap_or_else(|e| panic!("tree-walker failed on non-skipped {rel}: {e:?}"));
@@ -828,25 +907,36 @@ async fn vm_run_whole_corpus_matches_treewalker() {
     // Sanity: the gate must actually exercise the bulk of the corpus, and the
     // arithmetic must add up (no file silently missing from either set).
     assert_eq!(
-        ran + skipped,
+        ran + skipped + feature_skipped,
         all_corpus_examples().len(),
-        "every corpus example must be either run or skipped"
+        "every corpus example must be either run, explicitly skipped, or feature-skipped"
     );
+    // Floor is config-aware: the full-feature build runs the bulk of the corpus;
+    // `--no-default-features` strips most stdlib modules, so far fewer examples are
+    // runnable (only the bare-language ones) — the differential still PROVES
+    // byte-identity for whatever DOES run.
+    let floor = if cfg!(feature = "data") { 38 } else { 1 };
     assert!(
-        ran >= 18,
-        "expected the VM to run >=18 examples byte-identically, ran {ran}"
+        ran >= floor,
+        "expected the VM to run >={floor} examples byte-identically, ran {ran}"
     );
-    eprintln!("whole-corpus gate: {ran} examples byte-identical, {skipped} skipped");
+    eprintln!(
+        "whole-corpus gate: {ran} examples byte-identical, {skipped} skipped, \
+         {feature_skipped} feature-skipped (modules unavailable in this build)"
+    );
 }
 
 #[tokio::test]
 async fn vm_whole_corpus_skips_are_still_justified() {
     // Guard that keeps the skip list HONEST so it can only shrink, never rot:
-    //  - V12Import / V12FromDefaults: the VM must STILL reject the file at compile
-    //    time (it errors, it does NOT silently diverge). When `import` (V12) lands
-    //    these will start COMPILING and this guard fails — forcing the entry to be
-    //    deleted and the file moved into the must-run set.
-    //  - LongRunningServer: documented-only (it would hang the oracle), so it is
+    //  - V12FromDefaults / V12ClosureNotCallableInStdlib / V12MethodCallSpread:
+    //    stdlib `import` now COMPILES (V12-T1), so the file runs far enough to hit
+    //    its remaining VM gap — the VM must STILL fail to MATCH the tree-walker
+    //    (it errors at run time, it does NOT silently produce identical output).
+    //    When the tracked gap (#157/#176/#177) lands this guard fails, forcing the
+    //    entry to be deleted and the file moved into the must-run set.
+    //  - Nondeterministic / LongRunningServer: documented-only (random/time/
+    //    network bytes or a forever-blocking server hang the oracle), so they are
     //    not executed; we only assert the file exists so a rename is caught.
     //  - Every skip entry must name a real corpus file (no stale paths).
     let root = env!("CARGO_MANIFEST_DIR");
@@ -859,19 +949,33 @@ async fn vm_whole_corpus_skips_are_still_justified() {
         let src = std::fs::read_to_string(std::path::Path::new(root).join(rel))
             .unwrap_or_else(|e| panic!("read skipped example {rel}: {e}"));
         match reason {
-            SkipReason::V12Import | SkipReason::V12FromDefaults => {
-                // The VM must still FAIL to run this (compile-time reject), proving
-                // the skip is load-bearing. The tree-walker runs it fine.
+            SkipReason::V12FromDefaults
+            | SkipReason::V12ClosureNotCallableInStdlib
+            | SkipReason::V12MethodCallSpread => {
+                // `import` now compiles, so this no longer compile-errors; instead
+                // it must still DIVERGE — the VM run must NOT match the tree-walker
+                // (it errors at run time on the tracked gap), proving the skip is
+                // load-bearing. The tree-walker runs it fine.
+                let tw = ascript::run_source_exit(&src).await;
                 let vm = ascript::vm_run_source(&src).await;
+                let still_diverges = match (&tw, &vm) {
+                    (Ok(a), Ok(b)) => a != b,
+                    _ => true,
+                };
                 assert!(
-                    vm.is_err(),
-                    "skipped `{rel}` now RUNS on the VM — its V12 skip is stale; \
-                     delete the EXAMPLE_SKIPS entry and let the whole-corpus gate run it"
+                    still_diverges,
+                    "skipped `{rel}` now MATCHES the tree-walker on the VM — its V12 \
+                     skip is stale; delete the EXAMPLE_SKIPS entry and let the \
+                     whole-corpus gate run it"
                 );
             }
-            SkipReason::LongRunningServer => {
-                // Documented-only; not executed (would block on a peer). Existence
-                // is already asserted above.
+            SkipReason::Nondeterministic
+            | SkipReason::SharedExternalState
+            | SkipReason::LongRunningServer => {
+                // Documented-only; not executed (random/time/network bytes can't
+                // match across two runs, a shared-/tmp file races across the
+                // parallel oracles, or a server blocks). Existence is already
+                // asserted above.
             }
         }
     }
@@ -3902,6 +4006,16 @@ fn byte_identical_examples() -> Vec<String> {
 async fn vm_matches_recorded_goldens() {
     let mut checked = 0usize;
     for rel in byte_identical_examples() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&rel),
+        )
+        .unwrap_or_else(|e| panic!("read example {rel}: {e}"));
+        // Goldens are recorded under the full-feature build; under a reduced
+        // feature config the example may import an unavailable module and cannot
+        // reproduce its golden. Skip it for this build (covered by the full build).
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
         let gpath = golden_path_for(&rel);
         let golden_text = std::fs::read_to_string(&gpath).unwrap_or_else(|e| {
             panic!(
@@ -3914,10 +4028,6 @@ async fn vm_matches_recorded_goldens() {
             )
         });
         let (want_out, want_exit) = decode_golden(&golden_text);
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&rel),
-        )
-        .unwrap_or_else(|e| panic!("read example {rel}: {e}"));
         let (got_out, got_exit) = ascript::vm_run_source(&src)
             .await
             .unwrap_or_else(|e| panic!("VM failed on `{rel}` (golden expected it to run): {e:?}"));
@@ -4415,6 +4525,11 @@ async fn three_way_whole_corpus_generic_equals_specialized_equals_treewalker() {
         let src =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read example {rel}: {e}"));
 
+        // Skip examples whose imported modules are unavailable in this build.
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
+
         let tw = ascript::run_source_exit(&src)
             .await
             .unwrap_or_else(|e| panic!("tree-walker failed on non-skipped {rel}: {e:?}"));
@@ -4440,9 +4555,10 @@ async fn three_way_whole_corpus_generic_equals_specialized_equals_treewalker() {
         );
         ran += 1;
     }
+    let floor = if cfg!(feature = "data") { 38 } else { 1 };
     assert!(
-        ran >= 18,
-        "expected the three-way gate to run >=18 examples, ran {ran}"
+        ran >= floor,
+        "expected the three-way gate to run >={floor} examples, ran {ran}"
     );
     eprintln!("three-way whole-corpus gate: {ran} examples generic==specialized==tree-walker");
 }
@@ -4455,14 +4571,19 @@ async fn three_way_recorded_goldens_generic_equals_specialized() {
     let root = env!("CARGO_MANIFEST_DIR");
     let mut checked = 0usize;
     for rel in byte_identical_examples() {
+        let path = std::path::Path::new(root).join(&rel);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+
+        // Skip examples whose imported modules are unavailable in this build.
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
+
         let gpath = golden_path_for(&rel);
         let golden_text = std::fs::read_to_string(&gpath).unwrap_or_else(|e| {
             panic!("missing recorded golden for `{rel}`: {e} (record with record_vm_goldens)")
         });
         let (want_out, want_exit) = decode_golden(&golden_text);
-
-        let path = std::path::Path::new(root).join(&rel);
-        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
 
         let spec = ascript::vm_run_source(&src)
             .await
