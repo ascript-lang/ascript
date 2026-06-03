@@ -476,6 +476,295 @@ mod tests {
         );
     }
 
+    // ──────────────────────── V13-T4 SOUNDNESS GATE ────────────────────────
+    //
+    // Prove every cycle CLASS is actually reclaimed (not merely that ONE cycle is,
+    // as `collect_reclaims_a_reference_cycle` above shows). Each test follows the
+    // same deterministic shape — `gcmodule::count_thread_tracked()` deltas, never
+    // RSS (no flakiness):
+    //
+    //   1. `super::collect()` to a clean baseline, record `before`.
+    //   2. Build N independent cycles of the class under test in a loop, keeping an
+    //      external handle to each so they stay live.
+    //   3. Assert the tracked count is ELEVATED while held (cycles are alive and
+    //      refcounting alone CANNOT free them — each cycle's internal edges keep
+    //      its `Cc` refcounts > 0). This proves the cycle is real.
+    //   4. Drop every external handle, `super::collect()`, and assert the tracked
+    //      count returns to ~`before` — i.e. it does NOT grow linearly with N
+    //      (`before + N*cycle_size`). A surviving cycle = a real soundness bug
+    //      (a missing/incorrect `Trace` impl), to be fixed in the impls above, not
+    //      here.
+    //
+    // N is large (100) so "no linear growth" is unambiguous: each cycle has ≥2
+    // tracked nodes, so a leak would leave the tail ≥ before + 200, dwarfing any
+    // small slop. We assert the post-collect count is within a tiny constant of
+    // baseline (`<= before + SLOP`) to tolerate at most incidental allocations,
+    // never N-proportional growth.
+    const N: usize = 100;
+    const SLOP: usize = 4;
+
+    /// Cycle class 1 — SELF-CYCLE (data): `let a = []; a.push(a)`, N times.
+    /// Each array's sole element is itself, so its `Cc<RefCell<Vec<Value>>>` has a
+    /// refcount-keeping self-edge; dropping the external handle leaves a dead,
+    /// unreachable 1-node cycle that only trial-deletion can reclaim. (T3 proves
+    /// ONE; this is the N-in-a-loop no-linear-growth version the gate requires.)
+    #[test]
+    fn soundness_self_cycle_no_linear_growth() {
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        let mut held = Vec::with_capacity(N);
+        for _ in 0..N {
+            let a = Value::Array(Cc::new(RefCell::new(Vec::new())));
+            if let Value::Array(arr) = &a {
+                arr.borrow_mut().push(a.clone()); // self-edge
+            }
+            held.push(a);
+        }
+        let during = gcmodule::count_thread_tracked();
+        assert!(
+            during >= before + N,
+            "N self-cycles must be live & tracked while held (before={before}, during={during})"
+        );
+
+        drop(held); // refcounting cannot reclaim: each self-edge keeps refcount ≥ 1
+        let reclaimed = super::collect();
+        let after = gcmodule::count_thread_tracked();
+        assert!(
+            reclaimed >= N,
+            "every self-cycle must be reclaimed (reclaimed={reclaimed}, N={N})"
+        );
+        assert!(
+            after <= before + SLOP,
+            "tracked count must return to baseline, not grow with N \
+             (before={before}, after={after}, N={N})"
+        );
+    }
+
+    /// Cycle class 2 — MUTUALLY-REFERENCING objects AND instances: `a.other = b;
+    /// b.other = a`, N pairs. Covers both `Value::Object` (`Cc<ObjectCell>`) and
+    /// `Value::Instance` (`Cc<RefCell<Instance>>`) since both are cycle-capable
+    /// containers with field maps that can close a 2-node cycle.
+    #[test]
+    fn soundness_mutual_objects_and_instances_no_linear_growth() {
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        // --- Objects: a ⇄ b via "other" fields. ---
+        let mut held = Vec::with_capacity(N);
+        for _ in 0..N {
+            let a = Value::Object(ObjectCell::new(IndexMap::new()));
+            let b = Value::Object(ObjectCell::new(IndexMap::new()));
+            if let (Value::Object(oa), Value::Object(ob)) = (&a, &b) {
+                oa.borrow_mut().insert("other".into(), b.clone());
+                ob.borrow_mut().insert("other".into(), a.clone());
+            }
+            held.push((a, b));
+        }
+
+        // --- Instances: two instances of a minimal class, mutually referencing. ---
+        let class = Rc::new(crate::value::Class {
+            name: "Node".into(),
+            superclass: None,
+            fields: IndexMap::new(),
+            methods: IndexMap::new(),
+            def_env: crate::env::Environment::global(),
+        });
+        let mut held_inst = Vec::with_capacity(N);
+        for _ in 0..N {
+            let mk = || {
+                Value::Instance(Cc::new(RefCell::new(Instance {
+                    class: class.clone(),
+                    fields: IndexMap::new(),
+                    shape_id: Cell::new(0),
+                })))
+            };
+            let a = mk();
+            let b = mk();
+            if let (Value::Instance(ia), Value::Instance(ib)) = (&a, &b) {
+                ia.borrow_mut().fields.insert("other".into(), b.clone());
+                ib.borrow_mut().fields.insert("other".into(), a.clone());
+            }
+            held_inst.push((a, b));
+        }
+
+        let during = gcmodule::count_thread_tracked();
+        assert!(
+            during >= before + 4 * N, // 2 objects + 2 instances per iteration
+            "N object-pairs + N instance-pairs must be live & tracked while held \
+             (before={before}, during={during})"
+        );
+
+        drop(held);
+        drop(held_inst);
+        let reclaimed = super::collect();
+        let after = gcmodule::count_thread_tracked();
+        assert!(
+            reclaimed >= 4 * N,
+            "every mutual object/instance cycle must be reclaimed \
+             (reclaimed={reclaimed}, expected≥{})",
+            4 * N
+        );
+        assert!(
+            after <= before + SLOP,
+            "tracked count must return to baseline, not grow with N \
+             (before={before}, after={after}, N={N})"
+        );
+    }
+
+    /// Cycle class 3 — MUTUALLY-CAPTURING closures: two closures `f`, `g` that each
+    /// capture the OTHER through a shared upvalue cell (`f = fn => g(); g = fn =>
+    /// f()`). The cells are `Cc<RefCell<Value>>` and each holds a `Value::Closure`
+    /// whose upvalue list points at the OTHER's cell — a closure↔cell cycle the
+    /// collector must break. Built directly over the `Cc` model because expressing
+    /// "two closures capturing each other by reference" is the VM closure shape,
+    /// not a simple source spawn we can drop a handle on deterministically.
+    #[test]
+    fn soundness_mutual_closures_no_linear_growth() {
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        let mut held = Vec::with_capacity(N);
+        for _ in 0..N {
+            // Two cells, initially Nil; each will hold a closure that captures the
+            // other cell — closure_f.upvalues = [cell_g], closure_g.upvalues =
+            // [cell_f]; cell_f holds closure_f, cell_g holds closure_g.
+            let cell_f: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::Nil));
+            let cell_g: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::Nil));
+
+            let closure_f = Value::Closure(Closure::with_upvalues(
+                anon_proto(),
+                vec![cell_g.clone()], // f captures g's cell
+            ));
+            let closure_g = Value::Closure(Closure::with_upvalues(
+                anon_proto(),
+                vec![cell_f.clone()], // g captures f's cell
+            ));
+            *cell_f.borrow_mut() = closure_f;
+            *cell_g.borrow_mut() = closure_g;
+
+            // Hold ONLY the two cells externally; the closures are reachable only
+            // through them, forming the cycle cell_f → f → cell_g → g → cell_f.
+            held.push((cell_f, cell_g));
+        }
+        let during = gcmodule::count_thread_tracked();
+        assert!(
+            during >= before + 4 * N, // 2 cells + 2 closures per iteration
+            "N closure-pairs must be live & tracked while held \
+             (before={before}, during={during})"
+        );
+
+        drop(held);
+        let reclaimed = super::collect();
+        let after = gcmodule::count_thread_tracked();
+        assert!(
+            reclaimed >= 4 * N,
+            "every mutual-closure cycle must be reclaimed \
+             (reclaimed={reclaimed}, expected≥{})",
+            4 * N
+        );
+        assert!(
+            after <= before + SLOP,
+            "tracked count must return to baseline, not grow with N \
+             (before={before}, after={after}, N={N})"
+        );
+    }
+
+    /// Cycle class 4 — FIBER ↔ FUTURE/GENERATOR loop. The handle types themselves
+    /// (`Value::Future` = `SharedFuture(Rc<…>)`, `Value::Generator` =
+    /// `Rc<GeneratorHandle>`) deliberately STAY on `Rc` and have NO-OP `Trace`
+    /// (module docs: opaque task/coroutine state that must reclaim deterministically
+    /// — they are NOT in the `Cc` collector's object space). So a cycle is NEVER
+    /// closed THROUGH the handle's `Rc` edge; what the collector CAN and MUST
+    /// reclaim is the cyclic `Cc` subgraph reachable from a fiber's live state.
+    ///
+    /// A VM-backed generator/future suspends a `Fiber` whose frame SLOTS are
+    /// `Value`s and whose captured variables are `Cc<RefCell<Value>>` upvalue cells
+    /// — the SAME cell type as a closure capture. We therefore model the faithful
+    /// loop as: a captured cell that (transitively) references a closure that
+    /// captures that very cell back — i.e. the Cc cycle that a self-recursive
+    /// fiber's captured environment forms. We build it directly in Rust (a
+    /// suspended fiber holding a self-referential capture is not something a dropped
+    /// source handle exposes deterministically), and assert the captured-environment
+    /// cycle is reclaimed once the (simulated) fiber state is dropped.
+    #[test]
+    fn soundness_fiber_capture_cycle_no_linear_growth() {
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        let mut held = Vec::with_capacity(N);
+        for _ in 0..N {
+            // A fiber's captured environment: a cell the body closes over. The
+            // closure (the fiber body) captures `env_cell`; `env_cell` holds an
+            // array that contains the closure — so the body reaches itself through
+            // its own captured environment (a self-recursive generator/future body
+            // capturing a value that references the body). cell → array → closure →
+            // cell is a pure-Cc cycle; the (Rc) handle that would sit beside it is
+            // off-graph and irrelevant to reclamation.
+            let env_cell: Cc<RefCell<Value>> = Cc::new(RefCell::new(Value::Nil));
+            let body = Value::Closure(Closure::with_upvalues(
+                anon_proto(),
+                vec![env_cell.clone()], // body captures its environment
+            ));
+            let arr = Value::Array(Cc::new(RefCell::new(vec![body])));
+            *env_cell.borrow_mut() = arr; // environment references the body's container
+            held.push(env_cell);
+        }
+        let during = gcmodule::count_thread_tracked();
+        assert!(
+            during >= before + 3 * N, // cell + array + closure per iteration
+            "N fiber-capture cycles must be live & tracked while held \
+             (before={before}, during={during})"
+        );
+
+        drop(held);
+        let reclaimed = super::collect();
+        let after = gcmodule::count_thread_tracked();
+        assert!(
+            reclaimed >= 3 * N,
+            "every fiber-capture cycle must be reclaimed \
+             (reclaimed={reclaimed}, expected≥{})",
+            3 * N
+        );
+        assert!(
+            after <= before + SLOP,
+            "tracked count must return to baseline, not grow with N \
+             (before={before}, after={after}, N={N})"
+        );
+    }
+
+    /// Acyclic control data is unaffected by collection: a plain array of numbers
+    /// (no cycle) is freed by refcounting at `drop`, BEFORE the collector runs, so
+    /// `collect()` finds nothing to reclaim and the tracked count is already back to
+    /// baseline. This guards that the soundness tests above are measuring CYCLE
+    /// reclamation specifically, not collection of ordinary garbage.
+    #[test]
+    fn soundness_acyclic_data_freed_by_refcounting_not_collection() {
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        let mut held = Vec::with_capacity(N);
+        for i in 0..N {
+            held.push(Value::Array(Cc::new(RefCell::new(vec![Value::Number(
+                i as f64,
+            )]))));
+        }
+        assert!(gcmodule::count_thread_tracked() >= before + N);
+
+        drop(held); // no cycles → refcounting frees them immediately
+        let at_drop = gcmodule::count_thread_tracked();
+        assert!(
+            at_drop <= before + SLOP,
+            "acyclic data must be freed by refcounting at drop, before any collect \
+             (before={before}, at_drop={at_drop})"
+        );
+        let reclaimed = super::collect();
+        assert_eq!(
+            reclaimed, 0,
+            "collection must find nothing to reclaim — acyclic garbage is already gone"
+        );
+    }
+
     /// `maybe_collect` is a cheap no-op below the growth threshold (it must not
     /// collect on every call — that would tank throughput / the perf gate). Below
     /// threshold it returns 0 without sweeping; `collect` always sweeps.
