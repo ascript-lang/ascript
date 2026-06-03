@@ -1334,6 +1334,36 @@ fn stepped_ranges_iterate_both_engines() {
 }
 
 #[test]
+fn stepped_class_field_default_both_engines() {
+    // RANGES FEATURE: a STEPPED range used as a class FIELD DEFAULT must
+    // materialize identically on the VM and the tree-walker. This is the path
+    // that was guarded out of the VM's `cst_default_expr` field-default lowering
+    // (the non-stepped `1..=4` default already worked byte-identically). Covers
+    // ascending, descending, and inclusive stepped defaults.
+    let cases = [
+        (
+            "class Box { vals: array<number> = 1..10 step 2 }\nlet b = Box()\nprint(b.vals)",
+            "[1, 3, 5, 7, 9]\n",
+        ),
+        (
+            "class Box { vals: array<number> = 10..1 step -2 }\nlet b = Box()\nprint(b.vals)",
+            "[10, 8, 6, 4, 2]\n",
+        ),
+        (
+            "class Box { vals: array<number> = 0..=10 step 5 }\nlet b = Box()\nprint(b.vals)",
+            "[0, 5, 10]\n",
+        ),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("fieldstep_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("fieldstep_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
 fn descending_bare_range_counts_down_both_engines() {
     // RANGES FEATURE, Phase 4: when `step` is OMITTED the direction is inferred
     // from the bounds, so a bare descending range counts DOWN (was empty). Both

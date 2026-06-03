@@ -1134,8 +1134,8 @@ impl Interp {
                 // `for (i in a..=b)` is inclusive; an optional `step k` (sign
                 // honored as direction) is resolved + validated by `resolve_step`,
                 // the SHARED source of truth with the VM and value materialization.
-                // Omitted step is ascending-only this phase (direction inference is
-                // Phase 4, so bare `lo>hi` stays empty).
+                // When `step` is omitted the direction is inferred from the bounds:
+                // a bare descending range counts DOWN (`for (i in 10..7)` → 10 9 8).
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
                 let (lo, hi) = match (start_v, end_v) {
@@ -1571,8 +1571,9 @@ impl Interp {
             // `array<number>` honoring the inclusive (`..=`) boundary and an
             // optional `step k` (sign honored as direction), via the SHARED
             // `materialize_range_stepped`/`resolve_step` so it is byte-identical to
-            // the VM and the for-range loop. Omitted step stays ascending-only this
-            // phase (direction inference is Phase 4, so bare lo>hi stays empty).
+            // the VM and the for-range loop. When `step` is omitted the direction is
+            // inferred from the bounds, so a bare descending range counts DOWN
+            // (`10..1` → [10, 9, …, 2], `10..=1` → [10, 9, …, 1]).
             ExprKind::Range {
                 start,
                 end,
@@ -2988,8 +2989,9 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Contro
 /// of those ops here is a programmer error (`unreachable!`).
 ///
 /// Materialize a range value `[lo .. hi)` (exclusive) or `[lo ..= hi]` (inclusive)
-/// into an eager `array<number>` with step 1, ascending only (so `lo > hi` yields
-/// `[]` until sequence-direction inference lands). Both bounds must be `Number`;
+/// into an eager `array<number>` with an omitted (±1) step whose DIRECTION is
+/// inferred from the bounds (so a bare `10..1` counts DOWN to `[10, 9, …, 2]`).
+/// Both bounds must be `Number`;
 /// otherwise raise the same Tier-2 `"range bounds must be numbers"` panic the
 /// tree-walker and VM emit. Shared by `apply_binop` (`Op::Range`) and the VM's
 /// `Op::RangeInclusive` so both engines are byte-identical.

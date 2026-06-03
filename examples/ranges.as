@@ -49,6 +49,17 @@ assert(arrayEq(1..10 step 100, [1]), "1..10 step 100 overshoots to a single elem
 let quarters = 0..=1 step 0.25
 assert(arrayEq(quarters, [0, 0.25, 0.5, 0.75, 1]), "0..=1 step 0.25")
 
+// --- Class FIELD DEFAULTS: a (stepped) range default materializes per-instance. -
+class Strides {
+  asc: array<number> = 1..10 step 2     // [1, 3, 5, 7, 9]
+  desc: array<number> = 10..1 step -2   // [10, 8, 6, 4, 2]
+  incl: array<number> = 0..=10 step 5   // [0, 5, 10]
+}
+let s = Strides()
+assert(arrayEq(s.asc, [1, 3, 5, 7, 9]), "field default 1..10 step 2")
+assert(arrayEq(s.desc, [10, 8, 6, 4, 2]), "field default 10..1 step -2")
+assert(arrayEq(s.incl, [0, 5, 10]), "field default 0..=10 step 5")
+
 // --- Value position: a range materializes to an `array<number>`. -------------
 let r = 0..5
 assert(len(r) == 5, "value range has length 5")

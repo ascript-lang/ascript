@@ -135,6 +135,27 @@ fn build_then_run_aso_matches_stepped_match_pattern() {
     assert_eq!(aso_code, as_code);
 }
 
+#[test]
+fn build_then_run_aso_matches_stepped_field_default() {
+    // RANGES FEATURE: a STEPPED range as a class FIELD DEFAULT lowers to
+    // `ExprKind::Range { step: Some(..) }` and must survive the `.aso` round-trip,
+    // running byte-identically to the tree-walker oracle.
+    let dir = unique_dir("fieldstep");
+    write(
+        &dir,
+        "f.as",
+        "class Box { vals: array<number> = 1..10 step 2 }\nlet b = Box()\nprint(b.vals)\n",
+    );
+    build(&dir, "f.as");
+    assert!(dir.join("f.aso").exists(), "f.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "f.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "f.as"]);
+    assert_eq!(aso_out, "[1, 3, 5, 7, 9]\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
 // ---------------------------------------------------------------------------
 // FILE-module import resolution (named + namespace)
 // ---------------------------------------------------------------------------

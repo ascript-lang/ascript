@@ -210,10 +210,11 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
 ///    authoritative legacy ast for these forms, so they cannot diverge. The slice is
 ///    padded with leading spaces up to the node's start offset so the produced spans
 ///    keep their original-file byte offsets.
-/// 3. **Rejected** (symmetric with the tree-walker): a STEPPED range (`a..b step k`)
-///    as a value default — `step` has no codegen yet (a later phase), so it is a
-///    `CompileError` in both engines. (Inclusive `..=` value defaults ARE supported:
-///    they lower to `ExprKind::Range { inclusive: true, .. }`.)
+///    A value-position range default (`a..b`, `a..=b`, or stepped `a..b step k`)
+///    lowers to `ExprKind::Range { start, end, inclusive, step }` — the SAME node
+///    the tree-walker materializes, so the inclusive boundary and the signed `step`
+///    (incl. its zero/non-finite/direction validation) behave identically in both
+///    engines.
 fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     use crate::ast::{ArrayElem, BinOp, CallArg, ExprKind, ObjEntry, UnOp};
     let span = node_span(expr);
@@ -305,8 +306,12 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 rhs: Box::new(cst_default_expr(&rhs)?),
             }
         }
-        // Value-position range `a..b` / `a..=b` → `ExprKind::Range` (the tree-walker
-        // materializes it to `array<number>`, honoring the inclusive boundary).
+        // Value-position range `a..b` / `a..=b` / `a..b step k` → `ExprKind::Range`
+        // (the tree-walker materializes it to `array<number>`, honoring the inclusive
+        // boundary and — when present — the signed `step`). `ExprKind::Range` has full
+        // step support since Phase 3 (its eval runs the shared `resolve_step` /
+        // `materialize_range_stepped`), so a stepped field default lowers to a
+        // `step: Some(..)` range and validates identically to a stepped value range.
         Expr::RangeExpr(range) => {
             let start = range
                 .start()
@@ -314,15 +319,6 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             let end = range
                 .end()
                 .ok_or_else(|| CompileError::new("range default missing end bound", span))?;
-            // PHASE-3 temporary guard — removed when value ranges learn `step`
-            // semantics. A stepped range as a value default has no codegen yet;
-            // reject it rather than silently dropping the step.
-            if range.step().is_some() {
-                return Err(CompileError::new(
-                    "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
-                    span,
-                ));
-            }
             let inclusive = match range.op() {
                 Some(SyntaxKind::DotDot) => false,
                 Some(SyntaxKind::DotDotEq) => true,
@@ -333,11 +329,18 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                     ))
                 }
             };
+            // Read the optional `step` child (the 3rd Expr child, mirroring how
+            // `compile_range` / `compile_range_pattern` read it) and lower it through
+            // the same `cst_default_expr` path as the bounds.
+            let step = match range.step() {
+                Some(step) => Some(Box::new(cst_default_expr(&step)?)),
+                None => None,
+            };
             ExprKind::Range {
                 start: Box::new(cst_default_expr(&start)?),
                 end: Box::new(cst_default_expr(&end)?),
                 inclusive,
-                step: None,
+                step,
             }
         }
         Expr::ArrayExpr(arr) => {
@@ -2409,9 +2412,12 @@ impl Compiler {
     /// exit:
     ///   patch(break_sites...)      ; each `break` lands here
     /// ```
-    /// The INCLUSIVE form `for (i in 0..=5)` uses an inclusive bound comparison
-    /// (`Op::Le` instead of `Op::Lt`); both engines iterate ascending/step-1
-    /// (direction inference is Phase 4, so lo>hi stays empty).
+    /// The pseudocode above shows the simple ascending/step-1 shape; the real
+    /// codegen seeds a RESOLVED signed step (via `Op::RangeResolveStep`) and re-tests
+    /// a direction-aware `range_has_next(idx, end, step)` each iteration, so a bare
+    /// descending range (`for (i in 10..7)` → `10 9 8`) counts DOWN and an explicit
+    /// `step` is honored. The INCLUSIVE form `for (i in 0..=5)` uses an inclusive
+    /// bound comparison; both behave byte-identically to the tree-walker.
     ///
     /// A for-of (`for (x of iterable)`, `op() == OfKw`) is lowered by
     /// [`Self::compile_for_of`] (sync snapshot iteration); `for await` async
