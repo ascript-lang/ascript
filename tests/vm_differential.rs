@@ -709,13 +709,6 @@ async fn vm_run_sync_multi_feature_programs() {
 /// `import`, which deleted the whole `V12Import` category and unskipped 24 files).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
-    /// The example is `.from`-with-defaults / nested-class-coercion / typed-parse
-    /// dependent (task #157). Stdlib `import` now COMPILES (V12-T1), so the file
-    /// runs far enough to hit the `.from`/typed-parse divergence — the VM panics
-    /// or diverges where the tree-walker validates with defaults / nested-class
-    /// coercion. The guard asserts the VM still FAILS to match here, so when #157
-    /// lands these flip to must-run.
-    V12FromDefaults,
     /// The example uses spread in a member-method call (`recv.m(...args)`), which
     /// the VM compiler does not lower yet (only free-call spread `f(...args)` is
     /// supported). Surfaced by import compiling; tracked as V12 #177. The guard
@@ -745,20 +738,6 @@ enum SkipReason {
     /// EVEN the tree-walker oracle — so it is excluded the same way the CLI/
     /// conformance suites leave the server/peer examples out of their run set.
     LongRunningServer,
-    /// A self-contained client+server example whose VM run HANGS because the
-    /// `.from`-with-defaults / typed-parse divergence (task #157) corrupts the
-    /// in-process request/response round-trip: the route's `resp.json(Class)?`
-    /// returns the wrong value on the VM, so the client gets an unexpected
-    /// response and `await serving` never completes (the server's bounded
-    /// `maxRequests` drain is never reached). The tree-walker runs it fine. This
-    /// is the SAME #157 gap as `V12FromDefaults` — but because the VM run does not
-    /// terminate (rather than cleanly erroring), it cannot be EXECUTED in the
-    /// "still diverges" guard; it is documented-only. When #157 lands, the round-
-    /// trip completes on the VM and this flips to must-run (modulo the ephemeral
-    /// port — see `Nondeterministic`). Note: V12 #176 (stdlib HOFs accept
-    /// `Value::Closure`) is ALREADY fixed, so the server's route/middleware
-    /// closures now run correctly on the VM — the only remaining blocker is #157.
-    V12FromDefaultsServerHang,
 }
 
 /// The explicit, per-file SKIP list for the whole-corpus opt-out gate. EVERY entry
@@ -773,11 +752,16 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     // nondeterministic / server-blocking). Each is tracked precisely below.
     //
     // ---- `.from` defaults / nested-class coercion / typed-parse (task #157) ----
-    // Validates into a class with field defaults + a nested-class field + an
-    // Object→`map<K,Class>` boundary coercion — the exact `.from`/typed-parse
-    // divergence deferred to V12 (task #157).
-    ("examples/typed_parse.as", SkipReason::V12FromDefaults),
-    ("examples/shape_validation.as", SkipReason::V12FromDefaults),
+    // NOW FIXED. `typed_parse.as` and `shape_validation.as` validated into classes
+    // with field defaults + nested-class fields + an Object→`map<K,Class>` boundary
+    // coercion — the `.from`/typed-parse divergence. With the VM now populating
+    // `FieldSchema.default` (lowered default expr) and `Class.def_env` (a shared
+    // module env holding the class/enum bindings), the SHARED `validate_into` runs
+    // byte-identically, so both have been UNSKIPPED into the whole-corpus gate.
+    // `advanced/typed_http.as` (a self-contained client+server whose route does a
+    // typed-parse with a defaulted field) ALSO runs byte-identically now and is
+    // UNSKIPPED — its in-process round-trip completes and the output is deterministic
+    // (it binds an ephemeral port but, unlike `typed_api.as`, never prints it).
     // ---- stdlib callable-accept gap: Value::Closure (V12 #176) — NOW FIXED -----
     // `streams_and_testing.as` was here (it passes arrow/`fn` closures to
     // `stream.filter`/`map`/`reduce`/…). With native HOFs now accepting
@@ -832,18 +816,6 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     (
         "examples/advanced/ws_server.as",
         SkipReason::LongRunningServer,
-    ),
-    // ---- VM run hangs on the #157 `.from`-defaults round-trip corruption -------
-    // `typed_http.as` is a self-contained client+server; its route validates the
-    // body with `resp.json(User)?` (a typed-parse with the field default
-    // `role: "guest"`). On the VM that typed-parse diverges (#157), so the client
-    // gets an unexpected response and `await serving` never completes — the VM run
-    // HANGS (confirmed: a 15s-capped `vm_run_source` returns Elapsed). The #176
-    // Closure fix is NOT the blocker (the route/middleware closures run); #157 is.
-    // Because it does not terminate, it is documented-only (not executed).
-    (
-        "examples/advanced/typed_http.as",
-        SkipReason::V12FromDefaultsServerHang,
     ),
 ];
 
@@ -991,7 +963,7 @@ async fn vm_whole_corpus_skips_are_still_justified() {
         let src = std::fs::read_to_string(std::path::Path::new(root).join(rel))
             .unwrap_or_else(|e| panic!("read skipped example {rel}: {e}"));
         match reason {
-            SkipReason::V12FromDefaults | SkipReason::V12MethodCallSpread => {
+            SkipReason::V12MethodCallSpread => {
                 // `import` now compiles, so this no longer compile-errors; instead
                 // it must still DIVERGE — the VM run must NOT match the tree-walker
                 // (it errors at run time on the tracked gap), proving the skip is
@@ -1011,12 +983,10 @@ async fn vm_whole_corpus_skips_are_still_justified() {
             }
             SkipReason::Nondeterministic
             | SkipReason::SharedExternalState
-            | SkipReason::LongRunningServer
-            | SkipReason::V12FromDefaultsServerHang => {
+            | SkipReason::LongRunningServer => {
                 // Documented-only; not executed (random/time/network bytes can't
                 // match across two runs, a shared-/tmp file races across the
-                // parallel oracles, or a server blocks — incl. the #157-induced
-                // round-trip hang whose VM run never terminates). Existence is
+                // parallel oracles, or a server blocks forever). Existence is
                 // already asserted above.
             }
         }
@@ -3047,6 +3017,67 @@ async fn vm_class_string_field_and_template() {
     // A string field interpolated in a template method (exercises Display + the
     // method dispatch + self field read in one program).
     let src = "class Greeter {\n  name: string\n  fn init(name) { self.name = name }\n  fn hello() { return `hi ${self.name}` }\n}\nprint(Greeter(\"Ada\").hello())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+// ---- .from defaults + nested-class coercion (V12, task #157) --------------
+//
+// `ClassName.from(obj)` is powered by the SHARED `Interp::validate_into`, which
+// reads two pieces of class state the VM compiler must populate to match the
+// tree-walker: (1) `FieldSchema.default` (the lowered default expr, applied to a
+// MISSING field) and (2) `Class.def_env` (resolves a nested-class field type
+// name + a default-expr name). These tests assert the VM `.from` path is now
+// byte-identical to the tree-walker, including the recoverable field-path panic
+// message+span via the error-parity helper.
+
+#[tokio::test]
+async fn vm_from_applies_field_default() {
+    // A missing defaulted field (`role`) is filled by the lowered default expr
+    // during `.from` (NOT via the construct-time thunk — `.from` does not run
+    // init). Must be byte-identical to the tree-walker.
+    let src = "class User {\n  id: number\n  name: string\n  role: string = \"guest\"\n}\nlet u = User.from({id: 1, name: \"Ada\"})\nprint(u.role)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_from_coerces_nested_class_field() {
+    // A nested-class field (`address: Address`) — the raw sub-object validates
+    // into an `Address` instance, which requires the field type name `Address`
+    // to resolve in the class's `def_env`.
+    let src = "class Address {\n  street: string\n  zip: number\n}\nclass User {\n  name: string\n  address: Address\n}\nlet u = User.from({name: \"Ada\", address: {street: \"1 Way\", zip: 90210}})\nprint(u.address.zip)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_from_wrong_type_panics_identically() {
+    // A wrong-typed field is a recoverable field-path contract panic — identical
+    // message + span on both engines.
+    let src = "class User {\n  id: number\n  name: string\n  role: string = \"guest\"\n}\nlet u = User.from({id: \"nope\", name: \"Ada\"})";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_from_missing_required_panics_identically() {
+    // A missing REQUIRED (non-defaulted) field — `name` defaults to nil, which
+    // violates `string`. Identical recoverable field-path panic on both engines.
+    let src = "class User {\n  id: number\n  name: string\n  role: string = \"guest\"\n}\nlet u = User.from({id: 1})";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_from_nested_class_field_violation_panics_identically() {
+    // A nested-class field whose sub-object is wrong-typed — the recursion into
+    // `Address` produces a nested field-path panic identical on both engines.
+    let src = "class Address {\n  street: string\n  zip: number\n}\nclass User {\n  name: string\n  address: Address\n}\nlet u = User.from({name: \"Ada\", address: {street: \"1 Way\", zip: \"bad\"}})";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_construct_defaulted_field_still_byte_identical() {
+    // CONSTRUCT (`ClassName(args)`) must stay byte-identical after the #157 fix:
+    // the defaulted field still applies via the construct-time thunk (a FRESH
+    // value per instance), init runs, the typed fields hold.
+    let src = "class User {\n  id: number\n  name: string\n  role: string = \"guest\"\n  fn init(id, name) { self.id = id\n self.name = name }\n}\nlet u = User(7, \"Lin\")\nprint(u.id)\nprint(u.name)\nprint(u.role)";
     assert_vm_run_matches_treewalker(src).await;
 }
 

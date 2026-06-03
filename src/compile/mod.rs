@@ -176,6 +176,171 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
     }
 }
 
+/// Lower a field-default CST expression into the runtime [`crate::ast::Expr`] the
+/// SHARED `Interp::validate_into` evaluates (`eval_expr(default, def_class.def_env)`)
+/// to fill a MISSING field at `.from`/typed-parse time.
+///
+/// The VM otherwise carries field defaults only as compiled 0-arg THUNK closures
+/// (run at CONSTRUCT time), and `Class.fields[..].default` is `None`. But
+/// `validate_into` does NOT run the thunks — it reads `FieldSchema.default` and
+/// evals it — so `compile_class` ALSO populates `default: Some(cst_default_expr(..))`
+/// for `.from` parity. (Construct keeps using the thunk, so it stays byte-identical;
+/// the two paths agree because they lower the same source default.)
+///
+/// Scope: the realistic default forms across the corpus — literals
+/// (number/string/bool/nil), array/object literals, prefix `-`/`!`, a bare
+/// identifier (`Ident`) and a member access (`a.b`), and a call (`f(args)`). These
+/// are exactly the forms `eval_expr` can run against `def_env` (which holds the
+/// module's top-level class/enum bindings, see `Vm::class_env`). A default using a
+/// form outside this set is a clear `CompileError` (rare in practice).
+fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
+    use crate::ast::{ArrayElem, CallArg, ExprKind, ObjEntry, UnOp};
+    let span = node_span(expr);
+    let kind = match expr {
+        Expr::Literal(lit) => match literal_const_value(lit)? {
+            Value::Number(n) => ExprKind::Number(n),
+            Value::Str(s) => ExprKind::Str(s.to_string()),
+            Value::Bool(b) => ExprKind::Bool(b),
+            Value::Nil => ExprKind::Nil,
+            other => {
+                return Err(CompileError::new(
+                    format!("unsupported literal default value {other:?}"),
+                    span,
+                ))
+            }
+        },
+        Expr::NameRef(name_ref) => {
+            let name = name_ref
+                .ident_token()
+                .ok_or_else(|| CompileError::new("field default identifier has no name", span))?
+                .text()
+                .to_string();
+            ExprKind::Ident(name)
+        }
+        Expr::ParenExpr(p) => {
+            let inner = p
+                .expr()
+                .ok_or_else(|| CompileError::new("parenthesized default has no inner expr", span))?;
+            ExprKind::Paren(Box::new(cst_default_expr(&inner)?))
+        }
+        Expr::UnaryExpr(un) => {
+            let op = match un.op() {
+                Some(SyntaxKind::Minus) => UnOp::Neg,
+                Some(SyntaxKind::Bang) => UnOp::Not,
+                other => {
+                    return Err(CompileError::new(
+                        format!("unsupported unary operator {other:?} in field default"),
+                        span,
+                    ))
+                }
+            };
+            let operand = un
+                .expr()
+                .ok_or_else(|| CompileError::new("unary default missing operand", span))?;
+            ExprKind::Unary {
+                op,
+                expr: Box::new(cst_default_expr(&operand)?),
+            }
+        }
+        Expr::ArrayExpr(arr) => {
+            // No spread support in a default (the corpus uses `[]`/`[lit,..]`); a
+            // spread element would be a SpreadElem child, which `arr.exprs()` skips
+            // — reject it explicitly rather than silently drop it.
+            if arr
+                .syntax()
+                .children()
+                .any(|c| c.kind() == SyntaxKind::SpreadElem)
+            {
+                return Err(CompileError::new(
+                    "spread (...) in a field default is not supported",
+                    span,
+                ));
+            }
+            let mut elems = Vec::new();
+            for el in arr.exprs() {
+                elems.push(ArrayElem::Item(cst_default_expr(&el)?));
+            }
+            ExprKind::Array(elems)
+        }
+        Expr::ObjectExpr(obj) => {
+            if obj
+                .syntax()
+                .children()
+                .any(|c| c.kind() == SyntaxKind::SpreadElem)
+            {
+                return Err(CompileError::new(
+                    "spread (...) in a field default is not supported",
+                    span,
+                ));
+            }
+            let mut entries = Vec::new();
+            for field in obj.object_fields() {
+                let fspan = node_span(&field);
+                let key = object_field_key(&field)
+                    .ok_or_else(|| CompileError::new("object-default field has no key", fspan))?;
+                let value = field
+                    .value()
+                    .ok_or_else(|| CompileError::new("object-default field has no value", fspan))?;
+                entries.push(ObjEntry::KV(key, cst_default_expr(&value)?));
+            }
+            ExprKind::Object(entries)
+        }
+        Expr::MemberExpr(m) => {
+            let object = m
+                .expr()
+                .ok_or_else(|| CompileError::new("member default missing receiver", span))?;
+            let name = m
+                .ident_token()
+                .ok_or_else(|| CompileError::new("member default missing property name", span))?
+                .text()
+                .to_string();
+            ExprKind::Member {
+                object: Box::new(cst_default_expr(&object)?),
+                name,
+            }
+        }
+        Expr::CallExpr(call) => {
+            let callee = call
+                .expr()
+                .ok_or_else(|| CompileError::new("call default missing callee", span))?;
+            if call
+                .arg_list()
+                .map(|al| {
+                    al.syntax()
+                        .children()
+                        .any(|c| c.kind() == SyntaxKind::SpreadElem)
+                })
+                .unwrap_or(false)
+            {
+                return Err(CompileError::new(
+                    "spread (...) in a field-default call is not supported",
+                    span,
+                ));
+            }
+            let mut args = Vec::new();
+            if let Some(arg_list) = call.arg_list() {
+                for a in arg_list.exprs() {
+                    args.push(CallArg::Pos(cst_default_expr(&a)?));
+                }
+            }
+            ExprKind::Call {
+                callee: Box::new(cst_default_expr(&callee)?),
+                args,
+            }
+        }
+        other => {
+            return Err(CompileError::new(
+                format!(
+                    "field-default expression form {:?} is not supported",
+                    other.syntax().kind()
+                ),
+                span,
+            ))
+        }
+    };
+    Ok(crate::ast::Expr { kind, span })
+}
+
 /// The text of the first `Ident` token directly under a CST node.
 fn cst_first_ident(node: &crate::syntax::cst::ResolvedNode) -> Option<String> {
     node.children_with_tokens()
@@ -1082,19 +1247,25 @@ impl Compiler {
             if marker_optional && !matches!(ty, crate::ast::Type::Optional(_)) {
                 ty = crate::ast::Type::Optional(Box::new(ty));
             }
+            // The CONSTRUCT path uses the compiled default THUNK (emitted below) for
+            // a fresh value per instance. The `.from`/typed-parse path instead reads
+            // `FieldSchema.default` and evals it (shared `validate_into`), so ALSO
+            // lower the default to an `ast::Expr` here (task #157). Both paths lower
+            // the same source, so they agree; construct stays byte-identical because
+            // it keeps running the thunk (it never reads `FieldSchema.default`).
             let default = field.expr();
+            let default_ast = match &default {
+                Some(d) => Some(cst_default_expr(d)?),
+                None => None,
+            };
             if default.is_some() {
                 default_fields.push(fname.clone());
             }
-            // The default Expr is NOT stored on the FieldSchema for the VM (the VM
-            // evals defaults via thunk closures); store `None` so the runtime
-            // construct path knows the schema carries the type only. The thunk is
-            // the source of truth for the value.
             field_map.insert(
                 fname,
                 crate::value::FieldSchema {
                     ty,
-                    default: None,
+                    default: default_ast,
                 },
             );
         }

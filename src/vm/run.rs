@@ -52,6 +52,18 @@ pub struct Vm {
     /// order), keyed by the class's `Rc` identity (`Rc::as_ptr`) like the method
     /// tables. Computed once per class so every instance shares the same base id.
     class_base_shapes: RefCell<HashMap<usize, u32>>,
+    /// A shared `def_env` for every VM-created class (task #157). The compiler
+    /// leaves `Class.def_env` as an inert `global_env()` placeholder because the VM
+    /// has no tree-walker Environment; but the SHARED `Interp::validate_into`
+    /// (powering `ClassName.from` / typed-parse) resolves a NESTED-class field-type
+    /// name and a default-expr name via `def_class.def_env.get(name)`. So `Op::Class`
+    /// (a) rebuilds the class with `def_env` set to this env, and (b) registers the
+    /// new class into it. The env is a single CHILD of `global_env()` shared by all
+    /// classes — mirroring the tree-walker, where every top-level class's `def_env`
+    /// is the SAME module `env` (so siblings/forward refs resolve, late-bound). The
+    /// init is deferred to first use (built lazily) so a VM that never declares a
+    /// class allocates nothing.
+    class_env: RefCell<Option<crate::env::Environment>>,
     /// **The `--no-specialize` KILL SWITCH (V11-T5).** When `true` (the default),
     /// every specialization fast path is active: the polymorphic field/method
     /// inline caches (`GET_PROP`/`SET_PROP`/`CALL_METHOD`) and the PEP-659 adaptive
@@ -92,6 +104,7 @@ impl Vm {
             class_defaults: RefCell::new(HashMap::new()),
             shapes: RefCell::new(crate::vm::shape::ShapeRegistry::new()),
             class_base_shapes: RefCell::new(HashMap::new()),
+            class_env: RefCell::new(None),
             specialize,
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
@@ -117,6 +130,15 @@ impl Vm {
     #[allow(dead_code)]
     pub fn interp(&self) -> &Rc<Interp> {
         &self.interp
+    }
+
+    /// The shared `def_env` for VM-created classes (task #157), built lazily as a
+    /// single child of `global_env()` and reused for every class. See the
+    /// `class_env` field doc for why this mirrors the tree-walker's module env.
+    fn class_env(&self) -> crate::env::Environment {
+        let mut slot = self.class_env.borrow_mut();
+        slot.get_or_insert_with(|| crate::interp::global_env().child())
+            .clone()
     }
 
     /// Drive `fiber` until it returns (or panics). V1 runs the synchronous
@@ -1774,10 +1796,17 @@ impl Vm {
                     // registered under the NEW class's identity key. Mirrors the
                     // tree-walker's `Stmt::Class`, which sets `superclass` to the
                     // resolved parent `Value::Class`.
-                    let class: Rc<crate::value::Class> = if cp.has_super {
+                    // The shared `def_env` for VM classes (task #157): the SHARED
+                    // `validate_into` (`.from`/typed-parse) resolves nested-class
+                    // field-type names and default-expr names through it, so EVERY
+                    // class gets it (not just the `extends` case). This means we
+                    // always build a FRESH `Rc<Class>` (the compiler's template had
+                    // the inert `global_env()` placeholder + no superclass).
+                    let def_env = self.class_env();
+                    let superclass = if cp.has_super {
                         let sup = fiber.pop();
-                        let superclass = match sup {
-                            Value::Class(c) => c,
+                        match sup {
+                            Value::Class(c) => Some(c),
                             other => {
                                 return Err(self.panic_at(
                                     fiber,
@@ -1785,17 +1814,27 @@ impl Vm {
                                     format!("'{other}' is not a class"),
                                 ))
                             }
-                        };
-                        Rc::new(crate::value::Class {
-                            name: cp.class.name.clone(),
-                            superclass: Some(superclass),
-                            fields: cp.class.fields.clone(),
-                            methods: cp.class.methods.clone(),
-                            def_env: cp.class.def_env.clone(),
-                        })
+                        }
                     } else {
-                        cp.class.clone()
+                        None
                     };
+                    let class: Rc<crate::value::Class> = Rc::new(crate::value::Class {
+                        name: cp.class.name.clone(),
+                        superclass,
+                        fields: cp.class.fields.clone(),
+                        methods: cp.class.methods.clone(),
+                        def_env: def_env.clone(),
+                    });
+                    // Register the class into the shared env so a sibling/forward
+                    // nested-class field type (or a default-expr name) resolves at
+                    // `.from` time — late-bound exactly like the tree-walker's module
+                    // env. A redefinition (same name re-run) overwrites the binding.
+                    if def_env
+                        .define(&class.name, Value::Class(class.clone()), false)
+                        .is_err()
+                    {
+                        let _ = def_env.assign(&class.name, Value::Class(class.clone()));
+                    }
                     let key = Rc::as_ptr(&class) as usize;
                     let mut method_map: HashMap<String, Rc<Closure>> = HashMap::new();
                     for (name, mv) in cp.method_names.iter().zip(methods) {
