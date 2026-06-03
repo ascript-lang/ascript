@@ -147,6 +147,29 @@ pub enum Op {
     /// byte-identically to the tree-walker's `Stmt::ForRange`. Leaves both operands
     /// in place so the surrounding lowering can store them into slots.
     CheckNumbers,
+    /// `RANGE_STEP_VALUE(u8 flags)` — `lo hi step -- array<number>` (step on top).
+    /// Materialize a stepped value range honoring the `step`'s sign as direction.
+    /// `flags` bit0 = inclusive (`..=`); bit1 = step PRESENT (1) vs OMITTED (0).
+    /// When omitted, `step` on the stack is an ignored placeholder and the
+    /// omitted-default (`1.0` this phase) is used. Delegates to the SHARED
+    /// `interp::materialize_range_stepped`/`resolve_step` so it is byte-identical
+    /// to the tree-walker (incl. the zero/non-finite and direction-mismatch panics).
+    RangeStepValue,
+    /// `RANGE_RESOLVE_STEP(u8 present)` — `lo hi step -- lo hi resolved_step`. The
+    /// for-range loop SETUP: peek `lo`/`hi`, take `step` (top), run the SHARED
+    /// `resolve_step` (panic on zero/non-finite/mismatch), and push the resolved
+    /// effective step back (replacing the input `step`). `present` = 1 when a `step`
+    /// expr was written, 0 when omitted (the placeholder is ignored and the
+    /// omitted-default is resolved). `lo`/`hi` must already be verified numbers
+    /// (`CHECK_NUMBERS` runs first); the panic span is the START bound's, matching
+    /// the tree-walker.
+    RangeResolveStep,
+    /// `RANGE_HAS_NEXT(u8 inclusive)` — `i hi step -- ok:bool` (step on top). The
+    /// for-range loop CONDITION: push `true` iff the loop should continue, via the
+    /// SHARED direction-aware predicate `interp::range_has_next` (positive step:
+    /// `i < hi`/`i <= hi`; negative step: `i > hi`/`i >= hi`). `inclusive` = 1 for
+    /// `..=`. Never panics (validation already happened in `RANGE_RESOLVE_STEP`).
+    RangeHasNext,
 
     // ---- control flow -----------------------------------------------------
     /// `JUMP(i16)` — unconditional relative jump.
@@ -489,6 +512,9 @@ impl Op {
             x if x == Range as u8 => Range,
             x if x == RangeInclusive as u8 => RangeInclusive,
             x if x == CheckNumbers as u8 => CheckNumbers,
+            x if x == RangeStepValue as u8 => RangeStepValue,
+            x if x == RangeResolveStep as u8 => RangeResolveStep,
+            x if x == RangeHasNext as u8 => RangeHasNext,
 
             x if x == Jump as u8 => Jump,
             x if x == JumpIfFalse as u8 => JumpIfFalse,
@@ -575,7 +601,7 @@ impl Op {
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
 
             // u8-operand ops.
-            Call | MatchRange => 1,
+            Call | MatchRange | RangeStepValue | RangeResolveStep | RangeHasNext => 1,
 
             // u16 + u8 operand op.
             // DEFINE_GLOBAL: u16 name-const index + u8 mutability flag (1 = `let`,
@@ -646,6 +672,9 @@ mod tests {
         Op::Range,
         Op::RangeInclusive,
         Op::CheckNumbers,
+        Op::RangeStepValue,
+        Op::RangeResolveStep,
+        Op::RangeHasNext,
         Op::Jump,
         Op::JumpIfFalse,
         Op::JumpIfTrue,

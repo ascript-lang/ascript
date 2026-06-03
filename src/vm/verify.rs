@@ -267,6 +267,13 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
 
         // ---- for-range bounds guard (peek-only) ----
         CheckNumbers => Effect::new(2, 2),
+        // ---- stepped ranges ----
+        // RANGE_STEP_VALUE pops lo/hi/step, pushes the materialized array.
+        RangeStepValue => Effect::new(3, 1),
+        // RANGE_RESOLVE_STEP pops lo/hi/step, pushes lo/hi/resolved_step (validates).
+        RangeResolveStep => Effect::new(3, 3),
+        // RANGE_HAS_NEXT pops i/hi/step, pushes the continue-bool.
+        RangeHasNext => Effect::new(3, 1),
 
         // ---- destructuring (peek-only guards leave src in place) ----
         CheckArrayDestructure | CheckObjectDestructure => Effect::new(1, 1),

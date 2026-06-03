@@ -62,7 +62,12 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 /// - 7: inclusive `..=` ranges — new `Op::RangeInclusive` opcode (shifts opcode
 ///   byte values) and a new `EX_RANGE` field-default expr tag (value-position
 ///   `a..b`/`a..=b` defaults serialize as `ExprKind::Range`, not `BinOp::Range`).
-pub const ASO_FORMAT_VERSION: u32 = 7;
+/// - 8: stepped ranges — three new opcodes (`RangeStepValue`/`RangeResolveStep`/
+///   `RangeHasNext`) for signed-`step` value materialization + for-range iteration
+///   (shifts opcode byte values for everything after `CheckNumbers`). The
+///   field-default `EX_RANGE` byte layout is unchanged (step still rejected in
+///   field-default position by `cst_default_expr`).
+pub const ASO_FORMAT_VERSION: u32 = 8;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.

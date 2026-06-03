@@ -2457,18 +2457,12 @@ impl Compiler {
         };
 
         // The inclusive `..=` form drives the loop with an inclusive bound
-        // comparison (`Op::Le`); exclusive `..` uses `Op::Lt` (set below).
+        // comparison; exclusive `..` is half-open. An optional `step k` (sign
+        // honored as direction) is resolved + validated at RUNTIME by the shared
+        // `resolve_step` (via `Op::RangeResolveStep`), so a computed step validates
+        // identically to the tree-walker.
         let inclusive = range.op() == Some(SyntaxKind::DotDotEq);
-
-        // PHASE-3 temporary guard — removed when step iteration is wired. The
-        // for-range loop ignores any `step` child for now, so `for (i in 1..10 step
-        // 2)` would silently run as `1..10`. Reject it loudly until then.
-        if range.step().is_some() {
-            return Err(CompileError::new(
-                "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
-                span,
-            ));
-        }
+        let step_expr = range.step();
 
         let start = range
             .start()
@@ -2487,29 +2481,52 @@ impl Compiler {
         // we re-derive `i` from the counter at the TOP of each iteration, AFTER
         // installing a fresh cell for it (per-iteration capture freshness).
         let idx_slot = self.alloc_temp()?;
+        // The resolved (validated, signed) step lives in its own scratch slot and
+        // drives both the direction-aware condition and the increment.
+        let step_slot = self.alloc_temp()?;
         // Cell slots to refresh per iteration: the loop var `i` (if captured) plus
         // any captured `let`/`fn` declared in the loop BODY.
         let refresh_slots = self.loop_refresh_slots(&body, Some(var_slot));
-        // Anchor the bounds-numbers panic at the START bound's CODE start (trivia
-        // trimmed), byte-identical to the tree-walker's `AsError::at(_, start.span)`.
+        // Anchor the bounds-numbers AND step-validation panics at the START bound's
+        // CODE start (trivia trimmed), byte-identical to the tree-walker's
+        // `AsError::at(_, start.span)`.
         let start_span = node_code_span(&start);
 
         // Evaluate start then end (start below, end on top), guard both are
         // numbers (panic anchored at the START bound's span, matching the
-        // tree-walker), then store end ONCE and seed the counter `idx = start`.
+        // tree-walker). Then push the step expr (or a placeholder `1.0` when
+        // omitted) and RANGE_RESOLVE_STEP it (validates; leaves lo/hi + resolved
+        // step on the stack). Finally store step, end, and seed `idx = start`.
         self.compile_expr(&start)?;
         self.compile_expr(&end)?;
         self.chunk.emit(Op::CheckNumbers, start_span);
+        // present = 1 when a `step` expr was written; otherwise push a `1.0`
+        // placeholder (ignored by RANGE_RESOLVE_STEP, which resolves the omitted
+        // default at runtime — identical to the tree-walker's `None` branch).
+        let present = if let Some(step) = &step_expr {
+            self.compile_expr(step)?;
+            1u8
+        } else {
+            let one = self.chunk.add_const(Value::Number(1.0));
+            self.chunk.emit_u16(Op::Const, one, span);
+            0u8
+        };
+        self.chunk
+            .emit_u8(Op::RangeResolveStep, present, start_span);
+        // Stack (top→bottom): resolved_step, hi, lo. Pop into slots.
+        self.chunk.emit_u16(Op::SetLocal, step_slot, span);
         self.chunk.emit_u16(Op::SetLocal, end_slot, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
-        // Condition: re-test `idx < end` (exclusive) or `idx <= end` (inclusive)
-        // each iteration.
+        // Condition: re-test the direction-aware `range_has_next(idx, end, step)`
+        // each iteration (positive step: idx < end / idx <= end; negative step:
+        // idx > end / idx >= end).
         let cond_start = self.chunk.code.len();
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
         self.chunk.emit_u16(Op::GetLocal, end_slot, span);
+        self.chunk.emit_u16(Op::GetLocal, step_slot, span);
         self.chunk
-            .emit(if inclusive { Op::Le } else { Op::Lt }, span);
+            .emit_u8(Op::RangeHasNext, u8::from(inclusive), span);
         let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
 
         // Top of the iteration: give the loop var (and any loop-body captured
@@ -2532,8 +2549,8 @@ impl Compiler {
         });
         self.compile_block(&body)?;
 
-        // Increment: `idx = idx + 1`. This is where every `continue` lands — at the
-        // CURRENT end of code, which is exactly what `patch_jump` targets — so
+        // Increment: `idx = idx + step`. This is where every `continue` lands — at
+        // the CURRENT end of code, which is exactly what `patch_jump` targets — so
         // patch every recorded forward `continue` site here, BEFORE emitting the
         // increment instructions. The counter is the scratch slot, NOT the
         // user-visible `i`, so body mutation of `i` cannot affect progression.
@@ -2548,8 +2565,7 @@ impl Compiler {
             self.chunk.patch_jump(site);
         }
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
-        let one = self.chunk.add_const(Value::Number(1.0));
-        self.chunk.emit_u16(Op::Const, one, span);
+        self.chunk.emit_u16(Op::GetLocal, step_slot, span);
         self.chunk.emit(Op::Add, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
@@ -3812,18 +3828,9 @@ impl Compiler {
         let end = range
             .end()
             .ok_or_else(|| CompileError::new("range expression missing end bound", span))?;
-        // PHASE-3 temporary guard — removed when value ranges learn `step` semantics.
-        // A `step` child carries no codegen yet, so a stepped value range would
-        // silently compile as `1..10` (wrong output). Reject it loudly until then.
-        if range.step().is_some() {
-            return Err(CompileError::new(
-                "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
-                span,
-            ));
-        }
-        let op = match range.op() {
-            Some(SyntaxKind::DotDot) => Op::Range,
-            Some(SyntaxKind::DotDotEq) => Op::RangeInclusive,
+        let inclusive = match range.op() {
+            Some(SyntaxKind::DotDot) => false,
+            Some(SyntaxKind::DotDotEq) => true,
             other => {
                 return Err(CompileError::new(
                     format!("range expression has unexpected operator {other:?}"),
@@ -3831,9 +3838,27 @@ impl Compiler {
                 ))
             }
         };
-        self.compile_expr(&start)?;
-        self.compile_expr(&end)?;
-        self.chunk.emit(op, span);
+        // A stepped value range materializes via RANGE_STEP_VALUE (signed step,
+        // direction + validation done at RUNTIME by the shared `resolve_step`, so a
+        // computed step validates identically). An un-stepped range keeps the
+        // simpler RANGE / RANGE_INCLUSIVE materializers (ascending/step-1).
+        if let Some(step) = range.step() {
+            self.compile_expr(&start)?;
+            self.compile_expr(&end)?;
+            self.compile_expr(&step)?;
+            // flags: bit0 = inclusive, bit1 = step PRESENT (always 1 here).
+            let flags = u8::from(inclusive) | 0b10;
+            self.chunk.emit_u8(Op::RangeStepValue, flags, span);
+        } else {
+            let op = if inclusive {
+                Op::RangeInclusive
+            } else {
+                Op::Range
+            };
+            self.compile_expr(&start)?;
+            self.compile_expr(&end)?;
+            self.chunk.emit(op, span);
+        }
         Ok(())
     }
 
@@ -4925,21 +4950,33 @@ mod tests {
     #[test]
     fn for_range_emits_check_numbers_guard_and_loop() {
         // The lowering must include the eager bounds guard (CHECK_NUMBERS), the
-        // exclusive comparison (LT), and a backward LOOP back-edge.
+        // runtime step resolution (RANGE_RESOLVE_STEP), the direction-aware
+        // condition (RANGE_HAS_NEXT), and a backward LOOP back-edge.
         let chunk = compile_source("for (i in 0..3) { print(i) }").expect("compiles");
         let text = disasm(&chunk);
         assert!(text.contains("CHECK_NUMBERS"), "no bounds guard in:\n{text}");
-        assert!(text.contains("LT"), "no exclusive comparison in:\n{text}");
+        assert!(
+            text.contains("RANGE_RESOLVE_STEP"),
+            "no step resolution in:\n{text}"
+        );
+        assert!(
+            text.contains("RANGE_HAS_NEXT"),
+            "no direction-aware condition in:\n{text}"
+        );
         assert!(text.contains("LOOP"), "no loop back-edge in:\n{text}");
     }
 
     #[test]
-    fn for_range_inclusive_uses_le_comparison() {
-        // `..=` for-range drives the loop with an inclusive bound comparison (LE),
-        // where `..` uses LT.
+    fn for_range_inclusive_uses_range_has_next() {
+        // Both `..` and `..=` for-ranges drive the loop with the direction-aware
+        // RANGE_HAS_NEXT condition (the inclusive flag is an operand of that op),
+        // not a bare LT/LE comparison.
         let chunk = compile_source("for (i in 0..=3) { print(i) }").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains(" LE"), "expected LE comparison in:\n{text}");
+        assert!(
+            text.contains("RANGE_HAS_NEXT"),
+            "expected RANGE_HAS_NEXT condition in:\n{text}"
+        );
         assert!(text.contains("LOOP"), "no loop back-edge in:\n{text}");
     }
 

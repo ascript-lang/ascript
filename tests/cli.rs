@@ -1203,39 +1203,27 @@ fn env_args_no_args_returns_empty_array() {
 }
 
 #[test]
-fn vm_rejects_stepped_for_range_loudly() {
-    // PHASE 1: `step` parses on the CST front-end but the VM has no step codegen
-    // yet, so a stepped for-range MUST fail loudly with the temporary guard error
-    // — it must NEVER silently run as the unstepped `1..10`.
+fn vm_stepped_for_range_iterates() {
+    // PHASE 3: `step` is fully wired on the VM. A stepped for-range strides by the
+    // (signed) step — never silently the unstepped `1..10`.
     let bin = env!("CARGO_BIN_EXE_ascript");
     let file = std::env::temp_dir().join("ascript_stepped_for_range.as");
     std::fs::write(&file, "for (i in 1..10 step 2) { print(i) }\n").unwrap();
     let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
     let _ = std::fs::remove_file(&file);
-    assert!(!out.status.success(), "stepped for-range must NOT succeed: {:?}", out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("stepped ranges (`step`) are not yet supported"),
-        "expected the temporary step guard error; got stderr: {stderr}"
-    );
-    // It must not have silently produced the unstepped output.
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains('1'), "stepped for-range produced output: {stdout}");
+    assert!(out.status.success(), "stepped for-range must run: {:?}", out);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n3\n5\n7\n9\n");
 }
 
 #[test]
-fn vm_rejects_stepped_value_range_loudly() {
+fn vm_stepped_value_range_materializes() {
     let bin = env!("CARGO_BIN_EXE_ascript");
     let file = std::env::temp_dir().join("ascript_stepped_value_range.as");
     std::fs::write(&file, "print(1..10 step 2)\n").unwrap();
     let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
     let _ = std::fs::remove_file(&file);
-    assert!(!out.status.success(), "stepped value range must NOT succeed: {:?}", out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("stepped ranges (`step`) are not yet supported"),
-        "expected the temporary step guard error; got stderr: {stderr}"
-    );
+    assert!(out.status.success(), "stepped value range must run: {:?}", out);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[1, 3, 5, 7, 9]\n");
 }
 
 #[test]
@@ -1323,17 +1311,46 @@ fn inclusive_match_pattern_still_works_both_engines() {
 }
 
 #[test]
-fn stepped_ranges_still_rejected_both_engines() {
-    // `step` iteration is a later phase; both engines must reject it loudly.
-    for (i, src) in [
-        "for (i in 1..10 step 2) { print(i) }",
-        "print(1..10 step 2)",
-        "print(1..=10 step 2)",
+fn stepped_ranges_iterate_both_engines() {
+    // RANGES FEATURE, Phase 3: `step` iteration evaluates on BOTH engines, sign
+    // honored as direction, byte-identical between the VM and the tree-walker.
+    let cases = [
+        ("for (i in 1..10 step 2) { print(i) }", "1\n3\n5\n7\n9\n"),
+        ("for (i in 10..1 step -2) { print(i) }", "10\n8\n6\n4\n2\n"),
+        ("print(1..=10 step 2)", "[1, 3, 5, 7, 9]\n"),
+        ("print(0..=1 step 0.25)", "[0, 0.25, 0.5, 0.75, 1]\n"),
+        // omitted-step descending STILL empty this phase (Phase 4 owns direction).
+        ("print(10..1)", "[]\n"),
+        ("print(10..=1)", "[]\n"),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("step_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("step_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn stepped_ranges_validation_panics_both_engines() {
+    // RANGES FEATURE, Phase 3: zero/non-finite step and direction mismatch are
+    // Tier-2 panics (exit 1) with byte-identical messages across engines.
+    for (i, (src, msg)) in [
+        ("for (i in 1..10 step 0) {}", "step must be a finite, non-zero number"),
+        (
+            "for (i in 1..10 step -2) {}",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+        (
+            "for (i in 10..1 step 2) {}",
+            "step 2 moves away from end (1); range can never progress",
+        ),
     ]
     .iter()
     .enumerate()
     {
-        let file = std::env::temp_dir().join(format!("ascript_step_reject_{i}.as"));
+        let file = std::env::temp_dir().join(format!("ascript_step_panic_{i}.as"));
         std::fs::write(&file, src).unwrap();
         let bin = env!("CARGO_BIN_EXE_ascript");
         for tw in [false, true] {
@@ -1345,9 +1362,15 @@ fn stepped_ranges_still_rejected_both_engines() {
             let out = cmd.arg(&file).output().unwrap();
             assert!(
                 !out.status.success(),
-                "{} should REJECT stepped range `{src}`, got {:?}",
+                "{} should PANIC on `{src}`, got {:?}",
                 if tw { "tree-walker" } else { "vm" },
                 out
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(msg),
+                "{} stderr for `{src}` should contain {msg:?}, got: {stderr}",
+                if tw { "tree-walker" } else { "vm" }
             );
         }
         let _ = std::fs::remove_file(&file);

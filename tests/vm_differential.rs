@@ -1421,28 +1421,86 @@ async fn both_engines_inclusive_range_agree() {
 }
 
 #[tokio::test]
-async fn both_engines_still_reject_step_phase2() {
-    // RANGES FEATURE, Phase 2: `step` iteration is NOT yet implemented (a later
-    // phase). To stay byte-identical, BOTH engines must REJECT stepped ranges
-    // loudly rather than silently produce wrong (step-ignored) output.
-    for src in [
-        // for-range, stepped.
-        "for (i in 1..10 step 2) { print(i) }",
-        // value range, stepped.
-        "print(1..10 step 2)",
-        // inclusive + stepped: step still rejected.
-        "print(1..=10 step 2)",
+async fn both_engines_step_iteration_agree() {
+    // RANGES FEATURE, Phase 3: `step` iteration now EVALUATES on BOTH engines, with
+    // the step's sign honored as the direction. Both engines must SUCCEED and
+    // produce byte-identical output (a real both-accept parity assertion). Omitted
+    // step stays ascending-only this phase (direction inference is Phase 4).
+    for (src, expected) in [
+        // ascending stepped for-range.
+        ("for (i in 1..10 step 2) { print(i) }", "1\n3\n5\n7\n9\n"),
+        // descending stepped for-range (negative sign drives the direction).
+        ("for (i in 10..1 step -2) { print(i) }", "10\n8\n6\n4\n2\n"),
+        // stepped value ranges (exclusive + inclusive).
+        ("print(1..10 step 2)", "[1, 3, 5, 7, 9]\n"),
+        ("print(1..=10 step 2)", "[1, 3, 5, 7, 9]\n"),
+        // float step.
+        ("print(0..=1 step 0.25)", "[0, 0.25, 0.5, 0.75, 1]\n"),
+        // overshoot simply stops.
+        ("print(1..10 step 100)", "[1]\n"),
+        // omitted-step descending STILL empty this phase (Phase 4 owns direction).
+        ("print(10..1)", "[]\n"),
+        ("print(10..=1)", "[]\n"),
     ] {
         let tw = ascript::run_source(src).await;
         let vm = ascript::vm_run_source(src).await;
-        assert!(
-            tw.is_err(),
-            "tree-walker should REJECT stepped range for `{src}`, got {tw:?}"
+        assert!(tw.is_ok(), "tree-walker should accept `{src}`, got {tw:?}");
+        assert!(vm.is_ok(), "VM should accept `{src}`, got {vm:?}");
+        assert_eq!(
+            tw.as_deref().ok(),
+            Some(expected),
+            "tree-walker output wrong for `{src}`"
         );
-        assert!(
-            vm.is_err(),
-            "VM should REJECT stepped range for `{src}`, got {vm:?}"
+        assert_eq!(
+            tw.as_deref().ok(),
+            vm.as_ref().map(|(out, _)| out.as_str()).ok(),
+            "step-iteration output diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn both_engines_step_validation_panics_agree() {
+    // RANGES FEATURE, Phase 3: a zero/non-finite step or a direction mismatch is a
+    // Tier-2 panic. BOTH engines must panic AND produce the EXACT same message
+    // (the interpolated `{step}`/`{end}` use the canonical number formatting both
+    // engines share, so the strings are byte-identical).
+    for (src, expected_msg) in [
+        ("for (i in 1..10 step 0) {}", "step must be a finite, non-zero number"),
+        (
+            "for (i in 1..10 step -2) {}",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+        (
+            "for (i in 10..1 step 2) {}",
+            "step 2 moves away from end (1); range can never progress",
+        ),
+        // value-position validation panics identically.
+        ("print(1..10 step 0)", "step must be a finite, non-zero number"),
+        (
+            "print(1..10 step -2)",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        match (tw, vm) {
+            (Err(tw_err), Err(vm_err)) => {
+                assert_eq!(
+                    tw_err.message, vm_err.message,
+                    "step-validation panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                    tw_err.message, vm_err.message
+                );
+                assert_eq!(
+                    tw_err.message, expected_msg,
+                    "unexpected message for `{src}`: {:?}",
+                    tw_err.message
+                );
+            }
+            (tw, vm) => panic!(
+                "expected BOTH engines to panic for `{src}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+            ),
+        }
     }
 }
 

@@ -519,6 +519,90 @@ impl Vm {
                     fiber.push(v);
                 }
 
+                Op::RangeStepValue => {
+                    // `lo hi step -- array<number>`. flags bit0 = inclusive,
+                    // bit1 = step PRESENT. Delegates to the SHARED stepped
+                    // materializer so direction, validation, and panic messages are
+                    // byte-identical to the tree-walker's value-position `..`/`..=`.
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at);
+                    let inclusive = (flags & 0b01) != 0;
+                    let present = (flags & 0b10) != 0;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let step = fiber.pop();
+                    let hi = fiber.pop();
+                    let lo = fiber.pop();
+                    let step_v = if present {
+                        match step {
+                            Value::Number(s) => Some(s),
+                            _ => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    "range step must be a number".to_string(),
+                                ))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let v =
+                        crate::interp::materialize_range_stepped(&lo, &hi, inclusive, step_v, span)?;
+                    fiber.push(v);
+                }
+
+                Op::RangeResolveStep => {
+                    // For-range SETUP: `lo hi step -- lo hi resolved_step`. Peek
+                    // lo/hi (already CHECK_NUMBERS-verified), take step, run the
+                    // SHARED `resolve_step` (panics on zero/non-finite/mismatch at
+                    // this op's span = the START bound's), push the resolved step.
+                    let present = fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let step = fiber.pop();
+                    // Peek lo/hi without disturbing them (they stay on the stack).
+                    let hi = match fiber.peek(0) {
+                        Value::Number(n) => *n,
+                        _ => unreachable!("RANGE_RESOLVE_STEP hi must be a number (CHECK_NUMBERS)"),
+                    };
+                    let lo = match fiber.peek(1) {
+                        Value::Number(n) => *n,
+                        _ => unreachable!("RANGE_RESOLVE_STEP lo must be a number (CHECK_NUMBERS)"),
+                    };
+                    let step_v = if present {
+                        match step {
+                            Value::Number(s) => Some(s),
+                            _ => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    "for-range step must be a number".to_string(),
+                                ))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let resolved = crate::interp::resolve_step(lo, hi, step_v, span)?;
+                    fiber.push(Value::Number(resolved));
+                }
+
+                Op::RangeHasNext => {
+                    // For-range CONDITION: `i hi step -- ok:bool`. Direction-aware
+                    // continue predicate via the SHARED `range_has_next` (positive
+                    // step: i < hi / i <= hi; negative: i > hi / i >= hi). Never
+                    // panics (validation done in RANGE_RESOLVE_STEP).
+                    let inclusive = fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
+                    let step = fiber.pop();
+                    let hi = fiber.pop();
+                    let i = fiber.pop();
+                    let ok = match (&i, &hi, &step) {
+                        (Value::Number(i), Value::Number(hi), Value::Number(step)) => {
+                            crate::interp::range_has_next(*i, *hi, *step, inclusive)
+                        }
+                        _ => unreachable!("RANGE_HAS_NEXT operands must be numbers"),
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
                 Op::Neg | Op::Not => {
                     let a = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
