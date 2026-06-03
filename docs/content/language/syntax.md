@@ -115,8 +115,9 @@ order, and is `{}` when nothing is left over.
 ?  :                     conditional (ternary)  — cond ? then : else
 =  += -= *= /=           assignment (and compound)
 ?                        postfix Result propagation (see Errors)
-..                       range (exclusive)
-..=                      inclusive range — used in match range patterns
+..                       range, exclusive endpoint (see Ranges)
+..=                      range, inclusive endpoint
+step                     range stride (contextual keyword) — a..b step k
 ```
 
 **Precedence**, highest to lowest:
@@ -165,8 +166,88 @@ for (item of [10, 20, 30]) {  // values of an array (or characters of a string)
 }
 ```
 
-`break` and `continue` work inside both loop forms. The range operator `..` is half-open and
-produces an iterable; `range(...)` (a builtin) produces an actual array when you need one.
+`break` and `continue` work inside both loop forms. `for (… in range)` iterates lazily — no
+intermediate array is built (see [Ranges](#ranges) for the full model).
+
+## Ranges
+
+A range is a **sequence of numbers**. The same model applies wherever a range appears: `for`-range,
+value position, and match patterns.
+
+```text
+1..5         exclusive endpoint  →  1, 2, 3, 4
+1..=5        inclusive endpoint  →  1, 2, 3, 4, 5
+```
+
+**Direction follows the bounds.** When `start > end` the sequence counts *down* — `..` is a
+sequence, not an ascending-only loop:
+
+```text
+5..1         →  5, 4, 3, 2
+5..=1        →  5, 4, 3, 2, 1
+5..5         →  []          (empty: start == end)
+5..=5        →  [5]         (inclusive single element)
+```
+
+### step
+
+`step k` sets the stride. `step` is a **contextual keyword** — it is only special in range position,
+so `let step = 1` and other ordinary uses still work. The step is **signed**, and its sign sets the
+direction. When `step` is omitted the direction is inferred from the bounds (`+1` ascending, `−1`
+descending).
+
+```text
+1..10 step 2     →  1, 3, 5, 7, 9
+1..=10 step 2    →  1, 3, 5, 7, 9     (10 is not on the stride)
+10..1 step -2    →  10, 8, 6, 4, 2
+10..=1 step -2   →  10, 8, 6, 4, 2
+```
+
+A `step` must be a **finite, non-zero** number, and its **sign must agree with the bounds**
+(unless `start == end`). Violations are a runtime panic at materialization:
+
+```text
+1..10 step 0     →  panic: step must be a finite, non-zero number
+10..1 step 2     →  panic: step 2 moves away from end (1); range can never progress
+1..10 step 100   →  [1]   (overshooting the end is fine — it just stops)
+```
+
+The [`ascript check`](../cli) `range-step` lint catches these statically when the bounds and step
+are constants.
+
+### Value position
+
+A range used as a value **materializes to an `array<number>`**, honoring the same model. `for`-range
+iteration stays lazy; only explicit value use allocates:
+
+```ascript
+let xs = 1..=5            // [1, 2, 3, 4, 5]
+let countdown = 5..1      // [5, 4, 3, 2]
+print(len(0..10))         // 10
+```
+
+`range(start, end, step?)` from `std/stream` is the function form of the same model.
+
+### Match patterns — strided membership
+
+A range pattern matches by membership, and a `step` makes it a **strided** test: `start..end step k`
+matches `x` when `x` is in range *and* `(x − start)` is a whole multiple of `k`. The anchor is
+`start`, so parity follows where the range begins:
+
+```ascript
+match n {
+  1..=10 step 2 => "odd in 1..10",   // 1, 3, 5, 7, 9
+  1..=10        => "even in 1..10",
+  _             => "out of range"
+}
+```
+
+### Float steps
+
+Float steps are allowed (`0..=1 step 0.25` → `0, 0.25, 0.5, 0.75, 1`). Iteration accumulates by
+repeated addition, so large float ranges drift (`0..1 step 0.1` will not land cleanly on `0.9`), and
+a float `step` in a match pattern relies on exact equality and is therefore fragile — the
+`range-step` lint flags it as an advisory.
 
 ## Functions
 

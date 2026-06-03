@@ -98,6 +98,25 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > schema: `minLength/maxLength/pattern/min/max/refine/default/optional/strict/parse` (EXCLUDES the
 > source constructors `string/number/bool/nilType/any/literal/object/array/union/oneOf/map/fromClass`).
 >
+> **Ranges + `step` (ranges-step-analyzer feature).** `..` is exclusive, `..=` inclusive, and both
+> are **sequences**: direction is inferred from the bounds (`10..1` counts DOWN). A signed `step`
+> (`a..b step k`) is allowed in for-range, value position, AND match patterns; its sign sets the
+> direction, and when omitted the direction comes from the bounds. `step` is a **CONTEXTUAL keyword**
+> (only special in range position — `let step = 1` still works; it is NOT a reserved word). A range in
+> value position **materializes to `array<number>`**; for-range stays lazy. Match-range patterns with a
+> step are **strided membership** (anchor = `start`: `x` matches iff in-bounds AND `(x−start)` is a whole
+> multiple of `k`). All validation flows through the single shared validator
+> **`interp::resolve_step(lo, hi, step, span)`** — reused by the for-range, value-range, and match-range
+> paths in `interp.rs` AND by `stream.range` (`src/stdlib/stream.rs`) — so a `step 0`/non-finite step
+> (*"step must be a finite, non-zero number"*) and a direction mismatch (`sign(step) != sign(end−start)`
+> with `start != end`: *"step <k> moves away from end (<end>); range can never progress"*) are Tier-2
+> panics that are **byte-identical across both engines**. VM side: opcodes `Op::RangeInclusive`,
+> `RangeStepValue`, `RangeResolveStep`, `RangeHasNext` (`src/vm/opcode.rs`), and `Op::MatchRange` whose
+> u8 operand is a **flags byte** (bit0 = inclusive, bit1 = step present) with stack shape
+> `subject lo hi step`. These shifts mean **`ASO_FORMAT_VERSION` is now 9** (`src/vm/aso.rs`) — bump it
+> on any opcode/serialization change. Three new `ascript check` lints ship alongside: `range-step`,
+> `invalid-propagate`, `unresolved-import` (all default Warning, configurable).
+>
 > **Object destructuring**: `let {a, b as local, "k" as v} = obj` binds by key from an `Object` or
 > `Instance` (`Stmt::LetDestructureObject`); missing keys bind `nil`. Keys are `Ident | Str` (quote
 > non-identifier keys); rename with the soft keyword `as`. A trailing `...rest` collector is active

@@ -143,6 +143,18 @@ Lint levels can be tuned per invocation (`--deny`/`--warn`/`--allow`) or via an 
 discovered by walking up from the checked file. A non-zero exit status indicates problems were
 found, which makes `ascript check` suitable for CI.
 
+Three rules cover ranges and import/propagation hygiene (all default to **Warning**, all configurable
+via `--deny`/`--warn`/`--allow` or the `[lint]` table):
+
+- **`range-step`** — a statically-detectable bad range: a `step` of `0` (or a non-finite literal), or a
+  step whose sign disagrees with the bounds so the range can never progress. It also flags a *float*
+  `step` inside a `match` pattern as unreliable (the stride test there is exact float equality).
+- **`invalid-propagate`** — a postfix `?` (Result propagation) used where it cannot apply, e.g. outside
+  a function or on an expression that is never a `[value, err]` pair.
+- **`unresolved-import`** — an `import … from "std/…"` naming a std module that does not exist (e.g. a
+  typo like `"std/maths"`). **V1 limitation:** only `std/*` specifiers are checked; relative file paths
+  (`"./mod"`, `"mod.as"`) are not yet resolved (the analysis is path-less), so they are left untouched.
+
 ## `ascript lsp`
 
 Run the language server over stdio (the LSP protocol). Point your editor's generic LSP client at

@@ -17,7 +17,8 @@
 //! Sources:
 //!
 //!   - `stream.from(x)`           — `x` is an ARRAY (index-pull) or a GENERATOR (resume-pull)
-//!   - `stream.range(start, end, step?)` — numeric, exclusive `end`, default `step` 1
+//!   - `stream.range(start, end, step?)` — numeric, exclusive `end`; an omitted `step`
+//!     infers direction from the bounds (`start < end` ascends `+1`, `start > end` descends `−1`)
 //!
 //! Lazy combinators (return a NEW stream; no work yet):
 //!
