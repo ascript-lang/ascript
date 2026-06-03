@@ -62,6 +62,33 @@ fn fn_type_is_not_a_syntax_error() {
         "no syntax-error expected for `: fn`; output: {combined}"
     );
 }
+
+#[test]
+fn match_guard_ending_in_ident_is_not_a_syntax_error() {
+    // A match guard ending in a bare identifier right before `=>` (`n if n == lim
+    // => ...`) must not be mis-parsed as an arrow, which would leave the arm body
+    // dangling and surface a `syntax-error`. Regression for the CST front-end's
+    // greedy bare-arrow parsing inside guards.
+    let p = write_tmp(
+        "guardident.as",
+        "fn d(v, lim) {\n  return match v {\n    n if n == lim => \"eq\",\n    other => \"o\",\n  }\n}\nprint(d(2, 2))\n",
+    );
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "guard ending in ident must not produce a syntax error; output: {combined}"
+    );
+    assert!(
+        !combined.contains("syntax-error"),
+        "no syntax-error expected for guard-ending-in-ident; output: {combined}"
+    );
+}
+
 #[test]
 fn syntax_error_exits_nonzero_and_reports() {
     let p = write_tmp("bad.as", "let = 1\n");

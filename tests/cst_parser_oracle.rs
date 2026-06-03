@@ -94,6 +94,12 @@ const ACCEPT: &[&str] = &[
     // `fn` is a valid type (Type::Fn): let annotation + param annotation.
     "let f: fn = x",
     "fn apply(g: fn, x) { return g(x) }",
+    // Match guard ENDING in a bare identifier before `=>` (must not be parsed as an
+    // arrow that swallows the arm's `=>`). Closes the V10 differential blind spot:
+    // guards were previously only tested ending in literals.
+    "let g1 = match v { n if n == lim => \"eq\", other => \"o\" }",
+    "let g2 = match v { n if n > 0 && n == lim => \"a\", other => \"o\" }",
+    "let g3 = match v { x if (() => true)() => 1, _ => 2 }",
 ];
 
 #[test]

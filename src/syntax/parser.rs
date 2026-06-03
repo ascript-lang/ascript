@@ -35,6 +35,14 @@ struct Parser {
     errors: Vec<ParseError>,
     /// Lexical errors surfaced by the lexer (full-token-indexed).
     lex_errors: Vec<LexError>,
+    /// When true, a top-level bare `IDENT =>` (or `async IDENT =>` / `async (…) =>`)
+    /// is NOT consumed as an arrow — the `=>` belongs to an enclosing construct
+    /// (a match arm). Set only while parsing a match GUARD; cleared whenever the
+    /// parser descends into a bracketed sub-expression so nested/parenthesized
+    /// arrows inside the guard still parse. Mirrors the legacy parser, whose
+    /// `try_arrow` is reached only at the top of `assignment()` and so never fires
+    /// on a guard operand that precedes the arm's `=>`.
+    suppress_arrow: bool,
 }
 
 /// A pending open node. `complete` sets its kind; if dropped uncompleted it
@@ -57,7 +65,15 @@ impl Parser {
             .filter(|(_, t)| !t.kind.is_trivia())
             .map(|(i, _)| i)
             .collect();
-        Parser { tokens, nontrivia, pos: 0, events: Vec::new(), errors: Vec::new(), lex_errors }
+        Parser {
+            tokens,
+            nontrivia,
+            pos: 0,
+            events: Vec::new(),
+            errors: Vec::new(),
+            lex_errors,
+            suppress_arrow: false,
+        }
     }
 
     fn current(&self) -> SyntaxKind {
@@ -216,10 +232,12 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
     if p.at(SyntaxKind::Question) && ternary_ahead(p) {
         let m = p.precede(&lhs_cm);
         p.bump(); // ?
-        expr(p); // then
+        // Ternary branches are full sub-expressions whose `=>` (if any) cannot be a
+        // match-arm separator, so arrows are allowed even inside a guard.
+        with_arrows_allowed(p, expr); // then
         if p.at(SyntaxKind::Colon) {
             p.bump();
-            expr(p); // els
+            with_arrows_allowed(p, expr); // els
         } else {
             p.error("expected ':' in ternary");
         }
@@ -549,6 +567,20 @@ fn expr(p: &mut Parser) {
     let _ = expr_returning(p);
 }
 
+/// Run `f` with top-level arrow suppression temporarily disabled, restoring the
+/// previous setting afterwards. Used wherever the parser descends into a
+/// bracketed sub-expression (parens, call args, array/object/index, template
+/// interpolation, ternary branches) so that nested/parenthesized arrows inside a
+/// match guard still parse — only the guard's OWN top level suppresses the bare
+/// `IDENT =>` form.
+fn with_arrows_allowed<R>(p: &mut Parser, f: impl FnOnce(&mut Parser) -> R) -> R {
+    let saved = p.suppress_arrow;
+    p.suppress_arrow = false;
+    let r = f(p);
+    p.suppress_arrow = saved;
+    r
+}
+
 fn expr_bp(p: &mut Parser, min_bp: u8) {
     let mut lhs = lhs(p);
     loop {
@@ -671,7 +703,7 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.bump();
             p.complete(m, Literal)
         }
-        Ident if is_bare_arrow_ahead(p) => {
+        Ident if !p.suppress_arrow && is_bare_arrow_ahead(p) => {
             // Single-parameter arrow without parentheses: `x => expr`.
             let m = p.start();
             let pm = p.start();
@@ -689,7 +721,7 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.complete(m, NameRef)
         }
         MatchKw => match_expr(p),
-        AsyncKw if is_async_arrow_ahead(p) => {
+        AsyncKw if !p.suppress_arrow && is_async_arrow_ahead(p) => {
             let m = p.start();
             p.bump(); // async
             if p.at(Ident) {
@@ -710,17 +742,19 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             let m = p.start();
             param_list(p);
             p.bump(); // =>  (guaranteed by is_arrow_ahead)
-            if p.at(LBrace) {
-                block(p);
-            } else {
-                expr(p);
-            }
+            with_arrows_allowed(p, |p| {
+                if p.at(LBrace) {
+                    block(p);
+                } else {
+                    expr(p);
+                }
+            });
             p.complete(m, ArrowExpr)
         }
         LParen => {
             let m = p.start();
             p.bump(); // (
-            expr(p);
+            with_arrows_allowed(p, expr);
             if p.at(RParen) {
                 p.bump();
             } else {
@@ -767,7 +801,7 @@ fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
             LBracket => {
                 let m = p.precede(&cm);
                 p.bump(); // [
-                expr(p);
+                with_arrows_allowed(p, expr);
                 if p.at(RBracket) {
                     p.bump();
                 } else {
@@ -865,7 +899,7 @@ fn is_async_arrow_ahead(p: &Parser) -> bool {
 fn spread_elem(p: &mut Parser) {
     let m = p.start();
     p.bump(); // ...
-    expr(p);
+    with_arrows_allowed(p, expr);
     p.complete(m, SyntaxKind::SpreadElem);
 }
 
@@ -877,7 +911,7 @@ fn array_expr(p: &mut Parser) -> CompletedMarker {
         if p.at(DotDotDot) {
             spread_elem(p);
         } else {
-            expr(p);
+            with_arrows_allowed(p, expr);
         }
         if p.at(Comma) {
             p.bump();
@@ -909,7 +943,7 @@ fn object_expr(p: &mut Parser) -> CompletedMarker {
             }
             if p.at(Colon) {
                 p.bump();
-                expr(p);
+                with_arrows_allowed(p, expr);
             } else {
                 p.error("expected ':' after object key");
             }
@@ -936,7 +970,7 @@ fn template_expr(p: &mut Parser) -> CompletedMarker {
     let m = p.start();
     p.bump(); // TemplateStart  (`...${)
     loop {
-        expr(p); // interpolated expression
+        with_arrows_allowed(p, expr); // interpolated expression
         if p.at(TemplateMiddle) {
             p.bump(); // }...${  → another interpolation follows
             continue;
@@ -1170,7 +1204,7 @@ fn arg_list(p: &mut Parser) {
         if p.at(DotDotDot) {
             spread_elem(p);
         } else {
-            expr(p);
+            with_arrows_allowed(p, expr);
         }
         if p.at(Comma) {
             p.bump();
@@ -1190,7 +1224,7 @@ fn match_expr(p: &mut Parser) -> CompletedMarker {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // match
-    expr(p); // subject
+    with_arrows_allowed(p, expr); // subject
     if p.at(LBrace) {
         p.bump();
     } else {
@@ -1230,7 +1264,14 @@ fn match_arm(p: &mut Parser) {
     if p.at(IfKw) {
         let g = p.start();
         p.bump(); // if
+        // Suppress a TOP-LEVEL bare `IDENT =>` (or `async IDENT/(…) =>`) inside the
+        // guard: a guard ending in a bare identifier (`n if n == lim => ...`) must
+        // not swallow the arm's `=>`. Parenthesized/nested arrows still parse
+        // because every bracketed descent clears the flag via `with_arrows_allowed`.
+        let saved = p.suppress_arrow;
+        p.suppress_arrow = true;
         expr(p);
+        p.suppress_arrow = saved;
         p.complete(g, MatchGuard);
     }
     if p.at(FatArrow) {
@@ -1238,7 +1279,9 @@ fn match_arm(p: &mut Parser) {
     } else {
         p.error("expected '=>' in match arm");
     }
-    expr(p); // arm body
+    // The arm body is a complete sub-expression bounded by the match braces, so a
+    // bare arrow here is fine even if this match itself sits inside an outer guard.
+    with_arrows_allowed(p, expr); // arm body
     p.complete(m, MatchArm);
 }
 
@@ -1806,6 +1849,60 @@ mod tests {
         ] {
             assert!(s.contains(&k), "missing {k:?}");
         }
+    }
+
+    #[test]
+    fn match_guard_ending_in_ident_is_not_an_arrow() {
+        // A guard ending in a bare identifier right before `=>` must NOT be parsed
+        // as an arrow; the `=>` belongs to the match arm. Regression for the V10
+        // differential blind spot (guards previously only tested ending in literals).
+        let src = r#"match v { n if n == lim => 1, _ => 2 }"#;
+        let p = parse(src);
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape(src);
+        assert!(s.contains(&SyntaxKind::MatchExpr), "no MatchExpr");
+        assert!(s.contains(&SyntaxKind::MatchGuard), "no MatchGuard");
+        assert!(
+            !s.contains(&SyntaxKind::ArrowExpr),
+            "guard was mis-parsed as an arrow: {s:?}"
+        );
+        assert!(!s.contains(&SyntaxKind::Error), "unexpected Error node: {s:?}");
+        // Both arms must have a body: the arm node count should be 2.
+        let arms = s.iter().filter(|&&k| k == SyntaxKind::MatchArm).count();
+        assert_eq!(arms, 2, "expected 2 arms, got shape {s:?}");
+    }
+
+    #[test]
+    fn match_guard_with_logical_and_ending_in_ident() {
+        // A guard with `&&`/comparison that ends in an identifier.
+        let src = r#"match v { n if n > 0 && n == lim => "a", other => "o" }"#;
+        let p = parse(src);
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape(src);
+        assert!(!s.contains(&SyntaxKind::ArrowExpr), "spurious arrow: {s:?}");
+        assert!(!s.contains(&SyntaxKind::Error), "unexpected Error: {s:?}");
+    }
+
+    #[test]
+    fn match_guard_with_parenthesized_arrow_still_parses() {
+        // Parens disambiguate: an arrow inside the guard still works.
+        let src = r#"match v { x if (() => true)() => 1, _ => 2 }"#;
+        let p = parse(src);
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape(src);
+        assert!(s.contains(&SyntaxKind::ArrowExpr), "paren arrow lost: {s:?}");
+        assert!(!s.contains(&SyntaxKind::Error), "unexpected Error: {s:?}");
+    }
+
+    #[test]
+    fn match_guard_with_call_containing_arrow_arg() {
+        // A bare arrow inside a call argument within the guard must still parse.
+        let src = r#"match v { x if f(y => y) => 1, _ => 2 }"#;
+        let p = parse(src);
+        assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
+        let s = tree_shape(src);
+        assert!(s.contains(&SyntaxKind::ArrowExpr), "arg arrow lost: {s:?}");
+        assert!(!s.contains(&SyntaxKind::Error), "unexpected Error: {s:?}");
     }
 
     #[test]

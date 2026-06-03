@@ -86,6 +86,10 @@ fn interpreter_parses_each_grammar_construct() {
         "let m6 = match a { {role: \"admin\"} => 1, {role: r, ...rest} => 2, _ => 0 }",
         "let m7 = match a { 1..=9 => \"lo\", 10..100 => \"hi\", _ => \"x\" }",
         "let m8 = match a { _ if a < 0 => \"neg\", 0 => \"z\", n if n > 0 => \"pos\" }",
+        // Guard ENDING in a bare identifier right before `=>` (must not be parsed as
+        // an arrow that swallows the `=>` / arm body):
+        "let m9 = match a { n if n == lim => \"eq\", other => \"o\" }",
+        "let m10 = match a { n if n > 0 && n == lim => \"a\", other => \"o\" }",
         // --- classes / inheritance / enums ---
         "class C extends B { fn init() { super() } }",
         "class D { fn m(x) { return x } }",

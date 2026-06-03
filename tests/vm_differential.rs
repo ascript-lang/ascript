@@ -561,6 +561,27 @@ async fn vm_destructure_type_errors_match_treewalker() {
     }
 }
 
+#[tokio::test]
+async fn vm_match_guard_ending_in_ident_matches_treewalker() {
+    // A match guard ending in a bare identifier right before `=>` (`n if n == lim
+    // => ...`) must not be parsed as an arrow that swallows the arm body. Closes
+    // the V10 differential blind spot: guards were previously only tested ending
+    // in literals. Both engines must produce byte-identical output.
+    let programs = [
+        // The exact repro from the bug report.
+        "fn d(v, lim) {\n  return match v {\n    n if n == lim => \"eq\",\n    other => \"o\",\n  }\n}\nprint(d(2, 2))\nprint(d(5, 2))",
+        // Guard with another ident-ending comparison (`x == n`).
+        "fn d(x, n) { return match x { y if y == n => \"hit\", _ => \"miss\" } }\nprint(d(3, 3))\nprint(d(3, 4))",
+        // Guard with `&&` ending in an identifier.
+        "fn d(v, lim) { return match v { n if n > 0 && n == lim => \"a\", other => \"o\" } }\nprint(d(2, 2))\nprint(d(-1, 2))",
+        // Guard containing a parenthesized arrow (parens disambiguate; must work).
+        "fn d(v) { return match v { x if (() => true)() => \"y\", _ => \"n\" } }\nprint(d(1))",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
 // ----- V2-T7: widen the differential gate -------------------------------------
 //
 // Two complementary widenings of the byte-identical gate:
