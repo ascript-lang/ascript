@@ -2997,8 +2997,10 @@ pub(crate) fn materialize_range(
 ///     away from end (`<hi>`); range can never progress"*. The `<s>`/`<hi>` are
 ///     formatted via `Value::Number` Display (`format_number`) so both engines
 ///     produce a byte-identical string.
-/// - `step_v == None`: the omitted-step default. Ascending only THIS PHASE (`1.0`);
-///   Phase 4 flips this to `if hi >= lo { 1.0 } else { -1.0 }` (sequence direction).
+/// - `step_v == None`: the omitted-step default infers direction from the bounds
+///   (sequence semantics, spec §3.1): `+1.0` when `hi >= lo`, `-1.0` when
+///   `hi < lo`. So a bare `10..1` counts down. `lo == hi` is the empty (or, for
+///   `..=`, single-element) range.
 pub(crate) fn resolve_step(
     lo: f64,
     hi: f64,
@@ -3027,8 +3029,11 @@ pub(crate) fn resolve_step(
             }
             Ok(s)
         }
-        // Phase 4 flips this to direction-from-bounds; ascending-only for now.
-        None => Ok(1.0),
+        // Omitted step: the direction is inferred from the bounds (sequence
+        // semantics, spec §3.1) — ascending `+1` when `hi >= lo`, descending
+        // `-1` when `hi < lo`. `lo == hi` takes the `+1` branch and yields the
+        // empty (or single-element, when inclusive) range, which is correct.
+        None => Ok(if hi >= lo { 1.0 } else { -1.0 }),
     }
 }
 

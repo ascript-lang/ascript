@@ -1222,7 +1222,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let span = Span::new(left.span.start, right.span.end);
+        // The span runs through the END of the `step` clause when present, so a
+        // panic on a stepped VALUE range (`1..10 step 0`) underlines the whole
+        // `1..10 step 0` — byte-identical to the VM's caret (the CST front-end
+        // already spans the step). Without a step it ends at the range bound.
+        let end_off = step.as_ref().map_or(right.span.end, |s| s.span.end);
+        let span = Span::new(left.span.start, end_off);
         Ok(Expr {
             kind: ExprKind::Range {
                 start: Box::new(left),

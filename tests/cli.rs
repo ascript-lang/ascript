@@ -1267,12 +1267,13 @@ fn run_range_src(src: &str, tree_walker: bool, tag: &str) -> String {
 fn inclusive_range_iteration_and_value_both_engines() {
     // The four target cases must be byte-identical on the default VM AND the
     // tree-walker: inclusive for-range, inclusive value materialization, the
-    // single-element `5..=5`, and the (ascending-only this phase) empty `10..=1`.
+    // single-element `5..=5`, and (Phase 4) the descending inclusive `10..=1`
+    // counting down.
     let cases = [
         ("for (i in 1..=4) { print(i) }", "1\n2\n3\n4\n"),
         ("print(1..=5)", "[1, 2, 3, 4, 5]\n"),
         ("print(5..=5)", "[5]\n"),
-        ("print(10..=1)", "[]\n"),
+        ("print(10..=1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]\n"),
     ];
     for (i, (src, expected)) in cases.iter().enumerate() {
         let vm = run_range_src(src, false, &format!("vm_{i}"));
@@ -1319,13 +1320,41 @@ fn stepped_ranges_iterate_both_engines() {
         ("for (i in 10..1 step -2) { print(i) }", "10\n8\n6\n4\n2\n"),
         ("print(1..=10 step 2)", "[1, 3, 5, 7, 9]\n"),
         ("print(0..=1 step 0.25)", "[0, 0.25, 0.5, 0.75, 1]\n"),
-        // omitted-step descending STILL empty this phase (Phase 4 owns direction).
-        ("print(10..1)", "[]\n"),
-        ("print(10..=1)", "[]\n"),
+        // omitted-step descending: present-step rows above are unaffected by
+        // Phase 4 (which only changes the OMITTED-step default direction).
+        ("print(10..1 step -2)", "[10, 8, 6, 4, 2]\n"),
     ];
     for (i, (src, expected)) in cases.iter().enumerate() {
         let vm = run_range_src(src, false, &format!("step_vm_{i}"));
         let tw = run_range_src(src, true, &format!("step_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn descending_bare_range_counts_down_both_engines() {
+    // RANGES FEATURE, Phase 4: when `step` is OMITTED the direction is inferred
+    // from the bounds, so a bare descending range counts DOWN (was empty). Both
+    // engines must agree byte-for-byte. Empty/single-element and ascending cases
+    // are pinned as regression guards alongside.
+    let cases = [
+        // descending bare ranges now count down (THE Phase 4 behavior change).
+        ("for (i in 5..1) { print(i) }", "5\n4\n3\n2\n"),
+        ("for (i in 5..=1) { print(i) }", "5\n4\n3\n2\n1\n"),
+        ("print(10..1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2]\n"),
+        ("print(10..=1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]\n"),
+        // UNCHANGED: ascending bare ranges.
+        ("print(1..5)", "[1, 2, 3, 4]\n"),
+        ("print(1..=5)", "[1, 2, 3, 4, 5]\n"),
+        // UNCHANGED: equal bounds are empty (exclusive) / single (inclusive).
+        ("print(5..5)", "[]\n"),
+        ("print(5..=5)", "[5]\n"),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("down_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("down_tw_{i}"));
         assert_eq!(vm, *expected, "VM output wrong for `{src}`");
         assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
         assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
@@ -1375,4 +1404,82 @@ fn stepped_ranges_validation_panics_both_engines() {
         }
         let _ = std::fs::remove_file(&file);
     }
+}
+
+/// Strip ANSI SGR escape sequences so the rendered ariadne caret can be compared
+/// as plain text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip until the terminating 'm' of the SGR sequence.
+            for d in chars.by_ref() {
+                if d == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[test]
+fn stepped_value_range_panic_underlines_step_clause_both_engines() {
+    // Cleanup A: the legacy parser's `ExprKind::Range` span now covers through
+    // the END of the `step` clause, so a panic on a stepped VALUE range
+    // underlines the whole `1..10 step 0` on BOTH engines (previously the
+    // tree-walker underlined only `1..10`). The ariadne caret must:
+    //   (a) include the `step 0` text in the underlined region, and
+    //   (b) be byte-identical between the VM and the tree-walker (modulo the
+    //       file-path header line, which can differ by a `/private` symlink).
+    let src = "print(1..10 step 0)";
+    let file = std::env::temp_dir().join("ascript_step_span.as");
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    let render = |tw: bool| -> String {
+        let mut cmd = Command::new(bin);
+        cmd.arg("run");
+        if tw {
+            cmd.arg("--tree-walker");
+        }
+        let out = cmd.arg(&file).output().unwrap();
+        assert!(!out.status.success(), "should panic ({tw})");
+        // Drop the `╭─[ <path>:1:7 ]` header line (path differs by /private);
+        // keep the source + caret rows, which carry the span.
+        strip_ansi(&String::from_utf8_lossy(&out.stderr))
+            .lines()
+            .filter(|l| !l.contains(".as:"))
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let vm = render(false);
+    let tw = render(true);
+    let _ = std::fs::remove_file(&file);
+
+    // (a) the caret region reaches the `step 0` clause: the underline row (the
+    // one with the `┬` tick) must be at least as wide as the start column of
+    // `step` (the legacy bug truncated it at `1..10`, before `step`).
+    let underline = vm
+        .lines()
+        .find(|l| l.contains('┬'))
+        .expect("expected a caret/underline row");
+    // `1..10 step 0` starts at col 7 (1-based); the `step` keyword begins 6
+    // chars later. The full clause is 12 chars wide. Count the run of `─`/`┬`.
+    let span_width = underline.chars().filter(|&c| c == '─' || c == '┬').count();
+    assert!(
+        span_width >= 12,
+        "underline should span the full `1..10 step 0` (>=12), got {span_width} in:\n{vm}"
+    );
+
+    // (b) byte-identical carets across engines (this is the real divergence fix).
+    assert_eq!(
+        vm, tw,
+        "VM and tree-walker rendered different carets:\n--- vm ---\n{vm}\n--- tw ---\n{tw}"
+    );
 }

@@ -1386,10 +1386,11 @@ async fn vm_for_range_bounds_error_matches_treewalker() {
 
 #[tokio::test]
 async fn both_engines_inclusive_range_agree() {
-    // RANGES FEATURE, Phase 2: inclusive `..=` ranges now EVALUATE on BOTH engines
-    // in for-range and value position, ascending/step-1 (direction inference is a
-    // later phase, so `lo > hi` stays empty). Both engines must SUCCEED and produce
-    // byte-identical output — a real both-accept parity assertion.
+    // RANGES FEATURE, Phase 2 (+ Phase 4 direction): inclusive `..=` ranges
+    // EVALUATE on BOTH engines in for-range and value position; with `step`
+    // omitted the direction is inferred from the bounds, so `lo > hi` counts
+    // down. Both engines must SUCCEED and produce byte-identical output — a real
+    // both-accept parity assertion.
     for (src, expected) in [
         // for-range, inclusive: 1,2,3,4,5.
         ("for (i in 1..=5) { print(i) }", "1\n2\n3\n4\n5\n"),
@@ -1398,8 +1399,8 @@ async fn both_engines_inclusive_range_agree() {
         // single-element inclusive (`5..=5` → `[5]`; cf. exclusive `5..5` → `[]`).
         ("print(5..=5)", "[5]\n"),
         ("print(5..5)", "[]\n"),
-        // ascending-only this phase: descending inclusive stays empty.
-        ("print(10..=1)", "[]\n"),
+        // Phase 4: descending inclusive counts down (direction inferred).
+        ("print(10..=1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]\n"),
         // exclusive `..` is unchanged.
         ("print(1..5)", "[1, 2, 3, 4]\n"),
     ] {
@@ -1438,9 +1439,9 @@ async fn both_engines_step_iteration_agree() {
         ("print(0..=1 step 0.25)", "[0, 0.25, 0.5, 0.75, 1]\n"),
         // overshoot simply stops.
         ("print(1..10 step 100)", "[1]\n"),
-        // omitted-step descending STILL empty this phase (Phase 4 owns direction).
-        ("print(10..1)", "[]\n"),
-        ("print(10..=1)", "[]\n"),
+        // Phase 4: omitted-step descending counts down (direction inferred).
+        ("print(10..1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2]\n"),
+        ("print(10..=1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]\n"),
     ] {
         let tw = ascript::run_source(src).await;
         let vm = ascript::vm_run_source(src).await;
@@ -1455,6 +1456,43 @@ async fn both_engines_step_iteration_agree() {
             tw.as_deref().ok(),
             vm.as_ref().map(|(out, _)| out.as_str()).ok(),
             "step-iteration output diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn both_engines_descending_bare_range_counts_down() {
+    // RANGES FEATURE, Phase 4: the ONE changed existing behavior. With `step`
+    // OMITTED the direction is inferred from the bounds, so a bare descending
+    // range counts DOWN (was empty). Asserted byte-identical across engines, in
+    // both for-range (lazy) and value (materialized) position, with the §3.5
+    // truth-table guards (ascending unchanged, equal bounds empty/single).
+    for (src, expected) in [
+        // descending bare ranges count down (THE behavior change).
+        ("for (i in 5..1) { print(i) }", "5\n4\n3\n2\n"),
+        ("for (i in 5..=1) { print(i) }", "5\n4\n3\n2\n1\n"),
+        ("print(10..1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2]\n"),
+        ("print(10..=1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]\n"),
+        // UNCHANGED: ascending bare ranges.
+        ("print(1..5)", "[1, 2, 3, 4]\n"),
+        ("print(1..=5)", "[1, 2, 3, 4, 5]\n"),
+        // UNCHANGED: equal bounds.
+        ("print(5..5)", "[]\n"),
+        ("print(5..=5)", "[5]\n"),
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        assert!(tw.is_ok(), "tree-walker should accept `{src}`, got {tw:?}");
+        assert!(vm.is_ok(), "VM should accept `{src}`, got {vm:?}");
+        assert_eq!(
+            tw.as_deref().ok(),
+            Some(expected),
+            "tree-walker output wrong for `{src}`"
+        );
+        assert_eq!(
+            tw.as_deref().ok(),
+            vm.as_ref().map(|(out, _)| out.as_str()).ok(),
+            "count-down output diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
         );
     }
 }

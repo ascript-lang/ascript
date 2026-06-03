@@ -694,9 +694,9 @@ fn write_pattern(out: &mut String, pat: &Pattern) {
             inclusive,
             step,
         } => {
-            // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9). The
-            // parser does not yet set `step`, so today this renders no step; the
-            // render below is forward-compatible.
+            // Renders the inclusive boundary (`..=`) and the optional `step`
+            // clause, both of which the parser now populates (a `step`-less
+            // pattern simply leaves `step` `None`).
             write_expr(out, start, PREC_ASSIGN);
             out.push_str(if *inclusive { "..=" } else { ".." });
             write_expr(out, end, PREC_ASSIGN);
