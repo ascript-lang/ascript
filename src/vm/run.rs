@@ -2096,12 +2096,18 @@ impl Vm {
                                 // `validate_into` (`.from`/typed-parse) resolves the
                                 // same binding the construct-time thunk closes over.
                                 // The construct path still runs the thunk unchanged.
+                                // Mirror as MUTABLE so a default that ASSIGNS to a
+                                // captured name (`x: number = (g = 5)`) evaluates on
+                                // the `.from` path exactly as the tree-walker does
+                                // against its real `def_env` chain (where the captured
+                                // `let` keeps its declared mutability). For the common
+                                // read-only default the mutability flag is irrelevant.
                                 if let Some(caps) = cp.default_captures.get(i) {
                                     for (cap_name, up_idx) in caps {
                                         if let Some(cell) = c.upvalues.get(*up_idx as usize) {
                                             let val = cell.borrow().clone();
                                             if def_env
-                                                .define(cap_name, val.clone(), false)
+                                                .define(cap_name, val.clone(), true)
                                                 .is_err()
                                             {
                                                 let _ = def_env.assign(cap_name, val);

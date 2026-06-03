@@ -2986,6 +2986,129 @@ async fn vm_class_field_defaults_apply() {
     assert_vm_run_matches_treewalker(src).await;
 }
 
+/// Build a class whose single field `x: <ty>` has the computed `default` source,
+/// then exercise it through BOTH the construct path (`C()`) and the `.from` path
+/// (`C.from({})`), asserting the VM's stdout matches the tree-walker byte-for-byte.
+/// `prelude` declares any module-scope names the default references (e.g. a const).
+///
+/// This is the cst_default_expr-completeness oracle: a computed field default must
+/// evaluate identically on the VM (whose `.from`/typed-parse path reads the lowered
+/// `ast::Expr`, and whose construct path runs the compiled thunk) and the
+/// tree-walker (which shares `validate_into`). Before the lowering was completed, a
+/// non-trivial default form failed `compile_source` itself, breaking BOTH paths.
+async fn assert_field_default_matches(prelude: &str, ty: &str, default: &str, print_expr: &str) {
+    // Construct path: `C().<print_expr>`.
+    let construct = format!(
+        "{prelude}\nclass C {{ x: {ty} = {default}\n  fn init() {{}} }}\nprint(C().{print_expr})"
+    );
+    assert_vm_run_matches_treewalker(&construct).await;
+    // `.from` path: `C.from({{}}).<print_expr>` (the missing field falls back to the
+    // default, which `validate_into` evaluates from the lowered `ast::Expr`).
+    let from = format!(
+        "{prelude}\nclass C {{ x: {ty} = {default}\n  fn init() {{}} }}\nprint(C.from({{}}).{print_expr})"
+    );
+    assert_vm_run_matches_treewalker(&from).await;
+}
+
+#[tokio::test]
+async fn vm_field_default_binary_arithmetic() {
+    // `= A + B` and `= n * 2` — binary arithmetic defaults (the reviewer's category).
+    assert_field_default_matches("", "number", "10 + 5", "x").await;
+    assert_field_default_matches("let n = 7", "number", "n * 2", "x").await;
+    assert_field_default_matches("", "number", "2 ** 3 % 5", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_string_concat() {
+    // `= PREFIX + "x"` — the exact divergence the reviewer reported.
+    assert_field_default_matches("let PREFIX = \"pre\"", "string", "PREFIX + \"x\"", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_comparison_and_equality() {
+    assert_field_default_matches("let n = 3", "bool", "n > 0", "x").await;
+    assert_field_default_matches("let n = 3", "bool", "n == 3", "x").await;
+    assert_field_default_matches("let n = 3", "bool", "n != 4", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_logical_and_nullish() {
+    assert_field_default_matches("let a = true\nlet b = \"y\"", "any", "a && b", "x").await;
+    assert_field_default_matches("let a = false\nlet b = \"y\"", "any", "a || b", "x").await;
+    assert_field_default_matches("", "any", "nil ?? \"d\"", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_index() {
+    // `= arr[0]` — index read default.
+    assert_field_default_matches("let arr = [10, 20, 30]", "number", "arr[1]", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_ternary() {
+    // `= cond ? a : b` — ternary default (lazy branches).
+    assert_field_default_matches("let on = true", "number", "on ? 1 : 2", "x").await;
+    assert_field_default_matches("let on = false", "number", "on ? 1 : 2", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_template() {
+    // Template default with an interpolated module const and a nested expression.
+    assert_field_default_matches("let n = 5", "string", "`n=${n}!`", "x").await;
+    assert_field_default_matches("let xs = [1, 2]", "string", "`v=${xs[0] + 10}`", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_range_exclusive() {
+    // `= a..b` — exclusive range default (eager `array<number>`).
+    assert_field_default_matches("", "array<number>", "1..4", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_optmember_try_unwrap_await() {
+    // Optional-member, `?` propagate, `!` unwrap, and `await` defaults.
+    assert_field_default_matches("let o = {a: 7}", "number", "o?.a", "x").await;
+    assert_field_default_matches("fn f() { return [3, nil] }", "number", "f()?", "x").await;
+    assert_field_default_matches("fn f() { return [4, nil] }", "number", "f()!", "x").await;
+    assert_field_default_matches("fn g() { return 8 }", "number", "await g()", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_assignment() {
+    // Assignment defaults (plain and compound) — desugared to `target = (target OP
+    // value)` exactly like the legacy parser; the captured mutable updates.
+    assert_field_default_matches("let g = 0", "number", "(g = 5)", "x").await;
+    assert_field_default_matches("let g = 2", "number", "(g += 5)", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_spread() {
+    // Spread defaults in array/object/call literals (the tree-walker accepts these;
+    // they were previously rejected by `cst_default_expr`).
+    assert_field_default_matches("let ys = [1, 2]", "array<number>", "[...ys, 3]", "x").await;
+    assert_field_default_matches("let o = {a: 1}", "object", "{...o, b: 2}", "x").await;
+    assert_field_default_matches("fn f(a, b) { return a + b }\nlet ar = [1, 2]", "number", "f(...ar)", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_arrow_and_match() {
+    // Arrow and match defaults embed statement/pattern subtrees; lowered by
+    // re-parsing the node text through the legacy front-end. Construct + `.from`.
+    assert_field_default_matches("let base = 10", "fn", "(n) => n + base", "x(5)").await;
+    assert_field_default_matches("", "string", "match 1 { 1 => \"one\", _ => \"z\" }", "x").await;
+    assert_field_default_matches("", "string", "match 2 { 1 => \"one\", _ => \"z\" }", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_reviewer_regression() {
+    // The EXACT program from the divergence report: a computed string-concat default
+    // referencing a module const, printed off a freshly-constructed instance. The VM
+    // previously errored "field-default expression form BinaryExpr is not supported";
+    // now it matches the tree-walker (prints `prex`).
+    let src = "let PREFIX = \"pre\"\nclass C { tag: string = PREFIX + \"x\"\n  fn init() {} }\nprint(C().tag)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
 #[tokio::test]
 async fn vm_class_method_calls_method_via_self() {
     // A method that calls another method through self, threading state.

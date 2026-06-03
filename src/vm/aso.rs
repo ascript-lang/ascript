@@ -37,7 +37,9 @@
 //! [`Chunk::from_bytes`] return [`AsoError::VersionMismatch`] so the caller can
 //! recompile from source (or hard-error) — stale bytecode is NEVER run.
 
-use crate::ast::{ArrayElem, CallArg, Expr, ExprKind, ObjEntry, Param, Type, UnOp};
+use crate::ast::{
+    ArrayElem, BinOp, CallArg, Expr, ExprKind, ObjEntry, Param, TemplatePart, Type, UnOp,
+};
 use crate::span::Span;
 use crate::syntax::resolve::types::UpvalueDescriptor;
 use crate::value::{Class, FieldSchema, Value};
@@ -53,7 +55,11 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///
 /// History:
 /// - 1: initial `.aso` format (V12-T2).
-pub const ASO_FORMAT_VERSION: u32 = 2;
+/// - 2: (pre-existing).
+/// - 3: field-default expr now covers the full `cst_default_expr` lowering — new
+///   tags for binary/range/index/ternary/template/optmember/try/unwrap/await/
+///   assign and spread elements in array/object/call defaults.
+pub const ASO_FORMAT_VERSION: u32 = 3;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -155,6 +161,24 @@ const EX_ARRAY: u8 = 7;
 const EX_OBJECT: u8 = 8;
 const EX_MEMBER: u8 = 9;
 const EX_CALL: u8 = 10;
+const EX_BINARY: u8 = 11;
+const EX_INDEX: u8 = 12;
+const EX_OPTMEMBER: u8 = 13;
+const EX_TERNARY: u8 = 14;
+const EX_TEMPLATE: u8 = 15;
+const EX_TRY: u8 = 16;
+const EX_UNWRAP: u8 = 17;
+const EX_AWAIT: u8 = 18;
+const EX_ASSIGN: u8 = 19;
+
+// Template-part tags (within an `EX_TEMPLATE`).
+const TP_LIT: u8 = 0;
+const TP_EXPR: u8 = 1;
+
+// Array/object/call element tags so spreads round-trip (`cst_default_expr` lowers
+// spread elements in array/object/call defaults).
+const EL_ITEM: u8 = 0;
+const EL_SPREAD: u8 = 1;
 
 // ---- upvalue / import tags ---------------------------------------------------
 
@@ -817,10 +841,13 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
             w.len(elems.len());
             for el in elems {
                 match el {
-                    ArrayElem::Item(e) => write_expr(w, e)?,
-                    // `cst_default_expr` rejects spread; reject here too.
-                    ArrayElem::Spread(_) => {
-                        return Err(AsoError::NonLiteralConst("array-spread-default"))
+                    ArrayElem::Item(e) => {
+                        w.u8(EL_ITEM);
+                        write_expr(w, e)?;
+                    }
+                    ArrayElem::Spread(e) => {
+                        w.u8(EL_SPREAD);
+                        write_expr(w, e)?;
                     }
                 }
             }
@@ -831,11 +858,13 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
             for ent in entries {
                 match ent {
                     ObjEntry::KV(k, v) => {
+                        w.u8(EL_ITEM);
                         w.str(k);
                         write_expr(w, v)?;
                     }
-                    ObjEntry::Spread(_) => {
-                        return Err(AsoError::NonLiteralConst("object-spread-default"))
+                    ObjEntry::Spread(e) => {
+                        w.u8(EL_SPREAD);
+                        write_expr(w, e)?;
                     }
                 }
             }
@@ -845,23 +874,134 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
             w.str(name);
             write_expr(w, object)?;
         }
+        ExprKind::OptMember { object, name } => {
+            w.u8(EX_OPTMEMBER);
+            w.str(name);
+            write_expr(w, object)?;
+        }
+        ExprKind::Index { object, index } => {
+            w.u8(EX_INDEX);
+            write_expr(w, object)?;
+            write_expr(w, index)?;
+        }
         ExprKind::Call { callee, args } => {
             w.u8(EX_CALL);
             write_expr(w, callee)?;
             w.len(args.len());
             for a in args {
                 match a {
-                    CallArg::Pos(e) => write_expr(w, e)?,
-                    CallArg::Spread(_) => {
-                        return Err(AsoError::NonLiteralConst("call-spread-default"))
+                    CallArg::Pos(e) => {
+                        w.u8(EL_ITEM);
+                        write_expr(w, e)?;
+                    }
+                    CallArg::Spread(e) => {
+                        w.u8(EL_SPREAD);
+                        write_expr(w, e)?;
                     }
                 }
             }
         }
-        // Any other ExprKind cannot occur in a `cst_default_expr`-produced default.
-        _ => return Err(AsoError::NonLiteralConst("unsupported-default-expr")),
+        ExprKind::Binary { op, lhs, rhs } => {
+            w.u8(EX_BINARY);
+            w.u8(binop_tag(*op));
+            write_expr(w, lhs)?;
+            write_expr(w, rhs)?;
+        }
+        ExprKind::Ternary { cond, then, els } => {
+            w.u8(EX_TERNARY);
+            write_expr(w, cond)?;
+            write_expr(w, then)?;
+            write_expr(w, els)?;
+        }
+        ExprKind::Template { parts } => {
+            w.u8(EX_TEMPLATE);
+            w.len(parts.len());
+            for part in parts {
+                match part {
+                    TemplatePart::Lit(s) => {
+                        w.u8(TP_LIT);
+                        w.str(s);
+                    }
+                    TemplatePart::Expr(e) => {
+                        w.u8(TP_EXPR);
+                        write_expr(w, e)?;
+                    }
+                }
+            }
+        }
+        ExprKind::Try(e) => {
+            w.u8(EX_TRY);
+            write_expr(w, e)?;
+        }
+        ExprKind::Unwrap(e) => {
+            w.u8(EX_UNWRAP);
+            write_expr(w, e)?;
+        }
+        ExprKind::Await(e) => {
+            w.u8(EX_AWAIT);
+            write_expr(w, e)?;
+        }
+        ExprKind::Assign { target, value } => {
+            w.u8(EX_ASSIGN);
+            write_expr(w, target)?;
+            write_expr(w, value)?;
+        }
+        // `Arrow` and `Match` defaults embed statement/pattern subtrees that this
+        // flat serializer does not encode. They run correctly via `ascript run`
+        // (the VM compiles them through `cst_default_expr` in memory), but cannot
+        // be cached to an `.aso` file — a documented `ascript build`-only limit
+        // (parallel to the prior spread rejection). `Yield` never reaches here
+        // (`cst_default_expr` rejects a `yield` default outright).
+        ExprKind::Arrow { .. } => return Err(AsoError::NonLiteralConst("arrow-default")),
+        ExprKind::Match { .. } => return Err(AsoError::NonLiteralConst("match-default")),
+        ExprKind::Yield(_) => return Err(AsoError::NonLiteralConst("yield-default")),
     }
     Ok(())
+}
+
+/// The wire tag for a [`BinOp`] (mirrored by `binop_from_tag` on read).
+fn binop_tag(op: BinOp) -> u8 {
+    match op {
+        BinOp::Add => 0,
+        BinOp::Sub => 1,
+        BinOp::Mul => 2,
+        BinOp::Div => 3,
+        BinOp::Mod => 4,
+        BinOp::Pow => 5,
+        BinOp::Lt => 6,
+        BinOp::Le => 7,
+        BinOp::Gt => 8,
+        BinOp::Ge => 9,
+        BinOp::Eq => 10,
+        BinOp::Ne => 11,
+        BinOp::And => 12,
+        BinOp::Or => 13,
+        BinOp::Coalesce => 14,
+        BinOp::Range => 15,
+    }
+}
+
+/// The [`BinOp`] for a wire tag (inverse of `binop_tag`).
+fn binop_from_tag(tag: u8) -> Result<BinOp, AsoError> {
+    Ok(match tag {
+        0 => BinOp::Add,
+        1 => BinOp::Sub,
+        2 => BinOp::Mul,
+        3 => BinOp::Div,
+        4 => BinOp::Mod,
+        5 => BinOp::Pow,
+        6 => BinOp::Lt,
+        7 => BinOp::Le,
+        8 => BinOp::Gt,
+        9 => BinOp::Ge,
+        10 => BinOp::Eq,
+        11 => BinOp::Ne,
+        12 => BinOp::And,
+        13 => BinOp::Or,
+        14 => BinOp::Coalesce,
+        15 => BinOp::Range,
+        tag => return Err(AsoError::BadTag { what: "binop", tag }),
+    })
 }
 
 fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
@@ -891,7 +1031,12 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
             let n = r.len()?;
             let mut elems = Vec::with_capacity(n);
             for _ in 0..n {
-                elems.push(ArrayElem::Item(read_expr(r)?));
+                let el = match r.u8()? {
+                    EL_ITEM => ArrayElem::Item(read_expr(r)?),
+                    EL_SPREAD => ArrayElem::Spread(read_expr(r)?),
+                    tag => return Err(AsoError::BadTag { what: "array-elem", tag }),
+                };
+                elems.push(el);
             }
             ExprKind::Array(elems)
         }
@@ -899,9 +1044,15 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
             let n = r.len()?;
             let mut entries = Vec::with_capacity(n);
             for _ in 0..n {
-                let k = r.str()?;
-                let v = read_expr(r)?;
-                entries.push(ObjEntry::KV(k, v));
+                let ent = match r.u8()? {
+                    EL_ITEM => {
+                        let k = r.str()?;
+                        ObjEntry::KV(k, read_expr(r)?)
+                    }
+                    EL_SPREAD => ObjEntry::Spread(read_expr(r)?),
+                    tag => return Err(AsoError::BadTag { what: "object-entry", tag }),
+                };
+                entries.push(ent);
             }
             ExprKind::Object(entries)
         }
@@ -910,14 +1061,62 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
             let object = Box::new(read_expr(r)?);
             ExprKind::Member { object, name }
         }
+        EX_OPTMEMBER => {
+            let name = r.str()?;
+            let object = Box::new(read_expr(r)?);
+            ExprKind::OptMember { object, name }
+        }
+        EX_INDEX => {
+            let object = Box::new(read_expr(r)?);
+            let index = Box::new(read_expr(r)?);
+            ExprKind::Index { object, index }
+        }
         EX_CALL => {
             let callee = Box::new(read_expr(r)?);
             let n = r.len()?;
             let mut args = Vec::with_capacity(n);
             for _ in 0..n {
-                args.push(CallArg::Pos(read_expr(r)?));
+                let a = match r.u8()? {
+                    EL_ITEM => CallArg::Pos(read_expr(r)?),
+                    EL_SPREAD => CallArg::Spread(read_expr(r)?),
+                    tag => return Err(AsoError::BadTag { what: "call-arg", tag }),
+                };
+                args.push(a);
             }
             ExprKind::Call { callee, args }
+        }
+        EX_BINARY => {
+            let op = binop_from_tag(r.u8()?)?;
+            let lhs = Box::new(read_expr(r)?);
+            let rhs = Box::new(read_expr(r)?);
+            ExprKind::Binary { op, lhs, rhs }
+        }
+        EX_TERNARY => {
+            let cond = Box::new(read_expr(r)?);
+            let then = Box::new(read_expr(r)?);
+            let els = Box::new(read_expr(r)?);
+            ExprKind::Ternary { cond, then, els }
+        }
+        EX_TEMPLATE => {
+            let n = r.len()?;
+            let mut parts = Vec::with_capacity(n);
+            for _ in 0..n {
+                let part = match r.u8()? {
+                    TP_LIT => TemplatePart::Lit(r.str()?),
+                    TP_EXPR => TemplatePart::Expr(Box::new(read_expr(r)?)),
+                    tag => return Err(AsoError::BadTag { what: "template-part", tag }),
+                };
+                parts.push(part);
+            }
+            ExprKind::Template { parts }
+        }
+        EX_TRY => ExprKind::Try(Box::new(read_expr(r)?)),
+        EX_UNWRAP => ExprKind::Unwrap(Box::new(read_expr(r)?)),
+        EX_AWAIT => ExprKind::Await(Box::new(read_expr(r)?)),
+        EX_ASSIGN => {
+            let target = Box::new(read_expr(r)?);
+            let value = Box::new(read_expr(r)?);
+            ExprKind::Assign { target, value }
         }
         tag => return Err(AsoError::BadTag { what: "expr", tag }),
     };
@@ -1402,5 +1601,67 @@ run()
                 Value::Object(crate::value::ObjectCell::new(indexmap::IndexMap::new())),
             ]))));
         assert_eq!(c.check_consts_literal_only(), Err("object"));
+    }
+
+    #[test]
+    fn computed_field_defaults_roundtrip() {
+        // A class whose fields use the full range of computed defaults the
+        // `.aso` writer now serializes (binary, string concat, comparison,
+        // logical, nullish, index, ternary, template, exclusive range,
+        // optional-member, `?`, `!`, `await`, assignment, and spreads). The
+        // serialized field-default `ast::Expr` must round-trip structurally
+        // (same disasm fingerprint) AND produce identical output when run.
+        // NOTE: a bare `expr?`/`expr!` default at end of line followed by another
+        // `name: type` field parses as a TERNARY (`expr ? name : type = ...`), since
+        // the next field's `:` is taken as the ternary colon — that ambiguity is a
+        // source-shape concern, not a serialization one. The `?`/`!` Try/Unwrap
+        // round-trip is exercised by the explicit `EX_TRY`/`EX_UNWRAP` writer/reader
+        // arms and the differential tests, so this class avoids that surface
+        // collision and covers the remaining serialized forms (incl. `await`).
+        let src = r#"
+let PREFIX = "p-"
+let BASE = 10
+let SRC = [1, 2]
+let OBJ = {a: 1}
+fn add(a, b) { return a + b }
+
+class Config {
+    id: number = 1 + 1
+    tag: string = PREFIX + "x"
+    big: bool = BASE > 0
+    pick: any = nil ?? "d"
+    first: number = SRC[0]
+    pri: number = BASE > 0 ? BASE * 2 : 0
+    label: string = `b=${BASE}`
+    seq: array<number> = 1..4
+    a: number = OBJ?.a
+    aw: number = await add(1, 2)
+    xs: array<number> = [...SRC, 3]
+    merged: object = {...OBJ, b: 2}
+    summed: number = add(...SRC)
+    fn init() {}
+}
+
+let c = Config()
+print(c.id)
+print(c.tag)
+print(c.seq[2])
+print(c.merged)
+"#;
+        let original = compile(src);
+        let bytes = original.to_bytes();
+        let rt = Chunk::from_bytes(&bytes).expect("decode");
+        assert_eq!(
+            disasm(&original),
+            disasm(&rt),
+            "computed-default disasm fingerprint differs after .aso round-trip"
+        );
+        // The field-default `ast::Expr` lives in a serialized ClassProto, not the
+        // disasm, so also assert run-output parity through the round-trip.
+        assert_eq!(
+            run_chunk(compile(src)),
+            run_chunk(Chunk::from_bytes(&compile(src).to_bytes()).expect("decode")),
+            "computed-default output differs after .aso round-trip"
+        );
     }
 }

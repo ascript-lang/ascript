@@ -188,14 +188,34 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
 /// for `.from` parity. (Construct keeps using the thunk, so it stays byte-identical;
 /// the two paths agree because they lower the same source default.)
 ///
-/// Scope: the realistic default forms across the corpus — literals
-/// (number/string/bool/nil), array/object literals, prefix `-`/`!`, a bare
-/// identifier (`Ident`) and a member access (`a.b`), and a call (`f(args)`). These
-/// are exactly the forms `eval_expr` can run against `def_env` (which holds the
-/// module's top-level class/enum bindings, see `Vm::class_env`). A default using a
-/// form outside this set is a clear `CompileError` (rare in practice).
+/// Scope: this is a COMPLETE lowering of every expression form the tree-walker
+/// can evaluate as a field default — so the `.from`/typed-parse path (VM) never
+/// diverges from the tree-walker on a computed default. The forms split three ways:
+///
+/// 1. **Structurally lowered** into a single matching legacy `ExprKind` (mirroring
+///    the corresponding full-compiler handler's op/shape mapping): literals,
+///    `NameRef`, `Paren`, `Unary` (`-`/`!`), `Array`/`Object`/`Call` (incl. spread
+///    elements, lowered to `ArrayElem::Spread`/`ObjEntry::Spread`/`CallArg::Spread`),
+///    `Member`, `OptMember`, `Index`, `Binary` (`+ - * / % **`, comparison, equality,
+///    `&&`/`||`/`??` — mirroring `compile_binary`), exclusive `Range` (`..`, mirroring
+///    `compile_range`; legacy `BinOp::Range` is exclusive-only), `Ternary` (mirroring
+///    `compile_ternary`), `Template` (mirroring `compile_template`), `Try` (`?`),
+///    `Unwrap` (`!`), `Await`, `Yield`, and `Assign` (plain `=` and compound
+///    `+=`/`-=`/`*=`/`/=`, desugared to `target = (target OP value)` exactly like the
+///    legacy parser's `make_binary`).
+/// 2. **Re-parsed** via the legacy front-end on the node's exact source text:
+///    `ArrowExpr` and `MatchExpr`, whose bodies are arbitrary statement/pattern
+///    subtrees with no other CST→legacy lowering. Delegating to `crate::lexer::lex` +
+///    `crate::parser::parse` (the SAME front-end the tree-walker uses) yields the
+///    authoritative legacy ast for these forms, so they cannot diverge. The slice is
+///    padded with leading spaces up to the node's start offset so the produced spans
+///    keep their original-file byte offsets.
+/// 3. **Rejected** (symmetric with the tree-walker): an inclusive `..=` range as a
+///    value default — the legacy parser ALSO rejects it (the tree-walker reports
+///    "expected a field name or method, found DotDotEq"; `BinOp::Range` has no
+///    inclusive variant), so the VM's rejection here is symmetric.
 fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
-    use crate::ast::{ArrayElem, CallArg, ExprKind, ObjEntry, UnOp};
+    use crate::ast::{ArrayElem, BinOp, CallArg, ExprKind, ObjEntry, UnOp};
     let span = node_span(expr);
     let kind = match expr {
         Expr::Literal(lit) => match literal_const_value(lit)? {
@@ -243,46 +263,115 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 expr: Box::new(cst_default_expr(&operand)?),
             }
         }
-        Expr::ArrayExpr(arr) => {
-            // No spread support in a default (the corpus uses `[]`/`[lit,..]`); a
-            // spread element would be a SpreadElem child, which `arr.exprs()` skips
-            // — reject it explicitly rather than silently drop it.
-            if arr
-                .syntax()
-                .children()
-                .any(|c| c.kind() == SyntaxKind::SpreadElem)
-            {
-                return Err(CompileError::new(
-                    "spread (...) in a field default is not supported",
-                    span,
-                ));
+        // Binary arithmetic/comparison/equality/logical/nullish. Mirrors
+        // `compile_binary`'s op mapping and the legacy parser's token→`BinOp`
+        // mapping (`make_binary`): the same set, lowered into `ExprKind::Binary`.
+        Expr::BinaryExpr(bin) => {
+            let lhs = bin
+                .lhs()
+                .ok_or_else(|| CompileError::new("binary default missing left operand", span))?;
+            let rhs = bin
+                .rhs()
+                .ok_or_else(|| CompileError::new("binary default missing right operand", span))?;
+            let op = bin
+                .op()
+                .ok_or_else(|| CompileError::new("binary default missing operator", span))?;
+            let bin_op = match op {
+                SyntaxKind::Plus => BinOp::Add,
+                SyntaxKind::Minus => BinOp::Sub,
+                SyntaxKind::Star => BinOp::Mul,
+                SyntaxKind::Slash => BinOp::Div,
+                SyntaxKind::Percent => BinOp::Mod,
+                SyntaxKind::StarStar => BinOp::Pow,
+                SyntaxKind::Lt => BinOp::Lt,
+                SyntaxKind::Le => BinOp::Le,
+                SyntaxKind::Gt => BinOp::Gt,
+                SyntaxKind::Ge => BinOp::Ge,
+                SyntaxKind::EqEq => BinOp::Eq,
+                SyntaxKind::BangEq => BinOp::Ne,
+                SyntaxKind::AmpAmp => BinOp::And,
+                SyntaxKind::PipePipe => BinOp::Or,
+                SyntaxKind::QuestionQuestion => BinOp::Coalesce,
+                other => {
+                    return Err(CompileError::new(
+                        format!("unsupported binary operator {other:?} in field default"),
+                        span,
+                    ))
+                }
+            };
+            ExprKind::Binary {
+                op: bin_op,
+                lhs: Box::new(cst_default_expr(&lhs)?),
+                rhs: Box::new(cst_default_expr(&rhs)?),
             }
+        }
+        // Exclusive range `a..b` → `BinOp::Range` (mirrors `compile_range`). The
+        // inclusive `..=` form has no legacy `BinOp` (and no value-position
+        // representation): the legacy parser rejects `..=` as a value default too,
+        // so rejecting it here is symmetric with the tree-walker.
+        Expr::RangeExpr(range) => {
+            let start = range
+                .start()
+                .ok_or_else(|| CompileError::new("range default missing start bound", span))?;
+            let end = range
+                .end()
+                .ok_or_else(|| CompileError::new("range default missing end bound", span))?;
+            match range.op() {
+                Some(SyntaxKind::DotDot) => {}
+                Some(SyntaxKind::DotDotEq) => {
+                    return Err(CompileError::new(
+                        "inclusive range (..=) as a value default is not supported \
+                         (the tree-walker's parser also rejects it)",
+                        span,
+                    ))
+                }
+                other => {
+                    return Err(CompileError::new(
+                        format!("range default has unexpected operator {other:?}"),
+                        span,
+                    ))
+                }
+            }
+            ExprKind::Binary {
+                op: BinOp::Range,
+                lhs: Box::new(cst_default_expr(&start)?),
+                rhs: Box::new(cst_default_expr(&end)?),
+            }
+        }
+        Expr::ArrayExpr(arr) => {
+            // Lower each element in source order, preserving spreads as
+            // `ArrayElem::Spread` (the tree-walker evaluates `[...ys]` defaults).
             let mut elems = Vec::new();
-            for el in arr.exprs() {
-                elems.push(ArrayElem::Item(cst_default_expr(&el)?));
+            for child in arr.syntax().children() {
+                if let Some(spread) = SpreadElem::cast(child.clone()) {
+                    let operand = spread.expr().ok_or_else(|| {
+                        CompileError::new("array-default spread (...) missing operand", span)
+                    })?;
+                    elems.push(ArrayElem::Spread(cst_default_expr(&operand)?));
+                } else if let Some(el) = Expr::cast(child.clone()) {
+                    elems.push(ArrayElem::Item(cst_default_expr(&el)?));
+                }
             }
             ExprKind::Array(elems)
         }
         Expr::ObjectExpr(obj) => {
-            if obj
-                .syntax()
-                .children()
-                .any(|c| c.kind() == SyntaxKind::SpreadElem)
-            {
-                return Err(CompileError::new(
-                    "spread (...) in a field default is not supported",
-                    span,
-                ));
-            }
             let mut entries = Vec::new();
-            for field in obj.object_fields() {
-                let fspan = node_span(&field);
-                let key = object_field_key(&field)
-                    .ok_or_else(|| CompileError::new("object-default field has no key", fspan))?;
-                let value = field
-                    .value()
-                    .ok_or_else(|| CompileError::new("object-default field has no value", fspan))?;
-                entries.push(ObjEntry::KV(key, cst_default_expr(&value)?));
+            for child in obj.syntax().children() {
+                if let Some(spread) = SpreadElem::cast(child.clone()) {
+                    let operand = spread.expr().ok_or_else(|| {
+                        CompileError::new("object-default spread (...) missing operand", span)
+                    })?;
+                    entries.push(ObjEntry::Spread(cst_default_expr(&operand)?));
+                } else if let Some(field) = ObjectField::cast(child.clone()) {
+                    let fspan = node_span(&field);
+                    let key = object_field_key(&field).ok_or_else(|| {
+                        CompileError::new("object-default field has no key", fspan)
+                    })?;
+                    let value = field.value().ok_or_else(|| {
+                        CompileError::new("object-default field has no value", fspan)
+                    })?;
+                    entries.push(ObjEntry::KV(key, cst_default_expr(&value)?));
+                }
             }
             ExprKind::Object(entries)
         }
@@ -300,28 +389,51 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 name,
             }
         }
+        Expr::OptMemberExpr(m) => {
+            let object = m
+                .expr()
+                .ok_or_else(|| CompileError::new("optional-member default missing receiver", span))?;
+            let name = m
+                .ident_token()
+                .ok_or_else(|| {
+                    CompileError::new("optional-member default missing property name", span)
+                })?
+                .text()
+                .to_string();
+            ExprKind::OptMember {
+                object: Box::new(cst_default_expr(&object)?),
+                name,
+            }
+        }
+        Expr::IndexExpr(ix) => {
+            let base = ix
+                .base()
+                .ok_or_else(|| CompileError::new("index default missing receiver", span))?;
+            let index = ix
+                .index()
+                .ok_or_else(|| CompileError::new("index default missing index", span))?;
+            ExprKind::Index {
+                object: Box::new(cst_default_expr(&base)?),
+                index: Box::new(cst_default_expr(&index)?),
+            }
+        }
         Expr::CallExpr(call) => {
             let callee = call
                 .expr()
                 .ok_or_else(|| CompileError::new("call default missing callee", span))?;
-            if call
-                .arg_list()
-                .map(|al| {
-                    al.syntax()
-                        .children()
-                        .any(|c| c.kind() == SyntaxKind::SpreadElem)
-                })
-                .unwrap_or(false)
-            {
-                return Err(CompileError::new(
-                    "spread (...) in a field-default call is not supported",
-                    span,
-                ));
-            }
+            // Lower each argument in source order, preserving spreads as
+            // `CallArg::Spread` (the tree-walker evaluates `f(...args)` defaults).
             let mut args = Vec::new();
             if let Some(arg_list) = call.arg_list() {
-                for a in arg_list.exprs() {
-                    args.push(CallArg::Pos(cst_default_expr(&a)?));
+                for child in arg_list.syntax().children() {
+                    if let Some(spread) = SpreadElem::cast(child.clone()) {
+                        let operand = spread.expr().ok_or_else(|| {
+                            CompileError::new("call-default spread (...) missing operand", span)
+                        })?;
+                        args.push(CallArg::Spread(cst_default_expr(&operand)?));
+                    } else if let Some(a) = Expr::cast(child.clone()) {
+                        args.push(CallArg::Pos(cst_default_expr(&a)?));
+                    }
                 }
             }
             ExprKind::Call {
@@ -329,17 +441,161 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 args,
             }
         }
-        other => {
+        Expr::TernaryExpr(t) => {
+            let cond = t
+                .cond()
+                .ok_or_else(|| CompileError::new("ternary default missing condition", span))?;
+            let then = t
+                .then()
+                .ok_or_else(|| CompileError::new("ternary default missing then-branch", span))?;
+            let els = t
+                .els()
+                .ok_or_else(|| CompileError::new("ternary default missing else-branch", span))?;
+            ExprKind::Ternary {
+                cond: Box::new(cst_default_expr(&cond)?),
+                then: Box::new(cst_default_expr(&then)?),
+                els: Box::new(cst_default_expr(&els)?),
+            }
+        }
+        // Template `` `..${e}..` ``: walk the interleaved literal-chunk tokens and
+        // interpolated expression nodes in source order, mirroring
+        // `compile_template`'s `strip_template_delims` + `unescape_template_body`
+        // chunk decode, into `ExprKind::Template { parts }`.
+        Expr::TemplateExpr(t) => {
+            let mut parts = Vec::new();
+            for child in t.syntax().children_with_tokens() {
+                if let Some(tok) = child.as_token() {
+                    match tok.kind() {
+                        SyntaxKind::TemplateStr
+                        | SyntaxKind::TemplateStart
+                        | SyntaxKind::TemplateMiddle
+                        | SyntaxKind::TemplateEnd => {
+                            let chunk = unescape_template_body(strip_template_delims(tok.text()));
+                            parts.push(crate::ast::TemplatePart::Lit(chunk));
+                        }
+                        _ => continue,
+                    }
+                } else if let Some(node) = child.as_node() {
+                    let inner = Expr::cast((*node).clone()).ok_or_else(|| {
+                        CompileError::new("template-default interpolation is not an expression", span)
+                    })?;
+                    parts.push(crate::ast::TemplatePart::Expr(Box::new(cst_default_expr(
+                        &inner,
+                    )?)));
+                }
+            }
+            ExprKind::Template { parts }
+        }
+        Expr::TryExpr(t) => {
+            let inner = t
+                .expr()
+                .ok_or_else(|| CompileError::new("? default missing operand", span))?;
+            ExprKind::Try(Box::new(cst_default_expr(&inner)?))
+        }
+        Expr::UnwrapExpr(u) => {
+            let inner = u
+                .expr()
+                .ok_or_else(|| CompileError::new("! default missing operand", span))?;
+            ExprKind::Unwrap(Box::new(cst_default_expr(&inner)?))
+        }
+        Expr::AwaitExpr(a) => {
+            let inner = a
+                .expr()
+                .ok_or_else(|| CompileError::new("await default missing operand", span))?;
+            ExprKind::Await(Box::new(cst_default_expr(&inner)?))
+        }
+        // `yield` is only valid inside a generator body; a field default is never a
+        // generator. The tree-walker also rejects it (it raises "'yield' outside of a
+        // generator" when it EVALUATES the default), so failing the class compile here
+        // is symmetric — both engines reject a `yield` default (exit non-zero, no
+        // output). Rejecting it at lowering time (rather than lowering to
+        // `ExprKind::Yield`) also keeps the class from emitting a construct-time thunk
+        // whose `YIELD` op the run loop cannot drive outside a generator.
+        Expr::YieldExpr(_) => {
             return Err(CompileError::new(
-                format!(
-                    "field-default expression form {:?} is not supported",
-                    other.syntax().kind()
-                ),
+                "'yield' is not valid in a field default (the tree-walker also \
+                 rejects it: 'yield' outside of a generator)",
                 span,
             ))
         }
+        // Assignment as a default (`(g = 5)`, or compound `(a += b)`). The legacy
+        // parser desugars a compound `a OP= b` to `a = (a OP b)` (`make_binary`);
+        // mirror that so the lowered ast is byte-identical to the legacy parser's.
+        Expr::AssignExpr(assign) => {
+            let target = assign
+                .target()
+                .ok_or_else(|| CompileError::new("assign default missing target", span))?;
+            let value = assign
+                .value()
+                .ok_or_else(|| CompileError::new("assign default missing value", span))?;
+            let assign_op = assign
+                .syntax()
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find_map(|t| match t.kind() {
+                    SyntaxKind::PlusEq => Some(Some(BinOp::Add)),
+                    SyntaxKind::MinusEq => Some(Some(BinOp::Sub)),
+                    SyntaxKind::StarEq => Some(Some(BinOp::Mul)),
+                    SyntaxKind::SlashEq => Some(Some(BinOp::Div)),
+                    SyntaxKind::Eq => Some(None),
+                    _ => None,
+                })
+                .ok_or_else(|| CompileError::new("assign default missing operator", span))?;
+            let target_ast = cst_default_expr(&target)?;
+            let value_ast = cst_default_expr(&value)?;
+            let rhs = match assign_op {
+                None => value_ast,
+                Some(op) => crate::ast::Expr {
+                    kind: ExprKind::Binary {
+                        op,
+                        lhs: Box::new(target_ast.clone()),
+                        rhs: Box::new(value_ast),
+                    },
+                    span,
+                },
+            };
+            ExprKind::Assign {
+                target: Box::new(target_ast),
+                value: Box::new(rhs),
+            }
+        }
+        // Arrow and match defaults embed arbitrary statement/pattern subtrees that
+        // have no other CST→legacy lowering. Re-parse the node's exact source text
+        // through the SAME legacy front-end the tree-walker uses, which yields the
+        // authoritative legacy ast — so these forms cannot diverge.
+        Expr::ArrowExpr(_) | Expr::MatchExpr(_) => {
+            return reparse_default_expr(expr.syntax(), span)
+        }
     };
     Ok(crate::ast::Expr { kind, span })
+}
+
+/// Lower a field-default CST expression by RE-PARSING its exact source text through
+/// the legacy front-end (`crate::lexer::lex` + `crate::parser::parse`) — the same
+/// lexer/parser the tree-walker runs. Used for `ArrowExpr`/`MatchExpr` defaults,
+/// whose bodies are arbitrary statement/pattern subtrees. The slice is left-padded
+/// with spaces up to the node's start offset so the produced ast spans keep their
+/// original-file byte offsets (matching what the structural lowering produces).
+fn reparse_default_expr(
+    node: &crate::syntax::cst::ResolvedNode,
+    span: Span,
+) -> Result<crate::ast::Expr, CompileError> {
+    // The node's code span (trivia-trimmed) is the exact expression source; pad with
+    // leading spaces so token offsets line up with the original file.
+    let text = node.text().to_string();
+    let start = usize::from(node.text_range().start());
+    let padded = format!("{}{}", " ".repeat(start), text);
+    let tokens = crate::lexer::lex(&padded)
+        .map_err(|e| CompileError::new(format!("re-parsing field default: {}", e.message), span))?;
+    let stmts = crate::parser::parse(&tokens)
+        .map_err(|e| CompileError::new(format!("re-parsing field default: {}", e.message), span))?;
+    match stmts.into_iter().next() {
+        Some(crate::ast::Stmt::Expr(e)) => Ok(e),
+        _ => Err(CompileError::new(
+            "field default did not re-parse to a single expression",
+            span,
+        )),
+    }
 }
 
 /// The text of the first `Ident` token directly under a CST node.
