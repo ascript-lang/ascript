@@ -8,7 +8,6 @@ use crate::span::Span;
 use crate::value::{MapKey, Value};
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -60,7 +59,7 @@ impl Interp {
                     let v = self.call_value(f.clone(), vec![item], span).await?;
                     out.push(v);
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "filter" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("filter"))?;
@@ -73,7 +72,7 @@ impl Interp {
                         out.push(item);
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "reduce" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("reduce"))?;
@@ -111,7 +110,7 @@ impl Interp {
                 } else {
                     Vec::new()
                 };
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "contains" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("contains"))?;
@@ -177,7 +176,7 @@ impl Interp {
                         items = sorted;
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(items))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
             }
             "find" => {
                 let a = want_array(&arg(args, 0), span, &ctx("find"))?;
@@ -263,7 +262,7 @@ impl Interp {
                 };
                 let mut out = Vec::new();
                 flatten_into(&a.borrow(), depth, &mut out);
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "flatMap" => {
                 let a = want_array(&arg(args, 0), span, &ctx("flatMap"))?;
@@ -277,13 +276,13 @@ impl Interp {
                         other => out.push(other),
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "reverse" => {
                 let a = want_array(&arg(args, 0), span, &ctx("reverse"))?;
                 let mut items = a.borrow().clone();
                 items.reverse();
-                Ok(Value::Array(Rc::new(RefCell::new(items))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
             }
             "concat" => {
                 let a = want_array(&arg(args, 0), span, &ctx("concat"))?;
@@ -292,7 +291,7 @@ impl Interp {
                     let more = want_array(extra, span, &format!("array.concat arg {}", i))?;
                     out.extend(more.borrow().iter().cloned());
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "first" => {
                 let a = want_array(&arg(args, 0), span, &ctx("first"))?;
@@ -312,7 +311,7 @@ impl Interp {
                         out.push(item.clone());
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "take" => {
                 let a = want_array(&arg(args, 0), span, &ctx("take"))?;
@@ -323,7 +322,7 @@ impl Interp {
                     (nf as usize).min(a.borrow().len())
                 };
                 let out = a.borrow()[..k].to_vec();
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "drop" => {
                 let a = want_array(&arg(args, 0), span, &ctx("drop"))?;
@@ -334,7 +333,7 @@ impl Interp {
                     (nf as usize).min(a.borrow().len())
                 };
                 let out = a.borrow()[k..].to_vec();
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "chunk" => {
                 let a = want_array(&arg(args, 0), span, &ctx("chunk"))?;
@@ -348,9 +347,9 @@ impl Interp {
                 let out: Vec<Value> = a
                     .borrow()
                     .chunks(n)
-                    .map(|c| Value::Array(Rc::new(RefCell::new(c.to_vec()))))
+                    .map(|c| Value::Array(gcmodule::Cc::new(RefCell::new(c.to_vec()))))
                     .collect();
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "zip" => {
                 if args.is_empty() {
@@ -368,9 +367,9 @@ impl Interp {
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
                     let tuple: Vec<Value> = cols.iter().map(|c| c[i].clone()).collect();
-                    out.push(Value::Array(Rc::new(RefCell::new(tuple))));
+                    out.push(Value::Array(gcmodule::Cc::new(RefCell::new(tuple))));
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             "groupBy" => {
                 let a = want_array(&arg(args, 0), span, &ctx("groupBy"))?;
@@ -387,9 +386,9 @@ impl Interp {
                 }
                 let map: IndexMap<MapKey, Value> = groups
                     .into_iter()
-                    .map(|(k, v)| (k, Value::Array(Rc::new(RefCell::new(v)))))
+                    .map(|(k, v)| (k, Value::Array(gcmodule::Cc::new(RefCell::new(v)))))
                     .collect();
-                Ok(Value::Map(Rc::new(RefCell::new(map))))
+                Ok(Value::Map(crate::value::MapCell::new(map)))
             }
             "partition" => {
                 let a = want_array(&arg(args, 0), span, &ctx("partition"))?;
@@ -407,9 +406,9 @@ impl Interp {
                         fail.push(item);
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(vec![
-                    Value::Array(Rc::new(RefCell::new(pass))),
-                    Value::Array(Rc::new(RefCell::new(fail))),
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+                    Value::Array(gcmodule::Cc::new(RefCell::new(pass))),
+                    Value::Array(gcmodule::Cc::new(RefCell::new(fail))),
                 ]))))
             }
             _ => Err(AsError::at(format!("std/array has no function '{}'", func), span).into()),
@@ -465,7 +464,7 @@ mod tests {
         Value::Number(x)
     }
     fn arr(xs: Vec<Value>) -> Value {
-        Value::Array(Rc::new(RefCell::new(xs)))
+        Value::Array(gcmodule::Cc::new(RefCell::new(xs)))
     }
 
     /// Compile a single AScript expression (e.g. an arrow function) to a runtime

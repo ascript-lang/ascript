@@ -7,26 +7,29 @@
 
 use crate::value::Value;
 use crate::vm::chunk::FnProto;
+use gcmodule::Cc;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 /// A runtime closure: a function prototype plus its captured upvalue cells.
 ///
-/// Each cell is shared (`Rc<RefCell<Value>>`) so closures over the same variable
-/// observe mutation (by-reference capture). The `upvalues` vector is indexed by
-/// upvalue number, matching the resolver's `Resolution::Upvalue(idx)` and the
-/// proto's `chunk.upvalues` capture plan.
+/// Each cell is shared (`Cc<RefCell<Value>>`) so closures over the same variable
+/// observe mutation (by-reference capture). `Cc` (not `Rc`) so a closure-cycle
+/// (a closure captured by reference into a value it also reaches) is
+/// cycle-collectable (V13). The `upvalues` vector is indexed by upvalue number,
+/// matching the resolver's `Resolution::Upvalue(idx)` and the proto's
+/// `chunk.upvalues` capture plan.
 pub struct Closure {
     pub proto: Rc<FnProto>,
     /// Captured upvalue cells, in upvalue-index order.
-    pub upvalues: Vec<Rc<RefCell<Value>>>,
+    pub upvalues: Vec<Cc<RefCell<Value>>>,
 }
 
 impl Closure {
     /// Build a closure with no captured upvalues (the top-level script frame and
     /// any function that captures nothing).
-    pub fn new(proto: Rc<FnProto>) -> Rc<Self> {
-        Rc::new(Closure {
+    pub fn new(proto: Rc<FnProto>) -> Cc<Self> {
+        Cc::new(Closure {
             proto,
             upvalues: Vec::new(),
         })
@@ -34,8 +37,8 @@ impl Closure {
 
     /// Build a closure over `proto` capturing the given upvalue cells (in
     /// upvalue-index order). Used by `Op::Closure` once the capture plan is known.
-    pub fn with_upvalues(proto: Rc<FnProto>, upvalues: Vec<Rc<RefCell<Value>>>) -> Rc<Self> {
-        Rc::new(Closure { proto, upvalues })
+    pub fn with_upvalues(proto: Rc<FnProto>, upvalues: Vec<Cc<RefCell<Value>>>) -> Cc<Self> {
+        Cc::new(Closure { proto, upvalues })
     }
 }
 

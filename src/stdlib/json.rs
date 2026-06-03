@@ -8,7 +8,6 @@ use crate::span::Span;
 use crate::value::Value;
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -64,7 +63,7 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
         serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
         serde_json::Value::String(s) => Value::Str(s.as_str().into()),
         serde_json::Value::Array(a) => {
-            Value::Array(Rc::new(RefCell::new(a.iter().map(to_ascript).collect())))
+            Value::Array(gcmodule::Cc::new(RefCell::new(a.iter().map(to_ascript).collect())))
         }
         serde_json::Value::Object(o) => {
             let mut m = IndexMap::new();
@@ -110,7 +109,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
         }
         Value::Str(s) => Ok(serde_json::Value::String(s.to_string())),
         Value::Array(a) => {
-            let ptr = Rc::as_ptr(a) as usize;
+            let ptr = crate::gc::cc_addr(a);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to JSON".into());
             }
@@ -123,7 +122,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
             Ok(serde_json::Value::Array(out))
         }
         Value::Object(o) => {
-            let ptr = Rc::as_ptr(o) as usize;
+            let ptr = crate::gc::cc_addr(o);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to JSON".into());
             }
@@ -137,7 +136,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
         }
         Value::Map(m) => {
             // A Map serializes as a JSON object only if every key is a string.
-            let ptr = Rc::as_ptr(m) as usize;
+            let ptr = crate::gc::cc_addr(m);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to JSON".into());
             }
@@ -161,7 +160,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
         }
         Value::Set(s) => {
             // A Set serializes as a JSON array of its values (insertion order).
-            let ptr = Rc::as_ptr(s) as usize;
+            let ptr = crate::gc::cc_addr(s);
             if seen.contains(&ptr) {
                 return Err("cannot serialize a cyclic structure to JSON".into());
             }
@@ -204,7 +203,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
         }
         Value::Str(s) => J::String(s.to_string()),
         Value::Array(a) => {
-            let ptr = Rc::as_ptr(a) as usize;
+            let ptr = crate::gc::cc_addr(a);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
             }
@@ -214,7 +213,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             J::Array(out)
         }
         Value::Object(o) => {
-            let ptr = Rc::as_ptr(o) as usize;
+            let ptr = crate::gc::cc_addr(o);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
             }
@@ -227,7 +226,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             J::Object(m)
         }
         Value::Instance(i) => {
-            let ptr = Rc::as_ptr(i) as usize;
+            let ptr = crate::gc::cc_addr(i);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
             }
@@ -240,7 +239,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             J::Object(m)
         }
         Value::Map(mp) => {
-            let ptr = Rc::as_ptr(mp) as usize;
+            let ptr = crate::gc::cc_addr(mp);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
             }
@@ -257,7 +256,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             J::Object(m)
         }
         Value::Set(s) => {
-            let ptr = Rc::as_ptr(s) as usize;
+            let ptr = crate::gc::cc_addr(s);
             if seen.contains(&ptr) {
                 return J::String("[Circular]".into());
             }
@@ -336,7 +335,7 @@ mod tests {
 
     #[test]
     fn lossy_serializer_never_errors() {
-        let a = Value::Array(Rc::new(RefCell::new(vec![])));
+        let a = Value::Array(gcmodule::Cc::new(RefCell::new(vec![])));
         if let Value::Array(inner) = &a {
             inner.borrow_mut().push(a.clone());
         }

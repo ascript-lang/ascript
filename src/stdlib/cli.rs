@@ -860,7 +860,7 @@ mod tests {
     use crate::value::Value;
     use indexmap::IndexMap;
     use std::cell::RefCell;
-    use std::rc::Rc;
+    
 
     fn sp() -> Span {
         Span::new(0, 0)
@@ -883,7 +883,7 @@ mod tests {
     }
 
     fn arr(items: Vec<Value>) -> Value {
-        Value::Array(Rc::new(RefCell::new(items)))
+        Value::Array(gcmodule::Cc::new(RefCell::new(items)))
     }
 
     /// Build a simple spec with flags, options, positionals.

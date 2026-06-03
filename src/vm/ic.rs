@@ -146,7 +146,7 @@ pub enum MethodCache {
     /// compiled method (resolved up the chain) and its defining class.
     Mono {
         class_id: usize,
-        closure: std::rc::Rc<crate::vm::value_ext::Closure>,
+        closure: gcmodule::Cc<crate::vm::value_ext::Closure>,
         defining_class: std::rc::Rc<crate::value::Class>,
     },
 }
@@ -175,7 +175,7 @@ impl MethodCache {
         &self,
         class_id: usize,
     ) -> Option<(
-        std::rc::Rc<crate::vm::value_ext::Closure>,
+        gcmodule::Cc<crate::vm::value_ext::Closure>,
         std::rc::Rc<crate::value::Class>,
     )> {
         match self {
@@ -193,7 +193,7 @@ impl MethodCache {
     pub fn record(
         &mut self,
         class_id: usize,
-        closure: std::rc::Rc<crate::vm::value_ext::Closure>,
+        closure: gcmodule::Cc<crate::vm::value_ext::Closure>,
         defining_class: std::rc::Rc<crate::value::Class>,
     ) {
         *self = MethodCache::Mono {

@@ -6,7 +6,6 @@ use crate::interp::Control;
 use crate::span::Span;
 use crate::value::Value;
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -302,7 +301,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 let j = (next_random() * (i as f64 + 1.0)).floor() as usize;
                 items.swap(i, j.min(i));
             }
-            Ok(Value::Array(Rc::new(RefCell::new(items))))
+            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
         }
         "choice" => {
             let a = want_array(&arg(args, 0), span, &ctx("choice"))?;
@@ -428,7 +427,7 @@ mod tests {
 
     #[test]
     fn math_stats() {
-        let a = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+        let a = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![
             n(1.0),
             n(2.0),
             n(3.0),
@@ -456,7 +455,7 @@ mod tests {
         assert!(
             matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Number(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
         );
-        let empty = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![])));
+        let empty = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![])));
         assert_eq!(
             call("sum", std::slice::from_ref(&empty), sp()).unwrap(),
             n(0.0)
@@ -471,7 +470,7 @@ mod tests {
             Err(Control::Panic(_))
         ));
         // sample variance needs >= 2 elements
-        let one = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![n(5.0)])));
+        let one = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![n(5.0)])));
         assert!(matches!(
             call("variance", &[one, Value::Bool(true)], sp()),
             Err(Control::Panic(_))
@@ -493,7 +492,7 @@ mod tests {
             call("randomInt", &[n(6.0), n(1.0)], sp()),
             Err(Control::Panic(_))
         ));
-        let a = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+        let a = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![
             n(1.0),
             n(2.0),
             n(3.0),
@@ -530,7 +529,7 @@ mod tests {
         } else {
             panic!()
         }
-        let empty = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![])));
+        let empty = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![])));
         assert_eq!(
             call("choice", std::slice::from_ref(&empty), sp()).unwrap(),
             Value::Nil

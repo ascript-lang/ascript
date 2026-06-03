@@ -10,6 +10,7 @@
 use crate::span::Span;
 use crate::value::Value;
 use crate::vm::value_ext::{Closure, FiberState};
+use gcmodule::Cc;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -17,17 +18,17 @@ use std::rc::Rc;
 /// its chunk, and the base index of this frame's local window on the shared
 /// stack.
 pub struct CallFrame {
-    pub closure: Rc<Closure>,
+    pub closure: Cc<Closure>,
     pub ip: usize,
     pub slot_base: usize,
     /// Heap cells for this frame's *cell slots* (captured locals), indexed by
-    /// local slot. `Some(cell)` for a cell slot (`Rc<RefCell<Value>>`, allocated
+    /// local slot. `Some(cell)` for a cell slot (`Cc<RefCell<Value>>`, allocated
     /// nil at frame entry), `None` for a plain stack slot. A closure created in
-    /// this frame captures these cells by reference (cloning the `Rc`), so it
+    /// this frame captures these cells by reference (cloning the `Cc`), so it
     /// observes later mutation. Dropping the frame releases the frame's own
     /// strong refs; any capturing closures keep theirs — correct by-reference
-    /// semantics.
-    pub cells: Vec<Option<Rc<RefCell<Value>>>>,
+    /// semantics. `Cc` (not `Rc`) so a frame-cell ↔ closure cycle is collectable.
+    pub cells: Vec<Option<Cc<RefCell<Value>>>>,
     /// The CALL-site span this frame was invoked at. Used to anchor the
     /// return-type contract panic at RETURN exactly where the tree-walker does
     /// (`run_body` checks the return value against the CALL span, not the
@@ -44,17 +45,17 @@ pub struct CallFrame {
 
 /// Build the per-slot cell vector for a frame from its proto's `cell_slots`
 /// (every captured local). `slot_count` sizes the vector; each cell slot gets a
-/// fresh `Rc<RefCell<Value::Nil>>`, every other slot is `None`.
+/// fresh `Cc<RefCell<Value::Nil>>`, every other slot is `None`.
 pub(crate) fn alloc_cells(
     slot_count: usize,
     cell_slots: &[u32],
-) -> Vec<Option<Rc<RefCell<Value>>>> {
+) -> Vec<Option<Cc<RefCell<Value>>>> {
     let mut cells = vec![None; slot_count];
     for &slot in cell_slots {
         let idx = slot as usize;
         // The resolver allocated this slot within the frame's window, so it is in
         // range; a stale index would be a resolver/compiler bug.
-        cells[idx] = Some(Rc::new(RefCell::new(Value::Nil)));
+        cells[idx] = Some(Cc::new(RefCell::new(Value::Nil)));
     }
     cells
 }
@@ -70,7 +71,7 @@ impl Fiber {
     /// Create a fiber running `top` as its sole (bottom) frame. Reserves the
     /// frame's local slots as `Value::Nil` so locals occupy `stack[0 ..
     /// slot_count]`; operands push above. Starts in [`FiberState::Running`].
-    pub fn new(top: Rc<Closure>) -> Self {
+    pub fn new(top: Cc<Closure>) -> Self {
         let slot_count = top.proto.chunk.slot_count as usize;
         let stack = vec![Value::Nil; slot_count];
         let cells = alloc_cells(slot_count, &top.proto.chunk.cell_slots);
@@ -188,7 +189,7 @@ impl Fiber {
         *cell.borrow_mut() = v;
     }
 
-    /// Install a BRAND-NEW heap cell (`Rc<RefCell<Value::Nil>>`) into the current
+    /// Install a BRAND-NEW heap cell (`Cc<RefCell<Value::Nil>>`) into the current
     /// frame's `slot`, dropping the frame's strong ref to the previous cell. Any
     /// closure that captured the previous cell keeps it alive with its own value.
     /// Used by `Op::FreshCell` to give each loop iteration a fresh cell for the
@@ -204,7 +205,7 @@ impl Fiber {
             .get_mut(slot)
             .and_then(|c| c.as_mut())
             .expect("Fiber::fresh_cell on a non-cell slot (compiler/resolver bug)");
-        *slot_cell = Rc::new(RefCell::new(Value::Nil));
+        *slot_cell = Cc::new(RefCell::new(Value::Nil));
     }
 }
 
@@ -213,7 +214,7 @@ mod tests {
     use super::*;
     use crate::vm::chunk::{Chunk, FnProto};
 
-    fn closure_with_slots(slots: u16) -> Rc<Closure> {
+    fn closure_with_slots(slots: u16) -> Cc<Closure> {
         let mut chunk = Chunk::new();
         chunk.slot_count = slots;
         let proto = Rc::new(FnProto {
@@ -228,7 +229,7 @@ mod tests {
         Closure::new(proto)
     }
 
-    fn closure_with_cell_slots(slots: u16, cell_slots: Vec<u32>) -> Rc<Closure> {
+    fn closure_with_cell_slots(slots: u16, cell_slots: Vec<u32>) -> Cc<Closure> {
         let mut chunk = Chunk::new();
         chunk.slot_count = slots;
         chunk.cell_slots = cell_slots;

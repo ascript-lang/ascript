@@ -8,7 +8,6 @@ use crate::span::Span;
 use crate::value::{MapKey, Value};
 use indexmap::IndexSet;
 use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -25,7 +24,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     ]
 }
 
-fn want_set(v: &Value, span: Span, ctx: &str) -> Result<Rc<RefCell<IndexSet<MapKey>>>, Control> {
+fn want_set(v: &Value, span: Span, ctx: &str) -> Result<gcmodule::Cc<crate::value::SetCell>, Control> {
     match v {
         Value::Set(s) => Ok(s.clone()),
         _ => Err(AsError::at(
@@ -51,11 +50,11 @@ fn want_element(v: &Value, span: Span, ctx: &str) -> Result<MapKey, Control> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(Rc::new(RefCell::new(v)))
+    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
 }
 
 fn empty_set() -> Value {
-    Value::Set(Rc::new(RefCell::new(IndexSet::new())))
+    Value::Set(crate::value::SetCell::new(IndexSet::new()))
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -65,7 +64,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 
         "from" => {
             // Build a set from an array, deduplicating elements.
-            let s = Rc::new(RefCell::new(IndexSet::new()));
+            let s = crate::value::SetCell::new(IndexSet::new());
             let seed = arg(args, 0);
             if !matches!(seed, Value::Nil) {
                 let elements = match &seed {
@@ -130,7 +129,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             for k in b.borrow().iter() {
                 out.insert(k.clone());
             }
-            Ok(Value::Set(Rc::new(RefCell::new(out))))
+            Ok(Value::Set(crate::value::SetCell::new(out)))
         }
 
         "intersection" => {
@@ -144,7 +143,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .filter(|k| b_ref.contains(*k))
                 .cloned()
                 .collect();
-            Ok(Value::Set(Rc::new(RefCell::new(out))))
+            Ok(Value::Set(crate::value::SetCell::new(out)))
         }
 
         "difference" => {
@@ -158,7 +157,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .filter(|k| !b_ref.contains(*k))
                 .cloned()
                 .collect();
-            Ok(Value::Set(Rc::new(RefCell::new(out))))
+            Ok(Value::Set(crate::value::SetCell::new(out)))
         }
 
         _ => Err(AsError::at(format!("std/set has no function '{}'", func), span).into()),
@@ -168,14 +167,14 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
+    
 
     fn sp() -> Span {
         Span::new(0, 0)
     }
 
     fn mk_set(elems: &[Value]) -> Value {
-        let s = Rc::new(RefCell::new(IndexSet::new()));
+        let s = crate::value::SetCell::new(IndexSet::new());
         for el in elems {
             s.borrow_mut().insert(MapKey::from_value(el).unwrap());
         }
@@ -197,7 +196,7 @@ mod tests {
 
     #[test]
     fn from_deduplicates() {
-        let arr = Value::Array(Rc::new(RefCell::new(vec![
+        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
             Value::Number(1.0),
             Value::Number(1.0),
             Value::Number(2.0),
@@ -211,7 +210,7 @@ mod tests {
 
     #[test]
     fn from_empty_array() {
-        let arr = Value::Array(Rc::new(RefCell::new(vec![])));
+        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![])));
         let s = call("from", std::slice::from_ref(&arr), sp()).unwrap();
         assert_eq!(
             call("size", std::slice::from_ref(&s), sp()).unwrap(),
@@ -306,7 +305,7 @@ mod tests {
     #[test]
     fn non_hashable_add_panics() {
         let s = call("new", &[], sp()).unwrap();
-        let bad = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])));
+        let bad = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Number(1.0)])));
         assert!(matches!(
             call("add", &[s, bad], sp()),
             Err(Control::Panic(_))
@@ -315,7 +314,7 @@ mod tests {
 
     #[test]
     fn non_hashable_from_panics() {
-        let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Array(Rc::new(
+        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Array(gcmodule::Cc::new(
             RefCell::new(vec![Value::Number(1.0)]),
         ))])));
         assert!(matches!(call("from", &[arr], sp()), Err(Control::Panic(_))));
@@ -324,7 +323,7 @@ mod tests {
     #[test]
     fn non_hashable_has_panics() {
         let s = call("new", &[], sp()).unwrap();
-        let bad = Value::Array(Rc::new(RefCell::new(vec![])));
+        let bad = Value::Array(gcmodule::Cc::new(RefCell::new(vec![])));
         assert!(matches!(
             call("has", &[s, bad], sp()),
             Err(Control::Panic(_))

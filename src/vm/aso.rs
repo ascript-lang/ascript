@@ -591,7 +591,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
             for _ in 0..n {
                 elems.push(read_value(r)?);
             }
-            Value::Array(Rc::new(std::cell::RefCell::new(elems)))
+            Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(elems)))
         }
         other => return Err(AsoError::BadConst(other)),
     };
@@ -1352,7 +1352,7 @@ run()
         // The object-rest bound-key list is an `Array` of literal `Str`s; it must
         // pass the literal-only check and round-trip byte-stably.
         let mut c = Chunk::new();
-        let keys = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+        let keys = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![
             Value::Str(std::rc::Rc::from("a")),
             Value::Str(std::rc::Rc::from("b")),
         ])));
@@ -1375,7 +1375,7 @@ run()
         // An array containing a non-literal element is still rejected.
         let mut c = Chunk::new();
         c.consts
-            .push(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(vec![
+            .push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![
                 Value::Object(crate::value::ObjectCell::new(indexmap::IndexMap::new())),
             ]))));
         assert_eq!(c.check_consts_literal_only(), Err("object"));

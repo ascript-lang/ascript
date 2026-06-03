@@ -4,6 +4,7 @@
 
 use crate::ast::Stmt;
 use crate::env::Environment;
+use gcmodule::Cc;
 use indexmap::{IndexMap, IndexSet};
 use rust_decimal::Decimal;
 use std::cell::{Cell, Ref, RefCell, RefMut};
@@ -26,8 +27,8 @@ pub struct ObjectCell {
 
 impl ObjectCell {
     /// Wrap an `IndexMap` into a shared `ObjectCell` with shape `0` (unset).
-    pub fn new(map: IndexMap<String, Value>) -> Rc<ObjectCell> {
-        Rc::new(ObjectCell {
+    pub fn new(map: IndexMap<String, Value>) -> Cc<ObjectCell> {
+        Cc::new(ObjectCell {
             map: RefCell::new(map),
             shape: Cell::new(0),
         })
@@ -41,6 +42,48 @@ impl ObjectCell {
     /// Mutable borrow of the entry map (drop-in for the old `Rc<RefCell<…>>`).
     pub fn borrow_mut(&self) -> RefMut<'_, IndexMap<String, Value>> {
         self.map.borrow_mut()
+    }
+}
+
+/// The heap payload behind `Value::Map`. A thin newtype around the entry
+/// `RefCell<IndexMap<…>>` whose only purpose is to carry a hand-written
+/// [`gcmodule::Trace`] impl: `IndexMap` is a foreign type, so we cannot give it
+/// (nor `RefCell<IndexMap>`) a blanket `Trace` impl (orphan rule). Wrapping it in
+/// this local newtype lets `Cc<MapCell>` satisfy `T: Trace` while the cycle
+/// collector still reaches the contained `Value`s. `Deref`s to the inner
+/// `RefCell` so every `m.borrow()`/`m.borrow_mut()` access site is unchanged.
+pub struct MapCell(pub RefCell<IndexMap<MapKey, Value>>);
+
+impl MapCell {
+    /// Wrap an `IndexMap` into a shared, `Cc`-managed `MapCell`.
+    pub fn new(map: IndexMap<MapKey, Value>) -> Cc<MapCell> {
+        Cc::new(MapCell(RefCell::new(map)))
+    }
+}
+
+impl std::ops::Deref for MapCell {
+    type Target = RefCell<IndexMap<MapKey, Value>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// The heap payload behind `Value::Set`. See [`MapCell`] — same story, a local
+/// newtype over `RefCell<IndexSet<…>>` so it can carry a `Trace` impl (foreign
+/// `IndexSet` cannot) and `Cc<SetCell>` satisfies `T: Trace`.
+pub struct SetCell(pub RefCell<IndexSet<MapKey>>);
+
+impl SetCell {
+    /// Wrap an `IndexSet` into a shared, `Cc`-managed `SetCell`.
+    pub fn new(set: IndexSet<MapKey>) -> Cc<SetCell> {
+        Cc::new(SetCell(RefCell::new(set)))
+    }
+}
+
+impl std::ops::Deref for SetCell {
+    type Target = RefCell<IndexSet<MapKey>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -324,16 +367,16 @@ pub enum Value {
     /// A bytecode-VM closure: a function prototype plus its captured upvalue
     /// cells. Behaves like `Function` to the user (same `type()`/display);
     /// identity equality. Produced by the VM (V4+); inert in the tree-walker.
-    Closure(Rc<crate::vm::value_ext::Closure>),
-    Array(Rc<RefCell<Vec<Value>>>),
-    Object(Rc<ObjectCell>),
+    Closure(Cc<crate::vm::value_ext::Closure>),
+    Array(Cc<RefCell<Vec<Value>>>),
+    Object(Cc<ObjectCell>),
     // IndexMap (not HashMap) is deliberate: insertion order is required for
     // deterministic keys/values/entries/display and to match `Object`.
-    Map(Rc<RefCell<IndexMap<MapKey, Value>>>),
+    Map(Cc<MapCell>),
     /// An insertion-ordered hash set of hashable values (spec §11.2).
     /// Elements use the same `MapKey` type as Map keys.
     /// Identity equality (like Array/Map/Bytes).
-    Set(Rc<RefCell<IndexSet<MapKey>>>),
+    Set(Cc<SetCell>),
     /// A mutable byte buffer (spec §11.2). Identity equality, like Array/Map.
     Bytes(Rc<RefCell<Vec<u8>>>),
     /// A compiled regular expression (spec §11.2). Identity equality.
@@ -347,7 +390,7 @@ pub enum Value {
     Enum(Rc<EnumDef>),
     EnumVariant(Rc<EnumVariant>),
     Class(Rc<Class>),
-    Instance(Rc<RefCell<Instance>>),
+    Instance(Cc<RefCell<Instance>>),
     BoundMethod(Rc<BoundMethod>),
     Super(Rc<SuperRef>),
     /// A pending or completed async computation (spec §7, M17 Phase 2). Produced
@@ -388,11 +431,11 @@ impl PartialEq for Value {
             (Value::Builtin(a), Value::Builtin(b)) => a == b,
             // Functions compare by identity.
             (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
-            (Value::Closure(a), Value::Closure(b)) => Rc::ptr_eq(a, b),
-            (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
-            (Value::Map(a), Value::Map(b)) => Rc::ptr_eq(a, b),
-            (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
+            (Value::Closure(a), Value::Closure(b)) => crate::gc::cc_ptr_eq(a, b),
+            (Value::Array(a), Value::Array(b)) => crate::gc::cc_ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) => crate::gc::cc_ptr_eq(a, b),
+            (Value::Map(a), Value::Map(b)) => crate::gc::cc_ptr_eq(a, b),
+            (Value::Set(a), Value::Set(b)) => crate::gc::cc_ptr_eq(a, b),
             (Value::Bytes(a), Value::Bytes(b)) => Rc::ptr_eq(a, b),
             #[cfg(feature = "data")]
             (Value::Regex(a), Value::Regex(b)) => Rc::ptr_eq(a, b),
@@ -404,7 +447,7 @@ impl PartialEq for Value {
             (Value::EnumVariant(a), Value::EnumVariant(b)) => Rc::ptr_eq(a, b),
             // Classes/instances/bound-methods/super compare by identity.
             (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
-            (Value::Instance(a), Value::Instance(b)) => Rc::ptr_eq(a, b),
+            (Value::Instance(a), Value::Instance(b)) => crate::gc::cc_ptr_eq(a, b),
             (Value::BoundMethod(a), Value::BoundMethod(b)) => Rc::ptr_eq(a, b),
             (Value::Super(a), Value::Super(b)) => Rc::ptr_eq(a, b),
             // Futures compare by identity (same completion cell).
@@ -490,7 +533,7 @@ impl Value {
             // an anonymous `Function`. (Same concept to the user.)
             Value::Closure(_) => write!(f, "<function>"),
             Value::Array(a) => {
-                let ptr = Rc::as_ptr(a) as usize;
+                let ptr = crate::gc::cc_addr(a);
                 if seen.contains(&ptr) {
                     return write!(f, "[...]");
                 }
@@ -507,7 +550,7 @@ impl Value {
                 Ok(())
             }
             Value::Object(o) => {
-                let ptr = Rc::as_ptr(o) as usize;
+                let ptr = crate::gc::cc_addr(o);
                 if seen.contains(&ptr) {
                     return write!(f, "{{...}}");
                 }
@@ -525,7 +568,7 @@ impl Value {
                 Ok(())
             }
             Value::Map(m) => {
-                let ptr = Rc::as_ptr(m) as usize;
+                let ptr = crate::gc::cc_addr(m);
                 if seen.contains(&ptr) {
                     return write!(f, "map {{...}}");
                 }
@@ -544,7 +587,7 @@ impl Value {
                 Ok(())
             }
             Value::Set(s) => {
-                let ptr = Rc::as_ptr(s) as usize;
+                let ptr = crate::gc::cc_addr(s);
                 if seen.contains(&ptr) {
                     return write!(f, "set {{...}}");
                 }
@@ -635,15 +678,15 @@ mod tests {
     #[test]
     fn arrays_compare_by_identity_and_display() {
         use std::cell::RefCell;
-        use std::rc::Rc;
-        let a = Value::Array(Rc::new(RefCell::new(vec![
+        
+        let a = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
             Value::Number(1.0),
             Value::Str("two".into()),
         ])));
         assert_eq!(a.to_string(), "[1, \"two\"]");
         // identity: a clone of the SAME Rc is equal; a fresh array is not
         assert_eq!(a.clone(), a);
-        let b = Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])));
+        let b = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Number(1.0)])));
         assert_ne!(a, b);
         assert!(a.is_truthy());
     }
@@ -654,12 +697,12 @@ mod tests {
         let mut m = IndexMap::new();
         m.insert(MapKey::Str("a".into()), Value::Number(1.0));
         m.insert(MapKey::Num(0.0f64.to_bits()), Value::Str("zero".into()));
-        let map = Value::Map(Rc::new(RefCell::new(m)));
+        let map = Value::Map(crate::value::MapCell::new(m));
         assert_eq!(map.to_string(), "map {\"a\": 1, 0: \"zero\"}");
         assert_eq!(map.clone(), map);
         assert!(map.is_truthy());
         assert!(MapKey::from_value(&Value::Number(0.0)).is_some());
-        assert!(MapKey::from_value(&Value::Array(Rc::new(RefCell::new(vec![])))).is_none());
+        assert!(MapKey::from_value(&Value::Array(gcmodule::Cc::new(RefCell::new(vec![])))).is_none());
     }
 
     #[test]

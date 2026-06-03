@@ -39,11 +39,27 @@
 //! The [`Trace`] impl on [`Value`] therefore visits ONLY the container variants
 //! and is a no-op for everything else.
 
-use crate::value::{Instance, MapKey, ObjectCell, Value};
+use crate::value::{Instance, MapCell, MapKey, ObjectCell, SetCell, Value};
 use crate::vm::value_ext::Closure;
-use gcmodule::{Trace, Tracer};
+use gcmodule::{Cc, Trace, Tracer};
 use indexmap::{IndexMap, IndexSet};
 use std::hash::Hash;
+
+/// Heap address of a `Cc`-managed object, for identity comparison and the
+/// display cycle-guard `seen` list. `gcmodule::Cc` exposes no `as_ptr`, but it
+/// derefs to a `T` held at a stable heap address, so `&**cc` is a stable
+/// per-object pointer (drop-in for the old `Rc::as_ptr(cc) as usize`).
+#[inline]
+pub fn cc_addr<T: Trace + ?Sized>(cc: &Cc<T>) -> usize {
+    (&**cc as *const T).cast::<()>() as usize
+}
+
+/// Pointer (identity) equality for two `Cc`s, mirroring `Rc::ptr_eq`. `Cc` has
+/// no inherent `ptr_eq`, so compare the stable deref addresses.
+#[inline]
+pub fn cc_ptr_eq<T: Trace + ?Sized>(a: &Cc<T>, b: &Cc<T>) -> bool {
+    std::ptr::eq(&**a as *const T as *const (), &**b as *const T as *const ())
+}
 
 /// Trace an `indexmap::IndexMap` by visiting every key and value. `indexmap`
 /// is a foreign crate, so gcmodule has no blanket impl — we hand-write one as a
@@ -84,22 +100,12 @@ impl Trace for Value {
             // V13-T2 these become `Cc<T>` and the collector takes over.
             Value::Array(a) => a.trace(tracer),
             Value::Object(o) => o.trace(tracer),
-            // Map/Set wrap a foreign `IndexMap`/`IndexSet` for which we cannot
-            // provide a blanket `Trace` impl (orphan rule), so the `Rc`/`RefCell`
-            // blanket impls don't apply. Trace the borrowed contents via the
-            // free helpers instead. An outstanding mutable borrow implies an
-            // outstanding reference, so skipping it is safe (mirrors gcmodule's
-            // own `RefCell` impl).
-            Value::Map(m) => {
-                if let Ok(map) = m.try_borrow() {
-                    trace_index_map(&map, tracer);
-                }
-            }
-            Value::Set(s) => {
-                if let Ok(set) = s.try_borrow() {
-                    trace_index_set(&set, tracer);
-                }
-            }
+            // Map/Set wrap a foreign `IndexMap`/`IndexSet` (orphan rule: no
+            // blanket `Trace`), so each is held in a local `MapCell`/`SetCell`
+            // newtype that carries the hand-written `Trace` impl below. The `Cc`
+            // delegates to that impl, which borrows and traces the contents.
+            Value::Map(m) => m.trace(tracer),
+            Value::Set(s) => s.trace(tracer),
             Value::Instance(i) => i.trace(tracer),
             Value::Closure(c) => c.trace(tracer),
             // NOTE on `Function`: a tree-walker `Function` captures an
@@ -135,6 +141,37 @@ impl Trace for ObjectCell {
         // is safe). `shape: Cell<u32>` is acyclic.
         if let Ok(map) = self.map.try_borrow() {
             trace_index_map(&map, tracer);
+        }
+    }
+
+    fn is_type_tracked() -> bool {
+        true
+    }
+}
+
+/// `MapCell` (`Value::Map` payload): a newtype over `RefCell<IndexMap<…>>`. The
+/// foreign `IndexMap` has no `Trace`, so we trace the borrowed contents via the
+/// free `trace_index_map` helper. An outstanding mutable borrow implies an
+/// outstanding reference, so skipping it is safe (mirrors gcmodule's `RefCell`).
+impl Trace for MapCell {
+    fn trace(&self, tracer: &mut Tracer) {
+        if let Ok(map) = self.try_borrow() {
+            trace_index_map(&map, tracer);
+        }
+    }
+
+    fn is_type_tracked() -> bool {
+        true
+    }
+}
+
+/// `SetCell` (`Value::Set` payload): a newtype over `RefCell<IndexSet<…>>`. See
+/// [`MapCell`] — keys are acyclic `MapKey`s, traced via the free helper for
+/// uniformity.
+impl Trace for SetCell {
+    fn trace(&self, tracer: &mut Tracer) {
+        if let Ok(set) = self.try_borrow() {
+            trace_index_set(&set, tracer);
         }
     }
 
@@ -278,16 +315,16 @@ mod tests {
             m.insert("k".to_string(), Value::Number(1.0));
             Value::Object(ObjectCell::new(m))
         };
-        let arr = Value::Array(Rc::new(RefCell::new(vec![inner.clone(), Value::Nil])));
+        let arr = Value::Array(Cc::new(RefCell::new(vec![inner.clone(), Value::Nil])));
         let mut mm: IndexMap<MapKey, Value> = IndexMap::new();
         mm.insert(MapKey::Str("a".into()), arr.clone());
-        let map = Value::Map(Rc::new(RefCell::new(mm)));
+        let map = Value::Map(MapCell::new(mm));
         let mut ss: IndexSet<MapKey> = IndexSet::new();
         ss.insert(MapKey::Num(0.0f64.to_bits()));
-        let set = Value::Set(Rc::new(RefCell::new(ss)));
+        let set = Value::Set(SetCell::new(ss));
         let closure = Value::Closure(Closure::with_upvalues(
             anon_proto(),
-            vec![Rc::new(RefCell::new(arr.clone()))],
+            vec![Cc::new(RefCell::new(arr.clone()))],
         ));
         for v in [&arr, &inner, &map, &set, &closure] {
             v.trace(&mut noop);
@@ -318,7 +355,7 @@ mod tests {
 
         let closure_inner = Closure::with_upvalues(
             anon_proto(),
-            vec![Rc::new(RefCell::new(Value::Number(9.0)))],
+            vec![Cc::new(RefCell::new(Value::Number(9.0)))],
         );
         closure_inner.trace(&mut noop); // no panic, traces upvalue cells
     }

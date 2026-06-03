@@ -432,7 +432,7 @@ pub(crate) fn want_array(
     v: &Value,
     span: Span,
     ctx: &str,
-) -> Result<Rc<std::cell::RefCell<Vec<Value>>>, Control> {
+) -> Result<gcmodule::Cc<std::cell::RefCell<Vec<Value>>>, Control> {
     match v {
         Value::Array(a) => Ok(a.clone()),
         _ => Err(AsError::at(
@@ -453,7 +453,7 @@ pub(crate) fn want_object(
     v: &Value,
     span: Span,
     ctx: &str,
-) -> Result<Rc<crate::value::ObjectCell>, Control> {
+) -> Result<gcmodule::Cc<crate::value::ObjectCell>, Control> {
     match v {
         Value::Object(o) => Ok(o.clone()),
         _ => Err(AsError::at(

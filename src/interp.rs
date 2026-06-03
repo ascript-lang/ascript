@@ -70,7 +70,7 @@ pub fn global_env() -> Environment {
 /// Build a `[value, err]` Result pair.
 // pub(crate): used by std/* modules (std/convert) later in M10.
 pub(crate) fn make_pair(value: Value, err: Value) -> Value {
-    Value::Array(Rc::new(RefCell::new(vec![value, err])))
+    Value::Array(gcmodule::Cc::new(RefCell::new(vec![value, err])))
 }
 
 /// Build an error object `{ message: <msg> }`.
@@ -408,7 +408,7 @@ impl Interp {
             .iter()
             .map(|s| Value::Str(s.clone()))
             .collect();
-        Value::Array(Rc::new(RefCell::new(args)))
+        Value::Array(gcmodule::Cc::new(RefCell::new(args)))
     }
 
     /// Register one newly-spawned async task: bump `inflight` (and the high-water
@@ -1030,7 +1030,7 @@ impl Interp {
                 }
                 if let Some((rest_name, _)) = rest {
                     let tail: Vec<Value> = items.iter().skip(names.len()).cloned().collect();
-                    let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(tail)));
+                    let arr = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(tail)));
                     env.define(rest_name, arr, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
@@ -1439,7 +1439,7 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(values))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(values))))
             }
             ExprKind::Object(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
@@ -1678,7 +1678,7 @@ impl Interp {
                     let remainder: Vec<Value> = items[pats.len()..].to_vec();
                     bindings.push((
                         rest_name.clone(),
-                        Value::Array(Rc::new(RefCell::new(remainder))),
+                        Value::Array(gcmodule::Cc::new(RefCell::new(remainder))),
                     ));
                 }
                 Ok(true)
@@ -2348,7 +2348,7 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        let instance = std::rc::Rc::new(std::cell::RefCell::new(crate::value::Instance {
+        let instance = gcmodule::Cc::new(std::cell::RefCell::new(crate::value::Instance {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
             shape_id: std::cell::Cell::new(0),
@@ -2480,7 +2480,7 @@ impl Interp {
             }
         }
 
-        Ok(Value::Instance(std::rc::Rc::new(std::cell::RefCell::new(
+        Ok(Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
             crate::value::Instance {
                 class: class.clone(),
                 fields: inst_fields,
@@ -2526,7 +2526,7 @@ impl Interp {
                         let p = format!("{}[{}]", path, i);
                         out.push(self.coerce_field(elem, it, env, strict, &p, span).await?);
                     }
-                    Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+                    Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(out))))
                 }
                 _ => Ok(val),
             },
@@ -2537,7 +2537,7 @@ impl Interp {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
+                    let out = crate::value::MapCell::new(indexmap::IndexMap::new());
                     for (k, v) in entries {
                         let p = format!("{}[{}]", path, k.to_value());
                         let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
@@ -2557,7 +2557,7 @@ impl Interp {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
+                    let out = crate::value::MapCell::new(indexmap::IndexMap::new());
                     for (k, v) in entries {
                         let p = format!("{}[{}]", path, k);
                         let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
@@ -2795,7 +2795,7 @@ impl Interp {
                         i += step;
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             other => {
                 if let Some((module, func)) = other.split_once('.') {
@@ -2947,7 +2947,7 @@ pub(crate) fn apply_binop(
             items.push(Value::Number(i));
             i += 1.0;
         }
-        return Ok(Value::Array(Rc::new(RefCell::new(items))));
+        return Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))));
     }
 
     // String concatenation: `+` joins two strings.
@@ -3399,7 +3399,7 @@ pub(crate) fn check_call_args(
             }
             rest_vals.push(a);
         }
-        bound.push(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(
+        bound.push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
             rest_vals,
         ))));
         Ok(bound)

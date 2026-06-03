@@ -2620,7 +2620,7 @@ impl Compiler {
                         // Leftover keys — those not in `bound_keys`. The bound-key
                         // set is stored as a single Array const referenced by index.
                         let keys =
-                            Value::Array(Rc::new(std::cell::RefCell::new(bound_keys.clone())));
+                            Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(bound_keys.clone())));
                         let keys_idx = self.chunk.add_const(keys);
                         self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);
                     }
@@ -2980,7 +2980,7 @@ impl Compiler {
                 el.as_token().map(|t| t.kind() == Ident).unwrap_or(false)
             }) {
                 let slot = self.pattern_bind_slot(rest, range_span(rest))?;
-                let keys = Value::Array(Rc::new(std::cell::RefCell::new(bound_keys)));
+                let keys = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(bound_keys)));
                 let keys_idx = self.chunk.add_const(keys);
                 self.emit_get_local_temp(subj_temp, span);
                 self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);

@@ -19,6 +19,7 @@ use crate::value::Value;
 use crate::vm::fiber::Fiber;
 use crate::vm::opcode::Op;
 use crate::vm::value_ext::{Closure, RunOutcome};
+use gcmodule::Cc;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
@@ -43,12 +44,12 @@ pub struct Vm {
     /// closure. A class's `Value::Class.methods` map is left empty; method dispatch
     /// goes through this table (`compiled_method`). The key is stable because the
     /// `Rc<Class>` is created once at compile time and shared by every instance.
-    class_methods: RefCell<HashMap<usize, HashMap<String, Rc<Closure>>>>,
+    class_methods: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
     /// Per-class field-default thunk table (V9): class `Rc` identity → field name →
     /// a zero-arg closure that produces the field's default value. Run once per
     /// constructed instance (so a mutable default yields a fresh value each time,
     /// matching the tree-walker's per-construct default eval).
-    class_defaults: RefCell<HashMap<usize, HashMap<String, Rc<Closure>>>>,
+    class_defaults: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
     /// Per-VM hidden-class registry (V11-T2). Assigns a `shape_id` to every
     /// object/instance key-LAYOUT via a transition tree; V11-T3 inline caches key
     /// on these ids. Only VM code paths touch it (the tree-walker leaves shapes 0).
@@ -937,7 +938,7 @@ impl Vm {
                     for slot in values.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
-                    fiber.push(Value::Array(Rc::new(RefCell::new(values))));
+                    fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(values))));
                 }
 
                 Op::NewObject => {
@@ -1260,7 +1261,7 @@ impl Vm {
                             ))
                         }
                     };
-                    fiber.push(Value::Array(Rc::new(RefCell::new(items))));
+                    fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(items))));
                 }
 
                 Op::ArrayLen => {
@@ -1540,7 +1541,7 @@ impl Vm {
                         Value::Array(arr) => {
                             let tail: Vec<Value> =
                                 arr.borrow().iter().skip(start).cloned().collect();
-                            fiber.push(Value::Array(Rc::new(RefCell::new(tail))));
+                            fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(tail))));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -2059,7 +2060,7 @@ impl Vm {
                         let _ = def_env.assign(&class.name, Value::Class(class.clone()));
                     }
                     let key = Rc::as_ptr(&class) as usize;
-                    let mut method_map: HashMap<String, Rc<Closure>> = HashMap::new();
+                    let mut method_map: HashMap<String, Cc<Closure>> = HashMap::new();
                     for (name, mv) in cp.method_names.iter().zip(methods) {
                         match mv {
                             Value::Closure(c) => {
@@ -2074,7 +2075,7 @@ impl Vm {
                             }
                         }
                     }
-                    let mut default_map: HashMap<String, Rc<Closure>> = HashMap::new();
+                    let mut default_map: HashMap<String, Cc<Closure>> = HashMap::new();
                     for (name, dv) in cp.default_fields.iter().zip(defaults) {
                         match dv {
                             Value::Closure(c) => {
@@ -2286,7 +2287,7 @@ impl Vm {
         &self,
         class: &Rc<crate::value::Class>,
         name: &str,
-    ) -> Option<Rc<Closure>> {
+    ) -> Option<Cc<Closure>> {
         let key = Rc::as_ptr(class) as usize;
         self.class_methods
             .borrow()
@@ -2306,7 +2307,7 @@ impl Vm {
         &self,
         class: &Rc<crate::value::Class>,
         name: &str,
-    ) -> Option<(Rc<Closure>, Rc<crate::value::Class>)> {
+    ) -> Option<(Cc<Closure>, Rc<crate::value::Class>)> {
         let mut cur = Some(class.clone());
         while let Some(c) = cur {
             if let Some(closure) = self.compiled_method_own(&c, name) {
@@ -2323,7 +2324,7 @@ impl Vm {
     fn bound_method_is_vm(
         &self,
         bm: &crate::value::BoundMethod,
-    ) -> Option<Rc<Closure>> {
+    ) -> Option<Cc<Closure>> {
         if let Value::Instance(inst) = &bm.receiver {
             let class = inst.borrow().class.clone();
             // Resolve from the method's DEFINING class (set by `vm_read_member` /
@@ -2571,7 +2572,7 @@ impl Vm {
         op_off: usize,
         recv: &Value,
         name: &str,
-    ) -> Option<(Rc<Closure>, Rc<crate::value::Class>)> {
+    ) -> Option<(Cc<Closure>, Rc<crate::value::Class>)> {
         let Value::Instance(inst) = recv else {
             return None;
         };
@@ -2768,7 +2769,7 @@ impl Vm {
     /// key leaves the layout — and thus the shape — unchanged, which V11-T3's IC
     /// validity relies on). Walks the full key list through the transition tree;
     /// a no-op-cost path because shared prefixes are deduped.
-    fn resync_object_shape(&self, obj: &Rc<crate::value::ObjectCell>) {
+    fn resync_object_shape(&self, obj: &Cc<crate::value::ObjectCell>) {
         let keys: Vec<String> = obj.map.borrow().keys().cloned().collect();
         let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
         obj.shape.set(shape);
@@ -2781,7 +2782,7 @@ impl Vm {
     /// yields a changed shape, so any cache entry keyed by the OLD shape simply
     /// MISSES (and re-resolves) instead of reading a stale index. Reassigning an
     /// existing field leaves the layout — and thus the shape — unchanged.
-    fn resync_instance_shape(&self, inst: &Rc<RefCell<crate::value::Instance>>) {
+    fn resync_instance_shape(&self, inst: &Cc<RefCell<crate::value::Instance>>) {
         let keys: Vec<String> = inst.borrow().fields.keys().cloned().collect();
         let shape = self.object_shape_for(keys.iter().map(|s| s.as_str()));
         inst.borrow().shape_id.set(shape);
@@ -2886,7 +2887,7 @@ impl Vm {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        let instance = Rc::new(RefCell::new(crate::value::Instance {
+        let instance = Cc::new(RefCell::new(crate::value::Instance {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
             // Give the instance its class's BASE shape (the declared-field layout,
@@ -2978,7 +2979,7 @@ impl Vm {
     #[async_recursion::async_recursion(?Send)]
     async fn invoke_compiled_method(
         &self,
-        closure: Rc<Closure>,
+        closure: Cc<Closure>,
         receiver: Value,
         args: Vec<Value>,
         span: Span,
@@ -3996,7 +3997,7 @@ mod tests {
         let out = with_vm(|vm| async move {
             let a = spawn_vm_future(&vm, f.clone(), vec![Value::Number(10.0)]);
             let b = spawn_vm_future(&vm, f, vec![Value::Number(20.0)]);
-            let arr = Value::Array(Rc::new(RefCell::new(vec![a, b])));
+            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![a, b])));
             vm.interp()
                 .call_task("gather", &[arr], s())
                 .await
@@ -4025,7 +4026,7 @@ mod tests {
         let f = compile_closure("(n) => n * 2");
         let out = with_vm(|vm| async move {
             let a = spawn_vm_future(&vm, f, vec![Value::Number(21.0)]);
-            let arr = Value::Array(Rc::new(RefCell::new(vec![a])));
+            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![a])));
             vm.interp()
                 .call_task("race", &[arr], s())
                 .await
@@ -4041,7 +4042,7 @@ mod tests {
         // `(x) => x[9]` indexes a 1-element array out of bounds at runtime.
         let f = compile_closure("(x) => x[9]");
         let err = with_vm(|vm| async move {
-            let arr = Value::Array(Rc::new(RefCell::new(vec![Value::Number(0.0)])));
+            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Number(0.0)])));
             vm.call_value(f, vec![arr], s())
                 .await
                 .expect_err("expected a panic")

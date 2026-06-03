@@ -106,7 +106,7 @@ impl Interp {
                 ips.push(Value::Str(Rc::from(ip.as_str())));
             }
         }
-        let arr = Value::Array(Rc::new(std::cell::RefCell::new(ips)));
+        let arr = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(ips)));
         Ok(make_pair(arr, Value::Nil))
     }
 }
