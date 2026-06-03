@@ -68,19 +68,22 @@ pub enum Op {
     /// The VM's globals are the bare builtins (`crate::interp::BUILTIN_NAMES`);
     /// the result is the corresponding `Value::Builtin`.
     GetGlobal,
-    /// `SET_GLOBAL(u16)` — store TOS into the global named by `consts[idx]`.
-    ///
-    /// **Currently unused — never emitted by the compiler, never executed.**
-    /// AScript has no writable user globals: a top-level `let`/`const` binds a
-    /// *frame-local* of the SourceFile frame (so `x = ...` at top level lowers to
-    /// `SET_LOCAL`, handled by the locals slice), and the only true globals — the
-    /// bare builtins — are *immutable* (the tree-walker rejects `print = 5` with
-    /// "cannot assign to immutable binding 'print'", so the compiler never reaches
-    /// an assignment whose target resolves to a builtin global). The opcode stays
-    /// declared (it was reserved in V1 and keeps the byte layout stable for the
-    /// disassembler / future host-injected mutable globals), but `Vm::run` has no
-    /// arm for it; if one were ever emitted it would hit the "not yet implemented"
-    /// guard rather than silently mis-store.
+    /// `DEFINE_GLOBAL(u16)` — pop TOS and bind it as the MODULE-SCOPE user-global
+    /// named by `consts[idx]` (a `Str`), creating or overwriting the entry and
+    /// bumping the global version. Emitted by every DIRECT-child top-level binding
+    /// define-site (`let`/`const`/`fn`/`class`/`enum`/`import`). Pairs with
+    /// [`Op::GetGlobal`] (which consults the user-globals table before the builtins),
+    /// so a function/thunk body referencing a top-level binding declared LATER
+    /// late-binds at run time — matching the tree-walker's single shared module
+    /// `Environment`.
+    DefineGlobal,
+    /// `SET_GLOBAL(u16)` — store TOS into the EXISTING module-scope user-global named
+    /// by `consts[idx]` (a `Str`), bumping the global version. Emitted by a top-level
+    /// REASSIGNMENT `x = …` whose target resolves to a module global. Assigning to a
+    /// name not present in the user-globals table raises the tree-walker's exact
+    /// message `cannot assign to undefined variable '<name>'`. (A builtin global is
+    /// immutable — the compiler never lowers an assignment to a builtin, the
+    /// tree-walker rejects it earlier with "cannot assign to immutable binding".)
     SetGlobal,
 
     // ---- arithmetic / logic ----------------------------------------------
@@ -443,6 +446,7 @@ impl Op {
             x if x == CloseUpvalue as u8 => CloseUpvalue,
 
             x if x == GetGlobal as u8 => GetGlobal,
+            x if x == DefineGlobal as u8 => DefineGlobal,
             x if x == SetGlobal as u8 => SetGlobal,
 
             x if x == Add as u8 => Add,
@@ -538,10 +542,10 @@ impl Op {
         match self {
             // u16-operand ops.
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
-            | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | Closure | NewArray | NewObject
-            | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import
-            | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey | CallMethodSpread
-            | DefineExport => 2,
+            | SetUpvalue | CloseUpvalue | GetGlobal | DefineGlobal | SetGlobal | Closure | NewArray
+            | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template
+            | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey
+            | CallMethodSpread | DefineExport => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -595,6 +599,7 @@ mod tests {
         Op::SetUpvalue,
         Op::CloseUpvalue,
         Op::GetGlobal,
+        Op::DefineGlobal,
         Op::SetGlobal,
         Op::Add,
         Op::Sub,

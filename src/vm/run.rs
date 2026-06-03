@@ -101,6 +101,25 @@ pub struct Vm {
     /// relative file import (`from "./mod"`). Mirrors `Interp::module_dir`. Swapped
     /// around a nested module run and restored after.
     module_dir: RefCell<std::path::PathBuf>,
+    /// MODULE-SCOPE USER-GLOBALS: every DIRECT-child top-level binding of the entry
+    /// program (`let`/`const`/`fn`/`class`/`enum`/`import`) is a late-bound global
+    /// stored here by name, NOT a SourceFile-frame slot-local. `Op::DefineGlobal`
+    /// inserts, `Op::SetGlobal` updates, and `Op::GetGlobal` consults this table
+    /// BEFORE the bare builtins — so a function/thunk body that references a top-level
+    /// binding declared LATER resolves at run time, matching the tree-walker's single
+    /// shared module `Environment`. Plain owned `Value`s (the `Vm` is the GC root, so
+    /// they stay reachable) in insertion (declaration) order. This table is ALSO the
+    /// REPL's cross-line persistence: one `Vm` kept alive across lines carries its
+    /// globals forward. (A file module's exports use the separate `module_exports`
+    /// path; only the entry chunk defines into this table.)
+    user_globals: RefCell<indexmap::IndexMap<Rc<str>, Value>>,
+    /// Monotonic version counter, bumped on every global (re)definition or
+    /// assignment. The V11-T4 GET_GLOBAL inline cache (`adapt::GlobalCache`) guards
+    /// its cached value with this version: a cache entry recorded at version V is
+    /// valid only while the version is still V, so any global write invalidates it.
+    /// Top-level defines run once at load, then the version is stable, so the caches
+    /// stay hot for the steady-state hot loops.
+    global_version: std::cell::Cell<u64>,
 }
 
 impl Vm {
@@ -133,6 +152,8 @@ impl Vm {
             module_exports: RefCell::new(Rc::new(RefCell::new(indexmap::IndexMap::new()))),
             file_modules: RefCell::new(HashMap::new()),
             module_dir: RefCell::new(std::env::current_dir().unwrap_or_else(|_| ".".into())),
+            user_globals: RefCell::new(indexmap::IndexMap::new()),
+            global_version: std::cell::Cell::new(0),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -181,8 +202,20 @@ impl Vm {
     /// `class_env` field doc for why this mirrors the tree-walker's module env.
     fn class_env(&self) -> crate::env::Environment {
         let mut slot = self.class_env.borrow_mut();
-        slot.get_or_insert_with(|| crate::interp::global_env().child())
-            .clone()
+        if slot.is_none() {
+            // First build: seed with the module-scope user-globals already defined, so
+            // the SHARED `validate_into` (`ClassName.from` / typed-parse) resolves a
+            // field default that references a top-level `let`/`const`/`fn`/`class`
+            // (e.g. `n: number = LATER` where `const LATER` is a module global) — the
+            // VM's construct path reads those via `GET_GLOBAL`, but `.from` evaluates
+            // the default through this `def_env`. Kept in sync by `define_user_global`.
+            let env = crate::interp::global_env().child();
+            for (name, value) in self.user_globals.borrow().iter() {
+                let _ = env.define(name, value.clone(), true);
+            }
+            *slot = Some(env);
+        }
+        slot.as_ref().unwrap().clone()
     }
 
     /// Resolve, load, and run a FILE module on the VM, returning its exports map
@@ -493,30 +526,35 @@ impl Vm {
                             ))
                         }
                     };
-                    // The VM's globals are the bare builtins. The resolver classes
-                    // every free identifier as `Global`, and the compiler only
-                    // emits `GET_GLOBAL` for names in `BUILTIN_NAMES` (a bare-builtin
-                    // call or a first-class builtin reference like `let p = print`);
-                    // a non-builtin global is a compile-time deferral, so it never
-                    // reaches here in a validly-compiled program. The guard below is
-                    // defence-in-depth: should one ever arrive, we surface the
-                    // tree-walker's exact runtime message (`undefined variable '<n>'`,
-                    // see `Interp::eval_expr`'s `ExprKind::Ident` arm) so the two
-                    // engines stay byte-identical.
-                    // V11-T4 GET_GLOBAL_CACHED: cache the resolved value at this
-                    // op's offset, guarded by the global-table VERSION. A version
-                    // hit returns the cached value (skipping the name re-check); a
-                    // version miss (never today — globals are immutable builtins,
-                    // version is constant 0) re-resolves. Correctness: the cached
-                    // value is exactly what the resolve below produces, and the
-                    // version guard invalidates it on any future global mutation.
-                    // KILL SWITCH (V11-T5): with specialization OFF, NEVER consult
-                    // or record the global cache — always re-resolve the name
-                    // generically. The resolved value is identical either way (a
-                    // bare builtin), so generic and specialized stay byte-identical.
+                    // Resolution ORDER (matching the tree-walker's module
+                    // `Environment`, a child of the builtins): consult the
+                    // module-scope USER-GLOBALS first, THEN the bare builtins, ELSE
+                    // the tree-walker's exact runtime message (`undefined variable
+                    // '<n>'`, see `Interp::eval_expr`'s `ExprKind::Ident` arm). A user
+                    // global thus SHADOWS a builtin of the same name (e.g.
+                    // `import { test }` shadowing the builtin `test`), exactly as in
+                    // the tree-walker.
+                    // V11-T4 GET_GLOBAL_CACHED: cache the resolved value at this op's
+                    // offset, guarded by the global-table VERSION. A version hit
+                    // returns the cached value (skipping the lookup); a version miss
+                    // (any global write bumps the version) re-resolves. Correctness:
+                    // the cached value is exactly what the resolve below produces, and
+                    // the version guard invalidates it on every global mutation.
+                    // KILL SWITCH (V11-T5): with specialization OFF, NEVER consult or
+                    // record the global cache — always re-resolve generically. The
+                    // resolved value is identical either way, so generic and
+                    // specialized stay byte-identical.
                     let version = self.global_version();
                     let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
                     if let Some(v) = cache.get(version).filter(|_| self.specialize) {
+                        fiber.push(v);
+                    } else if let Some(v) = self.get_user_global(&name) {
+                        // A user global is a cheap IndexMap lookup and its VALUE is
+                        // MUTABLE (a top-level `let` reassigned in a hot loop). We do
+                        // NOT cache it: caching the value would thrash (every
+                        // SET_GLOBAL bumps the version, invalidating the entry each
+                        // iteration) AND would risk serving a stale value. Only the
+                        // IMMUTABLE bare builtins below are cached.
                         fiber.push(v);
                     } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
                         let v = Value::Builtin(name);
@@ -532,6 +570,58 @@ impl Vm {
                             fiber,
                             fault_ip,
                             format!("undefined variable '{name}'"),
+                        ));
+                    }
+                }
+
+                Op::DefineGlobal => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("DEFINE_GLOBAL operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let v = fiber.pop();
+                    self.define_user_global(name, v);
+                }
+
+                Op::SetGlobal => {
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("SET_GLOBAL operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    // Top-level reassignment `x = …` of an EXISTING module global. A
+                    // SET_LOCAL-style assignment leaves the value on the stack (an
+                    // assignment is an expression yielding the assigned value), so we
+                    // PEEK (clone TOS) rather than pop. Assigning to a name not in the
+                    // user-globals table is the tree-walker's exact error (see
+                    // `Interp` assignment): `cannot assign to undefined variable '<n>'`.
+                    let v = fiber.peek(0).clone();
+                    if self.user_globals.borrow().contains_key(name.as_ref()) {
+                        // Update the existing global's value in place. We do NOT bump
+                        // the global version: user-global reads are never cached (only
+                        // immutable builtins are), and a value update cannot change
+                        // which NAME a cached builtin entry resolves to — so no cache
+                        // can go stale. This keeps a hot reassignment loop cheap (no
+                        // per-iteration cache invalidation), matching the generic VM.
+                        self.update_user_global(&name, v);
+                    } else {
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("cannot assign to undefined variable '{name}'"),
                         ));
                     }
                 }
@@ -1390,7 +1480,7 @@ impl Vm {
 
                     match desc {
                         crate::vm::chunk::ImportDesc::Named { source, names } => {
-                            for (name, slot, is_cell) in names {
+                            for (name, slot, is_cell, is_global) in names {
                                 let v = {
                                     let ex = exports.borrow();
                                     match ex.get(&name) {
@@ -1407,7 +1497,9 @@ impl Vm {
                                         }
                                     }
                                 };
-                                if is_cell {
+                                if is_global {
+                                    self.define_user_global(Rc::from(name.as_str()), v);
+                                } else if is_cell {
                                     fiber.set_local_cell(slot as usize, v);
                                 } else {
                                     fiber.set_local(slot as usize, v);
@@ -1415,11 +1507,17 @@ impl Vm {
                             }
                         }
                         crate::vm::chunk::ImportDesc::Namespace {
-                            slot, is_cell, ..
+                            alias,
+                            slot,
+                            is_cell,
+                            is_global,
+                            ..
                         } => {
                             let map = exports.borrow().clone();
                             let ns = Value::Object(crate::value::ObjectCell::new(map));
-                            if is_cell {
+                            if is_global {
+                                self.define_user_global(Rc::from(alias.as_str()), ns);
+                            } else if is_cell {
                                 fiber.set_local_cell(slot as usize, ns);
                             } else {
                                 fiber.set_local(slot as usize, ns);
@@ -2694,15 +2792,58 @@ impl Vm {
         self.shapes.borrow_mut().shape_for(keys)
     }
 
-    /// The current global-table version (V11-T4). AScript's globals are the
-    /// immutable bare builtins (top-level `let`s are frame-locals; builtins are
-    /// never reassigned), so the global set is CONSTANT and the version never
-    /// changes. It exists so the [`GET_GLOBAL`](Op::GetGlobal) cache carries a
-    /// real version guard: should a future revision ever permit global mutation,
-    /// bumping this counter on that mutation invalidates every cached entry. Today
-    /// it is a constant `0` and every cache hit is trivially valid.
+    /// The current global-table version (V11-T4). Bumped on every user-global
+    /// (re)definition (`Op::DefineGlobal`) or assignment (`Op::SetGlobal`). The
+    /// [`GET_GLOBAL`](Op::GetGlobal) inline cache guards its cached value with this
+    /// version, so a global write invalidates every cached entry. Top-level defines
+    /// run once at load, then the version is stable and the caches stay hot.
     fn global_version(&self) -> u64 {
-        0
+        self.global_version.get()
+    }
+
+    /// Bump the global-table version (invalidates every `GET_GLOBAL` cache entry
+    /// recorded at the previous version). Saturating to avoid wraparound issues over
+    /// an extremely long-lived `Vm` (a wrap is harmless for correctness — a stale
+    /// cache hit would still be re-validated by the value's identity — but saturation
+    /// keeps the invariant "any write changes the version" exact).
+    fn bump_global_version(&self) {
+        self.global_version.set(self.global_version.get().saturating_add(1));
+    }
+
+    /// Read a module-scope user-global by name. Returns the stored `Value` (cloned)
+    /// or `None` if not yet defined.
+    fn get_user_global(&self, name: &str) -> Option<Value> {
+        self.user_globals.borrow().get(name).cloned()
+    }
+
+    /// Update an EXISTING module-scope user-global's value WITHOUT bumping the global
+    /// version (a value update cannot invalidate any cache — user-global reads are
+    /// never cached, and builtin caches key on the NAME's resolution target, which an
+    /// in-place value update does not change). Keeps the class `def_env` in sync for
+    /// `.from`/typed-parse default resolution. Caller has confirmed the key exists.
+    fn update_user_global(&self, name: &str, value: Value) {
+        if let Some(slot) = self.user_globals.borrow_mut().get_mut(name) {
+            *slot = value.clone();
+        }
+        if let Some(env) = self.class_env.borrow().as_ref() {
+            let _ = env.assign(name, value);
+        }
+    }
+
+    /// Define (create/overwrite) a module-scope user-global and bump the version.
+    fn define_user_global(&self, name: Rc<str>, value: Value) {
+        self.user_globals
+            .borrow_mut()
+            .insert(name.clone(), value.clone());
+        self.bump_global_version();
+        // Keep the lazily-built class `def_env` (used by the SHARED `validate_into`
+        // for `.from`/typed-parse field-default resolution) in sync, so a default
+        // that references this top-level binding resolves on the `.from` path too.
+        if let Some(env) = self.class_env.borrow().as_ref() {
+            if env.define(&name, value.clone(), true).is_err() {
+                let _ = env.assign(&name, value);
+            }
+        }
     }
 
     /// PEP-659 adaptive arithmetic (V11-T4): a guarded fast path in FRONT of the
@@ -3933,10 +4074,12 @@ mod tests {
 
     #[test]
     fn call_value_closure_observes_its_captured_upvalue() {
-        // A closure capturing an outer `k` and applied to a native-supplied arg —
-        // exactly `let k = 10; array.map([..], (x) => x + k)`. The captured cell
-        // travels with the closure value, so a fresh VM driving it still sees k.
-        let f = compile_closure("let k = 10\nlet f = (x) => x + k\nf");
+        // A closure capturing an outer FUNCTION-LOCAL `k` and applied to a
+        // native-supplied arg — exactly `array.map([..], (x) => x + k)` inside a fn.
+        // The captured cell travels WITH the closure value (it is a genuine upvalue,
+        // not a module global), so a fresh VM driving it still sees k = 10. (A
+        // top-level `let k` would instead be a module global read via GET_GLOBAL.)
+        let f = compile_closure("fn make() {\n let k = 10\n return (x) => x + k\n}\nmake()");
         let got = with_vm(|vm| async move {
             vm.call_value(f, vec![Value::Number(5.0)], s())
                 .await

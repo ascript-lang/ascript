@@ -5,7 +5,7 @@ pub mod types;
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use cstree::text::TextRange;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use types::*;
 
 /// Resolve a parsed source file.
@@ -74,6 +74,22 @@ struct Resolver {
     result: ResolveResult,
     frames: Vec<Frame>,
     scopes: Vec<Scope>,
+    /// Names of every DIRECT-child top-level binding of the `SourceFile`
+    /// (`let`/`const`/`fn`/`class`/`enum`/`import`). These are MODULE-SCOPE
+    /// USER-GLOBALS, not file-frame slot-locals: their references lower to
+    /// `Resolution::Global(name)` (→ `GET_GLOBAL`) and their define-sites lower to
+    /// `DEFINE_GLOBAL`, so a forward reference late-binds at run time — matching the
+    /// tree-walker's single shared module `Environment`. Inner shadowing still wins
+    /// because `resolve_local`/`resolve_upvalue` run BEFORE this set is consulted.
+    module_globals: HashSet<String>,
+    /// Per-name read-use counters for module globals (the slot-based `bump_use`
+    /// cannot count them — they have no file-frame slot). Mirrored into each global
+    /// binding's `use_count` in `finish` so the checker's `unused-binding`/
+    /// `unused-import` lints stay correct.
+    global_uses: HashMap<String, u32>,
+    /// The module-global bindings (one per declared top-level name), recorded for
+    /// the checker. They carry no real frame slot (`slot` is unused for globals).
+    global_bindings: Vec<Binding>,
 }
 
 impl Resolver {
@@ -82,6 +98,9 @@ impl Resolver {
             result: ResolveResult::default(),
             frames: Vec::new(),
             scopes: Vec::new(),
+            module_globals: HashSet::new(),
+            global_uses: HashMap::new(),
+            global_bindings: Vec::new(),
         }
     }
 
@@ -103,17 +122,77 @@ impl Resolver {
         self.scopes.pop();
     }
 
+    /// True when resolution is positioned at the DIRECT-child statement level of the
+    /// `SourceFile`: the file frame is the only open frame AND only its root scope is
+    /// open (no nested block/loop/match scope). A binding declared here is a
+    /// module-scope user-global; a binding inside a top-level bare `{ }` block (which
+    /// opens a child scope) is NOT — matching the tree-walker, where a `{ }` block is
+    /// an `env.child()` so its `let` does not escape the block.
+    fn at_module_top(&self) -> bool {
+        self.frames.len() == 1 && self.scopes.len() == self.frame_ref().scope_base + 1
+    }
+
+    /// Declare a binding, routing DIRECT-child top-level names (those in
+    /// `module_globals`) to a global binding (no slot, not entered into a scope) and
+    /// everything else to a normal frame-slot `declare`. Returns the assigned slot
+    /// for slot-locals; for a global it returns `u32::MAX` (never used — a global has
+    /// no slot, and its references lower to `GET_GLOBAL`, not `GET_LOCAL`).
+    fn declare_binding(&mut self, name: &str, kind: BindingKind, decl_range: TextRange) -> u32 {
+        if self.at_module_top() && self.module_globals.contains(name) {
+            self.declare_global(name, kind, decl_range);
+            u32::MAX
+        } else {
+            self.declare(name, kind, decl_range)
+        }
+    }
+
+    /// Record a module-scope user-global binding for the checker. It has NO file-frame
+    /// slot and is NOT entered into the scope map (so `resolve_local`/`resolve_upvalue`
+    /// never find it — a reference falls through to `Resolution::Global`). A repeated
+    /// declaration of the same global name (e.g. a re-`let`) records once; the first
+    /// declaration's range is canonical (mirrors the single shared module env).
+    fn declare_global(&mut self, name: &str, kind: BindingKind, decl_range: TextRange) {
+        if self.global_bindings.iter().any(|b| b.name == name) {
+            return;
+        }
+        self.global_bindings.push(Binding {
+            name: name.to_string(),
+            kind,
+            slot: u32::MAX,
+            decl_range,
+            captured: false,
+            mutated: false,
+            use_count: 0,
+            shadows: None,
+            is_global: true,
+        });
+    }
+
     fn declare(&mut self, name: &str, kind: BindingKind, decl_range: TextRange) -> u32 {
         // Shadowing is detected within the current function frame's scope stack
         // only; an inner fn shadowing an outer-fn binding is intentionally not
-        // flagged (conservative).
-        let shadows = self.resolve_local(name).and_then(|outer_slot| {
-            self.frame_ref()
-                .bindings
-                .iter()
-                .find(|b| b.slot == outer_slot)
-                .map(|b| b.decl_range)
-        });
+        // flagged (conservative). A frame-local that shadows a MODULE-SCOPE
+        // user-global (e.g. an inner-block `let x` over a top-level `let x`) is also
+        // flagged, since the tree-walker's single module env makes that a real shadow.
+        let shadows = self
+            .resolve_local(name)
+            .and_then(|outer_slot| {
+                self.frame_ref()
+                    .bindings
+                    .iter()
+                    .find(|b| b.slot == outer_slot)
+                    .map(|b| b.decl_range)
+            })
+            .or_else(|| {
+                if self.module_globals.contains(name) {
+                    self.global_bindings
+                        .iter()
+                        .find(|b| b.name == name)
+                        .map(|b| b.decl_range)
+                } else {
+                    None
+                }
+            });
         let slot = self.frame().next_slot;
         self.frame().next_slot += 1;
         self.frame().bindings.push(Binding {
@@ -125,6 +204,7 @@ impl Resolver {
             mutated: false,
             use_count: 0,
             shadows,
+            is_global: false,
         });
         self.scopes
             .last_mut()
@@ -223,6 +303,27 @@ impl Resolver {
         (ups.len() - 1) as u32
     }
 
+    /// Classify a NAME reference (a `NameRef`, or a `class … extends` superclass
+    /// ident) into a `Resolution`, with the SAME ordering at every use site:
+    /// `resolve_local` → `resolve_upvalue` → `Global`. Inner shadowing wins because
+    /// the local/upvalue lookups run before the global fallthrough. When the name is
+    /// a module global, its per-name read-use counter is bumped so the checker's
+    /// `unused-binding`/`unused-import` lints (which run off the binding's
+    /// `use_count`) stay correct even though the global has no frame slot.
+    fn resolve_name(&mut self, name: &str) -> Resolution {
+        if let Some(slot) = self.resolve_local(name) {
+            self.bump_use(slot);
+            Resolution::Local(slot)
+        } else if let Some(idx) = self.resolve_upvalue(self.frames.len() - 1, name) {
+            Resolution::Upvalue(idx)
+        } else {
+            if self.module_globals.contains(name) {
+                *self.global_uses.entry(name.to_string()).or_insert(0) += 1;
+            }
+            Resolution::Global(name.to_string())
+        }
+    }
+
     fn mark_captured(&mut self, frame_idx: usize, slot: u32) {
         if let Some(b) = self.frames[frame_idx]
             .bindings
@@ -230,6 +331,93 @@ impl Resolver {
             .find(|b| b.slot == slot)
         {
             b.captured = true;
+        }
+    }
+
+    /// Collect the binding name(s) a DIRECT-child top-level statement introduces
+    /// into `module_globals`. Mirrors what the tree-walker would bind into the
+    /// module `Environment`: a `let`/`const` (ident or destructuring-pattern names),
+    /// a hoisted `fn`/`class`/`enum`, and `import` names. An `export <decl>` is
+    /// unwrapped to its inner decl. Statements that bind nothing are ignored.
+    fn collect_module_globals(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        match node.kind() {
+            LetStmt => {
+                if let Some(arr) = node.children().find(|c| c.kind() == ArrayBindPat) {
+                    self.collect_pattern_global_names(arr);
+                } else if let Some(obj) = node.children().find(|c| c.kind() == ObjectBindPat) {
+                    self.collect_pattern_global_names(obj);
+                } else if let Some(name) = ident_text(node) {
+                    self.module_globals.insert(name);
+                }
+            }
+            FnDecl => {
+                if let Some(name) = fn_name(node) {
+                    self.module_globals.insert(name);
+                }
+            }
+            ClassDecl | EnumDecl => {
+                if let Some(name) = ident_text(node) {
+                    self.module_globals.insert(name);
+                }
+            }
+            ImportStmt => {
+                self.collect_import_global_names(node);
+            }
+            ExportStmt => {
+                for child in node.children() {
+                    self.collect_module_globals(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_pattern_global_names(&mut self, pat: &ResolvedNode) {
+        use SyntaxKind::*;
+        for entry in pat.children() {
+            match entry.kind() {
+                BindEntry => {
+                    let local = entry
+                        .children_with_tokens()
+                        .filter_map(|el| el.into_token())
+                        .filter(|t| t.kind() == Ident)
+                        .last()
+                        .map(|t| t.text().to_string());
+                    if let Some(name) = local {
+                        self.module_globals.insert(name);
+                    }
+                }
+                RestBind => {
+                    if let Some(name) = ident_text(entry) {
+                        self.module_globals.insert(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn collect_import_global_names(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        if let Some(list) = node.children().find(|c| c.kind() == ImportList) {
+            for t in list.children_with_tokens().filter_map(|el| el.into_token()) {
+                if t.kind() == Ident {
+                    self.module_globals.insert(t.text().to_string());
+                }
+            }
+        } else {
+            let idents: Vec<String> = node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .filter(|t| t.kind() == Ident)
+                .map(|t| t.text().to_string())
+                .collect();
+            if let Some(pos) = idents.iter().position(|t| t == "as") {
+                if let Some(alias) = idents.get(pos + 1) {
+                    self.module_globals.insert(alias.clone());
+                }
+            }
         }
     }
 
@@ -244,7 +432,17 @@ impl Resolver {
         });
         self.push_scope();
         let children: Vec<ResolvedNode> = root.children().cloned().collect();
-        self.hoist_decls(&children);
+        // CLASSIFY: every DIRECT-child top-level binding name is a module-scope
+        // user-global. Collected BEFORE resolution so a forward reference (a use
+        // textually earlier than its declaration) already sees the name as a global.
+        for child in &children {
+            self.collect_module_globals(child);
+        }
+        // No slot-hoisting at the file frame: top-level fn/class/enum are globals,
+        // defined in SOURCE ORDER at run time (DEFINE_GLOBAL) and read late
+        // (GET_GLOBAL), reproducing the tree-walker's late-binding module env. Bare
+        // top-level `{ }` blocks still hoist their own fn/class/enum (handled in the
+        // `Block` arm of `resolve_stmt`).
         for child in &children {
             self.resolve_stmt(child);
         }
@@ -303,10 +501,11 @@ impl Resolver {
                 }
             }
             FnDecl => {
-                // Reuse the slot allocated by the hoisting pre-pass if present.
+                // Reuse the slot allocated by the hoisting pre-pass if present;
+                // a DIRECT-child top-level fn is a module global (no slot).
                 if let Some(name) = fn_name(node) {
                     if !self.declared_in_current_scope(&name) {
-                        self.declare(&name, BindingKind::Fn, node.text_range());
+                        self.declare_binding(&name, BindingKind::Fn, node.text_range());
                     }
                 }
                 self.resolve_function(node);
@@ -331,7 +530,7 @@ impl Resolver {
             EnumDecl => {
                 if let Some(name) = ident_text(node) {
                     if !self.declared_in_current_scope(&name) {
-                        self.declare(&name, BindingKind::Enum, node.text_range());
+                        self.declare_binding(&name, BindingKind::Enum, node.text_range());
                     }
                 }
                 for v in node.descendants().filter(|n| n.kind() == EnumVariant) {
@@ -343,7 +542,7 @@ impl Resolver {
             ClassDecl => {
                 if let Some(name) = ident_text(node) {
                     if !self.declared_in_current_scope(&name) {
-                        self.declare(&name, BindingKind::Class, node.text_range());
+                        self.declare_binding(&name, BindingKind::Class, node.text_range());
                     }
                 }
                 self.resolve_class(node);
@@ -379,7 +578,7 @@ impl Resolver {
         } else if let Some(obj) = node.children().find(|c| c.kind() == ObjectBindPat) {
             self.declare_pattern_names(obj);
         } else if let Some(name) = ident_text(node) {
-            self.declare(&name, let_kind(node), node.text_range());
+            self.declare_binding(&name, let_kind(node), node.text_range());
         }
     }
 
@@ -398,12 +597,12 @@ impl Resolver {
                         .last()
                         .map(|t| t.text().to_string());
                     if let Some(name) = local {
-                        self.declare(&name, BindingKind::PatternBind, entry.text_range());
+                        self.declare_binding(&name, BindingKind::PatternBind, entry.text_range());
                     }
                 }
                 RestBind => {
                     if let Some(name) = ident_text(entry) {
-                        self.declare(&name, BindingKind::PatternBind, entry.text_range());
+                        self.declare_binding(&name, BindingKind::PatternBind, entry.text_range());
                     }
                 }
                 _ => {}
@@ -416,7 +615,8 @@ impl Resolver {
         if let Some(list) = node.children().find(|c| c.kind() == ImportList) {
             for t in list.children_with_tokens().filter_map(|el| el.into_token()) {
                 if t.kind() == Ident {
-                    self.declare(t.text(), BindingKind::Import, node.text_range());
+                    let name = t.text().to_string();
+                    self.declare_binding(&name, BindingKind::Import, node.text_range());
                 }
             }
         } else {
@@ -432,7 +632,7 @@ impl Resolver {
                 .collect();
             if let Some(pos) = idents.iter().position(|t| t == "as") {
                 if let Some(alias) = idents.get(pos + 1) {
-                    self.declare(alias, BindingKind::Import, node.text_range());
+                    self.declare_binding(alias, BindingKind::Import, node.text_range());
                 }
             }
         }
@@ -454,14 +654,7 @@ impl Resolver {
         let Some(sup) = sup else { return };
         let name = sup.text().to_string();
         let range = sup.text_range();
-        let resolution = if let Some(slot) = self.resolve_local(&name) {
-            self.bump_use(slot);
-            Resolution::Local(slot)
-        } else if let Some(idx) = self.resolve_upvalue(self.frames.len() - 1, &name) {
-            Resolution::Upvalue(idx)
-        } else {
-            Resolution::Global(name)
-        };
+        let resolution = self.resolve_name(&name);
         self.result.uses.insert(range, resolution);
     }
 
@@ -533,14 +726,7 @@ impl Resolver {
         match node.kind() {
             NameRef => {
                 let name = ident_text(node).unwrap_or_default();
-                let resolution = if let Some(slot) = self.resolve_local(&name) {
-                    self.bump_use(slot);
-                    Resolution::Local(slot)
-                } else if let Some(idx) = self.resolve_upvalue(self.frames.len() - 1, &name) {
-                    Resolution::Upvalue(idx)
-                } else {
-                    Resolution::Global(name)
-                };
+                let resolution = self.resolve_name(&name);
                 self.result.uses.insert(node.text_range(), resolution);
             }
             MatchExpr => {
@@ -700,8 +886,15 @@ impl Resolver {
             WildcardPat => {}
             LiteralPat => {
                 if let Some(name) = bare_ident_pattern(pat) {
+                    // Option-C: a bare ident already in scope is a VALUE COMPARE; an
+                    // unbound one BINDS the subject. A name in scope is a local, an
+                    // upvalue, OR a MODULE-SCOPE user-global (a top-level `const`/`let`/
+                    // `fn`/… used as a match comparand, e.g. `match s { NOT_FOUND => …`)
+                    // — the tree-walker's single module env makes a top-level binding
+                    // visible at match time, so it compares, never binds.
                     let resolvable = self.resolve_local(&name).is_some()
-                        || self.resolve_upvalue(self.frames.len() - 1, &name).is_some();
+                        || self.resolve_upvalue(self.frames.len() - 1, &name).is_some()
+                        || self.module_globals.contains(&name);
                     if resolvable {
                         // defined → value compare (resolve as a use)
                         for e in pat.children().filter(|c| is_expr(c.kind())) {
@@ -746,7 +939,14 @@ impl Resolver {
         }
     }
 
-    fn finish(self) -> ResolveResult {
+    fn finish(mut self) -> ResolveResult {
+        // Merge the module-global bindings into the result, applying their per-name
+        // read-use counts so the checker's unused-binding/unused-import lints work
+        // (globals have no frame slot, so they could not use the slot-based counter).
+        for mut b in self.global_bindings {
+            b.use_count = self.global_uses.get(&b.name).copied().unwrap_or(0);
+            self.result.bindings.push(b);
+        }
         self.result
     }
 }
@@ -841,7 +1041,9 @@ mod tests {
     }
 
     #[test]
-    fn let_then_use_is_local() {
+    fn top_level_let_use_is_global() {
+        // A DIRECT-child top-level `let` is now a MODULE-SCOPE user-global (not a
+        // file-frame local), so BOTH `x` and the builtin `print` resolve to Global.
         let tree = parse_to_tree("let x = 1\nprint(x)");
         let r = resolve(&tree);
         let mut locals = 0;
@@ -853,8 +1055,13 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(locals, 1, "x should be Local");
-        assert_eq!(globals, 1, "print should be Global");
+        assert_eq!(locals, 0, "no top-level locals (x is a module global)");
+        assert_eq!(globals, 2, "x and print are both Global");
+        // The top-level `x` binding is recorded as a global for the checker, with a
+        // use count of 1 (the `print(x)` read).
+        let x = r.bindings.iter().find(|b| b.name == "x").expect("x binding");
+        assert!(x.is_global, "top-level let is a module global");
+        assert_eq!(x.use_count, 1, "x is used once");
     }
 
     #[test]
@@ -911,18 +1118,28 @@ mod tests {
 
     #[test]
     fn destructuring_binds_all_names() {
+        // A DIRECT-child top-level destructuring `let` binds its names as MODULE
+        // globals; `a` and `rest` therefore have global bindings (not file-frame
+        // locals), each carrying a use count from their `print(...)` read.
         let tree = parse_to_tree("let [a, b, ...rest] = xs\nprint(a)\nprint(rest)");
         let r = resolve(&tree);
-        let locals = tree
-            .descendants()
-            .filter(|n| n.kind() == SyntaxKind::NameRef)
-            .filter(|n| matches!(r.uses.get(&n.text_range()), Some(Resolution::Local(_))))
-            .count();
-        assert_eq!(locals, 2, "a and rest are locals (xs/print are not)");
+        for name in ["a", "rest"] {
+            let b = r
+                .bindings
+                .iter()
+                .find(|b| b.name == name)
+                .unwrap_or_else(|| panic!("{name} binding"));
+            assert!(b.is_global, "{name} is a module global");
+            assert_eq!(b.use_count, 1, "{name} is read once");
+        }
+        // `b` is bound but unread; still a global binding with zero uses.
+        let b = r.bindings.iter().find(|b| b.name == "b").expect("b binding");
+        assert!(b.is_global && b.use_count == 0);
     }
 
     #[test]
     fn for_var_and_class_enum_bind() {
+        // A loop variable is a frame-local; a top-level `class` is a module global.
         let r1 = resolve(&parse_to_tree("for (i in 0..3) { print(i) }"));
         assert!(
             r1.uses.values().any(|r| matches!(r, Resolution::Local(_))),
@@ -930,8 +1147,14 @@ mod tests {
         );
         let r = resolve(&parse_to_tree("class C {}\nlet x = C"));
         assert!(
-            r.uses.values().any(|u| matches!(u, Resolution::Local(_))),
-            "C resolves to a local binding"
+            r.uses
+                .values()
+                .any(|u| matches!(u, Resolution::Global(n) if n == "C")),
+            "C resolves to a module global"
+        );
+        assert!(
+            r.bindings.iter().any(|b| b.name == "C" && b.is_global),
+            "C has a module-global binding"
         );
     }
 
@@ -1064,10 +1287,11 @@ mod tests {
     }
 
     #[test]
-    fn forward_fn_ref_resolves_to_frame_binding() {
-        // `b` is referenced inside `a` before `b` is textually declared. With
-        // hoisting, the use of `b` resolves to a frame binding (Local/Upvalue),
-        // NOT Global/Unresolved — so the VM can find its slot.
+    fn forward_fn_ref_resolves_to_module_global() {
+        // `b` is referenced inside `a` before `b` is textually declared. A top-level
+        // `fn` is a MODULE-SCOPE user-global, so the forward use of `b` resolves to
+        // `Global("b")` (late-bound via GET_GLOBAL) — the call runs after both fns are
+        // DEFINE_GLOBAL'd, reproducing the tree-walker's late module-env binding.
         let tree = parse_to_tree("fn a() { return b() }\nfn b() { return 7 }\n");
         let r = resolve(&tree);
         let b_use = tree
@@ -1075,15 +1299,16 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("b"))
             .unwrap();
         match r.uses.get(&b_use.text_range()) {
-            Some(Resolution::Upvalue(_)) | Some(Resolution::Local(_)) => {}
-            other => panic!("forward fn ref `b` should be a frame binding, got {other:?}"),
+            Some(Resolution::Global(n)) if n == "b" => {}
+            other => panic!("forward fn ref `b` should be a module global, got {other:?}"),
         }
+        assert!(r.bindings.iter().any(|x| x.name == "b" && x.is_global));
     }
 
     #[test]
-    fn self_recursion_is_a_captured_cell() {
-        // `fac` references itself; the name is captured by the inner frame and
-        // its slot (in the file frame) is a cell.
+    fn self_recursion_is_a_module_global() {
+        // A top-level self-recursive `fn` references itself by its module-global name
+        // (late-bound), not via a captured file-frame cell.
         let tree =
             parse_to_tree("fn fac(n) {\n if (n <= 1) { return 1 }\n return n * fac(n - 1)\n}\n");
         let r = resolve(&tree);
@@ -1093,35 +1318,21 @@ mod tests {
             .last()
             .unwrap();
         assert!(
-            matches!(
-                r.uses.get(&fac_use.text_range()),
-                Some(Resolution::Upvalue(_)) | Some(Resolution::Local(_))
-            ),
-            "self-recursive `fac` use must resolve to a frame binding"
+            matches!(r.uses.get(&fac_use.text_range()), Some(Resolution::Global(n)) if n == "fac"),
+            "self-recursive top-level `fac` use must resolve to a module global"
         );
-        // `fac` lives in the file frame; it is captured → its slot is a cell.
-        let file = r
-            .frames
-            .get(&(SyntaxKind::SourceFile, tree.text_range()))
-            .expect("file frame");
         let fac = r
             .bindings
             .iter()
             .find(|b| b.name == "fac" && b.kind == BindingKind::Fn)
             .expect("fac binding");
-        assert!(
-            fac.captured,
-            "self-recursive `fac` must be marked captured"
-        );
-        assert!(
-            file.cell_slots.contains(&fac.slot),
-            "captured `fac` slot must be in the file frame's cell_slots"
-        );
+        assert!(fac.is_global, "top-level `fac` is a module global");
+        assert_eq!(fac.use_count, 1, "the recursive call counts as one use");
     }
 
     #[test]
-    fn mutual_recursion_both_resolve_to_frame_bindings() {
-        // `a` calls `b`, `b` calls `a`. Both must resolve to frame bindings.
+    fn mutual_recursion_both_resolve_to_module_globals() {
+        // `a` calls `b`, `b` calls `a`. Both top-level fns resolve to module globals.
         let tree = parse_to_tree("fn a() { return b() }\nfn b() { return a() }\n");
         let r = resolve(&tree);
         for name in ["a", "b"] {
@@ -1134,9 +1345,9 @@ mod tests {
             assert!(
                 matches!(
                     r.uses.get(&use_site.text_range()),
-                    Some(Resolution::Upvalue(_)) | Some(Resolution::Local(_))
+                    Some(Resolution::Global(n)) if n == name
                 ),
-                "mutual-recursion use of `{name}` must be a frame binding, got {:?}",
+                "mutual-recursion use of `{name}` must be a module global, got {:?}",
                 r.uses.get(&use_site.text_range())
             );
         }

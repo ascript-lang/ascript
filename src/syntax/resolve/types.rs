@@ -38,6 +38,13 @@ pub struct Binding {
     pub use_count: u32,
     /// If this binding shadows an outer binding, the outer's decl range.
     pub shadows: Option<TextRange>,
+    /// A MODULE-SCOPE USER-GLOBAL: a DIRECT-child top-level binding of the
+    /// `SourceFile` (`let`/`const`/`fn`/`class`/`enum`/`import`). Such a binding has
+    /// NO file-frame slot (`slot` is meaningless for it); its references resolve to
+    /// `Resolution::Global(name)` and its define-site lowers to `DEFINE_GLOBAL`, so a
+    /// forward reference late-binds at run time (matching the tree-walker's single
+    /// shared module `Environment`). `false` for every nested-frame binding.
+    pub is_global: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

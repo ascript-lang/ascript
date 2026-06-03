@@ -45,13 +45,17 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
             continue;
         };
         let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
-        // callee must resolve to a local/upvalue binding (a user fn, not a builtin)
-        // and be a uniquely-named declared function.
-        let is_local = matches!(
-            resolved.uses.get(&callee.text_range()),
-            Some(Resolution::Local(_) | Resolution::Upvalue(_))
-        );
-        if !is_local || !unique(&name) {
+        // callee must resolve to a binding declared in this file — a local/upvalue
+        // OR a module-scope user-global (a top-level `fn`, the common case) — and be
+        // a uniquely-named declared function (so a bare builtin is excluded).
+        let user_fn = match resolved.uses.get(&callee.text_range()) {
+            Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
+            Some(Resolution::Global(gname)) => {
+                resolved.bindings.iter().any(|b| b.is_global && &b.name == gname)
+            }
+            _ => false,
+        };
+        if !user_fn || !unique(&name) {
             continue;
         }
         let Some(fn_decl) = by_name.get(&name) else {

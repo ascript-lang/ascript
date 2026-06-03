@@ -118,17 +118,24 @@ impl std::fmt::Debug for ClassProto {
 /// `decl_range` + name), exactly as `let` resolves its slot.
 #[derive(Debug, Clone)]
 pub enum ImportDesc {
-    /// `import { a, b } from "std/x"` — bind each named export into its slot.
+    /// `import { a, b } from "std/x"` — bind each named export.
     Named {
         source: String,
-        /// `(export name, local slot, is_cell)` per imported name, in source order.
-        names: Vec<(String, u16, bool)>,
+        /// `(export name, local slot, is_cell, is_global)` per imported name, in
+        /// source order. When `is_global`, the name binds into the module-scope
+        /// user-globals table (a DIRECT-child top-level import — the common case) and
+        /// `slot`/`is_cell` are unused; otherwise it binds into the frame slot.
+        names: Vec<(String, u16, bool, bool)>,
     },
-    /// `import * as alias from "std/x"` — bind the namespace Object into `slot`.
+    /// `import * as alias from "std/x"` — bind the namespace Object. When `is_global`
+    /// the alias binds into the user-globals table under `alias` (and `slot`/`is_cell`
+    /// are unused); otherwise it binds into the frame slot.
     Namespace {
         source: String,
+        alias: String,
         slot: u16,
         is_cell: bool,
+        is_global: bool,
     },
 }
 

@@ -264,6 +264,31 @@ calls `resync_object_shape`, reassigning an existing key keeps the shape — V11
 on this). The **tree-walker never touches the registry** — its objects/instances stay shape `0`. The
 change is additive/behavior-preserving (the whole-corpus differential + goldens stay byte-identical).
 
+**VM module-scope user-globals (WS1).** A DIRECT-child top-level `let`/`const`/`fn`/`class`/`enum`/
+`import` of the `SourceFile` is a **module-scope user-global**, NOT a file-frame slot-local — mirroring
+the tree-walker's single shared late-bound module `Environment`. The resolver (`resolve_file`) collects
+those names into `module_globals` and records each as a `Binding { is_global: true, slot: u32::MAX }`
+(kept in `result.bindings` for the checker, with use-counts tracked by NAME via `global_uses`); their
+references resolve `resolve_local → resolve_upvalue → Resolution::Global(name)` (so an inner `let` still
+shadows). The compiler lowers a global define-site to `Op::DefineGlobal <name>` (in SOURCE ORDER — no
+eager pre-pass) and a top-level reassignment to `Op::SetGlobal`; reads are the existing `Global`→
+`GET_GLOBAL`. Storage is on **`Vm`** (NOT `Interp`): `user_globals: RefCell<IndexMap<Rc<str>,Value>>`
+(the `Vm` is the GC root, so plain owned `Value`s stay live — do NOT wrap each in a `Cc` cell) +
+`global_version: Cell<u64>`. `GET_GLOBAL` consults `user_globals` FIRST, then `BUILTIN_NAMES` (so a user
+name shadows a builtin), else `undefined variable '<n>'`. This closes the forward-reference divergence
+(a fn/thunk/field-default referencing a top-level binding declared LATER late-binds at run time, matching
+the tree-walker); use-before-init stays a SYMMETRIC error on both engines. The `GET_GLOBAL` inline cache
+records ONLY immutable builtins — a user-global read is an uncached IndexMap lookup and `SET_GLOBAL`
+updates in place WITHOUT bumping the version (so a hot reassigned-top-level-`let` loop does not thrash the
+cache; `DefineGlobal`, which can shadow a builtin, DOES bump). `.from`/typed-parse field defaults resolve
+through the lazily-built `class_env` (`def_env`), which is seeded from `user_globals` and kept in sync by
+`define_user_global`/`update_user_global`. The checker treats an `is_global` binding name as defined
+(`undefined-variable` exempt) and as a file-declared callee (`dropped_local_call`/contract rules).
+`ImportDesc` carries `is_global` (named) / `alias`+`is_global` (namespace); a top-level import binds into
+`user_globals`. This is also the REPL's cross-line persistence (one `Vm` kept alive). `.aso`
+`ASO_FORMAT_VERSION` bumped 3→4 (new opcode + ImportDesc layout). The whole-corpus three-way differential
+stays byte-identical.
+
 **`--no-specialize` KILL SWITCH + three-way differential (V11-T5).** The `Vm` carries a
 `specialize: bool` (default `true`; `Vm::new` → specializing, `Vm::new_generic` /
 `Vm::with_specialize(interp, false)` → generic). When `false`, EVERY specialization fast path is

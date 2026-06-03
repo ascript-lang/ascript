@@ -274,9 +274,12 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         MatchRange => Effect::new(3, 1),
         MatchNoArm => Effect::new(0, 0),
 
-        // ---- not-yet-emitted ops with defined run-loop-less semantics ----
-        // SET_GLOBAL pops the value (mirrors SET_LOCAL); never emitted today.
-        SetGlobal => Effect::new(1, 0),
+        // DEFINE_GLOBAL pops the value and binds it as a module-scope user-global.
+        DefineGlobal => Effect::new(1, 0),
+        // SET_GLOBAL stores TOS into an existing user-global but LEAVES it on the
+        // stack (an assignment is an expression yielding the assigned value), exactly
+        // like SET_LOCAL.
+        SetGlobal => Effect::new(0, 0),
         // METHOD attaches TOS closure onto the class below it, leaving the class.
         Method => Effect::new(2, 1),
         // INSTANCE_OF: inst cls -- bool.
@@ -403,7 +406,7 @@ fn check_operands(
         Const => check_const(chunk.read_u16(operand_at) as usize)?,
 
         // ---- name-const (must be a Str) ----
-        GetGlobal | SetGlobal | GetProp | SetProp | GetPropOpt | Method | GetSuper
+        GetGlobal | DefineGlobal | SetGlobal | GetProp | SetProp | GetPropOpt | Method | GetSuper
         | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport => {
             check_name_const(chunk.read_u16(operand_at) as usize)?
         }

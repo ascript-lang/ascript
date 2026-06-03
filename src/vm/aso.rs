@@ -59,7 +59,7 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 /// - 3: field-default expr now covers the full `cst_default_expr` lowering — new
 ///   tags for binary/range/index/ternary/template/optmember/try/unwrap/await/
 ///   assign and spread elements in array/object/call defaults.
-pub const ASO_FORMAT_VERSION: u32 = 3;
+pub const ASO_FORMAT_VERSION: u32 = 4;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -1234,21 +1234,26 @@ fn write_import(w: &mut Writer, imp: &ImportDesc) {
             w.u8(IMP_NAMED);
             w.str(source);
             w.len(names.len());
-            for (name, slot, is_cell) in names {
+            for (name, slot, is_cell, is_global) in names {
                 w.str(name);
                 w.u16(*slot);
                 w.u8(u8::from(*is_cell));
+                w.u8(u8::from(*is_global));
             }
         }
         ImportDesc::Namespace {
             source,
+            alias,
             slot,
             is_cell,
+            is_global,
         } => {
             w.u8(IMP_NAMESPACE);
             w.str(source);
+            w.str(alias);
             w.u16(*slot);
             w.u8(u8::from(*is_cell));
+            w.u8(u8::from(*is_global));
         }
     }
 }
@@ -1263,18 +1268,23 @@ fn read_import(r: &mut Reader) -> Result<ImportDesc, AsoError> {
                 let name = r.str()?;
                 let slot = r.u16()?;
                 let is_cell = r.u8()? != 0;
-                names.push((name, slot, is_cell));
+                let is_global = r.u8()? != 0;
+                names.push((name, slot, is_cell, is_global));
             }
             Ok(ImportDesc::Named { source, names })
         }
         IMP_NAMESPACE => {
             let source = r.str()?;
+            let alias = r.str()?;
             let slot = r.u16()?;
             let is_cell = r.u8()? != 0;
+            let is_global = r.u8()? != 0;
             Ok(ImportDesc::Namespace {
                 source,
+                alias,
                 slot,
                 is_cell,
+                is_global,
             })
         }
         tag => Err(AsoError::BadTag {

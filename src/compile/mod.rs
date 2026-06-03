@@ -1058,21 +1058,30 @@ impl Compiler {
         // Phase 2: store to the target, leaving the assigned value on the stack.
         match &target {
             Expr::NameRef(name_ref) => {
-                // The store target: a frame-local slot (cell-aware) or an upvalue
-                // (a captured outer variable, mutated by reference). `DUP` first so
-                // a copy remains as the expression's result after the popping store.
-                let store = match self.resolved.uses.get(&name_ref.syntax().text_range()) {
+                // The store target: a frame-local slot (cell-aware), an upvalue (a
+                // captured outer variable, mutated by reference), or a MODULE-SCOPE
+                // user-global (`Resolution::Global` — a top-level `let` reassigned at
+                // top level). For the slot/upvalue stores `DUP` first so a copy remains
+                // as the expression's result after the popping store; `SET_GLOBAL`
+                // already LEAVES the value (peek), so it needs no `DUP`.
+                match self.resolved.uses.get(&name_ref.syntax().text_range()) {
                     Some(Resolution::Local(slot)) => {
                         let slot = u16::try_from(*slot).map_err(|_| {
                             CompileError::new("local slot index exceeds 65535", span)
                         })?;
-                        (true, slot)
+                        self.chunk.emit(Op::Dup, span);
+                        self.emit_set_local(slot, span);
                     }
                     Some(Resolution::Upvalue(idx)) => {
                         let idx = u16::try_from(*idx).map_err(|_| {
                             CompileError::new("upvalue index exceeds 65535", span)
                         })?;
-                        (false, idx)
+                        self.chunk.emit(Op::Dup, span);
+                        self.chunk.emit_u16(Op::SetUpvalue, idx, span);
+                    }
+                    Some(Resolution::Global(name)) => {
+                        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                        self.chunk.emit_u16(Op::SetGlobal, idx, span);
                     }
                     _ => {
                         return Err(CompileError::new(
@@ -1080,13 +1089,6 @@ impl Compiler {
                             node_span(&target),
                         ))
                     }
-                };
-                self.chunk.emit(Op::Dup, span);
-                let (is_local, slot) = store;
-                if is_local {
-                    self.emit_set_local(slot, span);
-                } else {
-                    self.chunk.emit_u16(Op::SetUpvalue, slot, span);
                 }
             }
             Expr::MemberExpr(m) => {
@@ -1408,12 +1410,19 @@ impl Compiler {
         let idx = self.chunk.add_proto(proto);
         self.chunk.emit_u16(Op::Closure, idx, span);
 
-        // Bind the closure to the fn name's slot in the enclosing frame. The name
-        // may be a cell slot (e.g. a self- or forward-referenced fn), so use the
-        // cell-aware store: the cell, allocated nil at frame entry and captured by
-        // the closure's own body, is filled HERE — late-binding-correct.
-        let slot = self.fn_decl_slot(fn_decl)?;
-        self.emit_set_local(slot, span);
+        // A DIRECT-child top-level `fn` is a module-scope user-global (DEFINE_GLOBAL,
+        // defined in source order, read late). Otherwise bind the closure to the fn
+        // name's slot in the enclosing frame — possibly a cell slot (a self- or
+        // forward-referenced fn), so use the cell-aware store: the cell, allocated nil
+        // at frame entry and captured by the closure's own body, is filled HERE —
+        // late-binding-correct.
+        let decl_range: TextRange = fn_decl.syntax().text_range();
+        if let Some(name) = self.global_binding_name(decl_range) {
+            self.emit_define_global(&name, span);
+        } else {
+            let slot = self.fn_decl_slot(fn_decl)?;
+            self.emit_set_local(slot, span);
+        }
         Ok(())
     }
 
@@ -1574,10 +1583,12 @@ impl Compiler {
                     self.chunk.emit_u16(Op::GetUpvalue, idx, sup_span);
                 }
                 Some(Resolution::Global(gname)) => {
-                    return Err(CompileError::new(
-                        format!("superclass '{gname}' is not in scope as a class binding (V9)"),
-                        sup_span,
-                    ));
+                    // A top-level superclass is a MODULE-SCOPE user-global (the common
+                    // case): read it via `GET_GLOBAL`, late-bound exactly like the
+                    // tree-walker's `env.get(sup_name)`. (A non-class value here is
+                    // caught by `Op::Class` at run time.)
+                    let idx = self.chunk.add_const(Value::Str(Rc::from(gname.as_str())));
+                    self.chunk.emit_u16(Op::GetGlobal, idx, sup_span);
                 }
                 Some(Resolution::Unresolved) | None => {
                     return Err(CompileError::new(
@@ -1626,11 +1637,17 @@ impl Compiler {
         let cp_idx = self.chunk.add_class_proto(class_proto);
         self.chunk.emit_u16(Op::Class, cp_idx, span);
 
-        // Bind the class value to its name's slot in the enclosing frame (the
-        // resolver records a `BindingKind::Class` binding whose `decl_range` is the
-        // ClassDecl node's `text_range()` — hoisted, see `hoist_decls`).
-        let slot = self.class_decl_slot(class_decl)?;
-        self.emit_set_local(slot, span);
+        // A DIRECT-child top-level `class` is a module-scope user-global
+        // (DEFINE_GLOBAL); otherwise bind the class value to its name's slot in the
+        // enclosing frame (the resolver records a `BindingKind::Class` binding whose
+        // `decl_range` is the ClassDecl node's `text_range()`).
+        let decl_range: TextRange = class_decl.syntax().text_range();
+        if let Some(name) = self.global_binding_name(decl_range) {
+            self.emit_define_global(&name, span);
+        } else {
+            let slot = self.class_decl_slot(class_decl)?;
+            self.emit_set_local(slot, span);
+        }
         Ok(())
     }
 
@@ -1706,11 +1723,17 @@ impl Compiler {
         let cp_idx = self.chunk.add_const(def);
         self.chunk.emit_u16(Op::Const, cp_idx, span);
 
-        // Bind to the enum's name slot. The resolver records a `BindingKind::Enum`
-        // binding keyed by the EnumDecl node's `text_range()` (hoisted, like classes
-        // and functions — see `hoist_decls`).
-        let slot = self.enum_decl_slot(enum_decl)?;
-        self.emit_set_local(slot, span);
+        // A DIRECT-child top-level `enum` is a module-scope user-global
+        // (DEFINE_GLOBAL); otherwise bind to the enum's name slot. The resolver
+        // records a `BindingKind::Enum` binding keyed by the EnumDecl node's
+        // `text_range()`.
+        let decl_range: TextRange = enum_decl.syntax().text_range();
+        if let Some(gname) = self.global_binding_name(decl_range) {
+            self.emit_define_global(&gname, span);
+        } else {
+            let slot = self.enum_decl_slot(enum_decl)?;
+            self.emit_set_local(slot, span);
+        }
         Ok(())
     }
 
@@ -1806,8 +1829,8 @@ impl Compiler {
                 .filter(|t| t.kind() == Ident)
             {
                 let name = tok.text().to_string();
-                let (slot, is_cell) = self.import_slot(&name, import_range, span)?;
-                names.push((name, slot, is_cell));
+                let (slot, is_cell, is_global) = self.import_slot(&name, import_range, span)?;
+                names.push((name, slot, is_cell, is_global));
             }
             ImportDesc::Named { source, names }
         } else {
@@ -1829,11 +1852,13 @@ impl Compiler {
                 .ok_or_else(|| {
                     CompileError::new("namespace import missing an alias after 'as'", span)
                 })?;
-            let (slot, is_cell) = self.import_slot(alias, import_range, span)?;
+            let (slot, is_cell, is_global) = self.import_slot(alias, import_range, span)?;
             ImportDesc::Namespace {
                 source,
+                alias: alias.clone(),
                 slot,
                 is_cell,
+                is_global,
             }
         };
 
@@ -1879,25 +1904,33 @@ impl Compiler {
         // detect that case by the inner node's kind and gather the pattern binds.
         use crate::syntax::resolve::types::BindingKind;
         let inner_kind = inner_range_kind(&inner);
-        let mut exports: Vec<(u16, String)> = Vec::new();
+        // Each exported binding is read back either from a frame slot
+        // (`Some(slot)`) or — for a MODULE-SCOPE user-global (a DIRECT-child
+        // top-level decl, the common case) — from the user-globals table (`None`,
+        // emit `GET_GLOBAL name`).
+        let mut exports: Vec<(Option<u16>, String)> = Vec::new();
+        let push_binding = |exports: &mut Vec<(Option<u16>, String)>,
+                            b: &crate::syntax::resolve::types::Binding| {
+            if b.is_global {
+                exports.push((None, b.name.clone()));
+            } else if let Ok(slot) = u16::try_from(b.slot) {
+                exports.push((Some(slot), b.name.clone()));
+            }
+        };
         if inner_kind == SyntaxKind::LetStmt {
             // Try the simple-let/const binding first.
             if let Some(b) = self.resolved.bindings.iter().find(|b| {
                 b.decl_range == inner_range
                     && matches!(b.kind, BindingKind::Let | BindingKind::Const)
             }) {
-                if let Ok(slot) = u16::try_from(b.slot) {
-                    exports.push((slot, b.name.clone()));
-                }
+                push_binding(&mut exports, b);
             } else {
                 // Destructuring let: each pattern target.
                 for b in &self.resolved.bindings {
                     if b.kind == BindingKind::PatternBind
                         && inner_range.contains_range(b.decl_range)
                     {
-                        if let Ok(slot) = u16::try_from(b.slot) {
-                            exports.push((slot, b.name.clone()));
-                        }
+                        push_binding(&mut exports, b);
                     }
                 }
             }
@@ -1909,9 +1942,7 @@ impl Compiler {
                 .iter()
                 .find(|b| b.decl_range == inner_range)
             {
-                if let Ok(slot) = u16::try_from(b.slot) {
-                    exports.push((slot, b.name.clone()));
-                }
+                push_binding(&mut exports, b);
             }
         }
 
@@ -1922,7 +1953,13 @@ impl Compiler {
             if !seen.insert(name.clone()) {
                 continue;
             }
-            self.emit_get_local(slot, span);
+            match slot {
+                Some(slot) => self.emit_get_local(slot, span),
+                None => {
+                    let gidx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    self.chunk.emit_u16(Op::GetGlobal, gidx, span);
+                }
+            }
             let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
             self.chunk.emit_u16(Op::DefineExport, name_idx, span);
         }
@@ -1939,7 +1976,7 @@ impl Compiler {
         name: &str,
         import_range: TextRange,
         span: Span,
-    ) -> Result<(u16, bool), CompileError> {
+    ) -> Result<(u16, bool, bool), CompileError> {
         use crate::syntax::resolve::types::BindingKind;
         let binding = self
             .resolved
@@ -1956,10 +1993,15 @@ impl Compiler {
                     span,
                 )
             })?;
+        // A DIRECT-child top-level import is a module-scope user-global: it has no
+        // frame slot (slot = u32::MAX), so report `is_global` and a placeholder slot.
+        if binding.is_global {
+            return Ok((0, false, true));
+        }
         let slot = u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))?;
         let is_cell = self.cur_cells.contains(&binding.slot);
-        Ok((slot, is_cell))
+        Ok((slot, is_cell, false))
     }
 
     /// Compile a method body (a `MethodDecl`) to its own [`FnProto`]. A method is a
@@ -2773,6 +2815,18 @@ impl Compiler {
             return self.compile_let_destructure(let_stmt, pat);
         }
 
+        // A DIRECT-child top-level `let`/`const` is a module-scope user-global: emit
+        // `<init>; DEFINE_GLOBAL name` (late-bound) instead of a frame-slot store.
+        let decl_range: TextRange = let_stmt.syntax().text_range();
+        if let Some(name) = self.global_binding_name(decl_range) {
+            match let_stmt.expr() {
+                Some(init) => self.compile_expr(&init)?,
+                None => self.chunk.emit(Op::Nil, span),
+            }
+            self.emit_define_global(&name, span);
+            return Ok(());
+        }
+
         let slot = self.let_slot(let_stmt)?;
 
         match let_stmt.expr() {
@@ -2782,6 +2836,24 @@ impl Compiler {
         }
         self.emit_set_local(slot, span);
         Ok(())
+    }
+
+    /// If the binding declared at `decl_range` is a MODULE-SCOPE user-global, return
+    /// its name; else `None`. Used by the declaration compilers to choose
+    /// `DEFINE_GLOBAL` over a frame-slot store.
+    fn global_binding_name(&self, decl_range: TextRange) -> Option<String> {
+        self.resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == decl_range && b.is_global)
+            .map(|b| b.name.clone())
+    }
+
+    /// Emit `DEFINE_GLOBAL <name>` (pops TOS, binds it as the module-scope global
+    /// `name`).
+    fn emit_define_global(&mut self, name: &str, span: Span) {
+        let idx = self.chunk.add_const(Value::Str(Rc::from(name)));
+        self.chunk.emit_u16(Op::DefineGlobal, idx, span);
     }
 
     /// The local slot for a `let`/`const` declaration. The resolver records a
@@ -2821,6 +2893,26 @@ impl Compiler {
             })?;
         u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// Store the value on TOS into a destructuring pattern binding (a `BindEntry` or
+    /// `RestBind` node). A MODULE-SCOPE user-global target (a DIRECT-child top-level
+    /// destructuring binding) lowers to `DEFINE_GLOBAL name`; otherwise to a
+    /// frame-slot store (`SET_LOCAL[_CELL]`). The `slot` is the resolver's slot for
+    /// the non-global case (ignored for a global).
+    fn emit_pattern_store(
+        &mut self,
+        entry: &ResolvedNode,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        let decl_range = entry.text_range();
+        if let Some(name) = self.global_binding_name(decl_range) {
+            self.emit_define_global(&name, span);
+            return Ok(());
+        }
+        let slot = self.pattern_bind_slot(entry, span)?;
+        self.emit_set_local(slot, span);
+        Ok(())
     }
 
     /// Compile a destructuring `let`/`const` — `let [a, b, ...r] = rhs` or
@@ -2889,28 +2981,25 @@ impl Compiler {
             let espan = range_span(entry);
             match entry.kind() {
                 BindEntry if is_array => {
-                    let slot = self.pattern_bind_slot(entry, espan)?;
                     self.chunk.emit_u16(Op::GetLocal, temp, span);
                     self.chunk.emit_u16(Op::ArrayElem, pos, span);
-                    self.emit_set_local(slot, span);
+                    self.emit_pattern_store(entry, espan)?;
                     pos = pos.checked_add(1).ok_or_else(|| {
                         CompileError::new("array pattern has too many bindings", span)
                     })?;
                 }
                 BindEntry => {
                     // Object entry: key by the FIRST significant token (Ident or
-                    // Str); the local name is the resolver binding's slot.
+                    // Str); the local name is the resolver binding's slot/global.
                     let key = bind_entry_key(entry)
                         .ok_or_else(|| CompileError::new("destructuring entry has no key", espan))?;
-                    let slot = self.pattern_bind_slot(entry, espan)?;
                     let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
                     bound_keys.push(Value::Str(Rc::from(key.as_str())));
                     self.chunk.emit_u16(Op::GetLocal, temp, span);
                     self.chunk.emit_u16(Op::ObjectKey, key_idx, span);
-                    self.emit_set_local(slot, span);
+                    self.emit_pattern_store(entry, espan)?;
                 }
                 RestBind => {
-                    let slot = self.pattern_bind_slot(entry, espan)?;
                     self.chunk.emit_u16(Op::GetLocal, temp, span);
                     if is_array {
                         // `arr[pos..]` — the tail past the named positions.
@@ -2923,7 +3012,7 @@ impl Compiler {
                         let keys_idx = self.chunk.add_const(keys);
                         self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);
                     }
-                    self.emit_set_local(slot, span);
+                    self.emit_pattern_store(entry, espan)?;
                 }
                 _ => {}
             }
@@ -4472,18 +4561,39 @@ mod tests {
     }
 
     #[test]
-    fn let_emits_set_local_and_sizes_slots() {
+    fn top_level_let_emits_define_global() {
+        // A DIRECT-child top-level `let` is a MODULE-SCOPE user-global, so its define
+        // lowers to DEFINE_GLOBAL and its use to GET_GLOBAL (NOT a frame slot).
         let chunk = compile_source("let x = 1\nx").expect("compiles");
-        assert!(chunk.slot_count >= 1, "slot_count not sized: {}", chunk.slot_count);
+        let text = disasm(&chunk);
+        assert!(text.contains("DEFINE_GLOBAL"), "missing DEFINE_GLOBAL in:\n{text}");
+        assert!(text.contains("GET_GLOBAL"), "missing GET_GLOBAL in:\n{text}");
+    }
+
+    #[test]
+    fn fn_local_let_emits_set_local_and_sizes_slots() {
+        // A `let` INSIDE a function is a frame slot-local (only DIRECT-children of the
+        // SourceFile become module globals).
+        let chunk = compile_source("fn f() { let x = 1\n return x }").expect("compiles");
         let text = disasm(&chunk);
         assert!(text.contains("SET_LOCAL"), "missing SET_LOCAL in:\n{text}");
         assert!(text.contains("GET_LOCAL"), "missing GET_LOCAL in:\n{text}");
     }
 
     #[test]
-    fn assign_dups_then_set_local() {
-        // Assignment-as-expression: value, DUP (result stays), SET_LOCAL (stores).
+    fn top_level_assign_emits_set_global() {
+        // Reassigning a top-level (module-global) `let` lowers to SET_GLOBAL (which
+        // leaves the value on the stack — an assignment is an expression).
         let chunk = compile_source("let x = 1\nx = 2").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("SET_GLOBAL"), "missing SET_GLOBAL in:\n{text}");
+    }
+
+    #[test]
+    fn fn_local_assign_dups_then_set_local() {
+        // Assignment-as-expression to a frame local: value, DUP (result stays),
+        // SET_LOCAL (stores).
+        let chunk = compile_source("fn f() { let x = 1\n x = 2 }").expect("compiles");
         let text = disasm(&chunk);
         assert!(text.contains("DUP"), "missing DUP in:\n{text}");
         assert!(text.contains("SET_LOCAL"), "missing SET_LOCAL in:\n{text}");
@@ -4491,9 +4601,18 @@ mod tests {
 
     #[test]
     fn block_shadowing_uses_distinct_slots() {
-        // Outer x and inner x are distinct slots → slot_count is at least 2.
+        // The outer `x` is a module global; the inner block `x` is a frame slot-local.
+        // The inner block-local still gets a frame slot (slot_count ≥ 1), and the
+        // outer global is read via GET_GLOBAL.
         let chunk = compile_source("let x = 1\n{ let x = 2\n print(x) }\nprint(x)").expect("compiles");
-        assert!(chunk.slot_count >= 2, "shadowing should allocate ≥2 slots, got {}", chunk.slot_count);
+        assert!(
+            chunk.slot_count >= 1,
+            "inner block-local should allocate a slot, got {}",
+            chunk.slot_count
+        );
+        let text = disasm(&chunk);
+        assert!(text.contains("DEFINE_GLOBAL"), "outer x is a module global:\n{text}");
+        assert!(text.contains("SET_LOCAL"), "inner block x is a slot-local:\n{text}");
     }
 
     #[test]
@@ -4533,15 +4652,19 @@ mod tests {
     #[test]
     fn compound_assignment_lowers_to_load_binop_store() {
         // `x += 2` desugars (like the tree-walker) to `x = (x + 2)`: load the
-        // current value, push the rhs, ADD, then store back (DUP + SET_LOCAL so the
-        // assignment expression yields the new value).
-        let chunk = compile_source("let x = 1\nx += 2\nx").expect("compiles");
+        // current value, push the rhs, ADD, then store back. Inside a function the
+        // target is a frame local (GET_LOCAL/SET_LOCAL).
+        let chunk = compile_source("fn f() { let x = 1\n x += 2\n return x }").expect("compiles");
         let text = disasm(&chunk);
         assert!(text.contains("ADD"), "expected ADD for `+=`, got:\n{text}");
         assert!(
             text.contains("SET_LOCAL"),
             "expected SET_LOCAL store, got:\n{text}"
         );
+        // At top level the same `+=` reads+writes the module global.
+        let g = disasm(&compile_source("let x = 1\nx += 2\nx").expect("compiles"));
+        assert!(g.contains("ADD") && g.contains("GET_GLOBAL") && g.contains("SET_GLOBAL"),
+            "top-level compound assign uses globals:\n{g}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4804,16 +4927,16 @@ mod tests {
     // ---- V4-T2: functions / arrows → FnProto + CLOSURE -------------------
 
     #[test]
-    fn fn_decl_emits_closure_and_set_local() {
-        // A `fn` declaration builds a nested proto, makes a closure over it
-        // (CLOSURE), and binds it to the name slot (SET_LOCAL). The proto's own
-        // body holds the function instructions (`CONST 1; RETURN`).
+    fn fn_decl_emits_closure_and_define_global() {
+        // A top-level `fn` declaration builds a nested proto, makes a closure over it
+        // (CLOSURE), and binds it as a MODULE-SCOPE user-global (DEFINE_GLOBAL). The
+        // proto's own body holds the function instructions (`CONST 1; RETURN`).
         let chunk = compile_source("fn greet() { return 1 }\n").expect("compiles");
         let text = disasm(&chunk);
-        // Top chunk: CLOSURE 0 referencing proto #0 (named greet) + SET_LOCAL.
+        // Top chunk: CLOSURE 0 referencing proto #0 (named greet) + DEFINE_GLOBAL.
         assert!(text.contains("CLOSURE"), "missing CLOSURE in:\n{text}");
         assert!(text.contains("proto #0 greet"), "missing named proto ref in:\n{text}");
-        assert!(text.contains("SET_LOCAL"), "missing SET_LOCAL (name bind) in:\n{text}");
+        assert!(text.contains("DEFINE_GLOBAL"), "missing DEFINE_GLOBAL (name bind) in:\n{text}");
         // Nested proto header + its body.
         assert!(
             text.contains("== fn greet (proto #0) =="),
@@ -4834,7 +4957,8 @@ mod tests {
         let chunk = compile_source("let f = (x) => x + 1\n").expect("compiles");
         let text = disasm(&chunk);
         assert!(text.contains("CLOSURE"), "missing CLOSURE in:\n{text}");
-        assert!(text.contains("SET_LOCAL"), "missing SET_LOCAL f in:\n{text}");
+        // `f` is a DIRECT-child top-level `let` → bound as a module global.
+        assert!(text.contains("DEFINE_GLOBAL"), "missing DEFINE_GLOBAL f in:\n{text}");
         // Proto body: GET_LOCAL 0 (x); CONST 1; ADD; RETURN.
         assert!(text.contains("GET_LOCAL"), "missing GET_LOCAL (param x) in:\n{text}");
         assert!(text.contains("ADD"), "missing ADD in proto body:\n{text}");
@@ -4868,28 +4992,33 @@ mod tests {
 
     #[test]
     fn fn_capturing_outer_local_compiles_with_upvalue() {
-        // A function reading an outer-scope local captures it by reference (V4-T3).
-        // `n` is captured, so it is a CELL SLOT in the file frame (SET_LOCAL_CELL
-        // binds it) and the inner body reads it via GET_UPVALUE; the inner proto
-        // carries a one-entry upvalue capture plan.
-        let chunk = compile_source("let n = 1\nfn f() { return n }\nf").expect("compiles");
-        let text = disasm(&chunk);
-        // The captured top-level binding is filled through its cell.
+        // A function reading an outer FUNCTION-LOCAL captures it by reference (V4-T3).
+        // Here `n` is a local of `outer` (NOT a module global — only DIRECT-children
+        // of the SourceFile become globals), so it is a CELL SLOT in `outer`'s frame
+        // (SET_LOCAL_CELL binds it) and `inner` reads it via GET_UPVALUE with a
+        // one-entry capture plan. (A top-level `let` would instead be read via
+        // GET_GLOBAL — covered by the forward-ref differential tests.)
+        let chunk =
+            compile_source("fn outer() {\n let n = 1\n fn inner() { return n }\n return inner()\n}")
+                .expect("compiles");
+        // outer's proto is proto #0; its body binds `n` through a cell.
+        let outer = chunk.protos.first().expect("outer proto");
+        let outer_text = disasm(&outer.chunk);
         assert!(
-            text.contains("SET_LOCAL_CELL"),
-            "captured `n` should bind via SET_LOCAL_CELL in:\n{text}"
+            outer_text.contains("SET_LOCAL_CELL"),
+            "captured `n` should bind via SET_LOCAL_CELL in:\n{outer_text}"
         );
         // The inner proto reads the capture via GET_UPVALUE and has a capture plan.
-        let proto = chunk.protos.first().expect("one nested proto");
+        let inner = outer.chunk.protos.first().expect("inner proto");
         assert_eq!(
-            proto.chunk.upvalues.len(),
+            inner.chunk.upvalues.len(),
             1,
             "inner fn captures exactly one upvalue (`n`)"
         );
-        let inner = disasm(&proto.chunk);
+        let inner_text = disasm(&inner.chunk);
         assert!(
-            inner.contains("GET_UPVALUE"),
-            "inner body should read `n` via GET_UPVALUE in:\n{inner}"
+            inner_text.contains("GET_UPVALUE"),
+            "inner body should read `n` via GET_UPVALUE in:\n{inner_text}"
         );
     }
 

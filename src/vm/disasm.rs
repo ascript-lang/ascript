@@ -72,7 +72,7 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
 
     match op {
         // u16 const-pool index → show the referenced value.
-        Op::Const | Op::GetGlobal | Op::SetGlobal => {
+        Op::Const | Op::GetGlobal | Op::DefineGlobal | Op::SetGlobal => {
             let idx = chunk.read_u16(at + 1);
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
         }
@@ -119,7 +119,7 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
                 match desc {
                     ImportDesc::Named { source, names } => {
                         let list: Vec<&str> =
-                            names.iter().map(|(n, _, _)| n.as_str()).collect();
+                            names.iter().map(|(n, _, _, _)| n.as_str()).collect();
                         let _ = write!(line, " ; import {{{}}} from \"{source}\"", list.join(", "));
                     }
                     ImportDesc::Namespace { source, slot, .. } => {
@@ -191,6 +191,7 @@ fn op_name(op: Op) -> &'static str {
         SetUpvalue => "SET_UPVALUE",
         CloseUpvalue => "CLOSE_UPVALUE",
         GetGlobal => "GET_GLOBAL",
+        DefineGlobal => "DEFINE_GLOBAL",
         SetGlobal => "SET_GLOBAL",
         Add => "ADD",
         Sub => "SUB",

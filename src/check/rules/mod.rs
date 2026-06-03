@@ -55,22 +55,32 @@ pub fn fn_name(fn_decl: &ResolvedNode) -> Option<String> {
 }
 
 /// If `expr_stmt` is a bare dropped call `name(...)` whose callee resolves to a
-/// LOCAL/UPVALUE binding, returns `(name, call_node)`. Used by unawaited-future
-/// and ignored-result to find a dropped call to a locally-declared function. The
-/// returned call node lets each rule compute `code_range(&call)` for its diagnostic.
+/// binding DECLARED in this file — a LOCAL/UPVALUE, or a MODULE-SCOPE user-global
+/// (a top-level `fn`, the common case) — returns `(name, call_node)`. Used by
+/// unawaited-future and ignored-result to find a dropped call to a file-declared
+/// function (so they can look up its declared return type). The returned call node
+/// lets each rule compute `code_range(&call)` for its diagnostic.
 pub fn dropped_local_call(
     expr_stmt: &ResolvedNode,
     resolved: &ResolveResult,
 ) -> Option<(String, ResolvedNode)> {
     let call = dropped_call(expr_stmt)?;
     let callee = call.children().find(|c| c.kind() == SyntaxKind::NameRef)?;
-    if !matches!(
-        resolved.uses.get(&callee.text_range()),
-        Some(Resolution::Local(_) | Resolution::Upvalue(_))
-    ) {
+    let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
+    let resolution = resolved.uses.get(&callee.text_range());
+    let file_declared = match resolution {
+        Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
+        // A module-scope user-global callee is file-declared iff its name has a
+        // binding recorded for this file (a top-level `fn`/`let`/… — NOT a bare
+        // builtin, which has no binding).
+        Some(Resolution::Global(gname)) => {
+            resolved.bindings.iter().any(|b| b.is_global && &b.name == gname)
+        }
+        _ => false,
+    };
+    if !file_declared {
         return None;
     }
-    let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
     Some((name, call))
 }
 

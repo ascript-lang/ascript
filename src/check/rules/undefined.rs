@@ -18,10 +18,17 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
     // position; the resolver records pre-declaration uses as Global. Treat any
     // Global whose name matches such a declaration as defined (conservative — we
     // never flag a name that IS declared somewhere as a hoistable item).
+    //
+    // MODULE-SCOPE USER-GLOBALS (every DIRECT-child top-level `let`/`const`/`fn`/
+    // `class`/`enum`/`import`) resolve to `Global(name)` too, but they ARE defined —
+    // a top-level binding's references late-bind to the module global, so exempt any
+    // `is_global` binding's name as well.
     let hoisted: HashSet<&str> = resolved
         .bindings
         .iter()
-        .filter(|b| matches!(b.kind, BindingKind::Fn | BindingKind::Class | BindingKind::Enum))
+        .filter(|b| {
+            b.is_global || matches!(b.kind, BindingKind::Fn | BindingKind::Class | BindingKind::Enum)
+        })
         .map(|b| b.name.as_str())
         .collect();
     for n in tree.descendants().filter(|n| n.kind() == SyntaxKind::NameRef) {

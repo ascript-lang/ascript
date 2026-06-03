@@ -5017,3 +5017,97 @@ async fn vm_literal_field_default_still_matches_treewalker() {
     )
     .await;
 }
+
+// ---- Module-scope user-globals: forward references --------------------------
+//
+// The tree-walker treats module scope as one shared, late-bound `Environment`: a
+// function/thunk body may reference a top-level `let`/`const` declared LATER, and
+// it resolves when the function RUNS. Before this feature the VM compiled a
+// top-level `let`/`const` as a frame SLOT-LOCAL and had NO user-globals, so a
+// forward reference resolved as Global→GET_GLOBAL→`undefined variable`. These
+// cases pin the now-byte-identical behavior; the use-before-init case stays
+// SYMMETRIC (both engines error).
+
+#[tokio::test]
+async fn vm_forward_const_from_function() {
+    // The canonical bug: `f` reads `X` declared AFTER it; the call runs after both
+    // are defined, so the late-bound global resolves to 9 on BOTH engines.
+    assert_vm_run_matches_treewalker("fn f() { return X }\nconst X = 9\nprint(f())").await;
+}
+
+#[tokio::test]
+async fn vm_forward_const_in_class_field_default() {
+    // A class field default referencing a later top-level const, via BOTH the
+    // constructor `C()` AND the validating `C.from({})` path.
+    assert_vm_run_matches_treewalker(
+        "class C {\n  n: number = LATER\n  fn init() {}\n}\nconst LATER = 42\nprint(C().n)\n",
+    )
+    .await;
+    assert_vm_run_matches_treewalker(
+        "class C {\n  n: number = LATER\n}\nconst LATER = 42\nprint(C.from({}).n)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_use_before_init_is_symmetric_error() {
+    // Reading a top-level const BEFORE its declaration runs is a TDZ-style error on
+    // BOTH engines (the global is not yet defined when the read executes).
+    assert_vm_run_error_matches_treewalker("print(X)\nconst X = 9").await;
+}
+
+#[tokio::test]
+async fn vm_top_level_let_reassigned_then_read() {
+    // A top-level mutable `let`, reassigned then read, must round-trip identically.
+    assert_vm_run_matches_treewalker("let x = 1\nx = x + 4\nprint(x)").await;
+    // Reassignment observed through a function that reads the global late.
+    assert_vm_run_matches_treewalker(
+        "let count = 0\nfn bump() { count = count + 1 }\nbump()\nbump()\nprint(count)",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_inner_function_reads_top_level_binding() {
+    // An inner function (nested two frames deep) reads a top-level let/const; it is
+    // a GLOBAL, not an upvalue, so it resolves late on both engines.
+    assert_vm_run_matches_treewalker(
+        "const BASE = 100\nfn outer() {\n  fn inner() { return BASE + 1 }\n  return inner()\n}\nprint(outer())",
+    )
+    .await;
+    assert_vm_run_matches_treewalker(
+        "let total = 5\nfn outer() {\n  let g = () => total * 2\n  return g()\n}\nprint(outer())",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_mutual_top_level_functions() {
+    // Mutual recursion between two top-level fns: `a` forward-references `b`.
+    assert_vm_run_matches_treewalker("fn a() { return b() }\nfn b() { return 1 }\nprint(a())").await;
+    // Even/odd mutual recursion exercises repeated forward+backward global reads.
+    assert_vm_run_matches_treewalker(
+        "fn even(n) { if (n == 0) { return true }\n return odd(n - 1) }\n\
+         fn odd(n) { if (n == 0) { return false }\n return even(n - 1) }\n\
+         print(even(10))\nprint(odd(7))",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_top_level_const_references_earlier_const() {
+    // A top-level const whose initializer reads an EARLIER top-level const (the
+    // common, already-defined direction) — must agree.
+    assert_vm_run_matches_treewalker("const A = 3\nconst B = A * 2\nprint(B)").await;
+    // And a top-level let initialized from an earlier top-level const.
+    assert_vm_run_matches_treewalker("const A = 10\nlet b = A + 5\nprint(b)").await;
+}
+
+#[tokio::test]
+async fn vm_inner_let_shadows_top_level_global() {
+    // An inner `let x` must shadow a top-level global `x` (resolve_local wins).
+    assert_vm_run_matches_treewalker(
+        "let x = 1\nfn f() { let x = 99\n return x }\nprint(f())\nprint(x)",
+    )
+    .await;
+}
