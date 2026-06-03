@@ -1130,18 +1130,17 @@ impl Interp {
                 step,
                 body,
             } => {
-                // RANGES FEATURE, Phase 1. Plain `for (i in a..b)` iterates
-                // ascending/exclusive/step-1 exactly as today. Inclusive (`..=`)
-                // and stepped (`step k`) for-ranges are not yet evaluable, so we
-                // REJECT them loudly to stay byte-identical with the VM (which
-                // rejects them in `src/compile/mod.rs`) — never silently iterate
-                // exclusive / step-ignored.
+                // RANGES FEATURE, Phase 2. `for (i in a..b)` is exclusive and
+                // `for (i in a..=b)` is inclusive; both iterate ascending/step-1
+                // (direction inference is Phase 4, so lo>hi stays empty). Stepped
+                // (`step k`) for-ranges are not yet evaluable, so we REJECT them
+                // loudly to stay byte-identical with the VM (which rejects step in
+                // `src/compile/mod.rs`) — never silently ignore `step`.
                 //
-                // PHASE-1 guard — removed in Phase 2/3 (Tasks 5–8) when for-ranges
-                // learn inclusive/step semantics.
-                if *inclusive || step.is_some() {
+                // PHASE-3 guard — removed when for-ranges learn `step` semantics.
+                if step.is_some() {
                     return Err(AsError::at(
-                        "inclusive/stepped ranges are not yet supported (implemented in a later phase)",
+                        "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
                         start.span,
                     )
                     .into());
@@ -1157,7 +1156,7 @@ impl Interp {
                     }
                 };
                 let mut i = lo;
-                while i < hi {
+                while if *inclusive { i <= hi } else { i < hi } {
                     let child = env.child();
                     child
                         .define(var, Value::Number(i), false)
@@ -1563,25 +1562,22 @@ impl Interp {
                     self.eval_expr(els, env).await
                 }
             }
-            // RANGES FEATURE, Phase 1. The parser DOES emit `ExprKind::Range`
-            // (since commit a91dfdc), so this is the live value-range path — it
-            // materializes a plain exclusive, ascending, step-1 `array<number>`
-            // (mirroring the legacy `BinOp::Range` eval in `apply_binop`). The
-            // inclusive (`..=`) and stepped (`step k`) semantics are not yet
-            // evaluable, so we REJECT them loudly to stay byte-identical with the
-            // VM (which rejects them in `src/compile/mod.rs`) — never silently
-            // ignore `inclusive`/`step` and emit wrong output.
+            // RANGES FEATURE, Phase 2. The value-range path materializes a
+            // `array<number>` honoring the inclusive (`..=`) boundary; it is still
+            // ascending/step-1 (direction inference is Phase 4, so lo>hi stays
+            // empty). Stepped (`step k`) value ranges are not yet evaluable, so we
+            // REJECT them loudly to stay byte-identical with the VM (which rejects
+            // step in `src/compile/mod.rs`) — never silently ignore `step`.
             ExprKind::Range {
                 start,
                 end,
                 inclusive,
                 step,
             } => {
-                // PHASE-1 guard — removed in Phase 2/3 (Tasks 5–8) when value
-                // ranges learn inclusive/step semantics.
-                if *inclusive || step.is_some() {
+                // PHASE-3 guard — removed when value ranges learn `step` semantics.
+                if step.is_some() {
                     return Err(AsError::at(
-                        "inclusive/stepped ranges are not yet supported (implemented in a later phase)",
+                        "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
                         expr.span,
                     )
                     .into());
@@ -1594,7 +1590,7 @@ impl Interp {
                 };
                 let mut items = Vec::new();
                 let mut i = lo;
-                while i < hi {
+                while if *inclusive { i <= hi } else { i < hi } {
                     items.push(Value::Number(i));
                     i += 1.0;
                 }
@@ -2981,6 +2977,31 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Contro
 /// inlines them above the operand evals; the VM lowers them to jumps). Passing one
 /// of those ops here is a programmer error (`unreachable!`).
 ///
+/// Materialize a range value `[lo .. hi)` (exclusive) or `[lo ..= hi]` (inclusive)
+/// into an eager `array<number>` with step 1, ascending only (so `lo > hi` yields
+/// `[]` until sequence-direction inference lands). Both bounds must be `Number`;
+/// otherwise raise the same Tier-2 `"range bounds must be numbers"` panic the
+/// tree-walker and VM emit. Shared by `apply_binop` (`Op::Range`) and the VM's
+/// `Op::RangeInclusive` so both engines are byte-identical.
+pub(crate) fn materialize_range(
+    l: &Value,
+    r: &Value,
+    inclusive: bool,
+    span: Span,
+) -> Result<Value, Control> {
+    let (lo, hi) = match (l, r) {
+        (Value::Number(a), Value::Number(b)) => (*a, *b),
+        _ => return Err(AsError::at("range bounds must be numbers", span).into()),
+    };
+    let mut items = Vec::new();
+    let mut i = lo;
+    while if inclusive { i <= hi } else { i < hi } {
+        items.push(Value::Number(i));
+        i += 1.0;
+    }
+    Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
+}
+
 /// Dispatch order mirrors `eval_expr`'s `ExprKind::Binary` arm exactly:
 /// Eq/Ne (cross-type decimal equality) → Range (eager `array<number>`) → string
 /// concat (`+` on two `Str`) → decimal arithmetic/ordering (either operand a
@@ -3008,17 +3029,7 @@ pub(crate) fn apply_binop(
     // ForRange and the `range()` builtin. Returns an Array, so it must be handled
     // before the generic "two numbers → Number" path below.
     if let BinOp::Range = op {
-        let (start, end) = match (&l, &r) {
-            (Value::Number(a), Value::Number(b)) => (*a, *b),
-            _ => return Err(AsError::at("range bounds must be numbers", span).into()),
-        };
-        let mut items = Vec::new();
-        let mut i = start;
-        while i < end {
-            items.push(Value::Number(i));
-            i += 1.0;
-        }
-        return Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))));
+        return materialize_range(&l, &r, false, span);
     }
 
     // String concatenation: `+` joins two strings.

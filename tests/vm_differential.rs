@@ -1385,32 +1385,63 @@ async fn vm_for_range_bounds_error_matches_treewalker() {
 }
 
 #[tokio::test]
-async fn both_engines_reject_inclusive_and_step_ranges_in_phase1() {
-    // RANGES FEATURE, Phase 1: the legacy front-end now PARSES `..=` and `step`
-    // into the dedicated `Range`/`ForRange` nodes, but NEITHER engine can yet
-    // EVALUATE inclusive/stepped semantics (those land in Phase 2/3, Tasks 5–8).
-    // To stay byte-identical, BOTH engines must REJECT these forms loudly rather
-    // than silently produce wrong (exclusive / step-ignored) output. This is a
-    // real both-reject parity assertion — not a recorded divergence.
+async fn both_engines_inclusive_range_agree() {
+    // RANGES FEATURE, Phase 2: inclusive `..=` ranges now EVALUATE on BOTH engines
+    // in for-range and value position, ascending/step-1 (direction inference is a
+    // later phase, so `lo > hi` stays empty). Both engines must SUCCEED and produce
+    // byte-identical output — a real both-accept parity assertion.
+    for (src, expected) in [
+        // for-range, inclusive: 1,2,3,4,5.
+        ("for (i in 1..=5) { print(i) }", "1\n2\n3\n4\n5\n"),
+        // value range, inclusive.
+        ("print(1..=5)", "[1, 2, 3, 4, 5]\n"),
+        // single-element inclusive (`5..=5` → `[5]`; cf. exclusive `5..5` → `[]`).
+        ("print(5..=5)", "[5]\n"),
+        ("print(5..5)", "[]\n"),
+        // ascending-only this phase: descending inclusive stays empty.
+        ("print(10..=1)", "[]\n"),
+        // exclusive `..` is unchanged.
+        ("print(1..5)", "[1, 2, 3, 4]\n"),
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        assert!(tw.is_ok(), "tree-walker should accept `{src}`, got {tw:?}");
+        assert!(vm.is_ok(), "VM should accept `{src}`, got {vm:?}");
+        assert_eq!(
+            tw.as_deref().ok(),
+            Some(expected),
+            "tree-walker output wrong for `{src}`"
+        );
+        assert_eq!(
+            tw.as_deref().ok(),
+            vm.as_ref().map(|(out, _)| out.as_str()).ok(),
+            "inclusive-range output diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn both_engines_still_reject_step_phase2() {
+    // RANGES FEATURE, Phase 2: `step` iteration is NOT yet implemented (a later
+    // phase). To stay byte-identical, BOTH engines must REJECT stepped ranges
+    // loudly rather than silently produce wrong (step-ignored) output.
     for src in [
-        // for-range, inclusive.
-        "for (i in 1..=5) { print(i) }",
         // for-range, stepped.
         "for (i in 1..10 step 2) { print(i) }",
-        // value range, inclusive.
-        "print(1..=5)",
         // value range, stepped.
         "print(1..10 step 2)",
+        // inclusive + stepped: step still rejected.
+        "print(1..=10 step 2)",
     ] {
         let tw = ascript::run_source(src).await;
         let vm = ascript::vm_run_source(src).await;
         assert!(
             tw.is_err(),
-            "tree-walker should REJECT inclusive/stepped range for `{src}`, got {tw:?}"
+            "tree-walker should REJECT stepped range for `{src}`, got {tw:?}"
         );
         assert!(
             vm.is_err(),
-            "VM should REJECT inclusive/stepped range for `{src}`, got {vm:?}"
+            "VM should REJECT stepped range for `{src}`, got {vm:?}"
         );
     }
 }

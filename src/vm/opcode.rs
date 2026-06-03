@@ -135,6 +135,11 @@ pub enum Op {
     /// `a b -- [a, a+1, .. b)` — eager half-open `array<number>` (step 1). Mirrors
     /// the tree-walker's `BinOp::Range`; both bounds must be `Number`.
     Range,
+    /// `a b -- [a, a+1, ..= b]` — eager INCLUSIVE `array<number>` (step 1).
+    /// Mirrors the tree-walker's value-position `..=` materialization; both bounds
+    /// must be `Number`. Ascending only (direction inference is a later phase, so
+    /// `a > b` yields `[]`).
+    RangeInclusive,
     /// `a b -- a b` (peek-only) — verify the top TWO stack values are both
     /// `Value::Number`, otherwise raise the Tier-2 panic carried at this op's span.
     /// Used to lower the for-range bounds check eagerly (before the loop) so the
@@ -482,6 +487,7 @@ impl Op {
             x if x == Gt as u8 => Gt,
             x if x == Ge as u8 => Ge,
             x if x == Range as u8 => Range,
+            x if x == RangeInclusive as u8 => RangeInclusive,
             x if x == CheckNumbers as u8 => CheckNumbers,
 
             x if x == Jump as u8 => Jump,
@@ -578,7 +584,8 @@ impl Op {
 
             // Zero-operand ops.
             Nil | True | False | Pop | Dup | Swap | Rot3 | Add | Sub | Mul | Div | Mod | Pow
-            | Neg | Not | Eq | Ne | Lt | Le | Gt | Ge | Range | CheckNumbers | Return | Spread
+            | Neg | Not | Eq | Ne | Lt | Le | Gt | Ge | Range | RangeInclusive | CheckNumbers
+            | Return | Spread
             | SpreadArgs | AppendArray | AppendObject | SpreadObject | CallSpread | GetIndex
             | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate
             | Unwrap | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen
@@ -637,6 +644,7 @@ mod tests {
         Op::Gt,
         Op::Ge,
         Op::Range,
+        Op::RangeInclusive,
         Op::CheckNumbers,
         Op::Jump,
         Op::JumpIfFalse,

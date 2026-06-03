@@ -1250,3 +1250,106 @@ fn vm_step_stays_usable_as_identifier() {
     assert!(out.status.success(), "process failed: {:?}", out);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
 }
+
+// ===== RANGES FEATURE, Phase 2: inclusive `..=` ranges (both engines) =========
+
+/// Run `src` as a `.as` program on a chosen engine, returning stdout. Panics if
+/// the process fails (so callers assert on successful output).
+fn run_range_src(src: &str, tree_walker: bool, tag: &str) -> String {
+    let file = std::env::temp_dir().join(format!("ascript_range_{tag}.as"));
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let mut cmd = Command::new(bin);
+    cmd.arg("run");
+    if tree_walker {
+        cmd.arg("--tree-walker");
+    }
+    let out = cmd.arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "process failed ({}): {:?}",
+        if tree_walker { "tree-walker" } else { "vm" },
+        out
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn inclusive_range_iteration_and_value_both_engines() {
+    // The four target cases must be byte-identical on the default VM AND the
+    // tree-walker: inclusive for-range, inclusive value materialization, the
+    // single-element `5..=5`, and the (ascending-only this phase) empty `10..=1`.
+    let cases = [
+        ("for (i in 1..=4) { print(i) }", "1\n2\n3\n4\n"),
+        ("print(1..=5)", "[1, 2, 3, 4, 5]\n"),
+        ("print(5..=5)", "[5]\n"),
+        ("print(10..=1)", "[]\n"),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("vm_{i}"));
+        let tw = run_range_src(src, true, &format!("tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn exclusive_range_unchanged_both_engines() {
+    // Exclusive `..` behavior is unchanged by Phase 2.
+    let cases = [
+        ("for (i in 1..4) { print(i) }", "1\n2\n3\n"),
+        ("print(1..5)", "[1, 2, 3, 4]\n"),
+        ("print(5..5)", "[]\n"),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("excl_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("excl_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn inclusive_match_pattern_still_works_both_engines() {
+    // `match n { 1..=10 => "in", _ => "out" }` with n=5 → "in" (pre-existing).
+    let src = "let n = 5\nprint(match n { 1..=10 => \"in\", _ => \"out\" })";
+    let vm = run_range_src(src, false, "match_vm");
+    let tw = run_range_src(src, true, "match_tw");
+    assert_eq!(vm, "in\n");
+    assert_eq!(tw, "in\n");
+}
+
+#[test]
+fn stepped_ranges_still_rejected_both_engines() {
+    // `step` iteration is a later phase; both engines must reject it loudly.
+    for (i, src) in [
+        "for (i in 1..10 step 2) { print(i) }",
+        "print(1..10 step 2)",
+        "print(1..=10 step 2)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let file = std::env::temp_dir().join(format!("ascript_step_reject_{i}.as"));
+        std::fs::write(&file, src).unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        for tw in [false, true] {
+            let mut cmd = Command::new(bin);
+            cmd.arg("run");
+            if tw {
+                cmd.arg("--tree-walker");
+            }
+            let out = cmd.arg(&file).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "{} should REJECT stepped range `{src}`, got {:?}",
+                if tw { "tree-walker" } else { "vm" },
+                out
+            );
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+}

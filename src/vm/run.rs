@@ -507,6 +507,18 @@ impl Vm {
                     fiber.push(v);
                 }
 
+                Op::RangeInclusive => {
+                    // Inclusive value-range `a..=b` — eager `array<number>`,
+                    // ascending/step-1, byte-identical to the tree-walker's
+                    // value-position `..=` materialization (shared materializer so
+                    // the bounds-panic message matches `Op::Range`).
+                    let b = fiber.pop();
+                    let a = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let v = crate::interp::materialize_range(&a, &b, true, span)?;
+                    fiber.push(v);
+                }
+
                 Op::Neg | Op::Not => {
                     let a = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);

@@ -210,10 +210,10 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
 ///    authoritative legacy ast for these forms, so they cannot diverge. The slice is
 ///    padded with leading spaces up to the node's start offset so the produced spans
 ///    keep their original-file byte offsets.
-/// 3. **Rejected** (symmetric with the tree-walker): an inclusive `..=` range as a
-///    value default — the legacy parser ALSO rejects it (the tree-walker reports
-///    "expected a field name or method, found DotDotEq"; `BinOp::Range` has no
-///    inclusive variant), so the VM's rejection here is symmetric.
+/// 3. **Rejected** (symmetric with the tree-walker): a STEPPED range (`a..b step k`)
+///    as a value default — `step` has no codegen yet (a later phase), so it is a
+///    `CompileError` in both engines. (Inclusive `..=` value defaults ARE supported:
+///    they lower to `ExprKind::Range { inclusive: true, .. }`.)
 fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     use crate::ast::{ArrayElem, BinOp, CallArg, ExprKind, ObjEntry, UnOp};
     let span = node_span(expr);
@@ -305,10 +305,8 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 rhs: Box::new(cst_default_expr(&rhs)?),
             }
         }
-        // Exclusive range `a..b` → `BinOp::Range` (mirrors `compile_range`). The
-        // inclusive `..=` form has no legacy `BinOp` (and no value-position
-        // representation): the legacy parser rejects `..=` as a value default too,
-        // so rejecting it here is symmetric with the tree-walker.
+        // Value-position range `a..b` / `a..=b` → `ExprKind::Range` (the tree-walker
+        // materializes it to `array<number>`, honoring the inclusive boundary).
         Expr::RangeExpr(range) => {
             let start = range
                 .start()
@@ -316,35 +314,30 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             let end = range
                 .end()
                 .ok_or_else(|| CompileError::new("range default missing end bound", span))?;
-            // PHASE-1 temporary guard — removed in Phase 2/3. A stepped range as a
-            // value default has no codegen yet; reject it rather than silently
-            // dropping the step.
+            // PHASE-3 temporary guard — removed when value ranges learn `step`
+            // semantics. A stepped range as a value default has no codegen yet;
+            // reject it rather than silently dropping the step.
             if range.step().is_some() {
                 return Err(CompileError::new(
                     "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
                     span,
                 ));
             }
-            match range.op() {
-                Some(SyntaxKind::DotDot) => {}
-                Some(SyntaxKind::DotDotEq) => {
-                    return Err(CompileError::new(
-                        "inclusive range (..=) as a value default is not supported \
-                         (the tree-walker's parser also rejects it)",
-                        span,
-                    ))
-                }
+            let inclusive = match range.op() {
+                Some(SyntaxKind::DotDot) => false,
+                Some(SyntaxKind::DotDotEq) => true,
                 other => {
                     return Err(CompileError::new(
                         format!("range default has unexpected operator {other:?}"),
                         span,
                     ))
                 }
-            }
-            ExprKind::Binary {
-                op: BinOp::Range,
-                lhs: Box::new(cst_default_expr(&start)?),
-                rhs: Box::new(cst_default_expr(&end)?),
+            };
+            ExprKind::Range {
+                start: Box::new(cst_default_expr(&start)?),
+                end: Box::new(cst_default_expr(&end)?),
+                inclusive,
+                step: None,
             }
         }
         Expr::ArrayExpr(arr) => {
@@ -2416,11 +2409,9 @@ impl Compiler {
     /// exit:
     ///   patch(break_sites...)      ; each `break` lands here
     /// ```
-    /// The INCLUSIVE form `for (i in 0..=5)` is REJECTED here: the legacy parser
-    /// (the differential oracle) rejects `..=` in a for-range head outright
-    /// ("expected RParen, found DotDotEq"), so inclusive for-range is unsupported
-    /// in the tree-walker. The VM must not invent behavior the oracle lacks, so an
-    /// `..=` for-range is a documented `CompileError` (both engines reject it).
+    /// The INCLUSIVE form `for (i in 0..=5)` uses an inclusive bound comparison
+    /// (`Op::Le` instead of `Op::Lt`); both engines iterate ascending/step-1
+    /// (direction inference is Phase 4, so lo>hi stays empty).
     ///
     /// A for-of (`for (x of iterable)`, `op() == OfKw`) is lowered by
     /// [`Self::compile_for_of`] (sync snapshot iteration); `for await` async
@@ -2465,18 +2456,13 @@ impl Compiler {
             _ => return self.compile_for_of(for_stmt, &iter, &body),
         };
 
-        // Inclusive `..=` for-range is rejected by the legacy parser (the oracle),
-        // so the VM rejects it too — never silently treat it as exclusive.
-        if range.op() == Some(SyntaxKind::DotDotEq) {
-            return Err(CompileError::new(
-                "inclusive for-range (`..=`) is not supported (the interpreter rejects it)",
-                span,
-            ));
-        }
+        // The inclusive `..=` form drives the loop with an inclusive bound
+        // comparison (`Op::Le`); exclusive `..` uses `Op::Lt` (set below).
+        let inclusive = range.op() == Some(SyntaxKind::DotDotEq);
 
-        // PHASE-1 temporary guard — removed in Phase 2/3. The for-range loop ignores
-        // any `step` child for now, so `for (i in 1..10 step 2)` would silently run as
-        // `1..10`. Reject it loudly until Phase 3 wires step iteration.
+        // PHASE-3 temporary guard — removed when step iteration is wired. The
+        // for-range loop ignores any `step` child for now, so `for (i in 1..10 step
+        // 2)` would silently run as `1..10`. Reject it loudly until then.
         if range.step().is_some() {
             return Err(CompileError::new(
                 "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
@@ -2517,11 +2503,13 @@ impl Compiler {
         self.chunk.emit_u16(Op::SetLocal, end_slot, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
-        // Condition: re-test `idx < end` each iteration.
+        // Condition: re-test `idx < end` (exclusive) or `idx <= end` (inclusive)
+        // each iteration.
         let cond_start = self.chunk.code.len();
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
         self.chunk.emit_u16(Op::GetLocal, end_slot, span);
-        self.chunk.emit(Op::Lt, span);
+        self.chunk
+            .emit(if inclusive { Op::Le } else { Op::Lt }, span);
         let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
 
         // Top of the iteration: give the loop var (and any loop-body captured
@@ -3808,16 +3796,15 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower a `RangeExpr` (`a..b`). Mirrors the tree-walker's `BinOp::Range`:
-    /// pushes both bounds and emits `RANGE`, which builds the eager half-open
-    /// `array<number>`. Only the exclusive `..` form has a tree-walker equivalent
-    /// in value position (the old parser produces `..=` only inside match
-    /// patterns), so an inclusive `..=` range as a value is a documented deferral.
+    /// Lower a `RangeExpr` (`a..b` / `a..=b`). Pushes both bounds and emits `RANGE`
+    /// (exclusive) or `RANGE_INCLUSIVE` (inclusive `..=`), which builds the eager
+    /// `array<number>` byte-identically to the tree-walker's value-position
+    /// materialization.
     fn compile_range(&mut self, range: &RangeExpr) -> Result<(), CompileError> {
-        // The RANGE op can PANIC (a non-number bound is a Tier-2 type error in
-        // `apply_binop`'s `BinOp::Range` arm). The tree-walker anchors it at the
-        // whole range expression's `expr.span`, which carries no leading trivia;
-        // use the trivia-trimmed code span for byte-identical diagnostics (#132).
+        // The RANGE / RANGE_INCLUSIVE op can PANIC (a non-number bound is a Tier-2
+        // type error). The tree-walker anchors it at the whole range expression's
+        // `expr.span`, which carries no leading trivia; use the trivia-trimmed code
+        // span for byte-identical diagnostics (#132).
         let span = node_code_span(range);
         let start = range
             .start()
@@ -3825,33 +3812,28 @@ impl Compiler {
         let end = range
             .end()
             .ok_or_else(|| CompileError::new("range expression missing end bound", span))?;
-        // PHASE-1 temporary guard — removed in Phase 2/3. A `step` child carries no
-        // codegen yet, so a stepped value range would silently compile as `1..10`
-        // (wrong output). Reject it loudly until Phase 3 wires step semantics.
+        // PHASE-3 temporary guard — removed when value ranges learn `step` semantics.
+        // A `step` child carries no codegen yet, so a stepped value range would
+        // silently compile as `1..10` (wrong output). Reject it loudly until then.
         if range.step().is_some() {
             return Err(CompileError::new(
                 "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
                 span,
             ));
         }
-        match range.op() {
-            Some(SyntaxKind::DotDot) => {}
-            Some(SyntaxKind::DotDotEq) => {
-                return Err(CompileError::new(
-                    "inclusive range (..=) as a value is not yet supported in V2",
-                    span,
-                ))
-            }
+        let op = match range.op() {
+            Some(SyntaxKind::DotDot) => Op::Range,
+            Some(SyntaxKind::DotDotEq) => Op::RangeInclusive,
             other => {
                 return Err(CompileError::new(
                     format!("range expression has unexpected operator {other:?}"),
                     span,
                 ))
             }
-        }
+        };
         self.compile_expr(&start)?;
         self.compile_expr(&end)?;
-        self.chunk.emit(Op::Range, span);
+        self.chunk.emit(op, span);
         Ok(())
     }
 
@@ -4475,11 +4457,12 @@ mod tests {
     }
 
     #[test]
-    fn inclusive_range_value_is_deferred() {
-        let err = compile_source("0..=5").unwrap_err();
+    fn inclusive_range_value_compiles_to_range_inclusive_op() {
+        let chunk = compile_source("0..=5").expect("compiles");
+        let text = disasm(&chunk);
         assert!(
-            err.message.contains("inclusive range"),
-            "expected inclusive-range deferral, got {err:?}"
+            text.contains("RANGE_INCLUSIVE"),
+            "missing RANGE_INCLUSIVE in:\n{text}"
         );
     }
 
@@ -4951,11 +4934,13 @@ mod tests {
     }
 
     #[test]
-    fn for_range_inclusive_is_rejected() {
-        // `..=` for-range is rejected (the tree-walker's parser rejects it), never
-        // silently treated as exclusive.
-        let err = compile_source("for (i in 0..=3) { print(i) }").unwrap_err();
-        assert!(err.message.contains("inclusive for-range"), "got {err:?}");
+    fn for_range_inclusive_uses_le_comparison() {
+        // `..=` for-range drives the loop with an inclusive bound comparison (LE),
+        // where `..` uses LT.
+        let chunk = compile_source("for (i in 0..=3) { print(i) }").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains(" LE"), "expected LE comparison in:\n{text}");
+        assert!(text.contains("LOOP"), "no loop back-edge in:\n{text}");
     }
 
     #[test]

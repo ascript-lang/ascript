@@ -212,7 +212,7 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Rot3 => Effect::new(3, 3),
 
         // ---- binary arithmetic / comparison / range ----
-        Add | Sub | Mul | Div | Mod | Pow | Lt | Le | Gt | Ge | Eq | Ne | Range => {
+        Add | Sub | Mul | Div | Mod | Pow | Lt | Le | Gt | Ge | Eq | Ne | Range | RangeInclusive => {
             Effect::new(2, 1)
         }
         // ---- unary ----
