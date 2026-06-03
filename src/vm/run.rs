@@ -167,6 +167,15 @@ impl Vm {
         &self.interp
     }
 
+    /// Force a full cycle collection (V13-T3). Thin pass-through to
+    /// [`crate::gc::collect`] so tests (V13-T4's soundness gate) can deterministically
+    /// trigger trial-deletion at a known point and assert a cycle was reclaimed. The
+    /// collector is thread-local; the VM runs single-threaded so this collects this
+    /// VM's whole `Cc` graph. Returns the number of objects reclaimed.
+    pub fn collect(&self) -> usize {
+        crate::gc::collect()
+    }
+
     /// The shared `def_env` for VM-created classes (task #157), built lazily as a
     /// single child of `global_env()` and reused for every class. See the
     /// `class_env` field doc for why this mirrors the tree-walker's module env.

@@ -50,6 +50,10 @@ pub async fn run_file(path: &Path, script_args: &[String]) -> Result<i32, AsErro
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(interp.load_module(path)).await;
     local.await; // drain spawned tasks (structured join) — no-op until Phase 2
+                 // End-of-program cycle collection (V13-T3): the tree-walker shares
+                 // the same `Cc` value model, so a final sweep here reclaims any
+                 // leftover cycles on clean shutdown. Output already streamed (Live).
+    crate::gc::collect();
     match result {
         Ok(_) => Ok(0),
         Err(crate::interp::Control::Panic(e)) => Err(e),
@@ -277,6 +281,11 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(vm.run(&mut fiber)).await;
     local.await; // drain spawned tasks
+                 // End-of-program cycle collection (V13-T3): reclaim any leftover
+                 // reference cycles for a clean shutdown. The fiber's stack has been
+                 // consumed by `run`, so this sweeps genuinely-dead cyclic garbage
+                 // only — it cannot affect output (already emitted) or live data.
+    crate::gc::collect();
     match result {
         Ok(RunOutcome::Done(_)) => Ok(0),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),
@@ -323,6 +332,10 @@ async fn vm_run_source_with(
     let local = tokio::task::LocalSet::new();
     let result = local.run_until(vm.run(&mut fiber)).await;
     local.await; // drain spawned tasks — no-op until later VM slices
+                 // End-of-program cycle collection (V13-T3): see `run_aso_file`. The
+                 // output is already captured on `interp`, so a final sweep of dead
+                 // cycles is observably invisible.
+    crate::gc::collect();
     match result {
         Ok(RunOutcome::Done(_)) => Ok((interp.output(), None)),
         Ok(RunOutcome::Yielded(_)) => unreachable!("top-level program cannot yield"),

@@ -43,7 +43,79 @@ use crate::value::{Instance, MapCell, MapKey, ObjectCell, SetCell, Value};
 use crate::vm::value_ext::Closure;
 use gcmodule::{Cc, Trace, Tracer};
 use indexmap::{IndexMap, IndexSet};
+use std::cell::Cell;
 use std::hash::Hash;
+
+// ───────────────────────────── cycle collection (V13-T3) ─────────────────────
+//
+// gcmodule's collector is **thread-local** (`collect_thread_cycles()` operates on
+// the current thread's `Cc`-tracked object space). AScript's runtime is `!Send`
+// and runs on a current-thread tokio runtime inside a `LocalSet`, so a single
+// thread owns the whole `Cc` graph — the thread-local collector fits exactly, and
+// we never need cross-thread coordination.
+//
+// **What collection does / does not do (the safety invariants this task rests on):**
+// - It reclaims ONLY unreachable *cycles*. gcmodule accounts external strong refs
+//   via the `Cc` refcount, so anything reachable from the live stack / frames /
+//   globals has refcount > internal-edges and is KEPT. Acyclic garbage is already
+//   freed by refcounting *before* the collector ever sees it (the `Cc` drops at
+//   refcount 0, exactly like `Rc`), so collection only ever touches genuinely
+//   cyclic, genuinely-dead subgraphs → it cannot change observable behavior.
+// - `Native`/`Str`/`Bytes`/`Class`/`Function` stay on `Rc` (NOT `Cc`), so they are
+//   not in the collector's object space at all — collection never traces or drops
+//   a native OS-resource handle, preserving deterministic fd reclamation (V13-T6).
+
+/// How many *net new* `Cc` allocations to let accumulate before an automatic
+/// collection is considered. The trigger compares the collector's live tracked
+/// count (`gcmodule::count_thread_tracked`, which gcmodule maintains for free) to
+/// the count at the last collection; once it has grown by this many, a collection
+/// runs. This is allocation-*pressure* based (not a per-op cost) so it stays cheap:
+/// the only per-check work is a thread-local counter read + compare.
+///
+/// Tuned conservatively high so steady-state acyclic programs (which never grow the
+/// tracked set, because refcounting drops their `Cc`s immediately) effectively never
+/// trigger a collection, and only a program that is genuinely *retaining* a large
+/// and growing `Cc` graph pays for a sweep. The V13-T5 soak + V13-T7 perf gates
+/// validate this default is neither too lazy (memory grows unbounded) nor too eager
+/// (throughput regresses).
+const COLLECT_GROWTH_THRESHOLD: usize = 10_000;
+
+thread_local! {
+    /// The tracked-object count at the most recent collection (auto or forced).
+    /// The auto trigger fires when the current tracked count exceeds this by
+    /// [`COLLECT_GROWTH_THRESHOLD`]. Updated after every collection so the trigger
+    /// measures *growth since last sweep*, not absolute size.
+    static LAST_COLLECT_TRACKED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Force a full cycle collection on the current thread and return the number of
+/// objects reclaimed. Thin wrapper over [`gcmodule::collect_thread_cycles`] that
+/// also resets the growth baseline so the *next* auto trigger measures growth from
+/// here. This is the explicit collection point: program-end (clean shutdown +
+/// reclaim leftover cycles) and the test hook (`Vm::collect`).
+#[inline]
+pub fn collect() -> usize {
+    let reclaimed = gcmodule::collect_thread_cycles();
+    LAST_COLLECT_TRACKED.with(|c| c.set(gcmodule::count_thread_tracked()));
+    reclaimed
+}
+
+/// Cheap allocation-pressure check, called at coarse-grained safe points during
+/// long-running execution (e.g. between accepted `http.serve` connections). Runs a
+/// collection ONLY when the live tracked-object count has grown past the last
+/// collection's baseline by [`COLLECT_GROWTH_THRESHOLD`]; otherwise it is a single
+/// thread-local read + compare and returns without collecting. Returns the number
+/// of objects reclaimed (0 if it did not collect).
+#[inline]
+pub fn maybe_collect() -> usize {
+    let tracked = gcmodule::count_thread_tracked();
+    let baseline = LAST_COLLECT_TRACKED.with(|c| c.get());
+    if tracked.saturating_sub(baseline) >= COLLECT_GROWTH_THRESHOLD {
+        collect()
+    } else {
+        0
+    }
+}
 
 /// Heap address of a `Cc`-managed object, for identity comparison and the
 /// display cycle-guard `seen` list. `gcmodule::Cc` exposes no `as_ptr`, but it
@@ -358,5 +430,63 @@ mod tests {
             vec![Cc::new(RefCell::new(Value::Number(9.0)))],
         );
         closure_inner.trace(&mut noop); // no panic, traces upvalue cells
+    }
+
+    /// V13-T3: collection actually RUNS and reclaims a reference cycle. Build a
+    /// self-referential array (`let a = []; a.push(a)`) directly over the `Cc`
+    /// value model, drop the external handle, then force a collection via the
+    /// public [`collect`] hook and assert the collector reports the cyclic node
+    /// reclaimed. Acyclic data would already be freed by refcounting before the
+    /// collector sees it, so a non-zero reclaim here is specifically the *cycle*
+    /// being broken — proof collection is wired and effective. (V13-T4 is the full
+    /// soundness gate; this just proves one cycle is reclaimed.)
+    #[test]
+    fn collect_reclaims_a_reference_cycle() {
+        // Start from a clean baseline: drop anything pending, then collect so the
+        // tracked set reflects only what THIS test allocates.
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        // `let a = []; a.push(a)` — an array whose sole element is itself. The
+        // `Cc<RefCell<Vec<Value>>>` now has an internal edge from its own slot, so
+        // dropping the external `a` leaves refcount 1 (the self-edge) → it is NOT
+        // freed by refcounting and would leak without cycle collection.
+        let a = Value::Array(Cc::new(RefCell::new(Vec::new())));
+        if let Value::Array(arr) = &a {
+            arr.borrow_mut().push(a.clone());
+        }
+        // The cycle is now live and tracked. Drop the only external reference.
+        drop(a);
+
+        // Refcounting alone cannot reclaim it (the self-edge keeps refcount at 1).
+        // Force a collection: trial-deletion must find the unreachable cycle and
+        // free it. `collect` returns the number of objects reclaimed.
+        let reclaimed = super::collect();
+        assert!(
+            reclaimed >= 1,
+            "cycle collection must reclaim the self-referential array (got {reclaimed})"
+        );
+
+        // And the live tracked count returns to the pre-cycle baseline (the cyclic
+        // node is gone from the collector's object space, not merely marked).
+        let after = gcmodule::count_thread_tracked();
+        assert_eq!(
+            after, before,
+            "tracked-object count must return to baseline after reclaiming the cycle"
+        );
+    }
+
+    /// `maybe_collect` is a cheap no-op below the growth threshold (it must not
+    /// collect on every call — that would tank throughput / the perf gate). Below
+    /// threshold it returns 0 without sweeping; `collect` always sweeps.
+    #[test]
+    fn maybe_collect_is_a_noop_below_threshold() {
+        super::collect(); // reset baseline
+                          // A single tiny acyclic allocation is far below the
+                          // COLLECT_GROWTH_THRESHOLD, so maybe_collect must skip.
+        let v = Value::Array(Cc::new(RefCell::new(vec![Value::Number(1.0)])));
+        let reclaimed = super::maybe_collect();
+        assert_eq!(reclaimed, 0, "maybe_collect must skip below the growth threshold");
+        drop(v);
     }
 }

@@ -813,6 +813,14 @@ impl Interp {
             }
             // (Unbounded serve: the handle is dropped — the task is detached and runs
             // to completion on the LocalSet; the semaphore bounds concurrency.)
+
+            // Periodic cycle collection (V13-T3): a long-running `serve` is THE soak
+            // target — each request may build and drop a cyclic `Cc` graph that
+            // refcounting alone cannot reclaim. This is a coarse, cheap safe point
+            // (once per accepted connection): `maybe_collect` only sweeps once the
+            // tracked-object count has grown past the threshold since the last sweep,
+            // so a server with no cyclic garbage pays just a thread-local read here.
+            crate::gc::maybe_collect();
         }
 
         // Deterministic shutdown: drain every in-flight handler task so all accepted
