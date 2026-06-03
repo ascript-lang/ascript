@@ -270,6 +270,50 @@ pub enum Op {
     /// per-iteration semantics). `slot` is always a resolver cell slot, so the
     /// frame's `cells[slot]` exists; a non-cell slot would be a compiler bug.
     FreshCell,
+
+    // ---- destructuring let (V10-T1) ---------------------------------------
+    /// `src -- src` (peek-only) — verify the value on TOS is a `Value::Array`,
+    /// else raise the Tier-2 panic `cannot destructure a non-array value of type
+    /// {t}` (`t` = `interp::type_name`) at this op's span (the RHS expression's
+    /// trivia-trimmed code span). Mirrors the tree-walker's `Stmt::LetDestructure`
+    /// type check, which validates ONCE before binding any name. Leaves the source
+    /// in place so the surrounding lowering can store it into a temp slot.
+    CheckArrayDestructure,
+    /// `src -- src` (peek-only) — verify the value on TOS is a `Value::Object` or
+    /// `Value::Instance`, else raise the Tier-2 panic `cannot destructure a
+    /// non-object value of type {t}` (`t` = `interp::type_name`) at this op's span.
+    /// Mirrors the tree-walker's `Stmt::LetDestructureObject` type check. Leaves
+    /// the source in place.
+    CheckObjectDestructure,
+    /// `ARRAY_ELEM(u16 index)` — `src -- src[index]`. Pop a `Value::Array` and push
+    /// the element at `index`, or `nil` if the index is out of bounds (positions
+    /// past the array's length bind nil, NOT an out-of-bounds panic — matching the
+    /// tree-walker's `items.get(i).cloned().unwrap_or(Value::Nil)`). The source has
+    /// already been validated as an array by `CheckArrayDestructure`; a non-array
+    /// here is a compiler bug surfaced as a Tier-2 panic.
+    ArrayElem,
+    /// `OBJECT_KEY(u16 const)` — `src -- src[key]` where `key = consts[const]` (a
+    /// `Str`). Pop a `Value::Object` or `Value::Instance` and push the value stored
+    /// under `key`, or `nil` if the key is absent. Mirrors the tree-walker's
+    /// destructure `get` closure EXACTLY: an Object reads its map entry, an Instance
+    /// reads its `fields` entry (it does NOT fall back to methods, unlike
+    /// `read_member`). The source has already been validated by
+    /// `CheckObjectDestructure`; any other value here is a compiler bug.
+    ObjectKey,
+    /// `ARRAY_REST(u16 start)` — `src -- src[start..]`. Pop a `Value::Array` and
+    /// push a NEW array of its elements from index `start` to the end (the trailing
+    /// collector `...rest`), matching the tree-walker's
+    /// `items.iter().skip(names.len())`. An empty tail yields an empty array. The
+    /// source has already been validated as an array; a non-array is a compiler bug.
+    ArrayRest,
+    /// `OBJECT_REST(u16 const)` — `src -- leftover` where `consts[const]` is a
+    /// `Value::Array` of `Str` keys that were explicitly bound. Pop a
+    /// `Value::Object`/`Value::Instance` and push a NEW object of its entries whose
+    /// key is NOT in the bound-keys set, preserving source order — matching the
+    /// tree-walker's leftover-keys collection (`...rest` excludes the already-bound
+    /// SOURCE keys). The source has already been validated; any other value is a
+    /// compiler bug.
+    ObjectRest,
 }
 
 impl Op {
@@ -362,6 +406,13 @@ impl Op {
             x if x == SetLocalCell as u8 => SetLocalCell,
             x if x == FreshCell as u8 => FreshCell,
 
+            x if x == CheckArrayDestructure as u8 => CheckArrayDestructure,
+            x if x == CheckObjectDestructure as u8 => CheckObjectDestructure,
+            x if x == ArrayElem as u8 => ArrayElem,
+            x if x == ObjectKey as u8 => ObjectKey,
+            x if x == ArrayRest as u8 => ArrayRest,
+            x if x == ObjectRest as u8 => ObjectRest,
+
             _ => return None,
         })
     }
@@ -374,7 +425,8 @@ impl Op {
             // u16-operand ops.
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | Closure | NewArray | NewObject
-            | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import => 2,
+            | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper | Template | Import
+            | ArrayElem | ObjectKey | ArrayRest | ObjectRest => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -389,7 +441,8 @@ impl Op {
             Nil | True | False | Pop | Dup | Swap | Rot3 | Add | Sub | Mul | Div | Mod | Pow
             | Neg | Not | Eq | Ne | Lt | Le | Gt | Ge | Range | CheckNumbers | Return | Spread
             | GetIndex | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate
-            | Unwrap | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen => 0,
+            | Unwrap | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen
+            | CheckArrayDestructure | CheckObjectDestructure => 0,
         }
     }
 
@@ -479,6 +532,12 @@ mod tests {
         Op::GetLocalCell,
         Op::SetLocalCell,
         Op::FreshCell,
+        Op::CheckArrayDestructure,
+        Op::CheckObjectDestructure,
+        Op::ArrayElem,
+        Op::ObjectKey,
+        Op::ArrayRest,
+        Op::ObjectRest,
     ];
 
     #[test]

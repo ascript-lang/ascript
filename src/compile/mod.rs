@@ -2082,16 +2082,13 @@ impl Compiler {
         let span = node_span(let_stmt);
 
         // A destructuring binder has an ArrayBindPat/ObjectBindPat child instead
-        // of a plain ident token; defer it to V10.
-        if let_stmt
+        // of a plain ident token.
+        if let Some(pat) = let_stmt
             .syntax()
             .children()
-            .any(|c| matches!(c.kind(), SyntaxKind::ArrayBindPat | SyntaxKind::ObjectBindPat))
+            .find(|c| matches!(c.kind(), SyntaxKind::ArrayBindPat | SyntaxKind::ObjectBindPat))
         {
-            return Err(CompileError::new(
-                "destructuring let (array/object pattern) not yet supported (V10)",
-                span,
-            ));
+            return self.compile_let_destructure(let_stmt, pat);
         }
 
         let slot = self.let_slot(let_stmt)?;
@@ -2121,6 +2118,135 @@ impl Compiler {
             })?;
         u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// The local slot the resolver assigned to a pattern binding (a `BindEntry` or
+    /// `RestBind` node). The resolver records a `BindingKind::PatternBind` binding
+    /// whose `decl_range` is the ENTRY node's `text_range()` (see
+    /// `declare_pattern_names`), so we match by that range.
+    fn pattern_bind_slot(&self, entry: &ResolvedNode, span: Span) -> Result<u16, CompileError> {
+        let decl_range: TextRange = entry.text_range();
+        let binding = self
+            .resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == decl_range)
+            .ok_or_else(|| {
+                CompileError::new(
+                    "destructuring binding has no resolver binding (compiler bug)",
+                    span,
+                )
+            })?;
+        u16::try_from(binding.slot)
+            .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
+    }
+
+    /// Compile a destructuring `let`/`const` — `let [a, b, ...r] = rhs` or
+    /// `let {a, b as local, "k" as v, ...rest} = rhs`. Mirrors the tree-walker's
+    /// `Stmt::LetDestructure` (array) and `Stmt::LetDestructureObject` (object)
+    /// EXACTLY: validate the RHS once (type panic at the RHS span), bind each
+    /// position/key (missing → nil), then the optional `...rest` collector (array
+    /// tail / leftover object keys).
+    ///
+    /// Lowering — the RHS is evaluated ONCE into a TEMP slot (it is read once per
+    /// binding), then each binding loads that temp and extracts its slice:
+    /// ```text
+    ///   <rhs>; SET_LOCAL temp                ; temp = rhs (evaluated once)
+    ///   GET_LOCAL temp; CHECK_(ARRAY|OBJECT)_DESTRUCTURE; POP   ; validate once
+    ///   ; per binding:
+    ///   GET_LOCAL temp; (ARRAY_ELEM i | OBJECT_KEY key); SET_LOCAL[_CELL] slot
+    ///   ; optional rest:
+    ///   GET_LOCAL temp; (ARRAY_REST n | OBJECT_REST bound_keys); SET_LOCAL[_CELL] slot
+    /// ```
+    fn compile_let_destructure(
+        &mut self,
+        let_stmt: &LetStmt,
+        pat: &ResolvedNode,
+    ) -> Result<(), CompileError> {
+        use SyntaxKind::*;
+        let span = node_span(let_stmt);
+        let init = let_stmt.expr().ok_or_else(|| {
+            CompileError::new("destructuring let has no initializer expression", span)
+        })?;
+        // The RHS expression's span (trivia-trimmed) — where the tree-walker anchors
+        // the "cannot destructure a non-array/object value" type panic (`value.span`).
+        let rhs_span = node_code_span(&init);
+
+        // Evaluate the RHS once into a temp slot (it is read once per binding).
+        let temp = self.alloc_temp()?;
+        self.compile_expr(&init)?;
+        self.chunk.emit_u16(Op::SetLocal, temp, span);
+
+        let is_array = pat.kind() == ArrayBindPat;
+
+        // Validate the RHS type ONCE, before any binding — byte-identical to the
+        // tree-walker, which checks the type first and panics at the RHS span.
+        self.chunk.emit_u16(Op::GetLocal, temp, rhs_span);
+        self.chunk.emit(
+            if is_array {
+                Op::CheckArrayDestructure
+            } else {
+                Op::CheckObjectDestructure
+            },
+            rhs_span,
+        );
+        self.chunk.emit(Op::Pop, rhs_span);
+
+        let entries: Vec<ResolvedNode> = pat
+            .children()
+            .filter(|c| matches!(c.kind(), BindEntry | RestBind))
+            .cloned()
+            .collect();
+
+        // Positional index for array elements (array only).
+        let mut pos: u16 = 0;
+        // Bound keys, in order, for the object-rest exclusion set (object only).
+        let mut bound_keys: Vec<Value> = Vec::new();
+
+        for entry in &entries {
+            let espan = range_span(entry);
+            match entry.kind() {
+                BindEntry if is_array => {
+                    let slot = self.pattern_bind_slot(entry, espan)?;
+                    self.chunk.emit_u16(Op::GetLocal, temp, span);
+                    self.chunk.emit_u16(Op::ArrayElem, pos, span);
+                    self.emit_set_local(slot, span);
+                    pos = pos.checked_add(1).ok_or_else(|| {
+                        CompileError::new("array pattern has too many bindings", span)
+                    })?;
+                }
+                BindEntry => {
+                    // Object entry: key by the FIRST significant token (Ident or
+                    // Str); the local name is the resolver binding's slot.
+                    let key = bind_entry_key(entry)
+                        .ok_or_else(|| CompileError::new("destructuring entry has no key", espan))?;
+                    let slot = self.pattern_bind_slot(entry, espan)?;
+                    let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                    bound_keys.push(Value::Str(Rc::from(key.as_str())));
+                    self.chunk.emit_u16(Op::GetLocal, temp, span);
+                    self.chunk.emit_u16(Op::ObjectKey, key_idx, span);
+                    self.emit_set_local(slot, span);
+                }
+                RestBind => {
+                    let slot = self.pattern_bind_slot(entry, espan)?;
+                    self.chunk.emit_u16(Op::GetLocal, temp, span);
+                    if is_array {
+                        // `arr[pos..]` — the tail past the named positions.
+                        self.chunk.emit_u16(Op::ArrayRest, pos, span);
+                    } else {
+                        // Leftover keys — those not in `bound_keys`. The bound-key
+                        // set is stored as a single Array const referenced by index.
+                        let keys =
+                            Value::Array(Rc::new(std::cell::RefCell::new(bound_keys.clone())));
+                        let keys_idx = self.chunk.add_const(keys);
+                        self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);
+                    }
+                    self.emit_set_local(slot, span);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Compile a lexical `Block` `{ ... }`. Blocks do NOT push a runtime scope:
@@ -2736,6 +2862,23 @@ fn object_field_key(field: &crate::syntax::ast::ObjectField) -> Option<String> {
     }
 }
 
+/// Decode an object-destructuring `BindEntry`'s KEY into the exact string the
+/// tree-walker keys by (`ObjBinding::key`). The key is the entry's FIRST
+/// significant token: an `Ident` (`a` / `b` in `b as local`) used verbatim, or a
+/// `Str` (`"k"` in `"k" as v`) whose contents are unescaped (the legacy lexer
+/// pre-decodes `Tok::Str`). Returns `None` only on a malformed entry with no key
+/// token (a parser/compiler bug).
+fn bind_entry_key(entry: &ResolvedNode) -> Option<String> {
+    let tok = entry
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| matches!(t.kind(), SyntaxKind::Ident | SyntaxKind::Str))?;
+    match tok.kind() {
+        SyntaxKind::Str => Some(unescape_str_body(strip_quotes(tok.text()))),
+        _ => Some(tok.text().to_string()),
+    }
+}
+
 /// Build the runtime [`Value`] for a `Literal` node (Number/Str/`true`/`false`/
 /// `nil`), reading the value TOKEN's text directly (trivia-free). Shared by the
 /// literal compiler (`compile_literal`) and the enum-backing const-evaluator
@@ -3085,9 +3228,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_destructuring_let() {
-        let err = compile_source("let [a, b] = arr").unwrap_err();
-        assert!(err.message.contains("destructuring let"), "got {err:?}");
+    fn array_destructure_lowers_to_check_elem_and_setlocal() {
+        // `let [a, b] = [1, 2]` validates the RHS once (CHECK_ARRAY_DESTRUCTURE),
+        // then reads each position (ARRAY_ELEM) and stores it (SET_LOCAL).
+        let chunk = compile_source("let [a, b] = [1, 2]\nprint(a)\nprint(b)").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(
+            text.contains("CHECK_ARRAY_DESTRUCTURE"),
+            "expected RHS type check, got:\n{text}"
+        );
+        assert!(text.contains("ARRAY_ELEM"), "expected ARRAY_ELEM, got:\n{text}");
+        assert!(text.contains("SET_LOCAL"), "expected SET_LOCAL store, got:\n{text}");
+    }
+
+    #[test]
+    fn array_rest_lowers_to_array_rest_op() {
+        let chunk =
+            compile_source("let [a, ...rest] = [1, 2, 3]\nprint(rest)").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("ARRAY_REST"), "expected ARRAY_REST, got:\n{text}");
+    }
+
+    #[test]
+    fn object_destructure_lowers_to_check_objectkey_and_objectrest() {
+        let chunk = compile_source("let {a, ...rest} = {a: 1, b: 2}\nprint(rest)").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(
+            text.contains("CHECK_OBJECT_DESTRUCTURE"),
+            "expected RHS type check, got:\n{text}"
+        );
+        assert!(text.contains("OBJECT_KEY"), "expected OBJECT_KEY, got:\n{text}");
+        assert!(text.contains("OBJECT_REST"), "expected OBJECT_REST, got:\n{text}");
     }
 
     #[test]

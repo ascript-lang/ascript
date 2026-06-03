@@ -786,6 +786,171 @@ impl Vm {
                     fiber.fresh_cell(slot);
                 }
 
+                Op::CheckArrayDestructure => {
+                    // Peek the RHS on TOS and validate it is an Array, exactly like
+                    // the tree-walker's `Stmt::LetDestructure` type check (which runs
+                    // ONCE before binding any name). Leaves the source in place so the
+                    // surrounding lowering can stash it in a temp slot.
+                    if !matches!(fiber.peek(0), Value::Array(_)) {
+                        let t = crate::interp::type_name(fiber.peek(0));
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("cannot destructure a non-array value of type {t}"),
+                        ));
+                    }
+                }
+
+                Op::CheckObjectDestructure => {
+                    // Peek the RHS on TOS and validate it is an Object or Instance,
+                    // exactly like the tree-walker's `Stmt::LetDestructureObject` type
+                    // check. Leaves the source in place.
+                    if !matches!(fiber.peek(0), Value::Object(_) | Value::Instance(_)) {
+                        let t = crate::interp::type_name(fiber.peek(0));
+                        return Err(self.panic_at(
+                            fiber,
+                            fault_ip,
+                            format!("cannot destructure a non-object value of type {t}"),
+                        ));
+                    }
+                }
+
+                Op::ArrayElem => {
+                    // `src -- src[index]`. Pop the (already-validated) array and push
+                    // the element at `index`, or `nil` for an out-of-bounds position
+                    // (positions past the length bind nil — `items.get(i).cloned()
+                    // .unwrap_or(Value::Nil)`).
+                    let index = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let src = fiber.pop();
+                    match src {
+                        Value::Array(arr) => {
+                            let v = arr.borrow().get(index).cloned().unwrap_or(Value::Nil);
+                            fiber.push(v);
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("ARRAY_ELEM operand is not an array: {other:?}"),
+                            ))
+                        }
+                    }
+                }
+
+                Op::ObjectKey => {
+                    // `src -- src[key]` where `key = consts[idx]`. Pop the
+                    // (already-validated) Object/Instance and push the value under
+                    // `key`, or `nil` if absent. Mirrors the tree-walker's destructure
+                    // `get` closure EXACTLY: an Instance reads only its `fields` (it
+                    // does NOT fall back to methods like `read_member` would).
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("OBJECT_KEY operand is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let src = fiber.pop();
+                    let v = match src {
+                        Value::Object(o) => {
+                            o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                        }
+                        Value::Instance(i) => {
+                            i.borrow().fields.get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("OBJECT_KEY operand is not an object: {other:?}"),
+                            ))
+                        }
+                    };
+                    fiber.push(v);
+                }
+
+                Op::ArrayRest => {
+                    // `src -- src[start..]`. Pop the (already-validated) array and push
+                    // a NEW array of its elements from `start` to the end — the `...rest`
+                    // collector (`items.iter().skip(names.len())`).
+                    let start = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let src = fiber.pop();
+                    match src {
+                        Value::Array(arr) => {
+                            let tail: Vec<Value> =
+                                arr.borrow().iter().skip(start).cloned().collect();
+                            fiber.push(Value::Array(Rc::new(RefCell::new(tail))));
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("ARRAY_REST operand is not an array: {other:?}"),
+                            ))
+                        }
+                    }
+                }
+
+                Op::ObjectRest => {
+                    // `src -- leftover` where `consts[idx]` is an Array of the bound
+                    // key strings. Pop the (already-validated) Object/Instance and push
+                    // a NEW object of its entries whose key is NOT bound, in source
+                    // order — the object-rest collector (excludes already-bound SOURCE
+                    // keys).
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let bound: std::collections::HashSet<Rc<str>> =
+                        match &fiber.frame().closure.proto.chunk.consts[idx] {
+                            Value::Array(keys) => keys
+                                .borrow()
+                                .iter()
+                                .filter_map(|v| match v {
+                                    Value::Str(s) => Some(s.clone()),
+                                    _ => None,
+                                })
+                                .collect(),
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "OBJECT_REST operand is not a key array: {other:?}"
+                                    ),
+                                ))
+                            }
+                        };
+                    let src = fiber.pop();
+                    let mut remaining: indexmap::IndexMap<String, Value> =
+                        indexmap::IndexMap::new();
+                    match src {
+                        Value::Object(o) => {
+                            for (k, v) in o.borrow().iter() {
+                                if !bound.contains(k.as_str()) {
+                                    remaining.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        Value::Instance(i) => {
+                            for (k, v) in i.borrow().fields.iter() {
+                                if !bound.contains(k.as_str()) {
+                                    remaining.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("OBJECT_REST operand is not an object: {other:?}"),
+                            ))
+                        }
+                    }
+                    fiber.push(Value::Object(Rc::new(RefCell::new(remaining))));
+                }
+
                 Op::GetUpvalue => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let v = fiber.frame().closure.upvalues[idx].borrow().clone();

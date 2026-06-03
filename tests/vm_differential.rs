@@ -471,6 +471,96 @@ async fn vm_short_circuit_does_not_evaluate_rhs() {
     }
 }
 
+// ----- V10-T1: destructuring `let` (array + object + rest) ---------------------
+//
+// `let [a, b, ...r] = arr` and `let {a, b as local, "k" as v, ...rest} = obj`.
+// The compiler lowers the RHS into a temp slot, validates its type ONCE (a panic
+// at the RHS span on a non-array / non-object), then binds each position/key
+// (missing → nil) and the optional `...rest` collector (array tail / leftover
+// object keys). Every case is byte-identical to the tree-walker's
+// `Stmt::LetDestructure` / `Stmt::LetDestructureObject`.
+
+#[tokio::test]
+async fn vm_destructure_array_matches_treewalker() {
+    let programs = [
+        // Basic positional binding.
+        "let [a, b, c] = [1, 2, 3]\nprint(a)\nprint(b)\nprint(c)",
+        // Rest collects the TAIL into a new array.
+        "let [first, ...rest] = [1, 2, 3, 4]\nprint(first)\nprint(rest)",
+        // Fewer names than elements (no rest) — extra elements are simply dropped.
+        "let [x] = [10, 20, 30]\nprint(x)",
+        // More names than elements — missing positions bind nil.
+        "let [a, b, c] = [1]\nprint(a)\nprint(b)\nprint(c)",
+        // Rest over an exhausted array yields an empty array.
+        "let [a, b, ...rest] = [1, 2]\nprint(rest)",
+        // `const` destructuring behaves identically at runtime.
+        "const [a, b] = [7, 8]\nprint(a + b)",
+        // Destructure from an expression RHS (evaluated once).
+        "let pair = [3, 4]\nlet [a, b] = pair\nprint(a * b)",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_destructure_object_matches_treewalker() {
+    let programs = [
+        // Shorthand keys.
+        "let {x, y} = {x: 10, y: 20}\nprint(x)\nprint(y)",
+        // Rename with `as` and a quoted key.
+        "let {a as A, \"k\" as v} = {a: 1, k: 2}\nprint(A)\nprint(v)",
+        // Missing key binds nil.
+        "let {a, missing} = {a: 5}\nprint(a)\nprint(missing)",
+        // Rest collects the LEFTOVER keys (excluding bound source keys), in order.
+        "let {a, ...rest} = {a: 1, b: 2, c: 3}\nprint(rest)",
+        // Rest after multiple bound keys.
+        "let {a, b, ...rest} = {a: 1, b: 2, c: 3, d: 4}\nprint(rest)",
+        // Object destructuring of a class instance reads its FIELDS (not methods).
+        "class P {\n  x: number\n  y: number\n}\nlet p = P.from({x: 3, y: 4})\nlet {x, y} = p\nprint(x + y)",
+        // `const` object destructuring.
+        "const {a, b} = {a: 1, b: 2}\nprint(a + b)",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_destructure_captured_in_closure_matches_treewalker() {
+    // A destructured binding captured by a closure must use the cell-backed slot
+    // exactly like a plain `let`, so the closure observes the bound value.
+    let programs = [
+        "let [a, b] = [1, 2]\nlet f = () => a + b\nprint(f())",
+        "let {x, y} = {x: 5, y: 6}\nfn g() {\n  return x * y\n}\nprint(g())",
+        // Rest binding captured.
+        "let [head, ...tail] = [10, 20, 30]\nlet f = () => tail\nprint(f())",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_destructure_type_errors_match_treewalker() {
+    // Destructuring a non-array / non-object RHS is a Tier-2 panic anchored at the
+    // RHS expression's span, with a message that names the value's type. Both
+    // engines must agree on message AND span.
+    let cases = [
+        "let [a, b] = 5",            // cannot destructure a non-array value of type number
+        "let [a] = \"hi\"",          // ... of type string
+        "let [a] = {x: 1}",          // ... of type object (an object is not an array)
+        "let [a] = nil",             // ... of type nil
+        "let {a, b} = 5",            // cannot destructure a non-object value of type number
+        "let {a} = [1, 2]",          // ... of type array (an array is not an object)
+        "let {a} = \"hi\"",          // ... of type string
+        "let {a} = nil",             // ... of type nil
+    ];
+    for expr in cases {
+        assert_vm_error_matches_treewalker(expr).await;
+    }
+}
+
 // ----- V2-T7: widen the differential gate -------------------------------------
 //
 // Two complementary widenings of the byte-identical gate:
@@ -647,6 +737,10 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     // an `init` that sets `self.id`/`self.name`, instance construction, and `assert`
     // over the resulting fields (incl. the applied default and the `nil` optional).
     "examples/typed_fields.as",
+    // `object_destructuring.as`: object destructuring — shorthand, `as` rename,
+    // quoted key, missing → nil — over both an object literal AND a class instance
+    // (`Point.from({...})`), reading the instance's FIELDS (V10-T1 + V9-T4).
+    "examples/object_destructuring.as",
     // DELIBERATELY EXCLUDED (verified by the empirical scan — these ERROR at VM
     // compile time, they do NOT diverge, so they correctly never qualify):
     //   - `oop.as`              — uses `match` (V10) in `shapeName`.
@@ -654,7 +748,7 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     //   - `shape_validation.as` — `import` (V12) AND `.from` with a nested-class
     //     field + an Object→`map<K,Class>` boundary coercion + field defaults (V12,
     //     task #157). The VM rejects it at compile time.
-    //   - `object_destructuring.as`/`rest.as`/`spread.as` — destructuring/spread (V10).
+    //   - `rest.as`/`spread.as` — rest params + spread in literals/calls (V10-T2).
     //   - every stdlib-heavy example — `import` (V12).
 ];
 

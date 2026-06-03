@@ -104,6 +104,12 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
                 }
             }
         }
+        // u16 const-pool index (a destructure key, or the bound-keys array) →
+        // show the referenced value.
+        Op::ObjectKey | Op::ObjectRest => {
+            let idx = chunk.read_u16(at + 1);
+            let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
+        }
         // Other u16-operand ops: just show the operand (no special comment).
         _ if width == 2 => {
             let idx = chunk.read_u16(at + 1);
@@ -207,6 +213,12 @@ fn op_name(op: Op) -> &'static str {
         GetLocalCell => "GET_LOCAL_CELL",
         SetLocalCell => "SET_LOCAL_CELL",
         FreshCell => "FRESH_CELL",
+        CheckArrayDestructure => "CHECK_ARRAY_DESTRUCTURE",
+        CheckObjectDestructure => "CHECK_OBJECT_DESTRUCTURE",
+        ArrayElem => "ARRAY_ELEM",
+        ObjectKey => "OBJECT_KEY",
+        ArrayRest => "ARRAY_REST",
+        ObjectRest => "OBJECT_REST",
     }
 }
 
