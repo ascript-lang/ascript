@@ -1,15 +1,39 @@
 //! Lint configuration: per-code severity overrides and warning promotion.
 //!
-//! NOTE: `LintConfig`'s severity-override surface (`deny`/`warn`/`allow`/
-//! `effective`) is implemented and unit-tested but not yet wired into `analyze`
-//! or the CLI — it is staged for the future `--deny <rule>` / `--warn <rule>` /
-//! `--allow <rule>` / `ascript.toml` config flags (a recorded follow-up
-//! sub-project). Today only `deny_warnings` is consulted (by
-//! `ascript check --deny-warnings`, for exit-code purposes). Inline
-//! `// ascript-ignore[code]` suppression is fully active (see `analyze.rs`).
+//! `LintConfig`'s severity-override surface (`deny`/`warn`/`allow`/`effective`)
+//! is wired into `analyze_with_config` and the `ascript check` CLI flags
+//! `--deny`/`--warn`/`--allow <rule>` (repeatable). `deny_warnings` additionally
+//! promotes all surviving warnings for exit-code purposes
+//! (`ascript check --deny-warnings`). Inline `// ascript-ignore[code]`
+//! suppression runs first (see `analyze.rs`) and config cannot resurrect a
+//! diagnostic the source suppressed. The future `ascript.toml` config will build
+//! the same `LintConfig`. [`RULE_CODES`] is the single source of truth for
+//! validating rule codes.
 
 use crate::check::diagnostic::Severity;
 use std::collections::HashMap;
+
+/// The complete set of lint rule codes the checker can emit. This is the single
+/// source of truth for validating `--deny`/`--warn`/`--allow` flags (and the
+/// future `ascript.toml`). It is feature-independent.
+///
+/// `syntax-error` is included so `--allow syntax-error` is accepted as a *known*
+/// code rather than rejected as unknown — but it is a NO-OP: `analyze_with_config`
+/// makes `syntax-error` immune (always `Error`, never dropped or downgraded), so
+/// configuring it has no effect.
+pub const RULE_CODES: &[&str] = &[
+    "syntax-error",
+    "undefined-variable",
+    "unused-binding",
+    "unused-import",
+    "shadowing",
+    "unreachable-code",
+    "missing-return",
+    "unawaited-future",
+    "ignored-result",
+    "dead-recover",
+    "contract-mismatch",
+];
 
 /// Per-code severity overrides plus global warning promotion.
 ///
@@ -22,6 +46,12 @@ pub struct LintConfig {
 }
 
 impl LintConfig {
+    /// Is `code` a known lint rule code? Used by the CLI/config layer to reject
+    /// unknown `--deny`/`--warn`/`--allow` values with a clear error.
+    pub fn is_known_code(code: &str) -> bool {
+        RULE_CODES.contains(&code)
+    }
+
     /// Force `code` to error severity.
     pub fn deny(&mut self, code: &str) {
         self.overrides.insert(code.to_string(), Some(Severity::Error));

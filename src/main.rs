@@ -38,6 +38,17 @@ enum Command {
         /// Treat all warnings as errors (non-zero exit on any warning).
         #[arg(long)]
         deny_warnings: bool,
+        /// Promote a lint rule to error severity (repeatable). E.g.
+        /// `--deny unused-binding`. `syntax-error` is always an error already.
+        #[arg(long = "deny", value_name = "RULE")]
+        deny: Vec<String>,
+        /// Force a lint rule to warning severity (repeatable).
+        #[arg(long = "warn", value_name = "RULE")]
+        warn: Vec<String>,
+        /// Suppress a lint rule entirely (repeatable). `--allow syntax-error` is
+        /// accepted but a no-op (syntax errors are always reported).
+        #[arg(long = "allow", value_name = "RULE")]
+        allow: Vec<String>,
     },
     /// Run .as test files
     Test { files: Vec<String> },
@@ -123,7 +134,33 @@ async fn main() -> ExitCode {
             files,
             json,
             deny_warnings,
+            deny,
+            warn,
+            allow,
         } => {
+            // Build the lint config from the flags, validating every rule code
+            // against the known set first. An unknown code is a usage error
+            // (distinct from a lint failure) — reject it before analyzing.
+            let mut config = ascript::check::LintConfig::default();
+            for (flag, codes) in [("deny", &deny), ("warn", &warn), ("allow", &allow)] {
+                for code in codes.iter() {
+                    if !ascript::check::LintConfig::is_known_code(code.as_str()) {
+                        eprintln!(
+                            "error: unknown lint rule '{}' (known rules: {})",
+                            code,
+                            ascript::check::RULE_CODES.join(", ")
+                        );
+                        return ExitCode::from(2);
+                    }
+                    match flag {
+                        "deny" => config.deny(code.as_str()),
+                        "warn" => config.warn(code.as_str()),
+                        _ => config.allow(code.as_str()),
+                    }
+                }
+            }
+            config.deny_warnings = deny_warnings;
+
             let mut any_error = false;
             let mut any_warning = false;
             for file in &files {
@@ -135,7 +172,7 @@ async fn main() -> ExitCode {
                         continue;
                     }
                 };
-                let analysis = ascript::check::analyze(&src);
+                let analysis = ascript::check::analyze::analyze_with_config(&src, &config);
                 for d in &analysis.diagnostics {
                     match d.severity {
                         ascript::check::Severity::Error => any_error = true,

@@ -136,6 +136,178 @@ fn json_output_is_a_json_array() {
     assert!(stdout.contains("\"code\":\"syntax-error\""));
 }
 
+// --- CFG-T2: --deny / --warn / --allow flags ------------------------------
+
+#[test]
+fn deny_promotes_warning_to_error_exit() {
+    // `let x = 1` is unused-binding (Warning by default → exit 0).
+    let p = write_tmp("deny_warn.as", "let x = 1\n");
+    let plain = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    assert!(plain.status.success(), "warning-only must exit 0 by default");
+    // --deny unused-binding promotes it to Error → non-zero exit.
+    let denied = Command::new(bin())
+        .arg("check")
+        .arg("--deny")
+        .arg("unused-binding")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        !denied.status.success(),
+        "--deny unused-binding must promote to Error and exit non-zero"
+    );
+}
+
+#[test]
+fn allow_silences_rule_and_removes_from_output() {
+    let p = write_tmp("allow_rule.as", "let x = 1\n");
+    // Sanity: without --allow the rule appears in output.
+    let plain = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let plain_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(
+        plain_out.contains("unused-binding"),
+        "sanity: unused-binding should appear by default; got {plain_out}"
+    );
+    // --allow drops the diagnostic entirely and exits 0.
+    let allowed = Command::new(bin())
+        .arg("check")
+        .arg("--allow")
+        .arg("unused-binding")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(allowed.status.success(), "--allow must exit 0");
+    let allowed_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&allowed.stdout),
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(
+        !allowed_out.contains("unused-binding"),
+        "--allow must remove the diagnostic from output; got {allowed_out}"
+    );
+}
+
+#[test]
+fn allow_beats_deny_warnings() {
+    // An --allow'd rule produces NO diagnostic, so it cannot trip --deny-warnings.
+    let p = write_tmp("allow_vs_denywarn.as", "let x = 1\n");
+    let out = Command::new(bin())
+        .arg("check")
+        .arg("--deny-warnings")
+        .arg("--allow")
+        .arg("unused-binding")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "an --allow'd rule must not trip --deny-warnings; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn warn_demotes_a_denied_rule_to_warning() {
+    // `--deny unused-binding --warn unused-binding`: last-write-wins in LintConfig,
+    // so the rule ends up Warning (exit 0 without --deny-warnings) — proving --warn
+    // maps to Warning. The label in human output is "warning".
+    let p = write_tmp("warn_demote.as", "let x = 1\n");
+    let out = Command::new(bin())
+        .arg("check")
+        .arg("--warn")
+        .arg("unused-binding")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--warn keeps it a Warning → exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.to_lowercase().contains("warning"),
+        "human output should label it a warning; got {combined}"
+    );
+}
+
+#[test]
+fn unknown_rule_code_is_a_usage_error() {
+    let p = write_tmp("unknown_rule.as", "let x = 1\n");
+    let out = Command::new(bin())
+        .arg("check")
+        .arg("--deny")
+        .arg("nonsense-rule")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "an unknown rule code must be a non-zero usage error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown lint rule") && stderr.contains("nonsense-rule"),
+        "must name the unknown rule clearly; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn allow_syntax_error_is_accepted_but_noop() {
+    // `--allow syntax-error` is a KNOWN code (no usage error) but a NO-OP:
+    // syntax-error is immune, so the file still fails.
+    let p = write_tmp("allow_syntax.as", "let = 1\n");
+    let out = Command::new(bin())
+        .arg("check")
+        .arg("--allow")
+        .arg("syntax-error")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "--allow syntax-error must NOT suppress the syntax error (immune)"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("syntax-error"),
+        "syntax-error must still be reported; got {combined}"
+    );
+}
+
+#[test]
+fn repeatable_deny_applies_to_all() {
+    // Two --deny flags both apply: a file with an unused binding AND an undefined
+    // variable, denying both → non-zero exit, both promoted.
+    let p = write_tmp("multi_deny.as", "let x = 1\nprint(y)\n");
+    let out = Command::new(bin())
+        .arg("check")
+        .arg("--deny")
+        .arg("unused-binding")
+        .arg("--deny")
+        .arg("undefined-variable")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "both denied rules must apply and fail the check"
+    );
+}
+
 // The checker must NOT false-positive on idiomatic code: every example program
 // should produce zero diagnostics (or only ones a maintainer has suppressed in
 // the source). Any new false positive fails this and must be fixed (rule made
