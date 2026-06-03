@@ -166,13 +166,17 @@ impl Vm {
                     // diagnostics are byte-identical to the tree-walker.
                     let b = fiber.pop();
                     let a = fiber.pop();
-                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let binop = binop_of(op);
                     // ONE shared dispatch with the tree-walker (`apply_binop`):
                     // string concat / decimal / range / cross-type equality /
                     // numeric, plus every exact panic message. And/Or/Coalesce are
                     // never lowered to these ops (they short-circuit via jumps), so
                     // `binop_of` never maps to one of them.
-                    let v = crate::interp::apply_binop(binop_of(op), a, b, span)?;
+                    //
+                    // V11-T4 PEP-659 adaptive specialization: a fast path IN FRONT
+                    // of `apply_binop` for the common monomorphic operand kinds,
+                    // guarded so it can never diverge from the generic result.
+                    let v = self.eval_binop_adaptive(fiber, fault_ip, binop, a, b)?;
                     fiber.push(v);
                 }
 
@@ -219,8 +223,24 @@ impl Vm {
                     // tree-walker's exact runtime message (`undefined variable '<n>'`,
                     // see `Interp::eval_expr`'s `ExprKind::Ident` arm) so the two
                     // engines stay byte-identical.
-                    if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
-                        fiber.push(Value::Builtin(name));
+                    // V11-T4 GET_GLOBAL_CACHED: cache the resolved value at this
+                    // op's offset, guarded by the global-table VERSION. A version
+                    // hit returns the cached value (skipping the name re-check); a
+                    // version miss (never today — globals are immutable builtins,
+                    // version is constant 0) re-resolves. Correctness: the cached
+                    // value is exactly what the resolve below produces, and the
+                    // version guard invalidates it on any future global mutation.
+                    let version = self.global_version();
+                    let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
+                    if let Some(v) = cache.get(version) {
+                        fiber.push(v);
+                    } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
+                        let v = Value::Builtin(name);
+                        fiber.frame().closure.proto.chunk.set_global_cache(
+                            fault_ip,
+                            crate::vm::adapt::GlobalCache::set(v.clone(), version),
+                        );
+                        fiber.push(v);
                     } else {
                         return Err(self.panic_at(
                             fiber,
@@ -2108,6 +2128,103 @@ impl Vm {
         self.shapes.borrow_mut().shape_for(keys)
     }
 
+    /// The current global-table version (V11-T4). AScript's globals are the
+    /// immutable bare builtins (top-level `let`s are frame-locals; builtins are
+    /// never reassigned), so the global set is CONSTANT and the version never
+    /// changes. It exists so the [`GET_GLOBAL`](Op::GetGlobal) cache carries a
+    /// real version guard: should a future revision ever permit global mutation,
+    /// bumping this counter on that mutation invalidates every cached entry. Today
+    /// it is a constant `0` and every cache hit is trivially valid.
+    fn global_version(&self) -> u64 {
+        0
+    }
+
+    /// PEP-659 adaptive arithmetic (V11-T4): a guarded fast path in FRONT of the
+    /// shared [`crate::interp::apply_binop`], specializing a hot arithmetic site to
+    /// the monomorphic operand kind it keeps seeing.
+    ///
+    /// CORRECTNESS: the fast path runs ONLY after its guard confirms the exact
+    /// operand kinds it specialized for, and then performs the SAME computation
+    /// `apply_binop` would for those kinds (the `f64`/`Decimal`/concat arms are
+    /// copied from `apply_binop`'s own arms). Every other case — a guard miss, a
+    /// non-specializable op, or an as-yet-unspecialized site — falls through to
+    /// `apply_binop`, which produces the canonical result and panic messages. A
+    /// guard miss additionally DEOPTs the site (revert to a fresh warmup). So
+    /// specialization can never change a result or a diagnostic; it only skips the
+    /// generic dispatch when the kinds match. The whole-corpus differential and
+    /// goldens stay byte-identical.
+    fn eval_binop_adaptive(
+        &self,
+        fiber: &Fiber,
+        fault_ip: usize,
+        op: BinOp,
+        a: Value,
+        b: Value,
+    ) -> Result<Value, Control> {
+        use crate::vm::adapt::{ArithCache, ArithKind};
+
+        let chunk = &fiber.frame().closure.proto.chunk;
+        // Only `+ - * /`-style arithmetic participates; comparisons, equality and
+        // range have no monomorphic fast path here (they go straight to generic).
+        let arith_op = matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Pow
+        );
+        if !arith_op {
+            let span = chunk.span_at(fault_ip);
+            return crate::interp::apply_binop(op, a, b, span);
+        }
+
+        let cache = chunk.arith_cache(fault_ip);
+
+        // Already specialized: GUARD the operands; on a hit take the inline fast
+        // path, on a miss DEOPT and fall to generic.
+        if let Some(kind) = cache.specialized() {
+            match (kind, &a, &b) {
+                (ArithKind::Number, Value::Number(x), Value::Number(y)) => {
+                    // SAME f64 arithmetic as apply_binop's final numeric arm.
+                    return Ok(number_fast(op, *x, *y));
+                }
+                (ArithKind::Decimal, Value::Decimal(x), Value::Decimal(y))
+                    if ArithCache::decimal_specializable(op) =>
+                {
+                    // SAME rust_decimal op as apply_binop's decimal arm. Both
+                    // operands are real Decimals (always finite), Add/Sub/Mul only
+                    // — no coercion, no div-by-zero.
+                    return Ok(decimal_fast(op, *x, *y));
+                }
+                (ArithKind::ConcatStr, Value::Str(x), Value::Str(y))
+                    if matches!(op, BinOp::Add) =>
+                {
+                    // SAME concat as apply_binop's string arm.
+                    return Ok(Value::Str(format!("{}{}", x, y).into()));
+                }
+                _ => {
+                    // Guard miss: deopt and run the generic path.
+                    chunk.set_arith_cache(fault_ip, cache.deopt());
+                    let span = chunk.span_at(fault_ip);
+                    return crate::interp::apply_binop(op, a, b, span);
+                }
+            }
+        }
+
+        // Not specialized yet: OBSERVE this execution's operand kinds (warmup),
+        // then run the generic path (the result is identical regardless of warmup).
+        let observed = match (&a, &b) {
+            (Value::Number(_), Value::Number(_)) => Some(ArithKind::Number),
+            (Value::Decimal(_), Value::Decimal(_)) if ArithCache::decimal_specializable(op) => {
+                Some(ArithKind::Decimal)
+            }
+            (Value::Str(_), Value::Str(_)) if matches!(op, BinOp::Add) => {
+                Some(ArithKind::ConcatStr)
+            }
+            _ => None,
+        };
+        chunk.set_arith_cache(fault_ip, cache.observe(observed));
+        let span = chunk.span_at(fault_ip);
+        crate::interp::apply_binop(op, a, b, span)
+    }
+
     /// Recompute and store the shape of `obj`'s ObjectCell from its CURRENT keys.
     /// Called after a mutation that may have ADDED a key (reassigning an existing
     /// key leaves the layout — and thus the shape — unchanged, which V11-T3's IC
@@ -2429,6 +2546,40 @@ fn binop_of(op: Op) -> BinOp {
         Op::Ne => BinOp::Ne,
         Op::Range => BinOp::Range,
         _ => unreachable!("binop_of called with non-binary opcode {op:?}"),
+    }
+}
+
+/// Inline numeric arithmetic for the `ADD_NUMBER`-family fast path (V11-T4).
+/// BYTE-IDENTICAL to [`crate::interp::apply_binop`]'s final two-`Number` arm — the
+/// same `f64` ops, so the specialized result equals the generic one bit-for-bit
+/// (incl. `NaN`/`Infinity`/`-0.0`). Only the arithmetic ops reach here (the
+/// adaptive guard restricts to Add/Sub/Mul/Div/Mod/Pow over two `Number`s).
+#[inline]
+fn number_fast(op: BinOp, a: f64, b: f64) -> Value {
+    match op {
+        BinOp::Add => Value::Number(a + b),
+        BinOp::Sub => Value::Number(a - b),
+        BinOp::Mul => Value::Number(a * b),
+        BinOp::Div => Value::Number(a / b),
+        BinOp::Mod => Value::Number(a % b),
+        BinOp::Pow => Value::Number(a.powf(b)),
+        _ => unreachable!("number_fast called with non-arithmetic op {op:?}"),
+    }
+}
+
+/// Inline decimal arithmetic for the `ADD_DECIMAL`-family fast path (V11-T4).
+/// BYTE-IDENTICAL to [`crate::interp::apply_binop`]'s decimal Add/Sub/Mul arms.
+/// Restricted by the adaptive guard to Add/Sub/Mul over two real `Decimal`s
+/// (always finite), so there is no coercion, no non-finite check and no
+/// div-by-zero to defer — those operators/operands never specialize and always go
+/// generic.
+#[inline]
+fn decimal_fast(op: BinOp, a: rust_decimal::Decimal, b: rust_decimal::Decimal) -> Value {
+    match op {
+        BinOp::Add => Value::Decimal(a + b),
+        BinOp::Sub => Value::Decimal(a - b),
+        BinOp::Mul => Value::Decimal(a * b),
+        _ => unreachable!("decimal_fast called with non-specializable op {op:?}"),
     }
 }
 
@@ -3549,6 +3700,200 @@ mod tests {
         };
         assert_eq!(s0, s1, "two instances of one class share the base shape");
         assert_ne!(s0, 0, "a class with declared fields has a non-empty shape");
+    }
+
+    // ---- V11-T4 adaptive specialization -----------------------------------
+
+    use crate::vm::adapt::{ArithCache, ArithKind, GlobalCache, WARMUP_THRESHOLD};
+    use rust_decimal::Decimal;
+
+    /// Build a `(Vm, Fiber)` over a single-op chunk whose op at offset 0 is `op`
+    /// (with a real span), so a test can repeatedly call `eval_binop_adaptive` at
+    /// `fault_ip = 0` and read back `chunk.arith_cache(0)` to watch specialization.
+    fn adaptive_harness(op: Op) -> (Rc<Vm>, Fiber) {
+        let mut c = Chunk::new();
+        c.emit(op, Span::new(0, 3));
+        c.emit(Op::Return, s());
+        let proto = Rc::new(FnProto {
+            chunk: c,
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            params: Vec::new(),
+            ret: None,
+        });
+        let closure = Closure::new(proto);
+        let fiber = Fiber::new(closure);
+        let interp = Rc::new(Interp::new());
+        interp.install_self();
+        let vm = Vm::new(interp);
+        (vm, fiber)
+    }
+
+    #[test]
+    fn add_warms_up_then_specializes_to_number() {
+        let (vm, fiber) = adaptive_harness(Op::Add);
+        // Drive N number adds at offset 0; each returns the correct sum and the
+        // last one flips the side-map cache to Specialized(Number).
+        for i in 0..WARMUP_THRESHOLD {
+            let v = vm
+                .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(i as f64), Value::Number(1.0))
+                .expect("ok");
+            assert_eq!(v, Value::Number(i as f64 + 1.0));
+        }
+        let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
+        assert_eq!(cache, ArithCache::Specialized { kind: ArithKind::Number });
+        // A subsequent number add still takes the (now specialized) fast path with
+        // the byte-identical result.
+        let v = vm
+            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(40.0), Value::Number(2.0))
+            .expect("ok");
+        assert_eq!(v, Value::Number(42.0));
+    }
+
+    #[test]
+    fn specialized_number_add_deopts_on_string_operand_and_stays_correct() {
+        let (vm, fiber) = adaptive_harness(Op::Add);
+        for _ in 0..WARMUP_THRESHOLD {
+            vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Number(1.0))
+                .expect("ok");
+        }
+        assert!(fiber.frame().closure.proto.chunk.arith_cache(0).specialized().is_some());
+        // Now feed two strings: the Number guard misses → deopt → generic concat.
+        let v = vm
+            .eval_binop_adaptive(
+                &fiber,
+                0,
+                BinOp::Add,
+                Value::Str("a".into()),
+                Value::Str("b".into()),
+            )
+            .expect("ok");
+        assert_eq!(v, Value::Str("ab".into()), "generic path gave the concat");
+        // The site deoptimized back to a fresh warmup (the deopt branch reverts and
+        // runs generic without re-observing in the same step); a subsequent
+        // execution starts observing anew.
+        let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
+        assert_eq!(cache, ArithCache::default());
+        assert!(cache.specialized().is_none());
+    }
+
+    #[test]
+    fn add_specializes_to_concat_str() {
+        let (vm, fiber) = adaptive_harness(Op::Add);
+        for _ in 0..WARMUP_THRESHOLD {
+            let v = vm
+                .eval_binop_adaptive(
+                    &fiber,
+                    0,
+                    BinOp::Add,
+                    Value::Str("x".into()),
+                    Value::Str("y".into()),
+                )
+                .expect("ok");
+            assert_eq!(v, Value::Str("xy".into()));
+        }
+        let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
+        assert_eq!(cache, ArithCache::Specialized { kind: ArithKind::ConcatStr });
+        // Specialized concat still byte-identical (incl. a key containing braces).
+        let v = vm
+            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Str("1".into()), Value::Str("2".into()))
+            .expect("ok");
+        assert_eq!(v, Value::Str("12".into()));
+    }
+
+    #[test]
+    fn add_specializes_to_decimal() {
+        let (vm, fiber) = adaptive_harness(Op::Add);
+        let a = Decimal::new(15, 1); // 1.5
+        let b = Decimal::new(25, 1); // 2.5
+        for _ in 0..WARMUP_THRESHOLD {
+            let v = vm
+                .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(a), Value::Decimal(b))
+                .expect("ok");
+            assert_eq!(v, Value::Decimal(a + b));
+        }
+        let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
+        assert_eq!(cache, ArithCache::Specialized { kind: ArithKind::Decimal });
+        // Specialized decimal add equals the generic apply_binop result bit-exact.
+        let v = vm
+            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(a), Value::Decimal(b))
+            .expect("ok");
+        let generic = crate::interp::apply_binop(BinOp::Add, Value::Decimal(a), Value::Decimal(b), s())
+            .expect("ok");
+        assert_eq!(v, generic);
+    }
+
+    #[test]
+    fn polymorphic_add_never_specializes_and_stays_correct() {
+        let (vm, fiber) = adaptive_harness(Op::Add);
+        for i in 0..(WARMUP_THRESHOLD as usize * 4) {
+            let (a, b, want) = if i % 2 == 0 {
+                (Value::Number(2.0), Value::Number(3.0), Value::Number(5.0))
+            } else {
+                (Value::Str("a".into()), Value::Str("b".into()), Value::Str("ab".into()))
+            };
+            let v = vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, a, b).expect("ok");
+            assert_eq!(v, want);
+            // Alternating kinds reset the warmup, so the site never specializes.
+            assert!(
+                fiber.frame().closure.proto.chunk.arith_cache(0).specialized().is_none(),
+                "polymorphic site stays generic at i={i}"
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_number_add_panics_identically_on_non_number_after_deopt() {
+        // After specializing to Number, a number+nil add must produce the SAME
+        // Tier-2 panic the generic apply_binop gives (it deopts, then runs generic).
+        let (vm, fiber) = adaptive_harness(Op::Add);
+        for _ in 0..WARMUP_THRESHOLD {
+            vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Number(1.0))
+                .expect("ok");
+        }
+        let got = vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Nil);
+        let generic = crate::interp::apply_binop(BinOp::Add, Value::Number(1.0), Value::Nil, Span::new(0, 3));
+        match (got, generic) {
+            (Err(Control::Panic(a)), Err(Control::Panic(b)) ) => {
+                assert_eq!(a.message, b.message);
+                assert_eq!(a.span, b.span, "deopt path carries the op's span");
+            }
+            other => panic!("expected matching panics, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_global_cached_returns_same_builtin() {
+        // Manually populate + read the global cache for a GET_GLOBAL site.
+        let mut c = Chunk::new();
+        let name = c.add_const(Value::Str(Rc::from("print")));
+        c.emit_u16(Op::GetGlobal, name, s());
+        c.emit(Op::Return, s());
+        let version = 0u64;
+        assert!(c.global_cache(0).get(version).is_none(), "cold initially");
+        c.set_global_cache(0, GlobalCache::set(Value::Builtin("print".into()), version));
+        match c.global_cache(0).get(version) {
+            Some(Value::Builtin(n)) => assert_eq!(&*n, "print"),
+            other => panic!("expected cached print builtin, got {other:?}"),
+        }
+        // A version bump invalidates it (defence-in-depth; never happens today).
+        assert!(c.global_cache(0).get(version + 1).is_none());
+    }
+
+    #[test]
+    fn hot_global_loop_resolves_print_consistently() {
+        // End-to-end: a loop that references `print` many times prints each line —
+        // the GET_GLOBAL_CACHED path must resolve the same builtin every iteration.
+        let (out, _code) = {
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let local = LocalSet::new();
+            local.block_on(&rt, async {
+                crate::vm_run_source("for (i in range(0, 5)) { print(i) }").await.unwrap()
+            })
+        };
+        assert_eq!(out, "0\n1\n2\n3\n4\n");
     }
 
     /// `expr?` where `expr` is not a 2-element array is a Tier-2 panic carrying

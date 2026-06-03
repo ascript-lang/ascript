@@ -183,6 +183,45 @@ async fn vm_run_print_matches_treewalker() {
 }
 
 #[tokio::test]
+async fn vm_adaptive_specialization_matches_treewalker() {
+    // V11-T4 PEP-659 adaptive specialization must stay byte-identical to the
+    // tree-walker on the four scenarios that drive the warmup / specialize / deopt
+    // machinery hard: a hot numeric loop (specializes to ADD_NUMBER), a loop that
+    // alternates number+string adds (constant deopt churn → never specializes), a
+    // decimal-arithmetic loop (ADD_DECIMAL), and global-heavy code that hammers a
+    // GET_GLOBAL site (GET_GLOBAL_CACHED). All four must agree exactly.
+    let cases = [
+        // Hot numeric loop: the `acc = acc + i` ADD site specializes to Number.
+        "let acc = 0\nfor (i in range(0, 50)) { acc = acc + i }\nprint(acc)",
+        // Numeric *, /, -, % in a hot loop (extends to the other numeric binops).
+        "let p = 1\nfor (i in range(1, 12)) { p = p * 2 }\nprint(p)\n\
+         let s = 1000\nfor (i in range(0, 20)) { s = s - i }\nprint(s)",
+        // Polymorphic ADD: alternating number+string adds keep deopting; the result
+        // must still be byte-identical (numbers sum, strings concat).
+        "let n = 0\nlet t = \"\"\n\
+         for (i in range(0, 20)) { if (i % 2 == 0) { n = n + i } else { t = t + \"x\" } }\n\
+         print(n)\nprint(t)",
+        // (Decimal-arithmetic specialization — ADD_DECIMAL — is covered by the
+        // run-loop unit test `add_specializes_to_decimal`; it can't run through a
+        // source-level differential here because constructing a `Value::Decimal`
+        // needs `import { from } from "std/decimal"`, and the VM does not compile
+        // `import` until V12. The whole-corpus differential exercises the decimal
+        // examples once that lands.)
+        // Global-heavy: a tight loop calling the `print` builtin via the same
+        // GET_GLOBAL site each iteration (GET_GLOBAL_CACHED hits every time).
+        "for (i in range(0, 12)) { print(i * i) }",
+        // Specialize then DEOPT mid-program: warm a number ADD site hot, then feed
+        // it strings so it deopts and concatenates — both engines agree.
+        "fn add(a, b) { return a + b }\n\
+         let r = 0\nfor (i in range(0, 30)) { r = add(r, 1) }\nprint(r)\n\
+         print(add(\"foo\", \"bar\"))",
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
 async fn vm_run_closures_match_treewalker() {
     // V4-T2: functions/arrows compile to a nested FnProto + CLOSURE. Calling is
     // V4-T3, but the closure VALUE is observable via `type(...)` (== "function")

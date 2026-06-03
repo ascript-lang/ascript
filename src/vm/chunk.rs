@@ -10,6 +10,7 @@
 use crate::span::Span;
 use crate::syntax::resolve::types::UpvalueDescriptor;
 use crate::value::Value;
+use crate::vm::adapt::{ArithCache, GlobalCache};
 use crate::vm::ic::{InlineCache, MethodCache};
 use crate::vm::opcode::Op;
 use std::cell::RefCell;
@@ -99,6 +100,17 @@ pub struct Chunk {
     /// Method-dispatch inline caches (`CALL_METHOD`), keyed by the op's bytecode
     /// offset. Lazily populated; a missing entry is `Cold`.
     pub method_ics: RefCell<HashMap<usize, MethodCache>>,
+    /// PEP-659 adaptive arithmetic state (`ADD`/`SUB`/`MUL`/…), keyed by the op's
+    /// bytecode offset (V11-T4). A site warms up then specializes to a guarded
+    /// `ADD_NUMBER`/`ADD_DECIMAL`/`CONCAT_STR`-style fast path; a guard miss
+    /// deopts. Lazily populated; a missing entry is the default (generic, warmup
+    /// 0). Same offset-keyed side-map pattern as the inline caches → bytecode and
+    /// disassembly stay byte-identical.
+    pub arith_caches: RefCell<HashMap<usize, ArithCache>>,
+    /// PEP-659 adaptive global-resolution cache (`GET_GLOBAL`), keyed by the op's
+    /// bytecode offset (V11-T4). Caches the resolved builtin value guarded by the
+    /// global-table version. Lazily populated; a missing entry is `Cold`.
+    pub global_caches: RefCell<HashMap<usize, GlobalCache>>,
     /// Optional name (function name / `<script>`), for the disassembler & traces.
     pub name: Option<String>,
 }
@@ -296,6 +308,39 @@ impl Chunk {
     /// `op_off`.
     pub fn set_method_ic(&self, op_off: usize, ic: MethodCache) {
         self.method_ics.borrow_mut().insert(op_off, ic);
+    }
+
+    // ---- adaptive specialization (V11-T4) --------------------------------
+
+    /// The current adaptive arithmetic state for the op at bytecode offset
+    /// `op_off`. A never-run site has no entry and reads as the default (generic,
+    /// warmup 0). `ArithCache` is `Copy`, so this returns by value (no borrow).
+    pub fn arith_cache(&self, op_off: usize) -> ArithCache {
+        self.arith_caches
+            .borrow()
+            .get(&op_off)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Store the updated adaptive arithmetic state for the op at `op_off`.
+    pub fn set_arith_cache(&self, op_off: usize, c: ArithCache) {
+        self.arith_caches.borrow_mut().insert(op_off, c);
+    }
+
+    /// The current global cache for the `GET_GLOBAL` op at bytecode offset
+    /// `op_off`, cloned out so no borrow is held. A never-run site reads `Cold`.
+    pub fn global_cache(&self, op_off: usize) -> GlobalCache {
+        self.global_caches
+            .borrow()
+            .get(&op_off)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Store the updated global cache for the `GET_GLOBAL` op at `op_off`.
+    pub fn set_global_cache(&self, op_off: usize, c: GlobalCache) {
+        self.global_caches.borrow_mut().insert(op_off, c);
     }
 
     // ---- spans ------------------------------------------------------------

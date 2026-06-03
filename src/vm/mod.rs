@@ -4,6 +4,7 @@
 //! wired into the binary yet. Exec arms, the compiler, and the run loop land in
 //! later VM plan slices (V2–V10).
 
+pub mod adapt;
 pub mod chunk;
 pub mod disasm;
 pub mod fiber;
