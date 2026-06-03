@@ -80,6 +80,15 @@ use std::hash::Hash;
 /// (throughput regresses).
 const COLLECT_GROWTH_THRESHOLD: usize = 10_000;
 
+/// The auto-collect growth threshold, exposed for the V13-T5 soak gate so it can
+/// size per-request garbage to exceed one growth window (forcing the accept-loop
+/// `maybe_collect` to fire) and assert the live set stays bounded near it — without
+/// hard-coding the constant in the test.
+#[cfg(all(test, feature = "net"))]
+pub(crate) const fn collect_growth_threshold() -> usize {
+    COLLECT_GROWTH_THRESHOLD
+}
+
 thread_local! {
     /// The tracked-object count at the most recent collection (auto or forced).
     /// The auto trigger fires when the current tracked count exceeds this by

@@ -2168,4 +2168,154 @@ await s.serve({{ maxRequests: 1 }})
             }
         }
     }
+
+    /// Issue `n` sequential GET requests to `url`, ignoring the response bodies.
+    /// Owned args so the future is `'static` + `Send` (it runs in a spawned task,
+    /// off the server's `!Send` LocalSet thread). Sequential (not concurrent) so
+    /// the server's `maxRequests` accounting matches request count exactly and the
+    /// soak runs at steady state — one in-flight request at a time.
+    /// Returns how many of the `n` requests got a 200 with the expected body, so the
+    /// soak test can ASSERT the handler actually ran (and built its cyclic garbage) on
+    /// every request — a silently-500ing handler (e.g. a broken body) would allocate
+    /// nothing and make the bounded-memory assertion vacuous.
+    async fn hammer(url: String, n: usize) -> usize {
+        let mut ok = 0;
+        for _ in 0..n {
+            let (status, body) = client_request("GET", &url, None).await;
+            if status == "HTTP/1.1 200 OK" && body == "ok" {
+                ok += 1;
+            }
+        }
+        ok
+    }
+
+    // ─────────────────────────── V13-T5 SOAK GATE ───────────────────────────
+    //
+    // A long-running `http.serve` is THE workload M17 + the cycle GC must keep
+    // BOUNDED: each request builds per-request garbage — here deliberately CYCLIC
+    // (a ring of mutually-referencing objects PLUS a self-referential array) so that
+    // refcounting ALONE cannot reclaim it; only the trial-deletion collector wired
+    // into the accept loop (`gc::maybe_collect`, called once per accepted connection,
+    // V13-T3) can. If anything retained per-request state (or that collection point
+    // never fired), the live tracked-Cc count would grow ~linearly with the request
+    // count — the unbounded-growth class this gate exists to reject.
+    //
+    // The assertion is DETERMINISTIC: `gcmodule::count_thread_tracked()` deltas, not
+    // RSS. The server runs INLINE on the test thread (`run_on`'s LocalSet is on this
+    // thread), and the GC tracked count is THREAD-LOCAL, so the counts observed here
+    // are exactly the server's live set. Two checks:
+    //
+    //   (1) IN-LOOP safe point works: per-request garbage (`RING * N`) is sized to
+    //       exceed the auto-collect growth threshold MANY times over, so the accept
+    //       loop's `maybe_collect` MUST fire repeatedly during the run. We read the
+    //       tracked count BEFORE any final forced collect; it must be bounded near a
+    //       single threshold-window (≈ COLLECT_GROWTH_THRESHOLD), NOT `N*RING`.
+    //   (2) Nothing is permanently retained: a final `collect()` returns the count to
+    //       within a small constant of the pre-serve baseline.
+    #[tokio::test]
+    async fn soak_http_serve_bounded_memory() {
+        // N requests; each builds a RING-node cyclic graph. `N*RING` (= 300*48 = 14_400)
+        // exceeds the GC's COLLECT_GROWTH_THRESHOLD (10_000) so the in-loop safe point is
+        // exercised, while staying fast (sub-second) and NOT requiring `#[ignore]`.
+        const N: usize = 300;
+        const RING: usize = 48;
+        // Steady-state ceiling: the in-loop sweep bounds live garbage to roughly one
+        // growth window plus a partial ring + buffers/route-table, NEVER `N*RING`. A
+        // generous-but-still-sublinear cap: leak growth would be ≥ N*RING (14_400), so
+        // anything ≤ this proves boundedness with wide margin.
+        let live_ceiling: usize = crate::gc::collect_growth_threshold() + 4 * RING;
+        // Final post-collect slop: tolerate a tiny constant (buffers, route table), never
+        // N-proportional growth.
+        const SLOP: usize = 64;
+
+        let port = reserve_port().await;
+        // Handler builds per-request CYCLIC garbage, then returns a plain string (so the
+        // response retains nothing). `ring` is a RING-element array each of whose entries
+        // is an object pointing at the NEXT, and the last points back at the first —
+        // a single big cycle. `cyc` is additionally a self-referential array. Both are
+        // dead the instant the handler returns, but neither can be freed by refcounting;
+        // only the cycle collector reclaims them.
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+import {{ push }} from "std/array"
+let s = create()
+s.route("GET", "/garbage", (req) => {{
+    let ring = []
+    for (i in 0..{RING}) {{
+        push(ring, {{ idx: i }})
+    }}
+    for (i in 0..{RING}) {{
+        ring[i].next = ring[(i + 1) % {RING}]
+    }}
+    let cyc = []
+    push(cyc, cyc)
+    return "ok"
+}})
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: {N} }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/garbage");
+
+        // Clean GC baseline on THIS thread, then build + run the server inline while
+        // the client hammers it from a spawned task. `with_server` runs the server via
+        // `run_on` (LocalSet on this thread) and returns once `serve` has handled all N
+        // requests and drained its in-flight handler tasks.
+        crate::gc::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        let ok = with_server(&src, move || hammer(url, N)).await;
+
+        // Guard against a vacuous pass: if the handler had silently 500'd (e.g. a broken
+        // body), it would allocate no garbage and the bounded-memory check below would be
+        // meaningless. Require every request to have returned the expected 200/"ok".
+        assert_eq!(
+            ok, N,
+            "soak handler did not run successfully on every request \
+             ({ok}/{N} returned 200 \"ok\") — the per-request cyclic garbage was never built, \
+             so the memory assertion would be vacuous"
+        );
+
+        // CHECK 1 — the IN-LOOP collection point bounded memory DURING the run. Read the
+        // live tracked count BEFORE forcing any collect: if `maybe_collect` fired in the
+        // accept loop as designed, this is bounded near one growth window; if it never
+        // fired / something is retained, it is ≈ before + N*RING (≥ 14_400).
+        let live_before_final = gcmodule::count_thread_tracked();
+        assert!(
+            live_before_final <= before + live_ceiling,
+            "http.serve let per-request cyclic garbage accumulate UNBOUNDED during the run: \
+             live tracked = {live_before_final} (baseline {before}, ceiling {}), \
+             N*RING potential = {}. The accept-loop maybe_collect safe point did not bound \
+             memory — do NOT weaken this assertion; find why collection isn't firing or what \
+             is retained.",
+            before + live_ceiling,
+            N * RING
+        );
+
+        // CHECK 2 — nothing is PERMANENTLY retained. Force a final sweep and confirm the
+        // live set returns to within a small constant of the pre-serve baseline.
+        let reclaimed = crate::gc::collect();
+        let after = gcmodule::count_thread_tracked();
+
+        eprintln!(
+            "soak: N={N} RING={RING} (N*RING={}), tracked before={before} \
+             live_before_final_collect={live_before_final} after={after} (delta={}), \
+             final collect reclaimed={reclaimed}",
+            N * RING,
+            after as isize - before as isize
+        );
+
+        // PRIMARY GATE: bounded memory. A per-request leak of the cyclic garbage would
+        // leave ~3*N (=900) extra tracked nodes; we require the post-serve live set to be
+        // within a small constant of baseline, i.e. NOT proportional to N.
+        assert!(
+            after <= before + SLOP,
+            "http.serve leaked per-request memory: tracked grew from {before} to {after} \
+             over {N} requests (delta {}, allowed slop {SLOP}). Cyclic per-request garbage \
+             is NOT being reclaimed — the accept-loop collection point or a retained \
+             per-request reference is the bug; do NOT weaken this assertion.",
+            after as isize - before as isize
+        );
+    }
 }
