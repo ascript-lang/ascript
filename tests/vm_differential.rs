@@ -630,6 +630,32 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     "examples/functions.as", // recursion + `for`-range + `+=` counter + arrow.
     "examples/factorial.as", // `*=` accumulator in a for-range + `if`/`else`.
     "examples/data.as",      // `+=` aggregation over an array of objects.
+    // V9-T6 class/enum qualifiers (verified byte-identical by running BOTH engines
+    // over the file). Now that the VM supports classes/enums/super/methods/typed-
+    // fields/`.from`/compound+index+member assignment (V9-T1..T5), these compile +
+    // run end-to-end. They contain NO `match` (V10), destructuring/spread (V10),
+    // `import` (V12), or `.from`-with-defaults-or-nested-class (V12) — so they
+    // qualify.
+    //
+    // `typed.as`: typed `fn` params/return contracts, `for (d of dims)` + `+=`
+    // accumulation, a runtime contract breach caught by `recover` (the `.message`
+    // round-trips identically), and an `async fn` whose `future<number>` result is
+    // `await`ed. All V4/V6/V7/V9 features the VM supports.
+    "examples/typed.as",
+    // `typed_fields.as`: a `class` with required (`id: number`), optional
+    // (`nickname: string?`), and defaulted (`role: string = "guest"`) typed fields,
+    // an `init` that sets `self.id`/`self.name`, instance construction, and `assert`
+    // over the resulting fields (incl. the applied default and the `nil` optional).
+    "examples/typed_fields.as",
+    // DELIBERATELY EXCLUDED (verified by the empirical scan — these ERROR at VM
+    // compile time, they do NOT diverge, so they correctly never qualify):
+    //   - `oop.as`              — uses `match` (V10) in `shapeName`.
+    //   - `pattern_matching.as` — `match` (V10).
+    //   - `shape_validation.as` — `import` (V12) AND `.from` with a nested-class
+    //     field + an Object→`map<K,Class>` boundary coercion + field defaults (V12,
+    //     task #157). The VM rejects it at compile time.
+    //   - `object_destructuring.as`/`rest.as`/`spread.as` — destructuring/spread (V10).
+    //   - every stdlib-heavy example — `import` (V12).
 ];
 
 #[tokio::test]
@@ -3125,4 +3151,49 @@ async fn vm_index_assign_oob_and_wrong_type_panics_match_treewalker() {
         "panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
         tw.message, vm.message
     );
+}
+
+// ----- V9-T6: class/enum multi-feature sync programs ---------------------------
+
+#[tokio::test]
+async fn vm_run_class_enum_multi_feature_programs() {
+    // Realistic OOP/enum SYNC snippets that COMBINE the V9 class/enum/super/method/
+    // field/assignment feature set (on top of V1..V8) in one run: classes with
+    // methods + typed/defaulted fields, inheritance + `super` chains, enum variant
+    // comparisons in conditionals, instances stored in arrays/objects + iterated,
+    // a method returning a closure capturing `self`, compound assignment on
+    // instance fields (`self.count += 1`), small OOP simulations, and enum-driven
+    // dispatch via if/else. NONE use `match`/destructuring/spread/`import`/`.from`
+    // (V10/V12). Each must be byte-identical to the tree-walker.
+    let programs = [
+        // (a) class with methods + typed defaulted fields; construct + call + read.
+        "class Point {\n  x: number = 0\n  y: number = 0\n  fn init(x, y) { self.x = x\n self.y = y }\n  fn norm2() { return self.x * self.x + self.y * self.y }\n}\nlet p = Point(3, 4)\nprint(p.norm2())\nprint(p.x)",
+        // (b) inheritance + `super` chain (super.init + super.describe).
+        "class Animal {\n  fn init(name) { self.name = name }\n  fn describe() { return `${self.name} is an animal` }\n}\nclass Dog extends Animal {\n  fn init(name) { super.init(name) }\n  fn describe() { return super.describe() + \", specifically a dog\" }\n  fn sound() { return \"woof\" }\n}\nlet d = Dog(\"Rex\")\nprint(d.describe())\nprint(d.sound())\nprint(d.name)",
+        // (c) enum + variant comparisons used in conditionals.
+        "enum Color { Red, Green, Blue }\nlet c = Color.Green\nif (c == Color.Green) { print(\"green\") } else { print(\"other\") }\nprint(c == Color.Red)\nprint(c == Color.Green)",
+        // (d) instances stored in an array + iterated (for-of), member read.
+        "class Box {\n  fn init(v) { self.v = v }\n}\nlet boxes = [Box(1), Box(2), Box(3)]\nlet sum = 0\nfor (b of boxes) { sum = sum + b.v }\nprint(sum)\nprint(boxes[1].v)",
+        // (e) instances stored in an object; method mutates self via `+=`.
+        "class Counter {\n  fn init() { self.n = 0 }\n  fn bump() { self.n += 1 }\n}\nlet reg = {a: Counter(), b: Counter()}\nreg.a.bump()\nreg.a.bump()\nreg.b.bump()\nprint(reg.a.n)\nprint(reg.b.n)",
+        // (f) method returning a closure capturing `self`.
+        "class Adder {\n  fn init(base) { self.base = base }\n  fn make() { return (x) => self.base + x }\n}\nlet a = Adder(10)\nlet f = a.make()\nprint(f(5))\nprint(f(100))",
+        // (g) compound assignment on instance fields (`self.count += 1`).
+        "class Acc {\n  fn init() { self.count = 0\n self.total = 0 }\n  fn add(n) { self.count += 1\n self.total += n }\n}\nlet acc = Acc()\nacc.add(5)\nacc.add(7)\nacc.add(3)\nprint(acc.count)\nprint(acc.total)",
+        // (h) small OOP simulation: a fixed-capacity stack (index assignment into a
+        // field array + a `self.n` top pointer; no stdlib import needed).
+        "class Stack {\n  fn init() { self.items = [0, 0, 0, 0]\n self.n = 0 }\n  fn push(v) { self.items[self.n] = v\n self.n += 1 }\n  fn size() { return self.n }\n  fn top() { return self.items[self.n - 1] }\n}\nlet s = Stack()\ns.push(10)\ns.push(20)\ns.push(30)\nprint(s.size())\nprint(s.top())\nprint(s.items)",
+        // (i) enum-driven dispatch via if/else if/else in a function.
+        "enum Op { Add, Sub, Mul }\nfn apply(op, a, b) {\n  if (op == Op.Add) { return a + b }\n  else if (op == Op.Sub) { return a - b }\n  else { return a * b }\n}\nprint(apply(Op.Add, 6, 4))\nprint(apply(Op.Sub, 6, 4))\nprint(apply(Op.Mul, 6, 4))",
+        // (j) enums stored in objects + an array, iterated with comparison + count.
+        "enum Status { Active, Idle, Done }\nlet tasks = [{name: \"a\", st: Status.Active}, {name: \"b\", st: Status.Done}, {name: \"c\", st: Status.Active}]\nlet active = 0\nfor (t of tasks) { if (t.st == Status.Active) { active += 1 } }\nprint(active)\nprint(tasks[1].st == Status.Done)\nprint(tasks[0].name)",
+        // (k) defaulted field + methods doing `+=`/`-=` on the field, returning it.
+        "class Wallet {\n  balance: number = 100\n  fn deposit(n) { self.balance += n\n return self.balance }\n  fn withdraw(n) { self.balance -= n\n return self.balance }\n}\nlet w = Wallet()\nprint(w.balance)\nprint(w.deposit(50))\nprint(w.withdraw(30))",
+        // (l) three-level shape hierarchy: overridden `area()` (Sq->Rect->Shape via
+        // `super.init`), instances in an array, iterated with `+=` accumulation.
+        "class Shape {\n  fn area() { return 0 }\n}\nclass Rect extends Shape {\n  fn init(w, h) { self.w = w\n self.h = h }\n  fn area() { return self.w * self.h }\n}\nclass Sq extends Rect {\n  fn init(s) { super.init(s, s) }\n}\nlet shapes = [Rect(2, 3), Sq(4)]\nlet total = 0\nfor (sh of shapes) { total += sh.area() }\nprint(total)\nprint(shapes[1].area())",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
 }
