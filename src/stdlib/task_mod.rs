@@ -80,7 +80,10 @@ impl Interp {
                 f.detach();
                 Ok(Value::Future(f))
             }
+            // `Value::Closure` is the VM's compiled-function value (V4-T5 bridge);
+            // `task.spawn(closure)` must invoke it like any other callable.
             callable @ (Value::Function(_)
+            | Value::Closure(_)
             | Value::Builtin(_)
             | Value::BoundMethod(_)
             | Value::NativeMethod(_)) => {
@@ -117,7 +120,7 @@ impl Interp {
                 other => out.push(other),
             }
         }
-        Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(out))))
     }
 
     /// `race([futures]) -> value`. Resolves to the first input future to complete

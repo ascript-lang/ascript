@@ -1,0 +1,65 @@
+# exit: none
+Parsed 5 record(s) from CSV
+  skipping malformed row: Doohickey D (units='channels')
+Capitalized tokens found in names: 3 -> ["Sprocket", "Widget", "Gadget"]
+
+=== JSON ===
+{
+  "generated": "data_pipeline",
+  "recordCount": 3,
+  "totalUnits": 265,
+  "totalRevenue": 11714.25,
+  "topSeller": "Sprocket E",
+  "records": [
+    {
+      "name": "Sprocket E",
+      "region": "ap-south",
+      "units": 88,
+      "revenue": 5123.75,
+      "unitPrice": 58.22443181818182,
+      "tier": "mid"
+    },
+    {
+      "name": "Widget A",
+      "region": "us-west",
+      "units": 120,
+      "revenue": 4380.5,
+      "unitPrice": 36.50416666666667,
+      "tier": "high"
+    },
+    {
+      "name": "Gadget C",
+      "region": "eu-central",
+      "units": 57,
+      "revenue": 2210,
+      "unitPrice": 38.771929824561404,
+      "tier": "mid"
+    }
+  ]
+}
+=== YAML ===
+generated: data_pipeline
+recordCount: 3
+totalUnits: 265
+totalRevenue: 11714.25
+topSeller: Sprocket E
+records:
+- name: Sprocket E
+  region: ap-south
+  units: 88
+  revenue: 5123.75
+  unitPrice: 58.22443181818182
+  tier: mid
+- name: Widget A
+  region: us-west
+  units: 120
+  revenue: 4380.5
+  unitPrice: 36.50416666666667
+  tier: high
+- name: Gadget C
+  region: eu-central
+  units: 57
+  revenue: 2210
+  unitPrice: 38.771929824561404
+  tier: mid
+

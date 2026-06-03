@@ -6,7 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AScript is a small, dynamically-typed scripting language (`.as` files) with JavaScript-flavored
 syntax, optional runtime-checked type contracts, and a batteries-included standard library. It is
-implemented as a single Rust binary `ascript` containing an async tree-walking interpreter.
+implemented as a single Rust binary `ascript`. The **default and production engine is an async
+bytecode VM** (CST front-end → resolver → bytecode compiler → `Chunk` → VM, with inline caches,
+adaptive arithmetic, and a cycle-collecting GC). The original async **tree-walking interpreter is
+retained** as a differential oracle and a `--tree-walker` debugging engine — kept byte-for-byte
+behavior-identical to the VM, not a second dialect.
 
 The design goal is **"Lua-simple language, Go/Deno-class standard library"**: the core stays tiny
 (~10 value kinds, gradual contracts, no hidden control flow) while the stdlib is deliberately rich.
@@ -151,9 +155,13 @@ cargo test <name>                        # run a single test by name substring
 cargo test --test cli                    # run one integration test file (tests/*.rs)
 cargo clippy --all-targets               # lint — must be clean in BOTH feature configs
 
-cargo run -- run examples/hello.as       # run a .as program
-cargo run -- repl                        # interactive REPL
+cargo run -- run examples/hello.as       # compile to bytecode + run on the VM (default engine)
+cargo run -- run file.as --tree-walker   # run on the legacy tree-walker (oracle/debug; flag precedes file)
+cargo run -- build file.as               # compile to bytecode → file.aso (-o to choose path)
+cargo run -- run file.aso                # run compiled bytecode (no compile step; always VM)
+cargo run -- repl                        # interactive REPL (VM; --tree-walker for the legacy engine)
 cargo run -- fmt file.as                 # format in place
+cargo run -- check file.as               # static check (syntax + lints)
 cargo run -- test file.as ...            # run a .as file's test(name, fn) registrations
 cargo run -- lsp                         # language server over stdio (LSP)
 ```
@@ -164,13 +172,27 @@ before considering work done.
 ## Architecture
 
 ### Pipeline
-`lexer` → `parser` (precedence-climbing) → `interp` (async tree-walker). The shared front-end
-(`lexer`, `token`, `ast`, `parser`, `span`) is also consumed by `fmt`, `repl`, and the `lsp` (which
-is static-analysis only and never instantiates the interpreter).
+**Two front-ends, two engines — same observable behavior.** The DEFAULT production path is the
+**bytecode VM**: a lossless **CST front-end** (`src/cst/` — trivia-preserving lexer + parser → typed
+AST) → resolver (scopes/upvalues/slots, classifies module top-level as user-globals) → bytecode
+compiler (`src/compile/`) → a `Chunk` → the async VM (`src/vm/`). `ascript run file.as` compiles and
+runs on the VM; `ascript build file.as` serializes the `Chunk` to a versioned, verified `.aso`
+(`src/vm/aso.rs` + `src/vm/verify.rs`) that `ascript run file.aso` loads with no compile step.
 
-Source flows as: `lexer::lex(src)` → `parser::parse(&tokens)` → `Interp::exec`/`load_module`. Every
-token and AST node carries a `Span` (byte offsets + line/col) so `diagnostics` (ariadne-backed) can
-point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_source`, `run_tests`.
+The LEGACY path is `lexer` → `parser` (precedence-climbing) → `interp` (async tree-walker). It is
+**retained as a differential oracle** (the VM is checked byte-for-byte against it over the whole
+corpus + recorded goldens, in both feature configs) and as a `--tree-walker` debug engine
+(`ascript run --tree-walker` / `ASCRIPT_ENGINE=tree-walker`; the flag must precede the file and is
+ignored for `.aso`). The legacy front-end (`lexer`, `token`, `ast`, `parser`, `span`) is also
+consumed by `fmt`, `repl`, and the `lsp` (which is static-analysis only and never instantiates the
+interpreter). When changing language *behavior*, both engines must stay byte-identical or the
+three-way/whole-corpus differential fails — fix the engine, don't relax the assertion.
+
+Source flows (legacy) as: `lexer::lex(src)` → `parser::parse(&tokens)` → `Interp::exec`/`load_module`.
+Every token and AST node carries a `Span` (byte offsets + line/col) so `diagnostics` (ariadne-backed)
+can point at exact source. Entry points live in `src/lib.rs`: `run_file`, `run_source`, `run_tests`
+(these route to the VM by default; `vm_run_source` / `vm_run_source_generic` are the VM test entry
+points).
 
 **REPL multi-line input**: `repl.rs` buffers lines while `is_incomplete` (positive delimiter-TOKEN
 depth, or unterminated string/template at EOF) on a `..` prompt, then execs the whole buffer against
@@ -233,6 +255,111 @@ the persistent session `Interp`+`Environment` (state already persists across lin
 and `Generator` (identity-equal, a consumer-driven `GeneratorHandle`). Mutable containers are
 `Rc<RefCell<...>>`. There is a separate
 hashable `MapKey` (numbers canonicalized: −0.0→+0.0, NaN unified) for `Map` keys.
+
+**Cycle-collecting GC (`src/gc.rs`, V13).** The spec adopts [`gcmodule`] (a refcounting `Cc<T>` +
+Bacon–Rajan trial-deletion cycle collector) to reclaim reference cycles (`a.push(a)`). `gcmodule` is
+an **unconditional, default-on, CORE dependency** (NOT a stdlib feature — it must build under
+`--no-default-features`). The migration is phased: **V13-T1 (done)** adds the dep + `gcmodule::Trace`
+impls for the cycle-capable types (`Value`, `ObjectCell`, `Instance`, `Closure`, `MapKey`, plus the
+`indexmap` collections via free `trace_index_map`/`trace_index_set` helpers — `indexmap` is foreign
+so no blanket impl is possible) while **keeping everything on `Rc` — NO migration**; the `Trace`
+impls compile and are exercised by `gc::tests` but are not yet load-bearing. **V13-T2** is the one-pass
+`Rc→Cc` migration of the cycle-capable variants (`Array`/`Object`/`Map`/`Set`/`Instance`/`Closure` +
+the closure upvalue cell). **Invariant:** native-resource handles (`Native`/`NativeMethod`) and the
+acyclic/immutable handles (`Str`/`Builtin`/`Regex`/`Enum`/`Class`/`Function`'s captured
+`Environment`/`Future`/`Generator`) **STAY on `Rc`** and have **no-op `Trace`** — the GC must never
+trace into a native resource, because those rely on deterministic `Drop` to reclaim fds. When touching
+`Value` variants, mirror any new cycle-capable container in `Value::trace`.
+
+**Object/instance SHAPES (hidden classes, V11-T2).** `Value::Object` is `Rc<ObjectCell>` where
+`ObjectCell { map: RefCell<IndexMap<String,Value>>, shape: Cell<u32> }` — the wrapper exists ONLY to
+carry a `shape` id beside the entry map. `ObjectCell` has `borrow()`/`borrow_mut()` helpers that
+forward to `map`, so the ~150 read/write sites (`o.borrow()`/`o.borrow_mut()`) are unchanged;
+construction uses `ObjectCell::new(map)` (shape defaults to `0`). `Instance` gained
+`shape_id: Cell<u32>` (also default `0`). A *shape* identifies an object's ordered key-LAYOUT; the
+per-VM `ShapeRegistry` (`src/vm/shape.rs`, lives on `Vm` behind a `RefCell`) assigns ids via a
+transition tree (`add_key(shape,key)→child`, memoized). Two objects with the same insertion-ordered
+keys share a shape; different keys OR order differ; shape `0` is the empty layout. The **VM** assigns
+shapes (object literals → `object_shape_for` on the final keys; instances → `class_base_shape` cached
+per class by `Rc::as_ptr`; adding a NEW key via `SET_PROP`/`SET_INDEX`/`APPEND_OBJECT`/`SPREAD_OBJECT`
+calls `resync_object_shape`, reassigning an existing key keeps the shape — V11-T3 inline caches rely
+on this). The **tree-walker never touches the registry** — its objects/instances stay shape `0`. The
+change is additive/behavior-preserving (the whole-corpus differential + goldens stay byte-identical).
+
+**VM module-scope user-globals (WS1).** A DIRECT-child top-level `let`/`const`/`fn`/`class`/`enum`/
+`import` of the `SourceFile` is a **module-scope user-global**, NOT a file-frame slot-local — mirroring
+the tree-walker's single shared late-bound module `Environment`. The resolver (`resolve_file`) collects
+those names into `module_globals` and records each as a `Binding { is_global: true, slot: u32::MAX }`
+(kept in `result.bindings` for the checker, with use-counts tracked by NAME via `global_uses`); their
+references resolve `resolve_local → resolve_upvalue → Resolution::Global(name)` (so an inner `let` still
+shadows). The compiler lowers a global define-site to `Op::DefineGlobal <name>` (in SOURCE ORDER — no
+eager pre-pass) and a top-level reassignment to `Op::SetGlobal`; reads are the existing `Global`→
+`GET_GLOBAL`. Storage is on **`Vm`** (NOT `Interp`): `user_globals: RefCell<IndexMap<Rc<str>,Value>>`
+(the `Vm` is the GC root, so plain owned `Value`s stay live — do NOT wrap each in a `Cc` cell) +
+`global_version: Cell<u64>`. `GET_GLOBAL` consults `user_globals` FIRST, then `BUILTIN_NAMES` (so a user
+name shadows a builtin), else `undefined variable '<n>'`. This closes the forward-reference divergence
+(a fn/thunk/field-default referencing a top-level binding declared LATER late-binds at run time, matching
+the tree-walker); use-before-init stays a SYMMETRIC error on both engines. The `GET_GLOBAL` inline cache
+records ONLY immutable builtins — a user-global read is an uncached IndexMap lookup and `SET_GLOBAL`
+updates in place WITHOUT bumping the version (so a hot reassigned-top-level-`let` loop does not thrash the
+cache; `DefineGlobal`, which can shadow a builtin, DOES bump). `.from`/typed-parse field defaults resolve
+through the lazily-built `class_env` (`def_env`), which is seeded from `user_globals` and kept in sync by
+`define_user_global`/`update_user_global`. The checker treats an `is_global` binding name as defined
+(`undefined-variable` exempt) and as a file-declared callee (`dropped_local_call`/contract rules).
+`ImportDesc` carries `is_global` (named) / `alias`+`is_global` (namespace); a top-level import binds into
+`user_globals`. This is also the REPL's cross-line persistence (one `Vm` kept alive). `.aso`
+`ASO_FORMAT_VERSION` bumped 3→4 (new opcode + ImportDesc layout). The whole-corpus three-way differential
+stays byte-identical.
+
+**Redeclaration + const immutability (WS1 follow-ups, both RUNTIME-timed).** The tree-walker enforces
+both via `Environment::define`/`assign` at RUNTIME — so a redeclaration / const-reassignment in
+dead/un-entered/uncalled code never errors, and an RHS side-effect runs before the error. The VM matches
+exactly. (a) **Redeclaration** (`let x; let x`, `let x; const x`, `fn f; fn f`, `fn f; let f`): the
+resolver records EVERY top-level define-site range in `ResolveResult::global_decl_ranges` (deduping only
+the checker `bindings` + a `duplicate-binding` resolve diagnostic surfaced by `check/analyze.rs`); the
+compiler lowers every such site to `DEFINE_GLOBAL` (keyed on the RANGE, NOT the name — so a same-named
+BLOCK/fn-body `let`, which has its own range NOT in the set, stays a slot-local exactly as the resolver
+classified it); `Op::DefineGlobal` errors `'<name>' is already defined in this scope` (span `None`, via
+`AsError::new` — NOT `panic_at` — to match the tree-walker's span-less error) when the name is already in
+`user_globals`. (b) **Const immutability** at EVERY scope: each `Binding` carries `mutable` (a `let`/
+`param` is mutable; `const`/`fn`/`class`/`enum`/`import`/loop-var, and a const-DESTRUCTURE pattern bind,
+are immutable — pattern-bind mutability is threaded from the enclosing `let`/`const`). The resolver's
+`mark_mutated_target` records an assignment whose target resolves to an immutable binding into
+`ResolveResult::immutable_assign_targets` (consulting `module_global_mutable`, collected UP FRONT, so a
+const reassignment inside a function body that textually PRECEDES the const's declaration is still caught);
+the compiler emits `Op::ImmutableError <name>` (a new opcode, `is_unconditional_terminator`) at the STORE
+position — i.e. AFTER the RHS is compiled — so it raises `cannot assign to immutable binding '<name>'`
+(anchored at the target span) with the tree-walker's exact runtime TIMING (RHS first, dead stores never
+fire) without any runtime const-flag tracking. `.aso` `ASO_FORMAT_VERSION` bumped 4→5 (new opcode). Both
+fixes keep the whole-corpus three-way differential byte-identical and add no perf-gate regression.
+
+> **Cross-chunk immutable globals (WS2 follow-up).** `Op::ImmutableError` only sees a SAME-chunk
+> assignment, so an immutable global (`const`/`fn`/`class`/`enum`/`import`) reassigned from a LATER,
+> separately-compiled chunk (REPL line-to-line, or a main module reassigning an import) escaped it.
+> Fix: `user_globals` now stores `GlobalSlot { value, mutable }` (still a plain `Value`, NO `Cc` cell —
+> the `Vm` is the GC root). `Op::DefineGlobal` carries a `u8` mutability flag (1 = `let`, 0 = immutable;
+> the compiler reads it off the resolver `Binding.mutable`) → `DefineGlobal` is now a `u16 name + u8 mut`
+> op (3 bytes). For a GLOBAL assignment target the compiler ALWAYS emits `SET_GLOBAL` (never the
+> compile-time `ImmutableError`); `Op::SetGlobal` is the SINGLE runtime source of truth: immutable global
+> → `cannot assign to immutable binding '<name>'` (target span), absent → `cannot assign to undefined
+> variable`, mutable → in-place update. Runtime-timed (dead `if false { k = 2 }` never executes the op);
+> imports define immutable globals (`define_user_global(.., false)`). `Op::ImmutableError` is KEPT for
+> immutable LOCALS/upvalues (a `const` inside a function — that path is unchanged, byte-identical).
+> `.aso` `ASO_FORMAT_VERSION` bumped 5→6 (DefineGlobal operand layout).
+
+**`--no-specialize` KILL SWITCH + three-way differential (V11-T5).** The `Vm` carries a
+`specialize: bool` (default `true`; `Vm::new` → specializing, `Vm::new_generic` /
+`Vm::with_specialize(interp, false)` → generic). When `false`, EVERY specialization fast path is
+skipped: the field/method inline caches (`GET_PROP`/`SET_PROP`/`CALL_METHOD`, via `ic_get_field` /
+`ic_resolve_method` / `vm_set_prop`), the PEP-659 adaptive arithmetic (`eval_binop_adaptive`), and
+the `GET_GLOBAL` cache all gate their consult AND record behind `if self.specialize`, falling through
+to the generic lookup with no warmup/specialize/deopt. The two modes MUST be byte-identical (both
+correct) — the only difference is speed. `vm_run_source` (specialize) and `vm_run_source_generic`
+(generic) are the test entry points; the eventual CLI `--no-specialize` maps to the generic one. The
+**THREE-WAY DIFFERENTIAL** (`tests/vm_differential.rs`, `three_way_*`) asserts
+`tree-walker == specialized-VM == generic-VM` byte-for-byte over the whole corpus + recorded goldens +
+an IC/adaptive/property/method/arithmetic-heavy program set, in BOTH feature configs. If generic and
+specialized EVER diverge, a specialization GUARD is wrong — do NOT relax the assertion, fix the guard.
 
 ### Standard library (`src/stdlib/`)
 Each `std/*` module is native Rust over the `Value` model. Two routing entry points in

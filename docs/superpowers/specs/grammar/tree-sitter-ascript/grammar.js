@@ -80,6 +80,20 @@ module.exports = grammar({
     //     the `... identifier` prefix until the container is resolved as a
     //     pattern or a literal.
     [$.rest_element, $._primary_expression],
+    // ----- Match-arm guard vs arrow (guard ends in a bare identifier) ------
+    // A match guard is a full `_expression`, but a guard ENDING in a bare
+    // identifier right before the arm's `=>` (e.g. `n if n == lim => "eq"`) is
+    // ambiguous: the trailing `lim =>` could shift into a single-param
+    // `arrow_function` (whose `=>` then steals the arm separator) OR `lim` could
+    // reduce to an expression operand so the `=>` belongs to the `match_arm`.
+    // GLR keeps both alive; only the latter yields a complete arm (`=> value`),
+    // so it wins. Mirrors the hand-written parser, which suppresses a top-level
+    // bare arrow inside the guard. The single-identifier `arrow_function` form is
+    // precedence-LESS (see its rule) so this shift/reduce becomes a genuine
+    // dynamic conflict: at `<ident> •  =>` reduce the identifier to a
+    // `_primary_expression` (the `=>` is the arm separator) vs shift into a bare
+    // `arrow_function` param.
+    [$.arrow_function, $._primary_expression],
   ],
 
   rules: {
@@ -441,12 +455,27 @@ module.exports = grammar({
       optional(seq(':', field('pattern', $._match_pattern_single))),
     ),
 
-    arrow_function: $ => prec(PREC.assign, seq(
-      optional('async'),
-      field('parameters', choice($.parameter_list, $.identifier)),
-      '=>',
-      field('body', choice($.block, $._expression)),
-    )),
+    // The single-IDENTIFIER parameter form is precedence-LESS so the shift/reduce
+    // at `<ident> =>` becomes a genuine GLR conflict (declared in `conflicts` as
+    // `[$.match_arm, $.arrow_function]`): inside a match guard, `n if n == lim =>`
+    // can then settle on the arm-completing parse (the `=>` is the arm separator)
+    // rather than statically shifting `lim =>` into an arrow. The parenthesized
+    // parameter form keeps `PREC.assign` (its `(` already disambiguates, and the
+    // precedence preserves right-associativity of `(x) => (y) => z`).
+    arrow_function: $ => choice(
+      prec(PREC.assign, seq(
+        optional('async'),
+        field('parameters', $.parameter_list),
+        '=>',
+        field('body', choice($.block, $._expression)),
+      )),
+      seq(
+        optional('async'),
+        field('parameters', $.identifier),
+        '=>',
+        field('body', choice($.block, $._expression)),
+      ),
+    ),
 
     // Postfix chain: call, member, index, optional member, ? propagation.
     _postfix_expression: $ => choice(

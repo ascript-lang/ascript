@@ -16,7 +16,6 @@ use crate::span::Span;
 use crate::value::Value;
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::rc::Rc;
 use std::time::Instant;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -97,7 +96,7 @@ impl Interp {
             ops_per_sec
         };
         obj.insert("opsPerSec".to_string(), Value::Number(ops));
-        Ok(Value::Object(Rc::new(RefCell::new(obj))))
+        Ok(Value::Object(crate::value::ObjectCell::new(obj)))
     }
 
     /// `bench.compare({name: fn, ...}, iterations?) -> array<{name, avgMs, opsPerSec}>`
@@ -153,11 +152,11 @@ impl Interp {
                 obj.insert("name".to_string(), Value::Str(name.into()));
                 obj.insert("avgMs".to_string(), Value::Number(avg_ms));
                 obj.insert("opsPerSec".to_string(), Value::Number(ops_per_sec));
-                Value::Object(Rc::new(RefCell::new(obj)))
+                Value::Object(crate::value::ObjectCell::new(obj))
             })
             .collect();
 
-        Ok(Value::Array(Rc::new(RefCell::new(out))))
+        Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
     }
 }
 

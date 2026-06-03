@@ -17,7 +17,7 @@ fn language() -> tree_sitter::Language {
 
 fn example_files() -> Vec<PathBuf> {
     let mut files = Vec::new();
-    for dir in ["examples", "examples/modules"] {
+    for dir in ["examples", "examples/modules", "examples/app"] {
         let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir}: {e}"));
         for entry in entries {
             let path = entry.unwrap().path();
@@ -54,6 +54,28 @@ fn treesitter_parses_all_examples_without_errors() {
         failures.is_empty(),
         "tree-sitter reported error nodes in: {failures:?}"
     );
+}
+
+#[test]
+fn treesitter_parses_match_guard_ending_in_ident() {
+    // A match guard ending in a bare identifier right before `=>` must NOT be
+    // mis-parsed as an arrow that swallows the arm separator. The grammar resolves
+    // this via its declared pattern-vs-expression GLR conflict at the arm's `=>`,
+    // so no regen is needed — this is a standing guard against regressions.
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        r#"let g = match v { n if n == lim => "eq", other => "o" }"#,
+        r#"let g = match v { n if n > 0 && n == lim => "a", other => "o" }"#,
+        r#"let g = match v { x if (() => true)() => 1, _ => 2 }"#,
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on guard snippet: {src}"
+        );
+    }
 }
 
 #[test]

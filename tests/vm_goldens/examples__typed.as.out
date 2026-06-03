@@ -1,0 +1,6 @@
+# exit: none
+12
+hello, Ada
+12
+type contract violated: expected number, got string (wide)
+42

@@ -1,0 +1,4 @@
+# exit: none
+ok user: Ada Lovelace (role=guest)
+rejected bad payload: type contract violated at user.id: expected number, got string
+typed_http ok

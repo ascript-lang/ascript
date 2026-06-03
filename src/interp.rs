@@ -52,11 +52,15 @@ impl From<AsError> for Control {
 }
 
 /// A fresh global environment with the built-in functions installed.
+/// The bare (unqualified) builtin names installed in every program's global env.
+/// Shared with the checker (`undefined-variable`) so they cannot drift.
+pub const BUILTIN_NAMES: &[&str] = &[
+    "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit",
+];
+
 pub fn global_env() -> Environment {
     let env = Environment::global();
-    for name in [
-        "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit",
-    ] {
+    for &name in BUILTIN_NAMES {
         env.define(name, Value::Builtin(name.into()), false)
             .expect("global env starts empty");
     }
@@ -66,7 +70,7 @@ pub fn global_env() -> Environment {
 /// Build a `[value, err]` Result pair.
 // pub(crate): used by std/* modules (std/convert) later in M10.
 pub(crate) fn make_pair(value: Value, err: Value) -> Value {
-    Value::Array(Rc::new(RefCell::new(vec![value, err])))
+    Value::Array(gcmodule::Cc::new(RefCell::new(vec![value, err])))
 }
 
 /// Build an error object `{ message: <msg> }`.
@@ -74,7 +78,7 @@ pub(crate) fn make_pair(value: Value, err: Value) -> Value {
 pub(crate) fn make_error(msg: Value) -> Value {
     let mut map = indexmap::IndexMap::new();
     map.insert("message".to_string(), msg);
-    Value::Object(Rc::new(RefCell::new(map)))
+    Value::Object(crate::value::ObjectCell::new(map))
 }
 
 #[derive(Clone)]
@@ -286,6 +290,14 @@ pub struct Interp {
     /// `Rc<Interp>` (`rc()`) so they can `spawn_local` a `'static` task that
     /// re-enters the interpreter — required for M17 Phase 2 async-fn scheduling.
     self_weak: RefCell<std::rc::Weak<Interp>>,
+    /// A `Weak` to the bytecode [`Vm`] driving this interpreter, installed by
+    /// [`Vm::new`] via [`Interp::set_vm`]. Lets a native higher-order stdlib
+    /// function (e.g. `array.map`, `recover`) re-enter the VM to run a
+    /// `Value::Closure` callback (see [`Interp::call_value`]'s `Closure` arm).
+    /// `None` (an empty `Weak`) on a pure tree-walker run where no VM exists; a
+    /// `Value::Closure` can only be produced by the VM, so a VM is always
+    /// registered whenever a closure can reach `call_value`.
+    vm: RefCell<std::rc::Weak<crate::vm::Vm>>,
     /// Number of eagerly-spawned `async fn`/method body tasks currently alive
     /// (incremented at spawn, decremented when the task future drops — completion
     /// OR cancel-on-drop). Used for cooperative backpressure so a tight un-awaited
@@ -366,6 +378,7 @@ impl Interp {
             resources: RefCell::new(HashMap::new()),
             next_resource_id: Cell::new(0),
             self_weak: RefCell::new(std::rc::Weak::new()),
+            vm: RefCell::new(std::rc::Weak::new()),
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
             #[cfg(feature = "log")]
@@ -395,7 +408,7 @@ impl Interp {
             .iter()
             .map(|s| Value::Str(s.clone()))
             .collect();
-        Value::Array(Rc::new(RefCell::new(args)))
+        Value::Array(gcmodule::Cc::new(RefCell::new(args)))
     }
 
     /// Register one newly-spawned async task: bump `inflight` (and the high-water
@@ -435,6 +448,21 @@ impl Interp {
     /// at every entry point, before running any program.
     pub(crate) fn install_self(self: &Rc<Interp>) {
         *self.self_weak.borrow_mut() = Rc::downgrade(self);
+    }
+
+    /// Register the bytecode [`Vm`] driving this interpreter. Called by
+    /// [`Vm::new`] right after the VM is constructed, so that a native
+    /// higher-order stdlib function reaching a `Value::Closure` in
+    /// [`Interp::call_value`] can re-enter the VM to run it (`native → VM`).
+    pub(crate) fn set_vm(&self, vm: std::rc::Weak<crate::vm::Vm>) {
+        *self.vm.borrow_mut() = vm;
+    }
+
+    /// Recover an owned `Rc<Vm>` from the registered weak, or `None` if no VM is
+    /// installed. Upgrading to an owned `Rc` lets callers drop the `RefCell`
+    /// borrow before awaiting (`await_holding_refcell_ref` stays clean).
+    pub(crate) fn vm(&self) -> Option<Rc<crate::vm::Vm>> {
+        self.vm.borrow().upgrade()
     }
 
     /// Recover an owned `Rc<Interp>` from `&self`. Panics if `install_self` was
@@ -575,7 +603,10 @@ impl Interp {
                 // (after the level filter above) so a filtered call is free.
                 if matches!(
                     args.first(),
-                    Some(Value::Function(_)) | Some(Value::Builtin(_))
+                    // A VM-compiled thunk is a `Value::Closure` — equally a deferred
+                    // message callable (`call_value` dispatches it via the V4-T5
+                    // bridge). Inert for the tree-walker (never makes a Closure).
+                    Some(Value::Function(_)) | Some(Value::Closure(_)) | Some(Value::Builtin(_))
                 ) {
                     let r = self.call_value(args[0].clone(), vec![], span).await?;
                     // An `async fn` thunk returns a `Value::Future`; drive it to
@@ -919,6 +950,16 @@ impl Interp {
         p
     }
 
+    /// Resolve a `std/*` module to its `ModuleEntry` for the bytecode VM. This is
+    /// the SAME `load_std_module` the tree-walker's `Stmt::Import` arm uses, so the
+    /// two engines bind byte-identical export values and error identically on an
+    /// unknown / feature-disabled module. The VM's `Op::Import` exec calls this;
+    /// non-`std/` (file-module) imports are a compile-time deferral (V12-T4) and
+    /// never reach here.
+    pub(crate) fn import_std(&self, source: &str) -> Result<ModuleEntry, Control> {
+        self.load_std_module(source)
+    }
+
     #[async_recursion(?Send)]
     pub async fn exec(&self, program: &[Stmt], env: &Environment) -> Result<Flow, Control> {
         for stmt in program {
@@ -989,7 +1030,7 @@ impl Interp {
                 }
                 if let Some((rest_name, _)) = rest {
                     let tail: Vec<Value> = items.iter().skip(names.len()).cloned().collect();
-                    let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(tail)));
+                    let arr = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(tail)));
                     env.define(rest_name, arr, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
@@ -1046,7 +1087,7 @@ impl Interp {
                         }
                         _ => {}
                     }
-                    let obj = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(remaining)));
+                    let obj = Value::Object(crate::value::ObjectCell::new(remaining));
                     env.define(rest_name, obj, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
@@ -1290,7 +1331,7 @@ impl Interp {
                         for name in entry.exports.borrow().iter() {
                             map.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
                         }
-                        env.define(alias, Value::Object(Rc::new(RefCell::new(map))), false)
+                        env.define(alias, Value::Object(crate::value::ObjectCell::new(map)), false)
                             .map_err(AsError::new)?;
                     }
                 }
@@ -1315,14 +1356,7 @@ impl Interp {
             }
             ExprKind::Unary { op, expr: operand } => {
                 let v = self.eval_expr(operand, env).await?;
-                match op {
-                    UnOp::Neg => match v {
-                        Value::Number(n) => Ok(Value::Number(-n)),
-                        Value::Decimal(d) => Ok(Value::Decimal(-d)),
-                        _ => Err(AsError::at("cannot negate a non-number", operand.span).into()),
-                    },
-                    UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
-                }
+                apply_unop(*op, v, operand.span)
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 match op {
@@ -1356,140 +1390,9 @@ impl Interp {
                 let l = self.eval_expr(lhs, env).await?;
                 let r = self.eval_expr(rhs, env).await?;
 
-                // Eq/Ne: cross-type Decimal↔Number comparison before generic `==`.
-                match op {
-                    BinOp::Eq => {
-                        let eq = decimal_cross_eq(&l, &r, expr.span)?;
-                        return Ok(Value::Bool(eq));
-                    }
-                    BinOp::Ne => {
-                        let eq = decimal_cross_eq(&l, &r, expr.span)?;
-                        return Ok(Value::Bool(!eq));
-                    }
-                    _ => {}
-                }
-
-                // Range `a..b`: eager, half-open `array<number>` with step 1,
-                // matching ForRange and the `range()` builtin. Returns an Array,
-                // so it must be handled before the generic "two numbers → Number"
-                // path below.
-                if let BinOp::Range = op {
-                    let (start, end) = match (&l, &r) {
-                        (Value::Number(a), Value::Number(b)) => (*a, *b),
-                        _ => {
-                            return Err(
-                                AsError::at("range bounds must be numbers", expr.span).into()
-                            )
-                        }
-                    };
-                    let mut items = Vec::new();
-                    let mut i = start;
-                    while i < end {
-                        items.push(Value::Number(i));
-                        i += 1.0;
-                    }
-                    return Ok(Value::Array(Rc::new(RefCell::new(items))));
-                }
-
-                // String concatenation: `+` joins two strings.
-                if let BinOp::Add = op {
-                    if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
-                        return Ok(Value::Str(format!("{}{}", a, b).into()));
-                    }
-                }
-
-                // Decimal arithmetic/comparison: triggered when either operand is
-                // Decimal. The other side is coerced (Number→Decimal; non-finite→
-                // Tier-2 panic; non-number/non-decimal → fall through to error).
-                if matches!((&l, &r), (Value::Decimal(_), _) | (_, Value::Decimal(_))) {
-                    use crate::stdlib::decimal::coerce_to_decimal;
-                    let da = coerce_to_decimal(&l, expr.span)?;
-                    let db = coerce_to_decimal(&r, expr.span)?;
-                    if let (Some(a), Some(b)) = (da, db) {
-                        let result = match op {
-                            BinOp::Add => Value::Decimal(a + b),
-                            BinOp::Sub => Value::Decimal(a - b),
-                            BinOp::Mul => Value::Decimal(a * b),
-                            BinOp::Div => {
-                                if b.is_zero() {
-                                    return Err(AsError::at(
-                                        "decimal division by zero",
-                                        expr.span,
-                                    )
-                                    .into());
-                                }
-                                Value::Decimal(a / b)
-                            }
-                            BinOp::Mod => {
-                                if b.is_zero() {
-                                    return Err(AsError::at(
-                                        "decimal remainder by zero",
-                                        expr.span,
-                                    )
-                                    .into());
-                                }
-                                Value::Decimal(a % b)
-                            }
-                            // Ordering: both operands are already finite Decimals
-                            // here (coerce_to_decimal above Tier-2-panics on a
-                            // non-finite Number). This is the INTENTIONAL asymmetry
-                            // vs equality: `decimal == Infinity` is a lenient `false`
-                            // (decimal_cross_eq), but `decimal < Infinity` panics —
-                            // there is no sensible order. See decimal_cross_eq's doc.
-                            BinOp::Lt => Value::Bool(a < b),
-                            BinOp::Le => Value::Bool(a <= b),
-                            BinOp::Gt => Value::Bool(a > b),
-                            BinOp::Ge => Value::Bool(a >= b),
-                            // Pow: not defined for Decimal — fall through to error.
-                            BinOp::Pow => {
-                                return Err(AsError::at(
-                                    "exponentiation (**) is not supported for decimal; use math.pow or convert to number",
-                                    expr.span,
-                                )
-                                .into())
-                            }
-                            BinOp::Eq
-                            | BinOp::Ne
-                            | BinOp::And
-                            | BinOp::Or
-                            | BinOp::Coalesce
-                            | BinOp::Range => unreachable!("handled above"),
-                        };
-                        return Ok(result);
-                    }
-                    // One operand was not a number or decimal — fall through to the
-                    // generic "operator requires two numbers or decimals" error.
-                }
-
-                let (a, b) = match (&l, &r) {
-                    (Value::Number(a), Value::Number(b)) => (*a, *b),
-                    _ => return Err(AsError::at(
-                        "operator requires two numbers (or two decimals, or number and decimal)",
-                        expr.span,
-                    )
-                    .into()),
-                };
-                let result = match op {
-                    BinOp::Add => Value::Number(a + b),
-                    BinOp::Sub => Value::Number(a - b),
-                    BinOp::Mul => Value::Number(a * b),
-                    BinOp::Div => Value::Number(a / b),
-                    BinOp::Mod => Value::Number(a % b),
-                    BinOp::Pow => Value::Number(a.powf(b)),
-                    BinOp::Lt => Value::Bool(a < b),
-                    BinOp::Le => Value::Bool(a <= b),
-                    BinOp::Gt => Value::Bool(a > b),
-                    BinOp::Ge => Value::Bool(a >= b),
-                    BinOp::Eq
-                    | BinOp::Ne
-                    | BinOp::And
-                    | BinOp::Or
-                    | BinOp::Coalesce
-                    | BinOp::Range => {
-                        unreachable!("handled above")
-                    }
-                };
-                Ok(result)
+                // All non-short-circuit operators (string concat / decimal / range
+                // / cross-type equality / numeric) share ONE dispatch with the VM.
+                apply_binop(*op, l, r, expr.span)
             }
             ExprKind::Arrow {
                 params,
@@ -1536,7 +1439,7 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(values))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(values))))
             }
             ExprKind::Object(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
@@ -1568,9 +1471,9 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Object(std::rc::Rc::new(std::cell::RefCell::new(
+                Ok(Value::Object(crate::value::ObjectCell::new(
                     map,
-                ))))
+                )))
             }
             ExprKind::Template { parts } => {
                 let mut out = String::new();
@@ -1775,7 +1678,7 @@ impl Interp {
                     let remainder: Vec<Value> = items[pats.len()..].to_vec();
                     bindings.push((
                         rest_name.clone(),
-                        Value::Array(Rc::new(RefCell::new(remainder))),
+                        Value::Array(gcmodule::Cc::new(RefCell::new(remainder))),
                     ));
                 }
                 Ok(true)
@@ -1813,7 +1716,7 @@ impl Interp {
                     }
                     bindings.push((
                         rest_name.clone(),
-                        Value::Object(Rc::new(RefCell::new(remaining))),
+                        Value::Object(crate::value::ObjectCell::new(remaining)),
                     ));
                 }
                 Ok(true)
@@ -1847,28 +1750,10 @@ impl Interp {
                     return Ok((Value::Nil, true));
                 }
                 let idx = self.eval_expr(index, env).await?;
-                let v = match obj {
-                    Value::Array(arr) => {
-                        let i = array_index(&idx, expr.span)?;
-                        let arr = arr.borrow();
-                        arr.get(i).cloned().ok_or_else(|| {
-                            AsError::at(
-                                format!("index {} out of bounds (len {})", i, arr.len()),
-                                expr.span,
-                            )
-                        })
-                    }
-                    Value::Object(map) => match idx {
-                        Value::Str(key) => Ok(map
-                            .borrow()
-                            .get(key.as_ref())
-                            .cloned()
-                            .unwrap_or(Value::Nil)),
-                        _ => Err(AsError::at("object index must be a string", expr.span)),
-                    },
-                    _ => Err(AsError::at("cannot index this value", object.span)),
-                };
-                Ok((v?, false))
+                // Shared with the bytecode VM (`Op::GetIndex`) so the two engines
+                // cannot drift on index-read semantics or panic messages.
+                let v = index_get(&obj, &idx, object.span, expr.span)?;
+                Ok((v, false))
             }
             ExprKind::Call { callee, args } => {
                 // Fluent schema method-chaining hook: a Call whose callee is a
@@ -1958,7 +1843,10 @@ impl Interp {
         Ok(values)
     }
 
-    fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
+    // pub(crate): shared with the bytecode VM (`Op::GetProp`/`Op::GetPropOpt`)
+    // so member-access semantics (fields, methods→BoundMethod, enum variants,
+    // native handles, nil-receiver errors) have ONE implementation.
+    pub(crate) fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
         match obj {
             Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
             Value::Enum(e) => e.variants.get(name).cloned().ok_or_else(|| {
@@ -2080,6 +1968,20 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         match callee {
+            // A VM closure (`native → VM` bridge): a native higher-order stdlib
+            // function (e.g. `array.map`, a sort comparator, `recover`) is calling
+            // a user callback that the VM produced. Re-enter the VM to run it on a
+            // fresh Fiber. Upgrade the registered `vm` weak to an owned `Rc<Vm>`
+            // FIRST so no `RefCell` borrow is held across the await. A
+            // `Value::Closure` can only exist if the VM created it, so the VM is
+            // always registered here; a missing VM is a wiring bug (clear panic,
+            // not UB).
+            Value::Closure(_) => {
+                let vm = self
+                    .vm()
+                    .expect("VM not registered for closure call (Interp::set_vm not called)");
+                vm.call_value(callee, args, span).await
+            }
             Value::Builtin(name) => self.call_builtin(&name, &args, span).await,
             Value::Function(func) => self.call_function(func, args, span).await,
             Value::Class(class) => self.construct(class, args, span).await,
@@ -2328,81 +2230,11 @@ impl Interp {
         what: &str,
     ) -> Result<Value, Control> {
         let BodySpec { params, ret, body } = spec;
-        let has_rest = params.last().is_some_and(|p| p.rest);
-        if !has_rest {
-            // UNCHANGED fast path — exact arity, identical wording.
-            if args.len() != params.len() {
-                return Err(AsError::at(
-                    format!(
-                        "{} expected {} argument(s), got {}",
-                        what,
-                        params.len(),
-                        args.len()
-                    ),
-                    span,
-                )
-                .into());
-            }
-            for (p, a) in params.iter().zip(args.into_iter()) {
-                if let Some(ty) = &p.ty {
-                    if !check_type(&a, ty) {
-                        return Err(contract_panic(ty, &a, span));
-                    }
-                }
-                call_env.define(&p.name, a, true).map_err(AsError::new)?;
-            }
-        } else {
-            let n_fixed = params.len() - 1;
-            if args.len() < n_fixed {
-                return Err(AsError::at(
-                    format!(
-                        "{} expected at least {} argument(s), got {}",
-                        what,
-                        n_fixed,
-                        args.len()
-                    ),
-                    span,
-                )
-                .into());
-            }
-            let mut it = args.into_iter();
-            for p in &params[..n_fixed] {
-                let a = it.next().unwrap();
-                if let Some(ty) = &p.ty {
-                    if !check_type(&a, ty) {
-                        return Err(contract_panic(ty, &a, span));
-                    }
-                }
-                call_env.define(&p.name, a, true).map_err(AsError::new)?;
-            }
-            let rest_p = &params[n_fixed];
-            let elem_ty = match &rest_p.ty {
-                Some(crate::ast::Type::Array(inner)) => Some(inner.as_ref()),
-                Some(other) => {
-                    return Err(AsError::at(
-                        format!(
-                            "a rest parameter type must be an array type (array<T>), got {}",
-                            other
-                        ),
-                        span,
-                    )
-                    .into())
-                }
-                None => None,
-            };
-            let mut rest_vals = Vec::new();
-            for a in it {
-                if let Some(t) = elem_ty {
-                    if !check_type(&a, t) {
-                        return Err(contract_panic(t, &a, span));
-                    }
-                }
-                rest_vals.push(a);
-            }
-            let arr = Value::Array(std::rc::Rc::new(std::cell::RefCell::new(rest_vals)));
-            call_env
-                .define(&rest_p.name, arr, true)
-                .map_err(AsError::new)?;
+        // Arity + parameter contracts + rest collection. Shared verbatim with the
+        // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
+        let bound = check_call_args(params, args, span, what)?;
+        for (p, a) in params.iter().zip(bound.into_iter()) {
+            call_env.define(&p.name, a, true).map_err(AsError::new)?;
         }
         let result = match self.exec(body, call_env).await {
             Ok(Flow::Return(v)) => v,
@@ -2516,9 +2348,10 @@ impl Interp {
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
-        let instance = std::rc::Rc::new(std::cell::RefCell::new(crate::value::Instance {
+        let instance = gcmodule::Cc::new(std::cell::RefCell::new(crate::value::Instance {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
+            shape_id: std::cell::Cell::new(0),
         }));
         let inst_val = Value::Instance(instance.clone());
         // Pre-populate declared-field defaults (merged base-class first so a
@@ -2647,10 +2480,11 @@ impl Interp {
             }
         }
 
-        Ok(Value::Instance(std::rc::Rc::new(std::cell::RefCell::new(
+        Ok(Value::Instance(gcmodule::Cc::new(std::cell::RefCell::new(
             crate::value::Instance {
                 class: class.clone(),
                 fields: inst_fields,
+                shape_id: std::cell::Cell::new(0),
             },
         ))))
     }
@@ -2692,7 +2526,7 @@ impl Interp {
                         let p = format!("{}[{}]", path, i);
                         out.push(self.coerce_field(elem, it, env, strict, &p, span).await?);
                     }
-                    Ok(Value::Array(std::rc::Rc::new(std::cell::RefCell::new(out))))
+                    Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(out))))
                 }
                 _ => Ok(val),
             },
@@ -2703,7 +2537,7 @@ impl Interp {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
+                    let out = crate::value::MapCell::new(indexmap::IndexMap::new());
                     for (k, v) in entries {
                         let p = format!("{}[{}]", path, k.to_value());
                         let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
@@ -2723,7 +2557,7 @@ impl Interp {
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    let out = std::rc::Rc::new(std::cell::RefCell::new(indexmap::IndexMap::new()));
+                    let out = crate::value::MapCell::new(indexmap::IndexMap::new());
                     for (k, v) in entries {
                         let p = format!("{}[{}]", path, k);
                         let cv = self.coerce_field(vty, v, env, strict, &p, span).await?;
@@ -2961,7 +2795,7 @@ impl Interp {
                         i += step;
                     }
                 }
-                Ok(Value::Array(Rc::new(RefCell::new(out))))
+                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
             }
             other => {
                 if let Some((module, func)) = other.split_once('.') {
@@ -2998,59 +2832,211 @@ impl Interp {
             ExprKind::Index { object, index } => {
                 let obj = self.eval_expr(object, env).await?;
                 let idx = self.eval_expr(index, env).await?;
-                match obj {
-                    Value::Array(arr) => {
-                        let i = array_index(&idx, target.span)?;
-                        let mut arr = arr.borrow_mut();
-                        if i >= arr.len() {
-                            return Err(AsError::at(
-                                format!("index {} out of bounds (len {})", i, arr.len()),
-                                target.span,
-                            )
-                            .into());
-                        }
-                        arr[i] = value.clone();
-                        Ok(value)
-                    }
-                    Value::Object(map) => match idx {
-                        Value::Str(key) => {
-                            map.borrow_mut().insert(key.to_string(), value.clone());
-                            Ok(value)
-                        }
-                        _ => Err(AsError::at("object index must be a string", target.span).into()),
-                    },
-                    _ => Err(
-                        AsError::at("cannot index-assign a non-array value", object.span).into(),
-                    ),
-                }
+                // Shared index-write dispatch (with the VM's `Op::SetIndex`) so the
+                // two engines apply identical index-assignment semantics + panic
+                // messages. `object.span` anchors the non-array error; `target.span`
+                // (the whole index expr) anchors OOB / object-index-type errors.
+                Ok(index_set(&obj, &idx, value, object.span, target.span)?)
             }
             ExprKind::Member { object, name } => {
                 let obj = self.eval_expr(object, env).await?;
-                match obj {
-                    Value::Object(map) => {
-                        map.borrow_mut().insert(name.clone(), value.clone());
-                        Ok(value)
-                    }
-                    Value::Instance(inst) => {
-                        let class = inst.borrow().class.clone();
-                        if let Some(schema) = lookup_field_schema(&class, name) {
-                            if !check_type(&value, &schema.ty) {
-                                return Err(contract_panic(&schema.ty, &value, value_span));
-                            }
-                        }
-                        inst.borrow_mut().fields.insert(name.clone(), value.clone());
-                        Ok(value)
-                    }
-                    _ => Err(AsError::at(
-                        format!("cannot set property '{}' on this value", name),
-                        object.span,
-                    )
-                    .into()),
-                }
+                self.set_member(&obj, name, value, object.span, value_span)
             }
             _ => Err(AsError::at("invalid assignment target", target.span).into()),
         }
     }
+
+    /// Set a member `obj.<name> = value`, applying a declared field-type contract
+    /// on an `Instance` field. Shared by the tree-walker's `assign_to` `Member` arm
+    /// and the bytecode VM's `Op::SetProp` so the two engines apply the field
+    /// contract and panic byte-identically. Returns the assigned value (assignment
+    /// is an expression). `value_span` anchors the contract panic exactly where the
+    /// tree-walker's does; `obj_span` anchors the "cannot set property" error.
+    pub(crate) fn set_member(
+        &self,
+        obj: &Value,
+        name: &str,
+        value: Value,
+        obj_span: Span,
+        value_span: Span,
+    ) -> Result<Value, Control> {
+        match obj {
+            Value::Object(map) => {
+                map.borrow_mut().insert(name.to_string(), value.clone());
+                Ok(value)
+            }
+            Value::Instance(inst) => {
+                let class = inst.borrow().class.clone();
+                if let Some(schema) = lookup_field_schema(&class, name) {
+                    if !check_type(&value, &schema.ty) {
+                        return Err(contract_panic(&schema.ty, &value, value_span));
+                    }
+                }
+                inst.borrow_mut()
+                    .fields
+                    .insert(name.to_string(), value.clone());
+                Ok(value)
+            }
+            _ => Err(AsError::at(
+                format!("cannot set property '{}' on this value", name),
+                obj_span,
+            )
+            .into()),
+        }
+    }
+}
+
+/// Pure unary-operator dispatch shared by the tree-walker (`ExprKind::Unary`) and
+/// the bytecode VM (`Op::Neg`/`Op::Not`). `span` anchors the Tier-2 panic so both
+/// engines emit byte-identical diagnostics.
+pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Control> {
+    match op {
+        UnOp::Neg => match v {
+            Value::Number(n) => Ok(Value::Number(-n)),
+            Value::Decimal(d) => Ok(Value::Decimal(-d)),
+            _ => Err(AsError::at("cannot negate a non-number", span).into()),
+        },
+        UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
+    }
+}
+
+/// Pure binary-operator dispatch shared by the tree-walker (`ExprKind::Binary`)
+/// and the bytecode VM. Both engines evaluate the operands first, then call this
+/// with the two values; `span` anchors every Tier-2 panic so diagnostics stay
+/// byte-identical.
+///
+/// `And`/`Or`/`Coalesce` are NOT handled here — they short-circuit and so must be
+/// evaluated by each engine before either operand is forced (the tree-walker
+/// inlines them above the operand evals; the VM lowers them to jumps). Passing one
+/// of those ops here is a programmer error (`unreachable!`).
+///
+/// Dispatch order mirrors `eval_expr`'s `ExprKind::Binary` arm exactly:
+/// Eq/Ne (cross-type decimal equality) → Range (eager `array<number>`) → string
+/// concat (`+` on two `Str`) → decimal arithmetic/ordering (either operand a
+/// `Decimal`) → the two-`Number` path → the generic "requires two numbers" error.
+pub(crate) fn apply_binop(
+    op: BinOp,
+    l: Value,
+    r: Value,
+    span: Span,
+) -> Result<Value, Control> {
+    // Eq/Ne: cross-type Decimal↔Number comparison before generic `==`.
+    match op {
+        BinOp::Eq => {
+            let eq = decimal_cross_eq(&l, &r, span)?;
+            return Ok(Value::Bool(eq));
+        }
+        BinOp::Ne => {
+            let eq = decimal_cross_eq(&l, &r, span)?;
+            return Ok(Value::Bool(!eq));
+        }
+        _ => {}
+    }
+
+    // Range `a..b`: eager, half-open `array<number>` with step 1, matching
+    // ForRange and the `range()` builtin. Returns an Array, so it must be handled
+    // before the generic "two numbers → Number" path below.
+    if let BinOp::Range = op {
+        let (start, end) = match (&l, &r) {
+            (Value::Number(a), Value::Number(b)) => (*a, *b),
+            _ => return Err(AsError::at("range bounds must be numbers", span).into()),
+        };
+        let mut items = Vec::new();
+        let mut i = start;
+        while i < end {
+            items.push(Value::Number(i));
+            i += 1.0;
+        }
+        return Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))));
+    }
+
+    // String concatenation: `+` joins two strings.
+    if let BinOp::Add = op {
+        if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
+            return Ok(Value::Str(format!("{}{}", a, b).into()));
+        }
+    }
+
+    // Decimal arithmetic/comparison: triggered when either operand is Decimal.
+    // The other side is coerced (Number→Decimal; non-finite→Tier-2 panic;
+    // non-number/non-decimal → fall through to error).
+    if matches!((&l, &r), (Value::Decimal(_), _) | (_, Value::Decimal(_))) {
+        use crate::stdlib::decimal::coerce_to_decimal;
+        let da = coerce_to_decimal(&l, span)?;
+        let db = coerce_to_decimal(&r, span)?;
+        if let (Some(a), Some(b)) = (da, db) {
+            let result = match op {
+                BinOp::Add => Value::Decimal(a + b),
+                BinOp::Sub => Value::Decimal(a - b),
+                BinOp::Mul => Value::Decimal(a * b),
+                BinOp::Div => {
+                    if b.is_zero() {
+                        return Err(AsError::at("decimal division by zero", span).into());
+                    }
+                    Value::Decimal(a / b)
+                }
+                BinOp::Mod => {
+                    if b.is_zero() {
+                        return Err(AsError::at("decimal remainder by zero", span).into());
+                    }
+                    Value::Decimal(a % b)
+                }
+                // Ordering: both operands are already finite Decimals here
+                // (coerce_to_decimal above Tier-2-panics on a non-finite Number).
+                // This is the INTENTIONAL asymmetry vs equality: `decimal ==
+                // Infinity` is a lenient `false` (decimal_cross_eq), but `decimal
+                // < Infinity` panics — there is no sensible order. See
+                // decimal_cross_eq's doc.
+                BinOp::Lt => Value::Bool(a < b),
+                BinOp::Le => Value::Bool(a <= b),
+                BinOp::Gt => Value::Bool(a > b),
+                BinOp::Ge => Value::Bool(a >= b),
+                // Pow: not defined for Decimal — Tier-2 panic.
+                BinOp::Pow => {
+                    return Err(AsError::at(
+                        "exponentiation (**) is not supported for decimal; use math.pow or convert to number",
+                        span,
+                    )
+                    .into())
+                }
+                BinOp::Eq | BinOp::Ne | BinOp::Range => unreachable!("handled above"),
+                BinOp::And | BinOp::Or | BinOp::Coalesce => {
+                    unreachable!("short-circuit ops are not dispatched through apply_binop")
+                }
+            };
+            return Ok(result);
+        }
+        // One operand was not a number or decimal — fall through to the generic
+        // "operator requires two numbers or decimals" error.
+    }
+
+    let (a, b) = match (&l, &r) {
+        (Value::Number(a), Value::Number(b)) => (*a, *b),
+        _ => {
+            return Err(AsError::at(
+                "operator requires two numbers (or two decimals, or number and decimal)",
+                span,
+            )
+            .into())
+        }
+    };
+    let result = match op {
+        BinOp::Add => Value::Number(a + b),
+        BinOp::Sub => Value::Number(a - b),
+        BinOp::Mul => Value::Number(a * b),
+        BinOp::Div => Value::Number(a / b),
+        BinOp::Mod => Value::Number(a % b),
+        BinOp::Pow => Value::Number(a.powf(b)),
+        BinOp::Lt => Value::Bool(a < b),
+        BinOp::Le => Value::Bool(a <= b),
+        BinOp::Gt => Value::Bool(a > b),
+        BinOp::Ge => Value::Bool(a >= b),
+        BinOp::Eq | BinOp::Ne | BinOp::Range => unreachable!("handled above"),
+        BinOp::And | BinOp::Or | BinOp::Coalesce => {
+            unreachable!("short-circuit ops are not dispatched through apply_binop")
+        }
+    };
+    Ok(result)
 }
 
 /// Validate that a value is a usable array index (a non-negative integer).
@@ -3097,11 +3083,105 @@ fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
     }
 }
 
+/// Pure index-read dispatch (`obj[idx]`) shared by the tree-walker
+/// (`ExprKind::Index` read path in `eval_chain`) and the bytecode VM
+/// (`Op::GetIndex`) so the two engines cannot drift on index semantics or panic
+/// messages. There is one implementation.
+///
+/// Semantics (mirroring the original inline `eval_chain` arm exactly):
+/// - `Array`: the index must be a non-negative integer `Number` (via
+///   [`array_index`], anchored at `index_span`); an out-of-bounds index is a
+///   Tier-2 panic (NOT nil), `"index {i} out of bounds (len {n})"` at `index_span`.
+/// - `Object`: the index must be a `Str` key; a missing key yields `nil` (never a
+///   panic); a non-string index panics `"object index must be a string"` at
+///   `index_span`.
+/// - anything else: `"cannot index this value"` at `obj_span`.
+///
+/// `obj_span` is the receiver's span (the tree-walker's `object.span`);
+/// `index_span` is the whole index-expression's span (the tree-walker's
+/// `expr.span`). The VM passes its single instruction span for both.
+pub(crate) fn index_get(
+    obj: &Value,
+    idx: &Value,
+    obj_span: Span,
+    index_span: Span,
+) -> Result<Value, AsError> {
+    match obj {
+        Value::Array(arr) => {
+            let i = array_index(idx, index_span)?;
+            let arr = arr.borrow();
+            arr.get(i).cloned().ok_or_else(|| {
+                AsError::at(
+                    format!("index {} out of bounds (len {})", i, arr.len()),
+                    index_span,
+                )
+            })
+        }
+        Value::Object(map) => match idx {
+            Value::Str(key) => Ok(map.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)),
+            _ => Err(AsError::at("object index must be a string", index_span)),
+        },
+        _ => Err(AsError::at("cannot index this value", obj_span)),
+    }
+}
+
+/// Pure index-write dispatch (`obj[idx] = value`) shared by the tree-walker
+/// (`assign_to`'s `Index` arm) and the bytecode VM (`Op::SetIndex`) so the two
+/// engines cannot drift on index-assignment semantics or panic messages. There
+/// is one implementation. Returns the assigned value (assignment is an
+/// expression).
+///
+/// Semantics (mirroring the original inline `assign_to` arm exactly):
+/// - `Array`: the index must be a non-negative integer `Number` (via
+///   [`array_index`], anchored at `index_span`); an out-of-bounds index is a
+///   Tier-2 panic (arrays do NOT grow), `"index {i} out of bounds (len {n})"`
+///   at `index_span`.
+/// - `Object`: the index must be a `Str` key (a new key is inserted); a
+///   non-string index panics `"object index must be a string"` at `index_span`.
+/// - anything else: `"cannot index-assign a non-array value"` at `obj_span`.
+///
+/// `obj_span` is the receiver's span (the tree-walker's `object.span`);
+/// `index_span` is the whole index-expression's span (the tree-walker's
+/// `target.span`). The VM passes its single instruction span for both.
+pub(crate) fn index_set(
+    obj: &Value,
+    idx: &Value,
+    value: Value,
+    obj_span: Span,
+    index_span: Span,
+) -> Result<Value, AsError> {
+    match obj {
+        Value::Array(arr) => {
+            let i = array_index(idx, index_span)?;
+            let mut arr = arr.borrow_mut();
+            if i >= arr.len() {
+                return Err(AsError::at(
+                    format!("index {} out of bounds (len {})", i, arr.len()),
+                    index_span,
+                ));
+            }
+            arr[i] = value.clone();
+            Ok(value)
+        }
+        Value::Object(map) => match idx {
+            Value::Str(key) => {
+                map.borrow_mut().insert(key.to_string(), value.clone());
+                Ok(value)
+            }
+            _ => Err(AsError::at("object index must be a string", index_span)),
+        },
+        _ => Err(AsError::at(
+            "cannot index-assign a non-array value",
+            obj_span,
+        )),
+    }
+}
+
 /// The recv/next method name a native handle exposes for `for await` async
 /// iteration, or `None` if the handle kind is not an async-iterable stream.
 /// Both methods follow the `[value, err]` contract ending in a `nil` value.
 #[allow(unused_variables)]
-fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> {
+pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> {
     #[cfg(feature = "net")]
     {
         use crate::value::NativeKind::*;
@@ -3121,7 +3201,7 @@ fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'static str> 
 /// Human-readable message for a Tier-1 error value. If `err` is an Object with a
 /// `message` field, that field's value is rendered; otherwise the whole value is.
 /// Single source of truth shared by `expr!` (Unwrap) and `for await` error paths.
-fn error_message(err: &Value) -> String {
+pub(crate) fn error_message(err: &Value) -> String {
     match err {
         Value::Object(o) => o
             .borrow()
@@ -3139,7 +3219,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Number(_) => "number",
         Value::Decimal(_) => "decimal",
         Value::Str(_) => "string",
-        Value::Builtin(_) | Value::Function(_) => "function",
+        Value::Builtin(_) | Value::Function(_) | Value::Closure(_) => "function",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
         Value::Map(_) => "map",
@@ -3229,7 +3309,104 @@ fn control_to_aserror(c: Control, span: Span) -> AsError {
 }
 
 /// Runtime contract check (spec §5). Eagerly checks parametric types to full depth.
-fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
+/// Validate call arguments against a parameter list (exact arity OR rest), apply
+/// each declared parameter type contract, and return the values to bind into the
+/// callee's parameter slots in declaration order. For a rest parameter the
+/// returned slot holds the collected `Value::Array` of the trailing arguments.
+///
+/// This is the single source of truth for function-call argument checking; it is
+/// shared by the tree-walker (`run_body`) and the bytecode VM (`vm::run` CALL) so
+/// arity/contract/rest behavior — message wording AND span — is byte-identical
+/// across both engines. `span` is the CALL-site span; `what` is the callee's
+/// name/description (e.g. the function name, `"function"`, or a method name).
+pub(crate) fn check_call_args(
+    params: &[crate::ast::Param],
+    args: Vec<Value>,
+    span: Span,
+    what: &str,
+) -> Result<Vec<Value>, Control> {
+    let has_rest = params.last().is_some_and(|p| p.rest);
+    if !has_rest {
+        // Exact arity.
+        if args.len() != params.len() {
+            return Err(AsError::at(
+                format!(
+                    "{} expected {} argument(s), got {}",
+                    what,
+                    params.len(),
+                    args.len()
+                ),
+                span,
+            )
+            .into());
+        }
+        let mut bound = Vec::with_capacity(params.len());
+        for (p, a) in params.iter().zip(args.into_iter()) {
+            if let Some(ty) = &p.ty {
+                if !check_type(&a, ty) {
+                    return Err(contract_panic(ty, &a, span));
+                }
+            }
+            bound.push(a);
+        }
+        Ok(bound)
+    } else {
+        let n_fixed = params.len() - 1;
+        if args.len() < n_fixed {
+            return Err(AsError::at(
+                format!(
+                    "{} expected at least {} argument(s), got {}",
+                    what,
+                    n_fixed,
+                    args.len()
+                ),
+                span,
+            )
+            .into());
+        }
+        let mut bound = Vec::with_capacity(params.len());
+        let mut it = args.into_iter();
+        for p in &params[..n_fixed] {
+            let a = it.next().unwrap();
+            if let Some(ty) = &p.ty {
+                if !check_type(&a, ty) {
+                    return Err(contract_panic(ty, &a, span));
+                }
+            }
+            bound.push(a);
+        }
+        let rest_p = &params[n_fixed];
+        let elem_ty = match &rest_p.ty {
+            Some(crate::ast::Type::Array(inner)) => Some(inner.as_ref()),
+            Some(other) => {
+                return Err(AsError::at(
+                    format!(
+                        "a rest parameter type must be an array type (array<T>), got {}",
+                        other
+                    ),
+                    span,
+                )
+                .into())
+            }
+            None => None,
+        };
+        let mut rest_vals = Vec::new();
+        for a in it {
+            if let Some(t) = elem_ty {
+                if !check_type(&a, t) {
+                    return Err(contract_panic(t, &a, span));
+                }
+            }
+            rest_vals.push(a);
+        }
+        bound.push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+            rest_vals,
+        ))));
+        Ok(bound)
+    }
+}
+
+pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
     use crate::ast::Type;
     match ty {
         Type::Any => true,
@@ -3238,7 +3415,15 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
         Type::Bool => matches!(value, Value::Bool(_)),
         Type::Nil => matches!(value, Value::Nil),
         Type::Object => matches!(value, Value::Object(_)),
-        Type::Fn => matches!(value, Value::Function(_) | Value::Builtin(_)),
+        // A VM-produced `Closure` is the bytecode analog of a tree-walker
+        // `Function`; both are first-class callables, so `: fn` typing accepts
+        // either. (The tree-walker never produces a `Closure`, so adding it here
+        // is behavior-preserving for the tree-walker and closes a real contract
+        // gap for the VM, which routes through this shared `check_type`.)
+        Type::Fn => matches!(
+            value,
+            Value::Function(_) | Value::Closure(_) | Value::Builtin(_)
+        ),
         Type::Error => matches!(value, Value::Object(_) | Value::Nil),
         Type::Array(elem) => match value {
             Value::Array(a) => a.borrow().iter().all(|v| check_type(v, elem)),
@@ -3292,7 +3477,7 @@ fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
 }
 
 /// Build a contract-violation panic.
-fn contract_panic(ty: &crate::ast::Type, value: &Value, span: Span) -> Control {
+pub(crate) fn contract_panic(ty: &crate::ast::Type, value: &Value, span: Span) -> Control {
     AsError::at(
         format!(
             "type contract violated: expected {}, got {} ({})",
@@ -3853,6 +4038,36 @@ print(y)
             err.message,
             "type contract violated: expected future<number>, got number (5)"
         );
+    }
+
+    #[test]
+    fn check_type_fn_accepts_closure() {
+        use crate::ast::Type;
+        // The shared `check_type` is used by BOTH the tree-walker and the VM (via
+        // `check_call_args`). A `: fn` contract must accept every first-class
+        // callable: the tree-walker's `Function`/`Builtin` AND the VM's `Closure`
+        // (the bytecode analog of a `Function`). Before the fix the `Type::Fn` arm
+        // matched only `Function | Builtin`, so a VM-produced `Closure` passed to
+        // an `fn`-typed binding was WRONGLY rejected by the contract.
+        let proto = std::rc::Rc::new(crate::vm::chunk::FnProto {
+            chunk: crate::vm::chunk::Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            params: Vec::new(),
+            ret: None,
+        });
+        let closure = Value::Closure(crate::vm::value_ext::Closure::new(proto));
+        assert!(
+            check_type(&closure, &Type::Fn),
+            "a VM Closure must satisfy a `: fn` contract"
+        );
+        // The tree-walker callables still satisfy `: fn`.
+        assert!(check_type(&Value::Builtin("len".into()), &Type::Fn));
+        // A non-callable still fails the `: fn` contract (behavior preserved).
+        assert!(!check_type(&Value::Number(7.0), &Type::Fn));
+        assert!(!check_type(&Value::Str("x".into()), &Type::Fn));
     }
 
     #[tokio::test]

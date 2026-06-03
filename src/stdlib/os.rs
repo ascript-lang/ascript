@@ -25,8 +25,6 @@ use crate::value::Value;
 use indexmap::IndexMap;
 #[cfg(feature = "sysinfo")]
 use std::cell::RefCell;
-#[cfg(feature = "sysinfo")]
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     // Base host facts; the `mut`-less binding keeps the `sysinfo`-off build
@@ -66,7 +64,7 @@ fn make_obj(pairs: &[(&str, Value)]) -> Value {
     for (k, v) in pairs {
         map.insert(k.to_string(), v.clone());
     }
-    Value::Object(Rc::new(RefCell::new(map)))
+    Value::Object(crate::value::ObjectCell::new(map))
 }
 
 pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
@@ -162,7 +160,7 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                     ])
                 })
                 .collect();
-            Ok(Value::Array(Rc::new(RefCell::new(entries))))
+            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(entries))))
         }
 
         // uptime() -> number  (seconds)
@@ -185,11 +183,11 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                         .collect();
                     make_obj(&[
                         ("name", Value::Str(name.as_str().into())),
-                        ("addresses", Value::Array(Rc::new(RefCell::new(addrs)))),
+                        ("addresses", Value::Array(gcmodule::Cc::new(RefCell::new(addrs)))),
                     ])
                 })
                 .collect();
-            Ok(Value::Array(Rc::new(RefCell::new(entries))))
+            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(entries))))
         }
 
         // localIp() -> [string, err]  — best-effort primary non-loopback IPv4 (Tier-1)

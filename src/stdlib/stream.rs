@@ -187,7 +187,11 @@ fn require_stream_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
 /// early gives a better message naming the stream op.
 fn require_callable(v: &Value, span: Span, ctx: &str) -> Result<Value, Control> {
     match v {
+        // `Value::Closure` is the VM's compiled-function value — equally callable
+        // via `call_value` (the V4-T5 bridge). The tree-walker never produces a
+        // Closure, so this arm is inert there; it only matters for VM programs.
         Value::Function(_)
+        | Value::Closure(_)
         | Value::Builtin(_)
         | Value::BoundMethod(_)
         | Value::NativeMethod(_)
@@ -591,7 +595,7 @@ impl Interp {
                 Stage::Enumerate { index } => {
                     let idx = *index;
                     *index += 1.0;
-                    value = Value::Array(Rc::new(std::cell::RefCell::new(vec![
+                    value = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![
                         Value::Number(idx),
                         value,
                     ])));
@@ -602,7 +606,7 @@ impl Interp {
                     // zipped stream ends too (the already-pulled `value` is dropped).
                     match self.pull_next(other_id, span).await? {
                         Some(partner) => {
-                            value = Value::Array(Rc::new(std::cell::RefCell::new(vec![
+                            value = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![
                                 value, partner,
                             ])));
                         }
@@ -624,7 +628,7 @@ impl Interp {
         while let Some(v) = self.pull_next(id, span).await? {
             out.push(v);
         }
-        Ok(Value::Array(Rc::new(std::cell::RefCell::new(out))))
+        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(out))))
     }
 
     /// `stream.forEach(s, fn)` — pull every item and call `fn(value)` for its effect.

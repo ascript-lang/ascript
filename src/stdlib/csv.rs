@@ -6,7 +6,6 @@ use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
 use crate::value::Value;
 use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -16,7 +15,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(Rc::new(RefCell::new(v)))
+    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
 }
 fn str_v(s: &str) -> Value {
     Value::Str(s.into())
@@ -63,7 +62,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                                     str_v(row.get(i).map(|s| s.as_str()).unwrap_or("")),
                                 );
                             }
-                            Value::Object(Rc::new(RefCell::new(o)))
+                            Value::Object(crate::value::ObjectCell::new(o))
                         })
                         .collect()
                 }
@@ -169,7 +168,7 @@ mod tests {
             "parse",
             &[
                 s("name,age\nAda,36"),
-                Value::Object(Rc::new(RefCell::new(opt))),
+                Value::Object(crate::value::ObjectCell::new(opt)),
             ],
             sp(),
         )

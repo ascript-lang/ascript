@@ -1,0 +1,17 @@
+# exit: none
+PASS  for await over a generator yields in order
+PASS  next() returns the first value
+PASS  next() returns the second value
+PASS  next() returns nil when exhausted
+PASS  next() keeps returning nil after done
+PASS  first next() starts the body and returns the first yield
+PASS  next(v) resumes and returns the next yield
+PASS  yield evaluates to the resumed value
+PASS  an empty generator's first next() is nil
+PASS  next() before close works
+PASS  next() after close is nil
+PASS  for await after close iterates nothing
+PASS  async generators compose via for await
+PASS  infinite generator with break pulls exactly what's consumed
+PASS  a never-iterated generator's body does not run
+done

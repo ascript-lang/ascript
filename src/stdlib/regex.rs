@@ -20,7 +20,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(Rc::new(RefCell::new(v)))
+    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
 }
 
 /// Resolve arg 0 to a compiled regex: a `Value::Regex` is used directly; a
@@ -99,7 +99,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         Value::Number(char_index(&s, whole.start())),
                     );
                     obj.insert("groups".to_string(), arr(groups));
-                    Ok(Value::Object(Rc::new(RefCell::new(obj))))
+                    Ok(Value::Object(crate::value::ObjectCell::new(obj)))
                 }
                 None => Ok(Value::Nil),
             }

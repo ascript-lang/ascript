@@ -134,6 +134,28 @@ fn reports_usage_without_args() {
 }
 
 #[test]
+fn run_tree_walker_flag_works() {
+    // `--tree-walker` routes a `.as` file to the legacy tree-walker oracle (the
+    // debugging escape hatch). Output must match the default VM run.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let vm = Command::new(bin)
+        .args(["run", "examples/hello.as"])
+        .output()
+        .unwrap();
+    let tw = Command::new(bin)
+        .args(["run", "--tree-walker", "examples/hello.as"])
+        .output()
+        .unwrap();
+    assert!(vm.status.success() && tw.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&vm.stdout),
+        String::from_utf8_lossy(&tw.stdout),
+        "--tree-walker output must match the default VM run"
+    );
+    assert_eq!(vm.status.code(), tw.status.code());
+}
+
+#[test]
 fn run_error_shows_source_caret() {
     let file = std::env::temp_dir().join(format!("ascript_diag_{}.as", std::process::id()));
     std::fs::write(&file, "let x = 1\nprint(missing)\n").unwrap();
@@ -275,6 +297,250 @@ fn repl_buffers_multiline_class() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains('7'), "expected 7; stdout: {stdout}");
+}
+
+/// Feed `input` to `ascript repl` (optionally with `--tree-walker`) over piped
+/// stdin and return `(stdout, stderr)`. Used by the WS2 VM-REPL tests below.
+fn run_repl_session(input: &str, tree_walker: bool) -> (String, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let mut cmd = Command::new(bin);
+    cmd.arg("repl");
+    if tree_walker {
+        cmd.arg("--tree-walker");
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn repl_vm_persists_bindings_across_lines() {
+    let (out, _) = run_repl_session("let x = 1\nx + 1\n", false);
+    assert!(out.contains('2'), "expected 2; stdout: {out}");
+}
+
+#[test]
+fn repl_vm_persists_fn_and_class_across_lines() {
+    let (out, _) = run_repl_session("fn sq(n) { return n * n }\nsq(5)\n", false);
+    assert!(out.contains("25"), "fn persistence; stdout: {out}");
+
+    let (out2, _) = run_repl_session(
+        "class P {\n  x: number\n  y: number\n}\nlet p = P.from({x: 3, y: 4})\np.x + p.y\n",
+        false,
+    );
+    assert!(out2.contains('7'), "class persistence; stdout: {out2}");
+}
+
+#[test]
+fn repl_vm_trailing_expr_prints_value_statements_print_nothing() {
+    // A bare trailing expression prints its value.
+    let (out, _) = run_repl_session("3 + 4\n", false);
+    assert_eq!(out.trim(), "7", "trailing expr; stdout: {out:?}");
+
+    // A `let` statement prints nothing.
+    let (out2, _) = run_repl_session("let z = 9\n", false);
+    assert_eq!(out2.trim(), "", "statement prints nothing; stdout: {out2:?}");
+
+    // A trailing `nil` expression prints nothing.
+    let (out3, _) = run_repl_session("nil\n", false);
+    assert_eq!(out3.trim(), "", "nil prints nothing; stdout: {out3:?}");
+}
+
+#[test]
+fn repl_vm_redefinition_across_lines_errors_matching_reference() {
+    // The tree-walker REPL rejects a re-`let` of the same name (already defined);
+    // the VM REPL must match: report the error AND keep the first binding.
+    let (out, err) = run_repl_session("let x = 1\nlet x = 2\nx\n", false);
+    let combined = format!("{out}{err}");
+    assert!(
+        combined.contains("already defined"),
+        "expected 'already defined'; out={out:?} err={err:?}"
+    );
+    // The first binding survives the failed redefinition.
+    assert!(out.contains('1'), "first binding survives; stdout: {out:?}");
+}
+
+#[test]
+fn repl_vm_const_reassignment_across_lines_errors_and_keeps_value() {
+    // An immutable top-level `const` defined on one REPL line and reassigned on a
+    // LATER, separately-compiled line: the VM REPL must error `cannot assign to
+    // immutable binding` (the cross-chunk runtime SET_GLOBAL check) AND keep the
+    // first value — byte-identical to the tree-walker REPL.
+    let session = "const k = 1\nk = 2\nk\n";
+    let (vm_out, vm_err) = run_repl_session(session, false);
+    let (tw_out, tw_err) = run_repl_session(session, true);
+    let vm = format!("{vm_out}{vm_err}");
+    let tw = format!("{tw_out}{tw_err}");
+    assert!(
+        vm.contains("cannot assign to immutable binding 'k'"),
+        "VM must reject const reassignment; out={vm_out:?} err={vm_err:?}"
+    );
+    assert!(
+        tw.contains("cannot assign to immutable binding 'k'"),
+        "TW must reject const reassignment; out={tw_out:?} err={tw_err:?}"
+    );
+    // The const keeps its first value on BOTH engines (the failed assignment did not
+    // mutate it): the final `k` line prints 1, not 2.
+    assert!(vm_out.contains('1'), "VM keeps k=1; stdout: {vm_out:?}");
+    assert!(tw_out.contains('1'), "TW keeps k=1; stdout: {tw_out:?}");
+    assert!(!vm_out.contains('2'), "VM must not print 2; stdout: {vm_out:?}");
+}
+
+#[test]
+fn repl_vm_fn_and_class_reassignment_across_lines_error() {
+    // fn / class names are immutable top-level bindings: reassigning one on a later
+    // REPL line errors on BOTH engines (cross-chunk runtime check).
+    for session in ["fn f() { return 1 }\nf = 5\n", "class C {}\nC = 9\n"] {
+        let (vm_out, vm_err) = run_repl_session(session, false);
+        let (tw_out, tw_err) = run_repl_session(session, true);
+        let vm = format!("{vm_out}{vm_err}");
+        let tw = format!("{tw_out}{tw_err}");
+        assert!(
+            vm.contains("cannot assign to immutable binding"),
+            "VM must reject for {session:?}; out={vm_out:?} err={vm_err:?}"
+        );
+        assert!(
+            tw.contains("cannot assign to immutable binding"),
+            "TW must reject for {session:?}; out={tw_out:?} err={tw_err:?}"
+        );
+    }
+}
+
+#[test]
+fn repl_vm_mutable_let_reassignment_across_lines_succeeds() {
+    // A mutable top-level `let` reassigned on a later line works (the runtime check
+    // must NOT over-trigger) — both engines print the new value.
+    let session = "let m = 1\nm = 2\nm\n";
+    let (vm_out, _) = run_repl_session(session, false);
+    let (tw_out, _) = run_repl_session(session, true);
+    assert!(vm_out.contains('2'), "VM let reassignment; stdout: {vm_out:?}");
+    assert!(tw_out.contains('2'), "TW let reassignment; stdout: {tw_out:?}");
+}
+
+#[test]
+fn file_mode_imported_const_reassignment_errors_on_both_engines() {
+    // A main module that imports an immutable `const` from another module and then
+    // reassigns it: BOTH engines reject `cannot assign to immutable binding 'K'` (in
+    // file mode the import + reassignment are in the same entry chunk, so the runtime
+    // SET_GLOBAL check fires identically to the tree-walker).
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join("ascript_imp_reassign_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("m.as"), "export const K = 1\n").unwrap();
+    let main = dir.join("main.as");
+    std::fs::write(&main, "import { K } from \"./m\"\nK = 5\nprint(K)\n").unwrap();
+
+    let vm = Command::new(bin).arg("run").arg(&main).output().unwrap();
+    let tw = Command::new(bin)
+        .args(["run", "--tree-walker"])
+        .arg(&main)
+        .output()
+        .unwrap();
+    let vm_err = String::from_utf8_lossy(&vm.stderr);
+    let tw_err = String::from_utf8_lossy(&tw.stderr);
+    assert!(
+        vm_err.contains("cannot assign to immutable binding 'K'"),
+        "VM must reject imported-const reassignment; stderr={vm_err:?}"
+    );
+    assert!(
+        tw_err.contains("cannot assign to immutable binding 'K'"),
+        "TW must reject imported-const reassignment; stderr={tw_err:?}"
+    );
+    assert!(!vm.status.success(), "VM must exit non-zero");
+    assert!(!tw.status.success(), "TW must exit non-zero");
+}
+
+#[test]
+fn repl_vm_dead_const_reassignment_across_lines_runs_fine() {
+    // A const reassignment in an UN-ENTERED branch on a later line never executes,
+    // so it does NOT error (runtime timing) — both engines keep k=1 and print it.
+    let session = "const k = 1\nif (false) { k = 2 }\nk\n";
+    let (vm_out, vm_err) = run_repl_session(session, false);
+    let (tw_out, _) = run_repl_session(session, true);
+    assert!(
+        !vm_err.contains("immutable"),
+        "dead const reassign must not error; err={vm_err:?}"
+    );
+    assert!(vm_out.contains('1'), "VM keeps k=1; stdout: {vm_out:?}");
+    assert!(tw_out.contains('1'), "TW keeps k=1; stdout: {tw_out:?}");
+}
+
+#[test]
+fn repl_vm_panic_recovers_and_keeps_prior_bindings() {
+    // A bad line (undefined var) reports an error but the loop continues with the
+    // prior bindings intact.
+    let (out, err) = run_repl_session("let a = 10\nb\na + 1\n", false);
+    let combined = format!("{out}{err}");
+    assert!(
+        combined.contains("undefined variable 'b'"),
+        "expected the panic diagnostic; out={out:?} err={err:?}"
+    );
+    assert!(
+        out.contains("11"),
+        "prior binding survives the panic; stdout: {out:?}"
+    );
+}
+
+#[test]
+fn repl_vm_exit_ends_the_session() {
+    // `exit()` ends the REPL: the line after it is never evaluated.
+    let (out, _) = run_repl_session("let z = 1\nexit()\nz + 100\n", false);
+    assert!(
+        !out.contains("101"),
+        "exit() must end the session before the next line; stdout: {out:?}"
+    );
+}
+
+#[test]
+fn repl_vm_builtins_and_print_work() {
+    let (out, _) = run_repl_session("print(1 + 2)\n", false);
+    assert!(out.contains('3'), "print works; stdout: {out:?}");
+
+    // A bare builtin reference is first-class (yields the builtin value).
+    let (out2, _) = run_repl_session("let p = print\np(\"hi\")\n", false);
+    assert!(out2.contains("hi"), "first-class builtin; stdout: {out2:?}");
+}
+
+#[test]
+fn repl_vm_buffers_multiline_input() {
+    // Multi-line buffering (unclosed delimiters) still works on the VM REPL.
+    let input = "fn add(a, b) {\n  return a + b\n}\nadd(2, 3)\n";
+    let (out, _) = run_repl_session(input, false);
+    assert!(out.contains('5'), "multiline buffering; stdout: {out:?}");
+}
+
+#[test]
+fn repl_tree_walker_flag_still_works() {
+    let (out, _) = run_repl_session("let x = 21\nx * 2\n", true);
+    assert!(out.contains("42"), "legacy REPL; stdout: {out:?}");
+}
+
+#[test]
+fn repl_vm_matches_tree_walker_on_a_shared_session() {
+    // A session valid in both engines must produce identical stdout.
+    let session = "let x = 1\nx + 1\nfn sq(n) { return n * n }\nsq(5)\nlet y = x + sq(3)\ny\nexit()\n";
+    let (vm_out, _) = run_repl_session(session, false);
+    let (tw_out, _) = run_repl_session(session, true);
+    assert_eq!(
+        vm_out, tw_out,
+        "VM-REPL and tree-walker-REPL must agree on stdout"
+    );
 }
 
 #[test]

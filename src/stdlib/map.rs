@@ -7,7 +7,6 @@ use crate::span::Span;
 use crate::value::{MapKey, Value};
 use indexmap::IndexMap;
 use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -26,7 +25,7 @@ fn want_map(
     v: &Value,
     span: Span,
     ctx: &str,
-) -> Result<Rc<RefCell<IndexMap<MapKey, Value>>>, Control> {
+) -> Result<gcmodule::Cc<crate::value::MapCell>, Control> {
     match v {
         Value::Map(m) => Ok(m.clone()),
         _ => Err(AsError::at(
@@ -52,14 +51,14 @@ fn want_key(v: &Value, span: Span, ctx: &str) -> Result<MapKey, Control> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(Rc::new(RefCell::new(v)))
+    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     let ctx = |f: &str| format!("map.{}", f);
     match func {
         "new" => {
-            let m = Rc::new(RefCell::new(IndexMap::new()));
+            let m = crate::value::MapCell::new(IndexMap::new());
             // Optional: seed from an array of [k, v] entry pairs.
             if let Some(seed) = args.first() {
                 if !matches!(seed, Value::Nil) {
@@ -192,12 +191,12 @@ mod tests {
     #[test]
     fn new_with_seed_and_bad_seed() {
         let sp = sp();
-        let seed = Value::Array(Rc::new(RefCell::new(vec![
-            Value::Array(Rc::new(RefCell::new(vec![
+        let seed = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+            Value::Array(gcmodule::Cc::new(RefCell::new(vec![
                 Value::Str("a".into()),
                 Value::Number(1.0),
             ]))),
-            Value::Array(Rc::new(RefCell::new(vec![
+            Value::Array(gcmodule::Cc::new(RefCell::new(vec![
                 Value::Str("b".into()),
                 Value::Number(2.0),
             ]))),
@@ -213,7 +212,7 @@ mod tests {
             Err(Control::Panic(_))
         ));
         // wrong-arity entry → panic
-        let bad = Value::Array(Rc::new(RefCell::new(vec![Value::Array(Rc::new(
+        let bad = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Array(gcmodule::Cc::new(
             RefCell::new(vec![Value::Number(1.0)]),
         ))])));
         assert!(matches!(call("new", &[bad], sp), Err(Control::Panic(_))));
@@ -258,7 +257,7 @@ mod tests {
     #[test]
     fn non_hashable_key_panics() {
         let m = call("new", &[], sp()).unwrap();
-        let bad = Value::Array(Rc::new(RefCell::new(vec![])));
+        let bad = Value::Array(gcmodule::Cc::new(RefCell::new(vec![])));
         assert!(matches!(
             call("set", &[m, bad, Value::Number(1.0)], sp()),
             Err(Control::Panic(_))

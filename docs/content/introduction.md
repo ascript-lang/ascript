@@ -4,12 +4,13 @@
 
 AScript is a small, dynamically-typed scripting language with **JavaScript-flavored syntax**,
 **optional runtime-checked type contracts**, and a **batteries-included standard library** — all
-executed by a tree-walking interpreter compiled into a single Rust binary named `ascript`.
+compiled to bytecode and executed by a virtual machine inside a single Rust binary named `ascript`.
 
 The guiding model is **"Lua-simple language, Go/Deno-class standard library."** The *language core*
-stays as simple as Lua — a tree-walker, about eight value kinds, gradual contracts, and no hidden
-control flow. The *standard library and tooling* are deliberately rich, because Rust's crate
-ecosystem makes high-quality batteries cheap to include.
+stays as simple as Lua — about ten value kinds, gradual contracts, and no hidden control flow — and
+runs on a [bytecode VM](runtime) with inline caches and a cycle-collecting GC. The *standard library
+and tooling* are deliberately rich, because Rust's crate ecosystem makes high-quality batteries cheap
+to include.
 
 ```ascript
 import * as json from "std/json"

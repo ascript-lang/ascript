@@ -17,7 +17,6 @@ use crate::error::AsError;
 use crate::interp::{Control, Interp, ResourceState, STDIN_RESOURCE_ID};
 use crate::span::Span;
 use crate::value::Value;
-use std::rc::Rc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -136,6 +135,6 @@ impl Interp {
             }
         }
         self.return_resource(STDIN_RESOURCE_ID, ResourceState::StdinReader(reader));
-        Ok(Value::Array(Rc::new(std::cell::RefCell::new(lines))))
+        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(lines))))
     }
 }

@@ -1,0 +1,8 @@
+# exit: none
+validation error  path="age"  message="expected number >= 0 (min), got -5"
+refine error  path="email"  message="must look like an email"
+fused error (bad JSON): "invalid JSON: key must be a string at line 1 column 2"
+fused error (schema mismatch)  path="name"  msg="expected string with minLength 1, got length 0"
+fromClass error  path="x"  message="expected number, got string"
+fluent username error  message="expected string with minLength 3, got length 2"
+validation: all assertions passed

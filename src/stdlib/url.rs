@@ -12,8 +12,6 @@ use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
 use crate::value::Value;
 use indexmap::IndexMap;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -43,7 +41,7 @@ fn make_obj(pairs: Vec<(&str, Value)>) -> Value {
     for (k, v) in pairs {
         m.insert(k.to_string(), v);
     }
-    Value::Object(Rc::new(RefCell::new(m)))
+    Value::Object(crate::value::ObjectCell::new(m))
 }
 
 // ── public call entry ──────────────────────────────────────────────────────
@@ -113,7 +111,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             for (k, v) in ::url::form_urlencoded::parse(s.as_bytes()) {
                 m.insert(k.into_owned(), Value::Str(v.into_owned().into()));
             }
-            Ok(Value::Object(Rc::new(RefCell::new(m))))
+            Ok(Value::Object(crate::value::ObjectCell::new(m)))
         }
 
         // ── url.buildQuery(obj) -> string ──────────────────────────────────
@@ -382,7 +380,7 @@ mod tests {
         let mut m = IndexMap::new();
         m.insert("a".to_string(), s("1"));
         m.insert("b".to_string(), s("2"));
-        let obj = Value::Object(Rc::new(RefCell::new(m)));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
         let out = call("buildQuery", &[obj], sp()).unwrap();
         assert_eq!(out, s("a=1&b=2"));
     }
@@ -391,7 +389,7 @@ mod tests {
     fn build_query_encodes_special() {
         let mut m = IndexMap::new();
         m.insert("q".to_string(), s("hello world"));
-        let obj = Value::Object(Rc::new(RefCell::new(m)));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
         let out = call("buildQuery", &[obj], sp()).unwrap();
         // form_urlencoded uses '+' for spaces, not %20
         assert_eq!(out, s("q=hello+world"));
@@ -403,7 +401,7 @@ mod tests {
         let mut m = IndexMap::new();
         m.insert("x".to_string(), s("foo bar"));
         m.insert("y".to_string(), s("a&b=c"));
-        let obj = Value::Object(Rc::new(RefCell::new(m)));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
         let qs = call("buildQuery", &[obj], sp()).unwrap();
         let parsed = call("parseQuery", std::slice::from_ref(&qs), sp()).unwrap();
         assert_eq!(field(&parsed, "x"), s("foo bar"));
@@ -450,7 +448,7 @@ mod tests {
         m.insert("scheme".to_string(), s("https"));
         m.insert("host".to_string(), s("x"));
         m.insert("path".to_string(), s("/p"));
-        let obj = Value::Object(Rc::new(RefCell::new(m)));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
         let pair = call("build", &[obj], sp()).unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
         let result = ok_val(&pair);
@@ -466,7 +464,7 @@ mod tests {
         m.insert("port".to_string(), Value::Number(9090.0));
         m.insert("path".to_string(), s("/api/v1"));
         m.insert("query".to_string(), s("key=val"));
-        let obj = Value::Object(Rc::new(RefCell::new(m)));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
         let built = ok_val(&call("build", &[obj], sp()).unwrap());
         let parsed_pair = call("parse", std::slice::from_ref(&built), sp()).unwrap();
         let parsed = ok_val(&parsed_pair);
@@ -481,7 +479,7 @@ mod tests {
     fn build_missing_scheme_is_err() {
         let mut m = IndexMap::new();
         m.insert("host".to_string(), s("x"));
-        let obj = Value::Object(Rc::new(RefCell::new(m)));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
         let pair = call("build", &[obj], sp()).unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
         assert!(pair.to_string().contains("scheme"));

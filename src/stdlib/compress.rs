@@ -106,7 +106,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let raw = src.borrow().clone();
             match extract_zip(&raw) {
                 Ok(arr) => Ok(make_pair(
-                    Value::Array(Rc::new(RefCell::new(arr))),
+                    Value::Array(gcmodule::Cc::new(RefCell::new(arr))),
                     Value::Nil,
                 )),
                 Err(msg) => Ok(err_pair(msg)),
@@ -206,7 +206,7 @@ fn extract_zip(raw: &[u8]) -> Result<Vec<Value>, String> {
         let mut obj = indexmap::IndexMap::new();
         obj.insert("name".to_string(), Value::Str(name.into()));
         obj.insert("data".to_string(), bytes_val(data));
-        out.push(Value::Object(Rc::new(RefCell::new(obj))));
+        out.push(Value::Object(crate::value::ObjectCell::new(obj)));
     }
     Ok(out)
 }
@@ -305,9 +305,9 @@ mod tests {
         let mut e2 = indexmap::IndexMap::new();
         e2.insert("name".to_string(), s("b.bin"));
         e2.insert("data".to_string(), b(vec![0x00, 0xFF, 0x10, 0x42]));
-        let entries = Value::Array(Rc::new(RefCell::new(vec![
-            Value::Object(Rc::new(RefCell::new(e1))),
-            Value::Object(Rc::new(RefCell::new(e2))),
+        let entries = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+            Value::Object(crate::value::ObjectCell::new(e1)),
+            Value::Object(crate::value::ObjectCell::new(e2)),
         ])));
 
         let zipped = ok_value(call("zipCreate", &[entries], sp()).unwrap());

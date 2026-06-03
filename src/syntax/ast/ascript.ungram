@@ -1,0 +1,78 @@
+SourceFile = Stmt*
+Stmt =
+    LetStmt | ExprStmt | Block | IfStmt | WhileStmt | ReturnStmt | FnDecl
+  | ForStmt | BreakStmt | ContinueStmt | EnumDecl | ClassDecl
+  | ImportStmt | ExportStmt
+LetStmt = ('let' | 'const') 'ident' ('=' Expr)?
+ExprStmt = Expr
+Block = '{' Stmt* '}'
+IfStmt = 'if' cond:Expr then:Block ('else' (IfStmt | Block))?
+WhileStmt = 'while' cond:Expr body:Block
+ReturnStmt = 'return' Expr?
+FnDecl = 'fn' 'ident' ParamList Block
+ParamList = '(' Param* ')'
+Param = 'ident'
+Expr =
+    Literal | NameRef | UnaryExpr | BinaryExpr | ParenExpr | CallExpr
+  | MemberExpr | IndexExpr | ArrowExpr | AssignExpr
+  | ArrayExpr | ObjectExpr | TemplateExpr | OptMemberExpr
+  | TryExpr | UnwrapExpr | TernaryExpr | AwaitExpr | YieldExpr | MatchExpr
+  | RangeExpr
+Literal = 'number' | 'string' | 'true' | 'false' | 'nil'
+NameRef = 'ident'
+UnaryExpr = op:('-' | '!') Expr
+BinaryExpr = lhs:Expr op:('+'|'-'|'*'|'/'|'%'|'**'|'=='|'!='|'<'|'<='|'>'|'>='|'&&'|'||'|'??') rhs:Expr
+ParenExpr = '(' Expr ')'
+CallExpr = Expr ArgList
+ArgList = '(' Expr* ')'
+MemberExpr = Expr '.' 'ident'
+IndexExpr = base:Expr '[' index:Expr ']'
+ArrowExpr = ParamList '=>' (Block | Expr)
+AssignExpr = target:Expr '=' value:Expr
+ArrayExpr = '[' (Expr | SpreadElem)* ']'
+ObjectExpr = '{' (ObjectField | SpreadElem)* '}'
+ObjectField = key:('ident' | 'string') ':' value:Expr
+SpreadElem = '...' Expr
+TemplateExpr = 'template'
+OptMemberExpr = Expr '?.' 'ident'
+TryExpr = Expr '?'
+UnwrapExpr = Expr '!'
+TernaryExpr = cond:Expr '?' then:Expr ':' els:Expr
+AwaitExpr = 'await' Expr
+YieldExpr = 'yield' Expr?
+ForStmt = 'for' 'await'? '(' 'ident' ('in' | 'of') iter:Expr ('..' | '..=') end:Expr? ')' body:Block
+BreakStmt = 'break'
+ContinueStmt = 'continue'
+RangeExpr = start:Expr ('..' | '..=') end:Expr
+ArrayBindPat = '[' (BindEntry | RestBind)* ']'
+ObjectBindPat = '{' (BindEntry | RestBind)* '}'
+BindEntry = key:'ident' ('as' local:'ident')?
+RestBind = '...' 'ident'
+RetType = ':' Type
+EnumDecl = 'enum' 'ident' '{' EnumVariant* '}'
+EnumVariant = 'ident' ('=' Expr)?
+ClassDecl = 'class' 'ident' ('extends' 'ident')? '{' (FieldDecl | MethodDecl)* '}'
+FieldDecl = 'ident' '?'? ':' Type ('=' Expr)?
+MethodDecl = 'async'? 'fn' '*'? 'ident' ParamList RetType? Block
+ImportStmt = 'import' (ImportList | '*' 'as' 'ident') 'from' 'string'
+ImportList = '{' 'ident'* '}'
+ExportStmt = 'export' Stmt
+MatchExpr = 'match' subject:Expr '{' MatchArm* '}'
+MatchArm = Pat ('|' Pat)* MatchGuard? '=>' body:Expr
+MatchGuard = 'if' Expr
+Pat = WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat
+WildcardPat = '_'
+IdentPat = 'ident'
+LiteralPat = Expr
+RangePat = start:Expr ('..' | '..=') end:Expr
+ArrayPat = '[' (Pat | PatRest)* ']'
+ObjectPat = '{' (ObjPatEntry | PatRest)* '}'
+ObjPatEntry = key:'ident' (':' Pat)?
+PatRest = '...' 'ident'?
+Type = NamedType | GenericType | OptionalType | UnionType | TupleType
+NamedType = 'ident'
+GenericType = 'ident' TypeArgs
+TypeArgs = '<' Type* '>'
+OptionalType = Type '?'
+UnionType = Type '|' Type
+TupleType = '[' Type* ']'

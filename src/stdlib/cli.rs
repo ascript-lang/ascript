@@ -32,8 +32,6 @@ use crate::interp::{make_error, make_pair, Control, Interp};
 use crate::span::Span;
 use crate::value::Value;
 use indexmap::IndexMap;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 // ── public exports ────────────────────────────────────────────────────────────
 
@@ -662,19 +660,19 @@ fn result_to_value(pr: ParseResult, subcommand: Value, help: Value) -> Value {
     let mut map = IndexMap::new();
     map.insert(
         "flags".to_string(),
-        Value::Object(Rc::new(RefCell::new(pr.flags))),
+        Value::Object(crate::value::ObjectCell::new(pr.flags)),
     );
     map.insert(
         "options".to_string(),
-        Value::Object(Rc::new(RefCell::new(pr.options))),
+        Value::Object(crate::value::ObjectCell::new(pr.options)),
     );
     map.insert(
         "positionals".to_string(),
-        Value::Object(Rc::new(RefCell::new(pr.positionals_map))),
+        Value::Object(crate::value::ObjectCell::new(pr.positionals_map)),
     );
     map.insert("subcommand".to_string(), subcommand);
     map.insert("help".to_string(), help);
-    Value::Object(Rc::new(RefCell::new(map)))
+    Value::Object(crate::value::ObjectCell::new(map))
 }
 
 // ── the impl Interp dispatch ──────────────────────────────────────────────────
@@ -817,17 +815,17 @@ impl Interp {
                     sub_map.insert("name".to_string(), Value::Str(sub_name.as_str().into()));
                     sub_map.insert(
                         "flags".to_string(),
-                        Value::Object(Rc::new(RefCell::new(sub_pr.flags))),
+                        Value::Object(crate::value::ObjectCell::new(sub_pr.flags)),
                     );
                     sub_map.insert(
                         "options".to_string(),
-                        Value::Object(Rc::new(RefCell::new(sub_pr.options))),
+                        Value::Object(crate::value::ObjectCell::new(sub_pr.options)),
                     );
                     sub_map.insert(
                         "positionals".to_string(),
-                        Value::Object(Rc::new(RefCell::new(sub_pr.positionals_map))),
+                        Value::Object(crate::value::ObjectCell::new(sub_pr.positionals_map)),
                     );
-                    let sub_val = Value::Object(Rc::new(RefCell::new(sub_map)));
+                    let sub_val = Value::Object(crate::value::ObjectCell::new(sub_map));
 
                     let result = result_to_value(top_pr, sub_val, Value::Nil);
                     return Ok(make_pair(result, Value::Nil));
@@ -862,7 +860,7 @@ mod tests {
     use crate::value::Value;
     use indexmap::IndexMap;
     use std::cell::RefCell;
-    use std::rc::Rc;
+    
 
     fn sp() -> Span {
         Span::new(0, 0)
@@ -881,11 +879,11 @@ mod tests {
         for (k, v) in fields {
             m.insert(k.to_string(), v);
         }
-        Value::Object(Rc::new(RefCell::new(m)))
+        Value::Object(crate::value::ObjectCell::new(m))
     }
 
     fn arr(items: Vec<Value>) -> Value {
-        Value::Array(Rc::new(RefCell::new(items)))
+        Value::Array(gcmodule::Cc::new(RefCell::new(items)))
     }
 
     /// Build a simple spec with flags, options, positionals.

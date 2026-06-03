@@ -1,14 +1,33 @@
 //! Interactive REPL (`ascript repl`).
 //!
-//! Keeps ONE `Interp` and ONE module `Environment` alive across all inputs so
-//! bindings persist (`let x = 1` then later `x + 1`). Each input is lexed and
-//! parsed to a `Vec<Stmt>`; if the last statement is an expression, the value of
-//! that trailing expression is printed (unless it is `nil`). A `Control::Panic`
-//! is reported but does NOT exit the loop — the environment stays intact and the
-//! loop continues.
+//! There are TWO engines, selected at the CLI:
 //!
-//! Each line is evaluated inside a `tokio::task::LocalSet` so spawned tasks (from
-//! M17 Phase 2 on) join before the prompt returns; today the drain is a no-op.
+//! - [`run_repl_vm`] (default) runs each line on the **bytecode VM**. ONE persistent
+//!   [`Vm`](crate::vm::Vm) is kept alive across all inputs; its module-scope
+//!   `user_globals` table IS the session scope. Each completed input is compiled to
+//!   its own [`Chunk`](crate::vm::chunk::Chunk) via [`compile_source`](crate::compile::compile_source)
+//!   and run on a fresh [`Fiber`](crate::vm::fiber::Fiber). A top-level
+//!   `let`/`const`/`fn`/`class`/`enum`/`import` compiles to `DEFINE_GLOBAL`, so it
+//!   persists in `user_globals`; a reference to a PRIOR line's binding compiles to
+//!   `GET_GLOBAL` and resolves at run time against that table. This is the production
+//!   path post-cutover.
+//!
+//! - [`run_repl_tree_walker`] runs each line on the legacy tree-walker
+//!   (`--tree-walker` / `ASCRIPT_ENGINE=tree-walker`). It keeps ONE
+//!   [`Interp`](crate::interp::Interp) and ONE module [`Environment`] alive. It is the
+//!   differential oracle / debugging escape hatch.
+//!
+//! Both engines share observable behavior (verified by the piped-stdin tests in
+//! `tests/cli.rs`): if the last statement is a bare expression, its value is printed
+//! unless it is `nil`; a statement-only line prints nothing; a `Control::Panic` is
+//! reported but does NOT exit the loop — the session scope stays intact and the loop
+//! continues; a re-`let` of an existing top-level binding is rejected (`'<n>' is
+//! already defined in this scope`) and the original binding survives; `exit()` ends
+//! the loop cleanly. Bindings defined BEFORE a panic on the SAME line persist (the
+//! define has already executed).
+//!
+//! Each line is evaluated inside a `tokio::task::LocalSet` so spawned tasks join
+//! before the prompt returns.
 
 use std::io::{BufRead, IsTerminal};
 use std::rc::Rc;
@@ -19,6 +38,9 @@ use crate::error::{AsError, SourceInfo};
 use crate::interp::{Control, Interp};
 use crate::token::Tok;
 use crate::value::Value;
+use crate::vm::chunk::FnProto;
+use crate::vm::value_ext::{Closure, RunOutcome};
+use crate::vm::Vm;
 
 /// Should the REPL buffer more lines? True only for unclosed delimiters or an
 /// unterminated string/template at EOF — NOT for genuine mid-line syntax errors.
@@ -60,11 +82,191 @@ fn is_unterminated_at_eof(e: &AsError, _src: &str) -> bool {
         || e.message == crate::lexer::ERR_UNTERMINATED_TEMPLATE
 }
 
-/// Run the interactive REPL until EOF (Ctrl-D) or Ctrl-C.
+// ============================================================================
+// Bytecode VM REPL (the default engine)
+// ============================================================================
+
+/// Run the interactive VM REPL until EOF (Ctrl-D) or Ctrl-C.
+///
+/// Keeps ONE persistent [`Vm`] over a live-output [`Interp`]: its `user_globals`
+/// table persists across lines and IS the session scope. Output streams live
+/// (`OutputSink::Live`), so a line's `print(..)` output appears in order, then the
+/// trailing-expression value (if any) is printed after the line finishes.
+pub async fn run_repl_vm() -> std::io::Result<()> {
+    // Live output so `print` streams in order; the VM REPL prints a trailing
+    // expression's value AFTER the line's body has run, preserving ordering.
+    let interp = Rc::new(Interp::new_live());
+    interp.install_self();
+    let vm = Vm::new(interp);
+
+    let result = if std::io::stdin().is_terminal() {
+        run_tty_vm(&vm).await
+    } else {
+        run_piped_vm(&vm).await
+    };
+    // End-of-session cycle collection (mirrors the other VM entry points): reclaim
+    // any leftover reference cycles created during the session for a clean shutdown.
+    crate::gc::collect();
+    result
+}
+
+/// Interactive VM path: rustyline editor with history.
+async fn run_tty_vm(vm: &Rc<Vm>) -> std::io::Result<()> {
+    use rustyline::error::ReadlineError;
+    use rustyline::DefaultEditor;
+
+    let mut rl = DefaultEditor::new().map_err(|e| std::io::Error::other(e.to_string()))?;
+    let mut buf = String::new();
+    loop {
+        let prompt = if buf.is_empty() { ">> " } else { ".. " };
+        match rl.readline(prompt) {
+            Ok(line) => {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(&line);
+                if is_incomplete(&buf) {
+                    continue;
+                }
+                let _ = rl.add_history_entry(buf.as_str());
+                let exiting = eval_line_vm(vm, &buf).await;
+                buf.clear();
+                if exiting {
+                    return Ok(());
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                if buf.is_empty() {
+                    break;
+                } else {
+                    buf.clear();
+                    continue;
+                }
+            }
+            Err(ReadlineError::Eof) => {
+                if !buf.is_empty() {
+                    eprintln!("(discarded incomplete input)");
+                }
+                break;
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Non-TTY VM path: read lines straight from stdin (used by the piped tests).
+async fn run_piped_vm(vm: &Rc<Vm>) -> std::io::Result<()> {
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        if !buf.is_empty() {
+            buf.push('\n');
+        }
+        buf.push_str(&line);
+        if is_incomplete(&buf) {
+            continue;
+        }
+        if eval_line_vm(vm, &buf).await {
+            return Ok(());
+        }
+        buf.clear();
+    }
+    // EOF: surface any leftover (e.g. an input that never closed its delimiter).
+    if !buf.trim().is_empty() {
+        eval_line_vm(vm, &buf).await;
+    }
+    Ok(())
+}
+
+/// Compile one completed input to a [`Chunk`](crate::vm::chunk::Chunk) and run it
+/// on the persistent [`Vm`]. The compiler already RETURNs a trailing bare
+/// expression's value as the program's [`RunOutcome::Done`] value (and `Nil` for a
+/// statement-terminated line), so the trailing-value behavior needs NO REPL re-parse
+/// — we just print the `Done` value unless it is `Nil`. A `Control::Panic` is
+/// reported and swallowed so the loop continues with the session scope intact (the
+/// per-line fiber is discarded; the `Vm` and its `user_globals` persist). Returns
+/// `true` when `exit()` was called and the loop should end.
+async fn eval_line_vm(vm: &Rc<Vm>, line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    let src_info = Rc::new(SourceInfo {
+        path: "<repl>".to_string(),
+        text: line.to_string(),
+    });
+
+    // Compile the line to a top-level chunk. A lex/parse/compile error is reported
+    // and the loop continues (no session-scope mutation happened).
+    let chunk = match crate::compile::compile_source(line) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::diagnostics::report(&AsError::at(e.message, e.span).with_source(src_info));
+            return false;
+        }
+    };
+    let proto = Rc::new(FnProto {
+        chunk,
+        arity: 0,
+        has_rest: false,
+        is_async: false,
+        is_generator: false,
+        params: Vec::new(),
+        ret: None,
+    });
+    let closure = Closure::new(proto);
+    let mut fiber = crate::vm::fiber::Fiber::new(closure);
+
+    // Drive the line under a LocalSet so spawned async tasks join before the prompt
+    // returns (structured concurrency).
+    let local = tokio::task::LocalSet::new();
+    let should_exit = local
+        .run_until(async {
+            match vm.run(&mut fiber).await {
+                // The trailing-expression value (or `Nil` for a statement line) — the
+                // compiler emitted `RETURN <value>`. Print it unless it is `Nil`,
+                // matching the tree-walker REPL's trailing-expression rule.
+                Ok(RunOutcome::Done(value)) => {
+                    if !matches!(value, Value::Nil) {
+                        println!("{}", value);
+                    }
+                    false
+                }
+                Ok(RunOutcome::Yielded(_)) => {
+                    // A top-level program cannot yield (no enclosing generator).
+                    // Defensive: treat as a no-value line.
+                    false
+                }
+                // A panic is reported but does NOT end the session — the per-line
+                // fiber is discarded; the Vm + user_globals persist (incl. any
+                // binding defined before the panic on this same line).
+                Err(Control::Panic(e)) => {
+                    crate::diagnostics::report(&e.with_source(src_info));
+                    false
+                }
+                // A top-level `?` propagation simply ends the line (no print).
+                Err(Control::Propagate(_)) => false,
+                // exit() — end the REPL loop cleanly.
+                Err(Control::Exit(_)) => true,
+            }
+        })
+        .await;
+    local.await; // drain spawned tasks (structured join)
+    should_exit
+}
+
+// ============================================================================
+// Tree-walker REPL (the legacy / oracle engine)
+// ============================================================================
+
+/// Run the interactive tree-walker REPL until EOF (Ctrl-D) or Ctrl-C.
 ///
 /// Uses `rustyline` line editing when stdin is a TTY; otherwise (piped input)
 /// reads lines from stdin directly so non-interactive use still works.
-pub async fn run_repl() -> std::io::Result<()> {
+pub async fn run_repl_tree_walker() -> std::io::Result<()> {
     let interp = Rc::new(Interp::new());
     interp.install_self();
     // Persistent session scope: a child of the builtins env so REPL definitions

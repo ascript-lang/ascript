@@ -45,7 +45,7 @@ fn deep_equal_inner(
 ) -> bool {
     match (a, b) {
         (Value::Array(x), Value::Array(y)) => {
-            if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+            if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return true;
             }
             let (x, y) = (x.borrow(), y.borrow());
@@ -55,7 +55,7 @@ fn deep_equal_inner(
                     .all(|(p, q)| deep_equal_inner(p, q, seen))
         }
         (Value::Object(x), Value::Object(y)) => {
-            if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+            if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return true;
             }
             let (x, y) = (x.borrow(), y.borrow());
@@ -64,7 +64,7 @@ fn deep_equal_inner(
                     .all(|(k, v)| y.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
         }
         (Value::Map(x), Value::Map(y)) => {
-            if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+            if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return true;
             }
             let (x, y) = (x.borrow(), y.borrow());
@@ -73,7 +73,7 @@ fn deep_equal_inner(
                     .all(|(k, v)| y.get(k).is_some_and(|w| deep_equal_inner(v, w, seen)))
         }
         (Value::Set(x), Value::Set(y)) => {
-            if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+            if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return true;
             }
             // Order-independent: same size and every element of x is in y.
@@ -82,7 +82,7 @@ fn deep_equal_inner(
         }
         (Value::Bytes(x), Value::Bytes(y)) => *x.borrow() == *y.borrow(),
         (Value::Instance(x), Value::Instance(y)) => {
-            if !seen.insert((Rc::as_ptr(x) as usize, Rc::as_ptr(y) as usize)) {
+            if !seen.insert((crate::gc::cc_addr(x), crate::gc::cc_addr(y))) {
                 return true;
             }
             let (x, y) = (x.borrow(), y.borrow());
@@ -105,11 +105,11 @@ fn deep_equal_inner(
 pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
     match v {
         Value::Array(rc) => {
-            let key = Rc::as_ptr(rc) as usize;
+            let key = crate::gc::cc_addr(rc);
             if let Some(c) = seen.get(&key) {
                 return c.clone();
             }
-            let out = Rc::new(RefCell::new(Vec::new()));
+            let out = gcmodule::Cc::new(RefCell::new(Vec::new()));
             let cloned = Value::Array(out.clone());
             seen.insert(key, cloned.clone());
             let src = rc.borrow().clone();
@@ -122,11 +122,11 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             cloned
         }
         Value::Object(rc) => {
-            let key = Rc::as_ptr(rc) as usize;
+            let key = crate::gc::cc_addr(rc);
             if let Some(c) = seen.get(&key) {
                 return c.clone();
             }
-            let out = Rc::new(RefCell::new(IndexMap::new()));
+            let out = crate::value::ObjectCell::new(IndexMap::new());
             let cloned = Value::Object(out.clone());
             seen.insert(key, cloned.clone());
             let src = rc.borrow().clone();
@@ -139,11 +139,11 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             cloned
         }
         Value::Map(rc) => {
-            let key = Rc::as_ptr(rc) as usize;
+            let key = crate::gc::cc_addr(rc);
             if let Some(c) = seen.get(&key) {
                 return c.clone();
             }
-            let out = Rc::new(RefCell::new(IndexMap::<MapKey, Value>::new()));
+            let out = crate::value::MapCell::new(IndexMap::<MapKey, Value>::new());
             let cloned = Value::Map(out.clone());
             seen.insert(key, cloned.clone());
             let src = rc.borrow().clone();
@@ -156,18 +156,18 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             cloned
         }
         Value::Set(rc) => {
-            let key = Rc::as_ptr(rc) as usize;
+            let key = crate::gc::cc_addr(rc);
             if let Some(c) = seen.get(&key) {
                 return c.clone();
             }
             let cloned_set = rc.borrow().clone();
-            let out = Value::Set(Rc::new(RefCell::new(cloned_set)));
+            let out = Value::Set(crate::value::SetCell::new(cloned_set));
             seen.insert(key, out.clone());
             out
         }
         Value::Bytes(rc) => Value::Bytes(Rc::new(RefCell::new(rc.borrow().clone()))),
         Value::Instance(rc) => {
-            let key = Rc::as_ptr(rc) as usize;
+            let key = crate::gc::cc_addr(rc);
             if let Some(c) = seen.get(&key) {
                 return c.clone();
             }
@@ -175,9 +175,10 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
                 let src = rc.borrow();
                 (src.class.clone(), src.fields.clone())
             };
-            let out = Rc::new(RefCell::new(Instance {
+            let out = gcmodule::Cc::new(RefCell::new(Instance {
                 class,
                 fields: IndexMap::new(),
+                shape_id: std::cell::Cell::new(0),
             }));
             let cloned = Value::Instance(out.clone());
             seen.insert(key, cloned.clone());
@@ -194,7 +195,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(Rc::new(RefCell::new(v)))
+    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
 }
 
 /// Clone the field map of an object-like value (Object or class Instance).
@@ -258,7 +259,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     out.insert(k.clone(), val.clone());
                 }
             }
-            Ok(Value::Object(Rc::new(RefCell::new(out))))
+            Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }
         "fromEntries" => {
             let pairs = want_array(&arg(args, 0), span, &ctx("fromEntries"))?;
@@ -274,7 +275,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 let v = p.get(1).cloned().unwrap_or(Value::Nil);
                 out.insert(k.to_string(), v);
             }
-            Ok(Value::Object(Rc::new(RefCell::new(out))))
+            Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }
         "pick" => {
             let src = object_like_fields(&arg(args, 0), span, "object.pick")?;
@@ -286,7 +287,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     out.insert(k.to_string(), v.clone());
                 }
             }
-            Ok(Value::Object(Rc::new(RefCell::new(out))))
+            Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }
         "omit" => {
             let src = object_like_fields(&arg(args, 0), span, "object.omit")?;
@@ -301,7 +302,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .filter(|(k, _)| !drop_set.contains(*k))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            Ok(Value::Object(Rc::new(RefCell::new(out))))
+            Ok(Value::Object(crate::value::ObjectCell::new(out)))
         }
         "deepEqual" => Ok(Value::Bool(deep_equal(&arg(args, 0), &arg(args, 1)))),
         "deepClone" => {
@@ -338,7 +339,7 @@ impl Interp {
                         .await?;
                     out.insert(k.clone(), mapped);
                 }
-                Ok(Value::Object(Rc::new(RefCell::new(out))))
+                Ok(Value::Object(crate::value::ObjectCell::new(out)))
             }
             _ => call(func, args, span),
         }
@@ -359,7 +360,7 @@ mod tests {
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
-        Value::Object(Rc::new(RefCell::new(m)))
+        Value::Object(crate::value::ObjectCell::new(m))
     }
     fn obj_ref(pairs: &[(&str, Value)]) -> Value {
         obj(pairs.iter().map(|(k, v)| (*k, v.clone())).collect())
@@ -506,15 +507,13 @@ mod tests {
     #[test]
     fn deep_clone_and_equal_handle_cycles() {
         // self-referential array: a = [a]
-        let a: Rc<RefCell<Vec<Value>>> = Rc::new(RefCell::new(Vec::new()));
+        let a: gcmodule::Cc<RefCell<Vec<Value>>> = gcmodule::Cc::new(RefCell::new(Vec::new()));
         let arr_a = Value::Array(a.clone());
         a.borrow_mut().push(arr_a.clone());
         // deep_clone terminates and yields a distinct (by identity) container
         let mut seen = std::collections::HashMap::new();
         let cloned = deep_clone(&arr_a, &mut seen);
-        assert!(
-            !matches!((&cloned, &arr_a), (Value::Array(c), Value::Array(o)) if Rc::ptr_eq(c, o))
-        );
+        assert!(!matches!((&cloned, &arr_a), (Value::Array(c), Value::Array(o)) if crate::gc::cc_ptr_eq(c, o)));
         // deep_equal on the cyclic structure vs itself terminates and is true
         assert!(
             call("deepEqual", &[arr_a.clone(), arr_a.clone()], sp()).unwrap() == Value::Bool(true)

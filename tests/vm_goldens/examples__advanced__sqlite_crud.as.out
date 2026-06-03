@@ -1,0 +1,14 @@
+# exit: none
+Opened in-memory database
+Inserted 2 users directly
+Inserted 2 users via prepared statement
+Transaction committed: bumped 3 row(s) by +1
+User #1 by named param: Ada Lovelace (score 96)
+
+=== Leaderboard (4 users) ===
+  1. Alan Turing  <alan@example.com>  score=99
+  2. Grace Hopper  <grace@example.com>  score=99
+  3. Ada Lovelace  <ada@example.com>  score=96
+  4. Edsger Dijkstra  <edsger@example.com>  score=92
+
+Connection closed cleanly

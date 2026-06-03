@@ -142,7 +142,7 @@ impl Interp {
                         obj.insert("data".to_string(), bytes_value(buf));
                         obj.insert("from".to_string(), Value::Str(from.to_string().into()));
                         Ok(make_pair(
-                            Value::Object(Rc::new(RefCell::new(obj))),
+                            Value::Object(crate::value::ObjectCell::new(obj)),
                             Value::Nil,
                         ))
                     }
