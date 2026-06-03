@@ -1564,6 +1564,104 @@ async fn vm_inclusive_match_pattern_matches_treewalker() {
     }
 }
 
+#[tokio::test]
+async fn both_engines_pattern_step_agree() {
+    // RANGES FEATURE, Phase 5: `step` in a MATCH-RANGE pattern = strided membership
+    // (spec §3.7), byte-identical on the VM and the tree-walker. Anchor is `start`,
+    // so parity/offset depends on where the range begins. A plain (no-step) pattern
+    // keeps its pre-existing in-bounds-only behavior (incl. a fractional subject).
+    for (src, expected) in [
+        // 3 ∈ {1,3,5,7,9}; 4 ∉.
+        ("print(match 3 { 1..=10 step 2 => \"in\", _ => \"out\" })", "in\n"),
+        ("print(match 4 { 1..=10 step 2 => \"in\", _ => \"out\" })", "out\n"),
+        // anchor 0 → even membership.
+        ("print(match 4 { 0..=10 step 2 => \"in\", _ => \"out\" })", "in\n"),
+        // out of bounds.
+        ("print(match 11 { 1..=10 step 2 => \"in\", _ => \"out\" })", "out\n"),
+        // exclusive vs inclusive end at the stride endpoint.
+        ("print(match 10 { 0..10 step 2 => \"in\", _ => \"out\" })", "out\n"),
+        ("print(match 10 { 0..=10 step 2 => \"in\", _ => \"out\" })", "in\n"),
+        // descending stepped pattern.
+        ("print(match 8 { 10..=2 step -2 => \"in\", _ => \"out\" })", "in\n"),
+        ("print(match 9 { 10..=2 step -2 => \"in\", _ => \"out\" })", "out\n"),
+        // float step membership (exact-equality, spec §3.8).
+        ("print(match 0.5 { 0..=1 step 0.25 => \"in\", _ => \"out\" })", "in\n"),
+        ("print(match 0.3 { 0..=1 step 0.25 => \"in\", _ => \"out\" })", "out\n"),
+        // PLAIN ASCENDING (no-step) patterns unchanged — incl. a FRACTIONAL
+        // subject, which must still match purely on bounds (no stride test).
+        ("print(match 5 { 1..=10 => \"in\", _ => \"out\" })", "in\n"),
+        ("print(match 2.5 { 1..=10 => \"in\", _ => \"out\" })", "in\n"),
+        ("print(match 15 { 1..=10 => \"in\", _ => \"out\" })", "out\n"),
+        // PLAIN DESCENDING (no-step) pattern — direction is now INFERRED from the
+        // bounds (spec §3.1), so `10..=1` is the descending sequence range and
+        // matches `[1,10]`. (Old behavior: `n>=lo && n<=hi` = `n>=10 && n<=1` =
+        // NEVER, i.e. empty on BOTH engines. The change is engine-symmetric: VM and
+        // tree-walker agreed before and agree now.)
+        ("print(match 5 { 10..=1 => \"in\", _ => \"out\" })", "in\n"),
+        ("print(match 1 { 10..=1 => \"in\", _ => \"out\" })", "in\n"),
+        ("print(match 1 { 10..1 => \"in\", _ => \"out\" })", "out\n"), // exclusive low end
+        ("print(match 11 { 10..=1 => \"in\", _ => \"out\" })", "out\n"),
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        assert!(tw.is_ok(), "tree-walker should accept `{src}`, got {tw:?}");
+        assert!(vm.is_ok(), "VM should accept `{src}`, got {vm:?}");
+        assert_eq!(
+            tw.as_deref().ok(),
+            Some(expected),
+            "tree-walker output wrong for `{src}`"
+        );
+        assert_eq!(
+            tw.as_deref().ok(),
+            vm.as_ref().map(|(out, _)| out.as_str()).ok(),
+            "pattern-step output diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn both_engines_pattern_step_validation_panics_agree() {
+    // RANGES FEATURE, Phase 5: a stepped pattern runs the SAME shared validator as
+    // iteration, so a `step 0` / direction-mismatch pattern PANICS with the EXACT
+    // same message on both engines (byte-identical). This also proves the Phase-3
+    // pattern-step REJECTION divergence (VM "empty expression statement" vs the
+    // tree-walker guard) is GONE — both now ACCEPT and validate uniformly.
+    for (src, expected_msg) in [
+        (
+            "print(match 5 { 1..=10 step 0 => 1, _ => 0 })",
+            "step must be a finite, non-zero number",
+        ),
+        (
+            "print(match 5 { 1..=10 step -2 => 1, _ => 0 })",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+        (
+            "print(match 5 { 10..=1 step 2 => 1, _ => 0 })",
+            "step 2 moves away from end (1); range can never progress",
+        ),
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        match (tw, vm) {
+            (Err(tw_err), Err(vm_err)) => {
+                assert_eq!(
+                    tw_err.message, vm_err.message,
+                    "pattern-step panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                    tw_err.message, vm_err.message
+                );
+                assert_eq!(
+                    tw_err.message, expected_msg,
+                    "unexpected message for `{src}`: {:?}",
+                    tw_err.message
+                );
+            }
+            (tw, vm) => panic!(
+                "expected BOTH engines to panic for `{src}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+            ),
+        }
+    }
+}
+
 // ----- V3-T4: sync for-of (Array + Str snapshot iteration) --------------------
 
 #[tokio::test]

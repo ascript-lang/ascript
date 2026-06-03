@@ -1406,6 +1406,107 @@ fn stepped_ranges_validation_panics_both_engines() {
     }
 }
 
+#[test]
+fn stepped_match_patterns_both_engines() {
+    // RANGES FEATURE, Phase 5: `step` in a match-range pattern = strided
+    // membership (spec §3.7), byte-identical on the VM and the tree-walker.
+    // Anchor is `start`, so parity/offset depends on where the range begins.
+    let cases = [
+        // 3 ∈ {1,3,5,7,9}
+        (
+            "print(match 3 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        // 4 ∉ {1,3,5,7,9}
+        (
+            "print(match 4 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
+        // 4 ∈ {0,2,4,6,8,10} (anchor 0)
+        (
+            "print(match 4 { 0..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        // 11 out of bounds
+        (
+            "print(match 11 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
+        // exclusive end: 10 not in {0,2,4,6,8}
+        (
+            "print(match 10 { 0..10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
+        // inclusive end: 10 ∈ {0,2,...,10}
+        (
+            "print(match 10 { 0..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        // descending stepped pattern: 8 ∈ {10,8,6,4,2}
+        (
+            "print(match 8 { 10..=2 step -2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        // plain (no-step) pattern is UNCHANGED.
+        (
+            "print(match 5 { 1..=10 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("patstep_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("patstep_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn stepped_match_pattern_validation_panics_both_engines() {
+    // RANGES FEATURE, Phase 5: a stepped pattern runs the SAME shared validator
+    // as iteration, so a `step 0` / direction-mismatch pattern PANICS with the
+    // byte-identical message on both engines.
+    for (i, (src, msg)) in [
+        (
+            "print(match 5 { 1..=10 step 0 => 1, _ => 0 })",
+            "step must be a finite, non-zero number",
+        ),
+        (
+            "print(match 5 { 1..=10 step -2 => 1, _ => 0 })",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let file = std::env::temp_dir().join(format!("ascript_patstep_panic_{i}.as"));
+        std::fs::write(&file, src).unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        for tw in [false, true] {
+            let mut cmd = Command::new(bin);
+            cmd.arg("run");
+            if tw {
+                cmd.arg("--tree-walker");
+            }
+            let out = cmd.arg(&file).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "{} should PANIC on `{src}`, got {:?}",
+                if tw { "tree-walker" } else { "vm" },
+                out
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(msg),
+                "{} stderr for `{src}` should contain {msg:?}, got: {stderr}",
+                if tw { "tree-walker" } else { "vm" }
+            );
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
 /// Strip ANSI SGR escape sequences so the rendered ariadne caret can be compared
 /// as plain text.
 fn strip_ansi(s: &str) -> String {

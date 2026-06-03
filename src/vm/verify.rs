@@ -281,7 +281,9 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
 
         // ---- match tests (subject -- bool) ----
         MatchArray | MatchObject | MatchHasKey => Effect::new(1, 1),
-        MatchRange => Effect::new(3, 1),
+        // `subject lo hi step -- ok` — pops 4 (step always present as a value,
+        // a `nil` placeholder when the pattern has no `step` clause).
+        MatchRange => Effect::new(4, 1),
         MatchNoArm => Effect::new(0, 0),
         // IMMUTABLE_ERROR always diverges (raises a Tier-2 panic); like MATCH_NO_ARM
         // it never produces a value, so it has no net stack effect.

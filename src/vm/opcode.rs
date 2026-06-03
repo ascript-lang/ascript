@@ -439,12 +439,16 @@ pub enum Op {
     /// peeked) so a missing-key fail-jump leaves NO orphaned value on the stack; the
     /// matched-key path reloads the subject temp for the sub-value read.
     MatchHasKey,
-    /// `MATCH_RANGE(u8 inclusive)` — `subject lo hi -- ok:bool` (hi on top). Pop the
-    /// three operands and push `true` iff the subject is a `Value::Number` `n`, `lo`
-    /// and `hi` are `Value::Number`s, and `n >= lo && (n <= hi if inclusive else
-    /// n < hi)`. Any non-number among the three pushes `false`. Mirrors the
-    /// tree-walker's `Pattern::Range` EXACTLY (non-number subject/bound → no match,
-    /// never a panic).
+    /// `MATCH_RANGE(u8 flags)` — `subject lo hi step -- ok:bool` (step on top).
+    /// `flags` bit0 = inclusive, bit1 = step PRESENT. Pop the four operands and push
+    /// `true` iff the subject is a `Value::Number` `n` matching the range, with `lo`
+    /// and `hi` `Value::Number`s. With step OMITTED (a `nil` placeholder) this is
+    /// the plain in-bounds test `n >= lo && (n <= hi if inclusive else n < hi)`
+    /// (bounds-inferred direction). With step PRESENT it is strided membership
+    /// (spec §3.7) anchored at `lo`, via the SHARED `interp::resolve_step` (validates
+    /// → PANICS on zero/non-finite/mismatch, byte-identical to iteration) +
+    /// `interp::range_pattern_contains`. Any non-number subject/bound pushes `false`
+    /// (a non-panic mismatch). Mirrors the tree-walker's `Pattern::Range` EXACTLY.
     MatchRange,
     /// `MATCH_NO_ARM` — unconditionally raise the Tier-2 panic `no matching arm in
     /// match expression` at this op's span (the `MatchExpr`'s code span). Emitted at

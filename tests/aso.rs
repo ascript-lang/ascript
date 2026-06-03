@@ -112,6 +112,29 @@ fn build_then_run_aso_matches_classes() {
     assert_eq!(aso_out, as_out);
 }
 
+#[test]
+fn build_then_run_aso_matches_stepped_match_pattern() {
+    // RANGES FEATURE, Phase 5: a stepped MATCH-RANGE pattern (strided membership)
+    // serializes through the `.aso` (the `Op::MATCH_RANGE` flags byte + the step
+    // operand survive the round-trip) and runs byte-identically to the tree-walker.
+    let dir = unique_dir("patstep");
+    write(
+        &dir,
+        "m.as",
+        // 3 ∈ {1,3,5,7,9} → "odd"; 4 ∈ {0,2,..} → "even"; 11 → out.
+        "fn cls(n) { return match n { 1..=10 step 2 => \"odd\", 0..=10 step 2 => \"even\", _ => \"out\" } }\n\
+         print(cls(3))\nprint(cls(4))\nprint(cls(11))\n",
+    );
+    build(&dir, "m.as");
+    assert!(dir.join("m.aso").exists(), "m.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "m.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "m.as"]);
+    assert_eq!(aso_out, "odd\neven\nout\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
 // ---------------------------------------------------------------------------
 // FILE-module import resolution (named + namespace)
 // ---------------------------------------------------------------------------

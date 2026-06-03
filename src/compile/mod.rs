@@ -3303,9 +3303,15 @@ impl Compiler {
         Ok(())
     }
 
-    /// A `RangePat` `start..end` / `start..=end`. Mirrors the tree-walker's
-    /// `Pattern::Range`: a non-number subject OR non-number bound is a (non-panic)
-    /// mismatch. Lowering: push subject, lo, hi; `MATCH_RANGE inclusive` → bool.
+    /// A `RangePat` `start..end` / `start..=end`, optionally `… step k` (strided
+    /// membership, spec §3.7). Mirrors the tree-walker's `Pattern::Range`: a
+    /// non-number subject OR non-number bound is a (non-panic) mismatch; a `step`
+    /// clause runs the SHARED `resolve_step` validation (so a `step 0` /
+    /// direction-mismatch pattern PANICS like iteration) + `range_pattern_contains`
+    /// stride test, byte-identical to the VM. `step` is the 3rd Expr child after
+    /// `start..end`. Lowering: push `subject lo hi step`; `MATCH_RANGE flags` → bool
+    /// (flags bit0 = inclusive, bit1 = step PRESENT). When step is omitted a `nil`
+    /// placeholder is pushed and ignored at runtime (resolved to the default ±1).
     fn compile_range_pattern(
         &mut self,
         pat: &ResolvedNode,
@@ -3318,7 +3324,9 @@ impl Compiler {
             .filter(|c| is_expr_kind(c.kind()))
             .cloned()
             .collect();
-        if exprs.len() != 2 {
+        // `step` (when present) is the 3rd Expr child, immediately after the
+        // `start..end` bounds (see `parse_range_step` in `src/syntax/parser.rs`).
+        if exprs.len() != 2 && exprs.len() != 3 {
             return Err(CompileError::new(
                 "range pattern must have a start and end bound",
                 range_span(pat),
@@ -3332,11 +3340,29 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("range start is not an expression", range_span(pat)))?;
         let hi = Expr::cast(exprs[1].clone())
             .ok_or_else(|| CompileError::new("range end is not an expression", range_span(pat)))?;
+        let step = match exprs.get(2) {
+            Some(s) => Some(Expr::cast(s.clone()).ok_or_else(|| {
+                CompileError::new("range step is not an expression", range_span(pat))
+            })?),
+            None => None,
+        };
         self.emit_get_local_temp(subj_temp, span);
         self.compile_expr(&lo)?;
         self.compile_expr(&hi)?;
-        self.chunk
-            .emit_u8(Op::MatchRange, u8::from(inclusive), span);
+        // Always push a step operand (the placeholder when omitted) so MATCH_RANGE
+        // has a fixed 4-operand stack shape; the PRESENT flag selects the path.
+        let present = match &step {
+            Some(s) => {
+                self.compile_expr(s)?;
+                true
+            }
+            None => {
+                self.chunk.emit(Op::Nil, span);
+                false
+            }
+        };
+        let flags = u8::from(inclusive) | (u8::from(present) << 1);
+        self.chunk.emit_u8(Op::MatchRange, flags, span);
         fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
         Ok(())
     }

@@ -1949,17 +1949,50 @@ impl Vm {
                 }
 
                 Op::MatchRange => {
-                    // `subject lo hi -- ok:bool` (hi on top). Pop all three; push
-                    // whether the subject is a Number in `[lo, hi)` (or `[lo, hi]` when
-                    // inclusive). A non-number subject OR bound → false, mirroring the
-                    // tree-walker's `Pattern::Range` (never a panic).
-                    let inclusive = fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
+                    // `subject lo hi step -- ok:bool` (step on top). flags bit0 =
+                    // inclusive, bit1 = step PRESENT. Pop all four; push whether the
+                    // subject is a Number that matches the range. With step OMITTED
+                    // (placeholder `nil`) this is the plain in-bounds test; with step
+                    // PRESENT it is strided membership (spec §3.7) anchored at `lo`,
+                    // via the SHARED `resolve_step` (validates → PANICS on
+                    // zero/non-finite/mismatch, byte-identical to iteration) +
+                    // `range_pattern_contains`. A non-number subject OR bound → false
+                    // (a non-panic mismatch), mirroring the tree-walker exactly.
+                    let flags = fiber.frame().closure.proto.chunk.read_u8(operand_at);
+                    let inclusive = (flags & 0b01) != 0;
+                    let present = (flags & 0b10) != 0;
+                    let step = fiber.pop();
                     let hi = fiber.pop();
                     let lo = fiber.pop();
                     let subject = fiber.pop();
                     let ok = match (&subject, &lo, &hi) {
                         (Value::Number(n), Value::Number(lo), Value::Number(hi)) => {
-                            *n >= *lo && if inclusive { *n <= *hi } else { *n < *hi }
+                            let step_v = if present {
+                                match step {
+                                    Value::Number(s) => Some(s),
+                                    _ => {
+                                        return Err(self.panic_at(
+                                            fiber,
+                                            fault_ip,
+                                            "range step must be a number".to_string(),
+                                        ))
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            // Validate an EXPLICIT step (PANICS on a bad step, at
+                            // this op's span = the START bound's), then test
+                            // membership. A plain pattern (step omitted) keeps its
+                            // no-stride behavior via the raw `Option`.
+                            if step_v.is_some() {
+                                let span =
+                                    fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                                crate::interp::resolve_step(*lo, *hi, step_v, span)?;
+                            }
+                            crate::interp::range_pattern_contains(
+                                *n, *lo, *hi, step_v, inclusive,
+                            )
                         }
                         _ => false,
                     };

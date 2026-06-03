@@ -1683,21 +1683,15 @@ impl Interp {
                 inclusive,
                 step,
             } => {
-                // RANGES FEATURE, Phase 1. Inclusive `..=` range patterns are
-                // PRE-EXISTING, working functionality (e.g. `match n { 1..=10 => …
-                // }`) and stay supported. Strided membership (`step k`) is not yet
-                // evaluable, so we REJECT a stepped pattern loudly to stay
-                // byte-identical with the VM — never silently ignore `step`.
-                //
-                // PHASE-1 guard — removed in Phase 5 (Tasks 10–11) when range
-                // patterns learn strided membership.
-                if step.is_some() {
-                    return Err(AsError::at(
-                        "inclusive/stepped ranges are not yet supported (implemented in a later phase)",
-                        start.span,
-                    )
-                    .into());
-                }
+                // RANGES FEATURE, Phase 5 (strided membership, spec §3.7). A
+                // non-number subject OR non-number bound is a (non-panic) mismatch,
+                // exactly as before. A `step k` clause turns the test into strided
+                // membership anchored at `start`, via the SHARED helpers so it is
+                // byte-identical to the VM: `resolve_step` validates (a `step 0` /
+                // non-finite / direction-mismatch pattern PANICS like iteration),
+                // then `range_pattern_contains` tests in-bounds + on-the-stride.
+                // With `step` omitted the membership degenerates to the plain
+                // in-bounds test, so existing no-step patterns are UNCHANGED.
                 let n = match subject {
                     Value::Number(n) => *n,
                     _ => return Ok(false),
@@ -1710,7 +1704,29 @@ impl Interp {
                     Value::Number(x) => x,
                     _ => return Ok(false),
                 };
-                Ok(n >= lo && if *inclusive { n <= hi } else { n < hi })
+                // Resolve the step's `f64` (None when omitted). A non-number step
+                // expression is a Tier-2 type error, mirroring iteration.
+                let step_v = match step {
+                    Some(s) => match self.eval_expr(s, env).await? {
+                        Value::Number(x) => Some(x),
+                        _ => {
+                            return Err(
+                                AsError::at("range step must be a number", s.span).into()
+                            )
+                        }
+                    },
+                    None => None,
+                };
+                // Validate the step (shared with iteration / the VM); a bad
+                // EXPLICIT step PANICS here with the byte-identical message, at the
+                // START bound's span (matching the for-range / value-range panics).
+                // `resolve_step` is run only to surface that panic; the membership
+                // helper takes the raw `Option` so a plain pattern keeps its
+                // pre-existing no-stride behavior.
+                if step_v.is_some() {
+                    resolve_step(lo, hi, step_v, start.span)?;
+                }
+                Ok(range_pattern_contains(n, lo, hi, step_v, *inclusive))
             }
             Pattern::Array(pats, rest) => {
                 // Snapshot the subject array (do not hold a borrow across awaits).
@@ -3084,6 +3100,51 @@ pub(crate) fn range_has_next(i: f64, hi: f64, step: f64, inclusive: bool) -> boo
         i >= hi
     } else {
         i > hi
+    }
+}
+
+/// Match-range membership, shared verbatim by the tree-walker (`Pattern::Range`)
+/// and the VM (`Op::MatchRange`) so the two engines can never drift.
+///
+/// `step_v` is the pattern's step: `None` when the `step` clause is OMITTED,
+/// `Some(k)` for an explicit `step k`. When `k` was given it MUST already be the
+/// resolved/validated value from [`resolve_step`] (the caller runs that first so a
+/// `step 0` / non-finite / direction-mismatch pattern PANICS with the byte-identical
+/// message iteration uses).
+///
+/// - **No step (`None`):** plain in-bounds membership — `x` between the bounds,
+///   honoring `..`/`..=` and the bounds-inferred direction. This is exactly the
+///   pre-existing plain-pattern behavior (NO stride test), so fractional subjects
+///   like `match 2.5 { 1..=10 => … }` keep matching.
+/// - **With step (`Some(k)`):** strided membership (spec §3.7) — in bounds AND on
+///   the stride from the anchor `lo`: `q = (x − lo) / k` is a NON-NEGATIVE WHOLE
+///   number (`q >= 0 && q.fract() == 0`). Anchor is `start`, so parity/offset
+///   depends on where the range begins.
+pub(crate) fn range_pattern_contains(
+    x: f64,
+    lo: f64,
+    hi: f64,
+    step_v: Option<f64>,
+    inclusive: bool,
+) -> bool {
+    // Direction: from the explicit step's sign, else inferred from the bounds
+    // (the same rule `resolve_step` uses, so in-bounds is direction-consistent).
+    let step = step_v.unwrap_or(if hi >= lo { 1.0 } else { -1.0 });
+    // In-bounds: upper edge via the shared iteration predicate; lower edge is the
+    // anchor `lo` on the step's side (ascending: x >= lo; descending: x <= lo).
+    let upper_ok = range_has_next(x, hi, step, inclusive);
+    let lower_ok = if step > 0.0 { x >= lo } else { x <= lo };
+    if !(upper_ok && lower_ok) {
+        return false;
+    }
+    match step_v {
+        // Plain pattern: in-bounds is the whole test (no stride), unchanged.
+        None => true,
+        // Stepped pattern: also require `x` on the stride from the anchor `lo`.
+        Some(k) => {
+            let q = (x - lo) / k;
+            q >= 0.0 && q.fract() == 0.0
+        }
     }
 }
 

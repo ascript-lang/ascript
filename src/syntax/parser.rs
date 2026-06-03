@@ -1371,6 +1371,11 @@ fn pattern(p: &mut Parser) -> CompletedMarker {
             if p.at(DotDot) || p.at(DotDotEq) {
                 p.bump();
                 let _ = lhs_for_pat(p);
+                // Trailing contextual `step <expr>` (strided membership, spec §3.7).
+                // `step` is recognized only when it directly follows the range end,
+                // so it stays a normal identifier elsewhere. The step expression is
+                // the 3rd Expr child of the `RangePat`, after `start..end`.
+                parse_range_step(p);
                 p.complete(m, RangePat)
             } else {
                 p.complete(m, LiteralPat)
