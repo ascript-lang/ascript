@@ -185,9 +185,9 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             step,
             body,
         } => {
-            // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9). The
-            // parser does not yet set `inclusive`/`step`, so today this always
-            // renders `..` with no step; the render below is forward-compatible.
+            // RANGES FEATURE, Phase 1. The parser DOES set `inclusive`/`step`
+            // (since commit a91dfdc); this render emits the `..=`/`step` surface
+            // faithfully (parsed now; evaluated in a later phase).
             indent(out, level);
             out.push_str("for (");
             out.push_str(var);
@@ -408,8 +408,8 @@ fn expr_prec(e: &Expr) -> u8 {
         ExprKind::Ternary { .. } => PREC_ASSIGN,
         ExprKind::Arrow { .. } => PREC_ASSIGN,
         ExprKind::Binary { op, .. } => bin_prec(*op),
-        // Mirror `BinOp::Range`'s precedence (Task 1 placeholder; the parser does
-        // not yet produce `ExprKind::Range`).
+        // `ExprKind::Range` (emitted by the parser since commit a91dfdc) mirrors
+        // the legacy `BinOp::Range` precedence.
         ExprKind::Range { .. } => bin_prec(BinOp::Range),
         ExprKind::Unary { .. } => PREC_UNARY,
         ExprKind::Await(_) => PREC_UNARY,
@@ -636,10 +636,10 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             }
             out.push_str(" }");
         }
-        // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9). The parser
-        // does not yet produce `ExprKind::Range` (value ranges still lower through
-        // `Binary { op: BinOp::Range, .. }`); this render mirrors that path's
-        // operand precedence and adds the forward-compatible `..=`/`step` surface.
+        // RANGES FEATURE, Phase 1. The parser DOES emit `ExprKind::Range` (since
+        // commit a91dfdc), so this is the live value-range render path. It mirrors
+        // the legacy `BinOp::Range` operand precedence and adds the `..=`/`step`
+        // surface (parsed now; evaluated in a later phase).
         ExprKind::Range {
             start,
             end,

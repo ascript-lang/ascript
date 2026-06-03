@@ -955,11 +955,10 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
         ExprKind::Arrow { .. } => return Err(AsoError::NonLiteralConst("arrow-default")),
         ExprKind::Match { .. } => return Err(AsoError::NonLiteralConst("match-default")),
         ExprKind::Yield(_) => return Err(AsoError::NonLiteralConst("yield-default")),
-        // PHASE 1 placeholder — the parser does not yet produce `ExprKind::Range`
-        // (value ranges still lower through `Binary { op: BinOp::Range, .. }`), so a
-        // `Range` field default cannot arise today. The flat default serializer
-        // gains a wire encoding when the parser starts emitting it (Task 3+); until
-        // then treat it as a documented `ascript build`-only limit like Arrow/Match.
+        // RANGES FEATURE, Phase 1. The parser DOES emit `ExprKind::Range` (since
+        // commit a91dfdc), so a `Range` field default can arise. The flat default
+        // serializer has no wire encoding for it yet, so — like Arrow/Match — it is
+        // a documented `ascript build`-only limit until a later phase adds one.
         ExprKind::Range { .. } => return Err(AsoError::NonLiteralConst("range-default")),
     }
     Ok(())

@@ -1126,13 +1126,26 @@ impl Interp {
                 var,
                 start,
                 end,
-                // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9).
-                // `inclusive=false, step=None` behaves exactly as today
-                // (ascending, exclusive, step 1); the new fields are wired later.
-                inclusive: _,
-                step: _,
+                inclusive,
+                step,
                 body,
             } => {
+                // RANGES FEATURE, Phase 1. Plain `for (i in a..b)` iterates
+                // ascending/exclusive/step-1 exactly as today. Inclusive (`..=`)
+                // and stepped (`step k`) for-ranges are not yet evaluable, so we
+                // REJECT them loudly to stay byte-identical with the VM (which
+                // rejects them in `src/compile/mod.rs`) — never silently iterate
+                // exclusive / step-ignored.
+                //
+                // PHASE-1 guard — removed in Phase 2/3 (Tasks 5–8) when for-ranges
+                // learn inclusive/step semantics.
+                if *inclusive || step.is_some() {
+                    return Err(AsError::at(
+                        "inclusive/stepped ranges are not yet supported (implemented in a later phase)",
+                        start.span,
+                    )
+                    .into());
+                }
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
                 let (lo, hi) = match (start_v, end_v) {
@@ -1550,19 +1563,29 @@ impl Interp {
                     self.eval_expr(els, env).await
                 }
             }
-            // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9).
-            // The parser does not yet produce `ExprKind::Range` (value ranges
-            // still lower through `Binary { op: BinOp::Range, .. }`); this arm
-            // exists only to keep the match exhaustive. It mirrors the exclusive,
-            // ascending, step-1 `BinOp::Range` eval in `apply_binop`
-            // (materialize to `array<number>`, `while i < hi`), ignoring
-            // `inclusive`/`step` until later phases wire them.
+            // RANGES FEATURE, Phase 1. The parser DOES emit `ExprKind::Range`
+            // (since commit a91dfdc), so this is the live value-range path — it
+            // materializes a plain exclusive, ascending, step-1 `array<number>`
+            // (mirroring the legacy `BinOp::Range` eval in `apply_binop`). The
+            // inclusive (`..=`) and stepped (`step k`) semantics are not yet
+            // evaluable, so we REJECT them loudly to stay byte-identical with the
+            // VM (which rejects them in `src/compile/mod.rs`) — never silently
+            // ignore `inclusive`/`step` and emit wrong output.
             ExprKind::Range {
                 start,
                 end,
-                inclusive: _,
-                step: _,
+                inclusive,
+                step,
             } => {
+                // PHASE-1 guard — removed in Phase 2/3 (Tasks 5–8) when value
+                // ranges learn inclusive/step semantics.
+                if *inclusive || step.is_some() {
+                    return Err(AsError::at(
+                        "inclusive/stepped ranges are not yet supported (implemented in a later phase)",
+                        expr.span,
+                    )
+                    .into());
+                }
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
                 let (lo, hi) = match (start_v, end_v) {
@@ -1668,10 +1691,23 @@ impl Interp {
                 start,
                 end,
                 inclusive,
-                // PHASE 1 placeholder — real semantics in Phase 3/4 (Task 7/9).
-                // Strided membership for `step` lands in Phase 5; ignored here.
-                step: _,
+                step,
             } => {
+                // RANGES FEATURE, Phase 1. Inclusive `..=` range patterns are
+                // PRE-EXISTING, working functionality (e.g. `match n { 1..=10 => …
+                // }`) and stay supported. Strided membership (`step k`) is not yet
+                // evaluable, so we REJECT a stepped pattern loudly to stay
+                // byte-identical with the VM — never silently ignore `step`.
+                //
+                // PHASE-1 guard — removed in Phase 5 (Tasks 10–11) when range
+                // patterns learn strided membership.
+                if step.is_some() {
+                    return Err(AsError::at(
+                        "inclusive/stepped ranges are not yet supported (implemented in a later phase)",
+                        start.span,
+                    )
+                    .into());
+                }
                 let n = match subject {
                     Value::Number(n) => *n,
                     _ => return Ok(false),

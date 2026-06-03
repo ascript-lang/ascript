@@ -1385,34 +1385,54 @@ async fn vm_for_range_bounds_error_matches_treewalker() {
 }
 
 #[tokio::test]
-async fn vm_for_range_inclusive_staged_rollout() {
-    // RANGES FEATURE, Phase 1 (legacy parser flipped in Task 3): the legacy
-    // front-end now PARSES `..=` in a for-range head into the dedicated
-    // `ForRange { inclusive, .. }` node, but the Phase-1 placeholder eval in
-    // `src/interp.rs` still iterates exclusively (real inclusive semantics land
-    // in Phase 2 / Task 5). The VM/CST front-end is untouched until Task 4 and
-    // still REJECTS `..=` in a for-range at compile time.
-    //
-    // So during this staged window the engines legitimately DIVERGE on an `..=`
-    // for-range: the tree-walker accepts-and-runs-exclusive; the VM rejects. This
-    // is intended and temporary — Phase 2 (Tasks 5/6) makes BOTH iterate
-    // inclusively and re-converges them. Asserting the staged reality here keeps
-    // the gate honest without pretending the feature has fully landed.
-    for (src, exclusive_out) in [
-        ("for (i in 0..=3) { print(i) }", "0\n1\n2\n"),
-        ("for (i in 0..=0) { print(i) }", ""),
+async fn both_engines_reject_inclusive_and_step_ranges_in_phase1() {
+    // RANGES FEATURE, Phase 1: the legacy front-end now PARSES `..=` and `step`
+    // into the dedicated `Range`/`ForRange` nodes, but NEITHER engine can yet
+    // EVALUATE inclusive/stepped semantics (those land in Phase 2/3, Tasks 5–8).
+    // To stay byte-identical, BOTH engines must REJECT these forms loudly rather
+    // than silently produce wrong (exclusive / step-ignored) output. This is a
+    // real both-reject parity assertion — not a recorded divergence.
+    for src in [
+        // for-range, inclusive.
+        "for (i in 1..=5) { print(i) }",
+        // for-range, stepped.
+        "for (i in 1..10 step 2) { print(i) }",
+        // value range, inclusive.
+        "print(1..=5)",
+        // value range, stepped.
+        "print(1..10 step 2)",
     ] {
         let tw = ascript::run_source(src).await;
         let vm = ascript::vm_run_source(src).await;
-        assert_eq!(
-            tw.as_deref().ok(),
-            Some(exclusive_out),
-            "tree-walker should PARSE `..=` for-range and run the Phase-1 \
-             exclusive placeholder for `{src}`, got {tw:?}"
+        assert!(
+            tw.is_err(),
+            "tree-walker should REJECT inclusive/stepped range for `{src}`, got {tw:?}"
         );
         assert!(
             vm.is_err(),
-            "VM should still REJECT `..=` for-range until Task 4 for `{src}`, got {vm:?}"
+            "VM should REJECT inclusive/stepped range for `{src}`, got {vm:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vm_inclusive_match_pattern_matches_treewalker() {
+    // Inclusive `..=` in a MATCH PATTERN is PRE-EXISTING, working functionality
+    // (distinct from value/for ranges). Both engines must accept it and agree —
+    // the Phase-1 step-rejection guard must NOT over-reject inclusive patterns.
+    for src in [
+        "let n = 5\nprint(match n { 1..=10 => \"in\", _ => \"out\" })",
+        "let n = 15\nprint(match n { 1..=10 => \"in\", _ => \"out\" })",
+        "let n = 10\nprint(match n { 1..=10 => \"in\", _ => \"out\" })",
+        "let n = 5\nprint(match n { 1..10 => \"in\", _ => \"out\" })",
+    ] {
+        let tw = ascript::run_source(src).await;
+        let vm = ascript::vm_run_source(src).await;
+        assert!(tw.is_ok(), "tree-walker should accept `{src}`, got {tw:?}");
+        assert_eq!(
+            tw.as_deref().ok(),
+            vm.as_ref().map(|(out, _)| out.as_str()).ok(),
+            "inclusive match-pattern output diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
         );
     }
 }
