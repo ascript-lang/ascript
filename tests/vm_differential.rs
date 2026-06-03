@@ -2787,3 +2787,159 @@ async fn vm_enum_no_variant_error() {
     let src = "enum Color { Red, Green }\nprint(Color.Purple)";
     assert_vm_run_error_matches_treewalker(src).await;
 }
+
+// ---- ClassName.from validation (V9-T4): via the CALL_METHOD path ---------
+//
+// `User.from({...})` compiles to `<class-name-ref> <obj-arg> CALL_METHOD "from"`.
+// In CALL_METHOD the receiver is a `Value::Class` (NOT a schema value), so the
+// hook falls through to `vm_read_member(class, "from")` → `Interp::read_member`
+// (yields `Value::ClassMethod(c, "from")`) → `Vm::call_value` → the non-VM-class
+// arm delegates to `Interp::call_value`, whose `ClassMethod(c, "from")` arm runs
+// `validate_into`. So the `.from` CALL PATH is REACHABLE on the VM with NO import
+// (the class is defined in-file): a valid object, an optional-no-default field,
+// a recoverable/uncaught shape mismatch, strict mode, a non-object arg, and an
+// unknown static member ALL match the tree-walker byte-for-byte. The two `.from`
+// sub-features that depend on tree-walker-only class state — DEFAULTED fields
+// (`FieldSchema.default`) and NESTED-class coercion (`Class.def_env`) — currently
+// DIVERGE on the VM and are deferred to V12 (see the two `#[ignore]`d reproducers
+// below for the precise root cause). Mirrored from examples/shape_validation.as.
+#[tokio::test]
+async fn vm_class_from_valid_constructs_instance() {
+    // A valid object validates into an instance whose fields read back; `.from`
+    // does NOT run `init` — it assigns validated fields directly.
+    let src = "class User {\n  name: string\n  age: number\n}\nlet u = User.from({name: \"ann\", age: 30})\nprint(u.name)\nprint(u.age)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_from_optional_field_without_default() {
+    // An OPTIONAL field with NO default (`nickname: string?`) is absent → binds
+    // nil, with no default-eval needed. This part of `.from` is reachable on the
+    // VM (no `FieldSchema.default`, no nested-class env lookup). (The DEFAULTED
+    // field case `role: string = "guest"` is the documented divergence below.)
+    let src = "class User {\n  id: number\n  name: string\n  nickname: string?\n}\nlet u = User.from({id: 1, name: \"Ada\"})\nprint(u.id)\nprint(u.name)\nprint(u.nickname)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+// DOCUMENTED VM DIVERGENCE (deferred to V12 — needs the global-env / CST→AST
+// bridge). `.from` is powered by `Interp::validate_into`, which reads TWO pieces
+// of TREE-WALKER-only class state that the VM compiler intentionally does NOT
+// populate (see `src/compile/mod.rs` `compile_class`):
+//   1. `FieldSchema.default` (the AST default Expr) — the VM stores `None` and
+//      evals defaults via compiled THUNK closures at construct time, so
+//      `validate_into` (which re-evals `fs.default`) sees no default → a
+//      DEFAULTED field stays nil and trips its own type contract.
+//   2. `Class.def_env` (a tree-walker `Environment`) — the VM has no
+//      Environment-based globals (user classes live in cell slots/upvalues), so
+//      `compile_class` uses an empty `global_env()` placeholder; `validate_into`
+//      / `coerce_field` then can't resolve a NESTED class name (`Address`) to
+//      coerce a raw sub-object into an instance → contract violation.
+// Both are the V12 import / global-environment bridge; fixing them needs
+// CST→legacy-AST-Expr lowering for defaults AND a populated def_env, neither of
+// which exists yet. Recorded here (NOT silently dropped) as ignored reproducers
+// that PASS on the tree-walker and currently DIVERGE on the VM.
+#[tokio::test]
+#[ignore = "V12: .from default-eval needs FieldSchema.default + def_env (VM uses thunks + empty env)"]
+async fn vm_class_from_applies_defaults_diverges_until_v12() {
+    let src = "class User {\n  id: number\n  name: string\n  role: string = \"guest\"\n}\nlet u = User.from({id: 1, name: \"Ada\"})\nprint(u.role)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+#[ignore = "V12: .from nested-class coercion needs a populated def_env (VM has no Environment globals)"]
+async fn vm_class_from_nested_class_field_diverges_until_v12() {
+    let src = "class Address {\n  street: string\n  zip: number\n}\nclass User {\n  name: string\n  address: Address\n}\nlet u = User.from({name: \"Ada\", address: {street: \"1 Way\", zip: 90210}})\nprint(u.name)\nprint(u.address.zip)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_from_recovered_shape_mismatch_matches_treewalker() {
+    // A wrong-typed field is a RECOVERABLE field-path panic; caught by `recover`
+    // it yields `[nil, err]`. The error message must be byte-identical (it
+    // carries the field path), which the printed `r[1].message` verifies.
+    let src = "class User {\n  name: string\n  age: number\n}\nlet r = recover(() => User.from({name: \"Bug\", age: \"nope\"}))\nprint(r[0])\nprint(r[1].message)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_from_missing_field_recovered_matches_treewalker() {
+    // A missing required field (no default) → nil → type contract violated;
+    // recovered, the field-path message is byte-identical.
+    let src = "class User {\n  name: string\n  age: number\n}\nlet r = recover(() => User.from({name: \"Bug\"}))\nprint(r[1].message)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_from_uncaught_shape_mismatch_aborts_identically() {
+    // Uncaught, the `.from` field-path panic aborts the program with the SAME
+    // message AND span on both engines.
+    let src = "class User {\n  name: string\n  age: number\n}\nUser.from({name: \"Bug\", age: \"nope\"})";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_from_strict_rejects_unexpected_key_matches_treewalker() {
+    // `.from(obj, true)` (strict) rejects an unexpected key; recovered, the
+    // message is byte-identical.
+    let src = "class User {\n  name: string\n}\nlet r = recover(() => User.from({name: \"Ada\", extra: 1}, true))\nprint(r[1].message)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_from_not_an_object_matches_treewalker() {
+    // `.from` on a non-object argument is a recoverable panic with a byte-identical
+    // message on both engines.
+    let src = "class User {\n  name: string\n}\nlet r = recover(() => User.from(42))\nprint(r[1].message)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_class_unknown_static_member_matches_treewalker() {
+    // A class static member other than `from` is the SAME Tier-2 panic on both
+    // engines (shared `read_member` on `Value::Class`).
+    let src = "class User {\n  name: string\n}\nprint(User.nope)";
+    assert_vm_run_error_matches_treewalker(src).await;
+}
+
+// ---- std/schema fluent-method chaining hook (V9-T4): CALL_METHOD routing --
+//
+// The schema fluent-method hook in CALL_METHOD (`is_schema_value(recv) &&
+// is_schema_method(name) → Interp::call_schema(name, [recv, ...args])`) mirrors
+// the tree-walker's `eval_chain` Member-callee arm EXACTLY. The usual entry
+// (`schema.string().minLength(3)`) needs `import * as schema` (V12), so an
+// END-TO-END schema example is DEFERRED to V12. But the ROUTING is reachable
+// NOW by building a schema-TAGGED Object literal in-file (no import): a
+// `{__kind: "string", ...}` object IS a schema value (`is_schema_value` keys on
+// the `__kind` tag), so calling a refiner/terminal method on it fires the hook.
+// These prove the VM's CALL_METHOD takes the schema branch byte-identically to
+// the tree-walker.
+#[tokio::test]
+async fn vm_schema_method_on_tagged_object_literal_matches_treewalker() {
+    // `.minLength(3)` on a string-schema-tagged Object returns a new schema with
+    // the constraint stored; reading it back proves `call_schema` ran on the VM.
+    let src = "let s = {__kind: \"string\"}\nlet s2 = s.minLength(3)\nprint(s2.minLength)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_schema_method_chain_on_tagged_object_literal_matches_treewalker() {
+    // A CHAIN of refiners, each a CALL_METHOD hitting the schema hook in turn.
+    let src = "let s = {__kind: \"string\"}\nlet s2 = s.minLength(3).maxLength(10)\nprint(s2.minLength)\nprint(s2.maxLength)";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_schema_parse_method_on_tagged_object_literal_matches_treewalker() {
+    // The terminal `.parse(value)` method validates an input against the schema
+    // (a `[value, err]` Tier-1 pair). Routing through the VM's schema hook must
+    // match the tree-walker byte-for-byte.
+    let src = "let s = {__kind: \"string\"}\nlet r = s.minLength(2).parse(\"hello\")\nprint(r[0])\nprint(r[1])";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_schema_parse_failure_on_tagged_object_literal_matches_treewalker() {
+    // A failing `.parse` yields `[nil, err]`; the error message must be identical.
+    let src = "let s = {__kind: \"string\"}\nlet r = s.minLength(5).parse(\"hi\")\nprint(r[0])\nprint(r[1].message)";
+    assert_vm_run_matches_treewalker(src).await;
+}
