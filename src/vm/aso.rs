@@ -59,7 +59,7 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 /// - 3: field-default expr now covers the full `cst_default_expr` lowering — new
 ///   tags for binary/range/index/ternary/template/optmember/try/unwrap/await/
 ///   assign and spread elements in array/object/call defaults.
-pub const ASO_FORMAT_VERSION: u32 = 5;
+pub const ASO_FORMAT_VERSION: u32 = 6;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.

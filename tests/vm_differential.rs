@@ -5177,6 +5177,22 @@ async fn vm_immutable_binding_kinds_error_match_treewalker() {
 }
 
 #[tokio::test]
+async fn vm_imported_binding_reassignment_errors_match_treewalker() {
+    // An IMPORTED name is an immutable module global: reassigning it (in the SAME
+    // entry chunk — the cross-MODULE case) is the immutable error on both engines,
+    // now via the runtime SET_GLOBAL mutability check.
+    assert_vm_run_error_matches_treewalker(
+        "import { abs } from \"std/math\"\nabs = 3\nprint(abs)",
+    )
+    .await;
+    // The same name USED first, then reassigned — still immutable.
+    assert_vm_run_error_matches_treewalker(
+        "import { max } from \"std/math\"\nprint(max(1, 2))\nmax = 9",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn vm_dead_const_reassignment_runs_fine_matches_treewalker() {
     // A const reassignment that is NEVER REACHED runs fine on both engines (runtime
     // timing — only an EXECUTED assignment errors).

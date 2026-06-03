@@ -1058,31 +1058,35 @@ impl Compiler {
         // Phase 2: store to the target, leaving the assigned value on the stack.
         match &target {
             Expr::NameRef(name_ref) => {
-                // An assignment to an IMMUTABLE binding (const/fn/class/enum/import/
-                // loop-var/const-pattern bind) is the runtime panic `cannot assign to
-                // immutable binding '<name>'`. The resolver recorded such targets; we
-                // emit IMMUTABLE_ERROR at the store position (AFTER the RHS, already on
-                // the stack, was evaluated) so the RHS side-effects run first and a
-                // dead/unreached assignment never triggers — matching the tree-walker's
-                // runtime timing, message, and target span exactly.
-                let target_range = name_ref.syntax().text_range();
-                if self.resolved.immutable_assign_targets.contains(&target_range) {
-                    let name = name_ref
-                        .ident_token()
-                        .map(|t| t.text().to_string())
-                        .unwrap_or_default();
-                    let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
-                    self.chunk
-                        .emit_u16(Op::ImmutableError, idx, node_code_span(name_ref));
-                    return Ok(());
-                }
                 // The store target: a frame-local slot (cell-aware), an upvalue (a
                 // captured outer variable, mutated by reference), or a MODULE-SCOPE
-                // user-global (`Resolution::Global` — a top-level `let` reassigned at
-                // top level). For the slot/upvalue stores `DUP` first so a copy remains
+                // user-global. For the slot/upvalue stores `DUP` first so a copy remains
                 // as the expression's result after the popping store; `SET_GLOBAL`
                 // already LEAVES the value (peek), so it needs no `DUP`.
+                //
+                // IMMUTABILITY: for a LOCAL/UPVALUE immutable target (a `const`/
+                // `loop-var`/const-pattern bind inside a function/block), the resolver
+                // recorded the target in `immutable_assign_targets`; we emit
+                // IMMUTABLE_ERROR at the store position (AFTER the RHS, already on the
+                // stack) so the RHS side-effects run first and a dead/unreached store
+                // never triggers — matching the tree-walker's runtime timing, message,
+                // and target span. For a GLOBAL target we do NOT special-case here: the
+                // store is ALWAYS `SET_GLOBAL`, whose RUNTIME mutability check is the
+                // single source of truth (it also catches a CROSS-CHUNK immutable global
+                // — REPL line-to-line, a main module reassigning an import — that the
+                // compile-time check cannot see).
+                let target_range = name_ref.syntax().text_range();
+                let is_immutable_target =
+                    self.resolved.immutable_assign_targets.contains(&target_range);
                 match self.resolved.uses.get(&name_ref.syntax().text_range()) {
+                    Some(Resolution::Local(slot)) if is_immutable_target => {
+                        let _ = slot;
+                        self.emit_immutable_error(name_ref);
+                    }
+                    Some(Resolution::Upvalue(idx)) if is_immutable_target => {
+                        let _ = idx;
+                        self.emit_immutable_error(name_ref);
+                    }
                     Some(Resolution::Local(slot)) => {
                         let slot = u16::try_from(*slot).map_err(|_| {
                             CompileError::new("local slot index exceeds 65535", span)
@@ -1098,8 +1102,11 @@ impl Compiler {
                         self.chunk.emit_u16(Op::SetUpvalue, idx, span);
                     }
                     Some(Resolution::Global(name)) => {
+                        // SET_GLOBAL anchors any error (immutable / undefined) at the
+                        // TARGET's span, matching the tree-walker's `target.span`.
                         let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
-                        self.chunk.emit_u16(Op::SetGlobal, idx, span);
+                        self.chunk
+                            .emit_u16(Op::SetGlobal, idx, node_code_span(name_ref));
                     }
                     _ => {
                         return Err(CompileError::new(
@@ -2866,11 +2873,42 @@ impl Compiler {
         self.resolved.global_decl_ranges.contains(&decl_range)
     }
 
-    /// Emit `DEFINE_GLOBAL <name>` (pops TOS, binds it as the module-scope global
-    /// `name`).
+    /// Whether the module-global named `name` is REASSIGNABLE (a `let`), per the
+    /// resolver's binding. Defaults to immutable (`false`) if no binding is found
+    /// (defensive — a global always has a resolver binding). Used to set the
+    /// `DEFINE_GLOBAL` mutability flag so the runtime `SET_GLOBAL` check matches the
+    /// tree-walker's per-binding `Environment` mutability across chunks.
+    fn global_mutable(&self, name: &str) -> bool {
+        self.resolved
+            .bindings
+            .iter()
+            .find(|b| b.is_global && b.name == name)
+            .is_some_and(|b| b.mutable)
+    }
+
+    /// Emit `IMMUTABLE_ERROR <name>` for an assignment to an immutable LOCAL/UPVALUE
+    /// target (a `const`/loop-var/const-pattern bind inside a function/block). Anchored
+    /// at the target span; raises `cannot assign to immutable binding '<name>'` at
+    /// runtime when reached (the RHS, already compiled, runs first). GLOBAL targets do
+    /// NOT use this — their `SET_GLOBAL` does the runtime mutability check instead.
+    fn emit_immutable_error(&mut self, name_ref: &NameRef) {
+        let name = name_ref
+            .ident_token()
+            .map(|t| t.text().to_string())
+            .unwrap_or_default();
+        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        self.chunk
+            .emit_u16(Op::ImmutableError, idx, node_code_span(name_ref));
+    }
+
+    /// Emit `DEFINE_GLOBAL <name>, <mutable>` (pops TOS, binds it as the module-scope
+    /// global `name` with its reassignability). The mutability flag lets the runtime
+    /// `SET_GLOBAL` reject a cross-chunk reassignment of an immutable global.
     fn emit_define_global(&mut self, name: &str, span: Span) {
+        let mutable = self.global_mutable(name);
         let idx = self.chunk.add_const(Value::Str(Rc::from(name)));
-        self.chunk.emit_u16(Op::DefineGlobal, idx, span);
+        self.chunk
+            .emit_u16_u8(Op::DefineGlobal, idx, u8::from(mutable), span);
     }
 
     /// The local slot for a `let`/`const` declaration. The resolver records a

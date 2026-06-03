@@ -311,6 +311,20 @@ position — i.e. AFTER the RHS is compiled — so it raises `cannot assign to i
 fire) without any runtime const-flag tracking. `.aso` `ASO_FORMAT_VERSION` bumped 4→5 (new opcode). Both
 fixes keep the whole-corpus three-way differential byte-identical and add no perf-gate regression.
 
+> **Cross-chunk immutable globals (WS2 follow-up).** `Op::ImmutableError` only sees a SAME-chunk
+> assignment, so an immutable global (`const`/`fn`/`class`/`enum`/`import`) reassigned from a LATER,
+> separately-compiled chunk (REPL line-to-line, or a main module reassigning an import) escaped it.
+> Fix: `user_globals` now stores `GlobalSlot { value, mutable }` (still a plain `Value`, NO `Cc` cell —
+> the `Vm` is the GC root). `Op::DefineGlobal` carries a `u8` mutability flag (1 = `let`, 0 = immutable;
+> the compiler reads it off the resolver `Binding.mutable`) → `DefineGlobal` is now a `u16 name + u8 mut`
+> op (3 bytes). For a GLOBAL assignment target the compiler ALWAYS emits `SET_GLOBAL` (never the
+> compile-time `ImmutableError`); `Op::SetGlobal` is the SINGLE runtime source of truth: immutable global
+> → `cannot assign to immutable binding '<name>'` (target span), absent → `cannot assign to undefined
+> variable`, mutable → in-place update. Runtime-timed (dead `if false { k = 2 }` never executes the op);
+> imports define immutable globals (`define_user_global(.., false)`). `Op::ImmutableError` is KEPT for
+> immutable LOCALS/upvalues (a `const` inside a function — that path is unchanged, byte-identical).
+> `.aso` `ASO_FORMAT_VERSION` bumped 5→6 (DefineGlobal operand layout).
+
 **`--no-specialize` KILL SWITCH + three-way differential (V11-T5).** The `Vm` carries a
 `specialize: bool` (default `true`; `Vm::new` → specializing, `Vm::new_generic` /
 `Vm::with_specialize(interp, false)` → generic). When `false`, EVERY specialization fast path is

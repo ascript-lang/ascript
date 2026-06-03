@@ -68,22 +68,28 @@ pub enum Op {
     /// The VM's globals are the bare builtins (`crate::interp::BUILTIN_NAMES`);
     /// the result is the corresponding `Value::Builtin`.
     GetGlobal,
-    /// `DEFINE_GLOBAL(u16)` — pop TOS and bind it as the MODULE-SCOPE user-global
-    /// named by `consts[idx]` (a `Str`), creating or overwriting the entry and
-    /// bumping the global version. Emitted by every DIRECT-child top-level binding
-    /// define-site (`let`/`const`/`fn`/`class`/`enum`/`import`). Pairs with
+    /// `DEFINE_GLOBAL(u16 name, u8 mutable)` — pop TOS and bind it as the MODULE-SCOPE
+    /// user-global named by `consts[name]` (a `Str`), creating or overwriting the entry
+    /// (and recording its REASSIGNABILITY: `mutable == 1` for a `let`, `0` for an
+    /// immutable `const`/`fn`/`class`/`enum`/`import`) and bumping the global version.
+    /// Emitted by every DIRECT-child top-level binding define-site. Pairs with
     /// [`Op::GetGlobal`] (which consults the user-globals table before the builtins),
     /// so a function/thunk body referencing a top-level binding declared LATER
     /// late-binds at run time — matching the tree-walker's single shared module
-    /// `Environment`.
+    /// `Environment`. The recorded mutability lets [`Op::SetGlobal`] reject a CROSS-CHUNK
+    /// reassignment of an immutable global (REPL line-to-line; a main module reassigning
+    /// an import) at run time, which the compile-time [`Op::ImmutableError`] cannot see.
     DefineGlobal,
     /// `SET_GLOBAL(u16)` — store TOS into the EXISTING module-scope user-global named
-    /// by `consts[idx]` (a `Str`), bumping the global version. Emitted by a top-level
-    /// REASSIGNMENT `x = …` whose target resolves to a module global. Assigning to a
-    /// name not present in the user-globals table raises the tree-walker's exact
-    /// message `cannot assign to undefined variable '<name>'`. (A builtin global is
-    /// immutable — the compiler never lowers an assignment to a builtin, the
-    /// tree-walker rejects it earlier with "cannot assign to immutable binding".)
+    /// by `consts[idx]` (a `Str`). Emitted by a top-level REASSIGNMENT `x = …` whose
+    /// target resolves to a module global. RUNTIME mutability check (the single source
+    /// of truth for GLOBAL assignment targets): if the global is IMMUTABLE
+    /// (`const`/`fn`/`class`/`enum`/`import`), raise `cannot assign to immutable binding
+    /// '<name>'` at the target span — even when the immutable decl is in an EARLIER,
+    /// separately-compiled chunk (REPL/imports), where the compile-time
+    /// [`Op::ImmutableError`] would not fire. Assigning to a name not present at all
+    /// raises `cannot assign to undefined variable '<name>'`. (A builtin global is
+    /// immutable and never reached — the tree-walker rejects `print = 5` earlier.)
     SetGlobal,
     /// `IMMUTABLE_ERROR(u16 name)` — UNCONDITIONALLY raise the Tier-2 panic
     /// `cannot assign to immutable binding '<name>'` (name = `consts[idx]`, a `Str`)
@@ -554,10 +560,10 @@ impl Op {
         match self {
             // u16-operand ops.
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
-            | SetUpvalue | CloseUpvalue | GetGlobal | DefineGlobal | SetGlobal | ImmutableError
-            | Closure | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method
-            | GetSuper | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest
-            | MatchHasKey | CallMethodSpread | DefineExport => 2,
+            | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | ImmutableError | Closure
+            | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper
+            | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey
+            | CallMethodSpread | DefineExport => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -566,7 +572,9 @@ impl Op {
             Call | MatchRange => 1,
 
             // u16 + u8 operand op.
-            CallMethod | MatchArray => 3,
+            // DEFINE_GLOBAL: u16 name-const index + u8 mutability flag (1 = `let`,
+            // 0 = immutable `const`/`fn`/`class`/`enum`/`import`).
+            CallMethod | MatchArray | DefineGlobal => 3,
 
             // Zero-operand ops.
             Nil | True | False | Pop | Dup | Swap | Rot3 | Add | Sub | Mul | Div | Mod | Pow

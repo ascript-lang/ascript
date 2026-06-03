@@ -377,6 +377,111 @@ fn repl_vm_redefinition_across_lines_errors_matching_reference() {
 }
 
 #[test]
+fn repl_vm_const_reassignment_across_lines_errors_and_keeps_value() {
+    // An immutable top-level `const` defined on one REPL line and reassigned on a
+    // LATER, separately-compiled line: the VM REPL must error `cannot assign to
+    // immutable binding` (the cross-chunk runtime SET_GLOBAL check) AND keep the
+    // first value — byte-identical to the tree-walker REPL.
+    let session = "const k = 1\nk = 2\nk\n";
+    let (vm_out, vm_err) = run_repl_session(session, false);
+    let (tw_out, tw_err) = run_repl_session(session, true);
+    let vm = format!("{vm_out}{vm_err}");
+    let tw = format!("{tw_out}{tw_err}");
+    assert!(
+        vm.contains("cannot assign to immutable binding 'k'"),
+        "VM must reject const reassignment; out={vm_out:?} err={vm_err:?}"
+    );
+    assert!(
+        tw.contains("cannot assign to immutable binding 'k'"),
+        "TW must reject const reassignment; out={tw_out:?} err={tw_err:?}"
+    );
+    // The const keeps its first value on BOTH engines (the failed assignment did not
+    // mutate it): the final `k` line prints 1, not 2.
+    assert!(vm_out.contains('1'), "VM keeps k=1; stdout: {vm_out:?}");
+    assert!(tw_out.contains('1'), "TW keeps k=1; stdout: {tw_out:?}");
+    assert!(!vm_out.contains('2'), "VM must not print 2; stdout: {vm_out:?}");
+}
+
+#[test]
+fn repl_vm_fn_and_class_reassignment_across_lines_error() {
+    // fn / class names are immutable top-level bindings: reassigning one on a later
+    // REPL line errors on BOTH engines (cross-chunk runtime check).
+    for session in ["fn f() { return 1 }\nf = 5\n", "class C {}\nC = 9\n"] {
+        let (vm_out, vm_err) = run_repl_session(session, false);
+        let (tw_out, tw_err) = run_repl_session(session, true);
+        let vm = format!("{vm_out}{vm_err}");
+        let tw = format!("{tw_out}{tw_err}");
+        assert!(
+            vm.contains("cannot assign to immutable binding"),
+            "VM must reject for {session:?}; out={vm_out:?} err={vm_err:?}"
+        );
+        assert!(
+            tw.contains("cannot assign to immutable binding"),
+            "TW must reject for {session:?}; out={tw_out:?} err={tw_err:?}"
+        );
+    }
+}
+
+#[test]
+fn repl_vm_mutable_let_reassignment_across_lines_succeeds() {
+    // A mutable top-level `let` reassigned on a later line works (the runtime check
+    // must NOT over-trigger) — both engines print the new value.
+    let session = "let m = 1\nm = 2\nm\n";
+    let (vm_out, _) = run_repl_session(session, false);
+    let (tw_out, _) = run_repl_session(session, true);
+    assert!(vm_out.contains('2'), "VM let reassignment; stdout: {vm_out:?}");
+    assert!(tw_out.contains('2'), "TW let reassignment; stdout: {tw_out:?}");
+}
+
+#[test]
+fn file_mode_imported_const_reassignment_errors_on_both_engines() {
+    // A main module that imports an immutable `const` from another module and then
+    // reassigns it: BOTH engines reject `cannot assign to immutable binding 'K'` (in
+    // file mode the import + reassignment are in the same entry chunk, so the runtime
+    // SET_GLOBAL check fires identically to the tree-walker).
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join("ascript_imp_reassign_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("m.as"), "export const K = 1\n").unwrap();
+    let main = dir.join("main.as");
+    std::fs::write(&main, "import { K } from \"./m\"\nK = 5\nprint(K)\n").unwrap();
+
+    let vm = Command::new(bin).arg("run").arg(&main).output().unwrap();
+    let tw = Command::new(bin)
+        .args(["run", "--tree-walker"])
+        .arg(&main)
+        .output()
+        .unwrap();
+    let vm_err = String::from_utf8_lossy(&vm.stderr);
+    let tw_err = String::from_utf8_lossy(&tw.stderr);
+    assert!(
+        vm_err.contains("cannot assign to immutable binding 'K'"),
+        "VM must reject imported-const reassignment; stderr={vm_err:?}"
+    );
+    assert!(
+        tw_err.contains("cannot assign to immutable binding 'K'"),
+        "TW must reject imported-const reassignment; stderr={tw_err:?}"
+    );
+    assert!(!vm.status.success(), "VM must exit non-zero");
+    assert!(!tw.status.success(), "TW must exit non-zero");
+}
+
+#[test]
+fn repl_vm_dead_const_reassignment_across_lines_runs_fine() {
+    // A const reassignment in an UN-ENTERED branch on a later line never executes,
+    // so it does NOT error (runtime timing) — both engines keep k=1 and print it.
+    let session = "const k = 1\nif (false) { k = 2 }\nk\n";
+    let (vm_out, vm_err) = run_repl_session(session, false);
+    let (tw_out, _) = run_repl_session(session, true);
+    assert!(
+        !vm_err.contains("immutable"),
+        "dead const reassign must not error; err={vm_err:?}"
+    );
+    assert!(vm_out.contains('1'), "VM keeps k=1; stdout: {vm_out:?}");
+    assert!(tw_out.contains('1'), "TW keeps k=1; stdout: {tw_out:?}");
+}
+
+#[test]
 fn repl_vm_panic_recovers_and_keeps_prior_bindings() {
     // A bad line (undefined var) reports an error but the loop continues with the
     // prior bindings intact.

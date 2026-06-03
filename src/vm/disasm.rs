@@ -72,9 +72,16 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
 
     match op {
         // u16 const-pool index → show the referenced value.
-        Op::Const | Op::GetGlobal | Op::DefineGlobal | Op::SetGlobal | Op::ImmutableError => {
+        Op::Const | Op::GetGlobal | Op::SetGlobal | Op::ImmutableError => {
             let idx = chunk.read_u16(at + 1);
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
+        }
+        // u16 name-const index + u8 mutability flag (1 = let, 0 = const/fn/class/…).
+        Op::DefineGlobal => {
+            let idx = chunk.read_u16(at + 1);
+            let mutable = chunk.read_u8(at + 3);
+            let kind = if mutable == 1 { "let" } else { "const" };
+            let _ = write!(line, "{idx:>5} {mutable} ; {kind} {}", const_repr(chunk, idx));
         }
         // i16 relative jump → show the absolute target offset.
         Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpIfNotNil | Op::Loop => {

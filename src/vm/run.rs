@@ -29,6 +29,20 @@ use std::rc::{Rc, Weak};
 /// reads it back (the namespace form clones it into a `Value::Object`).
 type ModuleExports = Rc<RefCell<indexmap::IndexMap<String, Value>>>;
 
+/// A module-scope user-global slot: its current value plus its REASSIGNABILITY,
+/// mirroring the tree-walker's per-binding `Environment` mutability flag. A `let`
+/// (or `param`, never a global) is mutable; `const`/`fn`/`class`/`enum`/`import` are
+/// immutable. `Op::SetGlobal` consults `mutable` at RUNTIME so an immutable global
+/// reassigned from a LATER, separately-compiled chunk (REPL line-to-line, or a main
+/// module reassigning an import) errors `cannot assign to immutable binding` exactly
+/// like the tree-walker — the compile-time `Op::ImmutableError` only sees same-chunk
+/// assignments. The value is a plain owned `Value` (the `Vm` is the GC root, so it
+/// stays reachable — NO `Cc` cell, preserving the deterministic native-Drop gate).
+struct GlobalSlot {
+    value: Value,
+    mutable: bool,
+}
+
 /// The bytecode virtual machine.
 ///
 /// Holds the shared [`Interp`] (the runtime state the VM and tree-walker share)
@@ -112,7 +126,7 @@ pub struct Vm {
     /// REPL's cross-line persistence: one `Vm` kept alive across lines carries its
     /// globals forward. (A file module's exports use the separate `module_exports`
     /// path; only the entry chunk defines into this table.)
-    user_globals: RefCell<indexmap::IndexMap<Rc<str>, Value>>,
+    user_globals: RefCell<indexmap::IndexMap<Rc<str>, GlobalSlot>>,
     /// Monotonic version counter, bumped on every global (re)definition or
     /// assignment. The V11-T4 GET_GLOBAL inline cache (`adapt::GlobalCache`) guards
     /// its cached value with this version: a cache entry recorded at version V is
@@ -210,8 +224,8 @@ impl Vm {
             // VM's construct path reads those via `GET_GLOBAL`, but `.from` evaluates
             // the default through this `def_env`. Kept in sync by `define_user_global`.
             let env = crate::interp::global_env().child();
-            for (name, value) in self.user_globals.borrow().iter() {
-                let _ = env.define(name, value.clone(), true);
+            for (name, gslot) in self.user_globals.borrow().iter() {
+                let _ = env.define(name, gslot.value.clone(), true);
             }
             *slot = Some(env);
         }
@@ -576,6 +590,9 @@ impl Vm {
 
                 Op::DefineGlobal => {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    // The u8 mutability flag follows the u16 name const (1 = `let`,
+                    // 0 = immutable `const`/`fn`/`class`/`enum`/`import`).
+                    let mutable = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) != 0;
                     let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
                         Value::Str(s) => s.clone(),
                         other => {
@@ -600,7 +617,7 @@ impl Vm {
                             "'{name}' is already defined in this scope"
                         ))));
                     }
-                    self.define_user_global(name, v);
+                    self.define_user_global(name, v, mutable);
                 }
 
                 Op::SetGlobal => {
@@ -618,24 +635,44 @@ impl Vm {
                     // Top-level reassignment `x = …` of an EXISTING module global. A
                     // SET_LOCAL-style assignment leaves the value on the stack (an
                     // assignment is an expression yielding the assigned value), so we
-                    // PEEK (clone TOS) rather than pop. Assigning to a name not in the
-                    // user-globals table is the tree-walker's exact error (see
-                    // `Interp` assignment): `cannot assign to undefined variable '<n>'`.
+                    // PEEK (clone TOS) rather than pop.
+                    //
+                    // RUNTIME mutability check (the single source of truth for GLOBAL
+                    // assignment targets — the compiler always lowers a global-target
+                    // assignment to SET_GLOBAL, never the compile-time IMMUTABLE_ERROR):
+                    //   - IMMUTABLE global (`const`/`fn`/`class`/`enum`/`import`) → the
+                    //     tree-walker's `cannot assign to immutable binding '<n>'`,
+                    //     anchored at the TARGET span (this op's span). This fires even
+                    //     when the immutable decl was in an EARLIER, separately-compiled
+                    //     chunk (REPL line-to-line; a main module reassigning an import),
+                    //     which the compile-time IMMUTABLE_ERROR cannot see. It is
+                    //     RUNTIME-timed: only an EXECUTED store errors (a dead
+                    //     `if false { k = 2 }` never runs this op), matching the
+                    //     tree-walker's `Environment::assign`.
+                    //   - Absent name → `cannot assign to undefined variable '<n>'`.
+                    //   - Mutable global (`let`) → update in place. We do NOT bump the
+                    //     global version: user-global reads are never cached (only
+                    //     immutable builtins are), and a value update cannot change which
+                    //     NAME a cached builtin entry resolves to — so no cache can go
+                    //     stale. Keeps a hot reassignment loop cheap (no per-iteration
+                    //     cache invalidation), matching the generic VM.
                     let v = fiber.peek(0).clone();
-                    if self.user_globals.borrow().contains_key(name.as_ref()) {
-                        // Update the existing global's value in place. We do NOT bump
-                        // the global version: user-global reads are never cached (only
-                        // immutable builtins are), and a value update cannot change
-                        // which NAME a cached builtin entry resolves to — so no cache
-                        // can go stale. This keeps a hot reassignment loop cheap (no
-                        // per-iteration cache invalidation), matching the generic VM.
-                        self.update_user_global(&name, v);
-                    } else {
-                        return Err(self.panic_at(
-                            fiber,
-                            fault_ip,
-                            format!("cannot assign to undefined variable '{name}'"),
-                        ));
+                    match self.user_global_mutable(name.as_ref()) {
+                        Some(true) => self.update_user_global(&name, v),
+                        Some(false) => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("cannot assign to immutable binding '{name}'"),
+                            ));
+                        }
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("cannot assign to undefined variable '{name}'"),
+                            ));
+                        }
                     }
                 }
 
@@ -1537,7 +1574,9 @@ impl Vm {
                                     }
                                 };
                                 if is_global {
-                                    self.define_user_global(Rc::from(name.as_str()), v);
+                                    // An imported name is an IMMUTABLE module global
+                                    // (tree-walker `define(..., false)`).
+                                    self.define_user_global(Rc::from(name.as_str()), v, false);
                                 } else if is_cell {
                                     fiber.set_local_cell(slot as usize, v);
                                 } else {
@@ -1555,7 +1594,8 @@ impl Vm {
                             let map = exports.borrow().clone();
                             let ns = Value::Object(crate::value::ObjectCell::new(map));
                             if is_global {
-                                self.define_user_global(Rc::from(alias.as_str()), ns);
+                                // A namespace alias is an IMMUTABLE module global.
+                                self.define_user_global(Rc::from(alias.as_str()), ns, false);
                             } else if is_cell {
                                 fiber.set_local_cell(slot as usize, ns);
                             } else {
@@ -2852,28 +2892,42 @@ impl Vm {
     /// Read a module-scope user-global by name. Returns the stored `Value` (cloned)
     /// or `None` if not yet defined.
     fn get_user_global(&self, name: &str) -> Option<Value> {
-        self.user_globals.borrow().get(name).cloned()
+        self.user_globals.borrow().get(name).map(|s| s.value.clone())
     }
 
-    /// Update an EXISTING module-scope user-global's value WITHOUT bumping the global
-    /// version (a value update cannot invalidate any cache — user-global reads are
-    /// never cached, and builtin caches key on the NAME's resolution target, which an
-    /// in-place value update does not change). Keeps the class `def_env` in sync for
-    /// `.from`/typed-parse default resolution. Caller has confirmed the key exists.
+    /// Whether a module-scope user-global named `name` exists and is REASSIGNABLE.
+    /// `None` if not yet defined; `Some(false)` if it is an immutable binding
+    /// (`const`/`fn`/`class`/`enum`/`import`). Consulted by `Op::SetGlobal`.
+    fn user_global_mutable(&self, name: &str) -> Option<bool> {
+        self.user_globals.borrow().get(name).map(|s| s.mutable)
+    }
+
+    /// Update an EXISTING module-scope user-global's value (preserving its mutability
+    /// flag) WITHOUT bumping the global version (a value update cannot invalidate any
+    /// cache — user-global reads are never cached, and builtin caches key on the
+    /// NAME's resolution target, which an in-place value update does not change).
+    /// Keeps the class `def_env` in sync for `.from`/typed-parse default resolution.
+    /// Caller has confirmed the key exists AND is mutable.
     fn update_user_global(&self, name: &str, value: Value) {
         if let Some(slot) = self.user_globals.borrow_mut().get_mut(name) {
-            *slot = value.clone();
+            slot.value = value.clone();
         }
         if let Some(env) = self.class_env.borrow().as_ref() {
             let _ = env.assign(name, value);
         }
     }
 
-    /// Define (create/overwrite) a module-scope user-global and bump the version.
-    fn define_user_global(&self, name: Rc<str>, value: Value) {
-        self.user_globals
-            .borrow_mut()
-            .insert(name.clone(), value.clone());
+    /// Define (create/overwrite) a module-scope user-global with its REASSIGNABILITY
+    /// (`mutable` = a `let`; `false` = `const`/`fn`/`class`/`enum`/`import`) and bump
+    /// the version.
+    fn define_user_global(&self, name: Rc<str>, value: Value, mutable: bool) {
+        self.user_globals.borrow_mut().insert(
+            name.clone(),
+            GlobalSlot {
+                value: value.clone(),
+                mutable,
+            },
+        );
         self.bump_global_version();
         // Keep the lazily-built class `def_env` (used by the SHARED `validate_into`
         // for `.from`/typed-parse field-default resolution) in sync, so a default
