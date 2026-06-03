@@ -66,13 +66,23 @@ stream.from(nats())       // infinite lazy source from a generator
 
 ### `stream.range(start, end, step?)`
 
-A numeric range `[start, end)`, advancing by `step` (default `1`). `end` is
-exclusive. `step` must be non-zero. Negative step counts down:
+A numeric range `[start, end)` (`end` exclusive), following the same unified
+range model as the `..` syntax:
+
+- **Omitted `step`** — the direction is **inferred from the bounds**:
+  `start < end` counts up by `+1`, `start > end` counts **down** by `-1`.
+  So `stream.range(10, 1)` yields `10, 9, …, 2`.
+- **Explicit `step`** — the step's **sign is honored**, but a sign that
+  **disagrees** with the bounds direction is a mismatch and **panics** (it is
+  *not* a silent empty range): `stream.range(1, 10, -2)` panics.
+- `step` must be **finite and non-zero**; `step 0` / `±Infinity` / `NaN` panic.
 
 ```ascript
 stream.range(0, 5)         // 0, 1, 2, 3, 4
 stream.range(0, 10, 2)     // 0, 2, 4, 6, 8
 stream.range(10, 0, -3)    // 10, 7, 4, 1
+stream.range(10, 1)        // 10, 9, 8, 7, 6, 5, 4, 3, 2  (direction inferred)
+stream.range(1, 10, -2)    // panic: step -2 moves away from end (10); range can never progress
 ```
 
 ---

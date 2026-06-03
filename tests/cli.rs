@@ -1407,6 +1407,85 @@ fn stepped_ranges_validation_panics_both_engines() {
 }
 
 #[test]
+fn stdlib_stream_range_unified_model_both_engines() {
+    // RANGES FEATURE, Phase 6: `stream.range` follows the SAME unified model as
+    // the `..` syntax. Omitted step infers direction from the bounds (counts down
+    // for `range(10, 1)`); the three documented examples are unchanged; both
+    // engines agree byte-for-byte.
+    let cases = [
+        // CHANGED: omitted step infers descending (was `[]`).
+        (
+            "import { range, collect } from \"std/stream\"\nprint(await collect(range(10, 1)))",
+            "[10, 9, 8, 7, 6, 5, 4, 3, 2]\n",
+        ),
+        // UNCHANGED documented examples.
+        (
+            "import { range, collect } from \"std/stream\"\nprint(await collect(range(0, 5)))",
+            "[0, 1, 2, 3, 4]\n",
+        ),
+        (
+            "import { range, collect } from \"std/stream\"\nprint(await collect(range(0, 10, 2)))",
+            "[0, 2, 4, 6, 8]\n",
+        ),
+        (
+            "import { range, collect } from \"std/stream\"\nprint(await collect(range(10, 0, -3)))",
+            "[10, 7, 4, 1]\n",
+        ),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("streamrange_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("streamrange_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn stdlib_stream_range_validation_panics_both_engines() {
+    // Phase 6: `stream.range` validation panics are byte-identical to the range
+    // SYNTAX panics (shared `resolve_step`): sign-mismatch and zero step.
+    for (i, (src, msg)) in [
+        (
+            "import { range, collect } from \"std/stream\"\nawait collect(range(1, 10, -2))",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+        (
+            "import { range, collect } from \"std/stream\"\nawait collect(range(1, 10, 0))",
+            "step must be a finite, non-zero number",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let file = std::env::temp_dir().join(format!("ascript_streamrange_panic_{i}.as"));
+        std::fs::write(&file, src).unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        for tw in [false, true] {
+            let mut cmd = Command::new(bin);
+            cmd.arg("run");
+            if tw {
+                cmd.arg("--tree-walker");
+            }
+            let out = cmd.arg(&file).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "{} should PANIC on `{src}`, got {:?}",
+                if tw { "tree-walker" } else { "vm" },
+                out
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(msg),
+                "{} stderr for `{src}` should contain {msg:?}, got: {stderr}",
+                if tw { "tree-walker" } else { "vm" }
+            );
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
+#[test]
 fn stepped_match_patterns_both_engines() {
     // RANGES FEATURE, Phase 5: `step` in a match-range pattern = strided
     // membership (spec §3.7), byte-identical on the VM and the tree-walker.

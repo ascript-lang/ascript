@@ -281,17 +281,20 @@ impl Interp {
         }))
     }
 
-    /// `stream.range(start, end, step?)` — numeric, exclusive end, default step 1.
+    /// `stream.range(start, end, step?)` — numeric, exclusive end. Unified range
+    /// model (spec §3/§4): an omitted step infers direction from the bounds
+    /// (`range(10, 1)` counts down); an explicit step's sign is honored but must
+    /// agree with the bounds (a disagreeing sign panics); step `0`/non-finite
+    /// panics. Validation goes through the shared `interp::resolve_step` so the
+    /// panic messages are byte-identical to the range *syntax*.
     fn stream_range(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let start = want_number(&arg(args, 0), span, "stream.range start")?;
         let end = want_number(&arg(args, 1), span, "stream.range end")?;
-        let step = match arg(args, 2) {
-            Value::Nil => 1.0,
-            v => want_number(&v, span, "stream.range step")?,
+        let step_opt = match arg(args, 2) {
+            Value::Nil => None,
+            v => Some(want_number(&v, span, "stream.range step")?),
         };
-        if step == 0.0 {
-            return Err(AsError::at("stream.range step must be non-zero", span).into());
-        }
+        let step = crate::interp::resolve_step(start, end, step_opt, span)?;
         Ok(self.register_stream(StreamState {
             source: StreamSource::Range {
                 cur: start,
@@ -875,6 +878,66 @@ print(await collect(range(0, 10, 3)))
 "#)
         .await;
         assert_eq!(out, "[0, 3, 6, 9]\n");
+    }
+
+    #[tokio::test]
+    async fn range_documented_examples_unchanged() {
+        // The three documented examples must keep working byte-for-byte (spec §4).
+        let out = run(r#"
+import { range, collect } from "std/stream"
+print(await collect(range(0, 5)))
+print(await collect(range(0, 10, 2)))
+print(await collect(range(10, 0, -3)))
+"#)
+        .await;
+        assert_eq!(out, "[0, 1, 2, 3, 4]\n[0, 2, 4, 6, 8]\n[10, 7, 4, 1]\n");
+    }
+
+    #[tokio::test]
+    async fn range_omitted_step_infers_descending() {
+        // CHANGED behavior: `range(10, 1)` now counts down (was `[]`).
+        let out = run(r#"
+import { range, collect } from "std/stream"
+print(await collect(range(10, 1)))
+"#)
+        .await;
+        assert_eq!(out, "[10, 9, 8, 7, 6, 5, 4, 3, 2]\n");
+    }
+
+    #[tokio::test]
+    async fn range_sign_mismatch_panics() {
+        // CHANGED: an explicit step whose sign disagrees with the bounds direction
+        // now PANICS (was silently `[]`). Message is byte-identical to range syntax.
+        let result = crate::run_source(
+            r#"
+import { range, collect } from "std/stream"
+await collect(range(1, 10, -2))
+"#,
+        )
+        .await;
+        let err = result.expect_err("expected mismatch panic");
+        assert!(
+            format!("{err:?}")
+                .contains("step -2 moves away from end (10); range can never progress"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn range_zero_step_panics() {
+        // step 0 → shared finite/non-zero panic message.
+        let result = crate::run_source(
+            r#"
+import { range, collect } from "std/stream"
+await collect(range(1, 10, 0))
+"#,
+        )
+        .await;
+        let err = result.expect_err("expected zero-step panic");
+        assert!(
+            format!("{err:?}").contains("step must be a finite, non-zero number"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
