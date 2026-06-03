@@ -308,6 +308,185 @@ fn repeatable_deny_applies_to_all() {
     );
 }
 
+// --- CFG-T3: ascript.toml [lint] config -----------------------------------
+//
+// Discovery walks UP from each checked file's parent directory looking for
+// `ascript.toml`. Tests therefore put the `.as` file and `ascript.toml` in the
+// SAME unique temp dir and pass the file path. Precedence: inline-ignore >
+// CLI flag > toml > rule default.
+mod toml_config {
+    use std::process::Command;
+    fn bin() -> &'static str {
+        env!("CARGO_BIN_EXE_ascript")
+    }
+    // A fresh, unique project dir per test so toml discovery is deterministic and
+    // tests don't see each other's `ascript.toml`.
+    fn project(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ascript_toml_cfg_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn write(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+    fn combined(out: &std::process::Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
+    #[test]
+    fn toml_deny_promotes_warning_to_error_exit() {
+        let dir = project("deny");
+        let f = write(&dir, "a.as", "let x = 1\n");
+        write(&dir, "ascript.toml", "[lint]\ndeny = [\"unused-binding\"]\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "ascript.toml deny must promote to Error and exit non-zero; out: {}",
+            combined(&out)
+        );
+    }
+
+    #[test]
+    fn cli_allow_overrides_toml_deny() {
+        // toml denies, CLI allows → CLI wins → exit 0 (CLI > toml).
+        let dir = project("cli_over_toml");
+        let f = write(&dir, "a.as", "let x = 1\n");
+        write(&dir, "ascript.toml", "[lint]\ndeny = [\"unused-binding\"]\n");
+        let out = Command::new(bin())
+            .arg("check")
+            .arg("--allow")
+            .arg("unused-binding")
+            .arg(&f)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "CLI --allow must override toml deny (CLI > toml); out: {}",
+            combined(&out)
+        );
+    }
+
+    #[test]
+    fn toml_allow_suppresses_rule() {
+        let dir = project("allow");
+        let f = write(&dir, "a.as", "let x = 1\n");
+        write(&dir, "ascript.toml", "[lint]\nallow = [\"unused-binding\"]\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(out.status.success(), "toml allow must exit 0");
+        assert!(
+            !combined(&out).contains("unused-binding"),
+            "toml allow must drop the diagnostic; out: {}",
+            combined(&out)
+        );
+    }
+
+    #[test]
+    fn toml_deny_warnings_fails_warning_only_file() {
+        let dir = project("denywarn");
+        let f = write(&dir, "a.as", "let x = 1\n");
+        write(&dir, "ascript.toml", "[lint]\ndeny_warnings = true\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "toml deny_warnings=true must fail a warning-only file; out: {}",
+            combined(&out)
+        );
+    }
+
+    #[test]
+    fn malformed_toml_is_a_clear_error() {
+        let dir = project("malformed");
+        let f = write(&dir, "a.as", "let x = 1\n");
+        // `deny` must be an array; a string is a type error in the [lint] table.
+        write(&dir, "ascript.toml", "[lint]\ndeny = \"notalist\"\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(!out.status.success(), "malformed toml must exit non-zero");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("ascript.toml"),
+            "error must name ascript.toml; stderr: {err}"
+        );
+    }
+
+    #[test]
+    fn broken_toml_syntax_is_a_clear_error() {
+        let dir = project("broken");
+        let f = write(&dir, "a.as", "let x = 1\n");
+        write(&dir, "ascript.toml", "[lint\ndeny = [\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(!out.status.success(), "broken toml syntax must exit non-zero");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("ascript.toml"),
+            "error must name ascript.toml; stderr: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_rule_in_toml_is_a_clear_error() {
+        let dir = project("unknown");
+        let f = write(&dir, "a.as", "let x = 1\n");
+        write(&dir, "ascript.toml", "[lint]\ndeny = [\"bogus\"]\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(!out.status.success(), "unknown rule in toml must exit non-zero");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("ascript.toml") && err.contains("bogus"),
+            "error must name ascript.toml and the unknown rule; stderr: {err}"
+        );
+    }
+
+    #[test]
+    fn no_toml_behaves_as_default() {
+        // No ascript.toml anywhere in the dir → warning-only file still exits 0.
+        let dir = project("none");
+        let f = write(&dir, "a.as", "let x = 1\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            out.status.success(),
+            "no ascript.toml must behave as default (warning → exit 0); out: {}",
+            combined(&out)
+        );
+    }
+
+    #[test]
+    fn toml_discovered_by_walking_up() {
+        // ascript.toml in the project root, the .as file in a nested subdir.
+        let dir = project("walkup");
+        let sub = dir.join("src").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let f = write(&sub, "a.as", "let x = 1\n");
+        write(&dir, "ascript.toml", "[lint]\ndeny = [\"unused-binding\"]\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            !out.status.success(),
+            "ascript.toml in an ancestor dir must be discovered; out: {}",
+            combined(&out)
+        );
+    }
+
+    #[test]
+    fn inline_ignore_beats_toml_deny() {
+        // inline ascript-ignore always wins over a toml deny.
+        let dir = project("inline");
+        let f = write(&dir, "a.as", "let x = 1 // ascript-ignore[unused-binding]\n");
+        write(&dir, "ascript.toml", "[lint]\ndeny = [\"unused-binding\"]\n");
+        let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
+        assert!(
+            out.status.success(),
+            "inline ascript-ignore must beat a toml deny; out: {}",
+            combined(&out)
+        );
+    }
+}
+
 // The checker must NOT false-positive on idiomatic code: every example program
 // should produce zero diagnostics (or only ones a maintainer has suppressed in
 // the source). Any new false positive fails this and must be fixed (rule made

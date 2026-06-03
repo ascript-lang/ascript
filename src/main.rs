@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
+mod lint_config_toml;
+
 #[derive(Parser)]
 #[command(name = "ascript", about = "The AScript interpreter")]
 struct Cli {
@@ -138,31 +140,44 @@ async fn main() -> ExitCode {
             warn,
             allow,
         } => {
-            // Build the lint config from the flags, validating every rule code
-            // against the known set first. An unknown code is a usage error
-            // (distinct from a lint failure) — reject it before analyzing.
-            let mut config = ascript::check::LintConfig::default();
-            for (flag, codes) in [("deny", &deny), ("warn", &warn), ("allow", &allow)] {
-                for code in codes.iter() {
-                    if !ascript::check::LintConfig::is_known_code(code.as_str()) {
-                        eprintln!(
-                            "error: unknown lint rule '{}' (known rules: {})",
-                            code,
-                            ascript::check::RULE_CODES.join(", ")
-                        );
-                        return ExitCode::from(2);
-                    }
-                    match flag {
-                        "deny" => config.deny(code.as_str()),
-                        "warn" => config.warn(code.as_str()),
-                        _ => config.allow(code.as_str()),
-                    }
+            // Validate every CLI rule code against the known set up front. An
+            // unknown code is a usage error (distinct from a lint failure) —
+            // reject it before analyzing anything.
+            for code in deny.iter().chain(warn.iter()).chain(allow.iter()) {
+                if !ascript::check::LintConfig::is_known_code(code.as_str()) {
+                    eprintln!(
+                        "error: unknown lint rule '{}' (known rules: {})",
+                        code,
+                        ascript::check::RULE_CODES.join(", ")
+                    );
+                    return ExitCode::from(2);
                 }
             }
-            config.deny_warnings = deny_warnings;
+
+            // Overlay CLI flags onto a config (CLI > toml > rule default). Called
+            // per-file AFTER the file's `ascript.toml [lint]` table has seeded the
+            // config, so a CLI flag re-applies over (wins per-rule) any toml entry.
+            // `deny_warnings` is additive: CLI can only turn it on.
+            let overlay_cli = |config: &mut ascript::check::LintConfig| {
+                for code in &deny {
+                    config.deny(code.as_str());
+                }
+                for code in &warn {
+                    config.warn(code.as_str());
+                }
+                for code in &allow {
+                    config.allow(code.as_str());
+                }
+                if deny_warnings {
+                    config.deny_warnings = true;
+                }
+            };
 
             let mut any_error = false;
-            let mut any_warning = false;
+            // A surviving warning fails the run only when its file's effective
+            // config (CLI `--deny-warnings` OR toml `deny_warnings = true`) asks
+            // for it. Tracked per-file so a toml-only `deny_warnings` still bites.
+            let mut deny_warnings_tripped = false;
             for file in &files {
                 let src = match std::fs::read_to_string(file) {
                     Ok(s) => s,
@@ -172,11 +187,27 @@ async fn main() -> ExitCode {
                         continue;
                     }
                 };
+                // Seed the config from the nearest `ascript.toml [lint]`, then
+                // overlay the CLI flags. A toml problem (malformed / wrong type /
+                // unknown rule) is a clear, file-named usage error → exit 2.
+                let mut config = match lint_config_toml::config_for_file(std::path::Path::new(file))
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                overlay_cli(&mut config);
                 let analysis = ascript::check::analyze::analyze_with_config(&src, &config);
                 for d in &analysis.diagnostics {
                     match d.severity {
                         ascript::check::Severity::Error => any_error = true,
-                        ascript::check::Severity::Warning => any_warning = true,
+                        ascript::check::Severity::Warning => {
+                            if config.deny_warnings {
+                                deny_warnings_tripped = true;
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -189,7 +220,7 @@ async fn main() -> ExitCode {
                     );
                 }
             }
-            let fail = any_error || (deny_warnings && any_warning);
+            let fail = any_error || deny_warnings_tripped;
             if fail {
                 ExitCode::from(1)
             } else {

@@ -31,7 +31,10 @@ regex = { version = "1.12.3", optional = true }
 base64 = { version = "0.22", optional = true }
 hex = { version = "0.4", optional = true }
 csv = { version = "1", optional = true }
-toml = { version = "0.8", optional = true }
+# NOT feature-gated: the CLI's `ascript.toml [lint]` parser (in `src/cli/`) needs
+# `toml` unconditionally so `--no-default-features` still builds the config layer.
+# `src/check/` stays toml-free and feature-independent.
+toml = "0.8"
 serde_yaml = { version = "0.9", optional = true }
 percent-encoding = { version = "2", optional = true }
 url = { version = "2", optional = true }
@@ -75,7 +78,7 @@ tree-sitter = "0.25"
 
 [features]
 default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo"]
-data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:toml", "dep:serde_yaml", "dep:percent-encoding", "dep:url"]
+data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:serde_yaml", "dep:percent-encoding", "dep:url"]
 # std/log: leveled structured logging. Reuses json's total `to_json_lossy`
 # serializer (behind `data`), so it pulls in `data`. Default-on; cfg's out
 # cleanly under --no-default-features.
