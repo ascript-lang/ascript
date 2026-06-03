@@ -220,8 +220,39 @@ impl Vm {
                     }
                 }
 
-                Op::Call => {
-                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at) as usize;
+                Op::Call | Op::CallSpread => {
+                    // `Op::Call` carries a STATIC `u8` argc; `Op::CallSpread` carries
+                    // none — its arguments arrived as a single runtime `Value::Array`
+                    // (built by the array/spread builder ops) sitting on top of the
+                    // callee `[..., callee, argsArray]`. For `CallSpread` we POP the
+                    // args array and re-push its elements as individual stack slots,
+                    // so the stack becomes `[..., callee, arg0, .., arg{n-1}]` — the
+                    // EXACT shape `Op::Call` expects — and dispatch is shared below
+                    // (arity/contracts then apply to the flattened list, byte-
+                    // identical to the tree-walker's `eval_call_args` → call).
+                    let argc = if matches!(op, Op::CallSpread) {
+                        let args = match fiber.pop() {
+                            Value::Array(a) => a,
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "CALL_SPREAD args are not an array: {}",
+                                        crate::interp::type_name(&other)
+                                    ),
+                                ))
+                            }
+                        };
+                        let items: Vec<Value> = args.borrow().iter().cloned().collect();
+                        let n = items.len();
+                        for v in items {
+                            fiber.push(v);
+                        }
+                        n
+                    } else {
+                        fiber.frame().closure.proto.chunk.read_u8(operand_at) as usize
+                    };
                     // The callee sits just below its `argc` arguments on the stack:
                     // `[..., callee, arg0, .., arg{argc-1}]`. Its stack index is the
                     // base where, for a Closure callee, the args become the callee
@@ -592,6 +623,150 @@ impl Vm {
                         map.insert(k.to_string(), v);
                     }
                     fiber.push(Value::Object(Rc::new(RefCell::new(map))));
+                }
+
+                Op::Spread | Op::SpreadArgs => {
+                    // `[arr, operand] -- [arr]` — flatten the spread `operand` (an
+                    // Array) into the under-construction array `arr` below it.
+                    // Mirrors the tree-walker's `ExprKind::Array` / `eval_call_args`
+                    // spread arm: a non-array is the SAME Tier-2 panic, anchored at
+                    // this op's span (the operand's trivia-trimmed code span). The
+                    // ONLY difference between SPREAD and SPREAD_ARGS is the message
+                    // ("into an array" vs "as call arguments").
+                    let operand = fiber.pop();
+                    match operand {
+                        Value::Array(src) => {
+                            // Clone elements out FIRST so a self-spread (`[...a]`
+                            // where `arr` aliased `a`) cannot observe a borrow
+                            // conflict, then extend the builder array.
+                            let items: Vec<Value> = src.borrow().iter().cloned().collect();
+                            match fiber.peek(0) {
+                                Value::Array(arr) => arr.borrow_mut().extend(items),
+                                other => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!(
+                                            "SPREAD target is not an array: {}",
+                                            crate::interp::type_name(other)
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        other => {
+                            let msg = if matches!(op, Op::SpreadArgs) {
+                                format!(
+                                    "can only spread an array as call arguments, got {}",
+                                    crate::interp::type_name(&other)
+                                )
+                            } else {
+                                format!(
+                                    "can only spread an array into an array, got {}",
+                                    crate::interp::type_name(&other)
+                                )
+                            };
+                            return Err(self.panic_at(fiber, fault_ip, msg));
+                        }
+                    }
+                }
+
+                Op::AppendArray => {
+                    // `[arr, item] -- [arr]` — push one `item` onto the builder
+                    // array `arr` below it.
+                    let item = fiber.pop();
+                    match fiber.peek(0) {
+                        Value::Array(arr) => arr.borrow_mut().push(item),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "APPEND_ARRAY target is not an array: {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendObject => {
+                    // `[obj, key, val] -- [obj]` — insert `key -> val` into the
+                    // builder object `obj`. Later-wins + first-position (IndexMap
+                    // insert), byte-identical to the tree-walker's `ExprKind::Object`.
+                    let val = fiber.pop();
+                    let key = match fiber.pop() {
+                        Value::Str(s) => s,
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("APPEND_OBJECT key is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    match fiber.peek(0) {
+                        Value::Object(obj) => {
+                            obj.borrow_mut().insert(key.to_string(), val);
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "APPEND_OBJECT target is not an object: {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    }
+                }
+
+                Op::SpreadObject => {
+                    // `[obj, operand] -- [obj]` — merge the operand object's entries
+                    // into the builder object `obj`. Mirrors the tree-walker's
+                    // `ExprKind::Object` spread arm: a non-object is the SAME Tier-2
+                    // panic at this op's span; entries insert later-wins/first-pos.
+                    let operand = fiber.pop();
+                    match operand {
+                        Value::Object(src) => {
+                            // Snapshot the source entries FIRST (avoids a borrow
+                            // conflict if `obj` aliases `src` via a self-spread).
+                            let entries: Vec<(String, Value)> = src
+                                .borrow()
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            match fiber.peek(0) {
+                                Value::Object(obj) => {
+                                    let mut m = obj.borrow_mut();
+                                    for (k, v) in entries {
+                                        m.insert(k, v);
+                                    }
+                                }
+                                other => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!(
+                                            "SPREAD_OBJECT target is not an object: {}",
+                                            crate::interp::type_name(other)
+                                        ),
+                                    ))
+                                }
+                            }
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "can only spread an object into an object, got {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ))
+                        }
+                    }
                 }
 
                 Op::GetIndex => {

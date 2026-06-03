@@ -13,9 +13,9 @@ use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
     ClassDecl, ContinueStmt, EnumDecl, Expr, FnDecl, ForStmt, IfStmt, IndexExpr, LetStmt, Literal,
-    MemberExpr, MethodDecl, NameRef, ObjectExpr, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt,
-    SourceFile, Stmt, TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt,
-    YieldExpr,
+    MemberExpr, MethodDecl, NameRef, ObjectExpr, ObjectField, OptMemberExpr, ParenExpr, RangeExpr,
+    ReturnStmt, SourceFile, SpreadElem, Stmt, TemplateExpr, TernaryExpr, TryExpr, UnaryExpr,
+    UnwrapExpr, WhileStmt, YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
@@ -2321,6 +2321,15 @@ impl Compiler {
         // defers a non-builtin bare global with its own clear error.
         self.compile_expr(&callee)?;
 
+        // A spread anywhere in the argument list makes the argc dynamic: build the
+        // flattened arg array at runtime, then dispatch via `CALL_SPREAD`. Without a
+        // spread the static fixed-argc `CALL` path is used (byte-identical output).
+        if self.arg_list_has_spread(call) {
+            self.compile_spread_args(call, span)?;
+            self.chunk.emit(Op::CallSpread, span);
+            return Ok(());
+        }
+
         // Compile each argument, left to right.
         let mut argc: u8 = 0;
         if let Some(arg_list) = call.arg_list() {
@@ -2333,6 +2342,48 @@ impl Compiler {
         }
 
         self.chunk.emit_u8(Op::Call, argc, span);
+        Ok(())
+    }
+
+    /// Whether a call's argument list contains a `...spread` element (a `SpreadElem`
+    /// child of the `ArgList`). Drives the dynamic-arity `CALL_SPREAD` lowering.
+    fn arg_list_has_spread(&self, call: &CallExpr) -> bool {
+        call.arg_list()
+            .map(|al| {
+                al.syntax()
+                    .children()
+                    .any(|c| c.kind() == SyntaxKind::SpreadElem)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Build the flattened call-argument array at runtime onto the stack (leaving a
+    /// single `Value::Array`): `NEW_ARRAY 0`, then for each source-order arg either
+    /// `<item>; APPEND_ARRAY` (one positional arg) or `<operand>; SPREAD_ARGS`
+    /// (flatten the operand array's elements in). `SPREAD_ARGS` mirrors the
+    /// tree-walker's `eval_call_args` spread arm — a non-array operand panics with
+    /// `can only spread an array as call arguments, got {type}` at the operand's
+    /// trivia-trimmed span. The arg ORDER (and thus arity/contract application)
+    /// matches the tree-walker exactly.
+    fn compile_spread_args(&mut self, call: &CallExpr, span: Span) -> Result<(), CompileError> {
+        self.chunk.emit_u16(Op::NewArray, 0, span);
+        let Some(arg_list) = call.arg_list() else {
+            return Ok(());
+        };
+        for child in arg_list.syntax().children() {
+            if let Some(spread) = SpreadElem::cast(child.clone()) {
+                let operand = spread.expr().ok_or_else(|| {
+                    CompileError::new("call argument spread (...) missing operand", node_span(&spread))
+                })?;
+                let op_span = node_code_span(&operand);
+                self.compile_expr(&operand)?;
+                self.chunk.emit(Op::SpreadArgs, op_span);
+            } else if let Some(arg) = Expr::cast(child.clone()) {
+                self.compile_expr(&arg)?;
+                self.chunk.emit(Op::AppendArray, span);
+            }
+            // Tokens (`(`, `,`, `)`) and trivia are skipped.
+        }
         Ok(())
     }
 
@@ -2369,6 +2420,14 @@ impl Compiler {
         if is_super_receiver(&object) {
             let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
             self.chunk.emit_u16(Op::GetSuper, name_idx, span);
+            // `GET_SUPER` leaves the BoundMethod callee on the stack, so a spread
+            // argument list is the same dynamic-arity build + `CALL_SPREAD` as a
+            // plain call (the callee is already in place).
+            if self.arg_list_has_spread(call) {
+                self.compile_spread_args(call, span)?;
+                self.chunk.emit(Op::CallSpread, span);
+                return Ok(());
+            }
             let mut argc: u8 = 0;
             if let Some(arg_list) = call.arg_list() {
                 for arg in arg_list.exprs() {
@@ -2380,6 +2439,19 @@ impl Compiler {
             }
             self.chunk.emit_u8(Op::Call, argc, span);
             return Ok(());
+        }
+
+        // A spread in a member-method call `recv.m(...args)` would need a
+        // CALL_METHOD variant that flattens a runtime-length arg list while keeping
+        // the schema-hook / `read_member` receiver dispatch. No example/test in the
+        // gated corpus hits this (the spread examples use bare-name calls); rather
+        // than diverge, reject it with a clear error. (Bare-name and `super.m(...)`
+        // spread calls ARE supported.)
+        if self.arg_list_has_spread(call) {
+            return Err(CompileError::new(
+                "spread in a member-method call (recv.m(...args)) not yet supported",
+                span,
+            ));
         }
 
         // Receiver, then args (left to right).
@@ -2520,29 +2592,53 @@ impl Compiler {
     /// then `NEW_ARRAY n` (which pops `n` values, preserving source order, into a
     /// fresh `Value::Array`). Matches the tree-walker's `ExprKind::Array`.
     ///
-    /// A spread element `[...a]` is a documented V10 deferral: the CST records it
-    /// as a `SpreadElem` child (NOT an `Expr`), so its presence is detected by a
-    /// `SpreadElem` child node and rejected with a clear `CompileError`.
+    /// A spread element `[...a, x, ...b]` (the CST records each as a `SpreadElem`
+    /// child interleaved with the plain `Expr` children) switches the lowering to
+    /// the INCREMENTAL builder: `NEW_ARRAY 0` (an empty array), then for each
+    /// source-order element either `<item>; APPEND_ARRAY` (push one) or
+    /// `<operand>; SPREAD` (flatten the operand array's elements in). This mirrors
+    /// the tree-walker's `ExprKind::Array` `Vec` build order exactly, and `SPREAD`
+    /// carries the operand's trivia-trimmed span so a non-array spread panics
+    /// byte-identically.
     fn compile_array(&mut self, arr: &ArrayExpr) -> Result<(), CompileError> {
         let span = node_span(arr);
-        if arr
+        let has_spread = arr
             .syntax()
             .children()
-            .any(|c| c.kind() == SyntaxKind::SpreadElem)
-        {
-            return Err(CompileError::new(
-                "spread in an array literal ([...a]) not yet supported (V10)",
-                span,
-            ));
+            .any(|c| c.kind() == SyntaxKind::SpreadElem);
+
+        if !has_spread {
+            // Fast path (no spread): byte-identical to the prior lowering — push all
+            // elements, then `NEW_ARRAY n`.
+            let mut n: u16 = 0;
+            for elem in arr.exprs() {
+                self.compile_expr(&elem)?;
+                n = n
+                    .checked_add(1)
+                    .ok_or_else(|| CompileError::new("array literal has too many elements", span))?;
+            }
+            self.chunk.emit_u16(Op::NewArray, n, span);
+            return Ok(());
         }
-        let mut n: u16 = 0;
-        for elem in arr.exprs() {
-            self.compile_expr(&elem)?;
-            n = n
-                .checked_add(1)
-                .ok_or_else(|| CompileError::new("array literal has too many elements", span))?;
+
+        // Incremental builder. Start with an empty array on the stack.
+        self.chunk.emit_u16(Op::NewArray, 0, span);
+        for child in arr.syntax().children() {
+            if let Some(spread) = SpreadElem::cast(child.clone()) {
+                let operand = spread.expr().ok_or_else(|| {
+                    CompileError::new("array spread (...) missing operand", node_span(&spread))
+                })?;
+                // The tree-walker anchors the non-array panic at the spread
+                // operand's `x.span` (no leading trivia) → the trimmed code span.
+                let op_span = node_code_span(&operand);
+                self.compile_expr(&operand)?;
+                self.chunk.emit(Op::Spread, op_span);
+            } else if let Some(elem) = Expr::cast(child.clone()) {
+                self.compile_expr(&elem)?;
+                self.chunk.emit(Op::AppendArray, span);
+            }
+            // Tokens (`[`, `,`, `]`) and trivia are skipped.
         }
-        self.chunk.emit_u16(Op::NewArray, n, span);
         Ok(())
     }
 
@@ -2560,37 +2656,66 @@ impl Compiler {
     /// literals have NO shorthand (`{x}`) — both parsers require `key: value` — so
     /// there is no shorthand case to handle.
     ///
-    /// Object-spread `{...o}` is a documented V10 deferral (a `SpreadElem` child).
+    /// Object-spread `{...o, k: v}` (the CST records each spread as a `SpreadElem`
+    /// child interleaved with the `ObjectField` children) switches the lowering to
+    /// the INCREMENTAL builder: `NEW_OBJECT 0` (an empty object), then for each
+    /// source-order entry either `<key>; <value>; APPEND_OBJECT` (insert one pair)
+    /// or `<operand>; SPREAD_OBJECT` (merge the operand object's entries in).
+    /// `APPEND_OBJECT`/`SPREAD_OBJECT` both `IndexMap::insert`, so later-wins +
+    /// first-position is byte-identical to the tree-walker; `SPREAD_OBJECT` carries
+    /// the operand's trivia-trimmed span for the identical non-object panic.
     fn compile_object(&mut self, obj: &ObjectExpr) -> Result<(), CompileError> {
         let span = node_span(obj);
-        if obj
+        let has_spread = obj
             .syntax()
             .children()
-            .any(|c| c.kind() == SyntaxKind::SpreadElem)
-        {
-            return Err(CompileError::new(
-                "spread in an object literal ({...o}) not yet supported (V10)",
-                span,
-            ));
+            .any(|c| c.kind() == SyntaxKind::SpreadElem);
+
+        if !has_spread {
+            // Fast path (no spread): byte-identical to the prior lowering.
+            let mut n: u16 = 0;
+            for field in obj.object_fields() {
+                let fspan = node_span(&field);
+                let key = object_field_key(&field)
+                    .ok_or_else(|| CompileError::new("object field has no key", fspan))?;
+                let value = field
+                    .value()
+                    .ok_or_else(|| CompileError::new("object field has no value", fspan))?;
+                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                self.chunk.emit_u16(Op::Const, key_idx, fspan);
+                self.compile_expr(&value)?;
+                n = n.checked_add(1).ok_or_else(|| {
+                    CompileError::new("object literal has too many fields", span)
+                })?;
+            }
+            self.chunk.emit_u16(Op::NewObject, n, span);
+            return Ok(());
         }
-        let mut n: u16 = 0;
-        for field in obj.object_fields() {
-            let fspan = node_span(&field);
-            // The key token is an `Ident` or a `Str`; decode it to the same
-            // string the tree-walker keys by.
-            let key = object_field_key(&field)
-                .ok_or_else(|| CompileError::new("object field has no key", fspan))?;
-            let value = field
-                .value()
-                .ok_or_else(|| CompileError::new("object field has no value", fspan))?;
-            let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
-            self.chunk.emit_u16(Op::Const, key_idx, fspan);
-            self.compile_expr(&value)?;
-            n = n
-                .checked_add(1)
-                .ok_or_else(|| CompileError::new("object literal has too many fields", span))?;
+
+        // Incremental builder. Start with an empty object on the stack.
+        self.chunk.emit_u16(Op::NewObject, 0, span);
+        for child in obj.syntax().children() {
+            if let Some(spread) = SpreadElem::cast(child.clone()) {
+                let operand = spread.expr().ok_or_else(|| {
+                    CompileError::new("object spread (...) missing operand", node_span(&spread))
+                })?;
+                let op_span = node_code_span(&operand);
+                self.compile_expr(&operand)?;
+                self.chunk.emit(Op::SpreadObject, op_span);
+            } else if let Some(field) = ObjectField::cast(child.clone()) {
+                let fspan = node_span(&field);
+                let key = object_field_key(&field)
+                    .ok_or_else(|| CompileError::new("object field has no key", fspan))?;
+                let value = field
+                    .value()
+                    .ok_or_else(|| CompileError::new("object field has no value", fspan))?;
+                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                self.chunk.emit_u16(Op::Const, key_idx, fspan);
+                self.compile_expr(&value)?;
+                self.chunk.emit(Op::AppendObject, fspan);
+            }
+            // Tokens (`{`, `,`, `}`) and trivia are skipped.
         }
-        self.chunk.emit_u16(Op::NewObject, n, span);
         Ok(())
     }
 
@@ -3339,15 +3464,59 @@ mod tests {
     }
 
     #[test]
-    fn array_spread_is_deferred() {
-        let err = compile_source("let a = [1]\nlet b = [...a]\nb").unwrap_err();
-        assert!(err.message.contains("spread in an array literal"), "got {err:?}");
+    fn array_spread_uses_incremental_builder() {
+        // A spread switches the array literal to the `NEW_ARRAY 0` +
+        // `APPEND_ARRAY`/`SPREAD` builder (V10-T2).
+        let chunk = compile_source("let a = [1]\nlet b = [0, ...a]\nb").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("APPEND_ARRAY"), "expected APPEND_ARRAY in:\n{text}");
+        assert!(
+            text.contains("SPREAD") && !text.contains("SPREAD_OBJECT"),
+            "expected SPREAD (array) in:\n{text}"
+        );
     }
 
     #[test]
-    fn object_spread_is_deferred() {
-        let err = compile_source("let o = {a: 1}\nlet p = {...o}\np").unwrap_err();
-        assert!(err.message.contains("spread in an object literal"), "got {err:?}");
+    fn array_without_spread_keeps_fixed_new_array() {
+        // No spread → the fast path still emits a single `NEW_ARRAY n` (byte-
+        // identical to the prior lowering — no builder ops).
+        let chunk = compile_source("let b = [1, 2, 3]\nb").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("NEW_ARRAY"), "expected NEW_ARRAY in:\n{text}");
+        assert!(!text.contains("APPEND_ARRAY"), "unexpected APPEND_ARRAY in:\n{text}");
+        assert!(!text.contains("SPREAD"), "unexpected SPREAD in:\n{text}");
+    }
+
+    #[test]
+    fn object_spread_uses_incremental_builder() {
+        // A spread switches the object literal to the `NEW_OBJECT 0` +
+        // `APPEND_OBJECT`/`SPREAD_OBJECT` builder (V10-T2).
+        let chunk = compile_source("let o = {a: 1}\nlet p = {...o, b: 2}\np").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("SPREAD_OBJECT"), "expected SPREAD_OBJECT in:\n{text}");
+        assert!(text.contains("APPEND_OBJECT"), "expected APPEND_OBJECT in:\n{text}");
+    }
+
+    #[test]
+    fn call_spread_uses_call_spread_op() {
+        // A spread argument switches the call to the args-array builder +
+        // `CALL_SPREAD` (dynamic arity) (V10-T2).
+        let chunk =
+            compile_source("fn f(x) { return x }\nlet a = [1]\nf(...a)").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(text.contains("SPREAD_ARGS"), "expected SPREAD_ARGS in:\n{text}");
+        assert!(text.contains("CALL_SPREAD"), "expected CALL_SPREAD in:\n{text}");
+    }
+
+    #[test]
+    fn member_method_spread_is_rejected() {
+        // Spread in a member-method call is a documented deferral (clean error,
+        // no divergence) — bare-name and `super.m(...)` spread calls ARE supported.
+        let err = compile_source("let o = {}\nlet a = [1]\no.m(...a)").unwrap_err();
+        assert!(
+            err.message.contains("spread in a member-method call"),
+            "got {err:?}"
+        );
     }
 
     #[test]

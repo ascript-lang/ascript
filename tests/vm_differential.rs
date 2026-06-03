@@ -741,6 +741,11 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     // quoted key, missing → nil — over both an object literal AND a class instance
     // (`Point.from({...})`), reading the instance's FIELDS (V10-T1 + V9-T4).
     "examples/object_destructuring.as",
+    // `spread.as`: spread in array/object literals + call args (V10-T2).
+    "examples/spread.as",
+    // `rest.as`: rest params + spread in literals/calls incl. a forwarding
+    // round-trip (`wrap(...args)` → `sum(...args)`) (V10-T2 + V4-T4).
+    "examples/rest.as",
     // DELIBERATELY EXCLUDED (verified by the empirical scan — these ERROR at VM
     // compile time, they do NOT diverge, so they correctly never qualify):
     //   - `oop.as`              — uses `match` (V10) in `shapeName`.
@@ -748,7 +753,6 @@ const SYNC_EXAMPLE_ALLOWLIST: &[&str] = &[
     //   - `shape_validation.as` — `import` (V12) AND `.from` with a nested-class
     //     field + an Object→`map<K,Class>` boundary coercion + field defaults (V12,
     //     task #157). The VM rejects it at compile time.
-    //   - `rest.as`/`spread.as` — rest params + spread in literals/calls (V10-T2).
     //   - every stdlib-heavy example — `import` (V12).
 ];
 
@@ -3289,5 +3293,123 @@ async fn vm_run_class_enum_multi_feature_programs() {
     ];
     for src in programs {
         assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+// ----- V10-T2: spread in array/object literals + call args --------------------
+
+#[tokio::test]
+async fn vm_array_spread_matches_treewalker() {
+    let cases = [
+        // Single spread of a local array.
+        "let a = [1, 2]\nprint([...a, 3])", // [1, 2, 3]
+        // Leading item + two spreads of the SAME array (order + duplication).
+        "let a = [1, 2]\nprint([0, ...a, ...a])", // [0, 1, 2, 1, 2]
+        // Spread of an empty array literal.
+        "print([...[]])", // []
+        // Spread interleaved with items on both sides.
+        "let a = [2, 3]\nprint([1, ...a, 4, 5])", // [1, 2, 3, 4, 5]
+        // Nested: spread of an array containing arrays.
+        "let a = [[1], [2]]\nprint([...a, [3]])", // [[1], [2], [3]]
+        // Spread of array-literals directly.
+        "print([...[1, 2], ...[3, 4]])", // [1, 2, 3, 4]
+        // Self-spread (the builder array does not alias the source).
+        "let a = [9]\nprint([...a, ...a, ...a])", // [9, 9, 9]
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_object_spread_matches_treewalker() {
+    let cases = [
+        // Spread then a new key.
+        "let o = {a: 1, b: 2}\nprint({...o, c: 3})", // {a: 1, b: 2, c: 3}
+        // LATER-WINS + FIRST-POSITION: `a` keeps its first position but takes the
+        // later value 9 (byte-identical to the tree-walker's IndexMap insert).
+        "print({a: 1, ...{a: 9, b: 2}})", // {a: 9, b: 2}
+        // Spread then overwrite a spread key with an explicit later entry.
+        "let o = {a: 1, b: 2}\nprint({...o, b: 99})", // {a: 1, b: 99}
+        // Earlier explicit key overwritten by a spread value (position preserved).
+        "print({a: 1, b: 2, ...{a: 7}})", // {a: 7, b: 2}
+        // Spread of an empty object literal.
+        "print({...{}})", // {}
+        // Two spreads, second wins on the overlap, first-seen position kept.
+        "print({...{a: 1, b: 2}, ...{b: 3, c: 4}})", // {a: 1, b: 3, c: 4}
+        // Nested object value through a spread.
+        "let o = {a: {x: 1}}\nprint({...o, b: 2})", // {a: {x: 1}, b: 2}
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_call_spread_matches_treewalker() {
+    let cases = [
+        // Pure spread of a local array as all args.
+        "fn add3(x, y, z) { return x + y + z }\nlet args = [1, 2, 3]\nprint(add3(...args))", // 6
+        // Mixed leading positional + spread of an array literal.
+        "fn add3(x, y, z) { return x + y + z }\nprint(add3(1, ...[2, 3]))", // 6
+        // Spread of an array literal as all args.
+        "fn add3(x, y, z) { return x + y + z }\nprint(add3(...[10, 20, 30]))", // 60
+        // Trailing positional after a spread.
+        "fn add3(x, y, z) { return x + y + z }\nprint(add3(...[1, 2], 3))", // 6
+        // Spread into a REST param (collects the flattened tail into an array).
+        "fn sum(...nums) {\n  let t = 0\n  for (n of nums) { t = t + n }\n  return t\n}\nlet a = [1, 2, 3, 4]\nprint(sum(...a))", // 10
+        // Leading fixed param + spread into a rest param.
+        "fn tag(label, ...rest) {\n  print(label)\n  print(rest)\n}\ntag(\"xs\", ...[1, 2, 3])", // xs then [1, 2, 3]
+        // Empty spread into a rest param (zero args).
+        "fn sum(...nums) {\n  let t = 0\n  for (n of nums) { t = t + n }\n  return t\n}\nprint(sum(...[]))", // 0
+        // Spread forwarding round-trip (spread into a wrapper that re-spreads).
+        "fn sum(...nums) {\n  let t = 0\n  for (n of nums) { t = t + n }\n  return t\n}\nfn wrap(...args) { return sum(...args) }\nprint(wrap(5, 6, 7))", // 18
+    ];
+    for src in cases {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_spread_wrong_type_panics_match_treewalker() {
+    // Non-array / non-object spreads are Tier-2 panics — the message AND the span
+    // must be byte-identical on both engines (the operand's trivia-trimmed span).
+    let cases = [
+        // Array spread of a non-array.
+        "print([...5])",
+        "let n = 7\nprint([1, ...n])",
+        "print([...\"hi\"])",
+        // Object spread of a non-object.
+        "print({...5})",
+        "let n = 7\nprint({a: 1, ...n})",
+        // Call-arg spread of a non-array (distinct message).
+        "fn f(x) { return x }\nprint(f(...5))",
+        "fn f(x) { return x }\nlet n = 3\nprint(f(...n))",
+    ];
+    for src in cases {
+        assert_vm_error_matches_treewalker(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_run_spread_examples_match_treewalker() {
+    // The two corpus examples that exercise spread end-to-end (now compiling on the
+    // VM) must produce byte-identical stdout. `spread.as` = array/object/call
+    // spread; `rest.as` = rest params + spread (incl. forwarding round-trip).
+    let root = env!("CARGO_MANIFEST_DIR");
+    for rel in ["examples/spread.as", "examples/rest.as"] {
+        let path = std::path::Path::new(root).join(rel);
+        let src =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read example {rel}: {e}"));
+        let tw = ascript::run_source_exit(&src)
+            .await
+            .unwrap_or_else(|e| panic!("tree-walker failed on {rel}: {e:?}"));
+        let vm = ascript::vm_run_source(&src)
+            .await
+            .unwrap_or_else(|e| panic!("VM failed on {rel}: {e:?}"));
+        assert_eq!(
+            tw, vm,
+            "VM diverged from tree-walker for `{rel}`\n  tree-walker: {tw:?}\n  vm:          {vm:?}"
+        );
     }
 }

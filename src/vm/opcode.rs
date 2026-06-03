@@ -161,8 +161,50 @@ pub enum Op {
     NewArray,
     /// `NEW_OBJECT(u16)` — pop `n` key/value pairs, push a new object.
     NewObject,
-    /// `... v --` — spread `v` into the array/object/call being built.
+    /// `[arr, v] -- [arr]` — flatten the spread operand `v` into the
+    /// under-construction array `arr` (which sits just below `v` on the stack).
+    /// Used for BOTH array-literal spreads `[...a]` AND call-argument spreads
+    /// `f(...a)` (call args are built into a scratch array, then dispatched via
+    /// [`Op::CallSpread`]). `v` MUST be a `Value::Array`; its elements are appended
+    /// (cloned) to `arr` in order. Any other value raises the SAME Tier-2 panic the
+    /// tree-walker's `ExprKind::Array` spread arm raises — `can only spread an array
+    /// into an array, got {type}` — anchored at this op's span (the spread operand
+    /// expression's trivia-trimmed code span). The call-args lowering rewrites the
+    /// message to `can only spread an array as call arguments, got {type}` by
+    /// emitting [`Op::SpreadArgs`] instead (same mechanism, different wording).
     Spread,
+    /// `[arr, v] -- [arr]` — IDENTICAL to [`Op::Spread`] (flatten the array `v`
+    /// into `arr`), EXCEPT the non-array panic message is `can only spread an array
+    /// as call arguments, got {type}` to match the tree-walker's `eval_call_args`
+    /// spread arm. Emitted only by the call-argument builder.
+    SpreadArgs,
+    /// `[arr, item] -- [arr]` — append a single `item` to the under-construction
+    /// array `arr` (which sits just below `item`). Used by the array-literal and
+    /// call-argument builders for a non-spread element. Never panics (the value
+    /// below is always a compiler-produced builder array).
+    AppendArray,
+    /// `[obj, key, val] -- [obj]` — insert `key -> val` into the under-construction
+    /// object `obj` (which sits below the key/value). `key` is a `Value::Str`.
+    /// Mirrors the tree-walker's `ExprKind::Object` `IndexMap::insert`: a later
+    /// duplicate key OVERWRITES the value but KEEPS the first-seen position. Used by
+    /// the object-literal builder for a non-spread `key: value` entry.
+    AppendObject,
+    /// `[obj, v] -- [obj]` — flatten the object spread operand `v` into the
+    /// under-construction object `obj`. `v` MUST be a `Value::Object`; each of its
+    /// entries is inserted (later-wins, first-position, like [`Op::AppendObject`]).
+    /// Any other value raises the SAME Tier-2 panic the tree-walker's
+    /// `ExprKind::Object` spread arm raises — `can only spread an object into an
+    /// object, got {type}` — anchored at this op's span (the spread operand's
+    /// trivia-trimmed code span).
+    SpreadObject,
+    /// `[callee, args] -- [result]` — call `callee` with the runtime-length argument
+    /// list held in the `args` array (built by the array/spread builder ops). The
+    /// dynamic-arity counterpart of [`Op::Call`]: it dispatches EXACTLY like
+    /// `Op::Call` (closure / async-fn / generator-fn / native via `call_value`),
+    /// applying arity + per-param contracts to the FLATTENED arg list via the shared
+    /// `check_call_args`. Emitted whenever a call's argument list contains a spread,
+    /// so the argc cannot be known statically.
+    CallSpread,
     /// `obj key -- obj[key]`.
     GetIndex,
     /// `obj key val -- val` — store `obj[key] = val`.
@@ -376,6 +418,11 @@ impl Op {
             x if x == NewArray as u8 => NewArray,
             x if x == NewObject as u8 => NewObject,
             x if x == Spread as u8 => Spread,
+            x if x == SpreadArgs as u8 => SpreadArgs,
+            x if x == AppendArray as u8 => AppendArray,
+            x if x == AppendObject as u8 => AppendObject,
+            x if x == SpreadObject as u8 => SpreadObject,
+            x if x == CallSpread as u8 => CallSpread,
             x if x == GetIndex as u8 => GetIndex,
             x if x == SetIndex as u8 => SetIndex,
             x if x == GetProp as u8 => GetProp,
@@ -440,7 +487,8 @@ impl Op {
             // Zero-operand ops.
             Nil | True | False | Pop | Dup | Swap | Rot3 | Add | Sub | Mul | Div | Mod | Pow
             | Neg | Not | Eq | Ne | Lt | Le | Gt | Ge | Range | CheckNumbers | Return | Spread
-            | GetIndex | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate
+            | SpreadArgs | AppendArray | AppendObject | SpreadObject | CallSpread | GetIndex
+            | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate
             | Unwrap | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen
             | CheckArrayDestructure | CheckObjectDestructure => 0,
         }
@@ -508,6 +556,11 @@ mod tests {
         Op::NewArray,
         Op::NewObject,
         Op::Spread,
+        Op::SpreadArgs,
+        Op::AppendArray,
+        Op::AppendObject,
+        Op::SpreadObject,
+        Op::CallSpread,
         Op::GetIndex,
         Op::SetIndex,
         Op::GetProp,
