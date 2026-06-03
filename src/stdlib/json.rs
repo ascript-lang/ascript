@@ -270,7 +270,9 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
             seen.pop();
             J::Array(out)
         }
-        Value::Function(_) | Value::Builtin(_) => J::String("<function>".into()),
+        Value::Function(_) | Value::Closure(_) | Value::Builtin(_) => {
+            J::String("<function>".into())
+        }
         other => J::String(format!("<{}>", crate::interp::type_name(other))),
     }
 }

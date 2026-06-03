@@ -603,7 +603,10 @@ impl Interp {
                 // (after the level filter above) so a filtered call is free.
                 if matches!(
                     args.first(),
-                    Some(Value::Function(_)) | Some(Value::Builtin(_))
+                    // A VM-compiled thunk is a `Value::Closure` — equally a deferred
+                    // message callable (`call_value` dispatches it via the V4-T5
+                    // bridge). Inert for the tree-walker (never makes a Closure).
+                    Some(Value::Function(_)) | Some(Value::Closure(_)) | Some(Value::Builtin(_))
                 ) {
                     let r = self.call_value(args[0].clone(), vec![], span).await?;
                     // An `async fn` thunk returns a `Value::Future`; drive it to

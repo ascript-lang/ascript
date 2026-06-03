@@ -621,6 +621,28 @@ async fn vm_match_guard_ending_in_ident_matches_treewalker() {
     }
 }
 
+#[tokio::test]
+async fn vm_closure_into_stdlib_hof_matches_treewalker() {
+    // V12 #176: a VM-compiled script function is a `Value::Closure`. Stdlib native
+    // HOFs that take a CALLBACK argument used to enumerate the callable `Value`
+    // variants WITHOUT `Closure`, so a VM program passing an arrow/`fn` to e.g.
+    // `stream.filter`/`stream.map`/`array.sort`'s comparator panicked "expects a
+    // function, got function". Both engines must now run byte-identically.
+    let programs = [
+        // stream.filter + stream.map with arrow closures (the streams_and_testing repro).
+        "import * as stream from \"std/stream\"\nlet s = stream.map(stream.filter(stream.from([1,2,3,4,5,6]), x => x % 2 == 0), x => x * 10)\nprint(await stream.collect(s))",
+        // stream.reduce with a 2-arg closure.
+        "import * as stream from \"std/stream\"\nprint(await stream.reduce(stream.from([1,2,3,4]), (a, x) => a + x, 0))",
+        // stream.forEach + stream.find with closures.
+        "import * as stream from \"std/stream\"\nawait stream.forEach(stream.from([\"a\",\"b\"]), x => print(x))\nprint(await stream.find(stream.from([1,2,3,4]), x => x > 2))",
+        // A NAMED `fn` (also a Closure on the VM) passed to a stdlib HOF.
+        "import * as stream from \"std/stream\"\nfn keep(x) { return x > 1 }\nprint(await stream.collect(stream.filter(stream.from([0,1,2,3]), keep)))",
+    ];
+    for src in programs {
+        assert_vm_run_matches_treewalker(src).await;
+    }
+}
+
 // ----- V2-T7: widen the differential gate -------------------------------------
 //
 // Two complementary widenings of the byte-identical gate:
@@ -694,16 +716,6 @@ enum SkipReason {
     /// coercion. The guard asserts the VM still FAILS to match here, so when #157
     /// lands these flip to must-run.
     V12FromDefaults,
-    /// The example reaches a stdlib native (`stream.filter`, `server.get/use`, …)
-    /// that type-checks its callback against the OLD callable variants
-    /// (`Value::Function`/`Builtin`/…) and does NOT yet accept the VM's
-    /// `Value::Closure` (the representation script functions take on the bytecode
-    /// VM). So the VM panics "expects a function, got function" while the
-    /// tree-walker (which produces `Value::Function`) runs fine. This is a
-    /// stdlib-callable-accept gap surfaced BY import compiling — tracked as
-    /// V12 #176 (widen the stdlib callable accept-lists to `Value::Closure`); it
-    /// is NOT an import bug. The guard asserts the VM still errors here.
-    V12ClosureNotCallableInStdlib,
     /// The example uses spread in a member-method call (`recv.m(...args)`), which
     /// the VM compiler does not lower yet (only free-call spread `f(...args)` is
     /// supported). Surfaced by import compiling; tracked as V12 #177. The guard
@@ -733,6 +745,20 @@ enum SkipReason {
     /// EVEN the tree-walker oracle — so it is excluded the same way the CLI/
     /// conformance suites leave the server/peer examples out of their run set.
     LongRunningServer,
+    /// A self-contained client+server example whose VM run HANGS because the
+    /// `.from`-with-defaults / typed-parse divergence (task #157) corrupts the
+    /// in-process request/response round-trip: the route's `resp.json(Class)?`
+    /// returns the wrong value on the VM, so the client gets an unexpected
+    /// response and `await serving` never completes (the server's bounded
+    /// `maxRequests` drain is never reached). The tree-walker runs it fine. This
+    /// is the SAME #157 gap as `V12FromDefaults` — but because the VM run does not
+    /// terminate (rather than cleanly erroring), it cannot be EXECUTED in the
+    /// "still diverges" guard; it is documented-only. When #157 lands, the round-
+    /// trip completes on the VM and this flips to must-run (modulo the ephemeral
+    /// port — see `Nondeterministic`). Note: V12 #176 (stdlib HOFs accept
+    /// `Value::Closure`) is ALREADY fixed, so the server's route/middleware
+    /// closures now run correctly on the VM — the only remaining blocker is #157.
+    V12FromDefaultsServerHang,
 }
 
 /// The explicit, per-file SKIP list for the whole-corpus opt-out gate. EVERY entry
@@ -752,23 +778,14 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     // divergence deferred to V12 (task #157).
     ("examples/typed_parse.as", SkipReason::V12FromDefaults),
     ("examples/shape_validation.as", SkipReason::V12FromDefaults),
-    // ---- stdlib callable-accept gap: Value::Closure (V12 #176) ----------------
-    // The file passes a script function (a VM `Value::Closure`) to a stdlib native
-    // (`stream.filter`, `server.get/use`) whose callable accept-list predates the
-    // VM and only allows `Value::Function`/`Builtin`/… — so the VM panics "expects
-    // a function, got function". Surfaced by import compiling; NOT an import bug.
-    (
-        "examples/streams_and_testing.as",
-        SkipReason::V12ClosureNotCallableInStdlib,
-    ),
-    (
-        "examples/advanced/typed_api.as",
-        SkipReason::V12ClosureNotCallableInStdlib,
-    ),
-    (
-        "examples/advanced/typed_http.as",
-        SkipReason::V12ClosureNotCallableInStdlib,
-    ),
+    // ---- stdlib callable-accept gap: Value::Closure (V12 #176) — NOW FIXED -----
+    // `streams_and_testing.as` was here (it passes arrow/`fn` closures to
+    // `stream.filter`/`map`/`reduce`/…). With native HOFs now accepting
+    // `Value::Closure` it runs byte-identically on the VM and has been UNSKIPPED
+    // into the whole-corpus gate. `typed_api.as` / `typed_http.as` (server route +
+    // middleware closures) ALSO run on the VM now, but each stays skipped for a
+    // DIFFERENT, now-surfaced reason — see below.
+    //
     // ---- member-method-call spread `recv.m(...args)` (V12 #177) ----------------
     // The VM compiler lowers free-call spread `f(...args)` but not method-call
     // spread `recv.m(...args)` yet, so this errors at run time on the VM.
@@ -790,6 +807,16 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         SkipReason::Nondeterministic,
     ),
     ("examples/advanced/sse_client.as", SkipReason::Nondeterministic),
+    // `typed_api.as` is byte-identical on the VM EXCEPT for the ephemeral bound
+    // port it prints (`server bound on http://127.0.0.1:<port>`): the OS assigns a
+    // fresh port to each of the two separate runs (tree-walker then VM), so the
+    // stdout-equality oracle cannot match that one line. Every other byte (the
+    // route/middleware closures now run on the VM via the #176 fix, plus the
+    // POST/GET round-trips and 400 rejections) is identical. Not a VM divergence.
+    (
+        "examples/advanced/typed_api.as",
+        SkipReason::Nondeterministic,
+    ),
     // ---- Mutates a fixed shared /tmp tree (races across parallel oracles) ------
     ("examples/system.as", SkipReason::SharedExternalState),
     ("examples/advanced/fs_toolkit.as", SkipReason::SharedExternalState),
@@ -805,6 +832,18 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     (
         "examples/advanced/ws_server.as",
         SkipReason::LongRunningServer,
+    ),
+    // ---- VM run hangs on the #157 `.from`-defaults round-trip corruption -------
+    // `typed_http.as` is a self-contained client+server; its route validates the
+    // body with `resp.json(User)?` (a typed-parse with the field default
+    // `role: "guest"`). On the VM that typed-parse diverges (#157), so the client
+    // gets an unexpected response and `await serving` never completes — the VM run
+    // HANGS (confirmed: a 15s-capped `vm_run_source` returns Elapsed). The #176
+    // Closure fix is NOT the blocker (the route/middleware closures run); #157 is.
+    // Because it does not terminate, it is documented-only (not executed).
+    (
+        "examples/advanced/typed_http.as",
+        SkipReason::V12FromDefaultsServerHang,
     ),
 ];
 
@@ -929,15 +968,18 @@ async fn vm_run_whole_corpus_matches_treewalker() {
 #[tokio::test]
 async fn vm_whole_corpus_skips_are_still_justified() {
     // Guard that keeps the skip list HONEST so it can only shrink, never rot:
-    //  - V12FromDefaults / V12ClosureNotCallableInStdlib / V12MethodCallSpread:
-    //    stdlib `import` now COMPILES (V12-T1), so the file runs far enough to hit
-    //    its remaining VM gap — the VM must STILL fail to MATCH the tree-walker
-    //    (it errors at run time, it does NOT silently produce identical output).
-    //    When the tracked gap (#157/#176/#177) lands this guard fails, forcing the
-    //    entry to be deleted and the file moved into the must-run set.
-    //  - Nondeterministic / LongRunningServer: documented-only (random/time/
-    //    network bytes or a forever-blocking server hang the oracle), so they are
-    //    not executed; we only assert the file exists so a rename is caught.
+    //  - V12FromDefaults / V12MethodCallSpread: stdlib `import` now COMPILES
+    //    (V12-T1), so the file runs far enough to hit its remaining VM gap — the VM
+    //    must STILL fail to MATCH the tree-walker (it errors at run time, it does
+    //    NOT silently produce identical output). When the tracked gap (#157/#177)
+    //    lands this guard fails, forcing the entry to be deleted and the file moved
+    //    into the must-run set. (The V12 #176 stdlib-Closure gap is FIXED, so that
+    //    reason no longer exists — `streams_and_testing.as` left the skip list.)
+    //  - Nondeterministic / SharedExternalState / LongRunningServer /
+    //    V12FromDefaultsServerHang: documented-only (random/time/network bytes, a
+    //    shared-/tmp race, a forever-blocking server, or a #157-induced round-trip
+    //    hang that never terminates), so they are not executed; we only assert the
+    //    file exists so a rename is caught.
     //  - Every skip entry must name a real corpus file (no stale paths).
     let root = env!("CARGO_MANIFEST_DIR");
     let corpus = all_corpus_examples();
@@ -949,9 +991,7 @@ async fn vm_whole_corpus_skips_are_still_justified() {
         let src = std::fs::read_to_string(std::path::Path::new(root).join(rel))
             .unwrap_or_else(|e| panic!("read skipped example {rel}: {e}"));
         match reason {
-            SkipReason::V12FromDefaults
-            | SkipReason::V12ClosureNotCallableInStdlib
-            | SkipReason::V12MethodCallSpread => {
+            SkipReason::V12FromDefaults | SkipReason::V12MethodCallSpread => {
                 // `import` now compiles, so this no longer compile-errors; instead
                 // it must still DIVERGE — the VM run must NOT match the tree-walker
                 // (it errors at run time on the tracked gap), proving the skip is
@@ -971,11 +1011,13 @@ async fn vm_whole_corpus_skips_are_still_justified() {
             }
             SkipReason::Nondeterministic
             | SkipReason::SharedExternalState
-            | SkipReason::LongRunningServer => {
+            | SkipReason::LongRunningServer
+            | SkipReason::V12FromDefaultsServerHang => {
                 // Documented-only; not executed (random/time/network bytes can't
                 // match across two runs, a shared-/tmp file races across the
-                // parallel oracles, or a server blocks). Existence is already
-                // asserted above.
+                // parallel oracles, or a server blocks — incl. the #157-induced
+                // round-trip hang whose VM run never terminates). Existence is
+                // already asserted above.
             }
         }
     }

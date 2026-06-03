@@ -187,7 +187,11 @@ fn require_stream_id(v: &Value, span: Span, ctx: &str) -> Result<u64, Control> {
 /// early gives a better message naming the stream op.
 fn require_callable(v: &Value, span: Span, ctx: &str) -> Result<Value, Control> {
     match v {
+        // `Value::Closure` is the VM's compiled-function value — equally callable
+        // via `call_value` (the V4-T5 bridge). The tree-walker never produces a
+        // Closure, so this arm is inert there; it only matters for VM programs.
         Value::Function(_)
+        | Value::Closure(_)
         | Value::Builtin(_)
         | Value::BoundMethod(_)
         | Value::NativeMethod(_)

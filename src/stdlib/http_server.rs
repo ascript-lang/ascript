@@ -1187,7 +1187,11 @@ pub struct NextState {
 fn is_callable(v: &Value) -> bool {
     matches!(
         v,
+        // `Value::Closure` is the VM's compiled-function value — `call_value` (the
+        // V4-T5 bridge) dispatches it to the VM. A route handler / middleware passed
+        // from a VM program is a Closure; accept it like any other callable.
         Value::Function(_)
+            | Value::Closure(_)
             | Value::Builtin(_)
             | Value::Class(_)
             | Value::BoundMethod(_)

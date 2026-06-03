@@ -1220,7 +1220,11 @@ impl Interp {
                 Ok(rb.body(bytes))
             }
             // (c) an async-generator fn → call to exhaustion (buffered-then-sent).
-            Value::Function(_) | Value::Builtin(_) | Value::BoundMethod(_) => {
+            // `Value::Closure` is the VM's compiled-function value (V4-T5 bridge).
+            Value::Function(_)
+            | Value::Closure(_)
+            | Value::Builtin(_)
+            | Value::BoundMethod(_) => {
                 let bytes = self.drain_generator(source.clone(), span).await?;
                 Ok(rb.body(bytes))
             }
