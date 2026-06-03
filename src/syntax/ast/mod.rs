@@ -205,6 +205,32 @@ mod tests {
     }
 
     #[test]
+    fn range_expr_start_end_op_and_step() {
+        // Plain exclusive range: start/end present, no step.
+        let r: RangeExpr = first("let xs = 1..5", SyntaxKind::RangeExpr);
+        assert!(matches!(r.start(), Some(Expr::Literal(_))));
+        assert!(matches!(r.end(), Some(Expr::Literal(_))));
+        assert_eq!(r.op(), Some(SyntaxKind::DotDot));
+        assert!(r.step().is_none(), "no step child for a bare range");
+
+        // Inclusive range records `..=`.
+        let ri: RangeExpr = first("let xs = 1..=5", SyntaxKind::RangeExpr);
+        assert_eq!(ri.op(), Some(SyntaxKind::DotDotEq));
+        assert!(ri.step().is_none());
+
+        // Stepped range: the step child is the 3rd Expr, after start and end.
+        let rs: RangeExpr = first("let ys = 1..10 step 2", SyntaxKind::RangeExpr);
+        assert!(matches!(rs.start(), Some(Expr::Literal(_))));
+        assert!(matches!(rs.end(), Some(Expr::Literal(_))));
+        assert!(matches!(rs.step(), Some(Expr::Literal(_))), "step child present");
+
+        // Inclusive + step together.
+        let ris: RangeExpr = first("let zs = 1..=10 step 2", SyntaxKind::RangeExpr);
+        assert_eq!(ris.op(), Some(SyntaxKind::DotDotEq));
+        assert!(ris.step().is_some());
+    }
+
+    #[test]
     fn ast_node_trait_object_safe_helpers() {
         // The AstNode impl on an enum delegates syntax() to the active variant.
         let root = parse_to_tree("1 + 2");

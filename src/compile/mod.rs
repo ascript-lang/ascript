@@ -316,6 +316,15 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             let end = range
                 .end()
                 .ok_or_else(|| CompileError::new("range default missing end bound", span))?;
+            // PHASE-1 temporary guard — removed in Phase 2/3. A stepped range as a
+            // value default has no codegen yet; reject it rather than silently
+            // dropping the step.
+            if range.step().is_some() {
+                return Err(CompileError::new(
+                    "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
+                    span,
+                ));
+            }
             match range.op() {
                 Some(SyntaxKind::DotDot) => {}
                 Some(SyntaxKind::DotDotEq) => {
@@ -2465,6 +2474,16 @@ impl Compiler {
             ));
         }
 
+        // PHASE-1 temporary guard — removed in Phase 2/3. The for-range loop ignores
+        // any `step` child for now, so `for (i in 1..10 step 2)` would silently run as
+        // `1..10`. Reject it loudly until Phase 3 wires step iteration.
+        if range.step().is_some() {
+            return Err(CompileError::new(
+                "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
+                span,
+            ));
+        }
+
         let start = range
             .start()
             .ok_or_else(|| CompileError::new("for-range missing start bound", span))?;
@@ -3806,6 +3825,15 @@ impl Compiler {
         let end = range
             .end()
             .ok_or_else(|| CompileError::new("range expression missing end bound", span))?;
+        // PHASE-1 temporary guard — removed in Phase 2/3. A `step` child carries no
+        // codegen yet, so a stepped value range would silently compile as `1..10`
+        // (wrong output). Reject it loudly until Phase 3 wires step semantics.
+        if range.step().is_some() {
+            return Err(CompileError::new(
+                "stepped ranges (`step`) are not yet supported (implemented in a later phase)",
+                span,
+            ));
+        }
         match range.op() {
             Some(SyntaxKind::DotDot) => {}
             Some(SyntaxKind::DotDotEq) => {

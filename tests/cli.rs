@@ -1201,3 +1201,52 @@ fn env_args_no_args_returns_empty_array() {
         "expected [] in stdout; got: {stdout}"
     );
 }
+
+#[test]
+fn vm_rejects_stepped_for_range_loudly() {
+    // PHASE 1: `step` parses on the CST front-end but the VM has no step codegen
+    // yet, so a stepped for-range MUST fail loudly with the temporary guard error
+    // — it must NEVER silently run as the unstepped `1..10`.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_stepped_for_range.as");
+    std::fs::write(&file, "for (i in 1..10 step 2) { print(i) }\n").unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(!out.status.success(), "stepped for-range must NOT succeed: {:?}", out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stepped ranges (`step`) are not yet supported"),
+        "expected the temporary step guard error; got stderr: {stderr}"
+    );
+    // It must not have silently produced the unstepped output.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains('1'), "stepped for-range produced output: {stdout}");
+}
+
+#[test]
+fn vm_rejects_stepped_value_range_loudly() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_stepped_value_range.as");
+    std::fs::write(&file, "print(1..10 step 2)\n").unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(!out.status.success(), "stepped value range must NOT succeed: {:?}", out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("stepped ranges (`step`) are not yet supported"),
+        "expected the temporary step guard error; got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn vm_step_stays_usable_as_identifier() {
+    // The contextual `step` keyword must not break ordinary identifier use on the
+    // default (VM) engine.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_step_identifier.as");
+    std::fs::write(&file, "let step = 7\nprint(step)\n").unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "process failed: {:?}", out);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
