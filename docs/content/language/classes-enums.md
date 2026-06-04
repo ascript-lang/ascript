@@ -118,6 +118,22 @@ Declared field types are **checked on assignment**, including inside `init` — 
 Fields you never declare stay fully **dynamic** (the gradual rule): you can still assign arbitrary
 `self.whatever = …` without a declaration.
 
+A field default can be **any expression** — including an [inclusive range](syntax#ranges) `1..=3`
+(which eagerly materializes to `[1, 2, 3]`), a stepped range `0..=10 step 2`, a binary/ternary/
+template expression, an arrow, or a `match`. The default is evaluated when the instance is built (and
+again, identically, by `Class.from(obj)`):
+
+```ascript
+class Grid {
+  cells: array<number> = 1..=3    // [1, 2, 3] at construction
+  scale: number = 2
+}
+print(Grid().cells)               // [1, 2, 3]
+```
+
+The only field-default expression that is **rejected** is `yield` (it is never valid outside a
+generator body) — both engines reject it symmetrically.
+
 > [!NOTE] The optional field above can be spelled two ways — `nickname: string?` or the marker form
 > `nickname?: string`. **Both lower to the same node** (`string | nil`); the formatter normalizes the
 > marker form to the canonical `nickname: string?`.

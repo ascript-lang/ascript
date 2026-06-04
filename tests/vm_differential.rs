@@ -3589,6 +3589,49 @@ async fn vm_field_default_yield_rejected_symmetrically() {
 }
 
 #[tokio::test]
+async fn sp2_f_inclusive_range_field_default_three_way() {
+    // SP2 Phase F (regression-lock + spec correction): `..=` as a class-field default
+    // materializes to an eager `array<number>` and runs BYTE-IDENTICAL on all three
+    // engines (tree-walker == specialized-VM == generic-VM), via BOTH the construct
+    // path (`C()`) and the `.from({})` path (which reads the SAME lowered default).
+    // Per SP2 §6 this supersedes the stale SP1 note claiming `..=` field defaults are
+    // rejected — they are supported; only `yield` defaults remain rejected (locked
+    // below). The exact `[1, 2, 3]` rendering is the regression anchor.
+    assert_three_way_matches("class C { xs: array<number> = 1..=3 }\nprint(C().xs)\n").await;
+    assert_three_way_matches("class C { xs: array<number> = 1..=3 }\nprint(C.from({}).xs)\n").await;
+    // Stepped inclusive — `0..=10 step 2` → `[0, 2, 4, 6, 8, 10]`, both paths.
+    assert_three_way_matches(
+        "class C { xs: array<number> = 0..=10 step 2 }\nprint(C().xs)\n",
+    )
+    .await;
+    assert_three_way_matches(
+        "class C { xs: array<number> = 0..=10 step 2 }\nprint(C.from({}).xs)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sp2_f_yield_field_default_rejected_three_way() {
+    // SP2 Phase F: the `yield` field default MUST stay rejected, symmetrically with
+    // `..=` being accepted. `yield` is never valid outside a generator body. The VM
+    // rejects it at COMPILE time (`cst_default_expr`); the tree-walker rejects it when
+    // it EVALUATES the default. The message/span legitimately differ (compile vs
+    // runtime), but the OBSERVABLE outcome is symmetric: ALL THREE engines error,
+    // none runs the program (no output). Lock the symmetry of the rejection.
+    for default in ["yield 5", "yield"] {
+        let src = format!("class C {{ x: number = {default} }}\nC()\n");
+        let tw = ascript::run_source(&src).await;
+        let spec = ascript::vm_run_source(&src).await;
+        let generic = ascript::vm_run_source_generic(&src).await;
+        assert!(
+            tw.is_err() && spec.is_err() && generic.is_err(),
+            "expected ALL THREE engines to reject the `{default}` field default\n  \
+             tree-walker: {tw:?}\n  specialized: {spec:?}\n  generic: {generic:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vm_field_default_reviewer_regression() {
     // The EXACT program from the divergence report: a computed string-concat default
     // referencing a module const, printed off a freshly-constructed instance. The VM
