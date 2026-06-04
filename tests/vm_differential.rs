@@ -6073,3 +6073,93 @@ async fn vm_instanceof_rhs_not_class_errors_match_treewalker() {
 async fn vm_instanceof_three_way_matches() {
     assert_three_way_matches("class A {}\nclass B extends A {}\nlet b = B()\nprint(b instanceof A)\nprint(b instanceof B)\nprint(5 instanceof A)\n").await;
 }
+
+// ---- SP2 Phase B: default parameters --------------------------------------
+
+#[tokio::test]
+async fn vm_default_param_basic_matches_treewalker() {
+    // Omitted trailing arg uses the default; supplied arg suppresses it.
+    assert_vm_run_matches_treewalker("fn f(a, b = 10) { return a + b }\nprint(f(1))\nprint(f(1, 2))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_refs_earlier_matches_treewalker() {
+    // A default may reference an earlier already-bound param.
+    assert_vm_run_matches_treewalker("fn g(a, b = a + 1) { return b }\nprint(g(5))\n").await;
+    assert_vm_run_matches_treewalker("fn f(a, b = a * 2) { return b }\nprint(f(5))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_arrow_matches_treewalker() {
+    assert_vm_run_matches_treewalker("let g = (x, y = 5) => x + y\nprint(g(2))\nprint(g(2, 3))\n").await;
+    assert_vm_run_matches_treewalker("let h = (x = 10) => x\nprint(h())\nprint(h(7))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_side_effect_only_when_omitted_matches_treewalker() {
+    // The default expr's side effect must run ONLY when the arg is omitted, and
+    // LEFT-TO-RIGHT across multiple omitted defaults.
+    let src = "let log = []\n\
+fn note(tag, v) { log.push(tag)\n return v }\n\
+fn f(a, b = note(\"b\", 2), c = note(\"c\", 3)) { return [a, b, c] }\n\
+print(f(1))\n\
+print(log)\n\
+let log2 = []\n\
+fn note2(tag, v) { log2.push(tag)\n return v }\n\
+fn h(a, b = note2(\"b\", 2), c = note2(\"c\", 3)) { return [a, b, c] }\n\
+print(h(1, 9))\n\
+print(log2)\n";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_default_param_calls_global_matches_treewalker() {
+    assert_vm_run_matches_treewalker("fn base() { return 42 }\nfn f(a, b = base()) { return a + b }\nprint(f(1))\nprint(f(1, 2))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_with_rest_matches_treewalker() {
+    assert_vm_run_matches_treewalker("fn h(a, b = 2, ...xs) { return [a, b, xs] }\nprint(h(1))\nprint(h(1, 9, 8, 7))\nprint(h(1, 9))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_explicit_nil_suppresses_matches_treewalker() {
+    // Explicit nil suppresses the default — only a MISSING arg triggers it.
+    assert_vm_run_matches_treewalker("fn f(a, b = 10) { return b }\nprint(f(1, nil))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_typed_contract_matches_treewalker() {
+    // A typed defaulted param: the explicit value is contract-checked.
+    assert_vm_run_error_matches_treewalker("fn f(a, b: number = 1) { return b }\nprint(f(1, \"x\"))\n").await;
+    // The default value is itself contract-checked when applied.
+    assert_vm_run_matches_treewalker("fn f(a, b: number = 1) { return b }\nprint(f(1))\nprint(f(1, 5))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_required_after_default_errors_match_treewalker() {
+    // A required param cannot follow a defaulted one — identical parse/compile
+    // error on both engines.
+    assert_vm_run_error_matches_treewalker("fn f(a = 1, b) { return b }\nprint(f(1, 2))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_arity_errors_match_treewalker() {
+    // Too few (below min) and too many (above max, no rest).
+    assert_vm_run_error_matches_treewalker("fn f(a, b = 1) {}\nf()\n").await;
+    assert_vm_run_error_matches_treewalker("fn f(a, b = 1) {}\nf(1, 2, 3)\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_three_way_matches() {
+    assert_three_way_matches(
+        "fn f(a, b = a + 1, c = 10) { return [a, b, c] }\n\
+print(f(1))\n\
+print(f(1, 2))\n\
+print(f(1, 2, 3))\n\
+let g = (x = 5) => x * 2\n\
+print(g())\n\
+print(g(4))\n",
+    )
+    .await;
+}
