@@ -166,27 +166,54 @@ pub enum GlobalCache {
     #[default]
     Cold,
     /// Resolved `value` for the global name at global-table `version`. A hit
-    /// requires `version == current_global_version`.
+    /// requires `version == current_global_version`. Used for the IMMUTABLE bare
+    /// builtins (their value never changes; the version guard is forward-compat).
     Cached {
         value: crate::value::Value,
         version: u64,
     },
+    /// Resolved USER-GLOBAL bound to its STABLE `IndexMap` index (SP8). User-globals
+    /// are only ever `insert`ed (never removed), so an entry's positional index is
+    /// fixed for the `Vm`'s life — reachable in O(1) via `IndexMap::get_index` /
+    /// `get_index_mut`, no string hash. Guarded by the STRUCTURAL generation
+    /// (`struct_gen`) the site resolved at: `struct_gen` bumps ONLY when a NEW global
+    /// is DEFINED (insertion can shift nothing for existing entries, but a new entry
+    /// or a shadowing redeclaration is the only event that can change which index a
+    /// name maps to), NEVER on a plain reassignment (`SET_GLOBAL`). So a hot
+    /// reassigned-top-level-`let` loop hits this cache every iteration (no thrash).
+    IndexBound { idx: usize, struct_gen: u64 },
 }
 
 impl GlobalCache {
     /// The cached value if present AND still valid for `version`, else `None`
-    /// (cold, or a stale version ⇒ re-resolve).
+    /// (cold, or a stale version ⇒ re-resolve). For the BUILTIN (`Cached`) path only.
     #[inline]
     pub fn get(&self, version: u64) -> Option<crate::value::Value> {
         match self {
-            GlobalCache::Cold => None,
             GlobalCache::Cached { value, version: v } => (*v == version).then(|| value.clone()),
+            GlobalCache::Cold | GlobalCache::IndexBound { .. } => None,
         }
     }
 
-    /// Record a freshly-resolved `value` at `version`.
+    /// The stable user-global index if this site is `IndexBound` AND its recorded
+    /// `struct_gen` still matches the VM's current `struct_gen`; else `None`
+    /// (cold, a builtin `Cached`, or a stale structural generation ⇒ re-resolve).
+    #[inline]
+    pub fn get_index(&self, struct_gen: u64) -> Option<usize> {
+        match self {
+            GlobalCache::IndexBound { idx, struct_gen: g } => (*g == struct_gen).then_some(*idx),
+            GlobalCache::Cold | GlobalCache::Cached { .. } => None,
+        }
+    }
+
+    /// Record a freshly-resolved `value` at `version` (BUILTIN path).
     pub fn set(value: crate::value::Value, version: u64) -> GlobalCache {
         GlobalCache::Cached { value, version }
+    }
+
+    /// Record a freshly-resolved user-global at its stable `idx` for `struct_gen`.
+    pub fn index_bound(idx: usize, struct_gen: u64) -> GlobalCache {
+        GlobalCache::IndexBound { idx, struct_gen }
     }
 }
 
@@ -296,6 +323,27 @@ mod tests {
         }
         // A bumped version invalidates the cache.
         assert!(c.get(8).is_none(), "stale version misses → re-resolve");
+    }
+
+    #[test]
+    fn global_cache_index_bound_struct_gen_guard() {
+        use crate::value::Value;
+        let cold = GlobalCache::Cold;
+        assert!(cold.get_index(0).is_none());
+
+        let c = GlobalCache::index_bound(3, 5);
+        // Same structural generation hits, returning the stable index.
+        assert_eq!(c.get_index(5), Some(3));
+        // A bumped struct_gen invalidates the cache → re-resolve.
+        assert!(
+            c.get_index(6).is_none(),
+            "stale struct_gen misses → re-resolve"
+        );
+        // The builtin-`get` path never returns an IndexBound value.
+        assert!(c.get(5).is_none(), "IndexBound is not a builtin Cached");
+        // And a builtin Cached never returns an index.
+        let b = GlobalCache::set(Value::Builtin("print".into()), 1);
+        assert!(b.get_index(1).is_none(), "Cached is not an IndexBound");
     }
 
     #[test]

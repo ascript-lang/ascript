@@ -77,6 +77,29 @@
 //!       >= 2× target. They still pass the no-regression check (spec/gen >= 1.0×)
 //!       and even beat the tree-walker (1.2-1.3× spec/tw).
 //! ───────────────────────────────────────────────────────────────────────────────
+//! GATE RESULT — PASS (recorded SP8 Phase A, 2026-06-04, release; same machine as the
+//! SP8 A0 baseline). The SP8 index-stable global-access cache (`GlobalCache::IndexBound`
+//! guarded by `struct_gen`, which bumps only on DEFINE, never on a reassigning
+//! SET_GLOBAL) recovers the user-global regression. Both gate conditions held.
+//!
+//!   benchmark                  kind     spec/tw   spec/gen   (A0 baseline spec/tw)
+//!   fib(30) recursion          compute    4.88x     1.03x     (4.88x)
+//!   sum recursion (500 x2000)  compute    5.83x     1.11x     (5.34x → recovered)
+//!   numeric loop (1e6)         compute    2.82x     1.21x     (2.96x; index-dominated)
+//!   while loop (1e6)           compute    4.43x     1.49x     (3.23x → recovered)
+//!   property r/w (1e6)         compute    2.96x     1.56x     (3.09x)
+//!   method dispatch (1e6)      compute    2.85x     1.79x     (2.69x)
+//!   string concat (50000)      alloc      1.25x     1.00x     (EXEMPT; allocator noise)
+//!   template build (50000)     alloc      1.16x     0.99x     (EXEMPT)
+//!   geomean spec/tw = 2.82x   (A0 baseline 2.73x → 2.82x)
+//!
+//!   The regression-target globals recovered most: `while loop` 3.23x → 4.43x (both
+//!   `i` and `sum` are reassigned globals read+written twice/iter — the index cache
+//!   hits every iteration), `sum recursion` 5.34x → 5.83x (back to the V11-T6 figure).
+//!   `numeric loop`/`property r/w` are dominated by the frame-LOCAL for-range index,
+//!   not the global, so they moved little (within run-to-run noise). NO spec-vs-generic
+//!   regression (the alloc benches hover at ~1.0x spec/gen with allocator jitter).
+//! ───────────────────────────────────────────────────────────────────────────────
 
 use std::time::{Duration, Instant};
 

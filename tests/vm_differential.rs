@@ -6925,3 +6925,90 @@ fn sp3_nested_expr_at_limit_panics_identical() {
     let k = ascript::interp::EXPR_NEST_LIMIT as usize;
     sp3_assert_three_way_identical(&sp3_nested_parens(k));
 }
+
+// ── SP8 Phase A: index-stable global-access fast path (regression guards) ──
+// These exercise the GET_GLOBAL/SET_GLOBAL `IndexBound` cache. They must stay
+// byte-identical across tree-walker == generic VM == specialized VM — the cache
+// only changes the lookup mechanism (stable index vs string hash), never the value.
+
+#[tokio::test]
+async fn sp8_global_reassign_loop() {
+    // Hot reassigned top-level `let` in a loop (the regression target): the index
+    // cache must hit every iteration (a SET never bumps `struct_gen`).
+    assert_three_way_matches("let sum = 0\nfor (i in 0..1000) { sum = sum + i }\nprint(sum)\n")
+        .await;
+}
+
+#[tokio::test]
+async fn sp8_global_while_two() {
+    // Two globals read+written each iteration (the while-loop shape, regressed most).
+    assert_three_way_matches(
+        "let i = 0\nlet s = 0\nwhile (i < 1000) { s = s + i\n i = i + 1 }\nprint(s)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sp8_global_forward_ref() {
+    // Forward/late read of a top-level `let` from a function defined earlier.
+    assert_three_way_matches("fn get() { return later }\nlet later = 42\nprint(get())\n").await;
+}
+
+#[tokio::test]
+async fn sp8_global_shadows_builtin() {
+    // A user-global shadows a builtin (resolution order: user-global wins — the
+    // index cache is filled only after user-globals resolve first).
+    assert_three_way_matches("let print2 = 7\nlet len = 99\nprint(len)\n").await;
+}
+
+#[tokio::test]
+async fn sp8_global_const_reassign() {
+    // Immutable global reassignment -> same-chunk compile-time immutable error.
+    assert_three_way_matches("const k = 1\nk = 2\nprint(k)\n").await;
+}
+
+#[tokio::test]
+async fn sp8_global_redeclare() {
+    // Redeclaration -> 'already defined in this scope' (errors before any cache read;
+    // the 1st define bumps `struct_gen`).
+    assert_three_way_matches("let x = 1\nlet x = 2\nprint(x)\n").await;
+}
+
+#[tokio::test]
+async fn sp8_global_use_before_define() {
+    // Reference to a not-yet-defined global from a CALL before its define ->
+    // undefined variable. The index cache must NEVER serve a value for an unresolved
+    // name — both VM engines must agree (the SP8 load-bearing assertion) and both
+    // must error. We compare spec==generic and that both error, rather than the full
+    // byte-identical span against the tree-walker, because `return <ident>` carries a
+    // PRE-EXISTING front-end span offset between the VM and tree-walker unrelated to
+    // SP8 (verified on the clean tree before these changes).
+    let src = "fn get() { return nope }\nprint(get())\n";
+    let spec = ascript::vm_run_source(src).await;
+    let generic = ascript::vm_run_source_generic(src).await;
+    let norm = |r: &Result<(String, Option<i32>), ascript::error::AsError>| match r {
+        Ok((out, code)) => Ok((out.clone(), *code)),
+        Err(e) => Err(e.to_string()),
+    };
+    assert_eq!(
+        norm(&spec),
+        norm(&generic),
+        "SP8 index cache must not diverge spec vs generic on use-before-define"
+    );
+    assert!(
+        spec.is_err(),
+        "use-before-define must error (undefined variable), got {:?}",
+        norm(&spec)
+    );
+}
+
+#[tokio::test]
+async fn sp8_global_define_then_reread_in_loop() {
+    // A new define mid-program bumps `struct_gen`, invalidating an earlier site's
+    // cache; the later loop still reads the correct (possibly re-resolved) value.
+    assert_three_way_matches(
+        "let a = 1\nlet b = 10\nlet total = 0\n\
+         for (i in 0..100) { total = total + a + b\n a = a + 1 }\nprint(total)\n",
+    )
+    .await;
+}
