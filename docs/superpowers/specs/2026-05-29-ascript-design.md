@@ -369,11 +369,28 @@ diagnostic + stack trace, and exit non-zero. Panics include:
   (the checked accessor `arr.get(i)` returns `nil` instead).
 - Calling a non-function, or reading a field of `nil`.
 - An explicit `assert(cond, msg)` failure.
+- **Exceeding the recursion-depth limit** (SP3). Deep non-yielding recursion (and a
+  deeply nested expression) is capped at a fixed logical depth (`MAX_CALL_DEPTH`);
+  over it the runtime raises `maximum recursion depth exceeded` **before** the
+  native stack overflows — a clean, deterministic panic, NOT a process abort, and
+  identical on both engines (the bytecode VM and the tree-walker oracle). This is a
+  graceful guard, not unlimited recursion: truly unbounded recursion needs an
+  explicit-stack VM and remains an architectural non-goal (see §7's non-goals).
 
 Panics are **not catchable** in normal code — this keeps the value-based model
 honest. A single host/REPL boundary, `recover(fn)`, runs `fn` and converts a panic
-into a Result `[nil, err]`; it exists for the REPL, the test runner, and embedding,
-not for routine control flow.
+into a Result `[nil, err]` (this includes `maximum recursion depth exceeded` — it is
+an ordinary recoverable panic); it exists for the REPL, the test runner, and
+embedding, not for routine control flow.
+
+**Bytecode-capacity compile errors (VM only).** A module too large for the bytecode
+format — more than 65535 constants / function definitions / class definitions /
+imports, a single function body whose jump spans > 32 KB of bytecode, or a string/
+collection too large to serialize to `.aso` — is rejected at compile time with a
+clean, actionable error (non-zero exit, never a process abort). These are honest
+capacity limits of the compiled representation; the tree-walker (which has no
+bytecode) runs such a module, a documented and correct asymmetry (it is the debug/
+oracle engine, not a second production dialect).
 
 ---
 

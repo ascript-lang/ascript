@@ -257,6 +257,37 @@ the persistent session `Interp`+`Environment` (state already persists across lin
     — the error channel. `Panic` is an unrecoverable Tier-2 programmer error (aborts unless caught by
     `recover`); `Propagate` is the `?`-operator early return carrying a `[nil, err]` Result pair.
     `AsError` converts into `Control::Panic`.
+- **Runtime robustness — capacity errors + recursion guard (SP3).** Two classes of large-but-valid
+  input that used to crash the process (a Rust `panic!`/`.expect` → SIGABRT, exit 134) now fail
+  *cleanly*:
+  - **(a) Bytecode-capacity errors are clean, VM-only.** A module that exceeds an internal bytecode
+    capacity (const pool / proto / class-proto / import table > `u16::MAX`, a jump/loop displacement
+    > 32 KB, an `.aso` byte field/collection > `u32::MAX`) is rejected with a clean `CompileError`/
+    `AsoError` (actionable message, non-zero exit — never a panic). Mechanism: a sticky
+    `Chunk.overflow: Cell<Option<ChunkLimit>>` (the `add_*`/`emit_*`/`patch_jump` sites record the
+    FIRST overflow + return a `u16::MAX`/`0` placeholder instead of `.expect`-ing; the compiler checks
+    `take_overflow()` after sealing each chunk) and a sticky `Writer.overflow` in `aso.rs`
+    (`to_bytes() -> Result<_, AsoError>`). The **tree-walker has NO bytecode caps**, so it *runs* a
+    module too large for the VM — a documented, correct asymmetry (SP3 §A5), NOT a parity hole: the VM
+    rejection is an honest capacity error, the tree-walker is the debug/oracle engine, and no corpus
+    module is remotely near 65535 of anything. A negative-sweep test (`tests/vm_limits.rs`) trips if a
+    capacity `.expect`/`panic!` is re-introduced in `chunk.rs`/`aso.rs`.
+  - **(b) Recursion-depth guard, byte-identical on both engines.** A single `Interp.call_depth:
+    Cell<u32>` (shared — the VM reaches it via its `Rc<Interp>`) is bounded by `MAX_CALL_DEPTH = 3000`;
+    over it → a clean, **`recover`-catchable** Tier-2 panic `maximum recursion depth exceeded` BEFORE
+    the native stack overflows (no SIGABRT). Increment points: tree-walker `run_body` (one per call) +
+    `eval_expr` (nested-expression recursion); VM frame-push (`enter_frame_depth`) + non-root
+    `return_from_frame` decrement, a snapshot-restore `DepthRestore` guard at the re-entrant `Vm::run`
+    boundaries (`invoke_compiled_method`/`call_value`, so a panic-unwound `recover` resumes at the right
+    depth), and `compile_expr` nesting (deeply nested SOURCE expr → a `CompileError` with the SAME
+    message). Both engines emit the identical panic + non-134 exit at/over the limit and complete
+    identically under it (the message carries no depth number; the per-engine internal trip factor
+    differs but the observable stdout+exit match — see `tests/vm_differential.rs` `sp3_*`). The entry
+    points (`main`, `run_on_worker_stack`) run the program on a `WORKER_STACK_SIZE = 512 MB` worker
+    thread so 3000 logical frames sit under native capacity with > 2× headroom even for the
+    tree-walker's large debug frames. Use `Cell` (not `RefCell`) — `await_holding_refcell_ref` stays
+    satisfied. **Truly unbounded recursion stays the SP9 architectural non-goal** (needs an
+    explicit-stack VM / stackful coroutines); SP3 turns the crash into a deterministic, catchable error.
 - `global_env()` builds a fresh environment with builtins installed; programs run in a `.child()` of
   it so they can shadow builtins (`let len = 5`).
 - **Native resource handles:** OS resources (TCP streams, child processes, HTTP bodies/servers, SSE,
