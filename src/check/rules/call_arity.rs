@@ -31,10 +31,12 @@
 //! in-file classes (an unknown/imported base means unknown fields).
 
 use crate::check::diagnostic::{AsDiagnostic, Severity};
-use crate::check::rules::{code_range, fn_name, is_expr_kind};
+use crate::check::rules::{
+    code_range, decl_arity, fn_name, is_expr_kind, resolves_to_unique, Arity,
+};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
-use crate::syntax::resolve::types::{BindingKind, Resolution, ResolveResult};
+use crate::syntax::resolve::types::{BindingKind, ResolveResult};
 use std::collections::HashMap;
 
 pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
@@ -80,14 +82,26 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         // class path; skip the call if neither applies.
         let arity = if unique(&name)
             && by_name.get(&name).is_some_and(|fn_decl| {
-                // Mirrors `unknown_enum_variant::resolves_to_enum`: the use must bind to
-                // the GENUINE top-level `fn` (not a shadowing `let`/`const`/param).
-                resolves_to_fn(callee, name.as_str(), fn_decl.text_range(), resolved)
+                // The use must bind to the GENUINE top-level `fn` (not a shadowing
+                // `let`/`const`/param) — the shared uniqueness gate.
+                resolves_to_unique(
+                    callee,
+                    name.as_str(),
+                    fn_decl.text_range(),
+                    BindingKind::Fn,
+                    resolved,
+                )
             }) {
-            Some(fn_arity(&by_name[&name]))
+            Some(decl_arity(&by_name[&name]))
         } else if class_unique(&name)
             && class_by_name.get(&name).is_some_and(|cls| {
-                resolves_to_class(callee, name.as_str(), cls.text_range(), resolved)
+                resolves_to_unique(
+                    callee,
+                    name.as_str(),
+                    cls.text_range(),
+                    BindingKind::Class,
+                    resolved,
+                )
             }) {
             // Constructor arity: an inherited/explicit `init`'s params, or — if no
             // class in the chain defines `init` — the merged declared-field count.
@@ -135,119 +149,6 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         }
     }
     out
-}
-
-/// The arity range of a `FnDecl`: `min` leading required params (no default),
-/// `max` total positional params, or `None` when a `...rest` makes it unbounded.
-struct Arity {
-    min: usize,
-    max: Option<usize>,
-}
-
-/// The arity range of a `FnDecl`. `min` is the leading run of POSITIONAL params
-/// with no default (SP2 §2: a required param may not follow a defaulted one, so
-/// this is the count of params before the first defaulted one); `max` is the
-/// positional param count, or `None` when a `...rest` param makes it unbounded. A
-/// param is a rest iff it carries a `DotDotDot` token; it has a default iff it has
-/// an EXPRESSION child (the `= expr` part — distinct from its TYPE child).
-fn fn_arity(fn_decl: &ResolvedNode) -> Arity {
-    use SyntaxKind::*;
-    let Some(list) = fn_decl.children().find(|c| c.kind() == ParamList) else {
-        return Arity {
-            min: 0,
-            max: Some(0),
-        };
-    };
-    let mut min = 0usize;
-    let mut positional = 0usize;
-    let mut seen_default = false;
-    for p in list.children().filter(|c| c.kind() == Param) {
-        let is_rest = p
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .any(|t| t.kind() == DotDotDot);
-        if is_rest {
-            return Arity { min, max: None }; // variadic — max unbounded
-        }
-        positional += 1;
-        let has_default = p.children().any(|c| is_expr_kind(c.kind()));
-        if has_default {
-            seen_default = true;
-        } else if !seen_default {
-            min += 1;
-        }
-    }
-    Arity {
-        min,
-        max: Some(positional),
-    }
-}
-
-/// Does the callee `NameRef` resolve to the genuine binding of the unique top-level
-/// `fn` `name` declared at `decl_range`? True iff the resolver maps this use to an
-/// in-file/global binding AND there is exactly one binding of that name, which is a
-/// `Fn` binding declared at exactly `decl_range`. A `let`/`const`/parameter that
-/// SHADOWS the fn name produces a second (non-`Fn`, different-range) binding, so the
-/// call is correctly skipped. Mirrors `unknown_enum_variant::resolves_to_enum`.
-fn resolves_to_fn(
-    callee: &ResolvedNode,
-    name: &str,
-    decl_range: cstree::text::TextRange,
-    resolved: &ResolveResult,
-) -> bool {
-    // The use must resolve to *some* in-file/global binding (not Unresolved/builtin).
-    let bound = match resolved.uses.get(&callee.text_range()) {
-        Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
-        Some(Resolution::Global(gname)) => resolved
-            .bindings
-            .iter()
-            .any(|b| b.is_global && b.name == *gname),
-        _ => false,
-    };
-    if !bound {
-        return false;
-    }
-    // The name must have exactly one binding, which must be the `fn` decl — i.e. no
-    // other (shadowing) binding shares the name.
-    let mut same_name = resolved.bindings.iter().filter(|b| b.name == name);
-    let Some(only) = same_name.next() else {
-        return false;
-    };
-    if same_name.next().is_some() {
-        return false; // ambiguous: the name is bound more than once (shadowing)
-    }
-    only.kind == BindingKind::Fn && only.decl_range == decl_range
-}
-
-/// Does the callee `NameRef` resolve to the genuine unique top-level `class`
-/// `name` declared at `decl_range`? Same structure as `resolves_to_fn` but for a
-/// `Class` binding — a `let`/`const`/param that shadows the class name produces a
-/// second binding, so the call is correctly skipped.
-fn resolves_to_class(
-    callee: &ResolvedNode,
-    name: &str,
-    decl_range: cstree::text::TextRange,
-    resolved: &ResolveResult,
-) -> bool {
-    let bound = match resolved.uses.get(&callee.text_range()) {
-        Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
-        Some(Resolution::Global(gname)) => resolved
-            .bindings
-            .iter()
-            .any(|b| b.is_global && b.name == *gname),
-        _ => false,
-    };
-    if !bound {
-        return false;
-    }
-    let mut same_name = resolved.bindings.iter().filter(|b| b.name == name);
-    let Some(only) = same_name.next() else {
-        return false;
-    };
-    if same_name.next().is_some() {
-        return false; // ambiguous: the name is bound more than once (shadowing)
-    }
-    only.kind == BindingKind::Class && only.decl_range == decl_range
 }
 
 /// The superclass name of a `ClassDecl` (the `Ident` after the soft keyword
@@ -313,7 +214,7 @@ fn class_arity(
     }
     // `init` inherited: leaf→base, first one wins (matches `find_method`).
     if let Some(init) = chain.iter().find_map(instance_init) {
-        return Some(fn_arity(&init));
+        return Some(decl_arity(&init));
     }
     // No `init`: auto-init over MERGED fields, base-class FIRST (reverse leaf→base).
     // `merged_field_schema` dedups by name with `IndexMap::insert`: a re-declared
