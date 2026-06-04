@@ -22,7 +22,7 @@ use crate::check::diagnostic::{AsDiagnostic, Severity};
 use crate::check::rules::{code_range, fn_name, is_expr_kind};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
-use crate::syntax::resolve::types::{Resolution, ResolveResult};
+use crate::syntax::resolve::types::{BindingKind, Resolution, ResolveResult};
 use std::collections::HashMap;
 
 pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
@@ -50,24 +50,20 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         };
         let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
 
-        // The callee must resolve to a binding DECLARED in this file — a
-        // local/upvalue OR a module-scope user-global (a top-level `fn`, the
-        // common case) — AND be a uniquely-named declared function (a bare
-        // builtin/import/parameter is excluded). Mirrors `contract.rs`.
-        let user_fn = match resolved.uses.get(&callee.text_range()) {
-            Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
-            Some(Resolution::Global(gname)) => resolved
-                .bindings
-                .iter()
-                .any(|b| b.is_global && &b.name == gname),
-            _ => false,
-        };
-        if !user_fn || !unique(&name) {
+        if !unique(&name) {
             continue;
         }
         let Some(fn_decl) = by_name.get(&name) else {
             continue;
         };
+        // The callee must resolve to the GENUINE top-level `fn` we matched by name —
+        // not a `let`/`const`/parameter that legally SHADOWS that name in an inner
+        // scope. Mirrors `unknown_enum_variant::resolves_to_enum`: verify the resolved
+        // use binds to a `Fn` binding declared at exactly this `FnDecl`'s range, with
+        // no other (shadowing) binding of the same name. (call_arity.rs:resolves_to_fn)
+        if !resolves_to_fn(callee, name.as_str(), fn_decl.text_range(), resolved) {
+            continue;
+        }
 
         // A rest parameter makes the arity a range, not exact → skip.
         let Some(param_count) = fixed_param_count(fn_decl) else {
@@ -122,6 +118,42 @@ fn fixed_param_count(fn_decl: &ResolvedNode) -> Option<usize> {
         count += 1;
     }
     Some(count)
+}
+
+/// Does the callee `NameRef` resolve to the genuine binding of the unique top-level
+/// `fn` `name` declared at `decl_range`? True iff the resolver maps this use to an
+/// in-file/global binding AND there is exactly one binding of that name, which is a
+/// `Fn` binding declared at exactly `decl_range`. A `let`/`const`/parameter that
+/// SHADOWS the fn name produces a second (non-`Fn`, different-range) binding, so the
+/// call is correctly skipped. Mirrors `unknown_enum_variant::resolves_to_enum`.
+fn resolves_to_fn(
+    callee: &ResolvedNode,
+    name: &str,
+    decl_range: cstree::text::TextRange,
+    resolved: &ResolveResult,
+) -> bool {
+    // The use must resolve to *some* in-file/global binding (not Unresolved/builtin).
+    let bound = match resolved.uses.get(&callee.text_range()) {
+        Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
+        Some(Resolution::Global(gname)) => resolved
+            .bindings
+            .iter()
+            .any(|b| b.is_global && b.name == *gname),
+        _ => false,
+    };
+    if !bound {
+        return false;
+    }
+    // The name must have exactly one binding, which must be the `fn` decl — i.e. no
+    // other (shadowing) binding shares the name.
+    let mut same_name = resolved.bindings.iter().filter(|b| b.name == name);
+    let Some(only) = same_name.next() else {
+        return false;
+    };
+    if same_name.next().is_some() {
+        return false; // ambiguous: the name is bound more than once (shadowing)
+    }
+    only.kind == BindingKind::Fn && only.decl_range == decl_range
 }
 
 #[cfg(test)]
@@ -181,6 +213,30 @@ mod tests {
         // `f(...xs)` parses as a SpreadElem in the arg list → count unknown → skip.
         let src = "fn f(a,b){a}\nf(...xs)";
         assert!(!has(src, "call-arity"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn param_shadow_not_flagged() {
+        // `cb` inside `apply` is the PARAMETER (a 1-arg lambda passed in), not the
+        // top-level `fn cb(a, b)`. Calling `cb(99)` must NOT be checked against the
+        // top-level fn's arity. (BLOCKER false-positive regression.)
+        let src = "fn cb(a, b) { return a }\nfn apply(cb) { return cb(99) }\nprint(apply((n) => n * 2))";
+        assert!(!has(src, "call-arity"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn block_let_shadow_not_flagged() {
+        // A `let` that shadows a top-level fn name in an inner block must suppress the
+        // arity check on calls that resolve to the local.
+        let src = "fn g(a, b) { return a }\nfn run() {\n  let g = (x) => x\n  return g(1)\n}\nprint(run())";
+        assert!(!has(src, "call-arity"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn genuine_mismatch_still_flagged() {
+        // The fix must not silence real mismatches to a uniquely-named top-level fn.
+        let src = "fn f(a, b) { return a }\nf(1, 2, 3)";
+        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
     }
 
     #[test]
