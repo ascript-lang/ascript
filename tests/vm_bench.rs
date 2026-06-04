@@ -100,6 +100,30 @@
 //!   not the global, so they moved little (within run-to-run noise). NO spec-vs-generic
 //!   regression (the alloc benches hover at ~1.0x spec/gen with allocator jitter).
 //! ───────────────────────────────────────────────────────────────────────────────
+//! GATE RESULT — PASS (recorded SP8 final / Phase B+C, 2026-06-04, release; same
+//! machine). Phase B added #136 capture-by-value upvalues (never-reassigned captures
+//! copied into a fresh private cell at Op::Closure; the declaring frame keeps a plain
+//! stack local — no cell alloc, no per-access RefCell borrow) + the `closure capture`
+//! bench. Both gate conditions held; geomean recovered toward the V11-T6 2.92x.
+//!
+//!   benchmark                  kind     spec/tw   spec/gen
+//!   fib(30) recursion          compute    4.97x     1.02x
+//!   sum recursion (500 x2000)  compute    5.79x     1.10x
+//!   numeric loop (1e6)         compute    2.87x     1.23x
+//!   while loop (1e6)           compute    3.32x     1.42x
+//!   property r/w (1e6)         compute    3.00x     1.57x
+//!   method dispatch (1e6)      compute    2.90x     1.87x
+//!   string concat (50000)      alloc      1.25x     1.05x   (EXEMPT from >= 2x)
+//!   template build (50000)     alloc      1.09x     0.99x   (EXEMPT)
+//!   closure capture (1e6)      compute    4.26x     1.13x   (NEW — SP8 #136)
+//!   geomean spec/tw = 2.88x   (A0 baseline 2.73x → 2.88x; V11-T6 was 2.92x)
+//!
+//!   (a) COMPUTE-BOUND >= 2x spec/tw: PASS (all 7 compute benches, min 2.87x).
+//!   (b) NO spec-vs-generic regression: PASS (every bench; alloc benches at ~1.0x
+//!       spec/gen with allocator jitter).
+//!   (c) The new `closure capture` bench (a closure capturing a never-reassigned `k`
+//!       each iteration — by-value eligible) lands at 4.26x spec/tw, 1.13x spec/gen.
+//! ───────────────────────────────────────────────────────────────────────────────
 
 use std::time::{Duration, Instant};
 
@@ -267,6 +291,27 @@ print(len(s))
 let s = ""
 for (i in 0..50000) { s = `${s}y` }
 print(len(s))
+"#,
+        },
+        // ── closure capture (SP8 #136 capture-by-value) ──────────────────────
+        // Each iteration builds a closure capturing a NEVER-reassigned local `k`.
+        // Under SP8 #136 `k` is captured BY VALUE: no cell allocation in `make`'s
+        // declaring frame and a plain GET_LOCAL (no RefCell borrow), vs the old
+        // per-iteration cell allocation + borrow.
+        Bench {
+            name: "closure capture (1e6)",
+            compute_bound: true,
+            src: r#"
+fn make(base) {
+  let k = base + 1
+  return () => k
+}
+let total = 0
+for (i in 0..1000000) {
+  let f = make(i)
+  total = total + f()
+}
+print(total)
 "#,
         },
     ]

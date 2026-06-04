@@ -143,9 +143,11 @@ Upvalues, implemented Rust-idiomatically (no `unsafe`, no stack-pointer dance):
 - Captured-and-mutated locals are stored as **`Rc<RefCell<Value>>` cells**; a closure captures *clones of
   the `Rc`* → shared by-reference, preserving AScript's current JS-like capture semantics. Non-captured
   locals stay plain `Value` in their slot.
-- **Capture-by-value optimization (Luau-style):** when the resolver proves a captured variable is never
-  reassigned after capture, capture it by value (clone the `Value`, no `RefCell`) — faster closures,
-  better locality. ~90% of captures are immutable.
+- **Capture-by-value optimization (Luau-style) — LANDED (SP8 #136):** when the resolver proves a captured
+  variable is never reassigned (`captured && !mutated`), it is captured by value (the `Value` is copied
+  into the closure's own fresh cell at `Op::Closure`; the declaring frame keeps a plain stack local — no
+  cell allocation, no per-access `RefCell` borrow) — faster closures, better locality. ~90% of captures
+  are immutable. A reassigned capture keeps the shared by-reference cell.
 - The **resolver** marks cell-vars and the per-closure upvalue plan; the compiler emits accordingly.
 
 ## Async/await & generators (model 2a — highest risk)
@@ -324,8 +326,8 @@ Falling short triggers the IC/specialization work *before* cutover.
   ISA, is the modern win). Specialization is **in-spec**, not deferred.
 - **Suspension model:** 2a (async dispatch loop borrowing tokio). 2b deferred (non-goal).
 - **Fiber** unifies main/async/generator execution; explicit frame stack ⇒ deep recursion.
-- **Closures:** upvalues via `Rc<RefCell<Value>>` cells, capture-by-value for immutable captures,
-  resolver-driven.
+- **Closures:** upvalues via `Cc<RefCell<Value>>` cells; capture-by-value for immutable (never-reassigned)
+  captures — LANDED in SP8 #136 — resolver-driven (`captured && !mutated`).
 - **`recover`:** native builtin over `call_value` (stays first-class); no opcode (block-form opcode is a
   future option).
 - **Specialization:** shapes via `shape_id`-on-`IndexMap` + per-VM `ShapeRegistry`; polymorphic ICs
