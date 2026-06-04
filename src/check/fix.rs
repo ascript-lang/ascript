@@ -209,6 +209,28 @@ mod tests {
     }
 
     #[test]
+    fn fix_is_idempotent_over_import_programs() {
+        use crate::check::analyze;
+        // For a few import-bearing programs, applying every collected fix once
+        // removes the fixable diagnostic; applying again is a byte-identical no-op.
+        for src in [
+            "import { a, b } from \"std/math\"\nprint(b)\n",
+            "import * as t from \"std/task\"\nprint(1)\n",
+            "import { a } from \"std/math\"\nprint(1)\n",
+        ] {
+            let once = apply_edits(src, &collect_fixes(&analyze(src)));
+            // After one pass there are no further fixable diagnostics.
+            assert!(
+                collect_fixes(&analyze(&once)).is_empty(),
+                "src {src:?} still has fixes after one pass: {once:?}"
+            );
+            // A second pass is a byte-identical no-op.
+            let twice = apply_edits(&once, &collect_fixes(&analyze(&once)));
+            assert_eq!(once, twice, "second --fix changed the file for {src:?}");
+        }
+    }
+
+    #[test]
     fn render_diff_shows_removed_line() {
         let d = render_diff("f.as", "keep\ndrop\nkeep2\n", "keep\nkeep2\n");
         assert!(d.contains("-drop"), "diff: {d}");
