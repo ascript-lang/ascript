@@ -1740,6 +1740,47 @@ fn check_range_step_lint_and_allow_suppression() {
 }
 
 #[test]
+fn check_call_arity_lint_and_allow_suppression() {
+    // The `call-arity` static lint flags a call to a uniquely-resolved file-local
+    // function with the wrong number of positional args, mirroring the runtime
+    // arity panic. Configurable: `--allow call-arity` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file =
+        std::env::temp_dir().join(format!("ascript_call_arity_lint_{}.as", std::process::id()));
+    std::fs::write(&file, "fn f(a,b){ return a }\nf(1,2,3)\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"call-arity\""),
+        "expected a call-arity diagnostic, got:\n{stdout}"
+    );
+
+    // `--allow call-arity` suppresses it (and the code is a known/configurable rule).
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("call-arity")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"call-arity\""),
+        "--allow call-arity should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn check_invalid_propagate_lint_and_allow_suppression() {
     // The `invalid-propagate` static lint flags a postfix `?` inside a function
     // whose declared return type is not a `Result`. Configurable: `--allow

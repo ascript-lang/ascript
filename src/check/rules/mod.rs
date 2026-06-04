@@ -4,6 +4,7 @@ use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{Resolution, ResolveResult};
 
+pub mod call_arity;
 pub mod contract;
 pub mod dead_recover;
 pub mod ignored_result;
@@ -30,6 +31,7 @@ pub static ALL: &[Rule] = &[
     ignored_result::check,
     dead_recover::check,
     contract::check,
+    call_arity::check,
     range_step::check,
     invalid_propagate::check,
     unresolved_import::check,

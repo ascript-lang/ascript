@@ -36,6 +36,7 @@ pub const RULE_CODES: &[&str] = &[
     "ignored-result",
     "dead-recover",
     "contract-mismatch",
+    "call-arity",
     "range-step",
     "invalid-propagate",
     "unresolved-import",
