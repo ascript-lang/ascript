@@ -163,6 +163,28 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > `match_pattern`), `fmt.rs` (`write_pattern`, `write_match_arm`), `token.rs` (`DotDotEq`),
 > `lexer.rs` (lex `..=`), tree-sitter grammar + `parser.c` (regen with
 > `tree-sitter generate --abi 14`), LSP (recognizes pattern bindings as definitions).
+>
+> **SP4 — checker & tooling (feature-INDEPENDENT, static-only).** (1) **`ascript check --fix` /
+> `--fix-dry-run`** apply only the `FIXABLE_CODES` allowlist (`src/check/fix.rs`: v1 = `unused-import`
+> only; `unused-binding` stays LSP-code-action-only). `apply_edits` is right-to-left overlap-safe;
+> `--fix` re-evaluates exit against the POST-fix analysis and is idempotent. The `unused-import` fix
+> removes a removable UNIT — whole `ImportStmt` (single-name/namespace, swallowing the trailing
+> newline) or one clause + a comma of a multi-name list — NOT the name token (the resolver records
+> every import binding's `decl_range` as the whole `ImportStmt`, so the fix matches by NAME). (2)
+> **`call-arity` extended** (`src/check/rules/call_arity.rs`) to constructors, METHODS (`recv.m` only
+> when the receiver class is certain: `self` in a non-static method, or a `let`/`const` directly
+> bound to `C(...)` with `Binding.mutated == false`), and imported `std/*` fns via a curated
+> drift-guarded table (`src/check/std_arity.rs`). **Std fns get `max=None`** — native fns IGNORE
+> surplus args, so ONLY too-few (a guaranteed panic) is flagged. Shared `resolves_to_unique` +
+> `Arity`/`arity_of`/`decl_arity` live in `rules/mod.rs`. (3) **Cross-module span provenance**:
+> `AsError.span_source` (set at raise time via `at_in`/`with_span_source`); `diagnostics::report`
+> prefers it over `source`. The VM binds each module's `SourceInfo` onto its whole proto tree
+> (`Chunk::set_module_source`, NOT serialized) and onto an escaping panic in `Vm::run` (via
+> `last_fault_source`); the tree-walker oracle keeps prior behavior (documented cut). (4) **Cross-file
+> LSP** (`src/lsp/workspace.rs`, `Send+Sync`, interpreter-free): a `WorkspaceIndex` built by reusing
+> the CST `tree_builder`+`resolve`, powering cross-file go-to-def / workspace symbols /
+> find-references / rename (refuses on collision or a parse error in a touched file) + index-backed
+> file-module `call-arity` merged into the LSP diagnostics path.
 
 ## Commands
 

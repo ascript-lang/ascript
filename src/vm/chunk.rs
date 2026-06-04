@@ -296,6 +296,37 @@ pub struct Chunk {
     /// `None` for every valid (sub-65535) module — the placeholder is never
     /// executed because compile aborts the moment the flag is observed set.
     pub overflow: std::cell::Cell<Option<ChunkLimit>>,
+    /// The MODULE source (`path` + full text) this chunk's spans index, for
+    /// cross-module diagnostic provenance (SP4 §3). Set at compile/load time on a
+    /// module's whole proto tree (see [`Chunk::set_module_source`]); read by the
+    /// VM's panic path to bind the span to its OWN module's text so a panic raised
+    /// in module A but propagating to B's call site renders the caret in A.
+    /// Runtime-only: NOT serialized to `.aso` (an `.aso` has no source to render),
+    /// defaults to `None` (the renderer falls back to the entry source — the
+    /// pre-SP4 single-module behavior).
+    pub source: RefCell<Option<std::rc::Rc<crate::error::SourceInfo>>>,
+}
+
+impl Chunk {
+    /// Recursively bind `src` as the module source of this chunk AND every nested
+    /// function/class-method proto chunk, so a panic in ANY function of the module
+    /// resolves to the module's own source. Idempotent / innermost-wins: a chunk
+    /// that already has a source is left as-is (a re-entered cached module).
+    pub fn set_module_source(&self, src: &std::rc::Rc<crate::error::SourceInfo>) {
+        {
+            let mut slot = self.source.borrow_mut();
+            if slot.is_some() {
+                return; // already bound (cached module) — innermost-wins
+            }
+            *slot = Some(src.clone());
+        }
+        // Every nested function/method/arrow body is a `FnProto` in `protos`
+        // (method closures are created via `CLOSURE` ops referencing `protos`), so
+        // recursing through `protos` covers the whole module proto tree.
+        for proto in &self.protos {
+            proto.chunk.set_module_source(src);
+        }
+    }
 }
 
 /// A compiled function prototype: a [`Chunk`] plus the calling-convention flags

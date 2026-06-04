@@ -4,11 +4,12 @@
 
 use crate::check::diagnostic::{AsDiagnostic, Severity};
 use crate::check::rules::{
-    code_range, fn_name, is_type_kind, lit_name, literal_kind, type_compat, Compat,
+    code_range, fn_name, is_type_kind, lit_name, literal_kind, resolves_to_unique, type_compat,
+    Compat,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
-use crate::syntax::resolve::types::{BindingKind, Resolution, ResolveResult};
+use crate::syntax::resolve::types::{BindingKind, ResolveResult};
 use std::collections::HashMap;
 
 pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
@@ -43,7 +44,13 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         // scope. Mirrors `unknown_enum_variant::resolves_to_enum`: verify the resolved
         // use binds to a `Fn` binding declared at exactly this `FnDecl`'s range, with
         // no other (shadowing) binding of the same name. (contract.rs:resolves_to_fn)
-        if !resolves_to_fn(callee, name.as_str(), fn_decl.text_range(), resolved) {
+        if !resolves_to_unique(
+            callee,
+            name.as_str(),
+            fn_decl.text_range(),
+            BindingKind::Fn,
+            resolved,
+        ) {
             continue;
         }
 
@@ -104,39 +111,6 @@ fn param_types(fn_decl: &ResolvedNode) -> Vec<Option<ResolvedNode>> {
         })
         .map(|p| p.children().find(|c| is_type_kind(c.kind())).cloned())
         .collect()
-}
-
-/// Does the callee `NameRef` resolve to the genuine binding of the unique top-level
-/// `fn` `name` declared at `decl_range`? True iff the resolver maps this use to an
-/// in-file/global binding AND there is exactly one binding of that name, which is a
-/// `Fn` binding declared at exactly `decl_range`. A `let`/`const`/parameter that
-/// SHADOWS the fn name produces a second (non-`Fn`, different-range) binding, so the
-/// call is correctly skipped. Mirrors `unknown_enum_variant::resolves_to_enum`.
-fn resolves_to_fn(
-    callee: &ResolvedNode,
-    name: &str,
-    decl_range: cstree::text::TextRange,
-    resolved: &ResolveResult,
-) -> bool {
-    let bound = match resolved.uses.get(&callee.text_range()) {
-        Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
-        Some(Resolution::Global(gname)) => resolved
-            .bindings
-            .iter()
-            .any(|b| b.is_global && b.name == *gname),
-        _ => false,
-    };
-    if !bound {
-        return false;
-    }
-    let mut same_name = resolved.bindings.iter().filter(|b| b.name == name);
-    let Some(only) = same_name.next() else {
-        return false;
-    };
-    if same_name.next().is_some() {
-        return false; // ambiguous: the name is bound more than once (shadowing)
-    }
-    only.kind == BindingKind::Fn && only.decl_range == decl_range
 }
 
 fn is_expr(kind: SyntaxKind) -> bool {

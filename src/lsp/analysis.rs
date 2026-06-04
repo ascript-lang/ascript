@@ -71,27 +71,34 @@ const STD_MODULE_PATHS: &[&str] = &[
 /// the `LineIndex` is char-based, so we convert byte→char per endpoint.
 pub fn diagnostics(text: &str) -> Vec<Diagnostic> {
     let analysis = crate::check::analyze(text);
-    let index = LineIndex::new(text);
     analysis
         .diagnostics
         .iter()
-        .map(|d| Diagnostic {
-            range: Range {
-                start: index.position(byte_to_char(text, d.range.start)),
-                end: index.position(byte_to_char(text, d.range.end)),
-            },
-            severity: Some(match d.severity {
-                crate::check::Severity::Error => DiagnosticSeverity::ERROR,
-                crate::check::Severity::Warning => DiagnosticSeverity::WARNING,
-                crate::check::Severity::Info => DiagnosticSeverity::INFORMATION,
-                crate::check::Severity::Hint => DiagnosticSeverity::HINT,
-            }),
-            code: Some(NumberOrString::String(d.code.clone())),
-            source: Some("ascript".to_string()),
-            message: d.message.clone(),
-            ..Diagnostic::default()
-        })
+        .map(|d| byte_diagnostic_to_lsp(text, d))
         .collect()
+}
+
+/// Convert one neutral `AsDiagnostic` (byte ranges) into an LSP `Diagnostic`.
+/// Shared by [`diagnostics`] and the index-backed file-module call-arity merge
+/// in the server (SP4 §4 D-arity).
+pub fn byte_diagnostic_to_lsp(text: &str, d: &crate::check::AsDiagnostic) -> Diagnostic {
+    let index = LineIndex::new(text);
+    Diagnostic {
+        range: Range {
+            start: index.position(byte_to_char(text, d.range.start)),
+            end: index.position(byte_to_char(text, d.range.end)),
+        },
+        severity: Some(match d.severity {
+            crate::check::Severity::Error => DiagnosticSeverity::ERROR,
+            crate::check::Severity::Warning => DiagnosticSeverity::WARNING,
+            crate::check::Severity::Info => DiagnosticSeverity::INFORMATION,
+            crate::check::Severity::Hint => DiagnosticSeverity::HINT,
+        }),
+        code: Some(NumberOrString::String(d.code.clone())),
+        source: Some("ascript".to_string()),
+        message: d.message.clone(),
+        ..Diagnostic::default()
+    }
 }
 
 /// Convert a byte offset to a char offset (the existing `LineIndex` is

@@ -101,6 +101,98 @@ pub fn dropped_local_call(
     Some((name, call))
 }
 
+/// The arity RANGE of a parameter list: `min` leading required params (no
+/// default), `max` total positional params, or `None` when a `...rest` makes it
+/// unbounded. Shared by `call_arity`'s fn/method/constructor/std checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Arity {
+    pub min: usize,
+    pub max: Option<usize>,
+}
+
+/// Compute the [`Arity`] of a `ParamList` CST node. `min` is the leading run of
+/// POSITIONAL params with no default (SP2 §2: a required param may not follow a
+/// defaulted one); `max` is the positional param count, or `None` when a `...rest`
+/// param makes it unbounded. A param is a rest iff it carries a `DotDotDot` token;
+/// it has a default iff it has an EXPRESSION child (the `= expr`, distinct from
+/// its TYPE child).
+pub(crate) fn arity_of(param_list: &ResolvedNode) -> Arity {
+    use SyntaxKind::*;
+    let mut min = 0usize;
+    let mut positional = 0usize;
+    let mut seen_default = false;
+    for p in param_list.children().filter(|c| c.kind() == Param) {
+        let is_rest = p
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == DotDotDot);
+        if is_rest {
+            return Arity { min, max: None }; // variadic — max unbounded
+        }
+        positional += 1;
+        let has_default = p.children().any(|c| is_expr_kind(c.kind()));
+        if has_default {
+            seen_default = true;
+        } else if !seen_default {
+            min += 1;
+        }
+    }
+    Arity {
+        min,
+        max: Some(positional),
+    }
+}
+
+/// The [`Arity`] of a function/method/init declaration (a node that may contain a
+/// `ParamList`). A declaration with no `ParamList` is zero-arity.
+pub(crate) fn decl_arity(decl: &ResolvedNode) -> Arity {
+    match decl.children().find(|c| c.kind() == SyntaxKind::ParamList) {
+        Some(list) => arity_of(list),
+        None => Arity {
+            min: 0,
+            max: Some(0),
+        },
+    }
+}
+
+/// Does the callee `NameRef` resolve to the GENUINE unique binding of `name`,
+/// of kind `kind`, declared at `decl_range`? True iff the resolver maps this use
+/// to an in-file/global binding AND there is exactly ONE binding of that name,
+/// which is a `kind` binding at exactly `decl_range`. A shadowing `let`/`const`/
+/// param produces a second (different-kind/range) binding, so the call is
+/// correctly skipped — the zero-false-positive uniqueness gate shared by
+/// `call_arity` (fn/class) and `contract` (fn). Mirrors the original
+/// per-rule `resolves_to_fn`/`resolves_to_class` exactly.
+pub(crate) fn resolves_to_unique(
+    callee: &ResolvedNode,
+    name: &str,
+    decl_range: cstree::text::TextRange,
+    kind: crate::syntax::resolve::types::BindingKind,
+    resolved: &ResolveResult,
+) -> bool {
+    // The use must resolve to *some* in-file/global binding (not Unresolved/builtin).
+    let bound = match resolved.uses.get(&callee.text_range()) {
+        Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
+        Some(Resolution::Global(gname)) => resolved
+            .bindings
+            .iter()
+            .any(|b| b.is_global && b.name == *gname),
+        _ => false,
+    };
+    if !bound {
+        return false;
+    }
+    // Exactly one binding of that name, which must be the expected decl.
+    let mut same_name = resolved.bindings.iter().filter(|b| b.name == name);
+    let Some(only) = same_name.next() else {
+        return false;
+    };
+    if same_name.next().is_some() {
+        return false; // ambiguous: the name is bound more than once (shadowing)
+    }
+    only.kind == kind && only.decl_range == decl_range
+}
+
 /// The CST expression kinds that can appear in an expression position. Mirrors
 /// `is_expr_kind` in `src/compile/mod.rs` for the cases the checker recurses into.
 /// Shared by the rules that need to pick out the expression children of a node

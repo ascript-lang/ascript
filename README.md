@@ -73,8 +73,9 @@ ascript run program.aso    # run compiled bytecode (no compile step)
 ascript repl               # interactive REPL
 ascript fmt file.as        # format in place
 ascript check file.as      # static check (syntax + lints)
+ascript check --fix *.as   # apply safe autofixes (unused-import removal)
 ascript test file.as       # run test(name, fn) cases
-ascript lsp                # language server over stdio
+ascript lsp                # language server over stdio (cross-file nav + rename)
 ```
 
 ### Runtime & performance
@@ -124,6 +125,13 @@ Precedence is inline `// ascript-ignore[code]` > CLI flag > `ascript.toml` > rul
 default; `syntax-error` is always an error. See the
 [checker design spec](docs/superpowers/specs/2026-06-02-checker-design.md) for the
 full rule-code list and details.
+
+`ascript check --fix` (or `--fix-dry-run` to preview) applies the safe, idempotent
+autofixes — currently **unused-import** removal — and re-evaluates the exit status
+against the post-fix analysis. The `call-arity` lint reaches across modules and to
+**constructor**, **method**, and **imported `std/*`** calls (zero false positives); the
+language server's cross-file index extends this and powers go-to-definition,
+find-references, workspace symbols, and **rename across files**.
 
 ### Hello, world
 

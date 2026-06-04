@@ -143,6 +143,23 @@ Lint levels can be tuned per invocation (`--deny`/`--warn`/`--allow`) or via an 
 discovered by walking up from the checked file. A non-zero exit status indicates problems were
 found, which makes `ascript check` suitable for CI.
 
+### Autofix (`--fix` / `--fix-dry-run`)
+
+```text
+ascript check --fix src/*.as          # apply safe autofixes in place
+ascript check --fix-dry-run src/*.as  # preview the changes (unified diff) without writing
+```
+
+`--fix` applies the **safe, unambiguous** autofixes — currently the removal of an **unused import**
+(removing the whole `import` statement, or a single clause of a multi-name `import { a, b }` list,
+keeping the list well-formed). It rewrites the file in place, prints `fixed N issue(s)`, and
+re-evaluates the exit status against the *post-fix* analysis (a file whose only issue was a fixed
+import exits **0**). Re-running `--fix` is **idempotent**. `--fix-dry-run` prints a unified diff
+(or, with `--json`, the planned edits) and never touches the file; the two flags are mutually
+exclusive. `unused-binding` removal is deliberately **not** auto-applied (it could drop a
+side-effecting initializer like `let x = doWork()`), though the editor still offers it as a
+code-action.
+
 Several structural rules cover ranges, import/propagation hygiene, calls, enums, and classes (all
 default to **Warning**, all configurable via `--deny`/`--warn`/`--allow` or the `[lint]` table):
 
@@ -154,7 +171,16 @@ default to **Warning**, all configurable via `--deny`/`--warn`/`--allow` or the 
 - **`unresolved-import`** — an `import … from "std/…"` naming a std module that does not exist (e.g. a
   typo like `"std/maths"`). **V1 limitation:** only `std/*` specifiers are checked; relative file paths
   (`"./mod"`, `"mod.as"`) are not yet resolved (the analysis is path-less), so they are left untouched.
-- **`call-arity`** — a direct call to a known function with the wrong number of arguments.
+- **`call-arity`** — a call with the wrong number of arguments where the callee is statically
+  certain. This covers: a directly-named **function** (default params widen the accepted range, a
+  `...rest` makes the max unbounded); a **constructor** `C(args)` against the class's `init` or
+  auto-derived field arity; a **method** `recv.m(args)` where the receiver's class is provable
+  (only `self` in a method, or a `let`/`const` bound directly to `C(...)` and never reassigned);
+  and an **imported `std/*` function** with too few args (a guaranteed runtime panic — native
+  functions ignore surplus args, so a too-many call is never flagged). Cross-file calls to a
+  *file-module* exported function are checked in the editor (the language server's workspace index
+  knows the target's signature). Every case stays **zero-false-positive**: any uncertainty skips
+  the call.
 - **`unknown-enum-variant`** — accessing a variant that the enum doesn't declare.
 - **`duplicate-member`** — two fields/methods with the same name in one class.
 - **`super-misuse`** — `super` used in a class that has no superclass.
@@ -163,12 +189,24 @@ default to **Warning**, all configurable via `--deny`/`--warn`/`--allow` or the 
 ## `ascript lsp`
 
 Run the language server over stdio (the LSP protocol). Point your editor's generic LSP client at
-`ascript lsp` to get diagnostics, document symbols, completion, hover, and go-to-definition.
+`ascript lsp` to get diagnostics, document symbols, completion, hover, go-to-definition,
+**find-references**, **workspace symbols**, and **rename** — all working **across files**.
 
 ```text
 ascript lsp
 ```
 
-> [!NOTE] The language server is **static-analysis only** — it lexes and parses your source to
-> produce diagnostics and navigation; it never runs the interpreter. Per-document analysis ships
-> today; cross-file go-to-definition, rename, and incremental sync are planned enhancements.
+The server builds a **cross-file workspace index** (warmed from the workspace root on startup,
+re-indexed incrementally as you type) so navigation spans modules:
+
+- **go-to-definition** on a use of an imported name jumps to the defining file;
+- **find-references** lists a symbol's uses across its file and every file that imports it;
+- **workspace symbols** (`workspace/symbol`) searches every `.as` file in the workspace;
+- **rename** rewrites a symbol's declaration, the import clauses that name it, and its use sites,
+  refusing the edit if a touched file has a parse error or the new name collides with an existing
+  binding;
+- a transient parse error retains the file's **last-good** index so navigation degrades gracefully.
+
+> [!NOTE] The language server is **static-analysis only** — it lexes, parses, and resolves your
+> source to produce diagnostics and navigation; it never runs the interpreter, so the whole layer
+> stays `Send + Sync` and free of runtime state.

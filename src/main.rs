@@ -64,6 +64,15 @@ enum Command {
         /// accepted but a no-op (syntax errors are always reported).
         #[arg(long = "allow", value_name = "RULE")]
         allow: Vec<String>,
+        /// Apply safe autofixes in place (currently `unused-import` removal).
+        /// Re-running is idempotent. Mutually exclusive with `--fix-dry-run`.
+        #[arg(long)]
+        fix: bool,
+        /// Show the autofixes that `--fix` would apply (a unified diff, or the
+        /// planned edits under `--json`) WITHOUT writing any file. Mutually
+        /// exclusive with `--fix`.
+        #[arg(long = "fix-dry-run")]
+        fix_dry_run: bool,
     },
     /// Run .as test files
     Test { files: Vec<String> },
@@ -94,6 +103,64 @@ fn main() -> ExitCode {
         })
         .expect("failed to spawn worker thread");
     worker.join().expect("worker thread panicked")
+}
+
+/// Fold an analysis's diagnostics into the run's exit-status accumulators: an
+/// `Error`-severity diagnostic fails the run; a surviving `Warning` trips the run
+/// only when the file's effective config asks (`--deny-warnings` / toml).
+fn tally(
+    analysis: &ascript::check::Analysis,
+    config: &ascript::check::LintConfig,
+    any_error: &mut bool,
+    deny_warnings_tripped: &mut bool,
+) {
+    for d in &analysis.diagnostics {
+        match d.severity {
+            ascript::check::Severity::Error => *any_error = true,
+            ascript::check::Severity::Warning => {
+                if config.deny_warnings {
+                    *deny_warnings_tripped = true;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A machine-readable JSON array of the planned `--fix-dry-run` edits for `path`:
+/// `[{"path","start","end","replacement"}, ...]`. Hand-rolled (serde-free) to
+/// match the existing JSON renderer's posture.
+fn fix_edits_json(path: &str, edits: &[ascript::check::TextEdit]) -> String {
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+    let mut out = String::from("[");
+    for (i, e) in edits.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"path\":\"{}\",\"start\":{},\"end\":{},\"replacement\":\"{}\"}}",
+            esc(path),
+            e.range.start,
+            e.range.end,
+            esc(&e.replacement)
+        ));
+    }
+    out.push(']');
+    out
 }
 
 async fn real_main() -> ExitCode {
@@ -198,7 +265,15 @@ async fn real_main() -> ExitCode {
             deny,
             warn,
             allow,
+            fix,
+            fix_dry_run,
         } => {
+            // `--fix` and `--fix-dry-run` are mutually exclusive (writing vs.
+            // previewing) — reject both together as a usage error.
+            if fix && fix_dry_run {
+                eprintln!("error: --fix and --fix-dry-run are mutually exclusive");
+                return ExitCode::from(2);
+            }
             // Validate every CLI rule code against the known set up front. An
             // unknown code is a usage error (distinct from a lint failure) —
             // reject it before analyzing anything.
@@ -259,17 +334,52 @@ async fn real_main() -> ExitCode {
                 };
                 overlay_cli(&mut config);
                 let analysis = ascript::check::analyze::analyze_with_config(&src, &config);
-                for d in &analysis.diagnostics {
-                    match d.severity {
-                        ascript::check::Severity::Error => any_error = true,
-                        ascript::check::Severity::Warning => {
-                            if config.deny_warnings {
-                                deny_warnings_tripped = true;
-                            }
+
+                // `--fix` / `--fix-dry-run`: collect the allowlisted autofixes and
+                // either preview them (dry-run) or apply them in place. After
+                // applying, the file is RE-ANALYZED so exit status reflects the
+                // post-fix state (a file whose only issue was an auto-fixed import
+                // exits clean).
+                if fix || fix_dry_run {
+                    let edits = ascript::check::collect_fixes(&analysis);
+                    let after = ascript::check::apply_edits(&src, &edits);
+                    if fix_dry_run {
+                        if json {
+                            println!("{}", fix_edits_json(file, &edits));
+                        } else if after != src {
+                            print!("{}", ascript::check::fix::render_diff(file, &src, &after));
                         }
-                        _ => {}
+                        // Dry-run: exit status reflects the CURRENT (un-fixed) analysis.
+                        tally(&analysis, &config, &mut any_error, &mut deny_warnings_tripped);
+                        continue;
                     }
+                    // `--fix`: write back only if changed, report, then re-analyze.
+                    if after != src {
+                        if let Err(e) = std::fs::write(file, &after) {
+                            eprintln!("error: could not write {}: {}", file, e);
+                            any_error = true;
+                            continue;
+                        }
+                        if !json {
+                            println!("fixed {} issue(s) in {}", edits.len(), file);
+                        }
+                    }
+                    let post = ascript::check::analyze::analyze_with_config(&after, &config);
+                    tally(&post, &config, &mut any_error, &mut deny_warnings_tripped);
+                    // Render the REMAINING (post-fix) diagnostics so the user sees
+                    // what `--fix` could not resolve.
+                    if json {
+                        println!("{}", ascript::check::render::json(file, &post.diagnostics));
+                    } else {
+                        print!(
+                            "{}",
+                            ascript::check::render::human(file, &after, &post.diagnostics)
+                        );
+                    }
+                    continue;
                 }
+
+                tally(&analysis, &config, &mut any_error, &mut deny_warnings_tripped);
                 if json {
                     println!(
                         "{}",
