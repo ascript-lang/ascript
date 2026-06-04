@@ -181,15 +181,24 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             var,
             start,
             end,
+            inclusive,
+            step,
             body,
         } => {
+            // RANGES FEATURE, Phase 1. The parser DOES set `inclusive`/`step`
+            // (since commit a91dfdc); this render emits the `..=`/`step` surface
+            // faithfully (parsed now; evaluated in a later phase).
             indent(out, level);
             out.push_str("for (");
             out.push_str(var);
             out.push_str(" in ");
             write_expr(out, start, 0);
-            out.push_str("..");
+            out.push_str(if *inclusive { "..=" } else { ".." });
             write_expr(out, end, 0);
+            if let Some(k) = step {
+                out.push_str(" step ");
+                write_expr(out, k, 0);
+            }
             out.push_str(") ");
             write_block(out, body, level);
             out.push('\n');
@@ -399,6 +408,9 @@ fn expr_prec(e: &Expr) -> u8 {
         ExprKind::Ternary { .. } => PREC_ASSIGN,
         ExprKind::Arrow { .. } => PREC_ASSIGN,
         ExprKind::Binary { op, .. } => bin_prec(*op),
+        // `ExprKind::Range` (emitted by the parser since commit a91dfdc) mirrors
+        // the legacy `BinOp::Range` precedence.
+        ExprKind::Range { .. } => bin_prec(BinOp::Range),
         ExprKind::Unary { .. } => PREC_UNARY,
         ExprKind::Await(_) => PREC_UNARY,
         // `yield` binds as loosely as assignment (it captures a full expression).
@@ -624,6 +636,25 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
             }
             out.push_str(" }");
         }
+        // RANGES FEATURE, Phase 1. The parser DOES emit `ExprKind::Range` (since
+        // commit a91dfdc), so this is the live value-range render path. It mirrors
+        // the legacy `BinOp::Range` operand precedence and adds the `..=`/`step`
+        // surface (parsed now; evaluated in a later phase).
+        ExprKind::Range {
+            start,
+            end,
+            inclusive,
+            step,
+        } => {
+            let p = bin_prec(BinOp::Range);
+            write_expr(out, start, p);
+            out.push_str(if *inclusive { "..=" } else { ".." });
+            write_expr(out, end, p + 1);
+            if let Some(k) = step {
+                out.push_str(" step ");
+                write_expr(out, k, PREC_ASSIGN);
+            }
+        }
         ExprKind::Paren(inner) => {
             // The parser keeps explicit parens only to break optional chains.
             // Re-emit them so semantics (and idempotence) are preserved.
@@ -661,10 +692,18 @@ fn write_pattern(out: &mut String, pat: &Pattern) {
             start,
             end,
             inclusive,
+            step,
         } => {
+            // Renders the inclusive boundary (`..=`) and the optional `step`
+            // clause, both of which the parser now populates (a `step`-less
+            // pattern simply leaves `step` `None`).
             write_expr(out, start, PREC_ASSIGN);
             out.push_str(if *inclusive { "..=" } else { ".." });
             write_expr(out, end, PREC_ASSIGN);
+            if let Some(k) = step {
+                out.push_str(" step ");
+                write_expr(out, k, PREC_ASSIGN);
+            }
         }
         Pattern::Array(pats, rest) => {
             out.push('[');

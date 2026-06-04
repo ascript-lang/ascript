@@ -210,10 +210,11 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
 ///    authoritative legacy ast for these forms, so they cannot diverge. The slice is
 ///    padded with leading spaces up to the node's start offset so the produced spans
 ///    keep their original-file byte offsets.
-/// 3. **Rejected** (symmetric with the tree-walker): an inclusive `..=` range as a
-///    value default — the legacy parser ALSO rejects it (the tree-walker reports
-///    "expected a field name or method, found DotDotEq"; `BinOp::Range` has no
-///    inclusive variant), so the VM's rejection here is symmetric.
+///    A value-position range default (`a..b`, `a..=b`, or stepped `a..b step k`)
+///    lowers to `ExprKind::Range { start, end, inclusive, step }` — the SAME node
+///    the tree-walker materializes, so the inclusive boundary and the signed `step`
+///    (incl. its zero/non-finite/direction validation) behave identically in both
+///    engines.
 fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     use crate::ast::{ArrayElem, BinOp, CallArg, ExprKind, ObjEntry, UnOp};
     let span = node_span(expr);
@@ -305,10 +306,12 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 rhs: Box::new(cst_default_expr(&rhs)?),
             }
         }
-        // Exclusive range `a..b` → `BinOp::Range` (mirrors `compile_range`). The
-        // inclusive `..=` form has no legacy `BinOp` (and no value-position
-        // representation): the legacy parser rejects `..=` as a value default too,
-        // so rejecting it here is symmetric with the tree-walker.
+        // Value-position range `a..b` / `a..=b` / `a..b step k` → `ExprKind::Range`
+        // (the tree-walker materializes it to `array<number>`, honoring the inclusive
+        // boundary and — when present — the signed `step`). `ExprKind::Range` has full
+        // step support since Phase 3 (its eval runs the shared `resolve_step` /
+        // `materialize_range_stepped`), so a stepped field default lowers to a
+        // `step: Some(..)` range and validates identically to a stepped value range.
         Expr::RangeExpr(range) => {
             let start = range
                 .start()
@@ -316,26 +319,28 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             let end = range
                 .end()
                 .ok_or_else(|| CompileError::new("range default missing end bound", span))?;
-            match range.op() {
-                Some(SyntaxKind::DotDot) => {}
-                Some(SyntaxKind::DotDotEq) => {
-                    return Err(CompileError::new(
-                        "inclusive range (..=) as a value default is not supported \
-                         (the tree-walker's parser also rejects it)",
-                        span,
-                    ))
-                }
+            let inclusive = match range.op() {
+                Some(SyntaxKind::DotDot) => false,
+                Some(SyntaxKind::DotDotEq) => true,
                 other => {
                     return Err(CompileError::new(
                         format!("range default has unexpected operator {other:?}"),
                         span,
                     ))
                 }
-            }
-            ExprKind::Binary {
-                op: BinOp::Range,
-                lhs: Box::new(cst_default_expr(&start)?),
-                rhs: Box::new(cst_default_expr(&end)?),
+            };
+            // Read the optional `step` child (the 3rd Expr child, mirroring how
+            // `compile_range` / `compile_range_pattern` read it) and lower it through
+            // the same `cst_default_expr` path as the bounds.
+            let step = match range.step() {
+                Some(step) => Some(Box::new(cst_default_expr(&step)?)),
+                None => None,
+            };
+            ExprKind::Range {
+                start: Box::new(cst_default_expr(&start)?),
+                end: Box::new(cst_default_expr(&end)?),
+                inclusive,
+                step,
             }
         }
         Expr::ArrayExpr(arr) => {
@@ -2407,11 +2412,12 @@ impl Compiler {
     /// exit:
     ///   patch(break_sites...)      ; each `break` lands here
     /// ```
-    /// The INCLUSIVE form `for (i in 0..=5)` is REJECTED here: the legacy parser
-    /// (the differential oracle) rejects `..=` in a for-range head outright
-    /// ("expected RParen, found DotDotEq"), so inclusive for-range is unsupported
-    /// in the tree-walker. The VM must not invent behavior the oracle lacks, so an
-    /// `..=` for-range is a documented `CompileError` (both engines reject it).
+    /// The pseudocode above shows the simple ascending/step-1 shape; the real
+    /// codegen seeds a RESOLVED signed step (via `Op::RangeResolveStep`) and re-tests
+    /// a direction-aware `range_has_next(idx, end, step)` each iteration, so a bare
+    /// descending range (`for (i in 10..7)` → `10 9 8`) counts DOWN and an explicit
+    /// `step` is honored. The INCLUSIVE form `for (i in 0..=5)` uses an inclusive
+    /// bound comparison; both behave byte-identically to the tree-walker.
     ///
     /// A for-of (`for (x of iterable)`, `op() == OfKw`) is lowered by
     /// [`Self::compile_for_of`] (sync snapshot iteration); `for await` async
@@ -2456,14 +2462,13 @@ impl Compiler {
             _ => return self.compile_for_of(for_stmt, &iter, &body),
         };
 
-        // Inclusive `..=` for-range is rejected by the legacy parser (the oracle),
-        // so the VM rejects it too — never silently treat it as exclusive.
-        if range.op() == Some(SyntaxKind::DotDotEq) {
-            return Err(CompileError::new(
-                "inclusive for-range (`..=`) is not supported (the interpreter rejects it)",
-                span,
-            ));
-        }
+        // The inclusive `..=` form drives the loop with an inclusive bound
+        // comparison; exclusive `..` is half-open. An optional `step k` (sign
+        // honored as direction) is resolved + validated at RUNTIME by the shared
+        // `resolve_step` (via `Op::RangeResolveStep`), so a computed step validates
+        // identically to the tree-walker.
+        let inclusive = range.op() == Some(SyntaxKind::DotDotEq);
+        let step_expr = range.step();
 
         let start = range
             .start()
@@ -2482,27 +2487,52 @@ impl Compiler {
         // we re-derive `i` from the counter at the TOP of each iteration, AFTER
         // installing a fresh cell for it (per-iteration capture freshness).
         let idx_slot = self.alloc_temp()?;
+        // The resolved (validated, signed) step lives in its own scratch slot and
+        // drives both the direction-aware condition and the increment.
+        let step_slot = self.alloc_temp()?;
         // Cell slots to refresh per iteration: the loop var `i` (if captured) plus
         // any captured `let`/`fn` declared in the loop BODY.
         let refresh_slots = self.loop_refresh_slots(&body, Some(var_slot));
-        // Anchor the bounds-numbers panic at the START bound's CODE start (trivia
-        // trimmed), byte-identical to the tree-walker's `AsError::at(_, start.span)`.
+        // Anchor the bounds-numbers AND step-validation panics at the START bound's
+        // CODE start (trivia trimmed), byte-identical to the tree-walker's
+        // `AsError::at(_, start.span)`.
         let start_span = node_code_span(&start);
 
         // Evaluate start then end (start below, end on top), guard both are
         // numbers (panic anchored at the START bound's span, matching the
-        // tree-walker), then store end ONCE and seed the counter `idx = start`.
+        // tree-walker). Then push the step expr (or a placeholder `1.0` when
+        // omitted) and RANGE_RESOLVE_STEP it (validates; leaves lo/hi + resolved
+        // step on the stack). Finally store step, end, and seed `idx = start`.
         self.compile_expr(&start)?;
         self.compile_expr(&end)?;
         self.chunk.emit(Op::CheckNumbers, start_span);
+        // present = 1 when a `step` expr was written; otherwise push a `1.0`
+        // placeholder (ignored by RANGE_RESOLVE_STEP, which resolves the omitted
+        // default at runtime — identical to the tree-walker's `None` branch).
+        let present = if let Some(step) = &step_expr {
+            self.compile_expr(step)?;
+            1u8
+        } else {
+            let one = self.chunk.add_const(Value::Number(1.0));
+            self.chunk.emit_u16(Op::Const, one, span);
+            0u8
+        };
+        self.chunk
+            .emit_u8(Op::RangeResolveStep, present, start_span);
+        // Stack (top→bottom): resolved_step, hi, lo. Pop into slots.
+        self.chunk.emit_u16(Op::SetLocal, step_slot, span);
         self.chunk.emit_u16(Op::SetLocal, end_slot, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
-        // Condition: re-test `idx < end` each iteration.
+        // Condition: re-test the direction-aware `range_has_next(idx, end, step)`
+        // each iteration (positive step: idx < end / idx <= end; negative step:
+        // idx > end / idx >= end).
         let cond_start = self.chunk.code.len();
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
         self.chunk.emit_u16(Op::GetLocal, end_slot, span);
-        self.chunk.emit(Op::Lt, span);
+        self.chunk.emit_u16(Op::GetLocal, step_slot, span);
+        self.chunk
+            .emit_u8(Op::RangeHasNext, u8::from(inclusive), span);
         let exit = self.chunk.emit_jump(Op::JumpIfFalse, span);
 
         // Top of the iteration: give the loop var (and any loop-body captured
@@ -2525,8 +2555,8 @@ impl Compiler {
         });
         self.compile_block(&body)?;
 
-        // Increment: `idx = idx + 1`. This is where every `continue` lands — at the
-        // CURRENT end of code, which is exactly what `patch_jump` targets — so
+        // Increment: `idx = idx + step`. This is where every `continue` lands — at
+        // the CURRENT end of code, which is exactly what `patch_jump` targets — so
         // patch every recorded forward `continue` site here, BEFORE emitting the
         // increment instructions. The counter is the scratch slot, NOT the
         // user-visible `i`, so body mutation of `i` cannot affect progression.
@@ -2541,8 +2571,7 @@ impl Compiler {
             self.chunk.patch_jump(site);
         }
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
-        let one = self.chunk.add_const(Value::Number(1.0));
-        self.chunk.emit_u16(Op::Const, one, span);
+        self.chunk.emit_u16(Op::GetLocal, step_slot, span);
         self.chunk.emit(Op::Add, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
@@ -3280,9 +3309,15 @@ impl Compiler {
         Ok(())
     }
 
-    /// A `RangePat` `start..end` / `start..=end`. Mirrors the tree-walker's
-    /// `Pattern::Range`: a non-number subject OR non-number bound is a (non-panic)
-    /// mismatch. Lowering: push subject, lo, hi; `MATCH_RANGE inclusive` → bool.
+    /// A `RangePat` `start..end` / `start..=end`, optionally `… step k` (strided
+    /// membership, spec §3.7). Mirrors the tree-walker's `Pattern::Range`: a
+    /// non-number subject OR non-number bound is a (non-panic) mismatch; a `step`
+    /// clause runs the SHARED `resolve_step` validation (so a `step 0` /
+    /// direction-mismatch pattern PANICS like iteration) + `range_pattern_contains`
+    /// stride test, byte-identical to the VM. `step` is the 3rd Expr child after
+    /// `start..end`. Lowering: push `subject lo hi step`; `MATCH_RANGE flags` → bool
+    /// (flags bit0 = inclusive, bit1 = step PRESENT). When step is omitted a `nil`
+    /// placeholder is pushed and ignored at runtime (resolved to the default ±1).
     fn compile_range_pattern(
         &mut self,
         pat: &ResolvedNode,
@@ -3295,7 +3330,9 @@ impl Compiler {
             .filter(|c| is_expr_kind(c.kind()))
             .cloned()
             .collect();
-        if exprs.len() != 2 {
+        // `step` (when present) is the 3rd Expr child, immediately after the
+        // `start..end` bounds (see `parse_range_step` in `src/syntax/parser.rs`).
+        if exprs.len() != 2 && exprs.len() != 3 {
             return Err(CompileError::new(
                 "range pattern must have a start and end bound",
                 range_span(pat),
@@ -3309,11 +3346,29 @@ impl Compiler {
             .ok_or_else(|| CompileError::new("range start is not an expression", range_span(pat)))?;
         let hi = Expr::cast(exprs[1].clone())
             .ok_or_else(|| CompileError::new("range end is not an expression", range_span(pat)))?;
+        let step = match exprs.get(2) {
+            Some(s) => Some(Expr::cast(s.clone()).ok_or_else(|| {
+                CompileError::new("range step is not an expression", range_span(pat))
+            })?),
+            None => None,
+        };
         self.emit_get_local_temp(subj_temp, span);
         self.compile_expr(&lo)?;
         self.compile_expr(&hi)?;
-        self.chunk
-            .emit_u8(Op::MatchRange, u8::from(inclusive), span);
+        // Always push a step operand (the placeholder when omitted) so MATCH_RANGE
+        // has a fixed 4-operand stack shape; the PRESENT flag selects the path.
+        let present = match &step {
+            Some(s) => {
+                self.compile_expr(s)?;
+                true
+            }
+            None => {
+                self.chunk.emit(Op::Nil, span);
+                false
+            }
+        };
+        let flags = u8::from(inclusive) | (u8::from(present) << 1);
+        self.chunk.emit_u8(Op::MatchRange, flags, span);
         fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
         Ok(())
     }
@@ -3789,16 +3844,15 @@ impl Compiler {
         Ok(())
     }
 
-    /// Lower a `RangeExpr` (`a..b`). Mirrors the tree-walker's `BinOp::Range`:
-    /// pushes both bounds and emits `RANGE`, which builds the eager half-open
-    /// `array<number>`. Only the exclusive `..` form has a tree-walker equivalent
-    /// in value position (the old parser produces `..=` only inside match
-    /// patterns), so an inclusive `..=` range as a value is a documented deferral.
+    /// Lower a `RangeExpr` (`a..b` / `a..=b`). Pushes both bounds and emits `RANGE`
+    /// (exclusive) or `RANGE_INCLUSIVE` (inclusive `..=`), which builds the eager
+    /// `array<number>` byte-identically to the tree-walker's value-position
+    /// materialization.
     fn compile_range(&mut self, range: &RangeExpr) -> Result<(), CompileError> {
-        // The RANGE op can PANIC (a non-number bound is a Tier-2 type error in
-        // `apply_binop`'s `BinOp::Range` arm). The tree-walker anchors it at the
-        // whole range expression's `expr.span`, which carries no leading trivia;
-        // use the trivia-trimmed code span for byte-identical diagnostics (#132).
+        // The RANGE / RANGE_INCLUSIVE op can PANIC (a non-number bound is a Tier-2
+        // type error). The tree-walker anchors it at the whole range expression's
+        // `expr.span`, which carries no leading trivia; use the trivia-trimmed code
+        // span for byte-identical diagnostics (#132).
         let span = node_code_span(range);
         let start = range
             .start()
@@ -3806,24 +3860,37 @@ impl Compiler {
         let end = range
             .end()
             .ok_or_else(|| CompileError::new("range expression missing end bound", span))?;
-        match range.op() {
-            Some(SyntaxKind::DotDot) => {}
-            Some(SyntaxKind::DotDotEq) => {
-                return Err(CompileError::new(
-                    "inclusive range (..=) as a value is not yet supported in V2",
-                    span,
-                ))
-            }
+        let inclusive = match range.op() {
+            Some(SyntaxKind::DotDot) => false,
+            Some(SyntaxKind::DotDotEq) => true,
             other => {
                 return Err(CompileError::new(
                     format!("range expression has unexpected operator {other:?}"),
                     span,
                 ))
             }
+        };
+        // A stepped value range materializes via RANGE_STEP_VALUE (signed step,
+        // direction + validation done at RUNTIME by the shared `resolve_step`, so a
+        // computed step validates identically). An un-stepped range keeps the
+        // simpler RANGE / RANGE_INCLUSIVE materializers (ascending/step-1).
+        if let Some(step) = range.step() {
+            self.compile_expr(&start)?;
+            self.compile_expr(&end)?;
+            self.compile_expr(&step)?;
+            // flags: bit0 = inclusive, bit1 = step PRESENT (always 1 here).
+            let flags = u8::from(inclusive) | 0b10;
+            self.chunk.emit_u8(Op::RangeStepValue, flags, span);
+        } else {
+            let op = if inclusive {
+                Op::RangeInclusive
+            } else {
+                Op::Range
+            };
+            self.compile_expr(&start)?;
+            self.compile_expr(&end)?;
+            self.chunk.emit(op, span);
         }
-        self.compile_expr(&start)?;
-        self.compile_expr(&end)?;
-        self.chunk.emit(Op::Range, span);
         Ok(())
     }
 
@@ -4447,11 +4514,12 @@ mod tests {
     }
 
     #[test]
-    fn inclusive_range_value_is_deferred() {
-        let err = compile_source("0..=5").unwrap_err();
+    fn inclusive_range_value_compiles_to_range_inclusive_op() {
+        let chunk = compile_source("0..=5").expect("compiles");
+        let text = disasm(&chunk);
         assert!(
-            err.message.contains("inclusive range"),
-            "expected inclusive-range deferral, got {err:?}"
+            text.contains("RANGE_INCLUSIVE"),
+            "missing RANGE_INCLUSIVE in:\n{text}"
         );
     }
 
@@ -4914,20 +4982,34 @@ mod tests {
     #[test]
     fn for_range_emits_check_numbers_guard_and_loop() {
         // The lowering must include the eager bounds guard (CHECK_NUMBERS), the
-        // exclusive comparison (LT), and a backward LOOP back-edge.
+        // runtime step resolution (RANGE_RESOLVE_STEP), the direction-aware
+        // condition (RANGE_HAS_NEXT), and a backward LOOP back-edge.
         let chunk = compile_source("for (i in 0..3) { print(i) }").expect("compiles");
         let text = disasm(&chunk);
         assert!(text.contains("CHECK_NUMBERS"), "no bounds guard in:\n{text}");
-        assert!(text.contains("LT"), "no exclusive comparison in:\n{text}");
+        assert!(
+            text.contains("RANGE_RESOLVE_STEP"),
+            "no step resolution in:\n{text}"
+        );
+        assert!(
+            text.contains("RANGE_HAS_NEXT"),
+            "no direction-aware condition in:\n{text}"
+        );
         assert!(text.contains("LOOP"), "no loop back-edge in:\n{text}");
     }
 
     #[test]
-    fn for_range_inclusive_is_rejected() {
-        // `..=` for-range is rejected (the tree-walker's parser rejects it), never
-        // silently treated as exclusive.
-        let err = compile_source("for (i in 0..=3) { print(i) }").unwrap_err();
-        assert!(err.message.contains("inclusive for-range"), "got {err:?}");
+    fn for_range_inclusive_uses_range_has_next() {
+        // Both `..` and `..=` for-ranges drive the loop with the direction-aware
+        // RANGE_HAS_NEXT condition (the inclusive flag is an operand of that op),
+        // not a bare LT/LE comparison.
+        let chunk = compile_source("for (i in 0..=3) { print(i) }").expect("compiles");
+        let text = disasm(&chunk);
+        assert!(
+            text.contains("RANGE_HAS_NEXT"),
+            "expected RANGE_HAS_NEXT condition in:\n{text}"
+        );
+        assert!(text.contains("LOOP"), "no loop back-edge in:\n{text}");
     }
 
     #[test]

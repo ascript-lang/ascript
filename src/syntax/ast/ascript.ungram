@@ -43,7 +43,7 @@ YieldExpr = 'yield' Expr?
 ForStmt = 'for' 'await'? '(' 'ident' ('in' | 'of') iter:Expr ('..' | '..=') end:Expr? ')' body:Block
 BreakStmt = 'break'
 ContinueStmt = 'continue'
-RangeExpr = start:Expr ('..' | '..=') end:Expr
+RangeExpr = start:Expr ('..' | '..=') end:Expr ('step' step:Expr)?
 ArrayBindPat = '[' (BindEntry | RestBind)* ']'
 ObjectBindPat = '{' (BindEntry | RestBind)* '}'
 BindEntry = key:'ident' ('as' local:'ident')?

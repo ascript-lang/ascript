@@ -1126,8 +1126,16 @@ impl Interp {
                 var,
                 start,
                 end,
+                inclusive,
+                step,
                 body,
             } => {
+                // RANGES FEATURE, Phase 3. `for (i in a..b)` is exclusive and
+                // `for (i in a..=b)` is inclusive; an optional `step k` (sign
+                // honored as direction) is resolved + validated by `resolve_step`,
+                // the SHARED source of truth with the VM and value materialization.
+                // When `step` is omitted the direction is inferred from the bounds:
+                // a bare descending range counts DOWN (`for (i in 10..7)` → 10 9 8).
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
                 let (lo, hi) = match (start_v, end_v) {
@@ -1138,8 +1146,22 @@ impl Interp {
                         )
                     }
                 };
+                let step_v = match step {
+                    Some(e) => match self.eval_expr(e, env).await? {
+                        Value::Number(s) => Some(s),
+                        _ => {
+                            return Err(
+                                AsError::at("for-range step must be a number", e.span).into()
+                            )
+                        }
+                    },
+                    None => None,
+                };
+                // Validation panic anchored at the START bound's span (matching the
+                // bounds panic above and the VM's range-setup op).
+                let step_n = resolve_step(lo, hi, step_v, start.span)?;
                 let mut i = lo;
-                while i < hi {
+                while range_has_next(i, hi, step_n, *inclusive) {
                     let child = env.child();
                     child
                         .define(var, Value::Number(i), false)
@@ -1149,7 +1171,7 @@ impl Interp {
                         Flow::Return(v) => return Ok(Flow::Return(v)),
                         Flow::Continue | Flow::Normal => {}
                     }
-                    i += 1.0;
+                    i += step_n;
                 }
                 Ok(Flow::Normal)
             }
@@ -1545,6 +1567,30 @@ impl Interp {
                     self.eval_expr(els, env).await
                 }
             }
+            // RANGES FEATURE, Phase 3. The value-range path materializes an
+            // `array<number>` honoring the inclusive (`..=`) boundary and an
+            // optional `step k` (sign honored as direction), via the SHARED
+            // `materialize_range_stepped`/`resolve_step` so it is byte-identical to
+            // the VM and the for-range loop. When `step` is omitted the direction is
+            // inferred from the bounds, so a bare descending range counts DOWN
+            // (`10..1` → [10, 9, …, 2], `10..=1` → [10, 9, …, 1]).
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+                step,
+            } => {
+                let start_v = self.eval_expr(start, env).await?;
+                let end_v = self.eval_expr(end, env).await?;
+                let step_v = match step {
+                    Some(e) => match self.eval_expr(e, env).await? {
+                        Value::Number(s) => Some(s),
+                        _ => return Err(AsError::at("range step must be a number", e.span).into()),
+                    },
+                    None => None,
+                };
+                materialize_range_stepped(&start_v, &end_v, *inclusive, step_v, expr.span)
+            }
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
             ExprKind::Try(inner) => {
                 let v = self.eval_expr(inner, env).await?;
@@ -1636,7 +1682,17 @@ impl Interp {
                 start,
                 end,
                 inclusive,
+                step,
             } => {
+                // RANGES FEATURE, Phase 5 (strided membership, spec §3.7). A
+                // non-number subject OR non-number bound is a (non-panic) mismatch,
+                // exactly as before. A `step k` clause turns the test into strided
+                // membership anchored at `start`, via the SHARED helpers so it is
+                // byte-identical to the VM: `resolve_step` validates (a `step 0` /
+                // non-finite / direction-mismatch pattern PANICS like iteration),
+                // then `range_pattern_contains` tests in-bounds + on-the-stride.
+                // With `step` omitted the membership degenerates to the plain
+                // in-bounds test, so existing no-step patterns are UNCHANGED.
                 let n = match subject {
                     Value::Number(n) => *n,
                     _ => return Ok(false),
@@ -1649,7 +1705,29 @@ impl Interp {
                     Value::Number(x) => x,
                     _ => return Ok(false),
                 };
-                Ok(n >= lo && if *inclusive { n <= hi } else { n < hi })
+                // Resolve the step's `f64` (None when omitted). A non-number step
+                // expression is a Tier-2 type error, mirroring iteration.
+                let step_v = match step {
+                    Some(s) => match self.eval_expr(s, env).await? {
+                        Value::Number(x) => Some(x),
+                        _ => {
+                            return Err(
+                                AsError::at("range step must be a number", s.span).into()
+                            )
+                        }
+                    },
+                    None => None,
+                };
+                // Validate the step (shared with iteration / the VM); a bad
+                // EXPLICIT step PANICS here with the byte-identical message, at the
+                // START bound's span (matching the for-range / value-range panics).
+                // `resolve_step` is run only to surface that panic; the membership
+                // helper takes the raw `Option` so a plain pattern keeps its
+                // pre-existing no-stride behavior.
+                if step_v.is_some() {
+                    resolve_step(lo, hi, step_v, start.span)?;
+                }
+                Ok(range_pattern_contains(n, lo, hi, step_v, *inclusive))
             }
             Pattern::Array(pats, rest) => {
                 // Snapshot the subject array (do not hold a borrow across awaits).
@@ -2910,6 +2988,168 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Contro
 /// inlines them above the operand evals; the VM lowers them to jumps). Passing one
 /// of those ops here is a programmer error (`unreachable!`).
 ///
+/// Materialize a range value `[lo .. hi)` (exclusive) or `[lo ..= hi]` (inclusive)
+/// into an eager `array<number>` with an omitted (±1) step whose DIRECTION is
+/// inferred from the bounds (so a bare `10..1` counts DOWN to `[10, 9, …, 2]`).
+/// Both bounds must be `Number`;
+/// otherwise raise the same Tier-2 `"range bounds must be numbers"` panic the
+/// tree-walker and VM emit. Shared by `apply_binop` (`Op::Range`) and the VM's
+/// `Op::RangeInclusive` so both engines are byte-identical.
+pub(crate) fn materialize_range(
+    l: &Value,
+    r: &Value,
+    inclusive: bool,
+    span: Span,
+) -> Result<Value, Control> {
+    materialize_range_stepped(l, r, inclusive, None, span)
+}
+
+/// Resolve the effective step for a range `lo..hi` (the SINGLE source of truth for
+/// direction + validation, shared verbatim by the tree-walker and the bytecode VM
+/// so their behavior and panic messages can never drift).
+///
+/// - `step_v == Some(s)`: the step's SIGN is honored as the direction.
+///   - `s` is `0`/`NaN`/`±Infinity` → Tier-2 panic *"step must be a finite,
+///     non-zero number"* (no interpolation).
+///   - `lo != hi` and `sign(s) != sign(hi - lo)` → Tier-2 panic *"step `<s>` moves
+///     away from end (`<hi>`); range can never progress"*. The `<s>`/`<hi>` are
+///     formatted via `Value::Number` Display (`format_number`) so both engines
+///     produce a byte-identical string.
+/// - `step_v == None`: the omitted-step default infers direction from the bounds
+///   (sequence semantics, spec §3.1): `+1.0` when `hi >= lo`, `-1.0` when
+///   `hi < lo`. So a bare `10..1` counts down. `lo == hi` is the empty (or, for
+///   `..=`, single-element) range.
+pub(crate) fn resolve_step(
+    lo: f64,
+    hi: f64,
+    step_v: Option<f64>,
+    span: Span,
+) -> Result<f64, Control> {
+    match step_v {
+        Some(s) => {
+            if s == 0.0 || !s.is_finite() {
+                return Err(
+                    AsError::at("step must be a finite, non-zero number", span).into(),
+                );
+            }
+            if lo != hi && (s > 0.0) != (hi > lo) {
+                // `{s}`/`{hi}` MUST match the engines' canonical number formatting
+                // (the `Value::Number` Display path) so the message is byte-identical.
+                return Err(AsError::at(
+                    format!(
+                        "step {} moves away from end ({}); range can never progress",
+                        format_number(s),
+                        format_number(hi),
+                    ),
+                    span,
+                )
+                .into());
+            }
+            Ok(s)
+        }
+        // Omitted step: the direction is inferred from the bounds (sequence
+        // semantics, spec §3.1) — ascending `+1` when `hi >= lo`, descending
+        // `-1` when `hi < lo`. `lo == hi` takes the `+1` branch and yields the
+        // empty (or single-element, when inclusive) range, which is correct.
+        None => Ok(if hi >= lo { 1.0 } else { -1.0 }),
+    }
+}
+
+/// Format a `Value::Number`'s `f64` exactly as the interpreter/VM display it
+/// (`impl Display for Value` → `write!("{}", n)`), so a number interpolated into a
+/// range panic message is identical across both engines.
+pub(crate) fn format_number(n: f64) -> String {
+    Value::Number(n).to_string()
+}
+
+/// Materialize a range value `[lo .. hi)` / `[lo ..= hi]` into an eager
+/// `array<number>`, honoring the resolved/validated `step` (direction-aware). The
+/// step (`None` → omitted default) is resolved through `resolve_step` so direction,
+/// validation, and panic messages are shared with the for-range loop and the VM.
+pub(crate) fn materialize_range_stepped(
+    l: &Value,
+    r: &Value,
+    inclusive: bool,
+    step_v: Option<f64>,
+    span: Span,
+) -> Result<Value, Control> {
+    let (lo, hi) = match (l, r) {
+        (Value::Number(a), Value::Number(b)) => (*a, *b),
+        _ => return Err(AsError::at("range bounds must be numbers", span).into()),
+    };
+    let step = resolve_step(lo, hi, step_v, span)?;
+    let mut items = Vec::new();
+    let mut i = lo;
+    while range_has_next(i, hi, step, inclusive) {
+        items.push(Value::Number(i));
+        i += step;
+    }
+    Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
+}
+
+/// The direction-aware loop predicate shared by the for-range loop and value
+/// materialization (and mirrored in the VM's `Op::RangeHasNext`): with a positive
+/// step iterate while `i < hi` (or `i <= hi` when inclusive); with a negative step
+/// while `i > hi` (or `i >= hi`).
+pub(crate) fn range_has_next(i: f64, hi: f64, step: f64, inclusive: bool) -> bool {
+    if step > 0.0 {
+        if inclusive {
+            i <= hi
+        } else {
+            i < hi
+        }
+    } else if inclusive {
+        i >= hi
+    } else {
+        i > hi
+    }
+}
+
+/// Match-range membership, shared verbatim by the tree-walker (`Pattern::Range`)
+/// and the VM (`Op::MatchRange`) so the two engines can never drift.
+///
+/// `step_v` is the pattern's step: `None` when the `step` clause is OMITTED,
+/// `Some(k)` for an explicit `step k`. When `k` was given it MUST already be the
+/// resolved/validated value from [`resolve_step`] (the caller runs that first so a
+/// `step 0` / non-finite / direction-mismatch pattern PANICS with the byte-identical
+/// message iteration uses).
+///
+/// - **No step (`None`):** plain in-bounds membership — `x` between the bounds,
+///   honoring `..`/`..=` and the bounds-inferred direction. This is exactly the
+///   pre-existing plain-pattern behavior (NO stride test), so fractional subjects
+///   like `match 2.5 { 1..=10 => … }` keep matching.
+/// - **With step (`Some(k)`):** strided membership (spec §3.7) — in bounds AND on
+///   the stride from the anchor `lo`: `q = (x − lo) / k` is a NON-NEGATIVE WHOLE
+///   number (`q >= 0 && q.fract() == 0`). Anchor is `start`, so parity/offset
+///   depends on where the range begins.
+pub(crate) fn range_pattern_contains(
+    x: f64,
+    lo: f64,
+    hi: f64,
+    step_v: Option<f64>,
+    inclusive: bool,
+) -> bool {
+    // Direction: from the explicit step's sign, else inferred from the bounds
+    // (the same rule `resolve_step` uses, so in-bounds is direction-consistent).
+    let step = step_v.unwrap_or(if hi >= lo { 1.0 } else { -1.0 });
+    // In-bounds: upper edge via the shared iteration predicate; lower edge is the
+    // anchor `lo` on the step's side (ascending: x >= lo; descending: x <= lo).
+    let upper_ok = range_has_next(x, hi, step, inclusive);
+    let lower_ok = if step > 0.0 { x >= lo } else { x <= lo };
+    if !(upper_ok && lower_ok) {
+        return false;
+    }
+    match step_v {
+        // Plain pattern: in-bounds is the whole test (no stride), unchanged.
+        None => true,
+        // Stepped pattern: also require `x` on the stride from the anchor `lo`.
+        Some(k) => {
+            let q = (x - lo) / k;
+            q >= 0.0 && q.fract() == 0.0
+        }
+    }
+}
+
 /// Dispatch order mirrors `eval_expr`'s `ExprKind::Binary` arm exactly:
 /// Eq/Ne (cross-type decimal equality) → Range (eager `array<number>`) → string
 /// concat (`+` on two `Str`) → decimal arithmetic/ordering (either operand a
@@ -2937,17 +3177,7 @@ pub(crate) fn apply_binop(
     // ForRange and the `range()` builtin. Returns an Array, so it must be handled
     // before the generic "two numbers → Number" path below.
     if let BinOp::Range = op {
-        let (start, end) = match (&l, &r) {
-            (Value::Number(a), Value::Number(b)) => (*a, *b),
-            _ => return Err(AsError::at("range bounds must be numbers", span).into()),
-        };
-        let mut items = Vec::new();
-        let mut i = start;
-        while i < end {
-            items.push(Value::Number(i));
-            i += 1.0;
-        }
-        return Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))));
+        return materialize_range(&l, &r, false, span);
     }
 
     // String concatenation: `+` joins two strings.

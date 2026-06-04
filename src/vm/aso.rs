@@ -59,7 +59,19 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 /// - 3: field-default expr now covers the full `cst_default_expr` lowering — new
 ///   tags for binary/range/index/ternary/template/optmember/try/unwrap/await/
 ///   assign and spread elements in array/object/call defaults.
-pub const ASO_FORMAT_VERSION: u32 = 6;
+/// - 7: inclusive `..=` ranges — new `Op::RangeInclusive` opcode (shifts opcode
+///   byte values) and a new `EX_RANGE` field-default expr tag (value-position
+///   `a..b`/`a..=b` defaults serialize as `ExprKind::Range`, not `BinOp::Range`).
+/// - 8: stepped ranges — three new opcodes (`RangeStepValue`/`RangeResolveStep`/
+///   `RangeHasNext`) for signed-`step` value materialization + for-range iteration
+///   (shifts opcode byte values for everything after `CheckNumbers`). The
+///   field-default `EX_RANGE` byte layout is unchanged (step still rejected in
+///   field-default position by `cst_default_expr`).
+/// - 9: stepped match-range patterns — `Op::MatchRange`'s u8 operand changed from a
+///   plain `inclusive` flag to a `flags` byte (bit0 = inclusive, bit1 = step
+///   PRESENT) and its stack shape grew from `subject lo hi` to `subject lo hi step`
+///   (a `nil` step placeholder when omitted). Opcode byte values are unchanged.
+pub const ASO_FORMAT_VERSION: u32 = 9;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -170,6 +182,9 @@ const EX_TRY: u8 = 16;
 const EX_UNWRAP: u8 = 17;
 const EX_AWAIT: u8 = 18;
 const EX_ASSIGN: u8 = 19;
+/// A value-position range `a..b` / `a..=b` (`ExprKind::Range`); `step` defaults
+/// never reach here (`cst_default_expr` rejects a stepped default).
+const EX_RANGE: u8 = 20;
 
 // Template-part tags (within an `EX_TEMPLATE`).
 const TP_LIT: u8 = 0;
@@ -955,6 +970,19 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
         ExprKind::Arrow { .. } => return Err(AsoError::NonLiteralConst("arrow-default")),
         ExprKind::Match { .. } => return Err(AsoError::NonLiteralConst("match-default")),
         ExprKind::Yield(_) => return Err(AsoError::NonLiteralConst("yield-default")),
+        // A value-position range `a..b` / `a..=b` field default. `step` defaults are
+        // rejected upstream (`cst_default_expr`), so only the inclusive flag varies.
+        ExprKind::Range {
+            start,
+            end,
+            inclusive,
+            step: _,
+        } => {
+            w.u8(EX_RANGE);
+            w.u8(u8::from(*inclusive));
+            write_expr(w, start)?;
+            write_expr(w, end)?;
+        }
     }
     Ok(())
 }
@@ -1117,6 +1145,17 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
             let target = Box::new(read_expr(r)?);
             let value = Box::new(read_expr(r)?);
             ExprKind::Assign { target, value }
+        }
+        EX_RANGE => {
+            let inclusive = r.u8()? != 0;
+            let start = Box::new(read_expr(r)?);
+            let end = Box::new(read_expr(r)?);
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+                step: None,
+            }
         }
         tag => return Err(AsoError::BadTag { what: "expr", tag }),
     };
@@ -1617,8 +1656,8 @@ run()
     fn computed_field_defaults_roundtrip() {
         // A class whose fields use the full range of computed defaults the
         // `.aso` writer now serializes (binary, string concat, comparison,
-        // logical, nullish, index, ternary, template, exclusive range,
-        // optional-member, `?`, `!`, `await`, assignment, and spreads). The
+        // logical, nullish, index, ternary, template, exclusive + inclusive
+        // range, optional-member, `?`, `!`, `await`, assignment, and spreads). The
         // serialized field-default `ast::Expr` must round-trip structurally
         // (same disasm fingerprint) AND produce identical output when run.
         // NOTE: a bare `expr?`/`expr!` default at end of line followed by another
@@ -1644,6 +1683,7 @@ class Config {
     pri: number = BASE > 0 ? BASE * 2 : 0
     label: string = `b=${BASE}`
     seq: array<number> = 1..4
+    iseq: array<number> = 1..=4
     a: number = OBJ?.a
     aw: number = await add(1, 2)
     xs: array<number> = [...SRC, 3]
@@ -1656,6 +1696,7 @@ let c = Config()
 print(c.id)
 print(c.tag)
 print(c.seq[2])
+print(c.iseq)
 print(c.merged)
 "#;
         let original = compile(src);

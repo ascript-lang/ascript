@@ -1,0 +1,149 @@
+//! `unresolved-import` (conservative): an `import … from "<path>"` whose path
+//! does not resolve.
+//!
+//! V1 scope — **`std/*` specifiers only**. A `std/*` path is checked against the
+//! authoritative, feature-INDEPENDENT module registry
+//! ([`crate::stdlib::is_known_std_module`] / `STD_MODULES`, mirrored 1:1 against
+//! `std_module_exports`): a `std/*` specifier not in that set (e.g. a typo like
+//! `"std/maths"`) is flagged. The registry is feature-independent on purpose so
+//! the checker behaves identically under `--no-default-features` (a source that
+//! imports `std/json` is valid AScript regardless of the binary's Cargo
+//! features).
+//!
+//! **Relative file paths** (`"./mod"`, `"../x"`, `"mod.as"`) are deliberately
+//! NOT flagged here: the static analysis entry point (`analyze` / `analyze_with_config`
+//! in `src/check/analyze.rs`) is PATH-LESS — it receives only the source text,
+//! not the importing file's path — so it cannot resolve a relative path against
+//! the filesystem. Rather than guess (and risk false positives), V1 leaves file
+//! imports untouched. File-path resolution is a documented follow-up that will
+//! require threading the source path into the analysis driver.
+
+use crate::check::diagnostic::{AsDiagnostic, Severity};
+use crate::check::rules::code_range;
+use crate::syntax::cst::ResolvedNode;
+use crate::syntax::kind::SyntaxKind;
+use crate::syntax::resolve::types::ResolveResult;
+
+pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
+    use SyntaxKind::*;
+    let mut out = Vec::new();
+    for import in tree.descendants().filter(|n| n.kind() == ImportStmt) {
+        // The module specifier string token (`from "<path>"`).
+        let Some(str_tok) = import
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| t.kind() == Str)
+        else {
+            continue; // malformed import (missing path) → syntax-error covers it
+        };
+        let path = strip_quotes(str_tok.text());
+
+        // V1: only `std/*` specifiers are resolvable here. A relative/file path
+        // cannot be checked without the importing file's location (path-less
+        // analysis) — see the module doc — so it is left alone.
+        if !path.starts_with("std/") {
+            continue;
+        }
+        if crate::stdlib::is_known_std_module(path) {
+            continue; // a real std module → OK
+        }
+        out.push(AsDiagnostic {
+            range: code_range(import),
+            severity: Severity::Warning,
+            code: "unresolved-import".to_string(),
+            message: format!("unresolved import `{path}`: no such std module"),
+            fix: None,
+        });
+    }
+    out
+}
+
+/// Strip the surrounding quote characters from a string-literal token's text.
+/// Module specifiers are plain ASCII paths with no escapes, so a first/last
+/// char trim is exact (mirrors `strip_quotes` in `src/compile/mod.rs`).
+fn strip_quotes(s: &str) -> &str {
+    let mut chars = s.chars();
+    chars.next();
+    chars.next_back();
+    chars.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::check::analyze;
+
+    fn count(src: &str, code: &str) -> usize {
+        analyze(src)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == code)
+            .count()
+    }
+    fn has(src: &str, code: &str) -> bool {
+        count(src, code) > 0
+    }
+
+    #[test]
+    fn typo_std_module_flagged() {
+        let src = "import { abs } from \"std/maths\"\nprint(1)\n";
+        assert_eq!(
+            count(src, "unresolved-import"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn real_std_module_not_flagged() {
+        let src = "import { abs } from \"std/math\"\nprint(abs(-1))\n";
+        assert!(
+            !has(src, "unresolved-import"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn nonexistent_std_module_flagged() {
+        let src = "import * as x from \"std/doesnotexist\"\nprint(1)\n";
+        assert_eq!(
+            count(src, "unresolved-import"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn nested_std_module_not_flagged() {
+        let src = "import { connect } from \"std/net/tcp\"\nprint(1)\n";
+        assert!(
+            !has(src, "unresolved-import"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn relative_path_not_flagged() {
+        // path-less analysis cannot resolve a file import; V1 leaves it alone.
+        let src = "import { a } from \"./mod\"\nprint(1)\n";
+        assert!(
+            !has(src, "unresolved-import"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn message_names_the_path() {
+        let src = "import { abs } from \"std/maths\"\nprint(1)\n";
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "unresolved-import")
+            .unwrap();
+        assert_eq!(d.message, "unresolved import `std/maths`: no such std module");
+    }
+}

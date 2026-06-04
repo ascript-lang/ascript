@@ -12,12 +12,56 @@
 
 use ascript::lexer::lex;
 use ascript::parser::parse;
+use ascript::syntax::kind::SyntaxKind;
+use ascript::syntax::parser as cst_parser;
+use ascript::syntax::parse_to_tree;
 
 /// Assert that `src` lexes and parses without error under the interpreter's
 /// front end.
 fn accepts(src: &str) {
     let toks = lex(src).unwrap_or_else(|e| panic!("lex failed for {src:?}: {e:?}"));
     parse(&toks).unwrap_or_else(|e| panic!("parse failed for {src:?}: {e:?}"));
+}
+
+/// Assert that `src` parses without error (no `ParseError`, no `Error` node)
+/// under the CST front-end (`src/syntax/`).
+fn cst_accepts(src: &str) {
+    let parsed = cst_parser::parse(src);
+    assert!(parsed.errors.is_empty(), "CST parse errors for {src:?}: {:?}", parsed.errors);
+    let has_error_node = parse_to_tree(src)
+        .descendants()
+        .any(|n| n.kind() == SyntaxKind::Error);
+    assert!(!has_error_node, "CST produced an Error node for {src:?}");
+}
+
+/// Differential: BOTH the legacy parser and the CST parser must accept `src`
+/// with no error.
+fn both_accept(src: &str) {
+    accepts(src);
+    cst_accepts(src);
+}
+
+/// `..=` (inclusive) and `step` parse on BOTH front-ends, in for-range and
+/// value position. Phase 1 is PARSE-only; semantics land in Phase 2/3.
+#[test]
+fn both_frontends_accept_inclusive_and_step_ranges() {
+    both_accept("for (i in 1..=5) {}");
+    both_accept("for (i in 1..10 step 2) {}");
+    both_accept("for (i in 10..1 step -2) {}");
+    both_accept("for (i in 1..=10 step 2) {}");
+    both_accept("let xs = 1..=5");
+    both_accept("let ys = 1..10 step 2");
+    both_accept("let zs = 1..=10 step 2");
+}
+
+/// `step` is a CONTEXTUAL keyword — it must remain usable as an ordinary
+/// identifier (fn name, variable, member) on the CST front-end.
+#[test]
+fn cst_keeps_step_as_a_plain_identifier() {
+    cst_accepts("fn step(n) { n }");
+    cst_accepts("let step = 1");
+    cst_accepts("let x = step + 1");
+    cst_accepts("step(3)");
 }
 
 #[test]

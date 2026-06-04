@@ -218,7 +218,8 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
         expr_bp(p, r_bp);
         lhs_cm = p.complete(m, SyntaxKind::BinaryExpr);
     }
-    // Range expression: `a..b` or `a..=b` (lower precedence than binary ops).
+    // Range expression: `a..b` or `a..=b` (lower precedence than binary ops),
+    // with an optional trailing contextual `step <expr>`.
     if p.at(SyntaxKind::DotDot) || p.at(SyntaxKind::DotDotEq) {
         let m = p.precede(&lhs_cm);
         p.bump(); // .. or ..=
@@ -226,6 +227,9 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
         if can_start_expr(p) {
             expr_bp(p, 1); // parse rhs at lowest precedence
         }
+        // Trailing contextual `step <expr>`: only when `step` directly follows a
+        // range end (otherwise `step` stays a normal identifier).
+        parse_range_step(p);
         lhs_cm = p.complete(m, SyntaxKind::RangeExpr);
     }
     // Ternary tail: cond ? then : els  (right-assoc; then/els are full exprs).
@@ -439,6 +443,19 @@ fn while_stmt(p: &mut Parser) {
     p.complete(m, WhileStmt);
 }
 
+/// Parse an optional trailing contextual `step <expr>` immediately after a
+/// range's end bound. `step` is NOT a reserved word: it is recognized here ONLY
+/// when it directly follows a range end, so `let step = 1` / `fn step(n)` keep
+/// `step` as a normal identifier. The step expression is attached as a child of
+/// the enclosing `RangeExpr` node (the caller has not yet `complete`d it), and
+/// the `step` keyword token is consumed so it doesn't leak as a NameRef.
+fn parse_range_step(p: &mut Parser) {
+    if p.at_kw("step") {
+        p.bump(); // contextual `step` keyword (an Ident token)
+        expr_bp(p, 1); // step expression at the range precedence boundary
+    }
+}
+
 fn for_stmt(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
@@ -477,6 +494,8 @@ fn for_stmt(p: &mut Parser) {
         let rm = p.precede(&iter_cm);
         p.bump(); // .. or ..=
         expr(p); // range end
+        // Trailing contextual `step <expr>` after the range end.
+        parse_range_step(p);
         p.complete(rm, RangeExpr);
     }
     if p.at(RParen) {
@@ -1352,6 +1371,11 @@ fn pattern(p: &mut Parser) -> CompletedMarker {
             if p.at(DotDot) || p.at(DotDotEq) {
                 p.bump();
                 let _ = lhs_for_pat(p);
+                // Trailing contextual `step <expr>` (strided membership, spec §3.7).
+                // `step` is recognized only when it directly follows the range end,
+                // so it stays a normal identifier elsewhere. The step expression is
+                // the 3rd Expr child of the `RangePat`, after `start..end`.
+                parse_range_step(p);
                 p.complete(m, RangePat)
             } else {
                 p.complete(m, LiteralPat)

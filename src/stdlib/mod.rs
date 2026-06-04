@@ -166,6 +166,67 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     Some(list.into_iter().map(|(n, v)| (n.to_string(), v)).collect())
 }
 
+/// The complete, **feature-independent** set of canonical `std/*` module
+/// specifiers the language knows about. This is the authoritative list mirrored
+/// 1:1 against the `std_module_exports` match arms above, but WITHOUT the
+/// `#[cfg(feature = …)]` gating: a `.as` source that imports `std/json` is valid
+/// AScript regardless of which Cargo features a given `ascript` binary was built
+/// with, so the static checker (`unresolved-import`) must recognise every module
+/// here even in a `--no-default-features` build. Keep this in sync with
+/// `std_module_exports` (and the `call` routing) whenever a module is added.
+pub const STD_MODULES: &[&str] = &[
+    "std/assert",
+    "std/bench",
+    "std/cli",
+    "std/color",
+    "std/decimal",
+    "std/math",
+    "std/string",
+    "std/array",
+    "std/object",
+    "std/map",
+    "std/schema",
+    "std/set",
+    "std/bytes",
+    "std/convert",
+    "std/task",
+    "std/time",
+    "std/sync",
+    "std/stream",
+    "std/date",
+    "std/intl",
+    "std/json",
+    "std/log",
+    "std/encoding",
+    "std/crypto",
+    "std/compress",
+    "std/env",
+    "std/fs",
+    "std/os",
+    "std/io",
+    "std/process",
+    "std/net",
+    "std/net/tcp",
+    "std/net/http",
+    "std/http/server",
+    "std/net/udp",
+    "std/net/ws",
+    "std/regex",
+    "std/sqlite",
+    "std/url",
+    "std/uuid",
+    "std/csv",
+    "std/toml",
+    "std/yaml",
+    "std/tui",
+];
+
+/// Is `path` a known canonical `std/*` module specifier? Feature-independent
+/// (see [`STD_MODULES`]).
+pub fn is_known_std_module(path: &str) -> bool {
+    STD_MODULES.contains(&path)
+}
+
 impl Interp {
     /// Dispatch a qualified stdlib builtin (`module` = "math", `func` = "abs").
     pub(crate) async fn call_stdlib(

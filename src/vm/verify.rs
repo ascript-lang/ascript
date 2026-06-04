@@ -212,7 +212,7 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Rot3 => Effect::new(3, 3),
 
         // ---- binary arithmetic / comparison / range ----
-        Add | Sub | Mul | Div | Mod | Pow | Lt | Le | Gt | Ge | Eq | Ne | Range => {
+        Add | Sub | Mul | Div | Mod | Pow | Lt | Le | Gt | Ge | Eq | Ne | Range | RangeInclusive => {
             Effect::new(2, 1)
         }
         // ---- unary ----
@@ -267,6 +267,13 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
 
         // ---- for-range bounds guard (peek-only) ----
         CheckNumbers => Effect::new(2, 2),
+        // ---- stepped ranges ----
+        // RANGE_STEP_VALUE pops lo/hi/step, pushes the materialized array.
+        RangeStepValue => Effect::new(3, 1),
+        // RANGE_RESOLVE_STEP pops lo/hi/step, pushes lo/hi/resolved_step (validates).
+        RangeResolveStep => Effect::new(3, 3),
+        // RANGE_HAS_NEXT pops i/hi/step, pushes the continue-bool.
+        RangeHasNext => Effect::new(3, 1),
 
         // ---- destructuring (peek-only guards leave src in place) ----
         CheckArrayDestructure | CheckObjectDestructure => Effect::new(1, 1),
@@ -274,7 +281,9 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
 
         // ---- match tests (subject -- bool) ----
         MatchArray | MatchObject | MatchHasKey => Effect::new(1, 1),
-        MatchRange => Effect::new(3, 1),
+        // `subject lo hi step -- ok` — pops 4 (step always present as a value,
+        // a `nil` placeholder when the pattern has no `step` clause).
+        MatchRange => Effect::new(4, 1),
         MatchNoArm => Effect::new(0, 0),
         // IMMUTABLE_ERROR always diverges (raises a Tier-2 panic); like MATCH_NO_ARM
         // it never produces a value, so it has no net stack effect.

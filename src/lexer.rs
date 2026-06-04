@@ -554,6 +554,18 @@ mod tests {
     }
 
     #[test]
+    fn step_is_a_plain_identifier() {
+        // `step` is a contextual keyword recognized in the parser, NOT reserved
+        // in the lexer — so `let step = 1` must keep `step` as a plain Ident.
+        let toks = lex("let step = 1").unwrap();
+        assert!(
+            matches!(toks[1].tok, Tok::Ident(ref s) if s == "step"),
+            "expected Ident(\"step\"), got {:?}",
+            toks[1].tok
+        );
+    }
+
+    #[test]
     fn lexes_question_variants() {
         assert_eq!(
             kinds("a ? b ?? c?.d"),

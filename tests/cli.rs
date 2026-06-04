@@ -1201,3 +1201,842 @@ fn env_args_no_args_returns_empty_array() {
         "expected [] in stdout; got: {stdout}"
     );
 }
+
+#[test]
+fn vm_stepped_for_range_iterates() {
+    // PHASE 3: `step` is fully wired on the VM. A stepped for-range strides by the
+    // (signed) step — never silently the unstepped `1..10`.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_stepped_for_range.as");
+    std::fs::write(&file, "for (i in 1..10 step 2) { print(i) }\n").unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "stepped for-range must run: {:?}", out);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n3\n5\n7\n9\n");
+}
+
+#[test]
+fn vm_stepped_value_range_materializes() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_stepped_value_range.as");
+    std::fs::write(&file, "print(1..10 step 2)\n").unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "stepped value range must run: {:?}", out);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "[1, 3, 5, 7, 9]\n");
+}
+
+#[test]
+fn vm_step_stays_usable_as_identifier() {
+    // The contextual `step` keyword must not break ordinary identifier use on the
+    // default (VM) engine.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join("ascript_step_identifier.as");
+    std::fs::write(&file, "let step = 7\nprint(step)\n").unwrap();
+    let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(out.status.success(), "process failed: {:?}", out);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
+}
+
+// ===== RANGES FEATURE, Phase 2: inclusive `..=` ranges (both engines) =========
+
+/// Run `src` as a `.as` program on a chosen engine, returning stdout. Panics if
+/// the process fails (so callers assert on successful output).
+fn run_range_src(src: &str, tree_walker: bool, tag: &str) -> String {
+    let file = std::env::temp_dir().join(format!("ascript_range_{tag}.as"));
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let mut cmd = Command::new(bin);
+    cmd.arg("run");
+    if tree_walker {
+        cmd.arg("--tree-walker");
+    }
+    let out = cmd.arg(&file).output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "process failed ({}): {:?}",
+        if tree_walker { "tree-walker" } else { "vm" },
+        out
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn inclusive_range_iteration_and_value_both_engines() {
+    // The four target cases must be byte-identical on the default VM AND the
+    // tree-walker: inclusive for-range, inclusive value materialization, the
+    // single-element `5..=5`, and (Phase 4) the descending inclusive `10..=1`
+    // counting down.
+    let cases = [
+        ("for (i in 1..=4) { print(i) }", "1\n2\n3\n4\n"),
+        ("print(1..=5)", "[1, 2, 3, 4, 5]\n"),
+        ("print(5..=5)", "[5]\n"),
+        ("print(10..=1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]\n"),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("vm_{i}"));
+        let tw = run_range_src(src, true, &format!("tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn exclusive_range_unchanged_both_engines() {
+    // Exclusive `..` behavior is unchanged by Phase 2.
+    let cases = [
+        ("for (i in 1..4) { print(i) }", "1\n2\n3\n"),
+        ("print(1..5)", "[1, 2, 3, 4]\n"),
+        ("print(5..5)", "[]\n"),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("excl_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("excl_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn inclusive_match_pattern_still_works_both_engines() {
+    // `match n { 1..=10 => "in", _ => "out" }` with n=5 → "in" (pre-existing).
+    let src = "let n = 5\nprint(match n { 1..=10 => \"in\", _ => \"out\" })";
+    let vm = run_range_src(src, false, "match_vm");
+    let tw = run_range_src(src, true, "match_tw");
+    assert_eq!(vm, "in\n");
+    assert_eq!(tw, "in\n");
+}
+
+#[test]
+fn stepped_ranges_iterate_both_engines() {
+    // RANGES FEATURE, Phase 3: `step` iteration evaluates on BOTH engines, sign
+    // honored as direction, byte-identical between the VM and the tree-walker.
+    let cases = [
+        ("for (i in 1..10 step 2) { print(i) }", "1\n3\n5\n7\n9\n"),
+        ("for (i in 10..1 step -2) { print(i) }", "10\n8\n6\n4\n2\n"),
+        ("print(1..=10 step 2)", "[1, 3, 5, 7, 9]\n"),
+        ("print(0..=1 step 0.25)", "[0, 0.25, 0.5, 0.75, 1]\n"),
+        // omitted-step descending: present-step rows above are unaffected by
+        // Phase 4 (which only changes the OMITTED-step default direction).
+        ("print(10..1 step -2)", "[10, 8, 6, 4, 2]\n"),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("step_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("step_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn stepped_class_field_default_both_engines() {
+    // RANGES FEATURE: a STEPPED range used as a class FIELD DEFAULT must
+    // materialize identically on the VM and the tree-walker. This is the path
+    // that was guarded out of the VM's `cst_default_expr` field-default lowering
+    // (the non-stepped `1..=4` default already worked byte-identically). Covers
+    // ascending, descending, and inclusive stepped defaults.
+    let cases = [
+        (
+            "class Box { vals: array<number> = 1..10 step 2 }\nlet b = Box()\nprint(b.vals)",
+            "[1, 3, 5, 7, 9]\n",
+        ),
+        (
+            "class Box { vals: array<number> = 10..1 step -2 }\nlet b = Box()\nprint(b.vals)",
+            "[10, 8, 6, 4, 2]\n",
+        ),
+        (
+            "class Box { vals: array<number> = 0..=10 step 5 }\nlet b = Box()\nprint(b.vals)",
+            "[0, 5, 10]\n",
+        ),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("fieldstep_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("fieldstep_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn descending_bare_range_counts_down_both_engines() {
+    // RANGES FEATURE, Phase 4: when `step` is OMITTED the direction is inferred
+    // from the bounds, so a bare descending range counts DOWN (was empty). Both
+    // engines must agree byte-for-byte. Empty/single-element and ascending cases
+    // are pinned as regression guards alongside.
+    let cases = [
+        // descending bare ranges now count down (THE Phase 4 behavior change).
+        ("for (i in 5..1) { print(i) }", "5\n4\n3\n2\n"),
+        ("for (i in 5..=1) { print(i) }", "5\n4\n3\n2\n1\n"),
+        ("print(10..1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2]\n"),
+        ("print(10..=1)", "[10, 9, 8, 7, 6, 5, 4, 3, 2, 1]\n"),
+        // UNCHANGED: ascending bare ranges.
+        ("print(1..5)", "[1, 2, 3, 4]\n"),
+        ("print(1..=5)", "[1, 2, 3, 4, 5]\n"),
+        // UNCHANGED: equal bounds are empty (exclusive) / single (inclusive).
+        ("print(5..5)", "[]\n"),
+        ("print(5..=5)", "[5]\n"),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("down_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("down_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn stepped_ranges_validation_panics_both_engines() {
+    // RANGES FEATURE, Phase 3: zero/non-finite step and direction mismatch are
+    // Tier-2 panics (exit 1) with byte-identical messages across engines.
+    for (i, (src, msg)) in [
+        ("for (i in 1..10 step 0) {}", "step must be a finite, non-zero number"),
+        (
+            "for (i in 1..10 step -2) {}",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+        (
+            "for (i in 10..1 step 2) {}",
+            "step 2 moves away from end (1); range can never progress",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let file = std::env::temp_dir().join(format!("ascript_step_panic_{i}.as"));
+        std::fs::write(&file, src).unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        for tw in [false, true] {
+            let mut cmd = Command::new(bin);
+            cmd.arg("run");
+            if tw {
+                cmd.arg("--tree-walker");
+            }
+            let out = cmd.arg(&file).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "{} should PANIC on `{src}`, got {:?}",
+                if tw { "tree-walker" } else { "vm" },
+                out
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(msg),
+                "{} stderr for `{src}` should contain {msg:?}, got: {stderr}",
+                if tw { "tree-walker" } else { "vm" }
+            );
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
+#[test]
+fn stdlib_stream_range_unified_model_both_engines() {
+    // RANGES FEATURE, Phase 6: `stream.range` follows the SAME unified model as
+    // the `..` syntax. Omitted step infers direction from the bounds (counts down
+    // for `range(10, 1)`); the three documented examples are unchanged; both
+    // engines agree byte-for-byte.
+    let cases = [
+        // CHANGED: omitted step infers descending (was `[]`).
+        (
+            "import { range, collect } from \"std/stream\"\nprint(await collect(range(10, 1)))",
+            "[10, 9, 8, 7, 6, 5, 4, 3, 2]\n",
+        ),
+        // UNCHANGED documented examples.
+        (
+            "import { range, collect } from \"std/stream\"\nprint(await collect(range(0, 5)))",
+            "[0, 1, 2, 3, 4]\n",
+        ),
+        (
+            "import { range, collect } from \"std/stream\"\nprint(await collect(range(0, 10, 2)))",
+            "[0, 2, 4, 6, 8]\n",
+        ),
+        (
+            "import { range, collect } from \"std/stream\"\nprint(await collect(range(10, 0, -3)))",
+            "[10, 7, 4, 1]\n",
+        ),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("streamrange_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("streamrange_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn stdlib_stream_range_validation_panics_both_engines() {
+    // Phase 6: `stream.range` validation panics are byte-identical to the range
+    // SYNTAX panics (shared `resolve_step`): sign-mismatch and zero step.
+    for (i, (src, msg)) in [
+        (
+            "import { range, collect } from \"std/stream\"\nawait collect(range(1, 10, -2))",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+        (
+            "import { range, collect } from \"std/stream\"\nawait collect(range(1, 10, 0))",
+            "step must be a finite, non-zero number",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let file = std::env::temp_dir().join(format!("ascript_streamrange_panic_{i}.as"));
+        std::fs::write(&file, src).unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        for tw in [false, true] {
+            let mut cmd = Command::new(bin);
+            cmd.arg("run");
+            if tw {
+                cmd.arg("--tree-walker");
+            }
+            let out = cmd.arg(&file).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "{} should PANIC on `{src}`, got {:?}",
+                if tw { "tree-walker" } else { "vm" },
+                out
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(msg),
+                "{} stderr for `{src}` should contain {msg:?}, got: {stderr}",
+                if tw { "tree-walker" } else { "vm" }
+            );
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
+#[test]
+fn stepped_match_patterns_both_engines() {
+    // RANGES FEATURE, Phase 5: `step` in a match-range pattern = strided
+    // membership (spec §3.7), byte-identical on the VM and the tree-walker.
+    // Anchor is `start`, so parity/offset depends on where the range begins.
+    let cases = [
+        // 3 ∈ {1,3,5,7,9}
+        (
+            "print(match 3 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        // 4 ∉ {1,3,5,7,9}
+        (
+            "print(match 4 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
+        // 4 ∈ {0,2,4,6,8,10} (anchor 0)
+        (
+            "print(match 4 { 0..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        // 11 out of bounds
+        (
+            "print(match 11 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
+        // exclusive end: 10 not in {0,2,4,6,8}
+        (
+            "print(match 10 { 0..10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
+        // inclusive end: 10 ∈ {0,2,...,10}
+        (
+            "print(match 10 { 0..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        // descending stepped pattern: 8 ∈ {10,8,6,4,2}
+        (
+            "print(match 8 { 10..=2 step -2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        // plain (no-step) pattern is UNCHANGED.
+        (
+            "print(match 5 { 1..=10 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+    ];
+    for (i, (src, expected)) in cases.iter().enumerate() {
+        let vm = run_range_src(src, false, &format!("patstep_vm_{i}"));
+        let tw = run_range_src(src, true, &format!("patstep_tw_{i}"));
+        assert_eq!(vm, *expected, "VM output wrong for `{src}`");
+        assert_eq!(tw, *expected, "tree-walker output wrong for `{src}`");
+        assert_eq!(vm, tw, "VM and tree-walker diverged for `{src}`");
+    }
+}
+
+#[test]
+fn stepped_match_pattern_validation_panics_both_engines() {
+    // RANGES FEATURE, Phase 5: a stepped pattern runs the SAME shared validator
+    // as iteration, so a `step 0` / direction-mismatch pattern PANICS with the
+    // byte-identical message on both engines.
+    for (i, (src, msg)) in [
+        (
+            "print(match 5 { 1..=10 step 0 => 1, _ => 0 })",
+            "step must be a finite, non-zero number",
+        ),
+        (
+            "print(match 5 { 1..=10 step -2 => 1, _ => 0 })",
+            "step -2 moves away from end (10); range can never progress",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let file = std::env::temp_dir().join(format!("ascript_patstep_panic_{i}.as"));
+        std::fs::write(&file, src).unwrap();
+        let bin = env!("CARGO_BIN_EXE_ascript");
+        for tw in [false, true] {
+            let mut cmd = Command::new(bin);
+            cmd.arg("run");
+            if tw {
+                cmd.arg("--tree-walker");
+            }
+            let out = cmd.arg(&file).output().unwrap();
+            assert!(
+                !out.status.success(),
+                "{} should PANIC on `{src}`, got {:?}",
+                if tw { "tree-walker" } else { "vm" },
+                out
+            );
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(msg),
+                "{} stderr for `{src}` should contain {msg:?}, got: {stderr}",
+                if tw { "tree-walker" } else { "vm" }
+            );
+        }
+        let _ = std::fs::remove_file(&file);
+    }
+}
+
+/// Strip ANSI SGR escape sequences so the rendered ariadne caret can be compared
+/// as plain text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Skip until the terminating 'm' of the SGR sequence.
+            for d in chars.by_ref() {
+                if d == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[test]
+fn stepped_value_range_panic_underlines_step_clause_both_engines() {
+    // Cleanup A: the legacy parser's `ExprKind::Range` span now covers through
+    // the END of the `step` clause, so a panic on a stepped VALUE range
+    // underlines the whole `1..10 step 0` on BOTH engines (previously the
+    // tree-walker underlined only `1..10`). The ariadne caret must:
+    //   (a) include the `step 0` text in the underlined region, and
+    //   (b) be byte-identical between the VM and the tree-walker (modulo the
+    //       file-path header line, which can differ by a `/private` symlink).
+    let src = "print(1..10 step 0)";
+    let file = std::env::temp_dir().join("ascript_step_span.as");
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    let render = |tw: bool| -> String {
+        let mut cmd = Command::new(bin);
+        cmd.arg("run");
+        if tw {
+            cmd.arg("--tree-walker");
+        }
+        let out = cmd.arg(&file).output().unwrap();
+        assert!(!out.status.success(), "should panic ({tw})");
+        // Drop the `╭─[ <path>:1:7 ]` header line (path differs by /private);
+        // keep the source + caret rows, which carry the span.
+        strip_ansi(&String::from_utf8_lossy(&out.stderr))
+            .lines()
+            .filter(|l| !l.contains(".as:"))
+            .map(|l| l.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let vm = render(false);
+    let tw = render(true);
+    let _ = std::fs::remove_file(&file);
+
+    // (a) the caret region reaches the `step 0` clause: the underline row (the
+    // one with the `┬` tick) must be at least as wide as the start column of
+    // `step` (the legacy bug truncated it at `1..10`, before `step`).
+    let underline = vm
+        .lines()
+        .find(|l| l.contains('┬'))
+        .expect("expected a caret/underline row");
+    // `1..10 step 0` starts at col 7 (1-based); the `step` keyword begins 6
+    // chars later. The full clause is 12 chars wide. Count the run of `─`/`┬`.
+    let span_width = underline.chars().filter(|&c| c == '─' || c == '┬').count();
+    assert!(
+        span_width >= 12,
+        "underline should span the full `1..10 step 0` (>=12), got {span_width} in:\n{vm}"
+    );
+
+    // (b) byte-identical carets across engines (this is the real divergence fix).
+    assert_eq!(
+        vm, tw,
+        "VM and tree-walker rendered different carets:\n--- vm ---\n{vm}\n--- tw ---\n{tw}"
+    );
+}
+
+#[test]
+fn check_range_step_lint_and_allow_suppression() {
+    // Phase 7: the `range-step` static lint surfaces a statically-detectable bad
+    // range (here `step 0`) at author-time, matching the runtime panic text. It is
+    // configurable: `--allow range-step` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file =
+        std::env::temp_dir().join(format!("ascript_range_step_lint_{}.as", std::process::id()));
+    std::fs::write(&file, "for (i in 1..10 step 0){}\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"range-step\""),
+        "expected a range-step diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("step must be a finite, non-zero number"),
+        "expected the runtime-matching message, got:\n{stdout}"
+    );
+
+    // `--allow range-step` suppresses it (and the code is a known/configurable rule).
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("range-step")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"range-step\""),
+        "--allow range-step should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_call_arity_lint_and_allow_suppression() {
+    // The `call-arity` static lint flags a call to a uniquely-resolved file-local
+    // function with the wrong number of positional args, mirroring the runtime
+    // arity panic. Configurable: `--allow call-arity` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file =
+        std::env::temp_dir().join(format!("ascript_call_arity_lint_{}.as", std::process::id()));
+    std::fs::write(&file, "fn f(a,b){ return a }\nf(1,2,3)\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"call-arity\""),
+        "expected a call-arity diagnostic, got:\n{stdout}"
+    );
+
+    // `--allow call-arity` suppresses it (and the code is a known/configurable rule).
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("call-arity")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"call-arity\""),
+        "--allow call-arity should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_unknown_enum_variant_lint_and_allow_suppression() {
+    // The `unknown-enum-variant` static lint flags access of a non-existent variant
+    // on a statically-known enum, mirroring the runtime `enum E has no variant 'V'`
+    // panic. Configurable: `--allow unknown-enum-variant` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_unknown_enum_variant_{}.as", std::process::id()));
+    std::fs::write(&file, "enum Color { Red, Green }\nprint(Color.Reddd)\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"unknown-enum-variant\""),
+        "expected an unknown-enum-variant diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("enum Color has no variant 'Reddd'"),
+        "expected the runtime-matching message, got:\n{stdout}"
+    );
+
+    // `--allow unknown-enum-variant` suppresses it.
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("unknown-enum-variant")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"unknown-enum-variant\""),
+        "--allow unknown-enum-variant should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_duplicate_member_lint_and_allow_suppression() {
+    // The `duplicate-member` static lint flags two members with the same name in
+    // one class body (a silent shadow at runtime). Configurable: `--allow
+    // duplicate-member` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_duplicate_member_{}.as", std::process::id()));
+    std::fs::write(&file, "class C {\n  x: number\n  x: string\n}\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"duplicate-member\""),
+        "expected a duplicate-member diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("duplicate member 'x' in class C"),
+        "expected the descriptive message, got:\n{stdout}"
+    );
+
+    // `--allow duplicate-member` suppresses it.
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("duplicate-member")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"duplicate-member\""),
+        "--allow duplicate-member should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_super_misuse_lint_and_allow_suppression() {
+    // The `super-misuse` static lint flags `super` used in a class with no
+    // superclass (a guaranteed runtime panic). Configurable: `--allow
+    // super-misuse` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_super_misuse_{}.as", std::process::id()));
+    std::fs::write(&file, "class A {\n  fn init() { super.init() }\n}\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"super-misuse\""),
+        "expected a super-misuse diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("which has no superclass"),
+        "expected the descriptive message, got:\n{stdout}"
+    );
+
+    // `--allow super-misuse` suppresses it.
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("super-misuse")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"super-misuse\""),
+        "--allow super-misuse should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_field_default_type_lint_and_allow_suppression() {
+    // The `field-default-type` static lint flags a class field whose literal
+    // default contradicts its declared type (a guaranteed runtime panic at
+    // construction). Configurable: `--allow field-default-type` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_field_default_type_{}.as", std::process::id()));
+    std::fs::write(&file, "class P { n: number = \"x\" }\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"field-default-type\""),
+        "expected a field-default-type diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("field 'n' default is string"),
+        "expected the descriptive message, got:\n{stdout}"
+    );
+
+    // `--allow field-default-type` suppresses it.
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("field-default-type")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"field-default-type\""),
+        "--allow field-default-type should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_invalid_propagate_lint_and_allow_suppression() {
+    // The `invalid-propagate` static lint flags a postfix `?` inside a function
+    // whose declared return type is not a `Result`. Configurable: `--allow
+    // invalid-propagate` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_invalid_propagate_{}.as", std::process::id()));
+    std::fs::write(
+        &file,
+        "fn g(): Result<number> { return [1, nil] }\nfn f(): number { return g()? }\n",
+    )
+    .unwrap();
+
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"invalid-propagate\""),
+        "expected an invalid-propagate diagnostic, got:\n{stdout}"
+    );
+
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("invalid-propagate")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"invalid-propagate\""),
+        "--allow invalid-propagate should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_unresolved_import_lint_and_allow_suppression() {
+    // The `unresolved-import` static lint flags a `std/*` import whose specifier
+    // is not a known std module (here a `std/maths` typo). Configurable:
+    // `--allow unresolved-import` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_unresolved_import_{}.as", std::process::id()));
+    std::fs::write(&file, "import { abs } from \"std/maths\"\nprint(1)\n").unwrap();
+
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"unresolved-import\""),
+        "expected an unresolved-import diagnostic, got:\n{stdout}"
+    );
+
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("unresolved-import")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"unresolved-import\""),
+        "--allow unresolved-import should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}

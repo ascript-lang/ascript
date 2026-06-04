@@ -83,6 +83,18 @@ pub enum ExprKind {
     /// break an optional chain: `(a?.b).c` errors on `.c` rather than
     /// short-circuiting (spec §4, matching JS).
     Paren(Box<Expr>),
+    /// `a..b`, `a..=b`, optionally `… step k` — value position. Materializes to
+    /// `array<number>` at eval. The dedicated successor to the old
+    /// `Binary { op: BinOp::Range, .. }` path (which still exists for this task;
+    /// the parser starts producing `Range` in Task 3).
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        /// `true` for `..=` (inclusive upper bound), `false` for `..`.
+        inclusive: bool,
+        /// Optional signed `step k` modifier; `None` means the default ±1.
+        step: Option<Box<Expr>>,
+    },
 }
 
 /// An element of an array literal: a plain item `x` or a spread `...x`.
@@ -249,6 +261,10 @@ pub enum Stmt {
         var: String,
         start: Expr,
         end: Expr,
+        /// `true` for `..=` (inclusive upper bound), `false` for `..`.
+        inclusive: bool,
+        /// Optional signed `step k` modifier; `None` means the default ±1.
+        step: Option<Expr>,
         body: Vec<Stmt>,
     },
     ForOf {
@@ -344,11 +360,14 @@ pub enum Pattern {
     /// Any value expression (literal, enum ref, member access, call, `1+1`, …) —
     /// evaluated then compared with `==`.
     Value(Box<Expr>),
-    /// `a..b` (exclusive) / `a..=b` (inclusive) — subject is a Number in range.
+    /// `a..b` (exclusive) / `a..=b` (inclusive), optionally `… step k` — subject
+    /// is a Number in range (with strided membership when `step` is present).
     Range {
         start: Box<Expr>,
         end: Box<Expr>,
         inclusive: bool,
+        /// Optional signed `step k` modifier; `None` means the default ±1.
+        step: Option<Box<Expr>>,
     },
     /// `[p0, p1, ...]` — subject is an array; exact arity unless a trailing rest.
     /// The rest: `None` = no rest, `Some(None)` = `...` (ignore), `Some(Some(n))`
@@ -378,9 +397,14 @@ impl std::fmt::Display for Pattern {
                 start,
                 end,
                 inclusive,
+                step,
             } => {
                 let op = if *inclusive { "..=" } else { ".." };
-                write!(f, "{}{}{}", start, op, end)
+                write!(f, "{}{}{}", start, op, end)?;
+                if let Some(k) = step {
+                    write!(f, " step {}", k)?;
+                }
+                Ok(())
             }
             Pattern::Array(pats, rest) => {
                 write!(f, "[")?;
@@ -575,6 +599,80 @@ impl fmt::Display for ExprKind {
             ExprKind::Yield(Some(e)) => write!(f, "(yield {})", e),
             ExprKind::Yield(None) => write!(f, "(yield)"),
             ExprKind::Paren(inner) => write!(f, "{}", inner),
+            ExprKind::Range {
+                start,
+                end,
+                inclusive,
+                step,
+            } => {
+                let op = if *inclusive { "..=" } else { ".." };
+                write!(f, "{}{}{}", start, op, end)?;
+                if let Some(k) = step {
+                    write!(f, " step {}", k)?;
+                }
+                Ok(())
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn num(n: f64) -> Box<Expr> {
+        Box::new(Expr {
+            kind: ExprKind::Number(n),
+            span: Span::new(0, 0),
+        })
+    }
+
+    fn range_expr(start: f64, end: f64, inclusive: bool, step: Option<f64>) -> Expr {
+        Expr {
+            kind: ExprKind::Range {
+                start: num(start),
+                end: num(end),
+                inclusive,
+                step: step.map(num),
+            },
+            span: Span::new(0, 0),
+        }
+    }
+
+    #[test]
+    fn range_display_inclusive_and_step() {
+        // inclusive + step
+        assert_eq!(
+            range_expr(1.0, 10.0, true, Some(2.0)).to_string(),
+            "1..=10 step 2"
+        );
+        // exclusive, no step
+        assert_eq!(range_expr(1.0, 5.0, false, None).to_string(), "1..5");
+        // exclusive + step
+        assert_eq!(
+            range_expr(0.0, 10.0, false, Some(2.0)).to_string(),
+            "0..10 step 2"
+        );
+        // inclusive, no step
+        assert_eq!(range_expr(1.0, 5.0, true, None).to_string(), "1..=5");
+    }
+
+    #[test]
+    fn pattern_range_display_inclusive_and_step() {
+        let pat = Pattern::Range {
+            start: num(1.0),
+            end: num(10.0),
+            inclusive: true,
+            step: Some(num(2.0)),
+        };
+        assert_eq!(pat.to_string(), "1..=10 step 2");
+
+        let pat = Pattern::Range {
+            start: num(1.0),
+            end: num(5.0),
+            inclusive: false,
+            step: None,
+        };
+        assert_eq!(pat.to_string(), "1..5");
     }
 }

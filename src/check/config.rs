@@ -36,6 +36,14 @@ pub const RULE_CODES: &[&str] = &[
     "ignored-result",
     "dead-recover",
     "contract-mismatch",
+    "call-arity",
+    "range-step",
+    "invalid-propagate",
+    "unresolved-import",
+    "unknown-enum-variant",
+    "duplicate-member",
+    "super-misuse",
+    "field-default-type",
 ];
 
 /// Per-code severity overrides plus global warning promotion.

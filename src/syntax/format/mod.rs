@@ -649,6 +649,12 @@ impl Printer<'_> {
                 if let Some(e) = kids.get(1) {
                     self.expr(e);
                 }
+                // Optional trailing contextual `step <expr>` (the third expr child;
+                // the `step` keyword itself is an Ident token, not an expr node).
+                if let Some(step) = kids.get(2) {
+                    self.out.text(" step ");
+                    self.expr(step);
+                }
             }
             _ => self.out.text(node.text().to_string().trim()),
         }
