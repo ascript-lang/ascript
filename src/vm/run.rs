@@ -3378,6 +3378,37 @@ impl Vm {
         // method's declared params (which EXCLUDE self) — shared with every call
         // path. The bound values land in slots 1.. (self is slot 0).
         let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+        // A generator method (`fn*` / `async fn*`) is NOT run inline: it binds `self`
+        // and args into a NOT-STARTED fiber and wraps it in a VM-backed
+        // `GeneratorHandle`, returning a `Value::Generator` immediately — exactly like
+        // the standalone-generator CALL path (`Op::Call`) and the tree-walker's
+        // `invoke_method` generator branch. The body runs only when the consumer
+        // drives it via `gen.next()` / `for await`; `self` (slot 0) is visible to a
+        // `yield self.x`. Both sync and async generator methods take this path.
+        if closure.proto.is_generator {
+            let mut gfiber = Fiber::new(closure);
+            gfiber.frame_mut().ret_span = span;
+            gfiber.frame_mut().def_class = def_class;
+            let cells = gfiber.frame().cells.clone();
+            // self -> slot 0 (cell-aware).
+            if let Some(cell) = &cells[0] {
+                *cell.borrow_mut() = receiver;
+            } else {
+                gfiber.stack[0] = receiver;
+            }
+            // bound args -> slots 1..n+1 (cell-aware).
+            for (i, v) in bound.into_iter().enumerate() {
+                let slot = i + 1;
+                if let Some(cell) = &cells[slot] {
+                    *cell.borrow_mut() = v;
+                } else {
+                    gfiber.stack[slot] = v;
+                }
+            }
+            let handle =
+                crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
+            return Ok(Value::Generator(Rc::new(handle)));
+        }
         let mut fiber = Fiber::new(closure);
         fiber.frame_mut().ret_span = span;
         // Record the DEFINING class so a `super.<name>` in this method body

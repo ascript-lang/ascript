@@ -113,6 +113,28 @@ fn build_then_run_aso_matches_classes() {
 }
 
 #[test]
+fn build_then_run_aso_matches_generator_method() {
+    // SP1 Phase B: a class with a `fn*` generator method (using `self`) compiles to
+    // a generator `FnProto` that serializes through the `.aso` (generator protos
+    // already round-trip) and runs byte-identically to the tree-walker.
+    let dir = unique_dir("genmethod");
+    write(
+        &dir,
+        "g.as",
+        "class C { fn init() { self.n = 10 }\n  fn* g() { yield self.n\n    yield self.n + 1\n    yield self.n + 2 } }\n\
+         let c = C()\nfor await (v in c.g()) { print(v) }\n",
+    );
+    build(&dir, "g.as");
+    assert!(dir.join("g.aso").exists(), "g.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "g.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "g.as"]);
+    assert_eq!(aso_out, "10\n11\n12\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
 fn build_then_run_aso_matches_stepped_match_pattern() {
     // RANGES FEATURE, Phase 5: a stepped MATCH-RANGE pattern (strided membership)
     // serializes through the `.aso` (the `Op::MATCH_RANGE` flags byte + the step

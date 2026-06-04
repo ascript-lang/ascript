@@ -2061,18 +2061,12 @@ impl Compiler {
     /// `params`/`ret`/`arity` from the param nodes (which EXCLUDE `self`), so the
     /// proto's `arity` is the user-visible arg count.
     fn compile_method_proto(&mut self, method: &MethodDecl) -> Result<Rc<FnProto>, CompileError> {
-        // A generator method (`fn*`) is out of scope for V9-T1.
-        if method
-            .syntax()
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .any(|t| t.kind() == SyntaxKind::Star)
-        {
-            return Err(CompileError::new(
-                "generator methods (fn*) not yet supported in the VM",
-                node_span(method),
-            ));
-        }
+        // A generator method (`fn*` / `async fn*`) compiles like any other method:
+        // `compile_fn_proto` reads the `Star`/`AsyncKw` tokens and sets `is_generator`
+        // / `is_async`, and `compile_fn_body` lowers `yield` via the SAME
+        // `MAKE_GENERATOR`/`YIELD` machinery standalone generators use (SP1 Phase B).
+        // The method-CALL path (`invoke_compiled_method`) binds `self` and wraps the
+        // not-started fiber in a `GeneratorHandle`, yielding a `Value::Generator`.
         self.compile_fn_proto(method.syntax())
     }
 

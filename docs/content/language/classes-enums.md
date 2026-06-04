@@ -25,6 +25,31 @@ print(a.speak())           // Rex makes a sound
 - `init` runs when you call the class; assign fields with `self.field = …`.
 - Methods may be `async fn`.
 
+### Generator methods
+
+A method may be a generator — `fn*` or `async fn*`. Calling it returns a generator
+bound to `self`, driven by `for await` / `.next()` / `gen.close()`, exactly like a standalone
+generator. `self`, arguments, type contracts, inheritance, and `super` all work as for an ordinary
+method.
+
+```ascript
+class Counter {
+  fn init(start) { self.start = start }
+  fn* upTo(n) {
+    let i = self.start
+    while (i <= n) {
+      yield i
+      i = i + 1
+    }
+  }
+}
+
+let c = Counter(3)
+for await (v in c.upTo(6)) {
+  print(v)   // 3 4 5 6
+}
+```
+
 ### Typed fields
 
 A class body may declare fields with [contract types](type-contracts) before its methods. There are
