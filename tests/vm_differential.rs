@@ -6519,6 +6519,27 @@ async fn record_inheritance_positional_matches_treewalker() {
 }
 
 #[tokio::test]
+async fn record_subclass_inherits_base_init_not_auto_init() {
+    // Inheritance-of-init decision: a subclass with no init of its own INHERITS the
+    // base class's explicit init (find_method walks the chain), so NO auto-init is
+    // derived — construction runs the inherited init. `Sub(5)` -> base init sets
+    // a = 5*10 = 50; the subclass field default b = 7 is applied. Both engines agree.
+    assert_vm_run_matches_treewalker(
+        "class Base { a: number\n fn init(v) { self.a = v * 10 } }\n\
+         class Sub extends Base { b: number = 7 }\n\
+         let s = Sub(5)\nprint(s.a)\nprint(s.b)\n",
+    )
+    .await;
+    // And the inherited-init arity is the BASE init's (1 arg) — passing 2 is the
+    // same arity panic on both engines (it is NOT the subclass field count).
+    assert_vm_run_error_matches_treewalker(
+        "class Base { a: number\n fn init(v) { self.a = v } }\n\
+         class Sub extends Base { b: number }\nSub(1, 2)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn record_from_still_works_on_auto_init_class() {
     // `.from` is independent of init; it must still validate/coerce an auto-init
     // (record) class, applying field defaults.
