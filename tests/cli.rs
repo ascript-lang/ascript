@@ -2191,3 +2191,59 @@ fn check_fix_and_fix_dry_run_together_is_usage_error() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn cross_module_panic_renders_caret_in_defining_module() {
+    // SP4 §3: a runtime panic raised in module A (defining `boom`) but invoked
+    // from module B must render its caret IN A's file (a.as), not B's — the span
+    // belongs to A and is bound to A's source at raise time.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_prov_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("a.as"),
+        "export fn boom() {\n  let x = nil\n  return x.field\n}\n",
+    )
+    .unwrap();
+    let b = dir.join("b.as");
+    std::fs::write(&b, "import { boom } from \"./a\"\nprint(\"before\")\nboom()\n").unwrap();
+
+    let out = Command::new(bin).arg("run").arg(&b).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The report must name a.as (the span's own module), NOT b.as.
+    assert!(
+        stderr.contains("a.as:3"),
+        "expected the caret in a.as line 3, got stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("b.as:"),
+        "the caret must not be rendered against b.as, got stderr:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn single_module_panic_provenance_unchanged() {
+    // SP4 §3 regression: a panic in a STANDALONE file still renders its caret in
+    // that file (the span-source fix is additive — single-module errors set the
+    // span source to the same file, so the caret is byte-identical to before).
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_single_prov_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("solo.as");
+    std::fs::write(&f, "let x = nil\nprint(x.field)\n").unwrap();
+
+    let out = Command::new(bin).arg("run").arg(&f).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("solo.as:2"),
+        "expected the caret in solo.as line 2, got stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("cannot read property 'field' of nil"),
+        "expected the property panic message, got stderr:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

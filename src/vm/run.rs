@@ -148,6 +148,11 @@ pub struct Vm {
     /// (no thrash). Distinct from `global_version`, which keeps serving the builtin
     /// `Cached` path (and DOES bump on define).
     struct_gen: std::cell::Cell<u64>,
+    /// The MODULE source of the frame most recently about to execute (SP4 §3).
+    /// Updated each instruction; read by [`run`] to bind a span's own module
+    /// source onto an escaping panic, so a cross-module panic renders its caret in
+    /// the module the span belongs to. `None` until the first sourced frame runs.
+    last_fault_source: RefCell<Option<Rc<crate::error::SourceInfo>>>,
 }
 
 impl Vm {
@@ -184,6 +189,7 @@ impl Vm {
             user_globals: RefCell::new(indexmap::IndexMap::new()),
             global_version: std::cell::Cell::new(0),
             struct_gen: std::cell::Cell::new(0),
+            last_fault_source: RefCell::new(None),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -453,7 +459,7 @@ impl Vm {
                 format!("cannot read module {}: {}", as_path.display(), e),
             )
         })?;
-        crate::compile::compile_source(&src).map_err(|e| {
+        let chunk = crate::compile::compile_source(&src).map_err(|e| {
             self.panic_at(
                 fiber,
                 fault_ip,
@@ -463,7 +469,16 @@ impl Vm {
                     e.message
                 ),
             )
-        })
+        })?;
+        // Bind THIS module's source onto its whole proto tree (SP4 §3) so a panic
+        // raised in any of its functions — even when invoked from a different
+        // module — renders its caret in this module's own file.
+        let src_info = Rc::new(crate::error::SourceInfo {
+            path: as_path.display().to_string(),
+            text: src,
+        });
+        chunk.set_module_source(&src_info);
+        Ok(chunk)
     }
 
     /// Drive `fiber` until it returns (or panics). V1 runs the synchronous
@@ -475,9 +490,37 @@ impl Vm {
     /// never held across a suspension point, keeping
     /// `clippy::await_holding_refcell_ref` clean once V7 introduces awaits.
     pub async fn run(&self, fiber: &mut Fiber) -> Result<RunOutcome, Control> {
+        let result = self.run_loop(fiber).await;
+        // SP4 §3: bind the FAULTING frame's module source onto an escaping panic
+        // that has a span but no span-source yet. The fault propagates
+        // synchronously up this `run` (no `.await` between the raise and here), so
+        // `last_fault_source` still holds the chunk source of the frame that
+        // faulted — the module the span belongs to. Innermost-wins (a nested
+        // `run` already bound it). `None` (e.g. an `.aso` with no source) leaves
+        // the error untouched, so the driver's entry-source fallback applies.
+        if let Err(Control::Panic(e)) = &result {
+            if e.span.is_some() && e.span_source.is_none() {
+                if let Some(src) = self.last_fault_source.borrow().clone() {
+                    return Err(Control::Panic(
+                        e.clone().with_span_source(src),
+                    ));
+                }
+            }
+        }
+        result
+    }
+
+    /// The instruction-dispatch loop. Wrapped by [`run`] which binds the faulting
+    /// module's source onto an escaping panic (SP4 §3 cross-module provenance).
+    async fn run_loop(&self, fiber: &mut Fiber) -> Result<RunOutcome, Control> {
         loop {
             // Capture the faulting ip (the opcode byte's offset) before advancing.
             let fault_ip = fiber.frame().ip;
+            // SP4 §3: remember the source of the frame about to execute, so a panic
+            // it raises can be bound to its own module's text on the way out.
+            if let Some(src) = fiber.frame().closure.proto.chunk.source.borrow().as_ref() {
+                *self.last_fault_source.borrow_mut() = Some(src.clone());
+            }
             let byte = fiber.frame().closure.proto.chunk.code[fault_ip];
             let op = Op::from_u8(byte)
                 .unwrap_or_else(|| panic!("invalid opcode byte {byte:#x} at ip {fault_ip}"));
@@ -3882,8 +3925,17 @@ impl Vm {
     /// of the instruction at `ip`, so ariadne points at the source exactly like
     /// the tree-walker.
     fn panic_at(&self, fiber: &Fiber, ip: usize, msg: String) -> Control {
-        let span = fiber.frame().closure.proto.chunk.span_at(ip);
-        Control::Panic(AsError::at(msg, span))
+        let chunk = &fiber.frame().closure.proto.chunk;
+        let span = chunk.span_at(ip);
+        // Bind the span to its OWN module's source (SP4 §3) so a panic raised in
+        // one module renders its caret in that module's file even when the error
+        // propagates up to a caller in a different module. `None` (no module
+        // source bound — e.g. an `.aso` with no source) falls back to the entry
+        // source at the top of the run, preserving single-module behavior.
+        match chunk.source.borrow().as_ref() {
+            Some(src) => Control::Panic(AsError::at_in(msg, span, src.clone())),
+            None => Control::Panic(AsError::at(msg, span)),
+        }
     }
 
     /// Unwind ONE call frame, returning `value` from it.

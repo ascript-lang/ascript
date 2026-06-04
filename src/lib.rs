@@ -354,6 +354,10 @@ pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, 
     });
     let chunk = crate::compile::compile_source(&src)
         .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
+    // Bind the entry module's source onto its whole proto tree (SP4 §3) so a
+    // panic raised in any of its functions renders its caret in this file even
+    // when the error propagates up from a different module's call site.
+    chunk.set_module_source(&src_info);
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);

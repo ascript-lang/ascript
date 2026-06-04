@@ -5,7 +5,13 @@ use crate::error::AsError;
 /// present, otherwise a plain `error: <message>` line.
 pub fn report(err: &AsError) {
     use ariadne::{Color, Label, Report, ReportKind, Source};
-    match (&err.source, err.span) {
+    // Prefer the span's OWN source (bound at raise time) for the caret, so a span
+    // is never rendered against a different module's text (SP4 §3 cross-module
+    // provenance). Fall back to the outer/context `source` when no span-source is
+    // bound (single-module errors set neither or both to the same `SourceInfo`, so
+    // they are byte-identical to before).
+    let caret_source = err.span_source.as_ref().or(err.source.as_ref());
+    match (caret_source, err.span) {
         (Some(src), Some(span)) => {
             // Spans are CHAR offsets; ariadne wants byte ranges. Convert.
             let text = &src.text;
