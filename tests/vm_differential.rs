@@ -1152,6 +1152,112 @@ async fn vm_opt_member_read_matches_treewalker() {
     }
 }
 
+// ----- SP1 Phase A: `a?.m(args)` optional method call -------------------------
+//
+// The VM used to REJECT `a?.m(...)` at compile (`optional method calls
+// (a?.m(...)) not yet supported (V9)`); the tree-walker runs it. These cases pin
+// the VM to the tree-walker's exact semantics, three-way (tree-walker ==
+// specialized-VM == generic-VM), byte-for-byte: a nil receiver yields `nil`
+// WITHOUT evaluating the arguments and short-circuits the rest of the postfix
+// chain; a non-nil receiver is an ordinary bound method call; `?.` guards ONLY
+// the nil receiver (a non-nil receiver with a missing method still panics
+// `value is not callable`).
+
+/// Three-way OK assertion: `tree-walker == specialized-VM == generic-VM`,
+/// byte-identical stdout, no exit code.
+async fn assert_opt_call_ok_three_way(src: &str) {
+    let tw = ascript::run_source(src).await.expect("tree-walker ok");
+    let (vm, vm_code) = ascript::vm_run_source(src).await.expect("specialized vm ok");
+    let (gen, gen_code) = ascript::vm_run_source_generic(src)
+        .await
+        .expect("generic vm ok");
+    assert_eq!(vm_code, None, "no exit code expected for `{src}`");
+    assert_eq!(gen_code, None, "no exit code expected for `{src}`");
+    assert_eq!(
+        tw, vm,
+        "specialized VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
+    );
+    assert_eq!(
+        tw, gen,
+        "generic VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  gen: {gen:?}"
+    );
+}
+
+/// Three-way ERROR assertion: all three engines panic with identical message +
+/// span.
+async fn assert_opt_call_error_three_way(src: &str) {
+    let tw = ascript::run_source(src).await;
+    let vm = ascript::vm_run_source(src).await;
+    let gen = ascript::vm_run_source_generic(src).await;
+    match (tw, vm, gen) {
+        (Err(tw_err), Err(vm_err), Err(gen_err)) => {
+            assert_eq!(
+                tw_err.message, vm_err.message,
+                "specialized-VM panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, vm_err.message
+            );
+            assert_eq!(
+                tw_err.span, vm_err.span,
+                "specialized-VM panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, tw_err.span, vm_err.span
+            );
+            assert_eq!(
+                tw_err.message, gen_err.message,
+                "generic-VM panic message diverged for `{src}`\n  tw: {:?}\n  gen: {:?}",
+                tw_err.message, gen_err.message
+            );
+            assert_eq!(
+                tw_err.span, gen_err.span,
+                "generic-VM panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  gen: {:?}",
+                tw_err.message, tw_err.span, gen_err.span
+            );
+        }
+        (tw, vm, gen) => panic!(
+            "expected ALL THREE engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm: {vm:?}\n  gen: {gen:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn vm_opt_call_nil_skips_args() {
+    // nil receiver: result nil AND the argument's side effect must NOT run.
+    assert_opt_call_ok_three_way(
+        "fn se() { print(\"ARG\")\n  return 1 }\nlet a = nil\nprint(a?.m(se()))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_opt_call_nonnil() {
+    // non-nil receiver: ordinary bound method call.
+    assert_opt_call_ok_three_way(
+        "class C { fn m(x) { return x + 1 } }\nlet c = C()\nprint(c?.m(10))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_opt_call_chain_nil() {
+    // chained: the whole postfix chain short-circuits when the receiver is nil.
+    assert_opt_call_ok_three_way("let a = nil\nprint(a?.m().n().o)\n").await;
+}
+
+#[tokio::test]
+async fn vm_opt_call_missing_method() {
+    // non-nil receiver, missing method -> all engines panic "value is not
+    // callable", identical span (`?.` does NOT guard a missing method).
+    assert_opt_call_error_three_way("class C {}\nlet c = C()\nprint(c?.nope(1))\n").await;
+}
+
+#[tokio::test]
+async fn vm_opt_call_mixed() {
+    // mixed optional member + optional call in one chain.
+    assert_opt_call_ok_three_way(
+        "class C { fn m() { return 5 } }\nlet c = C()\nprint(c?.m())\nlet a = nil\nprint(a?.b?.m())\n",
+    )
+    .await;
+}
+
 // ----- V3-T1: if / else if / else ---------------------------------------------
 
 #[tokio::test]

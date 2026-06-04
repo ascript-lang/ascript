@@ -907,6 +907,17 @@ impl Compiler {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        // A postfix chain (`Member`/`Index`/`Call`/`OptMember` nested via their
+        // receiver/object/callee spine) that contains an optional link which must
+        // SHORT-CIRCUIT THE REST OF THE CHAIN — an optional method call
+        // `a?.m(...)`, or an optional member read `a?.b` followed by more chain —
+        // is compiled with a chain-wide nil "sink" (mirroring the tree-walker's
+        // `eval_chain` `(value, short_circuited)` propagation). A trailing single
+        // `a?.b` (no further chain) still lowers to the self-short-circuiting
+        // `GET_PROP_OPT` via the existing per-node path (no sink needed).
+        if self.chain_needs_sink(expr) {
+            return self.compile_chain_root(expr);
+        }
         match expr {
             Expr::Literal(lit) => self.compile_literal(lit),
             Expr::BinaryExpr(bin) => self.compile_binary(bin),
@@ -3578,6 +3589,262 @@ impl Compiler {
     /// local/upvalue holding a closure (`GET_LOCAL`/`GET_LOCAL_CELL`/`GET_UPVALUE`),
     /// or a parenthesized arrow. Member calls (`a.m(...)`) and calls whose callee
     /// resolves to a non-builtin bare global are later deferrals (V9).
+    /// Whether `expr` is a postfix chain that must thread a chain-wide nil "sink"
+    /// (i.e. an optional link short-circuits the REST of the chain). True when the
+    /// chain contains either:
+    /// - an optional method CALL `recv?.m(...)` (a `CallExpr` whose callee is an
+    ///   `OptMemberExpr`) — closed by SP1; or
+    /// - an optional member read `recv?.b` that is FOLLOWED by more chain (the
+    ///   `OptMember` is not the chain's outermost node).
+    ///
+    /// A trailing single `a?.b` (the outermost node is the only `OptMember`, with
+    /// nothing after it) returns `false`: the existing `GET_PROP_OPT` per-node
+    /// lowering already short-circuits it correctly, with no sink needed.
+    fn chain_needs_sink(&self, expr: &Expr) -> bool {
+        // Walk the spine inward from `outer == true` at the outermost node.
+        fn walk(expr: &Expr, outer: bool) -> bool {
+            match expr {
+                Expr::CallExpr(call) => {
+                    match call.expr() {
+                        // An optional method call is always a sink chain.
+                        Some(Expr::OptMemberExpr(_)) => true,
+                        // Otherwise descend into the callee spine (no longer outer).
+                        Some(callee) => walk(&callee, false),
+                        None => false,
+                    }
+                }
+                Expr::MemberExpr(m) => m.expr().is_some_and(|o| walk(&o, false)),
+                Expr::IndexExpr(ix) => ix.base().is_some_and(|b| walk(&b, false)),
+                Expr::OptMemberExpr(m) => {
+                    // An OptMember that is not the outermost node needs the sink
+                    // (it must short-circuit the chain after it). Either way also
+                    // descend its receiver spine.
+                    !outer || m.expr().is_some_and(|o| walk(&o, false))
+                }
+                // Any other node ends the spine (paren breaks the chain; leaf).
+                _ => false,
+            }
+        }
+        walk(expr, true)
+    }
+
+    /// Compile a postfix chain that needs a chain-wide nil sink (see
+    /// [`Self::chain_needs_sink`]). Establishes ONE sink jump target at the END of
+    /// the outermost chain node: every optional link emits a nil-guard that, on a
+    /// nil receiver, leaves `nil` on the stack and jumps to the sink WITHOUT
+    /// evaluating that link's member/index/args/call. This mirrors the
+    /// tree-walker's `eval_chain` short-circuit propagation exactly — `a?.m().n().o`
+    /// is `nil` wholesale when `a` is nil, and a nil receiver never evaluates the
+    /// optional call's arguments.
+    fn compile_chain_root(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        let mut sink: Vec<usize> = Vec::new();
+        self.compile_chain(expr, &mut sink)?;
+        // The chain's value is on the stack; patch every short-circuit jump to land
+        // here (the instruction right after the whole chain).
+        for site in sink {
+            self.chunk.patch_jump(site);
+        }
+        Ok(())
+    }
+
+    /// Compile one node of a postfix chain spine, registering any nil short-circuit
+    /// jump sites into `sink` (patched to the chain end by `compile_chain_root`).
+    /// Off-spine sub-expressions (call args, index expressions, parenthesized
+    /// receivers, the base of the chain) are compiled via `compile_expr`, which
+    /// starts a FRESH chain — so an inner chain's short-circuit never escapes into
+    /// this one.
+    fn compile_chain(&mut self, expr: &Expr, sink: &mut Vec<usize>) -> Result<(), CompileError> {
+        match expr {
+            // `recv?.m(args)` — optional method call (the SP1 feature). Compile the
+            // receiver (continuing the spine), nil-guard it, and on the non-nil
+            // path do an ordinary bound method call; on the nil path leave `nil`
+            // and short-circuit the rest of the chain (args NOT evaluated).
+            Expr::CallExpr(call) if matches!(call.expr(), Some(Expr::OptMemberExpr(_))) => {
+                let span = node_code_span(call);
+                let Some(Expr::OptMemberExpr(m)) = call.expr() else {
+                    unreachable!("guarded by the match arm");
+                };
+                let receiver = m.expr().ok_or_else(|| {
+                    CompileError::new("optional method call missing receiver", span)
+                })?;
+                let name = m
+                    .ident_token()
+                    .ok_or_else(|| {
+                        CompileError::new("optional method call missing method name", span)
+                    })?
+                    .text()
+                    .to_string();
+                self.compile_chain(&receiver, sink)?;
+                self.emit_chain_nil_guard(sink, span);
+                // Non-nil receiver: an ordinary bound method call `(recv.m)(args)`.
+                // `?.` guards ONLY the nil receiver — a non-nil receiver with a
+                // missing method still panics `value is not callable` (the bound
+                // `recv.m` is nil and nil is called), identical to the tree-walker.
+                self.emit_method_call_on_receiver(call, &name, span)?;
+                Ok(())
+            }
+            // `recv?.b` — optional member read inside a longer chain.
+            Expr::OptMemberExpr(m) => {
+                let span = node_span(m);
+                let object = m.expr().ok_or_else(|| {
+                    CompileError::new("optional-member expression missing receiver", span)
+                })?;
+                let name = m
+                    .ident_token()
+                    .ok_or_else(|| {
+                        CompileError::new("optional-member expression missing property name", span)
+                    })?
+                    .text()
+                    .to_string();
+                let obj_span = node_code_span(&object);
+                self.compile_chain(&object, sink)?;
+                self.emit_chain_nil_guard(sink, obj_span);
+                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
+                Ok(())
+            }
+            // `recv.m(args)` — plain method call link in a sink chain (its receiver
+            // spine carries the optional link). Compile the receiver via the chain
+            // (so an inner short-circuit propagates), then the ordinary method call.
+            Expr::CallExpr(call) if matches!(call.expr(), Some(Expr::MemberExpr(_))) => {
+                let span = node_code_span(call);
+                let Some(Expr::MemberExpr(m)) = call.expr() else {
+                    unreachable!("guarded by the match arm");
+                };
+                if is_super_receiver(
+                    &m.expr().ok_or_else(|| {
+                        CompileError::new("method call missing receiver", span)
+                    })?,
+                ) {
+                    // `super.m()` cannot be a chain receiver (super is the implicit
+                    // base, never a value to short-circuit); fall back.
+                    return self.compile_method_call(call, &m, span);
+                }
+                let receiver = m.expr().ok_or_else(|| {
+                    CompileError::new("method call missing receiver", span)
+                })?;
+                let name = m
+                    .ident_token()
+                    .ok_or_else(|| {
+                        CompileError::new("method call missing method name", span)
+                    })?
+                    .text()
+                    .to_string();
+                self.compile_chain(&receiver, sink)?;
+                self.emit_method_call_on_receiver(call, &name, span)?;
+                Ok(())
+            }
+            // `callee(args)` with a non-member callee that is itself a chain (e.g.
+            // `(a?.b)()` is impossible — parens break the chain — but
+            // `a?.m()()` chains a plain call onto an optional-call result). The
+            // callee is on the spine; the args are off-spine.
+            Expr::CallExpr(call) => {
+                let span = node_code_span(call);
+                let callee = call.expr().ok_or_else(|| {
+                    CompileError::new("call expression missing callee", span)
+                })?;
+                self.compile_chain(&callee, sink)?;
+                if self.arg_list_has_spread(call) {
+                    self.compile_spread_args(call, span)?;
+                    self.chunk.emit(Op::CallSpread, span);
+                    return Ok(());
+                }
+                let mut argc: u8 = 0;
+                if let Some(arg_list) = call.arg_list() {
+                    for arg in arg_list.exprs() {
+                        self.compile_expr(&arg)?;
+                        argc = argc.checked_add(1).ok_or_else(|| {
+                            CompileError::new("too many call arguments (max 255)", span)
+                        })?;
+                    }
+                }
+                self.chunk.emit_u8(Op::Call, argc, span);
+                Ok(())
+            }
+            // `recv.b` — plain member read link in a sink chain.
+            Expr::MemberExpr(m) => {
+                let span = node_span(m);
+                let object = m.expr().ok_or_else(|| {
+                    CompileError::new("member expression missing receiver", span)
+                })?;
+                let name = m
+                    .ident_token()
+                    .ok_or_else(|| {
+                        CompileError::new("member expression missing property name", span)
+                    })?
+                    .text()
+                    .to_string();
+                let obj_span = node_code_span(&object);
+                self.compile_chain(&object, sink)?;
+                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
+                Ok(())
+            }
+            // `recv[index]` — index read link in a sink chain. The base is on the
+            // spine; the index is off-spine (a fresh chain).
+            Expr::IndexExpr(ix) => {
+                let span = node_code_span(ix);
+                let base = ix.base().ok_or_else(|| {
+                    CompileError::new("index expression missing receiver", span)
+                })?;
+                let index = ix.index().ok_or_else(|| {
+                    CompileError::new("index expression missing index", span)
+                })?;
+                self.compile_chain(&base, sink)?;
+                self.compile_expr(&index)?;
+                self.chunk.emit(Op::GetIndex, span);
+                Ok(())
+            }
+            // Spine base / leaf: any non-postfix node starts a fresh chain.
+            _ => self.compile_expr(expr),
+        }
+    }
+
+    /// Emit the nil short-circuit guard for an optional chain link. The receiver
+    /// is already on the stack: `DUP; JNN nonnil`. On a NON-nil receiver the JNN
+    /// pops the dup and falls onto the link's own op (`nonnil:`); on a NIL receiver
+    /// the JNN pops the dup (leaving the original `nil`) and we `JUMP sink` to the
+    /// chain end, skipping this link's member access / call (and, for a call, its
+    /// argument evaluation). The `JUMP` site is recorded in `sink` for patching.
+    fn emit_chain_nil_guard(&mut self, sink: &mut Vec<usize>, span: Span) {
+        self.chunk.emit(Op::Dup, span);
+        let nonnil = self.chunk.emit_jump(Op::JumpIfNotNil, span);
+        let to_sink = self.chunk.emit_jump(Op::Jump, span);
+        sink.push(to_sink);
+        // `nonnil:` — the non-nil receiver is on the stack; the link's op follows.
+        self.chunk.patch_jump(nonnil);
+    }
+
+    /// Emit an ordinary bound method call on a receiver ALREADY on the stack
+    /// (the non-nil path of an optional/chain method-call link): args left-to-right
+    /// then `CALL_METHOD name, argc` (or the dynamic-arity `CALL_METHOD_SPREAD`).
+    /// Mirrors `compile_method_call`'s non-super body, except the receiver is
+    /// pre-compiled by the caller (the chain spine).
+    fn emit_method_call_on_receiver(
+        &mut self,
+        call: &CallExpr,
+        name: &str,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name)));
+        if self.arg_list_has_spread(call) {
+            self.compile_spread_args(call, span)?;
+            self.chunk.emit_u16(Op::CallMethodSpread, name_idx, span);
+            return Ok(());
+        }
+        let mut argc: u8 = 0;
+        if let Some(arg_list) = call.arg_list() {
+            for arg in arg_list.exprs() {
+                self.compile_expr(&arg)?;
+                argc = argc
+                    .checked_add(1)
+                    .ok_or_else(|| CompileError::new("too many call arguments (max 255)", span))?;
+            }
+        }
+        self.chunk.emit_u16_u8(Op::CallMethod, name_idx, argc, span);
+        Ok(())
+    }
+
     fn compile_call(&mut self, call: &CallExpr) -> Result<(), CompileError> {
         // The CALL instruction can PANIC at runtime (arity mismatch, per-param
         // contract violation, non-callable callee, …). The tree-walker anchors
@@ -3596,17 +3863,12 @@ impl Compiler {
         // the tree-walker's `eval_chain` Member-callee Call arm (schema fluent hook
         // + `read_member` → `call_value`). This is what makes the generator
         // consumer API (`gen.next(v)` / `gen.close()`) work — and array/string/
-        // instance methods generally. An OPTIONAL member call `recv?.m(args)` needs
-        // the nil-receiver short-circuit-the-whole-call semantics and is a full-V9
-        // deferral; reject it here rather than diverge.
+        // instance methods generally. An OPTIONAL member call `recv?.m(args)` is
+        // routed through `compile_chain` (the chain-wide nil sink) by `compile_expr`
+        // BEFORE reaching here (`chain_needs_sink` is true for it), so it never
+        // arrives at `compile_call`.
         if let Expr::MemberExpr(m) = &callee {
             return self.compile_method_call(call, m, span);
-        }
-        if matches!(&callee, Expr::OptMemberExpr(_)) {
-            return Err(CompileError::new(
-                "optional method calls (a?.m(...)) not yet supported (V9)",
-                node_span(&callee),
-            ));
         }
 
         // Compile the callee onto the stack. `compile_expr` routes a `NameRef`
