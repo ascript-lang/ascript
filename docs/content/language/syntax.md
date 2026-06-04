@@ -19,8 +19,8 @@ always allowed but never required. The same optional `;` may separate **class me
 (`class P { x: number; y: number }`); newlines are the canonical form and the formatter normalizes
 `;` back to newlines. Note that `enum` variants are **comma**-separated, not `;`-separated.
 
-**Keywords:** `let const fn return if else while for of in match async await class extends super self
-enum import export nil true false`.
+**Keywords:** `let const fn return if else while for of in instanceof match async await class extends
+super self enum import export nil true false`.
 
 ## Bindings
 
@@ -110,6 +110,7 @@ order, and is `{}` when nothing is left over.
 ```text
 +  -  *  /  %  **        arithmetic ( ** is exponentiation )
 == != <  <= >  >=        comparison
+instanceof               class membership test — x instanceof C (see Classes)
 && || !                  logical (short-circuit)
 ?? ?.                    nil-coalescing / optional chaining
 ?  :                     conditional (ternary)  — cond ? then : else
@@ -128,7 +129,7 @@ step                     range stride (contextual keyword) — a..b step k
 **                      exponentiation
 *  /  %                 multiplicative
 +  -                    additive
-<  <= >  >=             relational
+<  <= >  >=  instanceof   relational
 == !=                   equality
 &&                      logical and
 ||                      logical or

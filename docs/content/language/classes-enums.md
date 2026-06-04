@@ -193,6 +193,28 @@ print(d.breed)             // Husky
 Method resolution walks the inheritance chain from the instance's class upward. A class name is a
 valid [contract type](type-contracts) that accepts the class and any subclass.
 
+### `instanceof` — runtime class test
+
+`x instanceof C` is a comparison-tier binary operator that returns a `bool`: `true` when `x` is an
+instance of `C` **or any subclass of `C`** (the `extends` chain is walked), and `false` otherwise.
+
+```ascript
+class Animal {}
+class Dog extends Animal {}
+
+const d = Dog()
+print(d instanceof Dog)        // true
+print(d instanceof Animal)     // true  — a subclass instance IS-A parent
+print(Animal() instanceof Dog) // false — but not the other way around
+```
+
+- A **non-instance** left operand — a number, string, `nil`, an object, an enum value — is always
+  `false`, never an error: `print(5 instanceof Animal)` prints `false`.
+- The **right operand must be a class**. Anything else (`x instanceof 5`, `x instanceof nil`) is a
+  Tier-2 panic: `instanceof requires a class on the right-hand side`.
+- It binds at the relational tier (same as `< <= > >=`), looser than `+`/`-` and tighter than `&&`,
+  so `a instanceof B && c` parses as `(a instanceof B) && c`.
+
 ## Enums
 
 Enums are **simple named variants** — no payloads, no methods. A variant may carry an optional
