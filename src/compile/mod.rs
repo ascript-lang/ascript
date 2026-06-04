@@ -1115,7 +1115,7 @@ impl Compiler {
                     }
                     _ => {
                         return Err(CompileError::new(
-                            "assignment to a non-local target not yet supported (V4)",
+                            "internal: assignment target resolved to an unexpected binding (compiler invariant)",
                             node_span(&target),
                         ))
                     }
@@ -1206,7 +1206,7 @@ impl Compiler {
             Stmt::ImportStmt(import_stmt) => self.compile_import(import_stmt),
             Stmt::ExportStmt(export_stmt) => self.compile_export(export_stmt),
             other => Err(CompileError::new(
-                "statement kind not yet supported in V2",
+                "internal: unexpected statement kind in compile_stmt (compiler invariant)",
                 stmt_span(other),
             )),
         }
@@ -3259,7 +3259,7 @@ impl Compiler {
             ArrayPat => self.compile_array_pattern(pat, subj_temp, span, fail_sites),
             ObjectPat => self.compile_object_pattern(pat, subj_temp, span, fail_sites),
             other => Err(CompileError::new(
-                format!("unsupported match pattern kind {other:?}"),
+                format!("internal: unexpected match pattern kind {other:?} (compiler invariant)"),
                 range_span(pat),
             )),
         }
@@ -3838,7 +3838,7 @@ impl Compiler {
             // never reach this non-short-circuit dispatch).
             other => {
                 return Err(CompileError::new(
-                    format!("binary operator {other:?} not yet supported in V2"),
+                    format!("internal: unexpected binary operator {other:?} (compiler invariant)"),
                     span,
                 ))
             }
@@ -4124,7 +4124,7 @@ impl Compiler {
             SyntaxKind::Bang => Op::Not,
             other => {
                 return Err(CompileError::new(
-                    format!("unary operator {other:?} not yet supported in V1"),
+                    format!("internal: unexpected unary operator {other:?} (compiler invariant)"),
                     span,
                 ))
             }
@@ -4396,7 +4396,7 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
         SyntaxKind::NilKw => Value::Nil,
         other => {
             return Err(CompileError::new(
-                format!("literal token {other:?} not yet supported in V1"),
+                format!("internal: unexpected literal token {other:?} (compiler invariant)"),
                 span,
             ))
         }
