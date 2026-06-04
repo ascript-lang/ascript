@@ -1288,6 +1288,9 @@ fn read_class(r: &mut Reader) -> Result<Class, AsoError> {
         superclass: None,
         fields,
         methods: indexmap::IndexMap::new(),
+        // Static methods (SP1 §3) round-trip via the static proto table, not this
+        // class template; see C6.
+        static_methods: indexmap::IndexMap::new(),
         def_env: crate::interp::global_env(),
     })
 }

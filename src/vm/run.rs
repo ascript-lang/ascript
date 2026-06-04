@@ -2346,6 +2346,12 @@ impl Vm {
                         superclass,
                         fields: cp.class.fields.clone(),
                         methods: cp.class.methods.clone(),
+                        // VM static methods live in a separate per-class proto
+                        // table (keyed by Rc::as_ptr); this runtime `Class` value
+                        // carries an empty namespace (populated for the tree-walker
+                        // path only). The VM resolves `C.name` statics via that
+                        // table (SP1 §3, C5).
+                        static_methods: indexmap::IndexMap::new(),
                         def_env: def_env.clone(),
                     });
                     // Register the class into the shared env so a sibling/forward

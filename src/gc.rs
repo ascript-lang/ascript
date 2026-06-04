@@ -578,6 +578,7 @@ mod tests {
             superclass: None,
             fields: IndexMap::new(),
             methods: IndexMap::new(),
+            static_methods: IndexMap::new(),
             def_env: crate::env::Environment::global(),
         });
         let mut held_inst = Vec::with_capacity(N);

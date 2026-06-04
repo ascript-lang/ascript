@@ -1604,6 +1604,7 @@ impl Compiler {
             superclass: None,
             fields: field_map,
             methods: indexmap::IndexMap::new(),
+            static_methods: indexmap::IndexMap::new(),
             def_env: crate::interp::global_env(),
         });
 

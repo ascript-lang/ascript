@@ -1316,6 +1316,7 @@ impl Interp {
                     superclass: parent,
                     fields: field_map,
                     methods: method_map,
+                    static_methods: indexmap::IndexMap::new(),
                     def_env: env.clone(),
                 }));
                 env.define(name, class, false).map_err(AsError::new)?;
@@ -2023,13 +2024,21 @@ impl Interp {
                     span,
                 )),
             },
-            Value::Class(c) => match name {
-                "from" => Ok(Value::ClassMethod(c.clone(), "from")),
-                other => Err(AsError::at(
-                    format!("class {} has no static member '{}'", c.name, other),
-                    span,
-                )),
-            },
+            // Class-level member read (`C.name`), generalized for SP1 §3 static
+            // methods: (1) a user `static_methods` entry walking the superclass
+            // chain → a bound static callable, ELSE (2) the built-in `from`, ELSE
+            // (3) "class X has no static member 'name'". `ClassMethod` carries the
+            // owned name; `call_value` dispatches it.
+            Value::Class(c) => {
+                if crate::value::find_static_method(c, name).is_some() || name == "from" {
+                    Ok(Value::ClassMethod(c.clone(), name.into()))
+                } else {
+                    Err(AsError::at(
+                        format!("class {} has no static member '{}'", c.name, name),
+                        span,
+                    ))
+                }
+            }
             Value::Nil => Err(AsError::at(
                 format!("cannot read property '{}' of nil", name),
                 span,
@@ -2072,18 +2081,28 @@ impl Interp {
             Value::GeneratorMethod(g, method) => {
                 self.call_generator_method(&g, method, args, span).await
             }
-            Value::ClassMethod(c, "from") => {
-                let obj = args.first().cloned().unwrap_or(Value::Nil);
-                let strict = matches!(args.get(1), Some(Value::Bool(true)));
-                self.validate_into(&c, &obj, strict, "", span)
-                    .await
-                    .map_err(Control::from)
+            Value::ClassMethod(c, name) => {
+                // A user `static fn` (SP1 §3) takes precedence over the built-in
+                // `from` only if it exists; we resolved the name at read time, but
+                // re-resolve here so the carrier is self-contained. A static name
+                // that shadows `from` is impossible — `static fn from` is rejected.
+                if let Some((method, defining)) = crate::value::find_static_method(&c, &name) {
+                    self.call_static_method(method, defining, args, span, &name)
+                        .await
+                } else if &*name == "from" {
+                    let obj = args.first().cloned().unwrap_or(Value::Nil);
+                    let strict = matches!(args.get(1), Some(Value::Bool(true)));
+                    self.validate_into(&c, &obj, strict, "", span)
+                        .await
+                        .map_err(Control::from)
+                } else {
+                    Err(AsError::at(
+                        format!("class {} has no static member '{}'", c.name, name),
+                        span,
+                    )
+                    .into())
+                }
             }
-            Value::ClassMethod(c, other) => Err(AsError::at(
-                format!("class {} has no static member '{}'", c.name, other),
-                span,
-            )
-            .into()),
             _ => Err(AsError::at("value is not callable", span).into()),
         }
     }
@@ -2723,6 +2742,55 @@ impl Interp {
             body: &bm.method.body,
         };
         self.run_body(spec, args, &call_env, span, &bm.name).await
+    }
+
+    /// Dispatch a STATIC method `C.name(args)` (SP1 §3). Unlike `invoke_method`
+    /// there is NO receiver: the call env is the DEFINING class's `def_env` child
+    /// (so the class name and sibling statics resolve), with NO `self`/`super`
+    /// binding. Async statics return a `Value::Future`; `static fn*` returns a
+    /// `Value::Generator` — reusing the same machinery as instance methods.
+    #[async_recursion(?Send)]
+    async fn call_static_method(
+        &self,
+        method: Rc<crate::value::Method>,
+        defining: Rc<crate::value::Class>,
+        args: Vec<Value>,
+        span: Span,
+        name: &str,
+    ) -> Result<Value, Control> {
+        let call_env = defining.def_env.child();
+        if method.is_generator {
+            let vm = self.rc();
+            let m = method.clone();
+            let what = name.to_string();
+            let body: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Control>>>> =
+                Box::pin(async move { vm.run_method_body(m, args, call_env, span, what).await });
+            return Ok(Value::Generator(Rc::new(
+                crate::coro::GeneratorHandle::new(body),
+            )));
+        }
+        if method.is_async {
+            let vm = self.rc();
+            let m = method.clone();
+            let what = name.to_string();
+            let fut = crate::task::SharedFuture::new();
+            let cell = fut.cell();
+            let guard = self.inflight_guard();
+            let handle = tokio::task::spawn_local(async move {
+                let _g = guard;
+                let r = vm.run_method_body(m, args, call_env, span, what).await;
+                cell.resolve(r);
+            });
+            fut.set_abort(handle.abort_handle());
+            self.maybe_yield_for_inflight().await;
+            return Ok(Value::Future(fut));
+        }
+        let spec = BodySpec {
+            params: &method.params,
+            ret: &method.ret,
+            body: &method.body,
+        };
+        self.run_body(spec, args, &call_env, span, name).await
     }
 
     /// Run a method body owning the `Rc<Method>` for the whole frame (so the
