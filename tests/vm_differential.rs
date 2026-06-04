@@ -3550,6 +3550,45 @@ async fn vm_field_default_arrow_and_match() {
 }
 
 #[tokio::test]
+async fn vm_field_default_range_inclusive_and_stepped() {
+    // SP1 Phase E (E1 audit): the `cst_default_expr` lowering covers BOTH the
+    // inclusive `..=` boundary and the signed `step` modifier as field defaults
+    // (the tree-walker materializes the same `ExprKind::Range`). Exercise both the
+    // construct path and the `.from` path — they read the SAME lowered default.
+    assert_field_default_matches("", "array<number>", "1..=4", "x").await;
+    assert_field_default_matches("", "array<number>", "0..=10 step 5", "x").await;
+    assert_field_default_matches("", "array<number>", "5..=1 step -2", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_yield_rejected_symmetrically() {
+    // SP1 Phase E (E1): a `yield` field default is rejected by BOTH engines (it is
+    // never valid outside a generator body). The VM rejects it at COMPILE time in
+    // `cst_default_expr` (a specialized message); the tree-walker rejects it when it
+    // EVALUATES the default. The messages/spans legitimately differ (compile-time
+    // vs runtime), but the OBSERVABLE outcome is symmetric: both error, neither runs
+    // the program. Assert the symmetry of the rejection (both `Err`), not the exact
+    // text — mirroring the documented asymmetry note in `cst_default_expr`.
+    for default in ["yield 1", "yield"] {
+        let construct =
+            format!("class C {{ x: any = {default}\n  fn init() {{}} }}\nprint(C().x)");
+        let tw = ascript::run_source(&construct).await;
+        let vm = ascript::vm_run_source(&construct).await;
+        assert!(
+            tw.is_err() && vm.is_err(),
+            "expected BOTH engines to reject the `{default}` field default\n  tree-walker: {tw:?}\n  vm: {vm:?}"
+        );
+        // The generic VM must agree with the specialized VM (no specialization can
+        // turn a rejected default into a running one).
+        let vm_generic = ascript::vm_run_source_generic(&construct).await;
+        assert!(
+            vm_generic.is_err(),
+            "generic VM must also reject the `{default}` field default\n  {vm_generic:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vm_field_default_reviewer_regression() {
     // The EXACT program from the divergence report: a computed string-concat default
     // referencing a module const, printed off a freshly-constructed instance. The VM
