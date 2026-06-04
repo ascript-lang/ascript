@@ -143,8 +143,8 @@ Lint levels can be tuned per invocation (`--deny`/`--warn`/`--allow`) or via an 
 discovered by walking up from the checked file. A non-zero exit status indicates problems were
 found, which makes `ascript check` suitable for CI.
 
-Three rules cover ranges and import/propagation hygiene (all default to **Warning**, all configurable
-via `--deny`/`--warn`/`--allow` or the `[lint]` table):
+Several structural rules cover ranges, import/propagation hygiene, calls, enums, and classes (all
+default to **Warning**, all configurable via `--deny`/`--warn`/`--allow` or the `[lint]` table):
 
 - **`range-step`** — a statically-detectable bad range: a `step` of `0` (or a non-finite literal), or a
   step whose sign disagrees with the bounds so the range can never progress. It also flags a *float*
@@ -154,6 +154,11 @@ via `--deny`/`--warn`/`--allow` or the `[lint]` table):
 - **`unresolved-import`** — an `import … from "std/…"` naming a std module that does not exist (e.g. a
   typo like `"std/maths"`). **V1 limitation:** only `std/*` specifiers are checked; relative file paths
   (`"./mod"`, `"mod.as"`) are not yet resolved (the analysis is path-less), so they are left untouched.
+- **`call-arity`** — a direct call to a known function with the wrong number of arguments.
+- **`unknown-enum-variant`** — accessing a variant that the enum doesn't declare.
+- **`duplicate-member`** — two fields/methods with the same name in one class.
+- **`super-misuse`** — `super` used in a class that has no superclass.
+- **`field-default-type`** — a class field's literal default contradicts its declared type.
 
 ## `ascript lsp`
 
