@@ -228,6 +228,49 @@ impl MapKey {
     }
 }
 
+/// `object.freeze` (SP2 §4): if `v` is a FROZEN mutable container, return the
+/// kind name for the panic message (`"array"|"object"|"map"|"set"|"instance"`);
+/// otherwise `None`. Non-frozen containers and all non-container values are
+/// `None` (mutation of an unfrozen container is allowed; non-containers are never
+/// frozen). Used by `check_not_frozen` at every mutation site on both engines.
+pub fn frozen_kind(v: &Value) -> Option<&'static str> {
+    match v {
+        Value::Array(a) if a.is_frozen() => Some("array"),
+        Value::Object(o) if o.is_frozen() => Some("object"),
+        Value::Map(m) if m.is_frozen() => Some("map"),
+        Value::Set(s) if s.is_frozen() => Some("set"),
+        Value::Instance(i) if i.borrow().frozen.get() => Some("instance"),
+        _ => None,
+    }
+}
+
+/// `object.freeze` (SP2 §4): shallow-freeze a mutable container in place. A no-op
+/// for any non-container value (JS `Object.freeze` ergonomics). Idempotent /
+/// one-way (no unfreeze). The caller returns `v` unchanged for chaining.
+pub fn freeze_value(v: &Value) {
+    match v {
+        Value::Array(a) => a.freeze(),
+        Value::Object(o) => o.freeze(),
+        Value::Map(m) => m.freeze(),
+        Value::Set(s) => s.freeze(),
+        Value::Instance(i) => i.borrow().frozen.set(true),
+        _ => {}
+    }
+}
+
+/// `object.isFrozen` (SP2 §4): whether `v` is a frozen container. `false` for any
+/// non-container value.
+pub fn is_frozen_value(v: &Value) -> bool {
+    match v {
+        Value::Array(a) => a.is_frozen(),
+        Value::Object(o) => o.is_frozen(),
+        Value::Map(m) => m.is_frozen(),
+        Value::Set(s) => s.is_frozen(),
+        Value::Instance(i) => i.borrow().frozen.get(),
+        _ => false,
+    }
+}
+
 pub struct EnumDef {
     pub name: String,
     pub variants: IndexMap<String, Value>, // each is a Value::EnumVariant

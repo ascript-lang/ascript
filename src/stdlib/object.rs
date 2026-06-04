@@ -26,6 +26,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("deepClone", bi("object.deepClone")),
         ("deepEqual", bi("object.deepEqual")),
         ("mapValues", bi("object.mapValues")),
+        ("freeze", bi("object.freeze")),
+        ("isFrozen", bi("object.isFrozen")),
     ]
 }
 
@@ -310,6 +312,16 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mut seen = HashMap::new();
             Ok(deep_clone(&arg(args, 0), &mut seen))
         }
+        // SP2 §4: shallow-freeze a mutable container in place and return it
+        // (chainable). No-op for a non-container (JS ergonomics). Idempotent.
+        "freeze" => {
+            let v = arg(args, 0);
+            crate::value::freeze_value(&v);
+            Ok(v)
+        }
+        // SP2 §4: whether the value is a frozen container. `false` for any
+        // non-container value.
+        "isFrozen" => Ok(Value::Bool(crate::value::is_frozen_value(&arg(args, 0)))),
         _ => Err(AsError::at(format!("std/object has no function '{}'", func), span).into()),
     }
 }
@@ -521,6 +533,77 @@ mod tests {
         assert!(
             call("deepEqual", &[arr_a.clone(), arr_a.clone()], sp()).unwrap() == Value::Bool(true)
         );
+    }
+
+    // ---- freeze / isFrozen (SP2 §4) ----
+
+    #[test]
+    fn freeze_sets_flag_returns_value_and_isfrozen_tracks() {
+        let o = obj(vec![("a", Value::Number(1.0))]);
+        // isFrozen false before
+        assert_eq!(
+            call("isFrozen", std::slice::from_ref(&o), sp()).unwrap(),
+            Value::Bool(false)
+        );
+        // freeze returns the SAME value (identity) for chaining
+        let r = call("freeze", std::slice::from_ref(&o), sp()).unwrap();
+        assert!(matches!((&r, &o), (Value::Object(a), Value::Object(b)) if crate::gc::cc_ptr_eq(a, b)));
+        // isFrozen true after, and the underlying cell flag is set
+        assert_eq!(
+            call("isFrozen", std::slice::from_ref(&o), sp()).unwrap(),
+            Value::Bool(true)
+        );
+        if let Value::Object(cell) = &o {
+            assert!(cell.is_frozen());
+        }
+    }
+
+    #[test]
+    fn freeze_each_container_kind() {
+        // array
+        let a = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
+        call("freeze", std::slice::from_ref(&a), sp()).unwrap();
+        assert!(crate::value::is_frozen_value(&a));
+        assert_eq!(crate::value::frozen_kind(&a), Some("array"));
+        // map
+        let m = Value::Map(crate::value::MapCell::new(IndexMap::new()));
+        call("freeze", std::slice::from_ref(&m), sp()).unwrap();
+        assert_eq!(crate::value::frozen_kind(&m), Some("map"));
+        // set
+        let st = Value::Set(crate::value::SetCell::new(indexmap::IndexSet::new()));
+        call("freeze", std::slice::from_ref(&st), sp()).unwrap();
+        assert_eq!(crate::value::frozen_kind(&st), Some("set"));
+    }
+
+    #[test]
+    fn freeze_noncontainer_is_noop() {
+        let n = Value::Number(5.0);
+        // no-op freeze returns the value unchanged
+        assert_eq!(call("freeze", std::slice::from_ref(&n), sp()).unwrap(), n);
+        // never reports frozen / kind
+        assert_eq!(
+            call("isFrozen", std::slice::from_ref(&n), sp()).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(crate::value::frozen_kind(&n), None);
+    }
+
+    #[test]
+    fn freeze_is_idempotent() {
+        let o = obj(vec![("a", Value::Number(1.0))]);
+        call("freeze", std::slice::from_ref(&o), sp()).unwrap();
+        call("freeze", std::slice::from_ref(&o), sp()).unwrap();
+        assert!(crate::value::is_frozen_value(&o));
+    }
+
+    #[test]
+    fn deep_clone_of_frozen_is_unfrozen() {
+        let o = obj(vec![("a", Value::Number(1.0))]);
+        crate::value::freeze_value(&o);
+        let mut seen = HashMap::new();
+        let c = deep_clone(&o, &mut seen);
+        // the clone is a fresh, UNFROZEN container (JS semantics)
+        assert!(!crate::value::is_frozen_value(&c));
     }
 
     #[test]

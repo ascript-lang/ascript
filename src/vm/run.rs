@@ -3377,6 +3377,10 @@ impl Vm {
         value: Value,
         span: Span,
     ) -> Result<Value, Control> {
+        // `object.freeze` guard (SP2 §4): BEFORE any write — incl. the IC fast
+        // path below, which bypasses `set_member`. Byte-identical to the
+        // tree-walker's `set_member` frozen check.
+        crate::interp::check_not_frozen(obj, span)?;
         match obj {
             Value::Object(cell) => {
                 let shape = cell.shape.get();

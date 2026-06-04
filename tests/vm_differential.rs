@@ -6261,3 +6261,164 @@ print(#{})\n",
     )
     .await;
 }
+
+// ─────────────────────────── SP2 Phase D — object.freeze / isFrozen ──────────
+
+#[tokio::test]
+async fn vm_freeze_returns_value_and_isfrozen_tracks_matches_treewalker() {
+    // freeze returns the value; isFrozen reflects before/after.
+    assert_vm_run_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let o = {a: 1}\n\
+print(object.isFrozen(o))\n\
+let r = object.freeze(o)\n\
+print(object.isFrozen(o))\n\
+print(r == o)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_object_set_field_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let o = {a: 1}\n\
+object.freeze(o)\n\
+o.a = 2\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_object_set_index_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let o = {a: 1}\n\
+object.freeze(o)\n\
+o[\"a\"] = 2\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_array_push_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+import * as array from \"std/array\"\n\
+let a = [1]\n\
+object.freeze(a)\n\
+array.push(a, 2)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_array_index_set_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let a = [1, 2]\n\
+object.freeze(a)\n\
+a[0] = 9\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_map_set_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+import * as map from \"std/map\"\n\
+let m = map.new()\n\
+object.freeze(m)\n\
+map.set(m, \"k\", 1)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_set_add_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+import * as set from \"std/set\"\n\
+let s = set.new()\n\
+object.freeze(s)\n\
+set.add(s, 1)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_instance_set_field_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+class C { x: number = 0 }\n\
+let c = C()\n\
+object.freeze(c)\n\
+c.x = 9\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_is_shallow_matches_treewalker() {
+    // Element of a frozen array is still mutable (shallow freeze).
+    assert_vm_run_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let a = [[1]]\n\
+object.freeze(a)\n\
+a[0][0] = 9\n\
+print(a)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_noncontainer_and_clone_unfrozen_matches_treewalker() {
+    // Freezing a non-container is a no-op; a deepClone of a frozen object is unfrozen.
+    assert_vm_run_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+print(object.isFrozen(5))\n\
+print(object.freeze(5))\n\
+let o = {a: 1}\n\
+object.freeze(o)\n\
+let c = object.deepClone(o)\n\
+print(object.isFrozen(c))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_idempotent_and_nonfrozen_mutates_matches_treewalker() {
+    // Freezing twice is fine; a non-frozen container still mutates normally.
+    assert_vm_run_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+import * as array from \"std/array\"\n\
+let a = [1]\n\
+object.freeze(a)\n\
+object.freeze(a)\n\
+let b = [1]\n\
+array.push(b, 2)\n\
+print(b)\n\
+print(object.isFrozen(a))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_three_way_matches() {
+    assert_three_way_matches(
+        "import * as object from \"std/object\"\n\
+import * as array from \"std/array\"\n\
+let o = {a: 1, b: 2}\n\
+print(object.isFrozen(o))\n\
+object.freeze(o)\n\
+print(object.isFrozen(o))\n\
+let a = [1, 2, 3]\n\
+object.freeze(a)\n\
+print(object.isFrozen(a))\n\
+let live = [9]\n\
+array.push(live, 10)\n\
+print(live)\n",
+    )
+    .await;
+}

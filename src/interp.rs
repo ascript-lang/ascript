@@ -3105,10 +3105,12 @@ impl Interp {
     ) -> Result<Value, Control> {
         match obj {
             Value::Object(map) => {
+                check_not_frozen(obj, value_span)?;
                 map.borrow_mut().insert(name.to_string(), value.clone());
                 Ok(value)
             }
             Value::Instance(inst) => {
+                check_not_frozen(obj, value_span)?;
                 let class = inst.borrow().class.clone();
                 if let Some(schema) = lookup_field_schema(&class, name) {
                     if !check_type(&value, &schema.ty) {
@@ -3127,6 +3129,19 @@ impl Interp {
             .into()),
         }
     }
+}
+
+/// `object.freeze` (SP2 §4): guard a container mutation. If `v` is a frozen
+/// container, raise the Tier-2 panic `"cannot mutate a frozen <kind>"` anchored at
+/// the mutation-site `span`; otherwise `Ok(())`. Called at the START of every
+/// user-visible mutation path on BOTH engines (tree-walker `index_set`/`set_member`
+/// plus stdlib mutators; VM `SetIndex`/`vm_set_prop`) so the diagnostic is
+/// byte-identical.
+pub(crate) fn check_not_frozen(v: &Value, span: Span) -> Result<(), Control> {
+    if let Some(kind) = crate::value::frozen_kind(v) {
+        return Err(AsError::at(format!("cannot mutate a frozen {}", kind), span).into());
+    }
+    Ok(())
 }
 
 /// Pure unary-operator dispatch shared by the tree-walker (`ExprKind::Unary`) and
@@ -3560,6 +3575,12 @@ pub(crate) fn index_set(
     obj_span: Span,
     index_span: Span,
 ) -> Result<Value, AsError> {
+    if let Some(kind) = crate::value::frozen_kind(obj) {
+        return Err(AsError::at(
+            format!("cannot mutate a frozen {}", kind),
+            index_span,
+        ));
+    }
     match obj {
         Value::Array(arr) => {
             let i = array_index(idx, index_span)?;

@@ -85,6 +85,7 @@ impl Interp {
             }
             "push" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("push"))?;
+                crate::interp::check_not_frozen(&arg(args, 0), span)?;
                 let item = arg(args, 1);
                 let mut b = arr.borrow_mut();
                 b.push(item);
@@ -92,6 +93,7 @@ impl Interp {
             }
             "pop" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("pop"))?;
+                crate::interp::check_not_frozen(&arg(args, 0), span)?;
                 let popped = arr.borrow_mut().pop();
                 Ok(popped.unwrap_or(Value::Nil))
             }

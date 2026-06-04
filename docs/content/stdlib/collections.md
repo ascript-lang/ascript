@@ -802,6 +802,35 @@ object.deepEqual({a: 1, b: [1, 2]}, {a: 1, b: [1, 2]})   // true
 object.deepEqual({a: 1}, {a: 2})                           // false
 ```
 
+### object.freeze
+
+Shallow-freeze a mutable container (object, array, map, set, or class instance) **in place** and return it (so calls chain). After freezing, any in-place mutation — field/index assignment (`o.k = …`, `a[i] = …`), `array.push`/`pop`, `map.set`/`delete`, `set.add`/`delete`, etc. — is a runtime panic: `cannot mutate a frozen <kind>`. Freezing is **shallow** (a nested container stays mutable), **one-way** (there is no `unfreeze`), and **idempotent**. Freezing a non-container value is a no-op that returns it unchanged. A `deepClone` of a frozen value is a fresh, **unfrozen** copy.
+
+- `x` — any value
+- Returns: `x` (the same value, for chaining)
+
+```ascript
+let config = object.freeze({host: "localhost", port: 8080})
+object.isFrozen(config)   // true
+config.port = 9090        // panic: cannot mutate a frozen object
+
+let outer = object.freeze([[1, 2]])
+outer[0][0] = 99          // OK — freeze is shallow
+```
+
+### object.isFrozen
+
+Whether the value is a frozen container. Returns `false` for any non-container value.
+
+- `x` — any value
+- Returns: `bool`
+
+```ascript
+object.isFrozen({a: 1})                 // false
+object.isFrozen(object.freeze({a: 1}))  // true
+object.isFrozen(42)                     // false
+```
+
 ## std/map
 
 The `Map` collection: insertion-ordered, with hashable keys (`nil`, `bool`, `number`, or `string`). Unlike objects, map keys are not restricted to strings.

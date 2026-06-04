@@ -93,6 +93,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "set" => {
             let m = want_map(&arg(args, 0), span, &ctx("set"))?;
+            crate::interp::check_not_frozen(&arg(args, 0), span)?;
             let k = want_key(&arg(args, 1), span, &ctx("set"))?;
             let v = arg(args, 2);
             m.borrow_mut().insert(k, v);
@@ -106,6 +107,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "delete" => {
             let m = want_map(&arg(args, 0), span, &ctx("delete"))?;
+            crate::interp::check_not_frozen(&arg(args, 0), span)?;
             let k = want_key(&arg(args, 1), span, &ctx("delete"))?;
             let existed = m.borrow_mut().shift_remove(&k).is_some();
             Ok(Value::Bool(existed))

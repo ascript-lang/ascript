@@ -93,6 +93,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 
         "add" => {
             let s = want_set(&arg(args, 0), span, &ctx("add"))?;
+            crate::interp::check_not_frozen(&arg(args, 0), span)?;
             let key = want_element(&arg(args, 1), span, &ctx("add"))?;
             s.borrow_mut().insert(key);
             Ok(arg(args, 0)) // return the set (chainable)
@@ -107,6 +108,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 
         "delete" => {
             let s = want_set(&arg(args, 0), span, &ctx("delete"))?;
+            crate::interp::check_not_frozen(&arg(args, 0), span)?;
             let key = want_element(&arg(args, 1), span, &ctx("delete"))?;
             let existed = s.borrow_mut().shift_remove(&key);
             Ok(Value::Bool(existed))
