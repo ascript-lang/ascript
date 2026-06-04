@@ -5750,6 +5750,159 @@ async fn vm_parser_accepts_runs_legitimate_rejections() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  SP2 Phase G — feature-coverage invariant gate.
+//
+//  THE closing invariant of SP2: every NEW surface feature (instanceof, default
+//  parameters, `#{…}` map literals, object.freeze/isFrozen + frozen-mutation
+//  panic, records / auto-derived init) RUNS on both VM modes and is byte-identical
+//  to the tree-walker oracle — including when several features are combined in one
+//  program. A regression that re-introduces a divergence (or a "parser accepts but
+//  one engine rejects/diverges on valid code" hole) on any SP2 feature trips this
+//  gate. Mirrors the SP1 `vm_parser_accepts_runs` gate above.
+//
+//  `std/object` (freeze/isFrozen) is a CORE module, so these programs run in BOTH
+//  feature configs — this file is compiled and run under `--no-default-features`
+//  too, where the gate stays meaningful.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every SP2 feature, as a runnable program that must be byte-identical on all
+/// three engines (tree-walker == specialized-VM == generic-VM). The last few
+/// programs combine multiple features so the cross-feature interactions are
+/// exercised together.
+const SP2_FEATURE_PROGRAMS: &[&str] = &[
+    // ── §1 instanceof ───────────────────────────────────────────────────────────
+    // own class, subclass↑parent, parent-NOT↑subclass, non-instance is false.
+    "class C {}\nlet c = C()\nprint(c instanceof C)\n",
+    "class A {}\nclass B extends A {}\nprint(B() instanceof A)\nprint(A() instanceof B)\n",
+    "class C {}\nprint(5 instanceof C)\nprint(\"x\" instanceof C)\nprint(nil instanceof C)\n",
+    // precedence: binds at the comparison tier (looser than `&&`).
+    "class C {}\nlet c = C()\nprint(c instanceof C && true)\n",
+
+    // ── §2 default parameters ────────────────────────────────────────────────────
+    // omitted vs supplied; a default that references an EARLIER param (left-to-right).
+    "fn f(a, b = 10) { return a + b }\nprint(f(1))\nprint(f(1, 2))\n",
+    "fn f(a, b = a * 2) { return b }\nprint(f(5))\n",
+    // arrow default + composition with rest.
+    "let g = (x, y = 5) => x + y\nprint(g(2))\nprint(g(2, 3))\n",
+    "fn f(a, b = 2, ...xs) { return [a, b, xs] }\nprint(f(1))\nprint(f(1, 9, 8, 7))\n",
+    // explicit nil suppresses the default.
+    "fn f(a, b = 10) { return b }\nprint(f(1, nil))\n",
+
+    // ── §3 `#{…}` map literals ───────────────────────────────────────────────────
+    // empty; string keys; numeric/bool/nil keys; expression key; later-key-wins.
+    "print(#{})\n",
+    "print(#{ \"a\": 1, \"b\": 2 })\n",
+    "print(#{ 1: \"x\", true: \"y\", nil: \"z\" })\n",
+    "let k = \"x\"\nprint(#{ k: 1 })\n",
+    "print(#{ 1: \"a\", 1: \"b\" })\n",
+
+    // ── §4 object.freeze / isFrozen ──────────────────────────────────────────────
+    // freeze returns the value; isFrozen reflects it; non-container is a no-op.
+    "import * as object from \"std/object\"\nlet o = {a: 1}\nprint(object.isFrozen(o))\n\
+     let r = object.freeze(o)\nprint(object.isFrozen(o))\nprint(r == o)\n",
+    "import * as object from \"std/object\"\nprint(object.isFrozen(5))\n",
+    // shallow: an element of a frozen array is still mutable.
+    "import * as object from \"std/object\"\nlet a = [[1]]\nobject.freeze(a)\na[0][0] = 9\nprint(a)\n",
+    // deep-clone of a frozen object is unfrozen.
+    "import * as object from \"std/object\"\nlet o = {a: 1}\nobject.freeze(o)\n\
+     let c = object.deepClone(o)\nprint(object.isFrozen(c))\n",
+
+    // ── §5 records / auto-derived init ───────────────────────────────────────────
+    // positional auto-constructor in declaration order; defaulted trailing field.
+    "class Point { x: number\n y: number }\nlet p = Point(1, 2)\nprint(p.x)\nprint(p.y)\n",
+    "class P { x: number\n y: number = 0 }\nprint(P(1).y)\nprint(P(1, 2).y)\n",
+    // a class WITH explicit init is unchanged (auto-init NOT applied).
+    "class C { x: number = 0\n fn init(v) { self.x = v + 1 } }\nprint(C(5).x)\n",
+    // inheritance: base fields then subclass fields, positional.
+    "class A { a: number }\nclass B extends A { b: number }\nlet x = B(1, 2)\nprint(x.a)\nprint(x.b)\n",
+
+    // ── cross-feature combinations ───────────────────────────────────────────────
+    // record + instanceof + inheritance + a defaulted trailing field together.
+    "class A { a: number }\nclass B extends A { b: number = 9 }\nlet x = B(1)\n\
+     print(x instanceof A)\nprint(x.a)\nprint(x.b)\n",
+    // default param whose default is a `#{…}` map literal; instanceof of nothing.
+    "fn f(m = #{ \"a\": 1 }) { return m }\nprint(f())\nprint(f(#{ \"b\": 2 }))\n",
+    // freeze a record instance, then a default-param fn reads a field off it.
+    "import * as object from \"std/object\"\nclass P { x: number\n y: number = 0 }\n\
+     let p = object.freeze(P(3))\nfn sum(pt, bias = 10) { return pt.x + pt.y + bias }\n\
+     print(object.isFrozen(p))\nprint(sum(p))\n",
+];
+
+/// G1 — the SP2 feature-coverage invariant: every SP2 feature (and several
+/// cross-feature combinations) RUNS on all three engines and is byte-identical.
+#[tokio::test]
+async fn vm_sp2_features() {
+    for src in SP2_FEATURE_PROGRAMS {
+        // Each program must RUN (not be a compile rejection) on the tree-walker AND
+        // both VM modes — a one-engine rejection on valid code is the hole this gate
+        // forbids.
+        let tw = ascript::run_source_exit(src).await;
+        assert!(
+            tw.is_ok(),
+            "tree-walker rejected a valid SP2 program (should RUN):\n  src: {src:?}\n  err: {tw:?}"
+        );
+        let spec = ascript::vm_run_source(src).await;
+        assert!(
+            spec.is_ok(),
+            "specialized VM rejected a valid SP2 program (parser-accepts-runs hole):\n  \
+             src: {src:?}\n  err: {spec:?}"
+        );
+        let generic = ascript::vm_run_source_generic(src).await;
+        assert!(
+            generic.is_ok(),
+            "generic VM rejected a valid SP2 program (parser-accepts-runs hole):\n  \
+             src: {src:?}\n  err: {generic:?}"
+        );
+        // …and all three engines agree byte-for-byte.
+        assert_three_way_matches(src).await;
+    }
+}
+
+/// G1 (companion) — SP2 features whose ONLY valid outcome is a SYMMETRIC error:
+/// every engine rejects them byte-identically (real errors, not engine gaps).
+/// Covers instanceof with a non-class rhs, default-after-required, and the
+/// frozen-mutation panic across all container kinds.
+#[tokio::test]
+async fn vm_sp2_features_symmetric_rejections() {
+    // These error byte-identically (same message + exit) on all three engines.
+    let byte_identical_rejections: &[&str] = &[
+        // instanceof requires a class on the rhs.
+        "let c = 1\nprint(c instanceof 5)\n",
+        // a required parameter cannot follow a defaulted one.
+        "fn f(a = 1, b) { return b }\nprint(f(1, 2))\n",
+        // default-param arity: too few / too many (no rest).
+        "fn f(a, b = 1) {}\nf()\n",
+        "fn f(a, b = 1) {}\nf(1, 2, 3)\n",
+        // typed default contract-checks the explicit arg.
+        "fn f(a, b: number = 1) { return b }\nprint(f(1, \"x\"))\n",
+        // record arity + positional contract.
+        "class Point { x: number\n y: number }\nPoint(1)\n",
+        "class Point { x: number\n y: number }\nPoint(1, 2, 3)\n",
+        "class Point { x: number\n y: number }\nPoint(\"a\", 2)\n",
+        // unhashable map key.
+        "print(#{ [1]: 2 })\n",
+        // frozen-mutation panic across object / array / map / instance.
+        "import * as object from \"std/object\"\nlet o = {a: 1}\nobject.freeze(o)\no.a = 2\n",
+        "import * as object from \"std/object\"\nimport * as array from \"std/array\"\n\
+         let a = [1]\nobject.freeze(a)\narray.push(a, 2)\n",
+        "import * as object from \"std/object\"\nimport * as map from \"std/map\"\n\
+         let m = map.new()\nobject.freeze(m)\nmap.set(m, \"k\", 1)\n",
+        "import * as object from \"std/object\"\nclass C { x: number = 0 }\nlet c = C()\n\
+         object.freeze(c)\nc.x = 9\n",
+    ];
+    for src in byte_identical_rejections {
+        let tw = ascript::run_source_exit(src).await;
+        assert!(
+            tw.is_err(),
+            "expected the tree-walker to reject a genuine SP2 error, but it ran:\n  \
+             src: {src:?}\n  ok: {tw:?}"
+        );
+        // …and reject byte-identically across all three engines.
+        assert_three_way_matches(src).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  V12-T3: bytecode verifier — every chunk the compiler emits must VERIFY OK.
 //
 //  The verifier (`ascript::vm::verify`) is the load-time guard for `.aso`: it walks
