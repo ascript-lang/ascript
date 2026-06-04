@@ -6,6 +6,7 @@ pub mod diagnostic;
 pub mod fix;
 pub mod render;
 pub mod rules;
+pub mod std_arity;
 pub use analyze::{analyze, Analysis};
 pub use config::{LintConfig, RULE_CODES};
 pub use diagnostic::{AsDiagnostic, ByteSpan, Fix, Severity, TextEdit};
