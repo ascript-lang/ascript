@@ -5400,6 +5400,63 @@ async fn three_way_generator_methods() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  SP1 Phase C — static methods (`static fn` / `static async fn` / `static fn*`).
+//  Called as `C.name(args)` with NO receiver; stored in a separate namespace;
+//  inherited up the superclass chain. `static fn from` is reserved; `super` in a
+//  static is invalid. Every case is byte-identical tree-walker == spec-VM ==
+//  generic-VM (the helper normalizes Ok/Err so error cases compare too).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The canonical Phase-C static-method program set (sync / static-calls-static /
+/// inheritance / override / instance+static coexistence / async factory / `fn*` /
+/// `from` coexists / unknown-static error / `static fn from` reserved). Shared by
+/// the tree-walker-side check (C4) and the three-way check (C5).
+const STATIC_METHOD_PROGRAMS: &[&str] = &[
+    // Sync static factory-ish: `C.make()` constructs and returns an instance.
+    "class C { fn init() { self.x = 1 } static fn make() { return C() } }\nlet c = C.make()\nprint(c.x)\n",
+    // A static calling ANOTHER static + constructing C().
+    "class C { fn init() { self.x = 0 } static fn one() { return 1 } static fn make() { let c = C()\n c.x = C.one()\n return c } }\nprint(C.make().x)\n",
+    // Inheritance: a subclass resolves a parent static up the chain.
+    "class A { static fn who() { return \"A\" } }\nclass B extends A {}\nprint(B.who())\n",
+    // Inheritance with override: the subclass's own static wins.
+    "class A { static fn who() { return \"A\" } }\nclass B extends A { static fn who() { return \"B\" } }\nprint(A.who())\nprint(B.who())\n",
+    // Instance + static SAME name coexist (separate namespaces).
+    "class C { fn init() { self.v = 9 } fn x() { return self.v } static fn x() { return 42 } }\nlet c = C()\nprint(c.x())\nprint(C.x())\n",
+    // The blessed async factory: `static async fn create()` awaited → instance.
+    "class C { fn init() { self.x = 0 } static async fn create() { let c = C()\n c.x = await 5\n return c } }\nlet c = await C.create()\nprint(c.x)\n",
+    // `static fn*` generator consumed via for-await.
+    "class C { static fn* seq() { yield 1\n yield 2\n yield 3 } }\nfor await (v in C.seq()) { print(v) }\n",
+    // The built-in `from` still works alongside user statics.
+    "class P { name: string = \"?\" static fn tag() { return \"P\" } }\nlet p = P.from({name: \"ok\"})\nprint(p.name)\nprint(P.tag())\n",
+    // Unknown static member → identical error on all three engines.
+    "class C {}\nprint(C.nope())\n",
+    // `static fn from` is reserved → identical compile/resolve error.
+    "class C { static fn from() { return 1 } }\nprint(C.from())\n",
+];
+
+/// C4 — the tree-walker (reference engine) runs every static-method program to a
+/// definite outcome (success or a deliberate error), establishing the oracle the
+/// VM must match in C5.
+#[tokio::test]
+async fn tree_walker_static_methods() {
+    for src in STATIC_METHOD_PROGRAMS {
+        // Just exercising the path — a panic-free `run_source_exit` (Ok or Err)
+        // both count; the three-way equality is asserted in `three_way_static_methods`.
+        let _ = ascript::run_source_exit(src).await;
+    }
+    // Spot-check the headline behaviors so this test is meaningful on its own.
+    let (out, _) = ascript::run_source_exit(STATIC_METHOD_PROGRAMS[0])
+        .await
+        .expect("C.make() runs on the tree-walker");
+    assert_eq!(out, "1\n");
+    let from_reserved = ascript::run_source_exit(STATIC_METHOD_PROGRAMS[9]).await;
+    assert!(
+        matches!(&from_reserved, Err(e) if e.message.contains("'from' is reserved")),
+        "`static fn from` is rejected on the tree-walker, got {from_reserved:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  V12-T3: bytecode verifier — every chunk the compiler emits must VERIFY OK.
 //
 //  The verifier (`ascript::vm::verify`) is the load-time guard for `.aso`: it walks

@@ -1299,24 +1299,37 @@ impl Interp {
                     );
                 }
                 let mut method_map = indexmap::IndexMap::new();
+                let mut static_method_map = indexmap::IndexMap::new();
                 for m in methods {
-                    method_map.insert(
-                        m.name.clone(),
-                        std::rc::Rc::new(crate::value::Method {
-                            params: m.params.clone(),
-                            ret: m.ret.clone(),
-                            body: m.body.clone(),
-                            is_async: m.is_async,
-                            is_generator: m.is_generator,
-                        }),
-                    );
+                    let method = std::rc::Rc::new(crate::value::Method {
+                        params: m.params.clone(),
+                        ret: m.ret.clone(),
+                        body: m.body.clone(),
+                        is_async: m.is_async,
+                        is_generator: m.is_generator,
+                    });
+                    if m.is_static {
+                        // `from` is reserved on classes (collides with the built-in
+                        // typed-parse `.from`) — declaring `static fn from` is an error
+                        // (SP1 §3), identical on both engines.
+                        if m.name == "from" {
+                            return Err(AsError::at(
+                                "'from' is reserved on classes",
+                                m.name_span,
+                            )
+                            .into());
+                        }
+                        static_method_map.insert(m.name.clone(), method);
+                    } else {
+                        method_map.insert(m.name.clone(), method);
+                    }
                 }
                 let class = Value::Class(std::rc::Rc::new(crate::value::Class {
                     name: name.clone(),
                     superclass: parent,
                     fields: field_map,
                     methods: method_map,
-                    static_methods: indexmap::IndexMap::new(),
+                    static_methods: static_method_map,
                     def_env: env.clone(),
                 }));
                 env.define(name, class, false).map_err(AsError::new)?;
