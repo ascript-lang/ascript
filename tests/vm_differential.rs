@@ -5472,6 +5472,50 @@ async fn three_way_static_methods() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  SP1 Phase D — `async fn init` / `fn* init` forbidden (both engines).
+//
+//  Synchronous construction (`C()` returns an instance, not a future) means there
+//  is no caller to `await` an async constructor, and a generator constructor makes
+//  no sense either. Per spec §3, an `init` declared `async` (or `fn*`) is a clean
+//  compile/resolve-time error with the IDENTICAL message + exit on BOTH engines.
+//  The blessed async-construction pattern is a static async factory.
+//
+//  Today the engines DIVERGE on `async fn init` (the VM ran the body; the
+//  tree-walker left fields nil) — these cases assert that both now reject it
+//  byte-identically, and that a `static async fn create()` factory is unaffected.
+// ─────────────────────────────────────────────────────────────────────────────
+const FORBIDDEN_INIT_PROGRAMS: &[&str] = &[
+    // async fn init — the headline divergence: must be a clean compile/resolve error.
+    "class C { async fn init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+    // fn* init — a generator constructor is equally forbidden.
+    "class C { fn* init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+    // async fn* init — both modifiers at once is still forbidden.
+    "class C { async fn* init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+];
+
+/// D1 — `async fn init` / `fn* init` are rejected byte-identically on all three
+/// engines (tree-walker == specialized-VM == generic-VM), while the blessed
+/// `static async fn create()` factory from Phase C still works.
+#[tokio::test]
+async fn three_way_forbidden_init() {
+    for src in FORBIDDEN_INIT_PROGRAMS {
+        assert_three_way_matches(src).await;
+    }
+    // The error message is the spec-mandated one (spot-checked on the tree-walker).
+    let err = ascript::run_source_exit(FORBIDDEN_INIT_PROGRAMS[0]).await;
+    assert!(
+        matches!(&err, Err(e) if e.message.contains(
+            "init must be a synchronous constructor; use a static async factory")),
+        "async fn init is rejected with the spec message, got {err:?}"
+    );
+    // The blessed alternative — a static async factory — is unaffected.
+    assert_three_way_matches(
+        "class C { fn init() { self.x = 0 } static async fn create() { let c = C()\n c.x = await 5\n return c } }\nlet c = await C.create()\nprint(c.x)\n",
+    )
+    .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  V12-T3: bytecode verifier — every chunk the compiler emits must VERIFY OK.
 //
 //  The verifier (`ascript::vm::verify`) is the load-time guard for `.aso`: it walks

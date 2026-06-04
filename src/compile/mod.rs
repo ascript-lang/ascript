@@ -1674,7 +1674,36 @@ impl Compiler {
                 .ident_token()
                 .map(|t| t.text().to_string())
                 .ok_or_else(|| CompileError::new("method declaration has no name", span))?;
-            if crate::syntax::resolve::is_static_method(method.syntax()) {
+            let is_static = crate::syntax::resolve::is_static_method(method.syntax());
+            // `init` must be a synchronous constructor: `C()` returns an instance,
+            // not a future, so there is no caller to `await` an async constructor,
+            // and a generator constructor makes no sense. Reject `async fn init` /
+            // `fn* init` (SP1 §3) — the SAME message + name-token span as the
+            // tree-walker, so the diagnostic is byte-identical on both engines.
+            if !is_static && mname == "init" {
+                let is_async_or_gen = method
+                    .syntax()
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .any(|t| {
+                        matches!(t.kind(), SyntaxKind::AsyncKw | SyntaxKind::Star)
+                    });
+                if is_async_or_gen {
+                    let name_span = method
+                        .ident_token()
+                        .map(|t| {
+                            let r = t.text_range();
+                            Span::new(usize::from(r.start()), usize::from(r.end()))
+                        })
+                        .unwrap_or_else(|| range_span(method.syntax()));
+                    return Err(CompileError::new(
+                        "init must be a synchronous constructor; use a static \
+                         async factory (e.g. `static async fn create()`)",
+                        name_span,
+                    ));
+                }
+            }
+            if is_static {
                 // `from` is reserved on classes (collides with built-in `.from`).
                 // Anchor at the method NAME token (matching the tree-walker's
                 // `m.name_span`) so the diagnostic is byte-identical on both engines.

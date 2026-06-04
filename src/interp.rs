@@ -1301,6 +1301,19 @@ impl Interp {
                 let mut method_map = indexmap::IndexMap::new();
                 let mut static_method_map = indexmap::IndexMap::new();
                 for m in methods {
+                    // `init` must be a synchronous constructor: `C()` returns an
+                    // instance, not a future, so there is no caller to `await` an
+                    // async constructor, and a generator constructor makes no sense.
+                    // Reject `async fn init` / `fn* init` (SP1 §3) — identical message
+                    // on both engines; the blessed pattern is a static async factory.
+                    if !m.is_static && m.name == "init" && (m.is_async || m.is_generator) {
+                        return Err(AsError::at(
+                            "init must be a synchronous constructor; use a static \
+                             async factory (e.g. `static async fn create()`)",
+                            m.name_span,
+                        )
+                        .into());
+                    }
                     let method = std::rc::Rc::new(crate::value::Method {
                         params: m.params.clone(),
                         ret: m.ret.clone(),

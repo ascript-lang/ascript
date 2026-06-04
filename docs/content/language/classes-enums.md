@@ -84,8 +84,11 @@ class User {
 let u = await User.load(42)
 ```
 
-> An **`async fn init`** is forbidden (synchronous construction has no caller to `await` it) — use a
-> `static async fn create()` factory instead. The name **`from`** is reserved on classes (it collides
+> An **`async fn init`** (or a generator **`fn* init`**) is forbidden — synchronous construction has
+> no caller to `await` it, and a generator constructor makes no sense. Both are a clean compile-time
+> error (*"init must be a synchronous constructor; use a static async factory (e.g. `static async fn
+> create()`)"*) on either engine — use a `static async fn create()` factory instead. The name
+> **`from`** is reserved on classes (it collides
 > with the built-in typed-parse `ClassName.from`), so `static fn from` is an error.
 
 ### Typed fields
