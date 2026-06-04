@@ -89,6 +89,12 @@ pub struct ClassProto {
     /// The method names, in declaration order, matching the method closures
     /// pushed immediately before `Op::Class` (after the default thunks).
     pub method_names: Vec<String>,
+    /// The STATIC method names (SP1 §3), in declaration order, matching the static
+    /// closures pushed immediately AFTER the instance-method closures (so the stack
+    /// below `Op::Class` is `[super?, ..thunks.., ..methods.., ..statics..]`).
+    /// `Op::Class` pops them into the `class_static_methods` side table keyed by the
+    /// class's `Rc` identity — a separate namespace from `method_names`.
+    pub static_method_names: Vec<String>,
     /// Whether this class has an `extends` clause (V9-T2). When true, the compiler
     /// emits the superclass class-value expression FIRST (below the default thunks
     /// and method closures); `Op::Class` pops it and builds a fresh `Rc<Class>`

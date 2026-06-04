@@ -1662,22 +1662,52 @@ impl Compiler {
                 self.chunk.emit_u16(Op::Closure, idx, span);
             }
         }
+        // Instance method closures FIRST, then static method closures (SP1 §3), so
+        // the stack below `CLASS` is `[super?, ..thunks.., ..methods.., ..statics..]`.
+        // A static method gets NO `self` slot (handled in the resolver / proto), and
+        // is registered into the class's separate static namespace by `Op::Class`.
         let mut method_names: Vec<String> = Vec::new();
+        let mut static_method_names: Vec<String> = Vec::new();
+        let mut static_methods: Vec<MethodDecl> = Vec::new();
         for method in class_decl.method_decls() {
             let mname = method
                 .ident_token()
                 .map(|t| t.text().to_string())
                 .ok_or_else(|| CompileError::new("method declaration has no name", span))?;
+            if crate::syntax::resolve::is_static_method(method.syntax()) {
+                // `from` is reserved on classes (collides with built-in `.from`).
+                // Anchor at the method NAME token (matching the tree-walker's
+                // `m.name_span`) so the diagnostic is byte-identical on both engines.
+                if mname == "from" {
+                    let name_span = method
+                        .ident_token()
+                        .map(|t| {
+                            let r = t.text_range();
+                            Span::new(usize::from(r.start()), usize::from(r.end()))
+                        })
+                        .unwrap_or_else(|| range_span(method.syntax()));
+                    return Err(CompileError::new("'from' is reserved on classes", name_span));
+                }
+                static_method_names.push(mname);
+                static_methods.push(method);
+                continue;
+            }
             let proto = self.compile_method_proto(&method)?;
             let idx = self.chunk.add_proto(proto);
             self.chunk.emit_u16(Op::Closure, idx, span);
             method_names.push(mname);
+        }
+        for method in &static_methods {
+            let proto = self.compile_method_proto(method)?;
+            let idx = self.chunk.add_proto(proto);
+            self.chunk.emit_u16(Op::Closure, idx, span);
         }
 
         let class_proto = Rc::new(ClassProto {
             class,
             default_fields,
             method_names,
+            static_method_names,
             default_captures,
             has_super,
         });

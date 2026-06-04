@@ -59,6 +59,11 @@ pub struct Vm {
     /// goes through this table (`compiled_method`). The key is stable because the
     /// `Rc<Class>` is created once at compile time and shared by every instance.
     class_methods: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
+    /// Per-class STATIC method table (SP1 §3): class `Rc` identity → static name →
+    /// compiled closure. A SEPARATE namespace from `class_methods`; a static is
+    /// called as `C.name(args)` with NO receiver (a plain `Value::Closure` call),
+    /// resolved up the superclass chain by `find_compiled_static_method`.
+    class_static_methods: RefCell<HashMap<usize, HashMap<String, Cc<Closure>>>>,
     /// Per-class field-default thunk table (V9): class `Rc` identity → field name →
     /// a zero-arg closure that produces the field's default value. Run once per
     /// constructed instance (so a mutable default yields a fresh value each time,
@@ -158,6 +163,7 @@ impl Vm {
             interp,
             self_weak: RefCell::new(Weak::new()),
             class_methods: RefCell::new(HashMap::new()),
+            class_static_methods: RefCell::new(HashMap::new()),
             class_defaults: RefCell::new(HashMap::new()),
             shapes: RefCell::new(crate::vm::shape::ShapeRegistry::new()),
             class_base_shapes: RefCell::new(HashMap::new()),
@@ -2302,8 +2308,15 @@ impl Vm {
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let cp = fiber.frame().closure.proto.chunk.class_protos[idx].clone();
                     let n_methods = cp.method_names.len();
+                    let n_statics = cp.static_method_names.len();
                     let n_defaults = cp.default_fields.len();
-                    // Pop method closures (top = LAST method), then default thunks.
+                    // Pop in reverse push order: static closures (top), then instance
+                    // method closures, then default thunks (SP1 §3 stack layout
+                    // `[super?, ..thunks.., ..methods.., ..statics..]`).
+                    let mut statics = vec![Value::Nil; n_statics];
+                    for slot in statics.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
                     let mut methods = vec![Value::Nil; n_methods];
                     for slot in methods.iter_mut().rev() {
                         *slot = fiber.pop();
@@ -2420,7 +2433,23 @@ impl Vm {
                             }
                         }
                     }
+                    let mut static_map: HashMap<String, Cc<Closure>> = HashMap::new();
+                    for (name, sv) in cp.static_method_names.iter().zip(statics) {
+                        match sv {
+                            Value::Closure(c) => {
+                                static_map.insert(name.clone(), c);
+                            }
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("static method '{name}' is not a closure: {other:?}"),
+                                ))
+                            }
+                        }
+                    }
                     self.class_methods.borrow_mut().insert(key, method_map);
+                    self.class_static_methods.borrow_mut().insert(key, static_map);
                     self.class_defaults.borrow_mut().insert(key, default_map);
                     fiber.push(Value::Class(class));
                 }
@@ -2648,6 +2677,39 @@ impl Vm {
         None
     }
 
+    /// The compiled STATIC closure for `(class identity, name)` looked up ON the
+    /// given class ONLY (no chain walk), if registered (SP1 §3).
+    fn compiled_static_own(
+        &self,
+        class: &Rc<crate::value::Class>,
+        name: &str,
+    ) -> Option<Cc<Closure>> {
+        let key = Rc::as_ptr(class) as usize;
+        self.class_static_methods
+            .borrow()
+            .get(&key)
+            .and_then(|m| m.get(name))
+            .cloned()
+    }
+
+    /// Walk the superclass chain for a compiled STATIC method `name` (SP1 §3),
+    /// mirroring `find_compiled_method` over the static side-table. A subclass
+    /// resolves an unknown static up its superclass chain.
+    fn find_compiled_static_method(
+        &self,
+        class: &Rc<crate::value::Class>,
+        name: &str,
+    ) -> Option<Cc<Closure>> {
+        let mut cur = Some(class.clone());
+        while let Some(c) = cur {
+            if let Some(closure) = self.compiled_static_own(&c, name) {
+                return Some(closure);
+            }
+            cur = c.superclass.clone();
+        }
+        None
+    }
+
     /// If `bm` is a bound method on a VM-registered class, return its compiled
     /// method closure (resolved up the chain); else `None` (so a tree-walker
     /// BoundMethod delegates).
@@ -2826,6 +2888,22 @@ impl Vm {
             fiber.push(v);
             return Ok(());
         }
+        // (1b) STATIC method call `C.name(args)` (SP1 §3): the receiver is a VM
+        // class whose `name` resolves (up the chain) to a compiled STATIC closure.
+        // Dispatch with NO receiver, with full generator/async/sync handling
+        // matching the `Op::Call` closure arm (so a `static fn*` returns a
+        // `Value::Generator` and a `static async fn` a `Value::Future`, byte-
+        // identical to the tree-walker's `call_static_method`). A non-static name
+        // (the built-in `from`, or an error) falls through to the shared dispatch.
+        if let Value::Class(class) = &recv {
+            if self.is_vm_class(class) {
+                if let Some(closure) = self.find_compiled_static_method(class, name) {
+                    let v = self.invoke_compiled_static(closure, args, span).await?;
+                    fiber.push(v);
+                    return Ok(());
+                }
+            }
+        }
         // (2) METHOD inline-cache fast path (V11-T3): the receiver is a VM instance
         // whose `name` resolves (up the chain) to a COMPILED method and is NOT
         // shadowed by an instance field. Byte-identical to the generic
@@ -2949,6 +3027,17 @@ impl Vm {
                         name: name.to_string(),
                     };
                     return Ok(Value::BoundMethod(Rc::new(bm)));
+                }
+            }
+        }
+        // `C.name` static-method read (SP1 §3): a VM-compiled static resolves up
+        // the superclass chain to its closure, returned as a plain `Value::Closure`
+        // (called with NO receiver). Falls through to the shared dispatch for the
+        // built-in `from` and the "no static member" error (C3 generalization).
+        if let Value::Class(class) = obj {
+            if self.is_vm_class(class) {
+                if let Some(closure) = self.find_compiled_static_method(class, name) {
+                    return Ok(Value::Closure(closure));
                 }
             }
         }
@@ -3442,6 +3531,74 @@ impl Vm {
             RunOutcome::Yielded(_) => {
                 unreachable!("a non-generator method cannot yield")
             }
+        }
+    }
+
+    /// Dispatch a compiled STATIC method (SP1 §3): a class-level call with NO
+    /// receiver. Args bind to slots `0..n` (no `self` slot). A `static fn*` returns
+    /// a `Value::Generator`; a `static async fn` is scheduled eagerly and returns a
+    /// `Value::Future`; a plain static runs to completion. Mirrors the `Op::Call`
+    /// closure arms and the tree-walker's `call_static_method` so the engines agree.
+    #[async_recursion::async_recursion(?Send)]
+    async fn invoke_compiled_static(
+        &self,
+        closure: Cc<Closure>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // `static async fn`: schedule eagerly (M17), return a `Value::Future`. The
+        // body re-enters via `Vm::call_value` inside the spawned task with the RAW
+        // args (so the arity/contract check runs INSIDE the task and surfaces
+        // lazily at `await`, byte-identical to the tree-walker and the `Op::Call`
+        // async-closure arm). Handled before arg-binding so the bind happens once.
+        if closure.proto.is_async {
+            let vm = self.rc();
+            let fut = crate::task::SharedFuture::new();
+            let cell = fut.cell();
+            let guard = self.interp.inflight_guard();
+            let handle = tokio::task::spawn_local(async move {
+                let _g = guard;
+                let r = vm.call_value(Value::Closure(closure), args, span).await;
+                cell.resolve(r);
+            });
+            fut.set_abort(handle.abort_handle());
+            self.interp.maybe_yield_for_inflight().await;
+            return Ok(Value::Future(fut));
+        }
+        let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+        // `static fn*` / `static async fn*`: build a NOT-STARTED fiber, bind args
+        // into slots 0.., wrap in a VM `GeneratorHandle`. No receiver/self slot.
+        if closure.proto.is_generator {
+            let mut gfiber = Fiber::new(closure);
+            gfiber.frame_mut().ret_span = span;
+            let cells = gfiber.frame().cells.clone();
+            for (slot, v) in bound.into_iter().enumerate() {
+                if let Some(cell) = &cells[slot] {
+                    *cell.borrow_mut() = v;
+                } else {
+                    gfiber.stack[slot] = v;
+                }
+            }
+            let handle = crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
+            return Ok(Value::Generator(Rc::new(handle)));
+        }
+        // Plain sync static: run a fresh one-frame fiber to completion (args bound
+        // into slots 0.., no receiver) — mirrors `invoke_compiled_method`'s sync
+        // tail without the `self` slot.
+        let mut fiber = Fiber::new(closure);
+        fiber.frame_mut().ret_span = span;
+        let cells = fiber.frame().cells.clone();
+        for (slot, v) in bound.into_iter().enumerate() {
+            if let Some(cell) = &cells[slot] {
+                *cell.borrow_mut() = v;
+            } else {
+                fiber.stack[slot] = v;
+            }
+        }
+        match self.run(&mut fiber).await? {
+            RunOutcome::Done(v) => Ok(v),
+            RunOutcome::Yielded(_) => unreachable!("a non-generator static cannot yield"),
         }
     }
 

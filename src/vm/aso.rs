@@ -1196,6 +1196,12 @@ fn write_class_proto(w: &mut Writer, cp: &ClassProto) -> Result<(), AsoError> {
     for m in &cp.method_names {
         w.str(m);
     }
+    // Static method names (SP1 §3, format v10): a separate namespace from
+    // `method_names`; the static closures are pushed after the instance methods.
+    w.len(cp.static_method_names.len());
+    for m in &cp.static_method_names {
+        w.str(m);
+    }
     // Per-default capture plan (parallel to default_fields): the free names each
     // default expression captures + their upvalue index in that field's thunk.
     w.len(cp.default_captures.len());
@@ -1223,6 +1229,11 @@ fn read_class_proto(r: &mut Reader) -> Result<ClassProto, AsoError> {
         method_names.push(r.str()?);
     }
     let n = r.len()?;
+    let mut static_method_names = Vec::with_capacity(n);
+    for _ in 0..n {
+        static_method_names.push(r.str()?);
+    }
+    let n = r.len()?;
     let mut default_captures = Vec::with_capacity(n);
     for _ in 0..n {
         let m = r.len()?;
@@ -1239,6 +1250,7 @@ fn read_class_proto(r: &mut Reader) -> Result<ClassProto, AsoError> {
         class: Rc::new(class),
         default_fields,
         method_names,
+        static_method_names,
         default_captures,
         has_super,
     })

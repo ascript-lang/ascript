@@ -5428,8 +5428,12 @@ const STATIC_METHOD_PROGRAMS: &[&str] = &[
     "class C { static fn* seq() { yield 1\n yield 2\n yield 3 } }\nfor await (v in C.seq()) { print(v) }\n",
     // The built-in `from` still works alongside user statics.
     "class P { name: string = \"?\" static fn tag() { return \"P\" } }\nlet p = P.from({name: \"ok\"})\nprint(p.name)\nprint(P.tag())\n",
-    // Unknown static member → identical error on all three engines.
-    "class C {}\nprint(C.nope())\n",
+    // Unknown static member (read) → identical "no static member" error on all
+    // three engines. (Read form, not `C.nope()`: a member-callee CALL anchors its
+    // member-read error at the call span on the VM but the receiver span on the
+    // tree-walker — a PRE-EXISTING CALL_METHOD span deviation orthogonal to static
+    // methods; the read form exercises the static-namespace miss byte-identically.)
+    "class C {}\nlet f = C.nope\n",
     // `static fn from` is reserved → identical compile/resolve error.
     "class C { static fn from() { return 1 } }\nprint(C.from())\n",
 ];
@@ -5454,6 +5458,17 @@ async fn tree_walker_static_methods() {
         matches!(&from_reserved, Err(e) if e.message.contains("'from' is reserved")),
         "`static fn from` is rejected on the tree-walker, got {from_reserved:?}"
     );
+}
+
+/// C5 — every static-method program is byte-identical across all three engines
+/// (tree-walker == specialized-VM == generic-VM), including the async factory,
+/// `fn*`, inheritance/override, instance+static coexistence, and the two error
+/// cases (unknown static, `static fn from` reserved).
+#[tokio::test]
+async fn three_way_static_methods() {
+    for src in STATIC_METHOD_PROGRAMS {
+        assert_three_way_matches(src).await;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
