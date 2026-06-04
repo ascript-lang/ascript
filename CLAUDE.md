@@ -425,3 +425,10 @@ guardrail. If you change syntax, update both parsers and keep the examples passi
   async engine — documented in spec §7 and `docs/superpowers/specs/adr/2026-05-30-async-generators.md`,
   not code TODOs): durable/serializable continuations (needs an explicit-stack VM), robust unbounded
   deep recursion (needs stackful coroutines), and deterministic/replayable task scheduling.
+  **Accepted SP1 trade-offs** (post-cutover, recorded so they are not mistaken for bugs): (1) a
+  **1-column caret-span offset** between the CST and legacy front-ends in error diagnostics — the
+  error *message* is always correct, only the caret column can be off by one (cosmetic, accepted);
+  (2) a **perf trade** (~2.9× → ~2.5× geomean) from routing top-level vars through `GET_GLOBAL` for
+  tree-walker-parity late-binding — still ≥2× (meets the perf gate); SP8 may recover it; (3)
+  **`Op::InstanceOf` is reserved for SP2** (declared at `src/vm/opcode.rs:290`, not yet emitted) —
+  do NOT remove it as "dead code"; SP2 reuses it for the `instanceof` operator.
