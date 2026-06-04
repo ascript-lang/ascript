@@ -13,8 +13,9 @@ use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
     ClassDecl, ContinueStmt, EnumDecl, ExportStmt, Expr, FnDecl, ForStmt, IfStmt, ImportStmt,
-    IndexExpr, LetStmt, Literal, MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef, ObjectExpr,
-    ObjectField, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, SpreadElem, Stmt,
+    IndexExpr, LetStmt, Literal, MapExpr, MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef,
+    ObjectExpr, ObjectField, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile,
+    SpreadElem, Stmt,
     TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
@@ -290,6 +291,7 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 SyntaxKind::AmpAmp => BinOp::And,
                 SyntaxKind::PipePipe => BinOp::Or,
                 SyntaxKind::QuestionQuestion => BinOp::Coalesce,
+                SyntaxKind::InstanceofKw => BinOp::InstanceOf,
                 other => {
                     return Err(CompileError::new(
                         format!("unsupported binary operator {other:?} in field default"),
@@ -376,6 +378,26 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 }
             }
             ExprKind::Object(entries)
+        }
+        // `#{ keyExpr: valueExpr, … }` map literal as a field default (SP2 §3).
+        // Lower each entry's key/value through the same path; the tree-walker
+        // evaluates the lowered `ExprKind::Map` at construct time.
+        Expr::MapExpr(map) => {
+            let mut entries = Vec::new();
+            for entry in map.map_entrys() {
+                let espan = node_span(&entry);
+                let key = entry
+                    .key()
+                    .ok_or_else(|| CompileError::new("map-default entry has no key", espan))?;
+                let value = entry
+                    .value()
+                    .ok_or_else(|| CompileError::new("map-default entry has no value", espan))?;
+                entries.push(crate::ast::MapEntry {
+                    key: cst_default_expr(&key)?,
+                    value: cst_default_expr(&value)?,
+                });
+            }
+            ExprKind::Map(entries)
         }
         Expr::MemberExpr(m) => {
             let object = m
@@ -650,11 +672,23 @@ fn cst_param(node: &crate::syntax::cst::ResolvedNode) -> crate::ast::Param {
         .children()
         .find(|c| is_type_node(c.kind()))
         .and_then(cst_type);
+    // A default-value child is the (only) expression child of the param node.
+    // Only its PRESENCE matters for `check_call_args` min-arity; the VM applies
+    // defaults via the compiled body prologue (`compile_default_prologue`), not
+    // this AST node, so a placeholder is sufficient.
+    let default = node
+        .children()
+        .any(|c| Expr::cast(c.clone()).is_some())
+        .then_some(crate::ast::Expr {
+            kind: crate::ast::ExprKind::Nil,
+            span: name_span,
+        });
     crate::ast::Param {
         name,
         ty,
         name_span,
         rest,
+        default,
     }
 }
 
@@ -944,6 +978,7 @@ impl Compiler {
             Expr::RangeExpr(range) => self.compile_range(range),
             Expr::ArrayExpr(arr) => self.compile_array(arr),
             Expr::ObjectExpr(obj) => self.compile_object(obj),
+            Expr::MapExpr(map) => self.compile_map(map),
             Expr::IndexExpr(ix) => self.compile_index(ix),
             Expr::MemberExpr(m) => self.compile_member(m),
             Expr::OptMemberExpr(m) => self.compile_opt_member(m),
@@ -1525,10 +1560,9 @@ impl Compiler {
     ///   SET_LOCAL <name slot>     ; bind the class to its name (like `fn name`)
     /// ```
     ///
-    /// Superclass (`extends`) and `super` are implemented (see the `extends`
-    /// handling below and `super.<name>` in `compile_expr`). The `instanceof`
-    /// operator remains reserved for SP2 (its `Op::InstanceOf` is declared but not
-    /// yet emitted) — see CLAUDE.md "Current deferrals". Each method is compiled
+    /// Superclass (`extends`), `super`, and `instanceof` (SP2 §1, emitted as
+    /// `Op::InstanceOf` from `compile_binary`) are implemented (see the `extends`
+    /// handling below and `super.<name>` in `compile_expr`). Each method is compiled
     /// with `self` already declared by the resolver as the method frame's slot 0
     /// (see `resolve_function`'s `MethodDecl` branch); the receiver is bound into
     /// slot 0 at the method CALL (`Vm::invoke_compiled_method`).
@@ -2374,6 +2408,25 @@ impl Compiler {
         // per-param contracts, rest collection, and the return contract are
         // byte-identical across engines (message + span).
         let proto_params: Vec<crate::ast::Param> = params.iter().map(|p| cst_param(p)).collect();
+        // A required (no-default) param may not follow a defaulted one — same
+        // rule + message + span the legacy parser enforces, so both engines
+        // reject `fn f(a = 1, b)` identically.
+        {
+            let mut seen_default = false;
+            for p in &proto_params {
+                if p.rest {
+                    continue;
+                }
+                if p.default.is_some() {
+                    seen_default = true;
+                } else if seen_default {
+                    return Err(CompileError::new(
+                        "a required parameter cannot follow a defaulted parameter",
+                        p.name_span,
+                    ));
+                }
+            }
+        }
         let ret_type = fn_node
             .children()
             .find(|c| c.kind() == SyntaxKind::RetType)
@@ -2442,6 +2495,10 @@ impl Compiler {
     /// `NIL; RETURN`; an arrow EXPRESSION body is the expression followed by
     /// `RETURN`.
     fn compile_fn_body(&mut self, fn_node: &ResolvedNode, span: Span) -> Result<(), CompileError> {
+        // Default-parameter prologue: for each defaulted param, if the caller
+        // omitted it, evaluate the default into the param's slot. Runs FIRST so the
+        // default sees earlier params (already bound in their slots).
+        self.compile_default_prologue(fn_node)?;
         if let Some(block_node) = fn_node.children().find(|c| c.kind() == SyntaxKind::Block) {
             let block = Block::cast(block_node.clone())
                 .ok_or_else(|| CompileError::new("function body is not a block", span))?;
@@ -2463,6 +2520,82 @@ impl Compiler {
             self.chunk.emit(Op::Return, span);
             Ok(())
         }
+    }
+
+    /// Emit the default-parameter prologue at the start of a function body. For
+    /// each positional param with a default expression, emit:
+    ///
+    /// ```text
+    ///   JUMP_IF_ARG_SUPPLIED param_index -> L_skip   ; argc > param_index ? skip
+    ///   <default expr>                               ; pushes the default value
+    ///   CHECK_PARAM param_index                      ; contract-check (typed only)
+    ///   SET_LOCAL[_CELL] slot                        ; store into the param slot
+    /// L_skip:
+    /// ```
+    ///
+    /// This is byte-identical in effect to the tree-walker's `run_body`, which
+    /// evaluates each omitted default LEFT-TO-RIGHT in the callee frame, contract-
+    /// checks it, and binds it. `param_index` is the param's 0-based position
+    /// (what the VM's `frame.argc` is compared against and what `proto.params`
+    /// indexes); `slot` is its resolver-assigned local slot. A `...rest` param
+    /// never carries a default (parser-enforced), so it is skipped here.
+    fn compile_default_prologue(
+        &mut self,
+        fn_node: &ResolvedNode,
+    ) -> Result<(), CompileError> {
+        let Some(param_list) = fn_node
+            .children()
+            .find(|c| c.kind() == SyntaxKind::ParamList)
+        else {
+            return Ok(());
+        };
+        for (idx, param) in param_list
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::Param)
+            .enumerate()
+        {
+            // The default is the param's expression child (the resolver already
+            // resolved its names against the earlier params/outer scope).
+            let Some(default) = param.children().find_map(|c| Expr::cast(c.clone())) else {
+                continue;
+            };
+            let pspan = range_span(param);
+            let param_index = u16::try_from(idx).map_err(|_| {
+                CompileError::new("too many parameters (max 65535)", pspan)
+            })?;
+            // The param's local slot comes from its resolver binding, keyed by the
+            // Param node's text range (the resolver declares params with that
+            // `decl_range`).
+            let prange = param.text_range();
+            let slot = self
+                .resolved
+                .bindings
+                .iter()
+                .find(|b| {
+                    b.decl_range == prange
+                        && b.kind == crate::syntax::resolve::types::BindingKind::Param
+                })
+                .map(|b| b.slot)
+                .ok_or_else(|| {
+                    CompileError::new("defaulted parameter has no resolver binding", pspan)
+                })?;
+            let slot = u16::try_from(slot).map_err(|_| {
+                CompileError::new("parameter slot exceeds 65535", pspan)
+            })?;
+            // Whether this param has a declared type contract (→ emit CHECK_PARAM).
+            let typed = param.children().any(|c| is_type_node(c.kind()));
+
+            let skip = self
+                .chunk
+                .emit_jump_if_arg_supplied(param_index, pspan);
+            self.compile_expr(&default)?;
+            if typed {
+                self.chunk.emit_u16(Op::CheckParam, param_index, pspan);
+            }
+            self.emit_set_local(slot, pspan);
+            self.chunk.patch_jump(skip);
+        }
+        Ok(())
     }
 
     /// Allocate a fresh anonymous scratch slot ABOVE the resolver's named-local
@@ -3199,9 +3332,9 @@ impl Compiler {
                     } else {
                         // Leftover keys — those not in `bound_keys`. The bound-key
                         // set is stored as a single Array const referenced by index.
-                        let keys = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+                        let keys = Value::Array(crate::value::ArrayCell::new(
                             bound_keys.clone(),
-                        )));
+                        ));
                         let keys_idx = self.chunk.add_const(keys);
                         self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);
                     }
@@ -3588,7 +3721,7 @@ impl Compiler {
                 .any(|el| el.as_token().map(|t| t.kind() == Ident).unwrap_or(false))
             {
                 let slot = self.pattern_bind_slot(rest, range_span(rest))?;
-                let keys = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(bound_keys)));
+                let keys = Value::Array(crate::value::ArrayCell::new(bound_keys));
                 let keys_idx = self.chunk.add_const(keys);
                 self.emit_get_local_temp(subj_temp, span);
                 self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);
@@ -4180,6 +4313,10 @@ impl Compiler {
             SyntaxKind::Ge => Op::Ge,
             SyntaxKind::EqEq => Op::Eq,
             SyntaxKind::BangEq => Op::Ne,
+            // `x instanceof C` (SP2 §1). `INSTANCE_OF` pops `cls`+`inst`; a non-class
+            // rhs is a Tier-2 panic anchored at this same trivia-trimmed span as the
+            // tree-walker's `apply_binop`, so the message+span are byte-identical.
+            SyntaxKind::InstanceofKw => Op::InstanceOf,
             // `&&`/`||`/`??` are handled by the short-circuit path above (they
             // never reach this non-short-circuit dispatch).
             other => {
@@ -4370,6 +4507,34 @@ impl Compiler {
                 self.chunk.emit(Op::AppendObject, fspan);
             }
             // Tokens (`{`, `,`, `}`) and trivia are skipped.
+        }
+        Ok(())
+    }
+
+    /// Lower a `#{ keyExpr: valueExpr, … }` map literal. Mirrors the tree-walker's
+    /// `ExprKind::Map`: `NEW_MAP` pushes an empty `Value::Map`, then each entry (in
+    /// source order) compiles `key`, compiles `value`, and emits `MAP_ENTRY` (which
+    /// converts the key to a `MapKey` — panicking on an unhashable key — and inserts
+    /// later-wins). `#{}` is just `NEW_MAP`. The `MAP_ENTRY` op carries the entry's
+    /// trivia-trimmed code span so the unhashable-key panic anchors at the key.
+    fn compile_map(&mut self, map: &MapExpr) -> Result<(), CompileError> {
+        let span = node_span(map);
+        self.chunk.emit(Op::NewMap, span);
+        for entry in map.map_entrys() {
+            let espan = node_code_span(&entry);
+            let key = entry
+                .key()
+                .ok_or_else(|| CompileError::new("map entry has no key", espan))?;
+            let value = entry
+                .value()
+                .ok_or_else(|| CompileError::new("map entry has no value", espan))?;
+            // The MAP_ENTRY op carries the KEY's trivia-trimmed code span so the
+            // unhashable-key panic anchors exactly where the tree-walker's
+            // `ExprKind::Map` arm anchors it (`entry.key.span`).
+            let key_span = node_code_span(&key);
+            self.compile_expr(&key)?;
+            self.compile_expr(&value)?;
+            self.chunk.emit(Op::MapEntry, key_span);
         }
         Ok(())
     }

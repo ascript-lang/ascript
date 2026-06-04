@@ -39,6 +39,9 @@ pub enum Tok {
     SlashEq,
     LBrace,
     RBrace,
+    /// `#{` — opens a map literal (`#{ keyExpr: valueExpr, … }`). Lexed as ONE
+    /// token so it cannot be confused with `#` + `{`. `#` alone is a lex error.
+    HashBrace,
     If,
     Else,
     While,
@@ -59,6 +62,7 @@ pub enum Tok {
     Colon,
     QuestionDot,
     Of,
+    Instanceof,
     TemplateStr(String),    // a complete template with no interpolation: `...`
     TemplateStart(String),  // `...${   — text before the first interpolation
     TemplateMiddle(String), // }...${    — text between interpolations

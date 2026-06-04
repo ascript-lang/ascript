@@ -52,7 +52,6 @@ use crate::interp::{make_pair, type_name, Control, Interp};
 use crate::span::Span;
 use crate::value::Value;
 use indexmap::IndexMap;
-use std::cell::RefCell;
 use std::rc::Rc;
 
 // ── public exports ────────────────────────────────────────────────────────────
@@ -318,7 +317,7 @@ fn type_to_schema(
             m.insert("__kind".to_string(), Value::Str("union".into()));
             m.insert(
                 "options".to_string(),
-                Value::Array(gcmodule::Cc::new(RefCell::new(opts))),
+                Value::Array(crate::value::ArrayCell::new(opts)),
             );
             Value::Object(crate::value::ObjectCell::new(m))
         }
@@ -677,7 +676,7 @@ impl Interp {
                                 )));
                             }
                         }
-                        return Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))));
+                        return Ok(Value::Array(crate::value::ArrayCell::new(out)));
                     }
                     _ => {
                         return Err(ParseFail::Mismatch(err_obj(
@@ -1683,10 +1682,10 @@ mod tests {
             .await
             .unwrap();
         // [1, 2] → ok
-        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![
             Value::Number(1.0),
             Value::Number(2.0),
-        ])));
+        ]));
         let pair = interp
             .call_schema("parse", &[arr_schema, arr], sp())
             .await
@@ -1703,10 +1702,10 @@ mod tests {
             .await
             .unwrap();
         // [1, "x"] → err path "[1]"
-        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![
             Value::Number(1.0),
             Value::Str("x".into()),
-        ])));
+        ]));
         let pair = interp
             .call_schema("parse", &[arr_schema, arr], sp())
             .await
@@ -1941,7 +1940,7 @@ mod tests {
     // ── 6b composite: schema.union ───────────────────────────────────────────
 
     fn make_array_val(items: Vec<Value>) -> Value {
-        Value::Array(gcmodule::Cc::new(RefCell::new(items)))
+        Value::Array(crate::value::ArrayCell::new(items))
     }
 
     #[tokio::test]
@@ -2276,10 +2275,10 @@ mod tests {
             .call_schema("minLength", &[arr_s, Value::Number(2.0)], sp())
             .await
             .unwrap();
-        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![
             Value::Number(1.0),
             Value::Number(2.0),
-        ])));
+        ]));
         let pair = interp.call_schema("parse", &[s, arr], sp()).await.unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
     }
@@ -2295,7 +2294,7 @@ mod tests {
             .call_schema("minLength", &[arr_s, Value::Number(3.0)], sp())
             .await
             .unwrap();
-        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Number(1.0)])));
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
         let pair = interp.call_schema("parse", &[s, arr], sp()).await.unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
         let msg = match field(&err_val(&pair), "message") {
@@ -2373,6 +2372,7 @@ mod tests {
                 ty: None,
                 name_span: S::new(0, 0),
                 rest: false,
+            default: None,
             }],
             ret: None,
             body,
@@ -2423,6 +2423,7 @@ mod tests {
                 ty: None,
                 name_span: S::new(0, 0),
                 rest: false,
+            default: None,
             }],
             ret: None,
             body,
@@ -2483,6 +2484,7 @@ mod tests {
                 ty: None,
                 name_span: S::new(0, 0),
                 rest: false,
+            default: None,
             }],
             ret: None,
             body,

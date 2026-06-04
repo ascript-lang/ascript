@@ -113,6 +113,29 @@ fn build_then_run_aso_matches_classes() {
 }
 
 #[test]
+fn build_then_run_aso_matches_record_auto_init() {
+    // SP2 §5 records: a field-only class (NO explicit `init`) auto-derives a
+    // positional constructor at construction time from the proto's field schema —
+    // no new serialized data, no `.aso` version bump. The built `.aso` must
+    // round-trip and run byte-identically to the tree-walker (positional bind,
+    // defaulted-field optional trailing param, base-first inheritance order).
+    let dir = unique_dir("record");
+    write(
+        &dir,
+        "r.as",
+        "class Point {\n  x: number\n  y: number = 0\n}\nclass P3 extends Point { z: number }\n\
+         print(Point(1).y)\nprint(Point(2, 3).y)\nlet r = P3(4, 5, 6)\nprint(r.x)\nprint(r.y)\nprint(r.z)\n",
+    );
+    build(&dir, "r.as");
+    assert!(dir.join("r.aso").exists(), "r.aso should exist");
+
+    let (aso_out, _) = run(&dir, &["run", "r.aso"]);
+    let (as_out, _) = run(&dir, &["run", "--tree-walker", "r.as"]);
+    assert_eq!(aso_out, "0\n3\n4\n5\n6\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+}
+
+#[test]
 fn build_then_run_aso_matches_generator_method() {
     // SP1 Phase B: a class with a `fn*` generator method (using `self`) compiles to
     // a generator `FnProto` that serializes through the `.aso` (generator protos
@@ -130,6 +153,55 @@ fn build_then_run_aso_matches_generator_method() {
     let (aso_out, aso_code) = run(&dir, &["run", "g.aso"]);
     let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "g.as"]);
     assert_eq!(aso_out, "10\n11\n12\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
+fn build_then_run_aso_matches_instanceof() {
+    // SP2 §1: a program using the `instanceof` operator compiles to the (formerly
+    // dead) `Op::InstanceOf` opcode, which round-trips through the `.aso` (format
+    // v12) and runs byte-identically to the tree-walker.
+    let dir = unique_dir("instanceof");
+    write(
+        &dir,
+        "io.as",
+        "class A {}\nclass B extends A {}\nlet b = B()\nprint(b instanceof A)\nprint(b instanceof B)\nprint(A() instanceof B)\nprint(5 instanceof A)\n",
+    );
+    build(&dir, "io.as");
+    assert!(dir.join("io.aso").exists(), "io.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "io.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "io.as"]);
+    assert_eq!(aso_out, "true\ntrue\nfalse\nfalse\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
+fn build_then_run_aso_matches_default_params() {
+    // SP2 §2: a function with default parameters — including a default that
+    // references an EARLIER param and one composing with a rest param — compiles
+    // its default-eval prologue into the body chunk (the param's default-presence
+    // flag round-trips, format v13) and runs byte-identically to the tree-walker.
+    let dir = unique_dir("defaultparams");
+    write(
+        &dir,
+        "d.as",
+        "fn f(a, b = a + 1, c = 10) { return [a, b, c] }\n\
+         fn h(a, b = 2, ...xs) { return [a, b, xs] }\n\
+         print(f(1))\nprint(f(1, 5))\nprint(f(1, 5, 6))\n\
+         print(h(1))\nprint(h(1, 9, 8, 7))\n",
+    );
+    build(&dir, "d.as");
+    assert!(dir.join("d.aso").exists(), "d.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "d.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "d.as"]);
+    assert_eq!(
+        aso_out,
+        "[1, 2, 10]\n[1, 5, 10]\n[1, 5, 6]\n[1, 2, []]\n[1, 9, [8, 7]]\n"
+    );
     assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
     assert_eq!(aso_code, as_code);
 }
@@ -250,6 +322,36 @@ fn build_then_run_aso_matches_arrow_match_via_from() {
     let (aso_out, aso_code) = run(&dir, &["run", "f.aso"]);
     let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "f.as"]);
     assert_eq!(aso_out, "7\none\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
+fn build_then_run_aso_matches_map_literals() {
+    // SP2 Phase C: `#{…}` map literals must round-trip through `.aso` (the new
+    // `Op::NewMap`/`Op::MapEntry` opcodes + a `#{…}` class-field default that the
+    // field-default serializer persists as `EX_MAP`). Built bytecode must run
+    // byte-identically to the tree-walker oracle.
+    let dir = unique_dir("maplit");
+    write(
+        &dir,
+        "f.as",
+        "import * as map from \"std/map\"\n\
+         class C {\n  \
+         m: map<string, number> = #{ \"a\": 1, \"b\": 2 }\n  \
+         fn init() {}\n}\n\
+         let c = C()\n\
+         let top = #{ 1: \"x\", 2: \"y\", 1: \"z\" }\n\
+         print(map.get(c.m, \"b\"))\n\
+         print(map.get(top, 1))\n\
+         print(#{})\n",
+    );
+    build(&dir, "f.as");
+    assert!(dir.join("f.aso").exists(), "f.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "f.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "f.as"]);
+    assert_eq!(aso_out, "2\nz\nmap {}\n");
     assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
     assert_eq!(aso_code, as_code);
 }

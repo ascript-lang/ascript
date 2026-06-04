@@ -1,0 +1,15 @@
+# exit: none
+map
+map {}
+map
+10
+7
+one
+yes
+none
+42
+two
+b
+true
+["x", "y"]
+map_literals ok

@@ -493,6 +493,7 @@ impl Vm {
                 | Op::Ge
                 | Op::Eq
                 | Op::Ne
+                | Op::InstanceOf
                 | Op::Range => {
                     // The two operands were pushed lhs-then-rhs, so pop rhs first.
                     // The op's span anchors any Tier-2 panic so the VM's
@@ -887,8 +888,9 @@ impl Vm {
                             // and the cell vector. We do NOT run it.
                             let mut gfiber = Fiber::new(callee);
                             gfiber.frame_mut().ret_span = call_span;
+                            gfiber.frame_mut().argc = bound.supplied;
                             let cells = gfiber.frame().cells.clone();
-                            for (slot, v) in bound.into_iter().enumerate() {
+                            for (slot, v) in bound.values.into_iter().enumerate() {
                                 if let Some(cell) = &cells[slot] {
                                     *cell.borrow_mut() = v;
                                 } else {
@@ -981,7 +983,8 @@ impl Vm {
                                 &callee.proto.chunk.cell_slots,
                             );
                             fiber.stack.resize(slot_base + slot_count, Value::Nil);
-                            for (slot, v) in bound.into_iter().enumerate() {
+                            let supplied = bound.supplied;
+                            for (slot, v) in bound.values.into_iter().enumerate() {
                                 if let Some(cell) = &cells[slot] {
                                     *cell.borrow_mut() = v;
                                 } else {
@@ -999,6 +1002,7 @@ impl Vm {
                                 // `def_class` (so `super` is unavailable here, which
                                 // is correct — `super` only appears in method bodies).
                                 def_class: None,
+                                argc: supplied,
                             });
                             // Continue the loop in the new frame (the run loop reads
                             // `fiber.frame()` at the top of each iteration). RETURN
@@ -1194,6 +1198,37 @@ impl Vm {
                         fiber.frame_mut().ip = (base + disp as isize) as usize;
                     }
                 }
+                Op::JumpIfArgSupplied => {
+                    // Default-parameter prologue guard. If the caller SUPPLIED this
+                    // positional param (frame `argc` > param-index), jump forward
+                    // past its default-eval code; otherwise fall through and run
+                    // the default. Touches no operand stack. The i16 jump offset is
+                    // the SECOND operand (after the u16 param-index), and `ip` is
+                    // already past the whole instruction.
+                    let chunk = &fiber.frame().closure.proto.chunk;
+                    let param = chunk.read_u16(operand_at) as usize;
+                    let disp = chunk.read_i16(operand_at + 2);
+                    if fiber.frame().argc > param {
+                        let base = fiber.frame().ip as isize;
+                        fiber.frame_mut().ip = (base + disp as isize) as usize;
+                    }
+                }
+                Op::CheckParam => {
+                    // Contract-check the just-evaluated default value (TOS, left in
+                    // place) against the param's declared type, byte-identical to
+                    // the tree-walker's default contract (same message; span = the
+                    // frame's call site `ret_span`). Untyped params emit no
+                    // CHECK_PARAM, so a type is always present here.
+                    let param = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let span = fiber.frame().ret_span;
+                    let ty = fiber.frame().closure.proto.params[param].ty.clone();
+                    if let Some(ty) = ty {
+                        let v = fiber.peek(0).clone();
+                        if !crate::interp::check_type(&v, &ty) {
+                            return Err(crate::interp::contract_panic(&ty, &v, span));
+                        }
+                    }
+                }
 
                 Op::NewArray => {
                     // Pop `n` elements (pushed in source order, so the last
@@ -1205,7 +1240,7 @@ impl Vm {
                     for slot in values.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
-                    fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(values))));
+                    fiber.push(Value::Array(crate::value::ArrayCell::new(values)));
                 }
 
                 Op::NewObject => {
@@ -1242,6 +1277,51 @@ impl Vm {
                     let shape = self.object_shape_for(cell.map.borrow().keys().map(|s| s.as_str()));
                     cell.shape.set(shape);
                     fiber.push(Value::Object(cell));
+                }
+
+                Op::NewMap => {
+                    // Push a fresh, empty `Value::Map`. The `#{…}` builder runs one
+                    // `MAP_ENTRY` per entry after this (or nothing for `#{}`).
+                    let cell = crate::value::MapCell::new(indexmap::IndexMap::new());
+                    fiber.push(Value::Map(cell));
+                }
+
+                Op::MapEntry => {
+                    // `[map, key, val] -- [map]` — convert `key` to a `MapKey` and
+                    // insert later-wins into the builder `map`. Byte-identical to the
+                    // tree-walker's `ExprKind::Map`: an unhashable key is the SAME
+                    // Tier-2 panic `cannot use {type} as a map key`, anchored at this
+                    // op's span (the key's trivia-trimmed code span).
+                    let val = fiber.pop();
+                    let key_val = fiber.pop();
+                    let key = match crate::value::MapKey::from_value(&key_val) {
+                        Some(k) => k,
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "cannot use {} as a map key",
+                                    crate::interp::type_name(&key_val)
+                                ),
+                            ))
+                        }
+                    };
+                    match fiber.peek(0) {
+                        Value::Map(m) => {
+                            m.borrow_mut().insert(key, val);
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "MAP_ENTRY target is not a map: {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    }
                 }
 
                 Op::Spread | Op::SpreadArgs => {
@@ -1529,7 +1609,7 @@ impl Vm {
                             ))
                         }
                     };
-                    fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(items))));
+                    fiber.push(Value::Array(crate::value::ArrayCell::new(items)));
                 }
 
                 Op::ArrayLen => {
@@ -1819,7 +1899,7 @@ impl Vm {
                         Value::Array(arr) => {
                             let tail: Vec<Value> =
                                 arr.borrow().iter().skip(start).cloned().collect();
-                            fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(tail))));
+                            fiber.push(Value::Array(crate::value::ArrayCell::new(tail)));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -2584,10 +2664,11 @@ impl Vm {
                 // param slots; the rest stay Nil.
                 let mut fiber = Fiber::new(closure);
                 fiber.frame_mut().ret_span = span;
+                fiber.frame_mut().argc = bound.supplied;
                 // Snapshot the cell `Rc`s for the param slots so we don't hold a
                 // frame borrow while also writing `fiber.stack` (plain slots).
                 let cells = fiber.frame().cells.clone();
-                for (slot, v) in bound.into_iter().enumerate() {
+                for (slot, v) in bound.values.into_iter().enumerate() {
                     if let Some(cell) = &cells[slot] {
                         *cell.borrow_mut() = v;
                     } else {
@@ -2932,7 +3013,8 @@ impl Vm {
                     fiber.stack[slot_base] = recv;
                 }
                 // bound args -> slots 1..n+1 (cell-aware).
-                for (i, v) in bound.into_iter().enumerate() {
+                let supplied = bound.supplied;
+                for (i, v) in bound.values.into_iter().enumerate() {
                     let slot = i + 1;
                     if let Some(cell) = &cells[slot] {
                         *cell.borrow_mut() = v;
@@ -2947,6 +3029,7 @@ impl Vm {
                     cells,
                     ret_span: span,
                     def_class: Some(def_class),
+                    argc: supplied,
                 });
                 // Continue the loop in the new frame; RETURN pops it and pushes the
                 // result onto the caller's stack.
@@ -3294,6 +3377,10 @@ impl Vm {
         value: Value,
         span: Span,
     ) -> Result<Value, Control> {
+        // `object.freeze` guard (SP2 §4): BEFORE any write — incl. the IC fast
+        // path below, which bypasses `set_member`. Byte-identical to the
+        // tree-walker's `set_member` frozen check.
+        crate::interp::check_not_frozen(obj, span)?;
         match obj {
             Value::Object(cell) => {
                 let shape = cell.shape.get();
@@ -3370,6 +3457,7 @@ impl Vm {
             // Give the instance its class's BASE shape (the declared-field layout,
             // in declaration order). V11-T3 inline caches key on this.
             shape_id: std::cell::Cell::new(self.class_base_shape(&class)),
+            frozen: std::cell::Cell::new(false),
         }));
         let inst_val = Value::Instance(instance.clone());
 
@@ -3429,16 +3517,19 @@ impl Vm {
         if let Some((init, def_class)) = self.find_compiled_method(&class, "init") {
             self.invoke_compiled_method(init, inst_val.clone(), args, span, Some(def_class))
                 .await?;
-        } else if !args.is_empty() {
-            return Err(AsError::at(
-                format!(
-                    "{} has no init but was given {} argument(s)",
-                    class.name,
-                    args.len()
-                ),
-                span,
-            )
-            .into());
+        } else {
+            // SP2 §5 records: no explicit `init` → auto-derive a positional
+            // constructor over the declared fields (merged base-first order).
+            // Defaults were already applied above; the positional args OVERRIDE
+            // the supplied leading fields, each contract-checked via the SHARED
+            // `auto_init_bindings` helper — byte-identical arity/contract messages
+            // to the tree-walker's `construct`. A zero-field class with no args is
+            // unchanged (empty params → only `C()` valid).
+            let fields = crate::value::merged_field_schema(&class);
+            let bindings = crate::interp::auto_init_bindings(&fields, &class.name, args, span)?;
+            for (fname, v) in bindings {
+                instance.borrow_mut().fields.insert(fname, v);
+            }
         }
         // Re-derive the shape from the instance's ACTUAL fields now that defaults +
         // `init` have populated them. The base shape set above reflects the FULL
@@ -3484,6 +3575,7 @@ impl Vm {
             let mut gfiber = Fiber::new(closure);
             gfiber.frame_mut().ret_span = span;
             gfiber.frame_mut().def_class = def_class;
+            gfiber.frame_mut().argc = bound.supplied;
             let cells = gfiber.frame().cells.clone();
             // self -> slot 0 (cell-aware).
             if let Some(cell) = &cells[0] {
@@ -3492,7 +3584,7 @@ impl Vm {
                 gfiber.stack[0] = receiver;
             }
             // bound args -> slots 1..n+1 (cell-aware).
-            for (i, v) in bound.into_iter().enumerate() {
+            for (i, v) in bound.values.into_iter().enumerate() {
                 let slot = i + 1;
                 if let Some(cell) = &cells[slot] {
                     *cell.borrow_mut() = v;
@@ -3510,6 +3602,7 @@ impl Vm {
         // (Op::GetSuper) resolves up from `def_class.superclass`, exactly like the
         // tree-walker's `invoke_method` super binding.
         fiber.frame_mut().def_class = def_class;
+        fiber.frame_mut().argc = bound.supplied;
         let cells = fiber.frame().cells.clone();
         // self -> slot 0 (cell-aware, in case a nested closure captured self).
         if let Some(cell) = &cells[0] {
@@ -3518,7 +3611,7 @@ impl Vm {
             fiber.stack[0] = receiver;
         }
         // bound args -> slots 1..n+1.
-        for (i, v) in bound.into_iter().enumerate() {
+        for (i, v) in bound.values.into_iter().enumerate() {
             let slot = i + 1;
             if let Some(cell) = &cells[slot] {
                 *cell.borrow_mut() = v;
@@ -3572,8 +3665,9 @@ impl Vm {
         if closure.proto.is_generator {
             let mut gfiber = Fiber::new(closure);
             gfiber.frame_mut().ret_span = span;
+            gfiber.frame_mut().argc = bound.supplied;
             let cells = gfiber.frame().cells.clone();
-            for (slot, v) in bound.into_iter().enumerate() {
+            for (slot, v) in bound.values.into_iter().enumerate() {
                 if let Some(cell) = &cells[slot] {
                     *cell.borrow_mut() = v;
                 } else {
@@ -3588,8 +3682,9 @@ impl Vm {
         // tail without the `self` slot.
         let mut fiber = Fiber::new(closure);
         fiber.frame_mut().ret_span = span;
+        fiber.frame_mut().argc = bound.supplied;
         let cells = fiber.frame().cells.clone();
-        for (slot, v) in bound.into_iter().enumerate() {
+        for (slot, v) in bound.values.into_iter().enumerate() {
             if let Some(cell) = &cells[slot] {
                 *cell.borrow_mut() = v;
             } else {
@@ -3675,6 +3770,7 @@ fn binop_of(op: Op) -> BinOp {
         Op::Eq => BinOp::Eq,
         Op::Ne => BinOp::Ne,
         Op::Range => BinOp::Range,
+        Op::InstanceOf => BinOp::InstanceOf,
         _ => unreachable!("binop_of called with non-binary opcode {op:?}"),
     }
 }
@@ -4585,7 +4681,7 @@ mod tests {
         let out = with_vm(|vm| async move {
             let a = spawn_vm_future(&vm, f.clone(), vec![Value::Number(10.0)]);
             let b = spawn_vm_future(&vm, f, vec![Value::Number(20.0)]);
-            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![a, b])));
+            let arr = Value::Array(crate::value::ArrayCell::new(vec![a, b]));
             vm.interp()
                 .call_task("gather", &[arr], s())
                 .await
@@ -4618,7 +4714,7 @@ mod tests {
         let f = compile_closure("(n) => n * 2");
         let out = with_vm(|vm| async move {
             let a = spawn_vm_future(&vm, f, vec![Value::Number(21.0)]);
-            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![a])));
+            let arr = Value::Array(crate::value::ArrayCell::new(vec![a]));
             vm.interp()
                 .call_task("race", &[arr], s())
                 .await
@@ -4634,7 +4730,7 @@ mod tests {
         // `(x) => x[9]` indexes a 1-element array out of bounds at runtime.
         let f = compile_closure("(x) => x[9]");
         let err = with_vm(|vm| async move {
-            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Number(0.0)])));
+            let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(0.0)]));
             vm.call_value(f, vec![arr], s())
                 .await
                 .expect_err("expected a panic")

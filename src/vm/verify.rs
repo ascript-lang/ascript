@@ -228,6 +228,10 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // JUMP/LOOP are unconditional, no stack effect. JUMP_IF_* pop the tested value.
         Jump | Loop => Effect::new(0, 0),
         JumpIfFalse | JumpIfTrue | JumpIfNotNil => Effect::new(1, 0),
+        // JUMP_IF_ARG_SUPPLIED consults the frame's argc only; no stack effect.
+        // CHECK_PARAM peeks TOS (the default value) and validates it in place.
+        JumpIfArgSupplied => Effect::new(0, 0),
+        CheckParam => Effect::new(1, 1),
 
         // ---- calls ----
         Call => Effect::new(argc_or_n + 1, 1),
@@ -239,6 +243,10 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // ---- collections / builders ----
         NewArray => Effect::new(argc_or_n, 1),
         NewObject => Effect::new(2 * argc_or_n, 1),
+        // `#{…}` builder: NEW_MAP pushes an empty map (pops 0); MAP_ENTRY pops the
+        // map+key+value and pushes the map back (like APPEND_OBJECT).
+        NewMap => Effect::new(0, 1),
+        MapEntry => Effect::new(3, 1),
         Spread | SpreadArgs | AppendArray | SpreadObject => Effect::new(2, 1),
         AppendObject => Effect::new(3, 1),
         GetIndex => Effect::new(2, 1),
@@ -523,6 +531,30 @@ fn check_operands(
         // ---- MATCH_ARRAY: u16 len + u8 exact (counts, no table) ----
         MatchArray => { /* count operands */ }
 
+        // ---- JUMP_IF_ARG_SUPPLIED: u16 param-index + i16 forward jump ----
+        JumpIfArgSupplied => {
+            // The param index is a runtime guard against `frame.argc`; its bound
+            // is the callee's own param list, checked at run time. Validate the
+            // forward jump target lands on a boundary (the disp is the 2nd operand).
+            let disp = chunk.read_i16(operand_at + 2) as isize;
+            let base = (operand_at + 4) as isize;
+            let target = base + disp;
+            if target < 0 || target > chunk.code.len() as isize {
+                return Err(VerifyError::JumpOutOfBounds {
+                    offset: off,
+                    target,
+                    code_len: chunk.code.len(),
+                });
+            }
+            let t = target as usize;
+            if !boundaries[t] {
+                return Err(VerifyError::JumpIntoInstruction {
+                    offset: off,
+                    target: t,
+                });
+            }
+        }
+
         // ---- ops with no operand or a count operand needing no table check ----
         _ => {}
     }
@@ -606,6 +638,13 @@ fn verify_stack_balance(
             // Conditional jumps: both the target and the fall-through.
             Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpIfNotNil => {
                 let target = jump_target(chunk, operand_at);
+                push_succ(&mut work, &resolve, target, depth_out, boundaries, off)?;
+                push_fallthrough(&mut work, &resolve, next_off, depth_out, off)?;
+            }
+            // JUMP_IF_ARG_SUPPLIED is a conditional FORWARD jump whose i16 offset
+            // is the SECOND operand (after the u16 param-index).
+            Op::JumpIfArgSupplied => {
+                let target = jump_target(chunk, operand_at + 2);
                 push_succ(&mut work, &resolve, target, depth_out, boundaries, off)?;
                 push_fallthrough(&mut work, &resolve, next_off, depth_out, off)?;
             }

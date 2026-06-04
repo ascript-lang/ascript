@@ -106,7 +106,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let raw = src.borrow().clone();
             match extract_zip(&raw) {
                 Ok(arr) => Ok(make_pair(
-                    Value::Array(gcmodule::Cc::new(RefCell::new(arr))),
+                    Value::Array(crate::value::ArrayCell::new(arr)),
                     Value::Nil,
                 )),
                 Err(msg) => Ok(err_pair(msg)),
@@ -305,10 +305,10 @@ mod tests {
         let mut e2 = indexmap::IndexMap::new();
         e2.insert("name".to_string(), s("b.bin"));
         e2.insert("data".to_string(), b(vec![0x00, 0xFF, 0x10, 0x42]));
-        let entries = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+        let entries = Value::Array(crate::value::ArrayCell::new(vec![
             Value::Object(crate::value::ObjectCell::new(e1)),
             Value::Object(crate::value::ObjectCell::new(e2)),
-        ])));
+        ]));
 
         let zipped = ok_value(call("zipCreate", &[entries], sp()).unwrap());
         let extracted = ok_value(call("zipExtract", &[zipped], sp()).unwrap());

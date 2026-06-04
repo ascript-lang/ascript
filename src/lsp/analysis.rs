@@ -872,6 +872,17 @@ fn match_arm_binding_in_expr(expr: &Expr, name: &str, offset: usize) -> Option<S
             }
             None
         }
+        ExprKind::Map(entries) => {
+            for en in entries {
+                if let r @ Some(_) = match_arm_binding_in_expr(&en.key, name, offset) {
+                    return r;
+                }
+                if let r @ Some(_) = match_arm_binding_in_expr(&en.value, name, offset) {
+                    return r;
+                }
+            }
+            None
+        }
         ExprKind::Template { parts } => {
             use crate::ast::TemplatePart;
             for p in parts {

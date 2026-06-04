@@ -7,7 +7,6 @@ use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
 use crate::value::Value;
 use indexmap::IndexMap;
-use std::cell::RefCell;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -62,9 +61,9 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
         serde_json::Value::String(s) => Value::Str(s.as_str().into()),
-        serde_json::Value::Array(a) => Value::Array(gcmodule::Cc::new(RefCell::new(
+        serde_json::Value::Array(a) => Value::Array(crate::value::ArrayCell::new(
             a.iter().map(to_ascript).collect(),
-        ))),
+        )),
         serde_json::Value::Object(o) => {
             let mut m = IndexMap::new();
             for (k, v) in o {
@@ -335,7 +334,7 @@ mod tests {
 
     #[test]
     fn lossy_serializer_never_errors() {
-        let a = Value::Array(gcmodule::Cc::new(RefCell::new(vec![])));
+        let a = Value::Array(crate::value::ArrayCell::new(vec![]));
         if let Value::Array(inner) = &a {
             inner.borrow_mut().push(a.clone());
         }

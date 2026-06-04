@@ -216,6 +216,7 @@ fn token_kind(name: &str) -> Option<&'static str> {
         "for" => "ForKw",
         "in" => "InKw",
         "of" => "OfKw",
+        "instanceof" => "InstanceofKw",
         "return" => "ReturnKw",
         "break" => "BreakKw",
         "continue" => "ContinueKw",

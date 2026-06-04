@@ -161,10 +161,17 @@ AScript has **eight value kinds**:
 | `string` | immutable UTF-8 text | immutable |
 | `array` | ordered list, `[...]` | mutable, shared by reference |
 | `object` | string-keyed record, `{...}` | mutable, shared by reference |
-| `map` | hash map with arbitrary keys | mutable, shared by reference |
+| `map` | hash map with arbitrary keys, `#{...}` | mutable, shared by reference |
 | `function` | closure (incl. async fns and methods) | immutable |
 
 Class instances are `object` values **tagged** with their class (§8).
+
+**Map literals — `#{ keyExpr: valueExpr, … }`** build a `map` directly (no `std/map`
+import). Unlike object literals, the part before `:` is an **expression evaluated to a
+key** (so `#{ k: 1 }` keys by the *value* of `k`), keys may be any hashable value
+(`nil`/`bool`/`number`/`string`), `#{}` is the empty map, and a repeated key is
+later-value-wins. An unhashable key (e.g. an array) is a Tier-2 panic. Spread inside a
+map literal (`#{ ...m }`) is not supported (a clean parse error). See §8.3.
 
 **Reference semantics:** `array`, `object`, `map`, and class instances are heap
 values shared by reference (assignment copies the handle, not the contents).
@@ -683,6 +690,78 @@ mechanism as class instances (§8.1), so it adds no new conceptual value kind to
 Enums are intentionally *simple*: no associated typed payloads and no methods
 (tagged-union ADTs are a deliberate non-goal for v1; use a class if you need
 per-variant data or behavior).
+
+### 8.3 SP2 language additions
+
+Five surface features added after the original draft, each implemented identically on
+both engines (bytecode VM + the `--tree-walker` oracle) and byte-identical in output:
+
+**`instanceof`** — a reserved binary operator at the comparison precedence tier
+(`x instanceof C`, looser than `&&`, same tier as `<`/`>`). It tests class membership,
+walking the superclass chain; a non-instance left side is always `false` (never panics).
+The right side **must** be a class — a non-class right side is a Tier-2 panic.
+
+```ascript
+class Animal {}
+class Dog extends Animal {}
+print(Dog() instanceof Animal)   // true
+print(Dog() instanceof Dog)      // true
+print(5 instanceof Animal)       // false (never panics)
+```
+
+**Default parameters** — `fn f(a, b = expr)` (also on arrows, methods, `init`,
+`async fn`, `fn*`). The default is evaluated at **call time**, left-to-right, and may
+reference **earlier already-bound parameters** (and outer scope). A typed default is
+contract-checked. An explicit `nil` argument **suppresses** the default (only a *missing*
+argument triggers it). A required parameter may **not** follow a defaulted one. Minimum
+arity = the leading run of no-default params; defaults compose with rest (`...xs`).
+
+```ascript
+fn greet(name, greeting = "Hello", times = 1) {
+  return `${greeting}, ${name}` + (times > 1 ? ` x${times}` : "")
+}
+print(greet("Ada"))                  // Hello, Ada
+print(greet("Ada", "Hi", 3))         // Hi, Ada x3
+```
+
+**`#{…}` map literals** — build a `map` directly (see §4): the key is an expression, keys
+may be any hashable value, `#{}` is empty, repeated keys are later-wins, an unhashable key
+panics (Tier 2), and spread inside `#{}` is unsupported.
+
+```ascript
+let scores = #{ "alice": 10, "bob": 7 }
+let mixed = #{ 1: "one", true: "yes", nil: "none" }
+```
+
+**`object.freeze` / `object.isFrozen`** (`std/object`, a core module) — `freeze(x)`
+shallow-freezes a mutable container (object/array/map/set/instance) **in place** and
+returns it for chaining; after that, any in-place mutation is a Tier-2 panic
+`cannot mutate a frozen <kind>`. Freezing is shallow (nested containers stay mutable),
+one-way, idempotent, and a no-op on non-containers. `isFrozen(x)` reports it; a
+`deepClone` of a frozen value is a fresh, unfrozen copy. (Full reference: §11.)
+
+```ascript
+import * as object from "std/object"
+let cfg = object.freeze({host: "localhost", port: 8080})
+print(object.isFrozen(cfg))   // true
+// cfg.port = 9090            // would panic: cannot mutate a frozen object
+```
+
+**Records — auto-derived `init`** — a class that declares fields but writes **no `init`**
+automatically gets a **positional constructor** over its fields, in declaration order
+(base-class fields first under inheritance). A defaulted field becomes an optional trailing
+parameter; each positional argument is contract-checked against its field's type. A class
+that *does* declare `init` is unchanged. Arity is min = required fields, max = total fields.
+
+```ascript
+class Point { x: number; y: number = 0 }
+let p = Point(3)          // y takes its default
+print(p.x)                // 3
+print(p.y)                // 0
+```
+
+> Field defaults (§8.1) may be **any expression**, including an inclusive range `1..=3`
+> (eagerly `[1, 2, 3]`); only `yield` is rejected as a field default. See §8.1.
 
 ---
 

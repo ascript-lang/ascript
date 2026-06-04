@@ -3589,6 +3589,49 @@ async fn vm_field_default_yield_rejected_symmetrically() {
 }
 
 #[tokio::test]
+async fn sp2_f_inclusive_range_field_default_three_way() {
+    // SP2 Phase F (regression-lock + spec correction): `..=` as a class-field default
+    // materializes to an eager `array<number>` and runs BYTE-IDENTICAL on all three
+    // engines (tree-walker == specialized-VM == generic-VM), via BOTH the construct
+    // path (`C()`) and the `.from({})` path (which reads the SAME lowered default).
+    // Per SP2 §6 this supersedes the stale SP1 note claiming `..=` field defaults are
+    // rejected — they are supported; only `yield` defaults remain rejected (locked
+    // below). The exact `[1, 2, 3]` rendering is the regression anchor.
+    assert_three_way_matches("class C { xs: array<number> = 1..=3 }\nprint(C().xs)\n").await;
+    assert_three_way_matches("class C { xs: array<number> = 1..=3 }\nprint(C.from({}).xs)\n").await;
+    // Stepped inclusive — `0..=10 step 2` → `[0, 2, 4, 6, 8, 10]`, both paths.
+    assert_three_way_matches(
+        "class C { xs: array<number> = 0..=10 step 2 }\nprint(C().xs)\n",
+    )
+    .await;
+    assert_three_way_matches(
+        "class C { xs: array<number> = 0..=10 step 2 }\nprint(C.from({}).xs)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sp2_f_yield_field_default_rejected_three_way() {
+    // SP2 Phase F: the `yield` field default MUST stay rejected, symmetrically with
+    // `..=` being accepted. `yield` is never valid outside a generator body. The VM
+    // rejects it at COMPILE time (`cst_default_expr`); the tree-walker rejects it when
+    // it EVALUATES the default. The message/span legitimately differ (compile vs
+    // runtime), but the OBSERVABLE outcome is symmetric: ALL THREE engines error,
+    // none runs the program (no output). Lock the symmetry of the rejection.
+    for default in ["yield 5", "yield"] {
+        let src = format!("class C {{ x: number = {default} }}\nC()\n");
+        let tw = ascript::run_source(&src).await;
+        let spec = ascript::vm_run_source(&src).await;
+        let generic = ascript::vm_run_source_generic(&src).await;
+        assert!(
+            tw.is_err() && spec.is_err() && generic.is_err(),
+            "expected ALL THREE engines to reject the `{default}` field default\n  \
+             tree-walker: {tw:?}\n  specialized: {spec:?}\n  generic: {generic:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vm_field_default_reviewer_regression() {
     // The EXACT program from the divergence report: a computed string-concat default
     // referencing a module const, printed off a freshly-constructed instance. The VM
@@ -3607,9 +3650,12 @@ async fn vm_class_method_calls_method_via_self() {
 
 #[tokio::test]
 async fn vm_class_no_init_no_args() {
-    // A class with no init, constructed with no args, fields written later via
-    // member assignment; a method reads them.
-    let src = "class Bag {\n  items: number\n  fn total() { return self.items }\n}\nlet b = Bag()\nb.items = 7\nprint(b.total())";
+    // A class with no init now auto-derives a positional constructor over its
+    // declared fields (SP2 §5 records): `Bag(7)` binds `items`, and a method
+    // reads it. (Pre-records this class was `Bag()` + a late `b.items = 7`; that
+    // late-init style is superseded by the record constructor — the required
+    // field must be supplied at construction, identically on both engines.)
+    let src = "class Bag {\n  items: number\n  fn total() { return self.items }\n}\nlet b = Bag(7)\nprint(b.total())";
     assert_vm_run_matches_treewalker(src).await;
 }
 
@@ -5704,6 +5750,159 @@ async fn vm_parser_accepts_runs_legitimate_rejections() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  SP2 Phase G — feature-coverage invariant gate.
+//
+//  THE closing invariant of SP2: every NEW surface feature (instanceof, default
+//  parameters, `#{…}` map literals, object.freeze/isFrozen + frozen-mutation
+//  panic, records / auto-derived init) RUNS on both VM modes and is byte-identical
+//  to the tree-walker oracle — including when several features are combined in one
+//  program. A regression that re-introduces a divergence (or a "parser accepts but
+//  one engine rejects/diverges on valid code" hole) on any SP2 feature trips this
+//  gate. Mirrors the SP1 `vm_parser_accepts_runs` gate above.
+//
+//  `std/object` (freeze/isFrozen) is a CORE module, so these programs run in BOTH
+//  feature configs — this file is compiled and run under `--no-default-features`
+//  too, where the gate stays meaningful.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every SP2 feature, as a runnable program that must be byte-identical on all
+/// three engines (tree-walker == specialized-VM == generic-VM). The last few
+/// programs combine multiple features so the cross-feature interactions are
+/// exercised together.
+const SP2_FEATURE_PROGRAMS: &[&str] = &[
+    // ── §1 instanceof ───────────────────────────────────────────────────────────
+    // own class, subclass↑parent, parent-NOT↑subclass, non-instance is false.
+    "class C {}\nlet c = C()\nprint(c instanceof C)\n",
+    "class A {}\nclass B extends A {}\nprint(B() instanceof A)\nprint(A() instanceof B)\n",
+    "class C {}\nprint(5 instanceof C)\nprint(\"x\" instanceof C)\nprint(nil instanceof C)\n",
+    // precedence: binds at the comparison tier (looser than `&&`).
+    "class C {}\nlet c = C()\nprint(c instanceof C && true)\n",
+
+    // ── §2 default parameters ────────────────────────────────────────────────────
+    // omitted vs supplied; a default that references an EARLIER param (left-to-right).
+    "fn f(a, b = 10) { return a + b }\nprint(f(1))\nprint(f(1, 2))\n",
+    "fn f(a, b = a * 2) { return b }\nprint(f(5))\n",
+    // arrow default + composition with rest.
+    "let g = (x, y = 5) => x + y\nprint(g(2))\nprint(g(2, 3))\n",
+    "fn f(a, b = 2, ...xs) { return [a, b, xs] }\nprint(f(1))\nprint(f(1, 9, 8, 7))\n",
+    // explicit nil suppresses the default.
+    "fn f(a, b = 10) { return b }\nprint(f(1, nil))\n",
+
+    // ── §3 `#{…}` map literals ───────────────────────────────────────────────────
+    // empty; string keys; numeric/bool/nil keys; expression key; later-key-wins.
+    "print(#{})\n",
+    "print(#{ \"a\": 1, \"b\": 2 })\n",
+    "print(#{ 1: \"x\", true: \"y\", nil: \"z\" })\n",
+    "let k = \"x\"\nprint(#{ k: 1 })\n",
+    "print(#{ 1: \"a\", 1: \"b\" })\n",
+
+    // ── §4 object.freeze / isFrozen ──────────────────────────────────────────────
+    // freeze returns the value; isFrozen reflects it; non-container is a no-op.
+    "import * as object from \"std/object\"\nlet o = {a: 1}\nprint(object.isFrozen(o))\n\
+     let r = object.freeze(o)\nprint(object.isFrozen(o))\nprint(r == o)\n",
+    "import * as object from \"std/object\"\nprint(object.isFrozen(5))\n",
+    // shallow: an element of a frozen array is still mutable.
+    "import * as object from \"std/object\"\nlet a = [[1]]\nobject.freeze(a)\na[0][0] = 9\nprint(a)\n",
+    // deep-clone of a frozen object is unfrozen.
+    "import * as object from \"std/object\"\nlet o = {a: 1}\nobject.freeze(o)\n\
+     let c = object.deepClone(o)\nprint(object.isFrozen(c))\n",
+
+    // ── §5 records / auto-derived init ───────────────────────────────────────────
+    // positional auto-constructor in declaration order; defaulted trailing field.
+    "class Point { x: number\n y: number }\nlet p = Point(1, 2)\nprint(p.x)\nprint(p.y)\n",
+    "class P { x: number\n y: number = 0 }\nprint(P(1).y)\nprint(P(1, 2).y)\n",
+    // a class WITH explicit init is unchanged (auto-init NOT applied).
+    "class C { x: number = 0\n fn init(v) { self.x = v + 1 } }\nprint(C(5).x)\n",
+    // inheritance: base fields then subclass fields, positional.
+    "class A { a: number }\nclass B extends A { b: number }\nlet x = B(1, 2)\nprint(x.a)\nprint(x.b)\n",
+
+    // ── cross-feature combinations ───────────────────────────────────────────────
+    // record + instanceof + inheritance + a defaulted trailing field together.
+    "class A { a: number }\nclass B extends A { b: number = 9 }\nlet x = B(1)\n\
+     print(x instanceof A)\nprint(x.a)\nprint(x.b)\n",
+    // default param whose default is a `#{…}` map literal; instanceof of nothing.
+    "fn f(m = #{ \"a\": 1 }) { return m }\nprint(f())\nprint(f(#{ \"b\": 2 }))\n",
+    // freeze a record instance, then a default-param fn reads a field off it.
+    "import * as object from \"std/object\"\nclass P { x: number\n y: number = 0 }\n\
+     let p = object.freeze(P(3))\nfn sum(pt, bias = 10) { return pt.x + pt.y + bias }\n\
+     print(object.isFrozen(p))\nprint(sum(p))\n",
+];
+
+/// G1 — the SP2 feature-coverage invariant: every SP2 feature (and several
+/// cross-feature combinations) RUNS on all three engines and is byte-identical.
+#[tokio::test]
+async fn vm_sp2_features() {
+    for src in SP2_FEATURE_PROGRAMS {
+        // Each program must RUN (not be a compile rejection) on the tree-walker AND
+        // both VM modes — a one-engine rejection on valid code is the hole this gate
+        // forbids.
+        let tw = ascript::run_source_exit(src).await;
+        assert!(
+            tw.is_ok(),
+            "tree-walker rejected a valid SP2 program (should RUN):\n  src: {src:?}\n  err: {tw:?}"
+        );
+        let spec = ascript::vm_run_source(src).await;
+        assert!(
+            spec.is_ok(),
+            "specialized VM rejected a valid SP2 program (parser-accepts-runs hole):\n  \
+             src: {src:?}\n  err: {spec:?}"
+        );
+        let generic = ascript::vm_run_source_generic(src).await;
+        assert!(
+            generic.is_ok(),
+            "generic VM rejected a valid SP2 program (parser-accepts-runs hole):\n  \
+             src: {src:?}\n  err: {generic:?}"
+        );
+        // …and all three engines agree byte-for-byte.
+        assert_three_way_matches(src).await;
+    }
+}
+
+/// G1 (companion) — SP2 features whose ONLY valid outcome is a SYMMETRIC error:
+/// every engine rejects them byte-identically (real errors, not engine gaps).
+/// Covers instanceof with a non-class rhs, default-after-required, and the
+/// frozen-mutation panic across all container kinds.
+#[tokio::test]
+async fn vm_sp2_features_symmetric_rejections() {
+    // These error byte-identically (same message + exit) on all three engines.
+    let byte_identical_rejections: &[&str] = &[
+        // instanceof requires a class on the rhs.
+        "let c = 1\nprint(c instanceof 5)\n",
+        // a required parameter cannot follow a defaulted one.
+        "fn f(a = 1, b) { return b }\nprint(f(1, 2))\n",
+        // default-param arity: too few / too many (no rest).
+        "fn f(a, b = 1) {}\nf()\n",
+        "fn f(a, b = 1) {}\nf(1, 2, 3)\n",
+        // typed default contract-checks the explicit arg.
+        "fn f(a, b: number = 1) { return b }\nprint(f(1, \"x\"))\n",
+        // record arity + positional contract.
+        "class Point { x: number\n y: number }\nPoint(1)\n",
+        "class Point { x: number\n y: number }\nPoint(1, 2, 3)\n",
+        "class Point { x: number\n y: number }\nPoint(\"a\", 2)\n",
+        // unhashable map key.
+        "print(#{ [1]: 2 })\n",
+        // frozen-mutation panic across object / array / map / instance.
+        "import * as object from \"std/object\"\nlet o = {a: 1}\nobject.freeze(o)\no.a = 2\n",
+        "import * as object from \"std/object\"\nimport * as array from \"std/array\"\n\
+         let a = [1]\nobject.freeze(a)\narray.push(a, 2)\n",
+        "import * as object from \"std/object\"\nimport * as map from \"std/map\"\n\
+         let m = map.new()\nobject.freeze(m)\nmap.set(m, \"k\", 1)\n",
+        "import * as object from \"std/object\"\nclass C { x: number = 0 }\nlet c = C()\n\
+         object.freeze(c)\nc.x = 9\n",
+    ];
+    for src in byte_identical_rejections {
+        let tw = ascript::run_source_exit(src).await;
+        assert!(
+            tw.is_err(),
+            "expected the tree-walker to reject a genuine SP2 error, but it ran:\n  \
+             src: {src:?}\n  ok: {tw:?}"
+        );
+        // …and reject byte-identically across all three engines.
+        assert_three_way_matches(src).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  V12-T3: bytecode verifier — every chunk the compiler emits must VERIFY OK.
 //
 //  The verifier (`ascript::vm::verify`) is the load-time guard for `.aso`: it walks
@@ -6018,4 +6217,552 @@ async fn vm_mutable_let_and_param_reassign_still_work() {
     assert_vm_run_matches_treewalker("fn f() { let y = 1\n y = 5\n return y }\nprint(f())").await;
     assert_vm_run_matches_treewalker("fn f(a) { a = 5\n return a }\nprint(f(1))").await;
     assert_vm_run_matches_treewalker("let [a, b] = [1, 2]\na = 9\nprint(a)").await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_basic_matches_treewalker() {
+    // SP2 §1 — an instance `instanceof` its own class is true.
+    assert_vm_run_matches_treewalker("class C {}\nlet c = C()\nprint(c instanceof C)\n").await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_subclass_matches_treewalker() {
+    // Subclass instance `instanceof` parent → true; parent instance NOT instanceof
+    // subclass → false (walk the `extends` chain).
+    assert_vm_run_matches_treewalker(
+        "class A {}\nclass B extends A {}\nprint(B() instanceof A)\nprint(A() instanceof B)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_non_instance_matches_treewalker() {
+    // Non-instances are always false, never panic.
+    assert_vm_run_matches_treewalker(
+        "class C {}\nprint(5 instanceof C)\nprint(\"x\" instanceof C)\nprint(nil instanceof C)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_precedence_matches_treewalker() {
+    // Precedence: binds like a comparison — `c instanceof C && true` parses as
+    // `(c instanceof C) && true`.
+    assert_vm_run_matches_treewalker("class C {}\nlet c = C()\nprint(c instanceof C && true)\n")
+        .await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_in_if_matches_treewalker() {
+    // `instanceof` as the condition of an `if`.
+    assert_vm_run_matches_treewalker(
+        "class C {}\nlet c = C()\nif (c instanceof C) { print(\"yes\") } else { print(\"no\") }\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_rhs_not_class_errors_match_treewalker() {
+    // RHS not a class → identical Tier-2 panic on both engines.
+    assert_vm_run_error_matches_treewalker("let c = 1\nprint(c instanceof 5)\n").await;
+    assert_vm_run_error_matches_treewalker("class C {}\nprint(C() instanceof nil)\n").await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_three_way_matches() {
+    assert_three_way_matches("class A {}\nclass B extends A {}\nlet b = B()\nprint(b instanceof A)\nprint(b instanceof B)\nprint(5 instanceof A)\n").await;
+}
+
+// ---- SP2 Phase B: default parameters --------------------------------------
+
+#[tokio::test]
+async fn vm_default_param_basic_matches_treewalker() {
+    // Omitted trailing arg uses the default; supplied arg suppresses it.
+    assert_vm_run_matches_treewalker("fn f(a, b = 10) { return a + b }\nprint(f(1))\nprint(f(1, 2))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_refs_earlier_matches_treewalker() {
+    // A default may reference an earlier already-bound param.
+    assert_vm_run_matches_treewalker("fn g(a, b = a + 1) { return b }\nprint(g(5))\n").await;
+    assert_vm_run_matches_treewalker("fn f(a, b = a * 2) { return b }\nprint(f(5))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_arrow_matches_treewalker() {
+    assert_vm_run_matches_treewalker("let g = (x, y = 5) => x + y\nprint(g(2))\nprint(g(2, 3))\n").await;
+    assert_vm_run_matches_treewalker("let h = (x = 10) => x\nprint(h())\nprint(h(7))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_side_effect_only_when_omitted_matches_treewalker() {
+    // The default expr's side effect (a `print`) must run ONLY when the arg is
+    // omitted, and LEFT-TO-RIGHT across multiple omitted defaults.
+    let src = "fn note(tag, v) { print(tag)\n return v }\n\
+fn f(a, b = note(\"b\", 2), c = note(\"c\", 3)) { return [a, b, c] }\n\
+print(\"--- f(1): both defaults run, b then c\")\n\
+print(f(1))\n\
+print(\"--- f(1, 9): only c default runs\")\n\
+print(f(1, 9))\n\
+print(\"--- f(1, 9, 8): no default runs\")\n\
+print(f(1, 9, 8))\n";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
+async fn vm_default_param_calls_global_matches_treewalker() {
+    assert_vm_run_matches_treewalker("fn base() { return 42 }\nfn f(a, b = base()) { return a + b }\nprint(f(1))\nprint(f(1, 2))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_with_rest_matches_treewalker() {
+    assert_vm_run_matches_treewalker("fn h(a, b = 2, ...xs) { return [a, b, xs] }\nprint(h(1))\nprint(h(1, 9, 8, 7))\nprint(h(1, 9))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_explicit_nil_suppresses_matches_treewalker() {
+    // Explicit nil suppresses the default — only a MISSING arg triggers it.
+    assert_vm_run_matches_treewalker("fn f(a, b = 10) { return b }\nprint(f(1, nil))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_typed_contract_matches_treewalker() {
+    // A typed defaulted param: the explicit value is contract-checked.
+    assert_vm_run_error_matches_treewalker("fn f(a, b: number = 1) { return b }\nprint(f(1, \"x\"))\n").await;
+    // The default value is itself contract-checked when applied.
+    assert_vm_run_matches_treewalker("fn f(a, b: number = 1) { return b }\nprint(f(1))\nprint(f(1, 5))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_required_after_default_errors_match_treewalker() {
+    // A required param cannot follow a defaulted one — identical parse/compile
+    // error on both engines.
+    assert_vm_run_error_matches_treewalker("fn f(a = 1, b) { return b }\nprint(f(1, 2))\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_arity_errors_match_treewalker() {
+    // Too few (below min) and too many (above max, no rest).
+    assert_vm_run_error_matches_treewalker("fn f(a, b = 1) {}\nf()\n").await;
+    assert_vm_run_error_matches_treewalker("fn f(a, b = 1) {}\nf(1, 2, 3)\n").await;
+}
+
+#[tokio::test]
+async fn vm_default_param_three_way_matches() {
+    assert_three_way_matches(
+        "fn f(a, b = a + 1, c = 10) { return [a, b, c] }\n\
+print(f(1))\n\
+print(f(1, 2))\n\
+print(f(1, 2, 3))\n\
+let g = (x = 5) => x * 2\n\
+print(g())\n\
+print(g(4))\n",
+    )
+    .await;
+}
+
+// ---- Phase C: #{…} map literals ----------------------------------------
+
+#[tokio::test]
+async fn vm_map_lit_empty_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{})\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_string_keys_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{ \"a\": 1, \"b\": 2 })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_numeric_keys_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{ 1: \"x\", 2: \"y\" })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_mixed_type_keys_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{ 1: \"x\", true: \"y\", nil: \"z\", \"k\": 4 })\n")
+        .await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_expr_key_uses_value_matches_treewalker() {
+    // The key expression is EVALUATED — `k` is keyed by its value "x", not "k".
+    assert_vm_run_matches_treewalker("let k = \"x\"\nprint(#{ k: 1 })\n").await;
+    assert_vm_run_matches_treewalker("let a = 2\nlet b = 3\nprint(#{ a + b: \"sum\" })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_later_key_wins_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{ 1: \"a\", 1: \"b\" })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_neg_zero_nan_canon_matches_treewalker() {
+    // -0.0 canonicalizes to +0.0; both keys collapse, later wins.
+    assert_vm_run_matches_treewalker("print(#{ -0.0: \"neg\", 0.0: \"pos\" })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_read_back_matches_treewalker() {
+    assert_vm_run_matches_treewalker(
+        "import * as map from \"std/map\"\nlet m = #{ \"a\": 1, \"b\": 2 }\nprint(map.get(m, \"a\"))\nprint(map.get(m, \"b\"))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_is_real_map_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(type(#{ \"a\": 1 }))\n").await;
+    assert_vm_run_matches_treewalker("print(type(#{}))\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_unhashable_key_errors_match_treewalker() {
+    assert_vm_run_error_matches_treewalker("print(#{ [1]: 2 })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_spread_is_parse_error_both_engines() {
+    // D4: a `...` spread element inside `#{}` is a clean parse error on BOTH
+    // front-ends (legacy oracle + CST/VM) — no panic, exit non-zero. The two
+    // independent parsers legitimately word the error differently, so we assert
+    // BOTH reject (Err), not message-equality (that's the conformance test's job).
+    let src = "let m = #{ \"a\": 1 }\nprint(#{ ...m })\n";
+    let tw = ascript::run_source(src).await;
+    let vm = ascript::vm_run_source(src).await;
+    assert!(
+        tw.is_err(),
+        "tree-walker (legacy parser) must reject `...` in a map literal, got {tw:?}"
+    );
+    assert!(
+        vm.is_err(),
+        "VM (CST parser) must reject `...` in a map literal, got {vm:?}"
+    );
+}
+
+#[tokio::test]
+async fn vm_map_lit_in_function_matches_treewalker() {
+    assert_vm_run_matches_treewalker("fn f() { return #{ 1: \"x\" } }\nprint(f())\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_three_way_matches() {
+    assert_three_way_matches(
+        "import * as map from \"std/map\"\n\
+let k = \"dyn\"\n\
+let m = #{ \"a\": 1, 2: \"two\", true: \"t\", k: 9, 2: \"two-again\" }\n\
+print(m)\n\
+print(map.get(m, \"a\"))\n\
+print(map.get(m, 2))\n\
+print(map.get(m, \"dyn\"))\n\
+print(map.get(m, 2))\n\
+print(#{})\n",
+    )
+    .await;
+}
+
+// ─────────────────────────── SP2 Phase D — object.freeze / isFrozen ──────────
+
+#[tokio::test]
+async fn vm_freeze_returns_value_and_isfrozen_tracks_matches_treewalker() {
+    // freeze returns the value; isFrozen reflects before/after.
+    assert_vm_run_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let o = {a: 1}\n\
+print(object.isFrozen(o))\n\
+let r = object.freeze(o)\n\
+print(object.isFrozen(o))\n\
+print(r == o)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_object_set_field_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let o = {a: 1}\n\
+object.freeze(o)\n\
+o.a = 2\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_object_set_index_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let o = {a: 1}\n\
+object.freeze(o)\n\
+o[\"a\"] = 2\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_array_push_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+import * as array from \"std/array\"\n\
+let a = [1]\n\
+object.freeze(a)\n\
+array.push(a, 2)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_array_index_set_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let a = [1, 2]\n\
+object.freeze(a)\n\
+a[0] = 9\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_map_set_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+import * as map from \"std/map\"\n\
+let m = map.new()\n\
+object.freeze(m)\n\
+map.set(m, \"k\", 1)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_set_add_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+import * as set from \"std/set\"\n\
+let s = set.new()\n\
+object.freeze(s)\n\
+set.add(s, 1)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_instance_set_field_panics_match_treewalker() {
+    assert_vm_run_error_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+class C { x: number = 0 }\n\
+let c = C()\n\
+object.freeze(c)\n\
+c.x = 9\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_is_shallow_matches_treewalker() {
+    // Element of a frozen array is still mutable (shallow freeze).
+    assert_vm_run_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+let a = [[1]]\n\
+object.freeze(a)\n\
+a[0][0] = 9\n\
+print(a)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_noncontainer_and_clone_unfrozen_matches_treewalker() {
+    // Freezing a non-container is a no-op; a deepClone of a frozen object is unfrozen.
+    assert_vm_run_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+print(object.isFrozen(5))\n\
+print(object.freeze(5))\n\
+let o = {a: 1}\n\
+object.freeze(o)\n\
+let c = object.deepClone(o)\n\
+print(object.isFrozen(c))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_idempotent_and_nonfrozen_mutates_matches_treewalker() {
+    // Freezing twice is fine; a non-frozen container still mutates normally.
+    assert_vm_run_matches_treewalker(
+        "import * as object from \"std/object\"\n\
+import * as array from \"std/array\"\n\
+let a = [1]\n\
+object.freeze(a)\n\
+object.freeze(a)\n\
+let b = [1]\n\
+array.push(b, 2)\n\
+print(b)\n\
+print(object.isFrozen(a))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_freeze_three_way_matches() {
+    assert_three_way_matches(
+        "import * as object from \"std/object\"\n\
+import * as array from \"std/array\"\n\
+let o = {a: 1, b: 2}\n\
+print(object.isFrozen(o))\n\
+object.freeze(o)\n\
+print(object.isFrozen(o))\n\
+let a = [1, 2, 3]\n\
+object.freeze(a)\n\
+print(object.isFrozen(a))\n\
+let live = [9]\n\
+array.push(live, 10)\n\
+print(live)\n",
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// SP2 Phase E — records / auto-derived `init`. A class declaring fields but no
+// explicit `init` gets an auto-derived positional constructor (params in
+// field-declaration order, defaults compose with §2 arity, field contracts
+// enforced). A class WITH an explicit `init` is unchanged. Both engines must be
+// byte-identical.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn record_auto_init_positional_matches_treewalker() {
+    // Positional auto-constructor in field-declaration order.
+    assert_vm_run_matches_treewalker(
+        "class Point { x: number\n y: number }\nlet p = Point(1, 2)\nprint(p.x)\nprint(p.y)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_auto_init_defaulted_field_matches_treewalker() {
+    // A defaulted field becomes an optional trailing param: P(1) uses the
+    // default (0), P(1, 2) overrides it.
+    assert_vm_run_matches_treewalker(
+        "class P { x: number\n y: number = 0 }\nprint(P(1).y)\nprint(P(1, 2).y)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_auto_init_arity_errors_match_treewalker() {
+    // Too few / too many args -> identical message + span both engines.
+    assert_vm_run_error_matches_treewalker("class Point { x: number\n y: number }\nPoint(1)\n")
+        .await;
+    assert_vm_run_error_matches_treewalker(
+        "class Point { x: number\n y: number }\nPoint(1, 2, 3)\n",
+    )
+    .await;
+    // Defaulted-field arity bounds (at least 1 / at most 2).
+    assert_vm_run_error_matches_treewalker("class P { x: number\n y: number = 0 }\nP()\n").await;
+    assert_vm_run_error_matches_treewalker(
+        "class P { x: number\n y: number = 0 }\nP(1, 2, 3)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_auto_init_contract_mismatch_matches_treewalker() {
+    // A positional arg failing the field's type contract -> identical panic.
+    assert_vm_run_error_matches_treewalker(
+        "class Point { x: number\n y: number }\nPoint(\"a\", 2)\n",
+    )
+    .await;
+    // Mismatch on the second positional arg likewise.
+    assert_vm_run_error_matches_treewalker(
+        "class Point { x: number\n y: number }\nPoint(1, \"b\")\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_class_with_explicit_init_unchanged() {
+    // A class WITH an explicit init is unchanged (auto-init NOT applied): the
+    // init body runs, fields bound via self.x.
+    assert_vm_run_matches_treewalker(
+        "class C { x: number = 0\n fn init(v) { self.x = v + 1 } }\nprint(C(5).x)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_zero_field_class_unchanged() {
+    // A class with no fields and no init keeps the zero-arg-only behavior.
+    assert_vm_run_matches_treewalker("class E {}\nlet e = E()\nprint(type(e))\n").await;
+    assert_vm_run_error_matches_treewalker("class E {}\nE(1)\n").await;
+}
+
+#[tokio::test]
+async fn record_inheritance_positional_matches_treewalker() {
+    // Inheritance: base fields then subclass fields, positional, base-first.
+    assert_vm_run_matches_treewalker(
+        "class A { a: number }\nclass B extends A { b: number }\n\
+         let x = B(1, 2)\nprint(x.a)\nprint(x.b)\n",
+    )
+    .await;
+    // Defaulted base field then required subclass field: positional binding in
+    // merged (base-first) order; arity bounds identical both engines.
+    assert_vm_run_matches_treewalker(
+        "class A { a: number\n b: number = 5 }\nclass B extends A { c: number }\n\
+         let x = B(1, 2, 3)\nprint(x.a)\nprint(x.b)\nprint(x.c)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_subclass_inherits_base_init_not_auto_init() {
+    // Inheritance-of-init decision: a subclass with no init of its own INHERITS the
+    // base class's explicit init (find_method walks the chain), so NO auto-init is
+    // derived — construction runs the inherited init. `Sub(5)` -> base init sets
+    // a = 5*10 = 50; the subclass field default b = 7 is applied. Both engines agree.
+    assert_vm_run_matches_treewalker(
+        "class Base { a: number\n fn init(v) { self.a = v * 10 } }\n\
+         class Sub extends Base { b: number = 7 }\n\
+         let s = Sub(5)\nprint(s.a)\nprint(s.b)\n",
+    )
+    .await;
+    // And the inherited-init arity is the BASE init's (1 arg) — passing 2 is the
+    // same arity panic on both engines (it is NOT the subclass field count).
+    assert_vm_run_error_matches_treewalker(
+        "class Base { a: number\n fn init(v) { self.a = v } }\n\
+         class Sub extends Base { b: number }\nSub(1, 2)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_from_still_works_on_auto_init_class() {
+    // `.from` is independent of init; it must still validate/coerce an auto-init
+    // (record) class, applying field defaults.
+    assert_vm_run_matches_treewalker(
+        "class P { x: number\n y: number = 0 }\n\
+         let p = P.from({x: 1})\nprint(p.x)\nprint(p.y)\n\
+         let q = P.from({x: 3, y: 4})\nprint(q.x)\nprint(q.y)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_three_way_matches() {
+    // The full record surface through all three engines (tree-walker ==
+    // specialized-VM == generic-VM), including instanceof + freeze interop.
+    assert_three_way_matches(
+        "import * as object from \"std/object\"\n\
+         class Point { x: number\n y: number = 0 }\n\
+         class P3 extends Point { z: number }\n\
+         let p = Point(1)\n\
+         print(p.x)\nprint(p.y)\n\
+         let q = Point(2, 3)\nprint(q.y)\n\
+         let r = P3(4, 5, 6)\nprint(r.x)\nprint(r.y)\nprint(r.z)\n\
+         print(p instanceof Point)\n\
+         print(r instanceof Point)\n\
+         object.freeze(p)\n\
+         print(object.isFrozen(p))\n",
+    )
+    .await;
 }

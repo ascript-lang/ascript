@@ -46,6 +46,12 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     Object(Vec<ObjEntry>),
+    /// `#{ keyExpr: valueExpr, … }` — a map literal producing a `Value::Map`.
+    /// Unlike object literals, the KEY is an arbitrary evaluated expression
+    /// (converted via `MapKey::from_value`), not a bare identifier name.
+    /// Spread is not representable (out of scope for SP2; a `...` inside `#{}`
+    /// is a parse error). Later-key-wins; insertion order = first-seen key.
+    Map(Vec<MapEntry>),
     Member {
         object: Box<Expr>,
         name: String,
@@ -114,6 +120,15 @@ pub enum ObjEntry {
     Spread(Expr),
 }
 
+/// An entry in a `#{…}` map literal: `key: value`, where BOTH the key and the
+/// value are arbitrary evaluated expressions. The key is converted to a
+/// `MapKey` at eval (an unhashable key is a Tier-2 panic). Later-key-wins.
+#[derive(Debug, Clone)]
+pub struct MapEntry {
+    pub key: Expr,
+    pub value: Expr,
+}
+
 /// A call argument: positional `x` or a spread `...args`.
 /// Spreading a non-array as call args is a runtime panic (strict).
 #[derive(Debug, Clone)]
@@ -155,6 +170,12 @@ pub struct Param {
     /// `true` if this is a rest parameter (`...name`), which collects trailing
     /// arguments into an array. A rest parameter must be the last parameter.
     pub rest: bool,
+    /// Default value expression (`fn f(a, b = expr)`), evaluated at CALL time in
+    /// the callee frame when the corresponding trailing argument is omitted. A
+    /// default may reference earlier already-bound params and the enclosing
+    /// scope. A required (no-default) param may not follow a defaulted one
+    /// (parse/compile error). Mirrors `FieldDecl.default`.
+    pub default: Option<Expr>,
 }
 
 /// One `{key as binding}` entry in an object-destructuring pattern. `key` is the
@@ -492,6 +513,7 @@ pub enum BinOp {
     Or,
     Coalesce,
     Range,
+    InstanceOf,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -519,6 +541,7 @@ impl fmt::Display for BinOp {
             BinOp::Or => "||",
             BinOp::Coalesce => "??",
             BinOp::Range => "..",
+            BinOp::InstanceOf => "instanceof",
         };
         write!(f, "{}", s)
     }
@@ -588,6 +611,16 @@ impl fmt::Display for ExprKind {
                         ObjEntry::KV(k, v) => write!(f, "{}: {}", k, v)?,
                         ObjEntry::Spread(x) => write!(f, "...{}", x)?,
                     }
+                }
+                write!(f, "}}")
+            }
+            ExprKind::Map(entries) => {
+                write!(f, "#{{")?;
+                for (i, e) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}: {}", e.key, e.value)?;
                 }
                 write!(f, "}}")
             }

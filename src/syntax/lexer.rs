@@ -169,7 +169,9 @@ pub fn lex_with_errors(src: &str) -> (Vec<LexToken>, Vec<LexError>) {
         // multi-char operators first (longest match), then single-char
         if let Some((kind, len)) = match_operator(&chars, i) {
             match kind {
-                SyntaxKind::LBrace => brace_depth += 1,
+                // `#{` is a brace-opener too (closed by a matching `}`), so it
+                // must track depth identically to `{` for template handling.
+                SyntaxKind::LBrace | SyntaxKind::HashLBrace => brace_depth += 1,
                 SyntaxKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
                 _ => {}
             }
@@ -272,6 +274,8 @@ fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
             ('/', '=') => Some(SlashEq),
             ('.', '.') => Some(DotDot),
             ('=', '>') => Some(FatArrow),
+            // `#{` opens a map literal — one token (so `#` alone stays an Error).
+            ('#', '{') => Some(HashLBrace),
             _ => None,
         };
         if let Some(k) = two {
@@ -377,6 +381,7 @@ fn keyword_kind(s: &str) -> Option<SyntaxKind> {
         "for" => ForKw,
         "in" => InKw,
         "of" => OfKw,
+        "instanceof" => InstanceofKw,
         "return" => ReturnKw,
         "break" => BreakKw,
         "continue" => ContinueKw,

@@ -15,7 +15,6 @@ use crate::interp::{Control, Interp};
 use crate::span::Span;
 use crate::value::Value;
 use indexmap::IndexMap;
-use std::cell::RefCell;
 use std::time::Instant;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -156,7 +155,7 @@ impl Interp {
             })
             .collect();
 
-        Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+        Ok(Value::Array(crate::value::ArrayCell::new(out)))
     }
 }
 

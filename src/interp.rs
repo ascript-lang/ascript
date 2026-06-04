@@ -70,7 +70,7 @@ pub fn global_env() -> Environment {
 /// Build a `[value, err]` Result pair.
 // pub(crate): used by std/* modules (std/convert) later in M10.
 pub(crate) fn make_pair(value: Value, err: Value) -> Value {
-    Value::Array(gcmodule::Cc::new(RefCell::new(vec![value, err])))
+    Value::Array(crate::value::ArrayCell::new(vec![value, err]))
 }
 
 /// Build an error object `{ message: <msg> }`.
@@ -408,7 +408,7 @@ impl Interp {
             .iter()
             .map(|s| Value::Str(s.clone()))
             .collect();
-        Value::Array(gcmodule::Cc::new(RefCell::new(args)))
+        Value::Array(crate::value::ArrayCell::new(args))
     }
 
     /// Register one newly-spawned async task: bump `inflight` (and the high-water
@@ -1030,7 +1030,7 @@ impl Interp {
                 }
                 if let Some((rest_name, _)) = rest {
                     let tail: Vec<Value> = items.iter().skip(names.len()).cloned().collect();
-                    let arr = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(tail)));
+                    let arr = Value::Array(crate::value::ArrayCell::new(tail));
                     env.define(rest_name, arr, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
@@ -1493,7 +1493,7 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(values))))
+                Ok(Value::Array(crate::value::ArrayCell::new(values)))
             }
             ExprKind::Object(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
@@ -1526,6 +1526,24 @@ impl Interp {
                     }
                 }
                 Ok(Value::Object(crate::value::ObjectCell::new(map)))
+            }
+            ExprKind::Map(entries) => {
+                let mut map = indexmap::IndexMap::with_capacity(entries.len());
+                for entry in entries {
+                    // Evaluate key then value, left-to-right.
+                    let key_val = self.eval_expr(&entry.key, env).await?;
+                    let key = crate::value::MapKey::from_value(&key_val).ok_or_else(|| {
+                        AsError::at(
+                            format!("cannot use {} as a map key", type_name(&key_val)),
+                            entry.key.span,
+                        )
+                    })?;
+                    let value = self.eval_expr(&entry.value, env).await?;
+                    // Later-key-wins: an IndexMap insert overwrites the value
+                    // while keeping the key's first-seen position.
+                    map.insert(key, value);
+                }
+                Ok(Value::Map(crate::value::MapCell::new(map)))
             }
             ExprKind::Template { parts } => {
                 let mut out = String::new();
@@ -1782,7 +1800,7 @@ impl Interp {
                     let remainder: Vec<Value> = items[pats.len()..].to_vec();
                     bindings.push((
                         rest_name.clone(),
-                        Value::Array(gcmodule::Cc::new(RefCell::new(remainder))),
+                        Value::Array(crate::value::ArrayCell::new(remainder)),
                     ));
                 }
                 Ok(true)
@@ -2360,8 +2378,34 @@ impl Interp {
         // Arity + parameter contracts + rest collection. Shared verbatim with the
         // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
         let bound = check_call_args(params, args, span, what)?;
-        for (p, a) in params.iter().zip(bound.into_iter()) {
+        let defaults = bound.defaults.clone();
+        // Bind the SUPPLIED params (and the rest array) — but NOT the omitted
+        // defaulted positions, whose `bound.values` entries are placeholders. They
+        // are bound below, AFTER their default is evaluated, so each default sees
+        // the earlier params and `define` is called exactly once per name.
+        for (i, (p, a)) in params.iter().zip(bound.values.into_iter()).enumerate() {
+            if defaults.contains(&i) {
+                continue;
+            }
             call_env.define(&p.name, a, true).map_err(AsError::new)?;
+        }
+        // Evaluate omitted trailing defaults LEFT-TO-RIGHT in the callee frame, so
+        // a default sees earlier already-bound params (and outer scope/globals).
+        // Each default value is contract-checked against the param's type, then
+        // bound. Never hold a borrow across the `.await`.
+        for i in defaults {
+            let p = &params[i];
+            let def = p
+                .default
+                .as_ref()
+                .expect("default range only covers defaulted params");
+            let dv = self.eval_expr(def, call_env).await?;
+            if let Some(ty) = &p.ty {
+                if !check_type(&dv, ty) {
+                    return Err(contract_panic(ty, &dv, span));
+                }
+            }
+            call_env.define(&p.name, dv, true).map_err(AsError::new)?;
         }
         let result = match self.exec(body, call_env).await {
             Ok(Flow::Return(v)) => v,
@@ -2479,6 +2523,7 @@ impl Interp {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
             shape_id: std::cell::Cell::new(0),
+            frozen: std::cell::Cell::new(false),
         }));
         let inst_val = Value::Instance(instance.clone());
         // Pre-populate declared-field defaults (merged base-class first so a
@@ -2507,16 +2552,18 @@ impl Interp {
                 self.invoke_method(&bm, args, span).await?;
             }
             None => {
-                if !args.is_empty() {
-                    return Err(AsError::at(
-                        format!(
-                            "{} has no init but was given {} argument(s)",
-                            class.name,
-                            args.len()
-                        ),
-                        span,
-                    )
-                    .into());
+                // SP2 §5 records: no explicit `init` → auto-derive a positional
+                // constructor over the declared fields (in merged base-first
+                // schema order). Field defaults were already applied above; the
+                // positional args OVERRIDE the supplied leading fields, each
+                // contract-checked against its field type via the SHARED
+                // `auto_init_bindings` helper (identical arity/contract messages to
+                // the VM). A zero-field class with no args keeps today's behavior
+                // (no fields → empty `params` → only `C()` is valid).
+                let fields = crate::value::merged_field_schema(&class);
+                let bindings = auto_init_bindings(&fields, &class.name, args, span)?;
+                for (fname, v) in bindings {
+                    instance.borrow_mut().fields.insert(fname, v);
                 }
             }
         }
@@ -2612,6 +2659,7 @@ impl Interp {
                 class: class.clone(),
                 fields: inst_fields,
                 shape_id: std::cell::Cell::new(0),
+                frozen: std::cell::Cell::new(false),
             },
         ))))
     }
@@ -2653,9 +2701,9 @@ impl Interp {
                         let p = format!("{}[{}]", path, i);
                         out.push(self.coerce_field(elem, it, env, strict, &p, span).await?);
                     }
-                    Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+                    Ok(Value::Array(crate::value::ArrayCell::new(
                         out,
-                    ))))
+                    )))
                 }
                 _ => Ok(val),
             },
@@ -2992,7 +3040,7 @@ impl Interp {
                         i += step;
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             other => {
                 if let Some((module, func)) = other.split_once('.') {
@@ -3059,10 +3107,12 @@ impl Interp {
     ) -> Result<Value, Control> {
         match obj {
             Value::Object(map) => {
+                check_not_frozen(obj, value_span)?;
                 map.borrow_mut().insert(name.to_string(), value.clone());
                 Ok(value)
             }
             Value::Instance(inst) => {
+                check_not_frozen(obj, value_span)?;
                 let class = inst.borrow().class.clone();
                 if let Some(schema) = lookup_field_schema(&class, name) {
                     if !check_type(&value, &schema.ty) {
@@ -3081,6 +3131,19 @@ impl Interp {
             .into()),
         }
     }
+}
+
+/// `object.freeze` (SP2 §4): guard a container mutation. If `v` is a frozen
+/// container, raise the Tier-2 panic `"cannot mutate a frozen <kind>"` anchored at
+/// the mutation-site `span`; otherwise `Ok(())`. Called at the START of every
+/// user-visible mutation path on BOTH engines (tree-walker `index_set`/`set_member`
+/// plus stdlib mutators; VM `SetIndex`/`vm_set_prop`) so the diagnostic is
+/// byte-identical.
+pub(crate) fn check_not_frozen(v: &Value, span: Span) -> Result<(), Control> {
+    if let Some(kind) = crate::value::frozen_kind(v) {
+        return Err(AsError::at(format!("cannot mutate a frozen {}", kind), span).into());
+    }
+    Ok(())
 }
 
 /// Pure unary-operator dispatch shared by the tree-walker (`ExprKind::Unary`) and
@@ -3201,7 +3264,7 @@ pub(crate) fn materialize_range_stepped(
         items.push(Value::Number(i));
         i += step;
     }
-    Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
+    Ok(Value::Array(crate::value::ArrayCell::new(items)))
 }
 
 /// The direction-aware loop predicate shared by the for-range loop and value
@@ -3292,6 +3355,20 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         return materialize_range(&l, &r, false, span);
     }
 
+    // `x instanceof C` (SP2 §1): bool. The rhs MUST be a class; a non-class rhs is
+    // a Tier-2 panic anchored at the (whole-expression) span — byte-identical to the
+    // VM's `Op::InstanceOf`. A non-instance lhs is `false`, never an error.
+    if let BinOp::InstanceOf = op {
+        let Value::Class(cls) = &r else {
+            return Err(AsError::at(
+                "instanceof requires a class on the right-hand side",
+                span,
+            )
+            .into());
+        };
+        return Ok(Value::Bool(crate::value::is_instance_of(&l, cls)));
+    }
+
     // String concatenation: `+` joins two strings.
     if let BinOp::Add = op {
         if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
@@ -3341,7 +3418,9 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
                     )
                     .into())
                 }
-                BinOp::Eq | BinOp::Ne | BinOp::Range => unreachable!("handled above"),
+                BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
+                    unreachable!("handled above")
+                }
                 BinOp::And | BinOp::Or | BinOp::Coalesce => {
                     unreachable!("short-circuit ops are not dispatched through apply_binop")
                 }
@@ -3373,7 +3452,9 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         BinOp::Le => Value::Bool(a <= b),
         BinOp::Gt => Value::Bool(a > b),
         BinOp::Ge => Value::Bool(a >= b),
-        BinOp::Eq | BinOp::Ne | BinOp::Range => unreachable!("handled above"),
+        BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
+            unreachable!("handled above")
+        }
         BinOp::And | BinOp::Or | BinOp::Coalesce => {
             unreachable!("short-circuit ops are not dispatched through apply_binop")
         }
@@ -3496,6 +3577,12 @@ pub(crate) fn index_set(
     obj_span: Span,
     index_span: Span,
 ) -> Result<Value, AsError> {
+    if let Some(kind) = crate::value::frozen_kind(obj) {
+        return Err(AsError::at(
+            format!("cannot mutate a frozen {}", kind),
+            index_span,
+        ));
+    }
     match obj {
         Value::Array(arr) => {
             let i = array_index(idx, index_span)?;
@@ -3665,63 +3752,114 @@ fn control_to_aserror(c: Control, span: Span) -> AsError {
 /// arity/contract/rest behavior — message wording AND span — is byte-identical
 /// across both engines. `span` is the CALL-site span; `what` is the callee's
 /// name/description (e.g. the function name, `"function"`, or a method name).
+/// The outcome of [`check_call_args`]: the args bound into their param slots,
+/// plus enough information for each engine to fill any OMITTED trailing defaulted
+/// params in the callee frame (left-to-right, seeing earlier params).
+///
+/// `values` has length `params.len()`. Supplied positional args occupy
+/// `0..supplied` (already contract-checked); the trailing missing-defaulted
+/// positions (`defaults`) hold a placeholder `Value::Nil` to be OVERWRITTEN by
+/// the engine's default evaluation; the rest param (last, if present) holds the
+/// collected tail array. `supplied` is the count of supplied positional
+/// (non-rest) args. `defaults` is the half-open range of param indices whose
+/// default must be evaluated (empty when every positional param was supplied).
+///
+/// Defaults are NOT evaluated here: a default expression can reference earlier
+/// params and run arbitrary code, so the engine (tree-walker `run_body` / VM
+/// prologue) evaluates them in the callee frame. This keeps `check_call_args`
+/// pure and synchronous.
+pub(crate) struct BoundArgs {
+    pub values: Vec<Value>,
+    pub supplied: usize,
+    pub defaults: std::ops::Range<usize>,
+}
+
 pub(crate) fn check_call_args(
     params: &[crate::ast::Param],
     args: Vec<Value>,
     span: Span,
     what: &str,
-) -> Result<Vec<Value>, Control> {
+) -> Result<BoundArgs, Control> {
     let has_rest = params.last().is_some_and(|p| p.rest);
-    if !has_rest {
-        // Exact arity.
-        if args.len() != params.len() {
-            return Err(AsError::at(
-                format!(
-                    "{} expected {} argument(s), got {}",
-                    what,
-                    params.len(),
-                    args.len()
-                ),
-                span,
-            )
-            .into());
-        }
-        let mut bound = Vec::with_capacity(params.len());
-        for (p, a) in params.iter().zip(args.into_iter()) {
-            if let Some(ty) = &p.ty {
-                if !check_type(&a, ty) {
-                    return Err(contract_panic(ty, &a, span));
-                }
-            }
-            bound.push(a);
-        }
-        Ok(bound)
+    // Count of POSITIONAL params (excludes a trailing `...rest`).
+    let n_positional = if has_rest {
+        params.len() - 1
     } else {
-        let n_fixed = params.len() - 1;
-        if args.len() < n_fixed {
-            return Err(AsError::at(
-                format!(
-                    "{} expected at least {} argument(s), got {}",
-                    what,
-                    n_fixed,
-                    args.len()
-                ),
-                span,
+        params.len()
+    };
+    // Min-arity = leading run of positional params with NO default (a required
+    // param may not follow a defaulted one, enforced at parse/compile time, so
+    // this is exactly the index of the first defaulted positional param).
+    let min = params[..n_positional]
+        .iter()
+        .take_while(|p| p.default.is_none())
+        .count();
+
+    // Too few arguments.
+    if args.len() < min {
+        // Preserve the EXACT pre-existing wording so goldens stay byte-identical:
+        // exact-arity (no rest, no defaults → min == max == len) keeps the
+        // "expected N" message; everything else (rest or defaults) uses
+        // "at least min".
+        let msg = if !has_rest && min == params.len() {
+            format!(
+                "{} expected {} argument(s), got {}",
+                what,
+                params.len(),
+                args.len()
             )
-            .into());
-        }
-        let mut bound = Vec::with_capacity(params.len());
-        let mut it = args.into_iter();
-        for p in &params[..n_fixed] {
-            let a = it.next().unwrap();
-            if let Some(ty) = &p.ty {
-                if !check_type(&a, ty) {
-                    return Err(contract_panic(ty, &a, span));
-                }
+        } else {
+            format!(
+                "{} expected at least {} argument(s), got {}",
+                what,
+                min,
+                args.len()
+            )
+        };
+        return Err(AsError::at(msg, span).into());
+    }
+    // Too many arguments (only possible without a rest param, which is unbounded).
+    if !has_rest && args.len() > n_positional {
+        let msg = if min == params.len() {
+            // No defaults → exact arity; keep the existing wording.
+            format!(
+                "{} expected {} argument(s), got {}",
+                what,
+                params.len(),
+                args.len()
+            )
+        } else {
+            format!(
+                "{} expected at most {} argument(s), got {}",
+                what, n_positional, args.len()
+            )
+        };
+        return Err(AsError::at(msg, span).into());
+    }
+
+    let mut values: Vec<Value> = Vec::with_capacity(params.len());
+    let mut it = args.into_iter();
+    // Bind the supplied positional args (contract-checking each), capping at the
+    // positional count so any surplus is collected by the rest param.
+    let supplied = it.len().min(n_positional);
+    for p in &params[..supplied] {
+        let a = it.next().unwrap();
+        if let Some(ty) = &p.ty {
+            if !check_type(&a, ty) {
+                return Err(contract_panic(ty, &a, span));
             }
-            bound.push(a);
         }
-        let rest_p = &params[n_fixed];
+        values.push(a);
+    }
+    // Placeholders for the omitted trailing defaulted positions (filled by the
+    // engine in the callee frame).
+    let defaults = supplied..n_positional;
+    for _ in defaults.clone() {
+        values.push(Value::Nil);
+    }
+    // Collect the rest param's tail (any args beyond the positional count).
+    if has_rest {
+        let rest_p = &params[n_positional];
         let elem_ty = match &rest_p.ty {
             Some(crate::ast::Type::Array(inner)) => Some(inner.as_ref()),
             Some(other) => {
@@ -3745,11 +3883,78 @@ pub(crate) fn check_call_args(
             }
             rest_vals.push(a);
         }
-        bound.push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+        values.push(Value::Array(crate::value::ArrayCell::new(
             rest_vals,
-        ))));
-        Ok(bound)
+        )));
     }
+    Ok(BoundArgs {
+        values,
+        supplied,
+        defaults,
+    })
+}
+
+/// Auto-derived positional constructor for a field-only class (SP2 §5, "records").
+/// SHARED by both engines (`Interp::construct` and `Vm::vm_construct`) so the
+/// arity check, error wording/span, and contract check cannot diverge.
+///
+/// `fields` is the class's ordered, merged-base-first field schema
+/// (`merged_field_schema(class)`, iterated in declaration order). The auto-init
+/// treats each field as a positional parameter: a field WITHOUT a default is a
+/// required leading param; a field WITH a default is an optional trailing param.
+/// Arity is validated with the SAME `check_call_args` logic used for functions —
+/// `what` is the class name, so the message reads `"<Class> expected N
+/// argument(s), got M"` (or `"at least"/"at most"` with defaults) and `span` is
+/// the construct call site.
+///
+/// Returns the positional field bindings as `(field_name, value)` pairs for the
+/// SUPPLIED args only (each already contract-checked against its field type).
+/// Omitted trailing (defaulted) fields are NOT returned — the caller has already
+/// applied their defaults to the fresh instance, and this auto-init only
+/// OVERRIDES the supplied positions. Defaults are never evaluated here (the
+/// synthesized params carry a sentinel default purely so `check_call_args`
+/// computes the right min/max arity).
+pub(crate) fn auto_init_bindings(
+    fields: &indexmap::IndexMap<String, (crate::value::FieldSchema, std::rc::Rc<crate::value::Class>)>,
+    class_name: &str,
+    args: Vec<Value>,
+    span: Span,
+) -> Result<Vec<(String, Value)>, Control> {
+    // Synthesize one positional `Param` per declared field, in declaration order.
+    // A defaulted field carries a sentinel default expression so `check_call_args`
+    // counts it toward `max` (total) but not `min` (required leading run); the
+    // sentinel is NEVER evaluated (we only consume `supplied`).
+    let params: Vec<crate::ast::Param> = fields
+        .iter()
+        .map(|(name, (schema, _))| crate::ast::Param {
+            name: name.clone(),
+            ty: Some(schema.ty.clone()),
+            name_span: span,
+            rest: false,
+            default: if schema.default.is_some() {
+                Some(crate::ast::Expr {
+                    kind: crate::ast::ExprKind::Nil,
+                    span,
+                })
+            } else {
+                None
+            },
+        })
+        .collect();
+    // Reuse the function-call arity + per-arg contract logic verbatim so messages
+    // and spans are byte-identical to a hand-written `init(x, y)`.
+    let bound = check_call_args(&params, args, span, class_name)?;
+    // Take only the supplied positional args (contract-checked by
+    // `check_call_args`); pair each with its field name. Omitted defaulted fields
+    // keep the default the caller already applied.
+    let names: Vec<&String> = fields.keys().collect();
+    Ok(bound
+        .values
+        .into_iter()
+        .take(bound.supplied)
+        .enumerate()
+        .map(|(i, v)| (names[i].clone(), v))
+        .collect())
 }
 
 pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
@@ -4707,13 +4912,28 @@ print(y)
     }
 
     #[tokio::test]
-    async fn class_without_init_rejects_args() {
+    async fn class_without_init_rejects_excess_args() {
+        // A zero-field class with no init auto-derives a zero-arg constructor
+        // (SP2 §5 records): `Empty(1)` is a too-many-args arity error, with the
+        // SAME wording as a 0-arg function call.
         let src = "class Empty {}\nEmpty(1)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
-        assert!(err.message.contains("no init"));
+        assert_eq!(err.message, "Empty expected 0 argument(s), got 1");
+    }
+
+    #[tokio::test]
+    async fn class_without_init_auto_derives_positional_constructor() {
+        // SP2 §5 records: a field-only class is constructed positionally, in
+        // field-declaration order, with field contracts enforced.
+        let src = "class Point { x: number\n y: number }\nlet p = Point(1, 2)\nprint(p.x)\nprint(p.y)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output(), "1\n2\n");
     }
 
     #[tokio::test]

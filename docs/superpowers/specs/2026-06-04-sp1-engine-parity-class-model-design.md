@@ -13,7 +13,7 @@
 
 ## Non-goals (explicitly out of SP1)
 
-These belong to SP2 (new language features) and are NOT in scope here: `instanceof` as a language feature, `map` literal syntax, `object.freeze`, default parameters on functions/arrows, auto-`init`/records, sync `for (x in generator)`. `..=` and `yield` as field-default expressions stay rejected (symmetric across engines, by design). The `--tree-walker` legacy-front-end syntax strictness (e.g. requires `if (cond)` parens) is unchanged — it is a debug/oracle engine, not a second dialect.
+These belong to SP2 (new language features) and are NOT in scope here: `instanceof` as a language feature, `map` literal syntax, `object.freeze`, default parameters on functions/arrows, auto-`init`/records, sync `for (x in generator)`. `..=` and `yield` as field-default expressions stay rejected (symmetric across engines, by design). **(Superseded by SP2: `..=` field defaults ARE supported — they materialize to an eager `array<number>` and run byte-identically on both engines; only `yield` field defaults remain rejected, symmetrically.)** The `--tree-walker` legacy-front-end syntax strictness (e.g. requires `if (cond)` parens) is unchanged — it is a debug/oracle engine, not a second dialect.
 
 ---
 
@@ -97,11 +97,11 @@ Differential + checker tests, byte-identical both engines: a sync `static fn`, a
 Computed field defaults (binary/index/ternary/template/call) run on both engines (the `cst_default_expr` completeness work shipped). Remaining gaps: (a) a few edge default-expression forms still error in `cst_default_expr` (`src/compile/mod.rs:229/254/298` — e.g. certain literal/operator forms); (b) **arrow and `match` field defaults run via `ascript run` but `ascript build` rejects them** (`.aso` serialization `NonLiteralConst`) — a build-only divergence from run.
 
 ### Target
-- Audit `cst_default_expr` for every default-expression form the tree-walker accepts as a field default; lower each so construct and `.from` match the tree-walker. Any form that stays rejected must be **symmetric** (the tree-walker rejects it too) and documented — `..=` and `yield` defaults remain rejected by design.
+- Audit `cst_default_expr` for every default-expression form the tree-walker accepts as a field default; lower each so construct and `.from` match the tree-walker. Any form that stays rejected must be **symmetric** (the tree-walker rejects it too) and documented — `..=` and `yield` defaults remain rejected by design. **(Superseded by SP2: the audit also enabled `..=` field defaults; they are supported on both engines. Only `yield` field defaults remain rejected, symmetrically.)**
 - Make `.aso` serialization round-trip arrow/match field defaults (whatever representation the compiler uses for them — today they re-parse via the legacy front-end at compile; the `.aso` must persist enough to reconstruct, OR persist the source text to re-parse on load) so `ascript build f.as && ascript run f.aso` == `ascript run f.as` for every field-default form. Bump `.aso` version if the layout changes (coordinate with §3's bump — one version bump for SP1).
 
 ### Tests
-Differential + build+VM+assert (`tests/aso.rs`): every supported field-default form via `C()` and `C.from({})`, plus an arrow default and a `match` default built to `.aso` and run, byte-identical to the tree-walker. Confirm `..=`/`yield` defaults still error symmetrically.
+Differential + build+VM+assert (`tests/aso.rs`): every supported field-default form via `C()` and `C.from({})`, plus an arrow default and a `match` default built to `.aso` and run, byte-identical to the tree-walker. Confirm `yield` defaults still error symmetrically. **(Superseded by SP2: `..=` field defaults are supported and locked by `tests/vm_differential.rs::sp2_f_inclusive_range_field_default_three_way` + the `tests/aso.rs` `..=`-field-default round-trip; only `yield` remains rejected.)**
 
 ---
 

@@ -12,11 +12,23 @@
 //! - callee is not a plain name (a method call `x.m(...)`, a computed callee);
 //! - the name is unresolved / a bare global builtin / an import / a parameter /
 //!   has multiple decls / is shadowed (only a unique file-declared `fn` proceeds);
-//! - the function has a REST parameter (`...rest`) — arity is a range, not exact;
+//! - the function has a REST parameter (`...rest`) — the MAX is unbounded, so a
+//!   too-MANY call is never flagged (a too-FEW call below the min is still flagged);
 //! - any call argument is a SPREAD (`f(...xs)`) — the count is unknown.
 //!
-//! (AScript has no default-parameter syntax — `fn f(a, b = 1)` does not parse —
-//! so there is no default-value case to skip.)
+//! Default parameters (SP2 §2) make arity a RANGE: `min` = the leading run of
+//! params with no default; `max` = the param count (or ∞ with a rest). A call is
+//! flagged when `arg_count < min` or (no rest and `arg_count > max`).
+//!
+//! Record construction (SP2 §5): a `CallExpr` whose callee resolves to a unique
+//! in-file `ClassDecl` is a constructor call. If the class (or any ancestor in a
+//! fully-resolvable in-file chain) declares an instance `init`, the call is
+//! checked against THAT `init`'s param arity (its params, never `self`). If NO
+//! class in the chain declares `init`, the class auto-derives a positional
+//! constructor over its MERGED declared fields (base-class-first): `min` =
+//! required fields (no default), `max` = total fields. Conservative: the whole
+//! call is skipped unless the entire superclass chain is uniquely-resolvable
+//! in-file classes (an unknown/imported base means unknown fields).
 
 use crate::check::diagnostic::{AsDiagnostic, Severity};
 use crate::check::rules::{code_range, fn_name, is_expr_kind};
@@ -41,6 +53,18 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
     }
     let unique = |name: &str| counts.get(name).copied() == Some(1);
 
+    // Same idea for classes: name → ClassDecl, only for names declared exactly once
+    // (a class call `C(args)` is a constructor — SP2 §5 records / `init` arity).
+    let mut class_counts: HashMap<String, usize> = HashMap::new();
+    let mut class_by_name: HashMap<String, ResolvedNode> = HashMap::new();
+    for c in tree.descendants().filter(|n| n.kind() == ClassDecl) {
+        if let Some(name) = crate::syntax::resolve::ident_text(c) {
+            *class_counts.entry(name.clone()).or_default() += 1;
+            class_by_name.insert(name, c.clone());
+        }
+    }
+    let class_unique = |name: &str| class_counts.get(name).copied() == Some(1);
+
     let mut out = Vec::new();
     for call in tree.descendants().filter(|n| n.kind() == CallExpr) {
         // The callee must be a plain `NameRef` directly under the call (a method
@@ -50,23 +74,29 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         };
         let name = crate::syntax::resolve::ident_text(callee).unwrap_or_default();
 
-        if !unique(&name) {
-            continue;
-        }
-        let Some(fn_decl) = by_name.get(&name) else {
-            continue;
+        // Resolve the callee to EITHER a unique top-level `fn` (function-arity) OR a
+        // unique in-file `class` (constructor-arity, SP2 §5). A name can't be both
+        // (single binding required for either), so try the fn path first, then the
+        // class path; skip the call if neither applies.
+        let arity = if unique(&name)
+            && by_name.get(&name).is_some_and(|fn_decl| {
+                // Mirrors `unknown_enum_variant::resolves_to_enum`: the use must bind to
+                // the GENUINE top-level `fn` (not a shadowing `let`/`const`/param).
+                resolves_to_fn(callee, name.as_str(), fn_decl.text_range(), resolved)
+            }) {
+            Some(fn_arity(&by_name[&name]))
+        } else if class_unique(&name)
+            && class_by_name.get(&name).is_some_and(|cls| {
+                resolves_to_class(callee, name.as_str(), cls.text_range(), resolved)
+            }) {
+            // Constructor arity: an inherited/explicit `init`'s params, or — if no
+            // class in the chain defines `init` — the merged declared-field count.
+            // `None` means the chain isn't fully in-file resolvable → skip.
+            class_arity(&class_by_name[&name], &class_by_name, &class_counts)
+        } else {
+            None
         };
-        // The callee must resolve to the GENUINE top-level `fn` we matched by name —
-        // not a `let`/`const`/parameter that legally SHADOWS that name in an inner
-        // scope. Mirrors `unknown_enum_variant::resolves_to_enum`: verify the resolved
-        // use binds to a `Fn` binding declared at exactly this `FnDecl`'s range, with
-        // no other (shadowing) binding of the same name. (call_arity.rs:resolves_to_fn)
-        if !resolves_to_fn(callee, name.as_str(), fn_decl.text_range(), resolved) {
-            continue;
-        }
-
-        // A rest parameter makes the arity a range, not exact → skip.
-        let Some(param_count) = fixed_param_count(fn_decl) else {
+        let Some(Arity { min, max }) = arity else {
             continue;
         };
 
@@ -82,13 +112,23 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
             .filter(|c| is_expr_kind(c.kind()))
             .count();
 
-        if arg_count != param_count {
+        // Too few (below the required min) or, when the arity is bounded, too many.
+        let too_few = arg_count < min;
+        let too_many = max.is_some_and(|m| arg_count > m);
+        if too_few || too_many {
+            // Describe the expected count: an exact `N` when min == max, else a
+            // range (`at least N` with a rest, `N to M` otherwise).
+            let expected = match max {
+                Some(m) if m == min => format!("{min} argument(s)"),
+                Some(m) => format!("{min} to {m} argument(s)"),
+                None => format!("at least {min} argument(s)"),
+            };
             out.push(AsDiagnostic {
                 range: code_range(call),
                 severity: Severity::Warning,
                 code: "call-arity".to_string(),
                 message: format!(
-                    "{name} expects {param_count} argument(s) but is called with {arg_count}"
+                    "{name} expects {expected} but is called with {arg_count}"
                 ),
                 fix: None,
             });
@@ -97,27 +137,50 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
     out
 }
 
-/// The number of FIXED (positional) parameters of a `FnDecl`, or `None` if it has
-/// a REST parameter (`...name`) — in which case the arity is a range and the call
-/// must not be flagged. A param is a rest iff it carries a `DotDotDot` token
-/// (same detection as `contract.rs::param_types`).
-fn fixed_param_count(fn_decl: &ResolvedNode) -> Option<usize> {
+/// The arity range of a `FnDecl`: `min` leading required params (no default),
+/// `max` total positional params, or `None` when a `...rest` makes it unbounded.
+struct Arity {
+    min: usize,
+    max: Option<usize>,
+}
+
+/// The arity range of a `FnDecl`. `min` is the leading run of POSITIONAL params
+/// with no default (SP2 §2: a required param may not follow a defaulted one, so
+/// this is the count of params before the first defaulted one); `max` is the
+/// positional param count, or `None` when a `...rest` param makes it unbounded. A
+/// param is a rest iff it carries a `DotDotDot` token; it has a default iff it has
+/// an EXPRESSION child (the `= expr` part — distinct from its TYPE child).
+fn fn_arity(fn_decl: &ResolvedNode) -> Arity {
     use SyntaxKind::*;
     let Some(list) = fn_decl.children().find(|c| c.kind() == ParamList) else {
-        return Some(0); // no param list ⇒ zero params
+        return Arity {
+            min: 0,
+            max: Some(0),
+        };
     };
-    let mut count = 0usize;
+    let mut min = 0usize;
+    let mut positional = 0usize;
+    let mut seen_default = false;
     for p in list.children().filter(|c| c.kind() == Param) {
         let is_rest = p
             .children_with_tokens()
             .filter_map(|el| el.into_token())
             .any(|t| t.kind() == DotDotDot);
         if is_rest {
-            return None; // variadic — arity not exact
+            return Arity { min, max: None }; // variadic — max unbounded
         }
-        count += 1;
+        positional += 1;
+        let has_default = p.children().any(|c| is_expr_kind(c.kind()));
+        if has_default {
+            seen_default = true;
+        } else if !seen_default {
+            min += 1;
+        }
     }
-    Some(count)
+    Arity {
+        min,
+        max: Some(positional),
+    }
 }
 
 /// Does the callee `NameRef` resolve to the genuine binding of the unique top-level
@@ -154,6 +217,129 @@ fn resolves_to_fn(
         return false; // ambiguous: the name is bound more than once (shadowing)
     }
     only.kind == BindingKind::Fn && only.decl_range == decl_range
+}
+
+/// Does the callee `NameRef` resolve to the genuine unique top-level `class`
+/// `name` declared at `decl_range`? Same structure as `resolves_to_fn` but for a
+/// `Class` binding — a `let`/`const`/param that shadows the class name produces a
+/// second binding, so the call is correctly skipped.
+fn resolves_to_class(
+    callee: &ResolvedNode,
+    name: &str,
+    decl_range: cstree::text::TextRange,
+    resolved: &ResolveResult,
+) -> bool {
+    let bound = match resolved.uses.get(&callee.text_range()) {
+        Some(Resolution::Local(_) | Resolution::Upvalue(_)) => true,
+        Some(Resolution::Global(gname)) => resolved
+            .bindings
+            .iter()
+            .any(|b| b.is_global && b.name == *gname),
+        _ => false,
+    };
+    if !bound {
+        return false;
+    }
+    let mut same_name = resolved.bindings.iter().filter(|b| b.name == name);
+    let Some(only) = same_name.next() else {
+        return false;
+    };
+    if same_name.next().is_some() {
+        return false; // ambiguous: the name is bound more than once (shadowing)
+    }
+    only.kind == BindingKind::Class && only.decl_range == decl_range
+}
+
+/// The superclass name of a `ClassDecl` (the `Ident` after the soft keyword
+/// `extends`), or `None` for a class without `extends`. Mirrors
+/// `resolve::record_superclass_use`'s token walk.
+fn superclass_name(class: &ResolvedNode) -> Option<String> {
+    use SyntaxKind::*;
+    class
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .skip_while(|t| !(t.kind() == Ident && t.text() == "extends"))
+        .filter(|t| t.kind() == Ident)
+        .nth(1)
+        .map(|t| t.text().to_string())
+}
+
+/// The instance `init` `MethodDecl` of a class, if it declares one (not a static
+/// method — auto-init / construction only consider instance `init`).
+fn instance_init(class: &ResolvedNode) -> Option<ResolvedNode> {
+    use SyntaxKind::*;
+    class
+        .children()
+        .filter(|c| c.kind() == MethodDecl)
+        .find(|m| {
+            crate::syntax::resolve::ident_text(m).as_deref() == Some("init")
+                && !crate::syntax::resolve::is_static_method(m)
+        })
+        .cloned()
+}
+
+/// The constructor arity of a class call (SP2 §5). Returns `None` (skip the call)
+/// when the class's superclass chain is NOT fully resolvable to unique in-file
+/// classes — an unknown/imported base means unknown inherited fields/`init`.
+///
+/// - If ANY class in the chain declares an instance `init`, the call is checked
+///   against the LEAF-resolved `init`'s params (`init` is inherited, so the first
+///   one found walking leaf→base wins; its arity is its param list, never `self`).
+/// - Otherwise (no `init` anywhere) the class auto-derives a positional
+///   constructor over the MERGED fields, base-class-FIRST: `min` = fields without
+///   a default, `max` = total field count.
+fn class_arity(
+    class: &ResolvedNode,
+    class_by_name: &HashMap<String, ResolvedNode>,
+    class_counts: &HashMap<String, usize>,
+) -> Option<Arity> {
+    // Walk leaf → base, collecting the chain. Bail (None) on any unresolvable or
+    // non-unique superclass, or a cycle (defensive depth cap).
+    let mut chain: Vec<ResolvedNode> = Vec::new();
+    let mut cur = class.clone();
+    loop {
+        chain.push(cur.clone());
+        let Some(sup) = superclass_name(&cur) else {
+            break; // reached a root class — chain fully in-file
+        };
+        if class_counts.get(&sup).copied() != Some(1) {
+            return None; // base is unknown/imported/ambiguous → can't count fields
+        }
+        let parent = class_by_name.get(&sup)?;
+        if chain.len() > 64 {
+            return None; // pathological/cyclic — stay conservative
+        }
+        cur = parent.clone();
+    }
+    // `init` inherited: leaf→base, first one wins (matches `find_method`).
+    if let Some(init) = chain.iter().find_map(instance_init) {
+        return Some(fn_arity(&init));
+    }
+    // No `init`: auto-init over MERGED fields, base-class FIRST (reverse leaf→base).
+    // `merged_field_schema` dedups by name with `IndexMap::insert`: a re-declared
+    // name keeps its FIRST-seen (base) POSITION but takes the LAST-written (leaf)
+    // schema — so a subclass override decides the field's default-ness. We mirror
+    // that: iterate base→leaf, recording each name's latest `has_default`; the
+    // distinct-name count is `max`, the count of still-required names is `min`.
+    use SyntaxKind::*;
+    let mut field_default: indexmap::IndexMap<String, bool> = indexmap::IndexMap::new();
+    for c in chain.iter().rev() {
+        for field in c.children().filter(|n| n.kind() == FieldDecl) {
+            let Some(fname) = crate::syntax::resolve::ident_text(field) else {
+                continue;
+            };
+            // A field has a default iff it carries an EXPRESSION child (the `= expr`,
+            // distinct from its TYPE child) — same test as `fn_arity`'s `has_default`.
+            let has_default = field.children().any(|c| is_expr_kind(c.kind()));
+            field_default.insert(fname, has_default);
+        }
+    }
+    let total = field_default.len();
+    let required = field_default.values().filter(|&&d| !d).count();
+    Some(Arity {
+        min: required,
+        max: Some(total),
+    })
 }
 
 #[cfg(test)]
@@ -264,5 +450,161 @@ mod tests {
             .find(|d| d.code == "call-arity")
             .unwrap();
         assert_eq!(d.message, "f expects 2 argument(s) but is called with 3");
+    }
+
+    // ---- SP2 §2: default-parameter arity range -----------------------------
+
+    #[test]
+    fn default_param_in_range_not_flagged() {
+        // `fn f(a, b = 1)` accepts 1 OR 2 args — both are in range.
+        assert!(
+            !has("fn f(a, b = 1) { return a }\nf(1)", "call-arity"),
+            "{:?}",
+            analyze("fn f(a, b = 1) { return a }\nf(1)").diagnostics
+        );
+        assert!(
+            !has("fn f(a, b = 1) { return a }\nf(1, 2)", "call-arity"),
+            "{:?}",
+            analyze("fn f(a, b = 1) { return a }\nf(1, 2)").diagnostics
+        );
+    }
+
+    #[test]
+    fn default_param_too_few_flagged() {
+        // Below the required min (1) → flagged.
+        let src = "fn f(a, b = 1) { return a }\nf()";
+        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "call-arity")
+            .unwrap();
+        assert_eq!(d.message, "f expects 1 to 2 argument(s) but is called with 0");
+    }
+
+    #[test]
+    fn default_param_too_many_flagged() {
+        // Above the max (2, no rest) → flagged.
+        let src = "fn f(a, b = 1) { return a }\nf(1, 2, 3)";
+        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn default_with_rest_only_too_few_flagged() {
+        // `fn f(a, b = 2, ...xs)`: min 1, max unbounded. Too-few (0) flagged; any
+        // count >= 1 is in range (never too-many).
+        let too_few = "fn f(a, b = 2, ...xs) { return a }\nf()";
+        assert_eq!(
+            count(too_few, "call-arity"),
+            1,
+            "{:?}",
+            analyze(too_few).diagnostics
+        );
+        let in_range = "fn f(a, b = 2, ...xs) { return a }\nf(1)\nf(1, 2, 3, 4)";
+        assert!(
+            !has(in_range, "call-arity"),
+            "{:?}",
+            analyze(in_range).diagnostics
+        );
+    }
+
+    // ---- SP2 §5: record / auto-init constructor arity ----------------------
+
+    #[test]
+    fn record_construction_too_few_flagged() {
+        // A field-only class auto-derives a constructor over its fields: `Point(1)`
+        // is too few (2 required).
+        let src = "class Point { x: number\n y: number }\nPoint(1)";
+        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "call-arity")
+            .unwrap();
+        assert_eq!(d.message, "Point expects 2 argument(s) but is called with 1");
+    }
+
+    #[test]
+    fn record_construction_in_range_not_flagged() {
+        let src = "class Point { x: number\n y: number }\nPoint(1, 2)";
+        assert!(!has(src, "call-arity"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn record_construction_too_many_flagged() {
+        let src = "class Point { x: number\n y: number }\nPoint(1, 2, 3)";
+        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn record_defaulted_field_is_a_range() {
+        // A defaulted field makes the count a 1..2 range.
+        let one = "class P { x: number\n y: number = 0 }\nP(1)";
+        let two = "class P { x: number\n y: number = 0 }\nP(1, 2)";
+        assert!(!has(one, "call-arity"), "{:?}", analyze(one).diagnostics);
+        assert!(!has(two, "call-arity"), "{:?}", analyze(two).diagnostics);
+        let none = "class P { x: number\n y: number = 0 }\nP()";
+        assert_eq!(
+            count(none, "call-arity"),
+            1,
+            "{:?}",
+            analyze(none).diagnostics
+        );
+        let three = "class P { x: number\n y: number = 0 }\nP(1, 2, 3)";
+        assert_eq!(
+            count(three, "call-arity"),
+            1,
+            "{:?}",
+            analyze(three).diagnostics
+        );
+    }
+
+    #[test]
+    fn class_with_init_validates_against_init_params_not_fields() {
+        // A class WITH an explicit init is checked against the INIT's params, NOT
+        // the field count. Here init takes 1 arg though there are 2 fields, so
+        // `C(5)` is fine and `C(5, 6)` is too many.
+        let ok = "class C { x: number\n y: number = 0\n fn init(v) { self.x = v } }\nC(5)";
+        assert!(!has(ok, "call-arity"), "{:?}", analyze(ok).diagnostics);
+        let too_many = "class C { x: number\n fn init(v) { self.x = v } }\nC(5, 6)";
+        assert_eq!(
+            count(too_many, "call-arity"),
+            1,
+            "{:?}",
+            analyze(too_many).diagnostics
+        );
+    }
+
+    #[test]
+    fn record_inheritance_merged_field_arity() {
+        // Base fields then subclass fields, no init anywhere → merged count (a=1,
+        // b=1) = 2 required. `B(1)` too few; `B(1, 2)` ok; `B(1, 2, 3)` too many.
+        let base = "class A { a: number }\nclass B extends A { b: number }\n";
+        let too_few = format!("{base}B(1)");
+        let ok = format!("{base}B(1, 2)");
+        let too_many = format!("{base}B(1, 2, 3)");
+        assert_eq!(count(&too_few, "call-arity"), 1, "{:?}", analyze(&too_few).diagnostics);
+        assert!(!has(&ok, "call-arity"), "{:?}", analyze(&ok).diagnostics);
+        assert_eq!(count(&too_many, "call-arity"), 1, "{:?}", analyze(&too_many).diagnostics);
+    }
+
+    #[test]
+    fn record_unknown_superclass_skipped() {
+        // An imported/unknown base means unknown inherited fields → conservatively
+        // skip (no false positive). `Base` is not declared in-file.
+        let src = "class B extends Base { b: number }\nB(1, 2, 3, 4)";
+        assert!(!has(src, "call-arity"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn zero_field_class_extra_arg_flagged() {
+        let src = "class E {}\nE(1)";
+        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "call-arity")
+            .unwrap();
+        assert_eq!(d.message, "E expects 0 argument(s) but is called with 1");
     }
 }

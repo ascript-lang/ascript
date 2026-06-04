@@ -11,17 +11,17 @@ WhileStmt = 'while' cond:Expr body:Block
 ReturnStmt = 'return' Expr?
 FnDecl = 'fn' 'ident' ParamList Block
 ParamList = '(' Param* ')'
-Param = 'ident'
+Param = '...'? 'ident' (':' Type)? ('=' Expr)?
 Expr =
     Literal | NameRef | UnaryExpr | BinaryExpr | ParenExpr | CallExpr
   | MemberExpr | IndexExpr | ArrowExpr | AssignExpr
-  | ArrayExpr | ObjectExpr | TemplateExpr | OptMemberExpr
+  | ArrayExpr | ObjectExpr | MapExpr | TemplateExpr | OptMemberExpr
   | TryExpr | UnwrapExpr | TernaryExpr | AwaitExpr | YieldExpr | MatchExpr
   | RangeExpr
 Literal = 'number' | 'string' | 'true' | 'false' | 'nil'
 NameRef = 'ident'
 UnaryExpr = op:('-' | '!') Expr
-BinaryExpr = lhs:Expr op:('+'|'-'|'*'|'/'|'%'|'**'|'=='|'!='|'<'|'<='|'>'|'>='|'&&'|'||'|'??') rhs:Expr
+BinaryExpr = lhs:Expr op:('+'|'-'|'*'|'/'|'%'|'**'|'=='|'!='|'<'|'<='|'>'|'>='|'&&'|'||'|'??'|'instanceof') rhs:Expr
 ParenExpr = '(' Expr ')'
 CallExpr = Expr ArgList
 ArgList = '(' Expr* ')'
@@ -32,6 +32,8 @@ AssignExpr = target:Expr '=' value:Expr
 ArrayExpr = '[' (Expr | SpreadElem)* ']'
 ObjectExpr = '{' (ObjectField | SpreadElem)* '}'
 ObjectField = key:('ident' | 'string') ':' value:Expr
+MapExpr = '#{' MapEntry* '}'
+MapEntry = key:Expr ':' value:Expr
 SpreadElem = '...' Expr
 TemplateExpr = 'template'
 OptMemberExpr = Expr '?.' 'ident'

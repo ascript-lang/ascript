@@ -19,8 +19,8 @@ always allowed but never required. The same optional `;` may separate **class me
 (`class P { x: number; y: number }`); newlines are the canonical form and the formatter normalizes
 `;` back to newlines. Note that `enum` variants are **comma**-separated, not `;`-separated.
 
-**Keywords:** `let const fn return if else while for of in match async await class extends super self
-enum import export nil true false`.
+**Keywords:** `let const fn return if else while for of in instanceof match async await class extends
+super self enum import export nil true false`.
 
 ## Bindings
 
@@ -110,6 +110,7 @@ order, and is `{}` when nothing is left over.
 ```text
 +  -  *  /  %  **        arithmetic ( ** is exponentiation )
 == != <  <= >  >=        comparison
+instanceof               class membership test — x instanceof C (see Classes)
 && || !                  logical (short-circuit)
 ?? ?.                    nil-coalescing / optional chaining
 ?  :                     conditional (ternary)  — cond ? then : else
@@ -128,7 +129,7 @@ step                     range stride (contextual keyword) — a..b step k
 **                      exponentiation
 *  /  %                 multiplicative
 +  -                    additive
-<  <= >  >=             relational
+<  <= >  >=  instanceof   relational
 == !=                   equality
 &&                      logical and
 ||                      logical or
@@ -278,6 +279,41 @@ print(next())   // 2
 
 A function may be `async` (see [Modules & async](modules-async)). Arrow functions may be async too:
 `async (x) => x + 1`.
+
+### Default parameters
+
+A parameter may carry a **default value** — `fn f(a, b = expr)` (and the same on arrows,
+methods, `init`, `async fn`, and `fn*`). The default is evaluated at **call time**,
+**left-to-right**, and **only when the corresponding trailing argument is omitted**:
+
+```ascript
+fn add(a, b = 10) {
+  return a + b
+}
+print(add(1))      // 11   (b defaults)
+print(add(1, 2))   // 3    (b supplied — the default is not evaluated)
+print(add(1, nil)) // 1    (an explicit `nil` SUPPRESSES the default — only a MISSING arg triggers it)
+```
+
+A default expression may reference **earlier already-bound parameters** (and any outer scope or
+global), and may run arbitrary code (e.g. call a function):
+
+```ascript
+fn grow(a, b = a * 2, c = a + b) {
+  return [a, b, c]
+}
+print(grow(5))       // [5, 10, 15]
+print(grow(5, 1))    // [5, 1, 6]
+```
+
+The **minimum arity** is the count of leading parameters with no default; defaulted parameters are
+optional. A required (no-default) parameter may **not** follow a defaulted one — `fn f(a = 1, b)` is
+a compile error (`a required parameter cannot follow a defaulted parameter`). A defaulted parameter
+may carry a type annotation (`b: number = 2`); the default value **and** any explicitly-passed value
+are both contract-checked.
+
+Defaults compose with a rest parameter — `fn f(a, b = 2, ...xs)` makes `a` required, `b` defaulted,
+and `xs` collect the rest.
 
 ### Rest parameters
 

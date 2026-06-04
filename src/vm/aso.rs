@@ -79,7 +79,17 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   re-lowered through the legacy front-end. The class byte layout is unchanged
 ///   (the source rides inside the field-default expr stream). Opcode byte values
 ///   are unchanged.
-pub const ASO_FORMAT_VERSION: u32 = 11;
+/// - 12: `instanceof` operator (SP2 §1) — the compiler now legitimately emits the
+///   formerly-dead `Op::InstanceOf` opcode, and the field-default binop wire-tag
+///   set gained tag 16 (`BinOp::InstanceOf`). Old chunks never contained either, so
+///   older readers must reject a v12 chunk. This is the single SP2 bump; later SP2
+///   phases that touch emitted bytecode reuse it.
+/// - 14: `#{…}` map literals (SP2 §3) — two new opcodes (`Op::NewMap`/`Op::MapEntry`,
+///   inserted after `NewObject`, shifting all later opcode byte values) and a new
+///   `EX_MAP` field-default expr tag (a `#{…}` literal in field-default position
+///   serializes as `ExprKind::Map`). Old chunks never contained either, so older
+///   readers must reject a v14 chunk.
+pub const ASO_FORMAT_VERSION: u32 = 14;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -199,6 +209,9 @@ const EX_RANGE: u8 = 20;
 /// to the identical `Expr`. Emitted by `write_field_default` (consulting the class's
 /// `default_sources`), NOT by the generic `write_expr` (which never sees these forms).
 const EX_REPARSE: u8 = 21;
+/// A `#{…}` map literal field default (`ExprKind::Map`, SP2 §3). Followed by a
+/// `len`-prefixed sequence of (key-expr, value-expr) pairs.
+const EX_MAP: u8 = 22;
 
 // Template-part tags (within an `EX_TEMPLATE`).
 const TP_LIT: u8 = 0;
@@ -652,7 +665,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
             for _ in 0..n {
                 elems.push(read_value(r)?);
             }
-            Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(elems)))
+            Value::Array(crate::value::ArrayCell::new(elems))
         }
         other => return Err(AsoError::BadConst(other)),
     };
@@ -709,6 +722,12 @@ fn write_param(w: &mut Writer, p: &Param) {
     w.usize(p.name_span.start);
     w.usize(p.name_span.end);
     w.u8(u8::from(p.rest));
+    // Only the PRESENCE of a default matters here: the VM evaluates defaults via
+    // the function body's compiled prologue (already serialized in the chunk
+    // code), and `check_call_args` reads only `default.is_some()` to compute
+    // min-arity. So serialize a single presence flag; reconstruct a placeholder
+    // `Expr` on read (its content is never inspected by the VM).
+    w.u8(u8::from(p.default.is_some()));
 }
 
 fn read_param(r: &mut Reader) -> Result<Param, AsoError> {
@@ -717,11 +736,17 @@ fn read_param(r: &mut Reader) -> Result<Param, AsoError> {
     let start = r.usize()?;
     let end = r.usize()?;
     let rest = r.u8()? != 0;
+    let has_default = r.u8()? != 0;
+    let default = has_default.then(|| crate::ast::Expr {
+        kind: crate::ast::ExprKind::Nil,
+        span: Span::new(start, end),
+    });
     Ok(Param {
         name,
         ty,
         name_span: Span::new(start, end),
         rest,
+        default,
     })
 }
 
@@ -905,6 +930,14 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
                 }
             }
         }
+        ExprKind::Map(entries) => {
+            w.u8(EX_MAP);
+            w.len(entries.len());
+            for ent in entries {
+                write_expr(w, &ent.key)?;
+                write_expr(w, &ent.value)?;
+            }
+        }
         ExprKind::Member { object, name } => {
             w.u8(EX_MEMBER);
             w.str(name);
@@ -1027,6 +1060,7 @@ fn binop_tag(op: BinOp) -> u8 {
         BinOp::Or => 13,
         BinOp::Coalesce => 14,
         BinOp::Range => 15,
+        BinOp::InstanceOf => 16,
     }
 }
 
@@ -1049,6 +1083,7 @@ fn binop_from_tag(tag: u8) -> Result<BinOp, AsoError> {
         13 => BinOp::Or,
         14 => BinOp::Coalesce,
         15 => BinOp::Range,
+        16 => BinOp::InstanceOf,
         tag => return Err(AsoError::BadTag { what: "binop", tag }),
     })
 }
@@ -1122,6 +1157,16 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
                 entries.push(ent);
             }
             ExprKind::Object(entries)
+        }
+        EX_MAP => {
+            let n = r.len()?;
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let key = read_expr(r)?;
+                let value = read_expr(r)?;
+                entries.push(crate::ast::MapEntry { key, value });
+            }
+            ExprKind::Map(entries)
         }
         EX_MEMBER => {
             let name = r.str()?;
@@ -1778,10 +1823,10 @@ run()
         // The object-rest bound-key list is an `Array` of literal `Str`s; it must
         // pass the literal-only check and round-trip byte-stably.
         let mut c = Chunk::new();
-        let keys = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![
+        let keys = Value::Array(crate::value::ArrayCell::new(vec![
             Value::Str(std::rc::Rc::from("a")),
             Value::Str(std::rc::Rc::from("b")),
-        ])));
+        ]));
         c.add_const(keys);
         assert_eq!(c.check_consts_literal_only(), Ok(()));
         let rt = Chunk::from_bytes(&c.to_bytes()).expect("decode");
@@ -1801,11 +1846,11 @@ run()
         // An array containing a non-literal element is still rejected.
         let mut c = Chunk::new();
         c.consts
-            .push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+            .push(Value::Array(crate::value::ArrayCell::new(
                 vec![Value::Object(crate::value::ObjectCell::new(
                     indexmap::IndexMap::new(),
                 ))],
-            ))));
+            )));
         assert_eq!(c.check_consts_literal_only(), Err("object"));
     }
 

@@ -574,11 +574,31 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
+                // Optional default value: `name = expr` (not for a rest param).
+                let default = if !is_rest && *self.peek() == Tok::Eq {
+                    self.advance();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                // A required (no-default) param may not follow a defaulted one.
+                if default.is_none()
+                    && !is_rest
+                    && params
+                        .iter()
+                        .any(|p: &crate::ast::Param| p.default.is_some())
+                {
+                    return Err(AsError::at(
+                        "a required parameter cannot follow a defaulted parameter",
+                        name_span,
+                    ));
+                }
                 params.push(crate::ast::Param {
                     name,
                     ty,
                     name_span,
                     rest: is_rest,
+                    default,
                 });
                 if is_rest {
                     if *self.peek() == Tok::Comma {
@@ -1044,6 +1064,7 @@ impl<'a> Parser<'a> {
                             ty: None,
                             name_span,
                             rest: false,
+                            default: None,
                         }],
                         body: Box::new(body),
                         is_async,
@@ -1209,6 +1230,7 @@ impl<'a> Parser<'a> {
                 Tok::Le => BinOp::Le,
                 Tok::Gt => BinOp::Gt,
                 Tok::Ge => BinOp::Ge,
+                Tok::Instanceof => BinOp::InstanceOf,
                 _ => break,
             };
             self.advance();
@@ -1669,6 +1691,41 @@ impl<'a> Parser<'a> {
                     span,
                 });
             }
+            Tok::HashBrace => {
+                let mut entries = Vec::new();
+                if *self.peek() != Tok::RBrace {
+                    loop {
+                        // D4: spread is out of scope for map literals in SP2 — a
+                        // `...` element is a clean parse error (no panic).
+                        if *self.peek() == Tok::DotDotDot {
+                            return Err(AsError::at(
+                                "spread is not allowed in a map literal",
+                                self.span(),
+                            ));
+                        }
+                        // The KEY is an arbitrary evaluated expression (unlike
+                        // object literals, where the key is a bare name/string).
+                        let key = self.expr()?;
+                        self.eat(&Tok::Colon)?;
+                        let value = self.expr()?;
+                        entries.push(crate::ast::MapEntry { key, value });
+                        if *self.peek() == Tok::Comma {
+                            self.advance();
+                            if *self.peek() == Tok::RBrace {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat(&Tok::RBrace)?;
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr {
+                    kind: ExprKind::Map(entries),
+                    span,
+                });
+            }
             Tok::TemplateStr(s) => {
                 let parts = vec![crate::ast::TemplatePart::Lit(s)];
                 let span = Span::new(tok_span.start, self.prev_end());
@@ -1772,6 +1829,7 @@ fn starts_expression(tok: &Tok) -> bool {
             | Tok::LParen
             | Tok::LBracket
             | Tok::LBrace
+            | Tok::HashBrace
             | Tok::Minus
             | Tok::Bang
             | Tok::Await

@@ -386,7 +386,7 @@ fn bin_prec(op: BinOp) -> u8 {
         BinOp::And => 2,
         BinOp::Coalesce => 3,
         BinOp::Eq | BinOp::Ne => 4,
-        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 5,
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::InstanceOf => 5,
         // Range binds looser than additive but tighter than comparison
         // (grammar PREC.range = 7, between compare = 6 and add = 8).
         BinOp::Range => 6,
@@ -582,6 +582,24 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                             write_expr(out, x, PREC_ASSIGN);
                         }
                     }
+                }
+                out.push_str(" }");
+            }
+        }
+        ExprKind::Map(entries) => {
+            if entries.is_empty() {
+                out.push_str("#{}");
+            } else {
+                out.push_str("#{ ");
+                for (i, e) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    // The map-key is an arbitrary expression (NOT the object-key
+                    // quoting logic): format it as an expression.
+                    write_expr(out, &e.key, PREC_ASSIGN);
+                    out.push_str(": ");
+                    write_expr(out, &e.value, PREC_ASSIGN);
                 }
                 out.push_str(" }");
             }

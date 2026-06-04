@@ -7,7 +7,6 @@ use crate::interp::{Control, Interp};
 use crate::span::Span;
 use crate::value::{MapKey, Value};
 use indexmap::IndexMap;
-use std::cell::RefCell;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -59,7 +58,7 @@ impl Interp {
                     let v = self.call_value(f.clone(), vec![item], span).await?;
                     out.push(v);
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "filter" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("filter"))?;
@@ -72,7 +71,7 @@ impl Interp {
                         out.push(item);
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "reduce" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("reduce"))?;
@@ -86,6 +85,7 @@ impl Interp {
             }
             "push" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("push"))?;
+                crate::interp::check_not_frozen(&arg(args, 0), span)?;
                 let item = arg(args, 1);
                 let mut b = arr.borrow_mut();
                 b.push(item);
@@ -93,6 +93,7 @@ impl Interp {
             }
             "pop" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("pop"))?;
+                crate::interp::check_not_frozen(&arg(args, 0), span)?;
                 let popped = arr.borrow_mut().pop();
                 Ok(popped.unwrap_or(Value::Nil))
             }
@@ -110,7 +111,7 @@ impl Interp {
                 } else {
                     Vec::new()
                 };
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "contains" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("contains"))?;
@@ -176,7 +177,7 @@ impl Interp {
                         items = sorted;
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
+                Ok(Value::Array(crate::value::ArrayCell::new(items)))
             }
             "find" => {
                 let a = want_array(&arg(args, 0), span, &ctx("find"))?;
@@ -262,7 +263,7 @@ impl Interp {
                 };
                 let mut out = Vec::new();
                 flatten_into(&a.borrow(), depth, &mut out);
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "flatMap" => {
                 let a = want_array(&arg(args, 0), span, &ctx("flatMap"))?;
@@ -276,13 +277,13 @@ impl Interp {
                         other => out.push(other),
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "reverse" => {
                 let a = want_array(&arg(args, 0), span, &ctx("reverse"))?;
                 let mut items = a.borrow().clone();
                 items.reverse();
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
+                Ok(Value::Array(crate::value::ArrayCell::new(items)))
             }
             "concat" => {
                 let a = want_array(&arg(args, 0), span, &ctx("concat"))?;
@@ -291,7 +292,7 @@ impl Interp {
                     let more = want_array(extra, span, &format!("array.concat arg {}", i))?;
                     out.extend(more.borrow().iter().cloned());
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "first" => {
                 let a = want_array(&arg(args, 0), span, &ctx("first"))?;
@@ -311,7 +312,7 @@ impl Interp {
                         out.push(item.clone());
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "take" => {
                 let a = want_array(&arg(args, 0), span, &ctx("take"))?;
@@ -322,7 +323,7 @@ impl Interp {
                     (nf as usize).min(a.borrow().len())
                 };
                 let out = a.borrow()[..k].to_vec();
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "drop" => {
                 let a = want_array(&arg(args, 0), span, &ctx("drop"))?;
@@ -333,7 +334,7 @@ impl Interp {
                     (nf as usize).min(a.borrow().len())
                 };
                 let out = a.borrow()[k..].to_vec();
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "chunk" => {
                 let a = want_array(&arg(args, 0), span, &ctx("chunk"))?;
@@ -347,9 +348,9 @@ impl Interp {
                 let out: Vec<Value> = a
                     .borrow()
                     .chunks(n)
-                    .map(|c| Value::Array(gcmodule::Cc::new(RefCell::new(c.to_vec()))))
+                    .map(|c| Value::Array(crate::value::ArrayCell::new(c.to_vec())))
                     .collect();
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "zip" => {
                 if args.is_empty() {
@@ -367,9 +368,9 @@ impl Interp {
                 let mut out = Vec::with_capacity(len);
                 for i in 0..len {
                     let tuple: Vec<Value> = cols.iter().map(|c| c[i].clone()).collect();
-                    out.push(Value::Array(gcmodule::Cc::new(RefCell::new(tuple))));
+                    out.push(Value::Array(crate::value::ArrayCell::new(tuple)));
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             "groupBy" => {
                 let a = want_array(&arg(args, 0), span, &ctx("groupBy"))?;
@@ -386,7 +387,7 @@ impl Interp {
                 }
                 let map: IndexMap<MapKey, Value> = groups
                     .into_iter()
-                    .map(|(k, v)| (k, Value::Array(gcmodule::Cc::new(RefCell::new(v)))))
+                    .map(|(k, v)| (k, Value::Array(crate::value::ArrayCell::new(v))))
                     .collect();
                 Ok(Value::Map(crate::value::MapCell::new(map)))
             }
@@ -406,10 +407,10 @@ impl Interp {
                         fail.push(item);
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(vec![
-                    Value::Array(gcmodule::Cc::new(RefCell::new(pass))),
-                    Value::Array(gcmodule::Cc::new(RefCell::new(fail))),
-                ]))))
+                Ok(Value::Array(crate::value::ArrayCell::new(vec![
+                    Value::Array(crate::value::ArrayCell::new(pass)),
+                    Value::Array(crate::value::ArrayCell::new(fail)),
+                ])))
             }
             _ => Err(AsError::at(format!("std/array has no function '{}'", func), span).into()),
         }
@@ -464,7 +465,7 @@ mod tests {
         Value::Number(x)
     }
     fn arr(xs: Vec<Value>) -> Value {
-        Value::Array(gcmodule::Cc::new(RefCell::new(xs)))
+        Value::Array(crate::value::ArrayCell::new(xs))
     }
 
     /// Compile a single AScript expression (e.g. an arrow function) to a runtime

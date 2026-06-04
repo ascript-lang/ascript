@@ -336,6 +336,23 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
             ',' => push(&mut tokens, Tok::Comma, start, &mut i),
             ';' => push(&mut tokens, Tok::Semicolon, start, &mut i),
             ':' => push(&mut tokens, Tok::Colon, start, &mut i),
+            '#' => {
+                if i + 1 < chars.len() && chars[i + 1] == '{' {
+                    // `#{` opens a map literal — one token, and it opens a
+                    // brace context (closed by `}`), so track the depth.
+                    brace_depth += 1;
+                    tokens.push(Token {
+                        tok: Tok::HashBrace,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
+                } else {
+                    return Err(AsError::at(
+                        "unexpected character '#'",
+                        Span::new(start, start + 1),
+                    ));
+                }
+            }
             '{' => {
                 brace_depth += 1;
                 push(&mut tokens, Tok::LBrace, start, &mut i);
@@ -501,6 +518,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "for" => Tok::For,
                     "in" => Tok::In,
                     "of" => Tok::Of,
+                    "instanceof" => Tok::Instanceof,
                     "return" => Tok::Return,
                     "break" => Tok::Break,
                     "continue" => Tok::Continue,

@@ -1,0 +1,12 @@
+# exit: none
+false
+true
+true
+[[99, 2]]
+42
+false
+false
+{a: 2}
+[1, 2]
+true
+frozen ok

@@ -151,6 +151,14 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
             let cmp = if exact == 1 { "==" } else { ">=" };
             let _ = write!(line, "{len:>5} {exact} ; len {cmp} {len}");
         }
+        // u16 param-index + i16 forward jump offset (default-param prologue).
+        Op::JumpIfArgSupplied => {
+            let param = chunk.read_u16(at + 1);
+            let disp = chunk.read_i16(at + 3);
+            let after = at + 1 + width;
+            let target = (after as i64 + disp as i64) as usize;
+            let _ = write!(line, "{param:>5} {disp} ; arg {param} present -> {target:04}");
+        }
         // Other u16-operand ops: just show the operand (no special comment).
         _ if width == 2 => {
             let idx = chunk.read_u16(at + 1);
@@ -229,6 +237,8 @@ fn op_name(op: Op) -> &'static str {
         JumpIfTrue => "JUMP_IF_TRUE",
         JumpIfNotNil => "JUMP_IF_NOT_NIL",
         Loop => "LOOP",
+        JumpIfArgSupplied => "JUMP_IF_ARG_SUPPLIED",
+        CheckParam => "CHECK_PARAM",
         Call => "CALL",
         CallMethod => "CALL_METHOD",
         CallMethodSpread => "CALL_METHOD_SPREAD",
@@ -236,6 +246,8 @@ fn op_name(op: Op) -> &'static str {
         Closure => "CLOSURE",
         NewArray => "NEW_ARRAY",
         NewObject => "NEW_OBJECT",
+        NewMap => "NEW_MAP",
+        MapEntry => "MAP_ENTRY",
         Spread => "SPREAD",
         SpreadArgs => "SPREAD_ARGS",
         AppendArray => "APPEND_ARRAY",

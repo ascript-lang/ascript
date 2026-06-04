@@ -14,7 +14,7 @@ AScript has a small, fixed set of value kinds. `type(v)` returns the kind name a
 | String | `string` | `"double"`, `'single'`, `` `template ${x}` `` | the raw text |
 | Array | `array` | `[1, 2, 3]` | `[1, "two"]` |
 | Object | `object` | `{ key: value, "quoted": 1 }` | `{a: 1, b: "x"}` |
-| Map | `map` | *(constructed via `std/map`)* | `map {"a": 1}` |
+| Map | `map` | `#{ keyExpr: value }` (or `std/map`) | `map {"a": 1}` |
 | Set | `set` | *(constructed via `std/set`)* | `set {1, "two"}` |
 | Decimal | `decimal` | *(constructed via `std/decimal`)* | `1.50`, `42` |
 | Bytes | `bytes` | *(via `std/bytes`)* | `<bytes len N>` |
@@ -95,6 +95,30 @@ import * as map from "std/map"
 let scores = map.new()
 map.set(scores, 42, "the answer")   // numeric key — needs a map, not an object
 ```
+
+### Map literals — `#{…}`
+
+A **map literal** `#{ keyExpr: valueExpr, … }` builds a `map` directly, with no `std/map` import
+needed. Unlike an object literal `{a: 1}` — where the key `a` is the literal name — a map-literal key
+is an **evaluated expression**, so its *value* becomes the key:
+
+```ascript
+let scores = #{ "alice": 10, "bob": 7 }   // string keys
+let mixed = #{ 1: "one", true: "yes", nil: "none" }   // number / bool / nil keys
+
+let k = "dynamic"
+let m = #{ k: 42, 1 + 1: "two" }   // keyed by "dynamic" and 2 — the VALUES
+print(m)                           // map {"dynamic": 42, 2: "two"}
+```
+
+- `#{}` is the empty map.
+- Keys follow the same rules as `std/map`: only `nil`, `bool`, `number`, `string` (and `decimal`)
+  are hashable; numbers are canonicalized (`-0.0` → `0.0`, all `NaN` unified). Using a container,
+  function, or instance as a key is a runtime error (`cannot use <type> as a map key`).
+- **Later-key-wins:** a duplicate key keeps the last value while preserving the first-seen position,
+  so `#{ 1: "a", 1: "b" }` is `map {1: "b"}`.
+- Read values back with [`std/map`](../stdlib/collections) (`map.get`, `map.has`, `map.keys`, …);
+  map literals interoperate fully with that API. (Spread `#{ ...m }` is not supported.)
 
 ## Sets
 

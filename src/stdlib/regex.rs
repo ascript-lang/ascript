@@ -5,7 +5,6 @@ use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
 use crate::value::{RegexHandle, Value};
-use std::cell::RefCell;
 use std::rc::Rc;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -20,7 +19,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
+    Value::Array(crate::value::ArrayCell::new(v))
 }
 
 /// Resolve arg 0 to a compiled regex: a `Value::Regex` is used directly; a

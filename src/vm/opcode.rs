@@ -185,6 +185,19 @@ pub enum Op {
     JumpIfNotNil,
     /// `LOOP(i16)` — unconditional backward relative jump (negative displacement).
     Loop,
+    /// `JUMP_IF_ARG_SUPPLIED(u16 param_index, i16 offset)` — default-parameter
+    /// prologue guard. If the current frame's `argc` (count of SUPPLIED positional
+    /// args) is `> param_index`, the caller passed this param, so jump FORWARD by
+    /// `offset` to skip its default-eval code. Otherwise fall through and run the
+    /// default. Touches no operand stack. Emitted only in a function prologue.
+    JumpIfArgSupplied,
+    /// `CHECK_PARAM(u16 param_index)` — contract-check the value on TOS (the just-
+    /// evaluated default) against `proto.params[param_index]`'s declared type. A
+    /// mismatch is a Tier-2 panic anchored at the frame's call span (`ret_span`),
+    /// byte-identical to the tree-walker's default contract check. Leaves TOS in
+    /// place (the following `SET_LOCAL` stores it). A no-op-emit when the param is
+    /// untyped (the compiler skips it).
+    CheckParam,
 
     // ---- calls / returns --------------------------------------------------
     /// `CALL(u8)` — call with `argc` arguments already on the stack above the
@@ -223,6 +236,18 @@ pub enum Op {
     NewArray,
     /// `NEW_OBJECT(u16)` — pop `n` key/value pairs, push a new object.
     NewObject,
+    /// `NEW_MAP` — push a new, empty `Value::Map`. The `#{…}` map-literal builder
+    /// starts here, then runs one [`Op::MapEntry`] per entry. (`#{}` is just this
+    /// op.)
+    NewMap,
+    /// `[map, key, val] -- [map]` — convert `key` to a `MapKey` and insert
+    /// `key -> val` into the under-construction `map` (which sits below the
+    /// key/value). Mirrors the tree-walker's `ExprKind::Map`: an unhashable `key`
+    /// (a container/function/instance — `MapKey::from_value` returns `None`) raises
+    /// the SAME Tier-2 panic `cannot use {type} as a map key`, anchored at this op's
+    /// span (the entry's trivia-trimmed code span = the key span). A later duplicate
+    /// key OVERWRITES the value but KEEPS the first-seen position (IndexMap insert).
+    MapEntry,
     /// `[arr, v] -- [arr]` — flatten the spread operand `v` into the
     /// under-construction array `arr` (which sits just below `v` on the stack).
     /// Used for BOTH array-literal spreads `[...a]` AND call-argument spreads
@@ -525,6 +550,8 @@ impl Op {
             x if x == JumpIfTrue as u8 => JumpIfTrue,
             x if x == JumpIfNotNil as u8 => JumpIfNotNil,
             x if x == Loop as u8 => Loop,
+            x if x == JumpIfArgSupplied as u8 => JumpIfArgSupplied,
+            x if x == CheckParam as u8 => CheckParam,
 
             x if x == Call as u8 => Call,
             x if x == CallMethod as u8 => CallMethod,
@@ -534,6 +561,8 @@ impl Op {
 
             x if x == NewArray as u8 => NewArray,
             x if x == NewObject as u8 => NewObject,
+            x if x == NewMap as u8 => NewMap,
+            x if x == MapEntry as u8 => MapEntry,
             x if x == Spread as u8 => Spread,
             x if x == SpreadArgs as u8 => SpreadArgs,
             x if x == AppendArray as u8 => AppendArray,
@@ -599,7 +628,7 @@ impl Op {
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | ImmutableError | Closure
             | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper
             | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey
-            | CallMethodSpread | DefineExport => 2,
+            | CallMethodSpread | DefineExport | CheckParam => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -611,6 +640,10 @@ impl Op {
             // DEFINE_GLOBAL: u16 name-const index + u8 mutability flag (1 = `let`,
             // 0 = immutable `const`/`fn`/`class`/`enum`/`import`).
             CallMethod | MatchArray | DefineGlobal => 3,
+
+            // u16 + i16 operand op.
+            // JUMP_IF_ARG_SUPPLIED: u16 param-index + i16 forward jump offset.
+            JumpIfArgSupplied => 4,
 
             // Zero-operand ops.
             Nil
@@ -660,6 +693,8 @@ impl Op {
             | CheckArrayDestructure
             | CheckObjectDestructure
             | MatchObject
+            | NewMap
+            | MapEntry
             | MatchNoArm => 0,
         }
     }
@@ -725,6 +760,8 @@ mod tests {
         Op::JumpIfTrue,
         Op::JumpIfNotNil,
         Op::Loop,
+        Op::JumpIfArgSupplied,
+        Op::CheckParam,
         Op::Call,
         Op::CallMethod,
         Op::CallMethodSpread,
@@ -732,6 +769,8 @@ mod tests {
         Op::Closure,
         Op::NewArray,
         Op::NewObject,
+        Op::NewMap,
+        Op::MapEntry,
         Op::Spread,
         Op::SpreadArgs,
         Op::AppendArray,

@@ -622,6 +622,13 @@ fn param_list(p: &mut Parser) {
             p.bump();
             type_ann(p);
         }
+        // Optional default value: `= <expr>`. The expression becomes an `Expr`
+        // child of the `Param` node (no wrapper); the compiler finds it via
+        // `Expr::cast`.
+        if p.at(Eq) {
+            p.bump();
+            expr(p);
+        }
         p.complete(pm, Param);
         if p.at(Comma) {
             p.bump();
@@ -650,7 +657,7 @@ fn infix_binding_power(kind: SyntaxKind) -> Option<(u8, u8)> {
         PipePipe => (3, 4),
         AmpAmp => (5, 6),
         EqEq | BangEq => (7, 8),
-        Lt | Le | Gt | Ge => (9, 10),
+        Lt | Le | Gt | Ge | InstanceofKw => (9, 10),
         Plus | Minus => (11, 12),
         Star | Slash | Percent => (13, 14),
         StarStar => (18, 17), // right-assoc
@@ -708,6 +715,7 @@ fn can_start_expr(p: &Parser) -> bool {
             | LParen
             | LBracket
             | LBrace
+            | HashLBrace
             | Minus
             | Bang
             | TemplateStr
@@ -882,6 +890,7 @@ fn primary(p: &mut Parser) -> CompletedMarker {
         }
         LBracket => array_expr(p),
         LBrace => object_expr(p),
+        HashLBrace => map_expr(p),
         TemplateStr => {
             let m = p.start();
             p.bump();
@@ -1079,6 +1088,43 @@ fn object_expr(p: &mut Parser) -> CompletedMarker {
         p.error("expected '}' to close object");
     }
     p.complete(m, ObjectExpr)
+}
+
+/// Parse a `#{ keyExpr: valueExpr, … }` map literal. Unlike `object_expr`, the
+/// KEY is an arbitrary expression (so the map keys by the key's VALUE). D4:
+/// a spread `...` element is a clean parse error (out of scope for SP2).
+fn map_expr(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // #{
+    while !p.at(RBrace) && !p.at_end() {
+        if p.at(DotDotDot) {
+            // Spread is not allowed in a map literal (D4) — report and bail so
+            // the resulting tree carries an error node (both front-ends reject).
+            p.error("spread is not allowed in a map literal");
+            break;
+        }
+        let em = p.start();
+        with_arrows_allowed(p, expr);
+        if p.at(Colon) {
+            p.bump();
+            with_arrows_allowed(p, expr);
+        } else {
+            p.error("expected ':' after map key");
+        }
+        p.complete(em, MapEntry);
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close map");
+    }
+    p.complete(m, MapExpr)
 }
 
 /// Parse an interpolated template: TemplateStart (expr TemplateMiddle)* expr

@@ -37,7 +37,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
+    Value::Array(crate::value::ArrayCell::new(v))
 }
 
 fn obj(m: IndexMap<String, Value>) -> Value {

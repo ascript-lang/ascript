@@ -118,9 +118,63 @@ Declared field types are **checked on assignment**, including inside `init` — 
 Fields you never declare stay fully **dynamic** (the gradual rule): you can still assign arbitrary
 `self.whatever = …` without a declaration.
 
+A field default can be **any expression** — including an [inclusive range](syntax#ranges) `1..=3`
+(which eagerly materializes to `[1, 2, 3]`), a stepped range `0..=10 step 2`, a binary/ternary/
+template expression, an arrow, or a `match`. The default is evaluated when the instance is built (and
+again, identically, by `Class.from(obj)`):
+
+```ascript
+class Grid {
+  cells: array<number> = 1..=3    // [1, 2, 3] at construction
+  scale: number = 2
+}
+print(Grid().cells)               // [1, 2, 3]
+```
+
+The only field-default expression that is **rejected** is `yield` (it is never valid outside a
+generator body) — both engines reject it symmetrically.
+
 > [!NOTE] The optional field above can be spelled two ways — `nickname: string?` or the marker form
 > `nickname?: string`. **Both lower to the same node** (`string | nil`); the formatter normalizes the
 > marker form to the canonical `nickname: string?`.
+
+### Records — an init-less class auto-derives a constructor
+
+A class that declares fields but writes **no `init`** automatically gets a **positional constructor**
+over its fields — no new keyword, "record-ness" is just *fields + no `init`*:
+
+```ascript
+class Point {
+  x: number
+  y: number
+}
+const p = Point(3, 4)   // auto-derived: binds x=3, y=4 positionally
+print(p.x)              // 3
+```
+
+- The parameters are the declared fields **in declaration order** (and, with [inheritance](#inheritance),
+  base-class fields come **first**).
+- A **defaulted field becomes an optional trailing parameter** — omit it to take the default, or pass
+  it to override:
+
+  ```ascript
+  class Config {
+    host: string
+    port: number = 8080
+  }
+  print(Config("localhost").port)        // 8080 (default)
+  print(Config("localhost", 9000).port)  // 9000 (overridden)
+  ```
+
+- Each positional argument is **contract-checked** against its field's type, exactly like a
+  hand-written `init` that assigns `self.f = arg` — a wrong type is a [type-contract](type-contracts)
+  panic, and too few / too many arguments is the same arity panic as any function call.
+- A class **with an explicit `init` is unchanged** — no auto-constructor is derived; your `init` runs
+  as written. A class with no fields *and* no `init` keeps its zero-argument constructor.
+
+> [!NOTE] The auto-derived constructor is synthesized at construction time from the class's declared
+> fields, so it works identically whether you `ascript run`, `ascript build` + run the `.aso`, or use
+> the `--tree-walker` engine; `ascript check` validates record-construction arity too.
 
 ### `ClassName.from` — validate a raw object into an instance
 
@@ -192,6 +246,28 @@ print(d.breed)             // Husky
 
 Method resolution walks the inheritance chain from the instance's class upward. A class name is a
 valid [contract type](type-contracts) that accepts the class and any subclass.
+
+### `instanceof` — runtime class test
+
+`x instanceof C` is a comparison-tier binary operator that returns a `bool`: `true` when `x` is an
+instance of `C` **or any subclass of `C`** (the `extends` chain is walked), and `false` otherwise.
+
+```ascript
+class Animal {}
+class Dog extends Animal {}
+
+const d = Dog()
+print(d instanceof Dog)        // true
+print(d instanceof Animal)     // true  — a subclass instance IS-A parent
+print(Animal() instanceof Dog) // false — but not the other way around
+```
+
+- A **non-instance** left operand — a number, string, `nil`, an object, an enum value — is always
+  `false`, never an error: `print(5 instanceof Animal)` prints `false`.
+- The **right operand must be a class**. Anything else (`x instanceof 5`, `x instanceof nil`) is a
+  Tier-2 panic: `instanceof requires a class on the right-hand side`.
+- It binds at the relational tier (same as `< <= > >=`), looser than `+`/`-` and tighter than `&&`,
+  so `a instanceof B && c` parses as `(a instanceof B) && c`.
 
 ## Enums
 

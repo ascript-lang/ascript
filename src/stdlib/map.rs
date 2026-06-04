@@ -6,7 +6,6 @@ use crate::interp::Control;
 use crate::span::Span;
 use crate::value::{MapKey, Value};
 use indexmap::IndexMap;
-use std::cell::RefCell;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -51,7 +50,7 @@ fn want_key(v: &Value, span: Span, ctx: &str) -> Result<MapKey, Control> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
+    Value::Array(crate::value::ArrayCell::new(v))
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -94,6 +93,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "set" => {
             let m = want_map(&arg(args, 0), span, &ctx("set"))?;
+            crate::interp::check_not_frozen(&arg(args, 0), span)?;
             let k = want_key(&arg(args, 1), span, &ctx("set"))?;
             let v = arg(args, 2);
             m.borrow_mut().insert(k, v);
@@ -107,6 +107,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "delete" => {
             let m = want_map(&arg(args, 0), span, &ctx("delete"))?;
+            crate::interp::check_not_frozen(&arg(args, 0), span)?;
             let k = want_key(&arg(args, 1), span, &ctx("delete"))?;
             let existed = m.borrow_mut().shift_remove(&k).is_some();
             Ok(Value::Bool(existed))
@@ -191,16 +192,16 @@ mod tests {
     #[test]
     fn new_with_seed_and_bad_seed() {
         let sp = sp();
-        let seed = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
-            Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+        let seed = Value::Array(crate::value::ArrayCell::new(vec![
+            Value::Array(crate::value::ArrayCell::new(vec![
                 Value::Str("a".into()),
                 Value::Number(1.0),
-            ]))),
-            Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+            ])),
+            Value::Array(crate::value::ArrayCell::new(vec![
                 Value::Str("b".into()),
                 Value::Number(2.0),
-            ]))),
-        ])));
+            ])),
+        ]));
         let m = call("new", std::slice::from_ref(&seed), sp).unwrap();
         assert_eq!(
             call("get", &[m.clone(), Value::Str("b".into())], sp).unwrap(),
@@ -212,9 +213,9 @@ mod tests {
             Err(Control::Panic(_))
         ));
         // wrong-arity entry → panic
-        let bad = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Array(
-            gcmodule::Cc::new(RefCell::new(vec![Value::Number(1.0)])),
-        )])));
+        let bad = Value::Array(crate::value::ArrayCell::new(vec![Value::Array(
+            crate::value::ArrayCell::new(vec![Value::Number(1.0)]),
+        )]));
         assert!(matches!(call("new", &[bad], sp), Err(Control::Panic(_))));
     }
 
@@ -257,7 +258,7 @@ mod tests {
     #[test]
     fn non_hashable_key_panics() {
         let m = call("new", &[], sp()).unwrap();
-        let bad = Value::Array(gcmodule::Cc::new(RefCell::new(vec![])));
+        let bad = Value::Array(crate::value::ArrayCell::new(vec![]));
         assert!(matches!(
             call("set", &[m, bad, Value::Number(1.0)], sp()),
             Err(Control::Panic(_))

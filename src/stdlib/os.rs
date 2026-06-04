@@ -23,8 +23,6 @@ use crate::value::Value;
 // construction), so gate them to keep the `sysinfo`-off build warning-clean.
 #[cfg(feature = "sysinfo")]
 use indexmap::IndexMap;
-#[cfg(feature = "sysinfo")]
-use std::cell::RefCell;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     // Base host facts; the `mut`-less binding keeps the `sysinfo`-off build
@@ -160,7 +158,7 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                     ])
                 })
                 .collect();
-            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(entries))))
+            Ok(Value::Array(crate::value::ArrayCell::new(entries)))
         }
 
         // uptime() -> number  (seconds)
@@ -185,12 +183,12 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                         ("name", Value::Str(name.as_str().into())),
                         (
                             "addresses",
-                            Value::Array(gcmodule::Cc::new(RefCell::new(addrs))),
+                            Value::Array(crate::value::ArrayCell::new(addrs)),
                         ),
                     ])
                 })
                 .collect();
-            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(entries))))
+            Ok(Value::Array(crate::value::ArrayCell::new(entries)))
         }
 
         // localIp() -> [string, err]  — best-effort primary non-loopback IPv4 (Tier-1)
