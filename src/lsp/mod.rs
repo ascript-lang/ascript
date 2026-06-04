@@ -14,6 +14,7 @@
 pub mod analysis;
 pub mod line_index;
 pub mod server;
+pub mod workspace;
 
 use server::Backend;
 use tower_lsp::{LspService, Server};
