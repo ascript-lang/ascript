@@ -306,6 +306,26 @@ pub struct Interp {
     /// High-water mark of `inflight` over the program's life. Exposed for tests
     /// that assert async-task memory stays bounded (does not scale with N).
     max_inflight: Cell<u64>,
+    /// Current LOGICAL CALL recursion depth (SP3 §B). Incremented EXACTLY ONCE per
+    /// logical call — on the tree-walker in `run_body` (the single call funnel), on
+    /// the VM at each `CallFrame` push / native re-entry — and decremented on return
+    /// / unwind. Shared by BOTH engines (the VM holds an `Rc<Interp>`), so a program
+    /// of logical call-depth D trips [`MAX_CALL_DEPTH`] at the SAME D on both →
+    /// byte-identical at/over the limit. It does NOT count expression nesting (that
+    /// is the separate [`Interp::expr_depth`] dimension) — counting expr nesting here
+    /// would double-count each call on the tree-walker (the call sub-expression's
+    /// `eval_expr` frames are live alongside the `run_body` frame) and make it trip
+    /// at ~MAX/2 while the VM trips at MAX. A `Cell` (never a `RefCell`) so it is
+    /// never held across an `.await` (`await_holding_refcell_ref` stays satisfied).
+    call_depth: Cell<u32>,
+    /// Current EXPRESSION-NESTING depth (SP3 §B / O1) — a SEPARATE dimension from
+    /// [`Interp::call_depth`]. A pathologically nested expression (`((((…))))`, a
+    /// huge binary chain) overflows the recursive evaluator with NO calls involved;
+    /// the tree-walker bounds it here in `eval_expr` and the VM bounds the mirror in
+    /// `compile_expr`, both at [`EXPR_NEST_LIMIT`]. Keeping it off `call_depth`
+    /// prevents expression nesting from contaminating the per-call count. A `Cell`,
+    /// never held across an `.await`.
+    expr_depth: Cell<u32>,
     /// std/log minimum level (records below it are dropped). Default `Info`.
     #[cfg(feature = "log")]
     log_level: std::cell::Cell<LogLevel>,
@@ -326,6 +346,151 @@ pub struct Interp {
 /// after spawning so the executor can reap finished/cancelled tasks. Keeps a
 /// no-await loop of un-awaited async calls bounded instead of growing to N.
 const INFLIGHT_YIELD_CAP: u64 = 256;
+
+/// The maximum LOGICAL call/eval recursion depth (SP3 §B). Exceeding it raises a
+/// clean, catchable Tier-2 panic `maximum recursion depth exceeded` BEFORE the
+/// native stack overflows (no SIGABRT). It is a single source of truth shared by
+/// both engines (the VM reaches it via its `Rc<Interp>`), so they trip at the SAME
+/// logical depth → byte-identical at/over the limit.
+///
+/// The number is pinned EMPIRICALLY (SP3 §B6): the tree-walker (the largest
+/// per-frame budget of either engine — its `#[async_recursion]` futures are huge)
+/// overflows the stock 8 MB main-thread stack at ~99 logical frames in a DEBUG
+/// build (~82 KB/frame) and ~810 in release (~10 KB/frame). To let 3000 frames sit
+/// comfortably UNDER native capacity the entry points run the program on a worker
+/// thread with an enlarged [`WORKER_STACK_SIZE`] stack: 3000 × ~82 KB ≈ 246 MB in
+/// the debug worst case, so a 512 MB worker stack gives > 2× headroom. Truly
+/// unbounded recursion stays the SP9 architectural non-goal (needs an
+/// explicit-stack VM); SP3 turns the crash into a deterministic, catchable error.
+pub const MAX_CALL_DEPTH: u32 = 3000;
+
+/// The maximum EXPRESSION-NESTING depth (SP3 §B / O1) — a SEPARATE limit from
+/// [`MAX_CALL_DEPTH`], on the [`Interp::expr_depth`] counter. Bounds a
+/// pathologically nested expression (`((((…))))`, a giant binary chain) on the
+/// tree-walker (`eval_expr`) and its mirror on the VM (`compile_expr`) so neither
+/// SIGABRTs; over it → the SAME `maximum recursion depth exceeded` Tier-2 panic, so
+/// both engines error byte-identically (stdout + exit). Kept equal to
+/// `MAX_CALL_DEPTH`: a single uniform "logical recursion" ceiling, just split across
+/// two non-interfering counters so expression nesting never inflates the per-call
+/// count. The expression evaluator's per-nesting native frame is far smaller than a
+/// `run_body` call frame, so this comfortably fits the [`WORKER_STACK_SIZE`] stack.
+pub const EXPR_NEST_LIMIT: u32 = MAX_CALL_DEPTH;
+
+/// The worker-thread stack size the entry points install (SP3 §B6) so
+/// [`MAX_CALL_DEPTH`] logical frames fit under native capacity with > 2× margin
+/// even for the tree-walker's large debug-build frames. Sized off the empirical
+/// ~82 KB-per-LOGICAL-CALL debug measurement (3000 × 82 KB ≈ 246 MB → 512 MB ≈
+/// 2.08×). A thread stack is virtual address space — only touched pages are
+/// committed — so a normal shallow program pays nothing.
+pub const WORKER_STACK_SIZE: usize = 512 << 20;
+
+/// RAII guard bounding a recursion counter (SP3 §B). [`DepthGuard::enter`]
+/// increments the given counter and returns `Err(Control::Panic)` if the new value
+/// exceeds `limit`; [`Drop`] decrements, so the count unwinds correctly through a
+/// `?`-early-return OR a panic. Used for BOTH the per-call counter
+/// (`call_depth`/`MAX_CALL_DEPTH`, incremented ONCE per logical call) and the
+/// separate expression-nesting counter (`expr_depth`/`EXPR_NEST_LIMIT`). The panic
+/// message is the same `maximum recursion depth exceeded` for both, so the two
+/// dimensions are observationally identical at the boundary.
+pub(crate) struct DepthGuard<'a> {
+    depth: &'a Cell<u32>,
+}
+
+impl<'a> DepthGuard<'a> {
+    /// Enter one recursion level on `depth`, capped at `limit`, anchored at `span`.
+    /// On overflow the counter is NOT incremented (so `Drop` does not under-count)
+    /// and a clean Tier-2 panic is returned.
+    pub(crate) fn enter(depth: &'a Cell<u32>, limit: u32, span: Span) -> Result<Self, Control> {
+        let next = depth.get() + 1;
+        if next > limit {
+            return Err(Control::Panic(AsError::at(
+                "maximum recursion depth exceeded",
+                span,
+            )));
+        }
+        depth.set(next);
+        Ok(DepthGuard { depth })
+    }
+}
+
+impl Drop for DepthGuard<'_> {
+    fn drop(&mut self) {
+        // `saturating_sub` (not `- 1`) so this can never underflow-panic in a
+        // destructor. A GENERATOR body parks at `yield` with its `run_body`/
+        // `eval_expr` guards still live on the SUSPENDED future's stack; the
+        // generator driver snapshot-restores the counters around each poll
+        // (`coro.rs`), so the main-stack accounting stays exact, but when the
+        // suspended future is finally DROPPED (`gen.close()` / abandonment) those
+        // held guards decrement against the restored (possibly already-zero)
+        // counter — `saturating_sub` makes that a no-op instead of a panic.
+        self.depth.set(self.depth.get().saturating_sub(1));
+    }
+}
+
+/// SP3 §B: a depth guard for the VM's RE-ENTRANT `Vm::run` boundaries
+/// (`invoke_compiled_method` / `call_value`). Unlike [`DepthGuard`] (which
+/// decrements by exactly one), this SNAPSHOTS the counter on entry (+1 for the
+/// re-entry's own logical frame, with the limit check) and on `Drop` RESTORES the
+/// counter to the snapshot — absorbing ANY imbalance left by the nested run,
+/// including frames abandoned when a `Control::Panic` unwinds `Vm::run` (so a
+/// `recover`-caught recursion panic leaves the depth exactly where it was before
+/// the recovered call, matching the tree-walker's RAII unwind). The VM's per-frame
+/// increment/decrement (`enter_frame_depth`/`leave_frame_depth`) balances on the
+/// NORMAL path; this restore is the safety net for the panic-unwind path.
+pub(crate) struct DepthRestore<'a> {
+    depth: &'a Cell<u32>,
+    saved: u32,
+}
+
+impl<'a> DepthRestore<'a> {
+    pub(crate) fn enter(depth: &'a Cell<u32>, span: Span) -> Result<Self, Control> {
+        let saved = depth.get();
+        let next = saved + 1;
+        if next > MAX_CALL_DEPTH {
+            return Err(Control::Panic(AsError::at(
+                "maximum recursion depth exceeded",
+                span,
+            )));
+        }
+        depth.set(next);
+        Ok(DepthRestore { depth, saved })
+    }
+}
+
+impl Drop for DepthRestore<'_> {
+    fn drop(&mut self) {
+        self.depth.set(self.saved);
+    }
+}
+
+/// SP3 §B / O1: RAII helper that RESETS the expression-nesting counter to 0 for the
+/// duration of a function-body execution and restores it on `Drop`. A call boundary
+/// starts a FRESH expression-nesting context — exactly like the VM, whose
+/// `compile_expr` depth resets per compiled function body. Without this reset the
+/// live `expr_depth` would accumulate across recursive `run_body` frames (the
+/// caller's `1 + f(n-1)` `eval_expr` frames stay on the native stack while the
+/// callee runs), so deep recursion would trip `EXPR_NEST_LIMIT` at ~half the call
+/// depth — making the tree-walker diverge from the VM (which has no runtime
+/// expr-nesting counter). With the reset, recursion is bounded SOLELY by
+/// `call_depth` on both engines, and expression nesting is bounded per body.
+pub(crate) struct ExprDepthReset<'a> {
+    depth: &'a Cell<u32>,
+    saved: u32,
+}
+
+impl<'a> ExprDepthReset<'a> {
+    fn enter(depth: &'a Cell<u32>) -> Self {
+        let saved = depth.get();
+        depth.set(0);
+        ExprDepthReset { depth, saved }
+    }
+}
+
+impl Drop for ExprDepthReset<'_> {
+    fn drop(&mut self) {
+        self.depth.set(self.saved);
+    }
+}
 
 /// Fixed resource-table id for the lazily-created stdin `BufReader` (std/io).
 /// Uses a sentinel near `u64::MAX` so it never collides with auto-incrementing ids
@@ -381,6 +546,8 @@ impl Interp {
             vm: RefCell::new(std::rc::Weak::new()),
             inflight: Cell::new(0),
             max_inflight: Cell::new(0),
+            call_depth: Cell::new(0),
+            expr_depth: Cell::new(0),
             #[cfg(feature = "log")]
             log_level: Cell::new(log_level_from_env_str(
                 std::env::var("ASCRIPT_LOG").ok().as_deref(),
@@ -463,6 +630,21 @@ impl Interp {
     /// borrow before awaiting (`await_holding_refcell_ref` stays clean).
     pub(crate) fn vm(&self) -> Option<Rc<crate::vm::Vm>> {
         self.vm.borrow().upgrade()
+    }
+
+    /// The shared logical-recursion-depth cell (SP3 §B). Both engines acquire a
+    /// [`DepthGuard`] over this ONE cell so they trip [`MAX_CALL_DEPTH`] at the same
+    /// logical depth. Used by the VM (which holds an `Rc<Interp>`) and the compiler.
+    pub(crate) fn call_depth_cell(&self) -> &Cell<u32> {
+        &self.call_depth
+    }
+
+    /// Acquire a SNAPSHOT-RESTORE depth guard for a VM re-entrant `Vm::run`
+    /// boundary (SP3 §B). On drop it restores the counter to its pre-entry value,
+    /// absorbing frames abandoned by a panic unwind so `recover` resumes at the
+    /// correct depth (see [`DepthRestore`]).
+    pub(crate) fn enter_call_depth_scoped(&self, span: Span) -> Result<DepthRestore<'_>, Control> {
+        DepthRestore::enter(&self.call_depth, span)
     }
 
     /// Recover an owned `Rc<Interp>` from `&self`. Panics if `install_self` was
@@ -1396,6 +1578,15 @@ impl Interp {
 
     #[async_recursion(?Send)]
     pub async fn eval_expr(&self, expr: &Expr, env: &Environment) -> Result<Value, Control> {
+        // SP3 §B / O1: bound EXPRESSION nesting (deeply nested `((((…))))`, long
+        // binary chains) on its OWN counter — NOT `call_depth`. Counting expr
+        // nesting against the per-call counter would double-count each logical call
+        // on the tree-walker (the call sub-expression's `eval_expr` frames are live
+        // alongside the `run_body` call frame), making it trip at ~MAX/2 while the
+        // VM trips at MAX — a byte-identical-oracle violation on ordinary recursion.
+        // One increment per nested `eval_expr`; decremented on every exit path
+        // (return / `?` / panic). A `Cell`, never held across an `.await`.
+        let _expr_depth = DepthGuard::enter(&self.expr_depth, EXPR_NEST_LIMIT, expr.span)?;
         match &expr.kind {
             ExprKind::Number(n) => Ok(Value::Number(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
@@ -2374,6 +2565,19 @@ impl Interp {
         span: Span,
         what: &str,
     ) -> Result<Value, Control> {
+        // SP3 §B: `run_body` is the single funnel EVERY script call (function,
+        // method, generator-step body, async body) passes through — and it is the
+        // actual native-stack deepener (`#[async_recursion]`). Guarding it here
+        // bounds the recursion at one logical-call increment per call (the VM's
+        // matching unit is one CallFrame push). Acquired BEFORE binding args / exec
+        // so the over-limit panic anchors at the call span; decremented on every
+        // exit path by the guard's `Drop`.
+        let _depth = DepthGuard::enter(&self.call_depth, MAX_CALL_DEPTH, span)?;
+        // SP3 §B / O1: a call boundary opens a FRESH expression-nesting context
+        // (mirroring the VM's per-body `compile_expr` depth reset), so a caller's
+        // live `eval_expr` frames do NOT count against the callee's body nesting.
+        // This keeps deep recursion bounded SOLELY by `call_depth` on both engines.
+        let _expr_reset = ExprDepthReset::enter(&self.expr_depth);
         let BodySpec { params, ret, body } = spec;
         // Arity + parameter contracts + rest collection. Shared verbatim with the
         // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.

@@ -2176,13 +2176,16 @@ async fn vm_deep_recursion_matches_treewalker_at_modest_depth() {
 #[tokio::test]
 async fn vm_deep_recursion_is_heap_bounded() {
     // VM-only: each CALL pushes a HEAP `CallFrame` and the Rust `run` loop stays
-    // flat, so recursion is heap-bounded — 50_000 deep does NOT overflow the native
-    // stack (the tree-walker cannot reach this depth). sum(50000) = 1_250_025_000.
-    // This is the proof that VM frames live on the heap, not the Rust stack.
-    let src = "fn sum(n) { if (n == 0) { return 0 }\n return n + sum(n - 1) }\nprint(sum(50000))";
+    // flat, so recursion is heap-bounded — the VM reaches a depth the tree-walker
+    // (native-stack recursion) cannot. SP3 §B now caps logical recursion at
+    // `MAX_CALL_DEPTH` (a clean catchable panic, NOT a SIGABRT). Prove heap-bounded
+    // depth JUST UNDER the cap completes on the small (~2 MiB) test-thread stack —
+    // 2900 nested CALL/RETURN frames the tree-walker could never reach there.
+    // sum(2900) = 2900 * 2901 / 2 = 4_206_450.
+    let src = "fn sum(n) { if (n == 0) { return 0 }\n return n + sum(n - 1) }\nprint(sum(2900))";
     let (vm_out, code) = ascript::vm_run_source(src).await.expect("vm ok");
     assert_eq!(code, None);
-    assert_eq!(vm_out, "1250025000\n", "deep VM recursion result");
+    assert_eq!(vm_out, "4206450\n", "deep VM recursion result (just under the cap)");
 }
 
 // ---- V4-T4: parameters — arity, rest, and type contracts ------------------
@@ -5946,7 +5949,9 @@ fn verifier_accepts_all_compiled_corpus_chunks() {
         //    documented gap), it must survive an `.aso` round-trip AND re-verify on
         //    load.
         if chunk_is_serializable(&chunk) {
-            let bytes = chunk.to_bytes();
+            let bytes = chunk
+                .to_bytes()
+                .unwrap_or_else(|e| panic!("to_bytes failed for `{rel}`: {e}"));
             ascript::vm::chunk::Chunk::from_bytes_verified(&bytes)
                 .unwrap_or_else(|e| panic!("from_bytes_verified rejected `{rel}`: {e}"));
         }
@@ -6765,4 +6770,158 @@ async fn record_three_way_matches() {
          print(object.isFrozen(p))\n",
     )
     .await;
+}
+
+// =============================================================================
+// SP3 §B — recursion-depth guard: byte-identical on both engines
+// =============================================================================
+//
+// A deep non-yielding recursion (and a deeply nested expression) USED to overflow
+// the native stack and SIGABRT (exit 134) at WILDLY different depths on the two
+// engines. SP3 adds a single shared logical-CALL counter (`MAX_CALL_DEPTH`,
+// incremented EXACTLY ONCE per logical call on BOTH engines) so they raise the SAME
+// clean, catchable Tier-2 panic `maximum recursion depth exceeded` — same message,
+// same (no) stdout, same non-134 exit — at the SAME logical depth, before the
+// native stack blows. These cases run on an enlarged worker stack
+// (`run_on_worker_stack`, the same headroom the `run` binary uses).
+//
+// The CEILING is IDENTICAL on both engines: a recursion to `MAX_CALL_DEPTH - 1`
+// completes on both; `MAX_CALL_DEPTH` fails on both. The boundary tests below read
+// the crate const and assert at exactly `MAX-1` (last success) and `MAX` (first
+// failure), so a re-introduced per-call double-count (e.g. counting expression
+// nesting against the call counter) would FAIL them. Deeply nested EXPRESSIONS are
+// a SEPARATE dimension (`EXPR_NEST_LIMIT`, on its own counter so it cannot
+// contaminate the per-call count); they too trip identically on both engines.
+
+/// A self-recursive driver to logical call-depth `n`.
+fn sp3_rec_src(n: usize) -> String {
+    format!("fn f(n) {{\n  if (n <= 0) {{ return 0 }}\n  return 1 + f(n - 1)\n}}\nprint(f({n}))\n")
+}
+
+/// `"let x = " + "("*k + "1" + ")"*k` — expression-nesting depth `k`.
+fn sp3_nested_parens(k: usize) -> String {
+    format!("let x = {}1{}\nprint(x)\n", "(".repeat(k), ")".repeat(k))
+}
+
+/// Run `src` on BOTH engines (tree-walker + specialized VM + generic VM) on an
+/// enlarged worker stack and assert BYTE-IDENTICAL outcome: either all three
+/// succeed with identical stdout, or all three error with the SAME message. The
+/// recursion guard trips at the SAME logical depth on every engine; only the
+/// panic's diagnostic SPAN differs (the tree-walker anchors at the innermost
+/// subexpression, the VM at the call), so this compares the message, not the span
+/// — the observable result (stdout + message + exit) must match exactly.
+fn sp3_assert_three_way_identical(src: &str) {
+    let src = src.to_string();
+    // `AsError` is `!Send` (it holds `Rc<SourceInfo>`), so the worker thread reduces
+    // each outcome to a `Send` comparable summary BEFORE crossing the join: either
+    // `Ok((stdout, exit))` or `Err(message)`. The recursion panic's diagnostic span
+    // differs by engine, so the message (not the span) is the byte-identical
+    // observable — exactly what the differential cares about (stdout + outcome).
+    type Summary = Result<(String, Option<i32>), String>;
+    let (tw, vm, gen): (Summary, Summary, Summary) =
+        ascript::run_on_worker_stack(move || async move {
+            let summarize =
+                |r: Result<(String, Option<i32>), ascript::error::AsError>| -> Summary {
+                    r.map_err(|e| e.message)
+                };
+            let tw = summarize(ascript::run_source_exit(&src).await);
+            let vm = summarize(ascript::vm_run_source(&src).await);
+            let gen = summarize(ascript::vm_run_source_generic(&src).await);
+            (tw, vm, gen)
+        });
+    assert_eq!(
+        tw, vm,
+        "tree-walker vs specialized VM diverged\n  tw: {tw:?}\n  vm: {vm:?}"
+    );
+    assert_eq!(
+        vm, gen,
+        "specialized vs generic VM diverged\n  vm: {vm:?}\n  gen: {gen:?}"
+    );
+}
+
+#[test]
+fn sp3_recursion_at_limit_minus_one_ok_identical() {
+    // SPEC §B7 boundary: a recursion to EXACTLY `MAX_CALL_DEPTH - 1` is the LAST
+    // depth that completes — and it must complete IDENTICALLY (same numeric stdout,
+    // exit 0) on all three engines. This is the strong oracle: if the tree-walker
+    // tripped earlier than the VM (the per-call double-count bug), this case would
+    // diverge (tree-walker errors, VM prints the number).
+    let n = (ascript::interp::MAX_CALL_DEPTH - 1) as usize;
+    sp3_assert_three_way_identical(&sp3_rec_src(n));
+}
+
+#[test]
+fn sp3_recursion_at_limit_panics_identical() {
+    // SPEC §B7 boundary: a recursion to EXACTLY `MAX_CALL_DEPTH` is the FIRST depth
+    // that fails — and it must fail IDENTICALLY (same `maximum recursion depth
+    // exceeded` message, no stdout, non-134 exit) on all three engines.
+    let n = ascript::interp::MAX_CALL_DEPTH as usize;
+    sp3_assert_three_way_identical(&sp3_rec_src(n));
+}
+
+#[test]
+fn sp3_recursion_over_limit_panics_identical() {
+    // Comfortably over the cap → all three engines emit the recursion panic, no
+    // stdout, non-134 exit — byte-identical (message + outcome).
+    let n = (ascript::interp::MAX_CALL_DEPTH + 50) as usize;
+    sp3_assert_three_way_identical(&sp3_rec_src(n));
+}
+
+#[test]
+fn sp3_mutual_recursion_over_limit_panics_identical() {
+    // Mutual recursion proves the counter is per-LOGICAL-CALL, not per-function:
+    // a/b alternate, so neither alone reaches the cap, but their combined depth does.
+    let n = ascript::interp::MAX_CALL_DEPTH + 50;
+    let src = format!(
+        "fn a(n) {{ if (n <= 0) {{ return 0 }} return b(n - 1) }}\n\
+         fn b(n) {{ if (n <= 0) {{ return 0 }} return a(n - 1) }}\n\
+         print(a({n}))\n"
+    );
+    sp3_assert_three_way_identical(&src);
+}
+
+#[test]
+fn sp3_recover_catches_recursion_limit_identical() {
+    // `recover` catches the Tier-2 recursion panic (it is an ordinary recoverable
+    // panic). The handler observes `[nil, err]` with the fixed message — identical
+    // on both engines. `f(n+1)` recurses without a base case → guaranteed over-cap.
+    let src = "fn f(n) { return f(n + 1) }\n\
+               let r = recover(() => f(0))\n\
+               print(r[1].message)\n";
+    sp3_assert_three_way_identical(src);
+}
+
+#[test]
+fn sp3_recover_then_recurse_resets_depth_identical() {
+    // After `recover` catches an over-limit recursion, the depth counter MUST be
+    // restored to the caller's level so a subsequent normal recursion is not
+    // wrongly tripped. The tree-walker gets this via its RAII guard unwinding; the
+    // VM via the snapshot-restore guard at its re-entrant `run` boundary. Both must
+    // print the recovered message AND then complete g(500) identically.
+    let src = "fn f(n) { return f(n + 1) }\n\
+               let r = recover(() => f(0))\n\
+               print(r[1].message)\n\
+               fn g(n) { if (n <= 0) { return 0 } return 1 + g(n - 1) }\n\
+               print(g(500))\n";
+    sp3_assert_three_way_identical(src);
+}
+
+#[test]
+fn sp3_nested_expr_at_limit_minus_one_ok_identical() {
+    // Expression nesting is a SEPARATE dimension (`EXPR_NEST_LIMIT`). At exactly
+    // `EXPR_NEST_LIMIT - 1` it is the LAST nesting that compiles + evaluates — to `1`
+    // on all three engines, identically.
+    let k = (ascript::interp::EXPR_NEST_LIMIT - 1) as usize;
+    sp3_assert_three_way_identical(&sp3_nested_parens(k));
+}
+
+#[test]
+fn sp3_nested_expr_at_limit_panics_identical() {
+    // At exactly `EXPR_NEST_LIMIT` the nesting trips identically on all three: the
+    // tree-walker at runtime `eval_expr`, the VM at compile-time `compile_expr` —
+    // BOTH surfaced as the SAME `maximum recursion depth exceeded`, no stdout,
+    // non-134 exit. (This far-edge case must NOT reintroduce the call-depth
+    // double-count — the recursion boundary tests above guard against that.)
+    let k = ascript::interp::EXPR_NEST_LIMIT as usize;
+    sp3_assert_three_way_identical(&sp3_nested_parens(k));
 }

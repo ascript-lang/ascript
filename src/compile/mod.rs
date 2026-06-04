@@ -38,7 +38,7 @@ pub struct CompileError {
 }
 
 impl CompileError {
-    fn new(message: impl Into<String>, span: Span) -> Self {
+    pub fn new(message: impl Into<String>, span: Span) -> Self {
         CompileError {
             message: message.into(),
             span,
@@ -760,6 +760,7 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
         loops: Vec::new(),
         next_temp,
         cur_cells,
+        compile_depth: 0,
     };
 
     // V2 supports a sequence of statements whose meaningful tail is an
@@ -801,6 +802,13 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
         compiler
             .chunk
             .emit(Op::Return, Span::new(src.len(), src.len()));
+    }
+
+    // SP3 §A: a bytecode-capacity overflow (const pool / proto / class-proto /
+    // import table / jump-loop displacement) on the TOP chunk recorded a sticky
+    // flag instead of panicking — surface it as a clean compile error.
+    if let Some(limit) = compiler.chunk.take_overflow() {
+        return Err(limit.into_compile_error());
     }
 
     Ok(compiler.chunk)
@@ -881,6 +889,19 @@ struct Compiler {
     /// instead, so the access goes through the by-reference cell. Swapped on
     /// function entry (saved/restored in `compile_fn_proto`).
     cur_cells: HashSet<u32>,
+    /// SP3 §B / O1: current `compile_expr` nesting depth — the VM's EXPRESSION-
+    /// nesting guard, mirroring the tree-walker's `eval_expr`/`expr_depth` guard. A
+    /// deeply nested SOURCE expression (`((((…))))`, a long binary chain) overflows
+    /// the recursive `compile_expr`; this bounds it at
+    /// [`crate::interp::EXPR_NEST_LIMIT`] — the SAME limit the tree-walker's runtime
+    /// `eval_expr` uses — so a literally-deeply-nested source trips at the same
+    /// nesting on both engines. This is a SEPARATE dimension from the per-call
+    /// counter (`Interp.call_depth`/`MAX_CALL_DEPTH`), so expression nesting never
+    /// contaminates the call count. Over the limit → a `CompileError` whose message
+    /// is the SAME `maximum recursion depth exceeded`; the lib boundary surfaces it
+    /// as an `AsError` with that message, byte-identical (stdout+exit) to the
+    /// tree-walker's runtime panic.
+    compile_depth: u32,
 }
 
 impl Compiler {
@@ -935,6 +956,12 @@ impl Compiler {
                 && body_range.contains_range(b.decl_range)
                 && b.decl_range != body_range
             {
+                // SP3 §A4: this `try_from` can never fall through to a silent skip.
+                // `b.slot` is a slot INDEX within this frame, and the frame's
+                // `slot_count` was already validated to fit `u16` (compile_source
+                // :741 / function frame :2378 / field default :2262) BEFORE any
+                // fresh-cell emit — so `b.slot < slot_count <= u16::MAX` always
+                // holds and the `Ok` arm is always taken. No capacity truncation.
                 if let Ok(slot) = u16::try_from(b.slot) {
                     slots.push(slot);
                 }
@@ -955,6 +982,26 @@ impl Compiler {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        // SP3 §B: bound `compile_expr` nesting (a deeply nested SOURCE expression
+        // overflows the recursive compiler). One increment per nested expr,
+        // decremented on EVERY exit path (success or error) before returning, so a
+        // mid-compile error cannot leak the count. Over the limit → a `CompileError`
+        // carrying the SAME message the tree-walker's runtime `eval_expr` panic
+        // uses, so the observable result (stdout + exit) is byte-identical.
+        self.compile_depth += 1;
+        if self.compile_depth > crate::interp::EXPR_NEST_LIMIT {
+            self.compile_depth -= 1;
+            return Err(CompileError::new(
+                "maximum recursion depth exceeded",
+                node_span(expr),
+            ));
+        }
+        let result = self.compile_expr_inner(expr);
+        self.compile_depth -= 1;
+        result
+    }
+
+    fn compile_expr_inner(&mut self, expr: &Expr) -> Result<(), CompileError> {
         // A postfix chain (`Member`/`Index`/`Call`/`OptMember` nested via their
         // receiver/object/callee spine) that contains an optional link which must
         // SHORT-CIRCUIT THE REST OF THE CHAIN — an optional method call
@@ -2088,6 +2135,10 @@ impl Compiler {
             if b.is_global {
                 exports.push((None, b.name.clone()));
             } else if let Ok(slot) = u16::try_from(b.slot) {
+                // SP3 §A4: same invariant as `loop_refresh_slots` — `b.slot` is a
+                // frame slot index < the frame's `slot_count`, which is validated to
+                // fit `u16` before any emit, so this `Ok` arm is always taken (no
+                // silent capacity truncation).
                 exports.push((Some(slot), b.name.clone()));
             }
         };
@@ -2287,6 +2338,13 @@ impl Compiler {
         };
         body_chunk.emit(Op::Return, span);
 
+        // SP3 §A: surface any bytecode-capacity overflow on this sealed nested
+        // chunk as a clean compile error (one check per sealed chunk catches a
+        // nested-function overflow too).
+        if let Some(limit) = body_chunk.take_overflow() {
+            return Err(limit.into_compile_error());
+        }
+
         Ok(Rc::new(FnProto {
             chunk: body_chunk,
             arity: 0,
@@ -2478,6 +2536,12 @@ impl Compiler {
         self.next_temp = saved_next_temp;
         self.cur_cells = saved_cells;
         result?;
+
+        // SP3 §A: surface any bytecode-capacity overflow on this sealed function
+        // body as a clean compile error (one check per sealed chunk).
+        if let Some(limit) = body_chunk.take_overflow() {
+            return Err(limit.into_compile_error());
+        }
 
         Ok(Rc::new(FnProto {
             chunk: body_chunk,

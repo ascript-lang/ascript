@@ -113,10 +113,22 @@ include:
 - A `!` [force-unwrap](#the--force-unwrap-operator) on a failed result pair (recoverable via `recover`).
 - A `ClassName.from(obj)` [shape mismatch](classes-enums) (recoverable, carries a field path).
 - Misusing a builtin (e.g. `len` on a number).
+- Exceeding the **recursion-depth limit** — `maximum recursion depth exceeded` (recoverable via
+  `recover`). Deep non-terminating recursion (and deeply nested expressions) hit a fixed logical-depth
+  cap and panic *cleanly* before the native stack overflows, instead of crashing the process. The same
+  limit applies on both the bytecode VM and the tree-walker.
 
 ```ascript
 let xs = [1, 2, 3]
 print(xs[9])     // panic: index 9 out of bounds (len 3)
+```
+
+A non-terminating recursion is caught like any other panic:
+
+```ascript
+fn forever(n) { return forever(n + 1) }
+let [_, err] = recover(() => forever(0))
+print(err.message)   // maximum recursion depth exceeded
 ```
 
 > [!TIER2] Panics signal *caller bugs*, not runtime conditions you should handle in control flow. If

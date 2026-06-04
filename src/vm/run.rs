@@ -208,6 +208,38 @@ impl Vm {
         &self.interp
     }
 
+    /// SP3 §B: increment the SHARED logical call-depth on establishing a new VM
+    /// call frame, returning the clean Tier-2 panic if it would exceed
+    /// [`crate::interp::MAX_CALL_DEPTH`]. Called at the in-loop `fiber.frames.push`
+    /// sites (the frame-Vec call path) — one increment per logical call, matching
+    /// the tree-walker's one-per-`run_body`. The matching decrement is in
+    /// [`Vm::return_from_frame`] on the non-root pop, so the count tracks the live
+    /// frame depth. The counter is `Interp.call_depth` (a `Cell`), never held
+    /// across an `.await`.
+    fn enter_frame_depth(&self, span: crate::span::Span) -> Result<(), Control> {
+        let depth = self.interp.call_depth_cell();
+        let next = depth.get() + 1;
+        if next > crate::interp::MAX_CALL_DEPTH {
+            return Err(Control::Panic(crate::error::AsError::at(
+                "maximum recursion depth exceeded",
+                span,
+            )));
+        }
+        depth.set(next);
+        Ok(())
+    }
+
+    /// SP3 §B: decrement the shared logical call-depth when a non-root frame is
+    /// popped (the matching dec for [`Vm::enter_frame_depth`]). The ROOT/initial
+    /// frame of a fiber is NOT decremented here — its depth unit is owned by the
+    /// program root (counter returns to 0 at program end) or by the re-entrant
+    /// `self.run`'s RAII [`crate::interp::DepthGuard`] (`invoke_compiled_method` /
+    /// `call_value`), so it unwinds exactly once.
+    fn leave_frame_depth(&self) {
+        let depth = self.interp.call_depth_cell();
+        depth.set(depth.get() - 1);
+    }
+
     /// Force a full cycle collection (V13-T3). Thin pass-through to
     /// [`crate::gc::collect`] so tests (V13-T4's soundness gate) can deterministically
     /// trigger trial-deletion at a known point and assert a cycle was reclaimed. The
@@ -991,6 +1023,11 @@ impl Vm {
                                     fiber.stack[slot_base + slot] = v;
                                 }
                             }
+                            // SP3 §B: one logical-call increment per frame push
+                            // (matches the tree-walker's one-per-`run_body`); the
+                            // matching decrement is in `return_from_frame`. Over the
+                            // limit → the clean Tier-2 panic anchored at the call.
+                            self.enter_frame_depth(call_span)?;
                             fiber.frames.push(super::fiber::CallFrame {
                                 closure: callee,
                                 ip: 0,
@@ -2675,6 +2712,13 @@ impl Vm {
                         fiber.stack[slot] = v;
                     }
                 }
+                // SP3 §B: this re-enters `Vm::run` on a FRESH native stack frame —
+                // the fiber's initial frame is one logical call. Guard it (RAII, the
+                // counter unwinds on drop); the initial frame's RETURN hits the root
+                // path in `return_from_frame` which does NOT decrement, so the guard
+                // owns exactly that unit. A `Cell`, never held as a RefCell borrow
+                // across the `.await`.
+                let _depth = self.interp.enter_call_depth_scoped(span)?;
                 // Drive the fresh fiber to completion. A top-level closure body
                 // cannot `yield` (yield is only valid inside a generator, which is
                 // driven differently), so `Done(v)` is the only outcome; a `yield`
@@ -3022,6 +3066,10 @@ impl Vm {
                         fiber.stack[slot_base + slot] = v;
                     }
                 }
+                // SP3 §B: one logical-call increment per method-call frame push
+                // (matches the tree-walker `run_body`); decremented in
+                // `return_from_frame`.
+                self.enter_frame_depth(span)?;
                 fiber.frames.push(super::fiber::CallFrame {
                     closure,
                     ip: 0,
@@ -3619,6 +3667,11 @@ impl Vm {
                 fiber.stack[slot] = v;
             }
         }
+        // SP3 §B: native re-entry into `Vm::run` — guard the fiber's initial
+        // (method) frame as one logical call (RAII, the root pop does not
+        // decrement, so the guard owns this unit). Matches one tree-walker
+        // `run_body`.
+        let _depth = self.interp.enter_call_depth_scoped(span)?;
         match self.run(&mut fiber).await? {
             RunOutcome::Done(v) => Ok(v),
             RunOutcome::Yielded(_) => {
@@ -3744,8 +3797,14 @@ impl Vm {
         }
         fiber.stack.truncate(frame.slot_base);
         if fiber.frames.is_empty() {
+            // ROOT/initial frame of this fiber — its logical-depth unit is owned by
+            // the program root (counter returns to 0 at program end) or by the
+            // re-entrant `self.run`'s RAII guard, so do NOT decrement here.
             return Ok(Some(RunOutcome::Done(value)));
         }
+        // SP3 §B: a non-root frame was popped — match the `enter_frame_depth`
+        // increment from when it was pushed.
+        self.leave_frame_depth();
         fiber.push(value);
         Ok(None)
     }

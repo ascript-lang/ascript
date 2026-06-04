@@ -846,7 +846,7 @@ mod tests {
     fn roundtrip_aso_verifies_ok() {
         for &src in PROGRAMS {
             let chunk = compile(src);
-            let bytes = chunk.to_bytes();
+            let bytes = chunk.to_bytes().expect("serialize");
             Chunk::from_bytes_verified(&bytes)
                 .unwrap_or_else(|e| panic!("from_bytes_verified failed for {src:?}: {e}"));
         }
@@ -998,7 +998,7 @@ mod tests {
         // Round-trip a real program, corrupt a byte in the code region, and confirm
         // from_bytes_verified rejects it (either decode or verify fails).
         let chunk = compile("fn f(a) { return a + 1 }\nprint(f(41))");
-        let mut bytes = chunk.to_bytes();
+        let mut bytes = chunk.to_bytes().expect("serialize");
         // The code length prefix is right after magic(4) + version(4) = offset 8.
         let code_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
         assert!(code_len > 0);
