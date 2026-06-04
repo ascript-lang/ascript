@@ -122,6 +122,44 @@ Fields you never declare stay fully **dynamic** (the gradual rule): you can stil
 > `nickname?: string`. **Both lower to the same node** (`string | nil`); the formatter normalizes the
 > marker form to the canonical `nickname: string?`.
 
+### Records — an init-less class auto-derives a constructor
+
+A class that declares fields but writes **no `init`** automatically gets a **positional constructor**
+over its fields — no new keyword, "record-ness" is just *fields + no `init`*:
+
+```ascript
+class Point {
+  x: number
+  y: number
+}
+const p = Point(3, 4)   // auto-derived: binds x=3, y=4 positionally
+print(p.x)              // 3
+```
+
+- The parameters are the declared fields **in declaration order** (and, with [inheritance](#inheritance),
+  base-class fields come **first**).
+- A **defaulted field becomes an optional trailing parameter** — omit it to take the default, or pass
+  it to override:
+
+  ```ascript
+  class Config {
+    host: string
+    port: number = 8080
+  }
+  print(Config("localhost").port)        // 8080 (default)
+  print(Config("localhost", 9000).port)  // 9000 (overridden)
+  ```
+
+- Each positional argument is **contract-checked** against its field's type, exactly like a
+  hand-written `init` that assigns `self.f = arg` — a wrong type is a [type-contract](type-contracts)
+  panic, and too few / too many arguments is the same arity panic as any function call.
+- A class **with an explicit `init` is unchanged** — no auto-constructor is derived; your `init` runs
+  as written. A class with no fields *and* no `init` keeps its zero-argument constructor.
+
+> [!NOTE] The auto-derived constructor is synthesized at construction time from the class's declared
+> fields, so it works identically whether you `ascript run`, `ascript build` + run the `.aso`, or use
+> the `--tree-walker` engine; `ascript check` validates record-construction arity too.
+
 ### `ClassName.from` — validate a raw object into an instance
 
 `ClassName.from(obj, strict = false)` turns an untrusted plain object (for example, the result of
