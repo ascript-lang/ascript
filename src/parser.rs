@@ -20,6 +20,15 @@ impl<'a> Parser<'a> {
         &self.tokens[self.pos].tok
     }
 
+    /// Look ahead `n` tokens past the cursor (0 = current). Returns `Tok::Eof`
+    /// past the end. Used for small contextual-keyword lookahead (e.g. `static`).
+    fn peek_nth(&self, n: usize) -> &Tok {
+        self.tokens
+            .get(self.pos + n)
+            .map(|t| &t.tok)
+            .unwrap_or(&Tok::Eof)
+    }
+
     fn span(&self) -> Span {
         self.tokens[self.pos].span
     }
@@ -338,9 +347,20 @@ impl<'a> Parser<'a> {
             if *self.peek() == Tok::RBrace {
                 break;
             }
-            // A member starting with `async` or `fn` is a method; otherwise a field.
-            if *self.peek() == Tok::Async || *self.peek() == Tok::Fn {
+            // A member starting with `async` or `fn` is a method (optionally
+            // preceded by the soft keyword `static`); otherwise a field. `static`
+            // lexes as `Tok::Ident("static")`; it is a method modifier ONLY when
+            // directly followed by `fn`/`async`, so `static: T` stays a field.
+            let is_static_method = matches!(self.peek(), Tok::Ident(s) if s == "static")
+                && matches!(self.peek_nth(1), Tok::Async | Tok::Fn);
+            if *self.peek() == Tok::Async || *self.peek() == Tok::Fn || is_static_method {
                 let mstart = self.span().start;
+                let is_static = if is_static_method {
+                    self.advance(); // consume the contextual `static`
+                    true
+                } else {
+                    false
+                };
                 let is_async = if *self.peek() == Tok::Async {
                     self.advance();
                     true
@@ -380,6 +400,7 @@ impl<'a> Parser<'a> {
                     body,
                     is_async,
                     is_generator,
+                    is_static,
                     span: mspan,
                     name_span: mname_span,
                 });

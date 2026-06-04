@@ -25,6 +25,72 @@ print(a.speak())           // Rex makes a sound
 - `init` runs when you call the class; assign fields with `self.field = …`.
 - Methods may be `async fn`.
 
+### Generator methods
+
+A method may be a generator — `fn*` or `async fn*`. Calling it returns a generator
+bound to `self`, driven by `for await` / `.next()` / `gen.close()`, exactly like a standalone
+generator. `self`, arguments, type contracts, inheritance, and `super` all work as for an ordinary
+method.
+
+```ascript
+class Counter {
+  fn init(start) { self.start = start }
+  fn* upTo(n) {
+    let i = self.start
+    while (i <= n) {
+      yield i
+      i = i + 1
+    }
+  }
+}
+
+let c = Counter(3)
+for await (v in c.upTo(6)) {
+  print(v)   // 3 4 5 6
+}
+```
+
+### Static methods & the async factory
+
+A member declared `static fn name(...)` (also `static async fn` and `static fn*`) is a
+**class-level** method, called as `C.name(args)` with **no `self`** / no instance. Static methods
+live in a **separate namespace** from instance methods (an instance `c.x()` and a static `C.x()` may
+share a name), are **inherited** up the superclass chain, and may construct instances or call other
+statics. `super` is not valid inside a static (there is no instance/parent receiver).
+
+```ascript
+class Point {
+  fn init(x, y) { self.x = x
+    self.y = y }
+  static fn origin() { return Point(0, 0) }   // sync factory
+  fn sum() { return self.x + self.y }
+}
+print(Point.origin().sum())   // 0
+```
+
+Because construction is synchronous (`Point(...)` returns an instance, not a future), the blessed
+pattern for **async construction** is a `static async fn create(...)` factory that returns a
+`future` — `create` is a convention, not a keyword:
+
+```ascript
+class User {
+  fn init(name) { self.name = name }
+  static async fn load(id) {
+    let u = User("?")
+    u.name = await fetchName(id)   // do async work, then return the built instance
+    return u
+  }
+}
+let u = await User.load(42)
+```
+
+> An **`async fn init`** (or a generator **`fn* init`**) is forbidden — synchronous construction has
+> no caller to `await` it, and a generator constructor makes no sense. Both are a clean compile-time
+> error (*"init must be a synchronous constructor; use a static async factory (e.g. `static async fn
+> create()`)"*) on either engine — use a `static async fn create()` factory instead. The name
+> **`from`** is reserved on classes (it collides
+> with the built-in typed-parse `ClassName.from`), so `static fn from` is an error.
+
 ### Typed fields
 
 A class body may declare fields with [contract types](type-contracts) before its methods. There are

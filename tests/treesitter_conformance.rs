@@ -107,6 +107,32 @@ fn treesitter_parses_inclusive_and_step_ranges() {
 }
 
 #[test]
+fn treesitter_parses_static_methods() {
+    // `static` is a class-member modifier on `fn`/`async fn`/`fn*` (SP1 §3) and a
+    // contextual soft keyword — usable as an ordinary identifier elsewhere.
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        "class C { static fn make() { return C() } }",
+        "class C { static async fn create() { return C() } }",
+        "class C { static fn* gen() { yield 1 } }",
+        "class C { fn m() { return 1 }\n static fn s() { return 2 } }",
+        // `static` is contextual, NOT reserved: usable as an ordinary identifier
+        // everywhere except as a class-member modifier.
+        "let static = 1",
+        "fn static(n) { return n }",
+        "let r = f(static)",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on static snippet: {src}"
+        );
+    }
+}
+
+#[test]
 fn interpreter_parser_accepts_all_examples() {
     let mut failures = Vec::new();
     for path in example_files() {

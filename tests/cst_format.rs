@@ -114,6 +114,41 @@ fn formats_inclusive_and_step_ranges() {
 }
 
 #[test]
+fn formats_static_methods() {
+    // SP1 §3: `static fn` / `static async fn` / `static fn*` format with the
+    // `static` modifier first, then `async`, then `fn`; statics sit with the other
+    // methods (after fields); idempotent + reparses.
+    for (src, want) in [
+        (
+            "class C { static fn make() { return C() } }\n",
+            "class C {\n  static fn make() {\n    return C()\n  }\n}\n",
+        ),
+        (
+            "class C { static async fn create() { return C() } }\n",
+            "class C {\n  static async fn create() {\n    return C()\n  }\n}\n",
+        ),
+        (
+            "class C { static fn* gen() { yield 1 } }\n",
+            "class C {\n  static fn* gen() {\n    yield 1\n  }\n}\n",
+        ),
+        // fields before methods; a static method sits with the instance methods.
+        (
+            "class C { static fn s() { return 1 }\n x: number = 0\n fn m() { return self.x } }\n",
+            "class C {\n  x: number = 0\n  static fn s() {\n    return 1\n  }\n  fn m() {\n    return self.x\n  }\n}\n",
+        ),
+    ] {
+        let once = ascript::syntax::format_tree(src);
+        assert_eq!(once, want, "unexpected format for {src:?}");
+        let twice = ascript::syntax::format_tree(&once);
+        assert_eq!(once, twice, "not idempotent for {src:?}");
+        assert!(
+            ascript::syntax::parser::parse(&once).errors.is_empty(),
+            "formatted static-method output does not reparse: {once:?}"
+        );
+    }
+}
+
+#[test]
 fn formats_nil_type_idempotently() {
     // `nil` as a type formats via the NamedType path (first non-trivia token
     // text) and round-trips. Regression for the missing `NilKw` arm in the CST
@@ -185,4 +220,40 @@ fn formatted_corpus_reparses_without_errors() {
         "formatter produced unparseable output:\n{}",
         failures.join("\n")
     );
+}
+
+#[test]
+fn consecutive_comments_stay_together_no_inserted_blank() {
+    // Regression (SP1 BUGFIX 1): the formatter wrongly inserted a blank line
+    // between consecutive `//` comment lines (the comment line's terminating
+    // newline was double-counted toward the next comment's `blank_before`).
+    // Consecutive comments — including a run that precedes a declaration — must
+    // stay together with NO inserted blank; genuine author blanks are preserved.
+    let cases: &[(&str, &str)] = &[
+        // The exact repro from the bug report: 3 comments + a decl, no blanks.
+        (
+            "// a\n// b\n// c\nlet x = 1\n",
+            "// a\n// b\n// c\nlet x = 1\n",
+        ),
+        // A genuine author blank between two comments is preserved.
+        ("// a\n\n// c\nlet x = 1\n", "// a\n\n// c\nlet x = 1\n"),
+        // Consecutive comments leading a function declaration (the body is
+        // canonicalized to multiline, but the comments stay together, no blank).
+        (
+            "// one\n// two\nfn f() { return 1 }\n",
+            "// one\n// two\nfn f() {\n  return 1\n}\n",
+        ),
+        // Mixed: a blank then a run of consecutive comments.
+        (
+            "let a = 1\n\n// x\n// y\nlet b = 2\n",
+            "let a = 1\n\n// x\n// y\nlet b = 2\n",
+        ),
+    ];
+    for (src, expected) in cases {
+        let once = ascript::syntax::format_tree(src);
+        assert_eq!(&once, expected, "fmt mismatch for {src:?}");
+        // …and idempotent.
+        let twice = ascript::syntax::format_tree(&once);
+        assert_eq!(once, twice, "not idempotent for {src:?}");
+    }
 }

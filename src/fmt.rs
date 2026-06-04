@@ -358,6 +358,10 @@ fn write_field(out: &mut String, fd: &FieldDecl, level: usize) {
 
 fn write_method(out: &mut String, m: &MethodDecl, level: usize) {
     indent(out, level);
+    // `static fn` / `static async fn` / `static fn*` (SP1 §3): modifier first.
+    if m.is_static {
+        out.push_str("static ");
+    }
     if m.is_async {
         out.push_str("async ");
     }

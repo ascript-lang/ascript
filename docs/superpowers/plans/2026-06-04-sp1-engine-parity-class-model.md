@@ -166,11 +166,11 @@ The largest phase. Build in dependency order: grammar → resolver → value/dis
 
 ### Task D1: reject async init identically
 
-- [ ] **Step 1 — Failing test:** `diff_case("async_init_rejected", "class C { async fn init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n")` — assert BOTH engines error with identical message + exit. (Today they diverge: VM runs it, tree-walker leaves `x` nil.)
-- [ ] **Step 2 — Run, verify divergence** (test fails because engines differ).
-- [ ] **Step 3 — Implement** both engines: a class whose `init` is `async` (or `fn*`) → compile/resolve error `"init must be a synchronous constructor; use a static async factory (e.g. \`static async fn create()\`)"`. Runtime-timed is unnecessary — this is a structural error knowable at compile/resolve; ensure BOTH engines emit it at the same point with the same message (a compile-time error in both is fine and symmetric).
-- [ ] **Step 4 — Run** → both reject identically.
-- [ ] **Step 5 — Phase-D gate + commit:** `feat: forbid async fn init on both engines (use a static async factory)`.
+- [x] **Step 1 — Failing test:** `diff_case("async_init_rejected", "class C { async fn init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n")` — assert BOTH engines error with identical message + exit. (Today they diverge: VM runs it, tree-walker leaves `x` nil.)
+- [x] **Step 2 — Run, verify divergence** (test fails because engines differ).
+- [x] **Step 3 — Implement** both engines: a class whose `init` is `async` (or `fn*`) → compile/resolve error `"init must be a synchronous constructor; use a static async factory (e.g. \`static async fn create()\`)"`. Runtime-timed is unnecessary — this is a structural error knowable at compile/resolve; ensure BOTH engines emit it at the same point with the same message (a compile-time error in both is fine and symmetric).
+- [x] **Step 4 — Run** → both reject identically.
+- [x] **Step 5 — Phase-D gate + commit:** `feat: forbid async fn init on both engines (use a static async factory)`.
 
 ---
 

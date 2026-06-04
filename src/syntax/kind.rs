@@ -229,6 +229,12 @@ pub enum SyntaxKind {
     AwaitKw,
     #[static_text("yield")]
     YieldKw,
+    // `static` is a CONTEXTUAL/soft keyword: the lexer never produces it (an
+    // identifier `static` lexes as `Ident`). The parser REMAPS the `static`
+    // identifier to this kind only in class-member-modifier position (before
+    // `fn`/`async fn`/`fn*`), so `let static = 1` keeps `static` an `Ident`.
+    // No `#[static_text]` — it is never matched by `keyword_kind`.
+    StaticKw,
 
     // --- sentinel for unrecognized input ---
     Error,

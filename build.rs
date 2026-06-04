@@ -228,6 +228,7 @@ fn token_kind(name: &str) -> Option<&'static str> {
         "async" => "AsyncKw",
         "await" => "AwaitKw",
         "yield" => "YieldKw",
+        "static" => "StaticKw",
         "number" => "Number",
         "string" => "Str",
         "ident" => "Ident",

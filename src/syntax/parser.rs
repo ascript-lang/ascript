@@ -111,6 +111,18 @@ impl Parser {
         }
     }
 
+    /// Consume the current token but record it under a DIFFERENT `SyntaxKind`.
+    /// The tree builder pairs the event's kind with the original token's TEXT
+    /// (it advances the raw-token cursor positionally), so this stays lossless.
+    /// Used for contextual/soft keywords (e.g. remapping a `static` identifier
+    /// to `StaticKw` in class-member-modifier position).
+    fn bump_remap(&mut self, kind: SyntaxKind) {
+        if !self.at_end() {
+            self.events.push(Event::Token { kind });
+            self.pos += 1;
+        }
+    }
+
     fn complete(&mut self, mut m: Marker, kind: SyntaxKind) -> CompletedMarker {
         m.completed = true;
         if let Event::Start { kind: slot, .. } = &mut self.events[m.pos] {
@@ -1217,7 +1229,7 @@ fn class_decl(p: &mut Parser) {
     }
     while !p.at(RBrace) && !p.at_end() {
         let before = p.pos;
-        if p.at(AsyncKw) || p.at(FnKw) {
+        if p.at(AsyncKw) || p.at(FnKw) || at_static_method(p) {
             method_decl(p);
         } else if p.at(Ident) {
             field_decl(p);
@@ -1257,9 +1269,26 @@ fn field_decl(p: &mut Parser) {
     p.complete(m, FieldDecl);
 }
 
+/// True when the cursor is at a `static` member modifier: the soft keyword
+/// `static` (an `Ident`) immediately followed by `fn` or `async` (the start of a
+/// method). This is the ONLY position where `static` is recognized as a keyword;
+/// `static: T` (a field) or `static = …` keep `static` an ordinary identifier.
+fn at_static_method(p: &Parser) -> bool {
+    if !p.at_kw("static") {
+        return false;
+    }
+    matches!(
+        p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
+        Some(SyntaxKind::FnKw) | Some(SyntaxKind::AsyncKw)
+    )
+}
+
 fn method_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
+    if at_static_method(p) {
+        p.bump_remap(StaticKw); // contextual `static` modifier
+    }
     if p.at(AsyncKw) {
         p.bump();
     }

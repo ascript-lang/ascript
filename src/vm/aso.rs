@@ -71,7 +71,15 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   plain `inclusive` flag to a `flags` byte (bit0 = inclusive, bit1 = step
 ///   PRESENT) and its stack shape grew from `subject lo hi` to `subject lo hi step`
 ///   (a `nil` step placeholder when omitted). Opcode byte values are unchanged.
-pub const ASO_FORMAT_VERSION: u32 = 9;
+/// - 10: static methods (SP1 §3) — `ClassProto` gained a `static_method_names`
+///   list (written right after `method_names`), so the class-proto byte layout
+///   grew. Opcode byte values are unchanged.
+/// - 11: arrow/`match` field defaults (SP1 §4) — a new `EX_REPARSE` field-default
+///   expr tag carries the default's left-padded source text inline; on load it is
+///   re-lowered through the legacy front-end. The class byte layout is unchanged
+///   (the source rides inside the field-default expr stream). Opcode byte values
+///   are unchanged.
+pub const ASO_FORMAT_VERSION: u32 = 11;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -185,6 +193,12 @@ const EX_ASSIGN: u8 = 19;
 /// A value-position range `a..b` / `a..=b` (`ExprKind::Range`); `step` defaults
 /// never reach here (`cst_default_expr` rejects a stepped default).
 const EX_RANGE: u8 = 20;
+/// An ARROW or `match` field default, lowered by RE-PARSING source text (SP1 §4,
+/// format v11). The payload is the left-padded source string (`reparse_default_source`);
+/// on load it is re-lowered through the legacy front-end (`reparse_default_from_source`)
+/// to the identical `Expr`. Emitted by `write_field_default` (consulting the class's
+/// `default_sources`), NOT by the generic `write_expr` (which never sees these forms).
+const EX_REPARSE: u8 = 21;
 
 // Template-part tags (within an `EX_TEMPLATE`).
 const TP_LIT: u8 = 0;
@@ -283,6 +297,11 @@ impl<'a> Reader<'a> {
     }
     fn u8(&mut self) -> Result<u8, AsoError> {
         Ok(self.take(1)?[0])
+    }
+    /// Read the next byte WITHOUT advancing (so the caller can branch on a tag and
+    /// then consume it or fall through to a uniform reader).
+    fn peek_u8(&self) -> Result<u8, AsoError> {
+        self.buf.get(self.pos).copied().ok_or(AsoError::Truncated)
     }
     fn u16(&mut self) -> Result<u16, AsoError> {
         let b = self.take(2)?;
@@ -963,11 +982,11 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
             write_expr(w, target)?;
             write_expr(w, value)?;
         }
-        // `Arrow` and `Match` defaults embed statement/pattern subtrees that this
-        // flat serializer does not encode. They run correctly via `ascript run`
-        // (the VM compiles them through `cst_default_expr` in memory), but cannot
-        // be cached to an `.aso` file — a documented `ascript build`-only limit
-        // (parallel to the prior spread rejection). `Yield` never reaches here
+        // `Arrow` and `Match` defaults embed statement/pattern subtrees this flat
+        // serializer does not encode structurally; they are serialized by
+        // `write_field_default` as an `EX_REPARSE` source-text payload (SP1 §4) and
+        // so never reach `write_expr`. Reaching here is a compiler invariant
+        // violation (a default_sources/field mismatch). `Yield` never reaches here
         // (`cst_default_expr` rejects a `yield` default outright).
         ExprKind::Arrow { .. } => return Err(AsoError::NonLiteralConst("arrow-default")),
         ExprKind::Match { .. } => return Err(AsoError::NonLiteralConst("match-default")),
@@ -1039,6 +1058,14 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
     let end = r.usize()?;
     let span = Span::new(start, end);
     let tag = r.u8()?;
+    let kind = read_expr_kind(r, tag)?;
+    Ok(Expr { kind, span })
+}
+
+/// Decode an [`ExprKind`] given its already-read tag byte (the span header is read
+/// by the caller). Split out so `read_field_default` can peek the tag to capture an
+/// `EX_REPARSE` source before delegating here for the non-reparse forms.
+fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
     let kind = match tag {
         EX_NUMBER => ExprKind::Number(r.f64()?),
         EX_STR => ExprKind::Str(r.str()?),
@@ -1179,21 +1206,43 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
                 step: None,
             }
         }
+        // `EX_REPARSE` (arrow/`match` field default, SP1 §4) only ever appears at the
+        // TOP of a field-default expr stream, where `read_field_default` peeks and
+        // handles it (capturing the source for re-serialization) BEFORE delegating
+        // here. It is never nested inside another expr (`cst_default_expr` re-parses
+        // the whole arrow/match node as one unit), so reaching it here is a corrupt
+        // stream.
+        EX_REPARSE => return Err(AsoError::BadTag { what: "expr", tag }),
         tag => return Err(AsoError::BadTag { what: "expr", tag }),
     };
-    Ok(Expr { kind, span })
+    Ok(kind)
 }
 
 // ---- ClassProto / Class / FieldSchema ----------------------------------------
 
 fn write_class_proto(w: &mut Writer, cp: &ClassProto) -> Result<(), AsoError> {
-    write_class(w, &cp.class)?;
+    // Build the field→source lookup for arrow/`match` defaults (SP1 §4). The
+    // `write_class` default writer consults it to emit an `EX_REPARSE` tag carrying
+    // the source inline instead of structurally serializing the (unrepresentable)
+    // statement/pattern subtree.
+    let sources: std::collections::HashMap<&str, &str> = cp
+        .default_sources
+        .iter()
+        .map(|(f, s)| (f.as_str(), s.as_str()))
+        .collect();
+    write_class(w, &cp.class, &sources)?;
     w.len(cp.default_fields.len());
     for f in &cp.default_fields {
         w.str(f);
     }
     w.len(cp.method_names.len());
     for m in &cp.method_names {
+        w.str(m);
+    }
+    // Static method names (SP1 §3, format v10): a separate namespace from
+    // `method_names`; the static closures are pushed after the instance methods.
+    w.len(cp.static_method_names.len());
+    for m in &cp.static_method_names {
         w.str(m);
     }
     // Per-default capture plan (parallel to default_fields): the free names each
@@ -1211,7 +1260,7 @@ fn write_class_proto(w: &mut Writer, cp: &ClassProto) -> Result<(), AsoError> {
 }
 
 fn read_class_proto(r: &mut Reader) -> Result<ClassProto, AsoError> {
-    let class = read_class(r)?;
+    let (class, default_sources) = read_class(r)?;
     let n = r.len()?;
     let mut default_fields = Vec::with_capacity(n);
     for _ in 0..n {
@@ -1221,6 +1270,11 @@ fn read_class_proto(r: &mut Reader) -> Result<ClassProto, AsoError> {
     let mut method_names = Vec::with_capacity(n);
     for _ in 0..n {
         method_names.push(r.str()?);
+    }
+    let n = r.len()?;
+    let mut static_method_names = Vec::with_capacity(n);
+    for _ in 0..n {
+        static_method_names.push(r.str()?);
     }
     let n = r.len()?;
     let mut default_captures = Vec::with_capacity(n);
@@ -1238,13 +1292,21 @@ fn read_class_proto(r: &mut Reader) -> Result<ClassProto, AsoError> {
     Ok(ClassProto {
         class: Rc::new(class),
         default_fields,
+        // Recovered from the `EX_REPARSE` field-default payloads by `read_class`, so a
+        // loaded chunk re-serializes byte-identically (round-trip idempotence).
+        default_sources,
         method_names,
+        static_method_names,
         default_captures,
         has_super,
     })
 }
 
-fn write_class(w: &mut Writer, c: &Class) -> Result<(), AsoError> {
+fn write_class(
+    w: &mut Writer,
+    c: &Class,
+    sources: &std::collections::HashMap<&str, &str>,
+) -> Result<(), AsoError> {
     // The compiler builds the ClassProto's class with `superclass: None`,
     // `methods` empty, and `def_env = global_env()` placeholder. Serialize only
     // the name + field schemas; the rest is rebuilt as the same inert template.
@@ -1256,7 +1318,7 @@ fn write_class(w: &mut Writer, c: &Class) -> Result<(), AsoError> {
         match &schema.default {
             Some(e) => {
                 w.u8(1);
-                write_expr(w, e)?;
+                write_field_default(w, fname, e, sources)?;
             }
             None => w.u8(0),
         }
@@ -1264,16 +1326,53 @@ fn write_class(w: &mut Writer, c: &Class) -> Result<(), AsoError> {
     Ok(())
 }
 
-fn read_class(r: &mut Reader) -> Result<Class, AsoError> {
+/// Serialize a field's default expression. For an arrow/`match` default (the forms
+/// `cst_default_expr` lowers by re-parsing source — they appear in `sources`) emit
+/// an `EX_REPARSE` tag carrying the source text; everything else delegates to the
+/// structural `write_expr`. The leading span (start/end) is written first either
+/// way, matching `read_expr`'s uniform header.
+fn write_field_default(
+    w: &mut Writer,
+    fname: &str,
+    e: &Expr,
+    sources: &std::collections::HashMap<&str, &str>,
+) -> Result<(), AsoError> {
+    if let Some(src) = sources.get(fname) {
+        debug_assert!(
+            matches!(e.kind, ExprKind::Arrow { .. } | ExprKind::Match { .. }),
+            "default_sources entry for a non-arrow/match default"
+        );
+        w.usize(e.span.start);
+        w.usize(e.span.end);
+        w.u8(EX_REPARSE);
+        w.str(src);
+        Ok(())
+    } else {
+        write_expr(w, e)
+    }
+}
+
+/// Read a class template plus the arrow/`match` default source-texts recovered from
+/// the field-default stream (`EX_REPARSE`). The sources let a loaded chunk be
+/// RE-serialized byte-identically (the `default_sources` lookup `write_field_default`
+/// consults) — preserving `.aso` round-trip idempotence for these defaults.
+fn read_class(r: &mut Reader) -> Result<(Class, Vec<(String, String)>), AsoError> {
     let name = r.str()?;
     let n = r.len()?;
     let mut fields = indexmap::IndexMap::with_capacity(n);
+    let mut sources: Vec<(String, String)> = Vec::new();
     for _ in 0..n {
         let fname = r.str()?;
         let ty = read_type(r)?;
         let default = match r.u8()? {
             0 => None,
-            1 => Some(read_expr(r)?),
+            1 => {
+                let (expr, src) = read_field_default(r)?;
+                if let Some(src) = src {
+                    sources.push((fname.clone(), src));
+                }
+                Some(expr)
+            }
             tag => {
                 return Err(AsoError::BadTag {
                     what: "field-default",
@@ -1283,13 +1382,41 @@ fn read_class(r: &mut Reader) -> Result<Class, AsoError> {
         };
         fields.insert(fname, FieldSchema { ty, default });
     }
-    Ok(Class {
+    let class = Class {
         name,
         superclass: None,
         fields,
         methods: indexmap::IndexMap::new(),
+        // Static methods (SP1 §3) round-trip via the static proto table, not this
+        // class template; see C6.
+        static_methods: indexmap::IndexMap::new(),
         def_env: crate::interp::global_env(),
-    })
+    };
+    Ok((class, sources))
+}
+
+/// Read one field default. Returns the lowered [`Expr`] and, for an `EX_REPARSE`
+/// (arrow/`match`) default, its original source text (so it can be re-serialized).
+/// Mirrors `read_expr`'s uniform `(span, tag, ..)` framing but peeks the tag so the
+/// `EX_REPARSE` source can be captured before re-lowering.
+fn read_field_default(r: &mut Reader) -> Result<(Expr, Option<String>), AsoError> {
+    let start = r.usize()?;
+    let end = r.usize()?;
+    if r.peek_u8()? == EX_REPARSE {
+        let _ = r.u8()?; // consume the peeked tag
+        let src = r.str()?;
+        let expr = crate::compile::reparse_default_from_source(&src).map_err(|_| AsoError::BadTag {
+            what: "reparse-default",
+            tag: EX_REPARSE,
+        })?;
+        return Ok((expr, Some(src)));
+    }
+    // Not a reparse default: rewind to the span and read normally. The span bytes
+    // were already consumed, so feed them back by reading the rest via `read_expr`'s
+    // body. Reconstruct the full expr by reusing the already-read span.
+    let tag = r.u8()?;
+    let kind = read_expr_kind(r, tag)?;
+    Ok((Expr { kind, span: Span::new(start, end) }, None))
 }
 
 // ---- ImportDesc --------------------------------------------------------------
@@ -1743,6 +1870,41 @@ print(c.merged)
             run_chunk(compile(src)),
             run_chunk(Chunk::from_bytes(&compile(src).to_bytes()).expect("decode")),
             "computed-default output differs after .aso round-trip"
+        );
+    }
+
+    #[test]
+    fn arrow_and_match_field_defaults_roundtrip(/* SP1 §4, format v11 */) {
+        // Arrow + `match` field defaults are lowered by RE-PARSING source text; the
+        // `.aso` writer persists that source (`EX_REPARSE`) and re-lowers it on load.
+        // Assert (1) run-output parity through the round-trip and (2) that a LOADED
+        // chunk re-serializes byte-identically (round-trip idempotence) — the
+        // `default_sources` recovered by `read_class` make the second encode possible.
+        let src = r#"
+let base = 100
+
+class C {
+    f: fn = (n) => n + base
+    label: string = match 2 { 1 => "one", 2 => "two", _ => "many" }
+    fn init() {}
+}
+
+let c = C()
+print(c.f(5))
+print(c.label)
+"#;
+        assert_eq!(
+            run_chunk(compile(src)),
+            run_chunk(Chunk::from_bytes(&compile(src).to_bytes()).expect("decode")),
+            "arrow/match field-default output differs after .aso round-trip"
+        );
+        // Idempotence: encode → decode → encode must be byte-stable.
+        let once = Chunk::from_bytes(&compile(src).to_bytes()).expect("decode 1");
+        let twice = Chunk::from_bytes(&once.to_bytes()).expect("decode 2");
+        assert_eq!(
+            once.to_bytes(),
+            twice.to_bytes(),
+            "arrow/match field-default .aso re-serialization is not idempotent"
         );
     }
 }

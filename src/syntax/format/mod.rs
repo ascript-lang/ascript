@@ -393,6 +393,11 @@ impl Printer<'_> {
                     .filter_map(|el| el.into_token())
                     .map(|t| t.kind())
                     .collect();
+                // `static fn` / `static async fn` / `static fn*` (SP1 §3): the
+                // `static` modifier prints first, then `async`, then `fn`.
+                if toks.contains(&StaticKw) {
+                    self.out.text("static ");
+                }
                 if toks.contains(&AsyncKw) {
                     self.out.text("async ");
                 }

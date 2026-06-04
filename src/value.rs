@@ -149,6 +149,7 @@ pub struct Method {
     pub ret: Option<crate::ast::Type>,
     pub body: Vec<Stmt>,
     pub is_async: bool,
+    pub is_generator: bool,
 }
 
 #[derive(Clone)]
@@ -162,6 +163,11 @@ pub struct Class {
     pub superclass: Option<Rc<Class>>,
     pub fields: IndexMap<String, FieldSchema>,
     pub methods: IndexMap<String, Rc<Method>>,
+    /// `static fn` / `static async fn` / `static fn*` members (SP1 §3). A SEPARATE
+    /// namespace from instance `methods` — an instance method and a static method
+    /// may share a name (`c.x()` vs `C.x()`). Called as `C.name(args)` with no
+    /// receiver; inherited up the superclass chain like instance methods.
+    pub static_methods: IndexMap<String, Rc<Method>>,
     pub def_env: Environment,
 }
 
@@ -317,6 +323,20 @@ pub fn find_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Clas
     None
 }
 
+/// Walk a class chain for a STATIC method (SP1 §3), returning it plus the class
+/// that defined it. Mirrors `find_method` but over the `static_methods` namespace
+/// so a subclass resolves an unknown static up its superclass chain.
+pub fn find_static_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Class>)> {
+    let mut cur = Some(class.clone());
+    while let Some(c) = cur {
+        if let Some(m) = c.static_methods.get(name) {
+            return Some((m.clone(), c.clone()));
+        }
+        cur = c.superclass.clone();
+    }
+    None
+}
+
 /// Merge the declared field schemas across a class's inheritance chain,
 /// **base-class first** so a subclass declaration overrides a base one with the
 /// same name. Each entry carries the class that declared it, so callers that
@@ -404,8 +424,12 @@ pub enum Value {
     /// async `call_generator_method`. Generators have no `NativeObject`, so they
     /// can't reuse `NativeMethod`; this is the parallel binding for them.
     GeneratorMethod(Rc<crate::coro::GeneratorHandle>, &'static str),
-    /// A class associated function bound to its class, e.g. `User.from`.
-    ClassMethod(Rc<Class>, &'static str),
+    /// A class associated function bound to its class: either the built-in typed
+    /// parser `User.from` or a USER static method `User.create` (SP1 §3). The name
+    /// is an `Rc<str>` (not `&'static`) so it can carry an arbitrary user static
+    /// name; `call_value` resolves it against `static_methods` (chain-walked),
+    /// then the built-in `from`.
+    ClassMethod(Rc<Class>, Rc<str>),
 }
 
 impl Value {

@@ -108,10 +108,16 @@ pub fn attach(root: &ResolvedNode) -> CommentMap {
                     let blank_before = newlines_since_content >= 2;
                     pending.push(Leading { text, blank_before });
                 }
-                // A comment itself does not reset `newlines_since_content` —
-                // only non-trivia tokens do.  But we *do* count newlines
-                // between the comment and the next token normally.
-                // (newlines_since_content is NOT reset here.)
+                // A comment occupies its line, so it acts as "content" for the
+                // purpose of blank-line tracking: reset the newline counter so the
+                // newline that *terminates this comment's line* is not double-counted
+                // toward the NEXT comment's `blank_before`. Without this, a run of
+                // consecutive `//` lines accrues one extra newline per comment and
+                // the formatter wrongly inserts a blank between them. A genuine
+                // author blank line (>= 2 newlines between two comments) is still
+                // preserved because those extra newlines are counted *after* this
+                // reset, before the next comment.
+                newlines_since_content = 0;
             }
             _ => {
                 // Non-trivia token: flush pending leading comments onto this
@@ -184,6 +190,43 @@ mod tests {
         assert!(
             lead[0].blank_before,
             "2+ newlines before comment → blank line preserved"
+        );
+    }
+
+    #[test]
+    fn consecutive_comments_have_no_blank_between() {
+        // Regression: a run of `//` lines with no author blank between them must
+        // NOT accrue a `blank_before` — the comment line's terminating newline was
+        // being double-counted toward the next comment.
+        let root = parse_to_tree("// a\n// b\n// c\nlet x = 1\n");
+        let map = attach(&root);
+        let stmt = first_stmt(&root); // the LetStmt
+        let lead = map
+            .leading
+            .get(&stmt.text_range())
+            .expect("3 leading comments on the let");
+        assert_eq!(lead.len(), 3);
+        for (i, c) in lead.iter().enumerate() {
+            assert!(
+                !c.blank_before,
+                "comment {i} ({:?}) must have no blank_before in a consecutive run",
+                c.text
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_blank_between_comments_is_preserved() {
+        // An author blank line (>= 2 newlines) between two comments is still kept.
+        let root = parse_to_tree("// a\n\n// c\nlet x = 1\n");
+        let map = attach(&root);
+        let stmt = first_stmt(&root);
+        let lead = map.leading.get(&stmt.text_range()).expect("2 leading");
+        assert_eq!(lead.len(), 2);
+        assert!(!lead[0].blank_before, "first comment: no blank before");
+        assert!(
+            lead[1].blank_before,
+            "second comment: author blank line preserved"
         );
     }
 }

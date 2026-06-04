@@ -1152,6 +1152,112 @@ async fn vm_opt_member_read_matches_treewalker() {
     }
 }
 
+// ----- SP1 Phase A: `a?.m(args)` optional method call -------------------------
+//
+// The VM used to REJECT `a?.m(...)` at compile (`optional method calls
+// (a?.m(...)) not yet supported (V9)`); the tree-walker runs it. These cases pin
+// the VM to the tree-walker's exact semantics, three-way (tree-walker ==
+// specialized-VM == generic-VM), byte-for-byte: a nil receiver yields `nil`
+// WITHOUT evaluating the arguments and short-circuits the rest of the postfix
+// chain; a non-nil receiver is an ordinary bound method call; `?.` guards ONLY
+// the nil receiver (a non-nil receiver with a missing method still panics
+// `value is not callable`).
+
+/// Three-way OK assertion: `tree-walker == specialized-VM == generic-VM`,
+/// byte-identical stdout, no exit code.
+async fn assert_opt_call_ok_three_way(src: &str) {
+    let tw = ascript::run_source(src).await.expect("tree-walker ok");
+    let (vm, vm_code) = ascript::vm_run_source(src).await.expect("specialized vm ok");
+    let (gen, gen_code) = ascript::vm_run_source_generic(src)
+        .await
+        .expect("generic vm ok");
+    assert_eq!(vm_code, None, "no exit code expected for `{src}`");
+    assert_eq!(gen_code, None, "no exit code expected for `{src}`");
+    assert_eq!(
+        tw, vm,
+        "specialized VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
+    );
+    assert_eq!(
+        tw, gen,
+        "generic VM diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  gen: {gen:?}"
+    );
+}
+
+/// Three-way ERROR assertion: all three engines panic with identical message +
+/// span.
+async fn assert_opt_call_error_three_way(src: &str) {
+    let tw = ascript::run_source(src).await;
+    let vm = ascript::vm_run_source(src).await;
+    let gen = ascript::vm_run_source_generic(src).await;
+    match (tw, vm, gen) {
+        (Err(tw_err), Err(vm_err), Err(gen_err)) => {
+            assert_eq!(
+                tw_err.message, vm_err.message,
+                "specialized-VM panic message diverged for `{src}`\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, vm_err.message
+            );
+            assert_eq!(
+                tw_err.span, vm_err.span,
+                "specialized-VM panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  vm: {:?}",
+                tw_err.message, tw_err.span, vm_err.span
+            );
+            assert_eq!(
+                tw_err.message, gen_err.message,
+                "generic-VM panic message diverged for `{src}`\n  tw: {:?}\n  gen: {:?}",
+                tw_err.message, gen_err.message
+            );
+            assert_eq!(
+                tw_err.span, gen_err.span,
+                "generic-VM panic span diverged for `{src}` (msg {:?})\n  tw: {:?}\n  gen: {:?}",
+                tw_err.message, tw_err.span, gen_err.span
+            );
+        }
+        (tw, vm, gen) => panic!(
+            "expected ALL THREE engines to error for `{src}`\n  tree-walker: {tw:?}\n  vm: {vm:?}\n  gen: {gen:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn vm_opt_call_nil_skips_args() {
+    // nil receiver: result nil AND the argument's side effect must NOT run.
+    assert_opt_call_ok_three_way(
+        "fn se() { print(\"ARG\")\n  return 1 }\nlet a = nil\nprint(a?.m(se()))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_opt_call_nonnil() {
+    // non-nil receiver: ordinary bound method call.
+    assert_opt_call_ok_three_way(
+        "class C { fn m(x) { return x + 1 } }\nlet c = C()\nprint(c?.m(10))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_opt_call_chain_nil() {
+    // chained: the whole postfix chain short-circuits when the receiver is nil.
+    assert_opt_call_ok_three_way("let a = nil\nprint(a?.m().n().o)\n").await;
+}
+
+#[tokio::test]
+async fn vm_opt_call_missing_method() {
+    // non-nil receiver, missing method -> all engines panic "value is not
+    // callable", identical span (`?.` does NOT guard a missing method).
+    assert_opt_call_error_three_way("class C {}\nlet c = C()\nprint(c?.nope(1))\n").await;
+}
+
+#[tokio::test]
+async fn vm_opt_call_mixed() {
+    // mixed optional member + optional call in one chain.
+    assert_opt_call_ok_three_way(
+        "class C { fn m() { return 5 } }\nlet c = C()\nprint(c?.m())\nlet a = nil\nprint(a?.b?.m())\n",
+    )
+    .await;
+}
+
 // ----- V3-T1: if / else if / else ---------------------------------------------
 
 #[tokio::test]
@@ -3444,6 +3550,45 @@ async fn vm_field_default_arrow_and_match() {
 }
 
 #[tokio::test]
+async fn vm_field_default_range_inclusive_and_stepped() {
+    // SP1 Phase E (E1 audit): the `cst_default_expr` lowering covers BOTH the
+    // inclusive `..=` boundary and the signed `step` modifier as field defaults
+    // (the tree-walker materializes the same `ExprKind::Range`). Exercise both the
+    // construct path and the `.from` path — they read the SAME lowered default.
+    assert_field_default_matches("", "array<number>", "1..=4", "x").await;
+    assert_field_default_matches("", "array<number>", "0..=10 step 5", "x").await;
+    assert_field_default_matches("", "array<number>", "5..=1 step -2", "x").await;
+}
+
+#[tokio::test]
+async fn vm_field_default_yield_rejected_symmetrically() {
+    // SP1 Phase E (E1): a `yield` field default is rejected by BOTH engines (it is
+    // never valid outside a generator body). The VM rejects it at COMPILE time in
+    // `cst_default_expr` (a specialized message); the tree-walker rejects it when it
+    // EVALUATES the default. The messages/spans legitimately differ (compile-time
+    // vs runtime), but the OBSERVABLE outcome is symmetric: both error, neither runs
+    // the program. Assert the symmetry of the rejection (both `Err`), not the exact
+    // text — mirroring the documented asymmetry note in `cst_default_expr`.
+    for default in ["yield 1", "yield"] {
+        let construct =
+            format!("class C {{ x: any = {default}\n  fn init() {{}} }}\nprint(C().x)");
+        let tw = ascript::run_source(&construct).await;
+        let vm = ascript::vm_run_source(&construct).await;
+        assert!(
+            tw.is_err() && vm.is_err(),
+            "expected BOTH engines to reject the `{default}` field default\n  tree-walker: {tw:?}\n  vm: {vm:?}"
+        );
+        // The generic VM must agree with the specialized VM (no specialization can
+        // turn a rejected default into a running one).
+        let vm_generic = ascript::vm_run_source_generic(&construct).await;
+        assert!(
+            vm_generic.is_err(),
+            "generic VM must also reject the `{default}` field default\n  {vm_generic:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vm_field_default_reviewer_regression() {
     // The EXACT program from the divergence report: a computed string-concat default
     // referencing a module const, printed off a freshly-constructed instance. The VM
@@ -5253,6 +5398,308 @@ async fn three_way_smoke_basic_constructs() {
     ];
     for src in progs {
         assert_three_way_matches(src).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SP1 Phase B — generator methods (`fn*` / `async fn*`) in classes.
+//
+//  A `fn*`/`async fn*` method dispatched as `c.g(args)` returns a generator bound
+//  to the instance `self`, behaving exactly like a standalone generator (yield /
+//  .next() / for await / close) with method dispatch + arity/contracts + inherit/
+//  override. Both engines gain the feature in lockstep — byte-identical.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn three_way_generator_methods() {
+    let progs: &[&str] = &[
+        // Basic fn* method consumed via `for await`.
+        "class C { fn* g() { yield 1\n yield 2\n yield 3 } }\nlet c = C()\nfor await (v in c.g()) { print(v) }\n",
+        // fn* method using `self` (set in init), consumed via `.next()`.
+        "class C { fn init() { self.n = 10 }\n fn* g() { yield self.n\n yield self.n + 1 } }\n\
+         let c = C()\nlet it = c.g()\nprint(it.next())\nprint(it.next())\n",
+        // async fn* method (yield + await), consumed via `for await`.
+        "class C { async fn* g() { yield 1\n let x = await 2\n yield x } }\n\
+         let c = C()\nfor await (v in c.g()) { print(v) }\n",
+        // Inheritance / override: subclass overrides a fn* method.
+        "class A { fn* g() { yield 1 } }\nclass B extends A { fn* g() { yield 2\n yield 3 } }\n\
+         for await (v in B().g()) { print(v) }\n",
+        // Inheritance WITHOUT override: subclass inherits the parent's fn* method.
+        "class A { fn* g() { yield 7\n yield 8 } }\nclass B extends A {}\n\
+         for await (v in B().g()) { print(v) }\n",
+        // Generator method with args + self interacting.
+        "class C { fn init() { self.base = 100 }\n fn* g(a, b) { yield self.base + a\n yield self.base + b } }\n\
+         let c = C()\nfor await (v in c.g(1, 2)) { print(v) }\n",
+        // .close() on a generator method handle.
+        "class C { fn* g() { yield 1\n yield 2\n yield 3 } }\nlet c = C()\nlet it = c.g()\n\
+         print(it.next())\nit.close()\nprint(\"closed\")\n",
+    ];
+    for src in progs {
+        assert_three_way_matches(src).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SP1 Phase C — static methods (`static fn` / `static async fn` / `static fn*`).
+//  Called as `C.name(args)` with NO receiver; stored in a separate namespace;
+//  inherited up the superclass chain. `static fn from` is reserved; `super` in a
+//  static is invalid. Every case is byte-identical tree-walker == spec-VM ==
+//  generic-VM (the helper normalizes Ok/Err so error cases compare too).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The canonical Phase-C static-method program set (sync / static-calls-static /
+/// inheritance / override / instance+static coexistence / async factory / `fn*` /
+/// `from` coexists / unknown-static error / `static fn from` reserved). Shared by
+/// the tree-walker-side check (C4) and the three-way check (C5).
+const STATIC_METHOD_PROGRAMS: &[&str] = &[
+    // Sync static factory-ish: `C.make()` constructs and returns an instance.
+    "class C { fn init() { self.x = 1 } static fn make() { return C() } }\nlet c = C.make()\nprint(c.x)\n",
+    // A static calling ANOTHER static + constructing C().
+    "class C { fn init() { self.x = 0 } static fn one() { return 1 } static fn make() { let c = C()\n c.x = C.one()\n return c } }\nprint(C.make().x)\n",
+    // Inheritance: a subclass resolves a parent static up the chain.
+    "class A { static fn who() { return \"A\" } }\nclass B extends A {}\nprint(B.who())\n",
+    // Inheritance with override: the subclass's own static wins.
+    "class A { static fn who() { return \"A\" } }\nclass B extends A { static fn who() { return \"B\" } }\nprint(A.who())\nprint(B.who())\n",
+    // Instance + static SAME name coexist (separate namespaces).
+    "class C { fn init() { self.v = 9 } fn x() { return self.v } static fn x() { return 42 } }\nlet c = C()\nprint(c.x())\nprint(C.x())\n",
+    // The blessed async factory: `static async fn create()` awaited → instance.
+    "class C { fn init() { self.x = 0 } static async fn create() { let c = C()\n c.x = await 5\n return c } }\nlet c = await C.create()\nprint(c.x)\n",
+    // `static fn*` generator consumed via for-await.
+    "class C { static fn* seq() { yield 1\n yield 2\n yield 3 } }\nfor await (v in C.seq()) { print(v) }\n",
+    // The built-in `from` still works alongside user statics.
+    "class P { name: string = \"?\" static fn tag() { return \"P\" } }\nlet p = P.from({name: \"ok\"})\nprint(p.name)\nprint(P.tag())\n",
+    // Unknown static member (read) → identical "no static member" error on all
+    // three engines. (Read form, not `C.nope()`: a member-callee CALL anchors its
+    // member-read error at the call span on the VM but the receiver span on the
+    // tree-walker — a PRE-EXISTING CALL_METHOD span deviation orthogonal to static
+    // methods; the read form exercises the static-namespace miss byte-identically.)
+    "class C {}\nlet f = C.nope\n",
+    // `static fn from` is reserved → identical compile/resolve error.
+    "class C { static fn from() { return 1 } }\nprint(C.from())\n",
+];
+
+/// C4 — the tree-walker (reference engine) runs every static-method program to a
+/// definite outcome (success or a deliberate error), establishing the oracle the
+/// VM must match in C5.
+#[tokio::test]
+async fn tree_walker_static_methods() {
+    for src in STATIC_METHOD_PROGRAMS {
+        // Just exercising the path — a panic-free `run_source_exit` (Ok or Err)
+        // both count; the three-way equality is asserted in `three_way_static_methods`.
+        let _ = ascript::run_source_exit(src).await;
+    }
+    // Spot-check the headline behaviors so this test is meaningful on its own.
+    let (out, _) = ascript::run_source_exit(STATIC_METHOD_PROGRAMS[0])
+        .await
+        .expect("C.make() runs on the tree-walker");
+    assert_eq!(out, "1\n");
+    let from_reserved = ascript::run_source_exit(STATIC_METHOD_PROGRAMS[9]).await;
+    assert!(
+        matches!(&from_reserved, Err(e) if e.message.contains("'from' is reserved")),
+        "`static fn from` is rejected on the tree-walker, got {from_reserved:?}"
+    );
+}
+
+/// C5 — every static-method program is byte-identical across all three engines
+/// (tree-walker == specialized-VM == generic-VM), including the async factory,
+/// `fn*`, inheritance/override, instance+static coexistence, and the two error
+/// cases (unknown static, `static fn from` reserved).
+#[tokio::test]
+async fn three_way_static_methods() {
+    for src in STATIC_METHOD_PROGRAMS {
+        assert_three_way_matches(src).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SP1 Phase D — `async fn init` / `fn* init` forbidden (both engines).
+//
+//  Synchronous construction (`C()` returns an instance, not a future) means there
+//  is no caller to `await` an async constructor, and a generator constructor makes
+//  no sense either. Per spec §3, an `init` declared `async` (or `fn*`) is a clean
+//  compile/resolve-time error with the IDENTICAL message + exit on BOTH engines.
+//  The blessed async-construction pattern is a static async factory.
+//
+//  Today the engines DIVERGE on `async fn init` (the VM ran the body; the
+//  tree-walker left fields nil) — these cases assert that both now reject it
+//  byte-identically, and that a `static async fn create()` factory is unaffected.
+// ─────────────────────────────────────────────────────────────────────────────
+const FORBIDDEN_INIT_PROGRAMS: &[&str] = &[
+    // async fn init — the headline divergence: must be a clean compile/resolve error.
+    "class C { async fn init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+    // fn* init — a generator constructor is equally forbidden.
+    "class C { fn* init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+    // async fn* init — both modifiers at once is still forbidden.
+    "class C { async fn* init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+];
+
+/// D1 — `async fn init` / `fn* init` are rejected byte-identically on all three
+/// engines (tree-walker == specialized-VM == generic-VM), while the blessed
+/// `static async fn create()` factory from Phase C still works.
+#[tokio::test]
+async fn three_way_forbidden_init() {
+    for src in FORBIDDEN_INIT_PROGRAMS {
+        assert_three_way_matches(src).await;
+    }
+    // The error message is the spec-mandated one (spot-checked on the tree-walker).
+    let err = ascript::run_source_exit(FORBIDDEN_INIT_PROGRAMS[0]).await;
+    assert!(
+        matches!(&err, Err(e) if e.message.contains(
+            "init must be a synchronous constructor; use a static async factory")),
+        "async fn init is rejected with the spec message, got {err:?}"
+    );
+    // The blessed alternative — a static async factory — is unaffected.
+    assert_three_way_matches(
+        "class C { fn init() { self.x = 0 } static async fn create() { let c = C()\n c.x = await 5\n return c } }\nlet c = await C.create()\nprint(c.x)\n",
+    )
+    .await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SP1 Phase F — parser-accepts-runs invariant gate.
+//
+//  THE closing invariant of SP1: every grammar-accepted construct that SP1 touched
+//  must RUN on the VM (no "parser accepts but engine rejects valid code" hole) and
+//  be byte-identical to the tree-walker oracle. The front-end audit (spec §5) found
+//  exactly two such holes — `a?.m()` optional calls and `fn*` generator methods —
+//  and §§1–3 closed them; statics and the richer field-default forms widened the
+//  accepted surface further. This curated set re-asserts that the whole surface
+//  RUNS, so a future change that re-introduces a rejection trips this gate.
+//
+//  The ONLY legitimate compile-time rejections remaining are genuine, SYMMETRIC
+//  errors — the engines reject them identically because they are real errors, not
+//  engine gaps. They are listed (and asserted symmetric) in
+//  `vm_parser_accepts_runs_legitimate_rejections` below:
+//    • `async fn init` / `fn* init` — a constructor cannot be async/generator.
+//    • `static fn from`              — `from` is a reserved class member.
+//    • `yield` field default         — `yield` is never valid outside a generator.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every grammar-accepted construct SP1 touched, as a runnable program. Each MUST
+/// run (no compile rejection) on BOTH VM modes and be byte-identical to the
+/// tree-walker — that is the parser-accepts-runs invariant.
+const PARSER_ACCEPTS_RUNS_PROGRAMS: &[&str] = &[
+    // ── §1 optional method calls `a?.m()` + chains ──────────────────────────────
+    // nil receiver short-circuits; the arg's side effect must NOT run.
+    "fn se() { print(\"ARG\")\n return 1 }\nlet a = nil\nprint(a?.m(se()))\n",
+    // non-nil receiver → ordinary bound method call.
+    "class C { fn m(x) { return x + 1 } }\nlet c = C()\nprint(c?.m(10))\n",
+    // a whole postfix chain short-circuits when the receiver is nil.
+    "let a = nil\nprint(a?.m().n().o)\n",
+    // mixed optional member + optional call in one chain.
+    "class C { fn m() { return 5 } }\nlet c = C()\nprint(c?.m())\nlet a = nil\nprint(a?.b?.m())\n",
+    // optional call with multiple args on a live receiver.
+    "class C { fn add(a, b) { return a + b } }\nlet c = C()\nprint(c?.add(3, 4))\n",
+
+    // ── §2 generator methods `fn*` / `async fn*` ───────────────────────────────
+    // basic fn* method consumed via for-await.
+    "class C { fn* g() { yield 1\n yield 2 } }\nfor await (v in C().g()) { print(v) }\n",
+    // fn* method using `self`, consumed via .next().
+    "class C { fn init() { self.n = 10 }\n fn* g() { yield self.n\n yield self.n + 1 } }\n\
+     let it = C().g()\nprint(it.next())\nprint(it.next())\n",
+    // async fn* method (yield + await).
+    "class C { async fn* g() { yield 1\n let x = await 2\n yield x } }\nfor await (v in C().g()) { print(v) }\n",
+    // inherited (no override) fn* method.
+    "class A { fn* g() { yield 7\n yield 8 } }\nclass B extends A {}\nfor await (v in B().g()) { print(v) }\n",
+
+    // ── §3 static methods (sync / async / fn* / inherited / C.name()) ───────────
+    // sync static factory called as C.make().
+    "class C { fn init() { self.x = 1 } static fn make() { return C() } }\nprint(C.make().x)\n",
+    // static async factory awaited → instance.
+    "class C { fn init() { self.x = 0 } static async fn create() { let c = C()\n c.x = await 5\n return c } }\nprint((await C.create()).x)\n",
+    // static fn* generator consumed via for-await.
+    "class C { static fn* seq() { yield 1\n yield 2 } }\nfor await (v in C.seq()) { print(v) }\n",
+    // inherited static resolved up the superclass chain.
+    "class A { static fn who() { return \"A\" } }\nclass B extends A {}\nprint(B.who())\n",
+    // instance + static of the SAME name coexist (separate namespaces).
+    "class C { fn init() { self.v = 9 } fn x() { return self.v } static fn x() { return 42 } }\nlet c = C()\nprint(c.x())\nprint(C.x())\n",
+
+    // ── §4 richer field-default forms (computed / arrow / match) ────────────────
+    // computed (binary) field default via C() and C.from({}).
+    "class C { x: number = 10 + 5 }\nprint(C().x)\nprint(C.from({}).x)\n",
+    // arrow field default — the value is the arrow itself, called to verify.
+    "class C { f: fn = (a, b) => a + b }\nprint(C().f(2, 3))\n",
+    // match field default.
+    "let n = 2\nclass C { label: string = match n { 1 => \"one\", 2 => \"two\", _ => \"many\" } }\nprint(C().label)\n",
+    // inclusive-range (`..=`) field default — a valid range expression, NOT a hole.
+    "class C { r: any = 1..=3 }\nprint(C().r)\n",
+    // stepped inclusive-range field default.
+    "class C { r: any = 1..=10 step 2 }\nprint(C().r)\n",
+];
+
+/// F1 — the parser-accepts-runs invariant: every grammar-accepted construct SP1
+/// touched RUNS on both VM modes and is byte-identical to the tree-walker. A new
+/// "parser accepts but engine rejects valid code" hole trips this gate.
+#[tokio::test]
+async fn vm_parser_accepts_runs() {
+    for src in PARSER_ACCEPTS_RUNS_PROGRAMS {
+        // Each program must run to a value on the tree-walker AND both VM modes —
+        // i.e. NONE of them is a compile rejection. (A genuine runtime outcome is
+        // fine; a compile-time "not supported" rejection on only one engine is the
+        // hole this gate forbids.)
+        let tw = ascript::run_source_exit(src).await;
+        assert!(
+            tw.is_ok(),
+            "tree-walker rejected a parser-accepted program (should RUN):\n  src: {src:?}\n  err: {tw:?}"
+        );
+        let spec = ascript::vm_run_source(src).await;
+        assert!(
+            spec.is_ok(),
+            "specialized VM rejected a parser-accepted program (parser-accepts-runs hole):\n  \
+             src: {src:?}\n  err: {spec:?}"
+        );
+        let generic = ascript::vm_run_source_generic(src).await;
+        assert!(
+            generic.is_ok(),
+            "generic VM rejected a parser-accepted program (parser-accepts-runs hole):\n  \
+             src: {src:?}\n  err: {generic:?}"
+        );
+        // …and all three agree byte-for-byte.
+        assert_three_way_matches(src).await;
+    }
+}
+
+/// F1 (companion) — the ONLY legitimate compile-time rejections after SP1 are
+/// genuine, SYMMETRIC errors: every engine rejects them, with byte-identical
+/// outcomes. This pins down that the remaining rejections are real errors (not
+/// engine gaps) so the invariant above stays meaningful.
+#[tokio::test]
+async fn vm_parser_accepts_runs_legitimate_rejections() {
+    // These reject byte-identically (same message + exit) on all three engines —
+    // a structural compile/resolve error knowable before execution.
+    let symmetric_message_rejections: &[&str] = &[
+        // async constructor — there is no caller to await it.
+        "class C { async fn init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+        // generator constructor — makes no sense.
+        "class C { fn* init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+        // `from` is a reserved class member (the built-in validator).
+        "class C { static fn from() { return 1 } }\nprint(C.from())\n",
+    ];
+    for src in symmetric_message_rejections {
+        // Every engine must REJECT (these are real errors, not engine gaps)…
+        let tw = ascript::run_source_exit(src).await;
+        assert!(
+            tw.is_err(),
+            "expected the tree-walker to reject a genuine error, but it ran:\n  src: {src:?}\n  ok: {tw:?}"
+        );
+        // …and reject byte-identically across all three engines.
+        assert_three_way_matches(src).await;
+    }
+
+    // `yield` as a field default is rejected by every engine, but the VM rejects it
+    // at COMPILE time (`cst_default_expr`) and the tree-walker at default-EVAL time,
+    // so the message/timing legitimately differ (documented in
+    // `vm_field_default_yield_rejected_symmetrically`). Assert symmetry-of-rejection
+    // (all three `Err`), not byte-identical text.
+    for default in ["yield 1", "yield"] {
+        let src = format!("class C {{ y: any = {default}\n  fn init() {{}} }}\nprint(C().y)\n");
+        let tw = ascript::run_source(&src).await;
+        let spec = ascript::vm_run_source(&src).await;
+        let generic = ascript::vm_run_source_generic(&src).await;
+        assert!(
+            tw.is_err() && spec.is_err() && generic.is_err(),
+            "expected ALL engines to reject the `{default}` field default\n  \
+             tree-walker: {tw:?}\n  spec: {spec:?}\n  generic: {generic:?}"
+        );
     }
 }
 
