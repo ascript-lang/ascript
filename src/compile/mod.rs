@@ -760,6 +760,7 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
         loops: Vec::new(),
         next_temp,
         cur_cells,
+        compile_depth: 0,
     };
 
     // V2 supports a sequence of statements whose meaningful tail is an
@@ -888,6 +889,16 @@ struct Compiler {
     /// instead, so the access goes through the by-reference cell. Swapped on
     /// function entry (saved/restored in `compile_fn_proto`).
     cur_cells: HashSet<u32>,
+    /// SP3 §B: current `compile_expr` nesting depth. A deeply nested SOURCE
+    /// expression (`((((…))))`, a long binary chain) overflows the
+    /// `#[async_recursion]`-free but still recursive `compile_expr`; this bounds it
+    /// at [`crate::interp::MAX_CALL_DEPTH`] — the SAME limit the tree-walker's
+    /// runtime `eval_expr` uses — so a literally-deeply-nested source trips at the
+    /// same logical nesting on both engines. Over the limit → a `CompileError` whose
+    /// message is the SAME `maximum recursion depth exceeded`; the lib boundary
+    /// surfaces it as an `AsError` with that message, byte-identical (stdout+exit)
+    /// to the tree-walker's runtime panic.
+    compile_depth: u32,
 }
 
 impl Compiler {
@@ -968,6 +979,26 @@ impl Compiler {
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        // SP3 §B: bound `compile_expr` nesting (a deeply nested SOURCE expression
+        // overflows the recursive compiler). One increment per nested expr,
+        // decremented on EVERY exit path (success or error) before returning, so a
+        // mid-compile error cannot leak the count. Over the limit → a `CompileError`
+        // carrying the SAME message the tree-walker's runtime `eval_expr` panic
+        // uses, so the observable result (stdout + exit) is byte-identical.
+        self.compile_depth += 1;
+        if self.compile_depth > crate::interp::MAX_CALL_DEPTH {
+            self.compile_depth -= 1;
+            return Err(CompileError::new(
+                "maximum recursion depth exceeded",
+                node_span(expr),
+            ));
+        }
+        let result = self.compile_expr_inner(expr);
+        self.compile_depth -= 1;
+        result
+    }
+
+    fn compile_expr_inner(&mut self, expr: &Expr) -> Result<(), CompileError> {
         // A postfix chain (`Member`/`Index`/`Call`/`OptMember` nested via their
         // receiver/object/callee spine) that contains an optional link which must
         // SHORT-CIRCUIT THE REST OF THE CHAIN — an optional method call

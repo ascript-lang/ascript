@@ -28,6 +28,38 @@ pub use crate::interp::TestSummary;
 use std::path::Path;
 use std::rc::Rc;
 
+/// SP3 §B: run a `!Send` async closure on a worker thread with the enlarged
+/// [`crate::interp::WORKER_STACK_SIZE`] stack, hosting a fresh single-threaded
+/// tokio runtime + `LocalSet`. This is how the recursion-depth guard
+/// (`MAX_CALL_DEPTH` logical frames) sits under native capacity with headroom: a
+/// deeply-recursive program hits the clean catchable panic BEFORE the native stack
+/// overflows. The `run` binary uses an enlarged stack via its own worker thread in
+/// `main`; this helper is the in-process equivalent for tests / embedders that
+/// drive the engines directly (`vm_run_source` / `run_source_exit`) and want the
+/// same headroom. `make_fut` builds the (`!Send`) future INSIDE the worker thread,
+/// so only `make_fut` (and the returned `R`) need be `Send`.
+pub fn run_on_worker_stack<R, F, Fut>(make_fut: F) -> R
+where
+    R: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = R>,
+{
+    std::thread::Builder::new()
+        .name("ascript-worker".to_string())
+        .stack_size(crate::interp::WORKER_STACK_SIZE)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build worker tokio runtime");
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, make_fut())
+        })
+        .expect("failed to spawn worker thread")
+        .join()
+        .expect("worker thread panicked")
+}
+
 /// Run a `.as` file as the entry module (with import resolution relative to it).
 ///
 /// Returns the process exit code: `Ok(0)` for clean termination, `Ok(n)` when

@@ -72,10 +72,31 @@ enum Command {
     Lsp,
 }
 
-// Single-threaded runtime matches spec §7's single-threaded event loop and the
+// SP3 §B: run the whole program on a worker thread with an enlarged
+// (`WORKER_STACK_SIZE` = 512 MB) stack so the recursion-depth guard
+// (`MAX_CALL_DEPTH` = 3000 logical frames) sits comfortably UNDER native capacity
+// with > 2× headroom even for the tree-walker's large debug-build frames — the
+// guard then converts a deep recursion into a clean catchable panic BEFORE the
+// native stack overflows (no SIGABRT). A thread stack is virtual address space;
+// only touched pages are committed, so a shallow program pays nothing. The runtime
+// stays single-threaded (`current_thread` + `LocalSet`), matching spec §7 and the
 // interpreter's `?Send` (Rc-friendly) futures.
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let worker = std::thread::Builder::new()
+        .name("ascript-main".to_string())
+        .stack_size(ascript::interp::WORKER_STACK_SIZE)
+        .spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            rt.block_on(real_main())
+        })
+        .expect("failed to spawn worker thread");
+    worker.join().expect("worker thread panicked")
+}
+
+async fn real_main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Run {
