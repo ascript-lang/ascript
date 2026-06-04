@@ -180,9 +180,7 @@ impl GlobalCache {
     pub fn get(&self, version: u64) -> Option<crate::value::Value> {
         match self {
             GlobalCache::Cold => None,
-            GlobalCache::Cached { value, version: v } => {
-                (*v == version).then(|| value.clone())
-            }
+            GlobalCache::Cached { value, version: v } => (*v == version).then(|| value.clone()),
         }
     }
 
@@ -213,7 +211,11 @@ mod tests {
         for _ in 0..(WARMUP_THRESHOLD - 1) {
             c = c.observe(Some(ArithKind::Number));
         }
-        assert_eq!(c.specialized(), None, "one short of threshold stays generic");
+        assert_eq!(
+            c.specialized(),
+            None,
+            "one short of threshold stays generic"
+        );
         c = c.observe(Some(ArithKind::Number));
         assert_eq!(c.specialized(), Some(ArithKind::Number));
     }

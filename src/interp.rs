@@ -1353,8 +1353,12 @@ impl Interp {
                         for name in entry.exports.borrow().iter() {
                             map.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
                         }
-                        env.define(alias, Value::Object(crate::value::ObjectCell::new(map)), false)
-                            .map_err(AsError::new)?;
+                        env.define(
+                            alias,
+                            Value::Object(crate::value::ObjectCell::new(map)),
+                            false,
+                        )
+                        .map_err(AsError::new)?;
                     }
                 }
                 Ok(Flow::Normal)
@@ -1493,9 +1497,7 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Object(crate::value::ObjectCell::new(
-                    map,
-                )))
+                Ok(Value::Object(crate::value::ObjectCell::new(map)))
             }
             ExprKind::Template { parts } => {
                 let mut out = String::new();
@@ -1710,11 +1712,7 @@ impl Interp {
                 let step_v = match step {
                     Some(s) => match self.eval_expr(s, env).await? {
                         Value::Number(x) => Some(x),
-                        _ => {
-                            return Err(
-                                AsError::at("range step must be a number", s.span).into()
-                            )
-                        }
+                        _ => return Err(AsError::at("range step must be a number", s.span).into()),
                     },
                     None => None,
                 };
@@ -1924,7 +1922,12 @@ impl Interp {
     // pub(crate): shared with the bytecode VM (`Op::GetProp`/`Op::GetPropOpt`)
     // so member-access semantics (fields, methods→BoundMethod, enum variants,
     // native handles, nil-receiver errors) have ONE implementation.
-    pub(crate) fn read_member(&self, obj: &Value, name: &str, span: Span) -> Result<Value, AsError> {
+    pub(crate) fn read_member(
+        &self,
+        obj: &Value,
+        name: &str,
+        span: Span,
+    ) -> Result<Value, AsError> {
         match obj {
             Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
             Value::Enum(e) => e.variants.get(name).cloned().ok_or_else(|| {
@@ -2604,7 +2607,9 @@ impl Interp {
                         let p = format!("{}[{}]", path, i);
                         out.push(self.coerce_field(elem, it, env, strict, &p, span).await?);
                     }
-                    Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(out))))
+                    Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+                        out,
+                    ))))
                 }
                 _ => Ok(val),
             },
@@ -3028,9 +3033,7 @@ pub(crate) fn resolve_step(
     match step_v {
         Some(s) => {
             if s == 0.0 || !s.is_finite() {
-                return Err(
-                    AsError::at("step must be a finite, non-zero number", span).into(),
-                );
+                return Err(AsError::at("step must be a finite, non-zero number", span).into());
             }
             if lo != hi && (s > 0.0) != (hi > lo) {
                 // `{s}`/`{hi}` MUST match the engines' canonical number formatting
@@ -3154,12 +3157,7 @@ pub(crate) fn range_pattern_contains(
 /// Eq/Ne (cross-type decimal equality) → Range (eager `array<number>`) → string
 /// concat (`+` on two `Str`) → decimal arithmetic/ordering (either operand a
 /// `Decimal`) → the two-`Number` path → the generic "requires two numbers" error.
-pub(crate) fn apply_binop(
-    op: BinOp,
-    l: Value,
-    r: Value,
-    span: Span,
-) -> Result<Value, Control> {
+pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Control> {
     // Eq/Ne: cross-type Decimal↔Number comparison before generic `==`.
     match op {
         BinOp::Eq => {
@@ -3348,7 +3346,11 @@ pub(crate) fn index_get(
             })
         }
         Value::Object(map) => match idx {
-            Value::Str(key) => Ok(map.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)),
+            Value::Str(key) => Ok(map
+                .borrow()
+                .get(key.as_ref())
+                .cloned()
+                .unwrap_or(Value::Nil)),
             _ => Err(AsError::at("object index must be a string", index_span)),
         },
         _ => Err(AsError::at("cannot index this value", obj_span)),

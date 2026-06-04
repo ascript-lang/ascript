@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn arrays_compare_by_identity_and_display() {
         use std::cell::RefCell;
-        
+
         let a = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
             Value::Number(1.0),
             Value::Str("two".into()),
@@ -702,7 +702,9 @@ mod tests {
         assert_eq!(map.clone(), map);
         assert!(map.is_truthy());
         assert!(MapKey::from_value(&Value::Number(0.0)).is_some());
-        assert!(MapKey::from_value(&Value::Array(gcmodule::Cc::new(RefCell::new(vec![])))).is_none());
+        assert!(
+            MapKey::from_value(&Value::Array(gcmodule::Cc::new(RefCell::new(vec![])))).is_none()
+        );
     }
 
     #[test]

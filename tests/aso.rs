@@ -214,11 +214,7 @@ fn transitive_file_imports_on_vm() {
         "b.as",
         "import { C } from \"./c\"\nexport fn bfn() { return C + 1 }\n",
     );
-    write(
-        &dir,
-        "a.as",
-        "import { bfn } from \"./b\"\nprint(bfn())\n",
-    );
+    write(&dir, "a.as", "import { bfn } from \"./b\"\nprint(bfn())\n");
     build(&dir, "a.as");
 
     let (aso_out, _) = run(&dir, &["run", "a.aso"]);
@@ -237,11 +233,7 @@ fn aso_only_dependency_runs_without_source() {
     // still work (prefers the .aso when no source is present).
     let dir = unique_dir("asoonly");
     write(&dir, "dep.as", "export const V = 42\n");
-    write(
-        &dir,
-        "use.as",
-        "import { V } from \"./dep\"\nprint(V)\n",
-    );
+    write(&dir, "use.as", "import { V } from \"./dep\"\nprint(V)\n");
     build(&dir, "dep.as");
     build(&dir, "use.as");
     std::fs::remove_file(dir.join("dep.as")).unwrap();
@@ -257,11 +249,7 @@ fn stale_aso_recompiles_from_newer_source() {
     // source (Python's rule: prefer .aso only when aso_mtime >= src_mtime).
     let dir = unique_dir("stale");
     write(&dir, "dep.as", "export const V = \"old\"\n");
-    write(
-        &dir,
-        "use.as",
-        "import { V } from \"./dep\"\nprint(V)\n",
-    );
+    write(&dir, "use.as", "import { V } from \"./dep\"\nprint(V)\n");
     build(&dir, "dep.as");
     build(&dir, "use.as");
 
@@ -284,11 +272,7 @@ fn corrupt_aso_dep_recompiles_when_source_present() {
     // recompiling the source when source is present.
     let dir = unique_dir("corrupt");
     write(&dir, "dep.as", "export const V = \"src\"\n");
-    write(
-        &dir,
-        "use.as",
-        "import { V } from \"./dep\"\nprint(V)\n",
-    );
+    write(&dir, "use.as", "import { V } from \"./dep\"\nprint(V)\n");
     build(&dir, "use.as");
     // Corrupt the dep.aso but keep it NEWER than dep.as so it would be preferred.
     write(&dir, "dep.aso", "GARBAGE-NOT-A-VALID-ASO");
@@ -356,7 +340,11 @@ fn run_root(args: &[&str], engine: Option<&str>) -> (String, i32) {
 /// across a hello, an imports example, and a class/compute example.
 #[test]
 fn run_as_on_vm_matches_aso_and_tree_walker() {
-    for example in ["examples/hello.as", "examples/modules/main.as", "examples/oop.as"] {
+    for example in [
+        "examples/hello.as",
+        "examples/modules/main.as",
+        "examples/oop.as",
+    ] {
         // Default (no env): VM path.
         let (vm_out, vm_code) = run_root(&["run", example], None);
         // Oracle escape hatch: tree-walker.
@@ -365,7 +353,10 @@ fn run_as_on_vm_matches_aso_and_tree_walker() {
             vm_out, tw_out,
             "{example}: VM stdout must match tree-walker oracle"
         );
-        assert_eq!(vm_code, tw_code, "{example}: VM exit must match tree-walker");
+        assert_eq!(
+            vm_code, tw_code,
+            "{example}: VM exit must match tree-walker"
+        );
 
         // And byte-identical to the built .aso (VM, no compile step at run time).
         let dir = unique_dir("cutover");
@@ -386,8 +377,14 @@ fn run_as_on_vm_matches_aso_and_tree_walker() {
         }
         build(&dir, "prog.as");
         let (aso_out, aso_code) = run(&dir, &["run", "prog.aso"]);
-        assert_eq!(aso_out, vm_out, "{example}: .aso stdout must match VM .as run");
-        assert_eq!(aso_code, vm_code, "{example}: .aso exit must match VM .as run");
+        assert_eq!(
+            aso_out, vm_out,
+            "{example}: .aso stdout must match VM .as run"
+        );
+        assert_eq!(
+            aso_code, vm_code,
+            "{example}: .aso exit must match VM .as run"
+        );
     }
 }
 
@@ -408,8 +405,14 @@ fn all_features_example_aso_vm_and_tree_walker_agree() {
     // VM from source vs the tree-walker oracle.
     let (vm_out, vm_code) = run_root(&["run", example], None);
     let (tw_out, tw_code) = run_root(&["run", example], Some("tree-walker"));
-    assert_eq!(vm_out, tw_out, "{example}: VM stdout must match tree-walker");
-    assert_eq!(vm_code, tw_code, "{example}: VM exit must match tree-walker");
+    assert_eq!(
+        vm_out, tw_out,
+        "{example}: VM stdout must match tree-walker"
+    );
+    assert_eq!(
+        vm_code, tw_code,
+        "{example}: VM exit must match tree-walker"
+    );
     assert_eq!(vm_code, 0, "{example}: should exit 0");
     assert!(
         vm_out.ends_with("all_features ok\n"),
@@ -424,8 +427,14 @@ fn all_features_example_aso_vm_and_tree_walker_agree() {
     build(&dir, "prog.as");
     assert!(dir.join("prog.aso").exists(), "prog.aso should exist");
     let (aso_out, aso_code) = run(&dir, &["run", "prog.aso"]);
-    assert_eq!(aso_out, vm_out, "{example}: .aso stdout must match VM .as run");
-    assert_eq!(aso_code, vm_code, "{example}: .aso exit must match VM .as run");
+    assert_eq!(
+        aso_out, vm_out,
+        "{example}: .aso stdout must match VM .as run"
+    );
+    assert_eq!(
+        aso_code, vm_code,
+        "{example}: .aso exit must match VM .as run"
+    );
 }
 
 /// WS3 Deliverable 2 — the multi-file local-import application (`examples/app/`):
@@ -464,8 +473,14 @@ fn local_import_app_example_aso_vm_and_tree_walker_agree() {
     build(&dir, "main.as");
     assert!(dir.join("main.aso").exists(), "main.aso should exist");
     let (aso_out, aso_code) = run(&dir, &["run", "main.aso"]);
-    assert_eq!(aso_out, vm_out, "{entry}: .aso stdout must match VM .as run");
-    assert_eq!(aso_code, vm_code, "{entry}: .aso exit must match VM .as run");
+    assert_eq!(
+        aso_out, vm_out,
+        "{entry}: .aso stdout must match VM .as run"
+    );
+    assert_eq!(
+        aso_code, vm_code,
+        "{entry}: .aso exit must match VM .as run"
+    );
 }
 
 /// The oracle escape hatch stays CLI-reachable: `ASCRIPT_ENGINE=tree-walker`

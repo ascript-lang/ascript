@@ -10,7 +10,10 @@ use crate::syntax::kind::SyntaxKind;
 pub enum Event {
     /// Open a node. `kind` is `TOMBSTONE` until the node is completed; some
     /// Start events are abandoned (left as Tombstone) and skipped by the builder.
-    Start { kind: SyntaxKind, forward_parent: Option<usize> },
+    Start {
+        kind: SyntaxKind,
+        forward_parent: Option<usize>,
+    },
     /// Finish the current node.
     Finish,
     /// Consume the next non-trivia token (the builder pulls the actual token,
@@ -31,8 +34,13 @@ mod tests {
     #[test]
     fn events_are_constructible() {
         let evs = [
-            Event::Start { kind: SyntaxKind::SourceFile, forward_parent: None },
-            Event::Token { kind: SyntaxKind::Number },
+            Event::Start {
+                kind: SyntaxKind::SourceFile,
+                forward_parent: None,
+            },
+            Event::Token {
+                kind: SyntaxKind::Number,
+            },
             Event::Finish,
         ];
         assert_eq!(evs.len(), 3);

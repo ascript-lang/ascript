@@ -286,14 +286,14 @@ async fn vm_run_bare_builtins_match_treewalker() {
     // these all use number/string/nested-call arguments that compile today.)
     let cases = [
         // len over a string and over range's array result.
-        "print(len(\"hello\"))",     // 5
-        "print(len(range(5)))",       // range(5) -> [0,1,2,3,4]; len -> 5
+        "print(len(\"hello\"))", // 5
+        "print(len(range(5)))",  // range(5) -> [0,1,2,3,4]; len -> 5
         // type strings (must match the tree-walker's exact spellings).
-        "print(type(1))",             // number
-        "print(type(\"x\"))",         // string
-        "print(type(true))",          // bool
-        "print(type(nil))",           // nil
-        "print(type(range(2)))",      // array
+        "print(type(1))",        // number
+        "print(type(\"x\"))",    // string
+        "print(type(true))",     // bool
+        "print(type(nil))",      // nil
+        "print(type(range(2)))", // array
         // Ok / Err formatting ([value, nil] / [nil, {message}]).
         "print(Ok(1))",
         "print(Err(\"e\"))",
@@ -341,14 +341,14 @@ async fn vm_range_value_matches_treewalker() {
     // `a..b` is an eager half-open `array<number>`; the printed array form and
     // `len(...)` over it must agree byte-for-byte with the tree-walker.
     let cases = [
-        "0..5",          // [0, 1, 2, 3, 4]
-        "0..0",          // [] (empty)
-        "3..3",          // [] (empty, non-zero bound)
-        "2..5",          // [2, 3, 4]
-        "len(0..5)",     // 5
-        "len(0..0)",     // 0
-        "1..1",          // []
-        "(1 + 1)..5",    // additive binds tighter: (2)..5 → [2,3,4]
+        "0..5",       // [0, 1, 2, 3, 4]
+        "0..0",       // [] (empty)
+        "3..3",       // [] (empty, non-zero bound)
+        "2..5",       // [2, 3, 4]
+        "len(0..5)",  // 5
+        "len(0..0)",  // 0
+        "1..1",       // []
+        "(1 + 1)..5", // additive binds tighter: (2)..5 → [2,3,4]
     ];
     for expr in cases {
         assert_vm_matches_treewalker(expr).await;
@@ -458,14 +458,14 @@ async fn vm_short_circuit_result_values_match_treewalker() {
         "false || 5",
         "nil ?? 7",
         "5 ?? 7",
-        "0 || 9",      // 0 is truthy -> 0
-        "0 && 9",      // 0 is truthy -> 9
+        "0 || 9",        // 0 is truthy -> 0
+        "0 && 9",        // 0 is truthy -> 9
         "\"\" || \"x\"", // "" is truthy -> ""
         "\"\" && \"x\"", // "" is truthy -> "x"
-        "nil && 1",    // nil is falsy -> nil
-        "nil || 1",    // nil is falsy -> 1
-        "false ?? 7",  // false is non-nil -> false
-        "nil ?? nil",  // -> nil
+        "nil && 1",      // nil is falsy -> nil
+        "nil || 1",      // nil is falsy -> 1
+        "false ?? 7",    // false is non-nil -> false
+        "nil ?? nil",    // -> nil
     ];
     for expr in cases {
         assert_vm_matches_treewalker(expr).await;
@@ -586,14 +586,14 @@ async fn vm_destructure_type_errors_match_treewalker() {
     // RHS expression's span, with a message that names the value's type. Both
     // engines must agree on message AND span.
     let cases = [
-        "let [a, b] = 5",            // cannot destructure a non-array value of type number
-        "let [a] = \"hi\"",          // ... of type string
-        "let [a] = {x: 1}",          // ... of type object (an object is not an array)
-        "let [a] = nil",             // ... of type nil
-        "let {a, b} = 5",            // cannot destructure a non-object value of type number
-        "let {a} = [1, 2]",          // ... of type array (an array is not an object)
-        "let {a} = \"hi\"",          // ... of type string
-        "let {a} = nil",             // ... of type nil
+        "let [a, b] = 5",   // cannot destructure a non-array value of type number
+        "let [a] = \"hi\"", // ... of type string
+        "let [a] = {x: 1}", // ... of type object (an object is not an array)
+        "let [a] = nil",    // ... of type nil
+        "let {a, b} = 5",   // cannot destructure a non-object value of type number
+        "let {a} = [1, 2]", // ... of type array (an array is not an object)
+        "let {a} = \"hi\"", // ... of type string
+        "let {a} = nil",    // ... of type nil
     ];
     for expr in cases {
         assert_vm_error_matches_treewalker(expr).await;
@@ -839,7 +839,10 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/datetime_intl.as",
         SkipReason::Nondeterministic,
     ),
-    ("examples/advanced/sse_client.as", SkipReason::Nondeterministic),
+    (
+        "examples/advanced/sse_client.as",
+        SkipReason::Nondeterministic,
+    ),
     // `typed_api.as` is byte-identical on the VM EXCEPT for the ephemeral bound
     // port it prints (`server bound on http://127.0.0.1:<port>`): the OS assigns a
     // fresh port to each of the two separate runs (tree-walker then VM), so the
@@ -852,7 +855,10 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
     ),
     // ---- Mutates a fixed shared /tmp tree (races across parallel oracles) ------
     ("examples/system.as", SkipReason::SharedExternalState),
-    ("examples/advanced/fs_toolkit.as", SkipReason::SharedExternalState),
+    (
+        "examples/advanced/fs_toolkit.as",
+        SkipReason::SharedExternalState,
+    ),
     // ---- Network-peer / long-running servers (cannot run headless) ------------
     // Forever-serving HTTP API: blocks on `serve` awaiting a client in a separate
     // process; it does not terminate on its own and hangs even the tree-walker.
@@ -1094,11 +1100,11 @@ async fn vm_array_object_literals_match_treewalker() {
     let cases = [
         "print([1, 2, 3])",
         "print([1, \"a\", true])",
-        "print([[1], [2]])",     // nested arrays
-        "print([])",             // empty array
+        "print([[1], [2]])", // nested arrays
+        "print([])",         // empty array
         "print({a: 1, b: 2})",
-        "print({\"k\": 5})",     // string key
-        "print({})",             // empty object
+        "print({\"k\": 5})",                   // string key
+        "print({})",                           // empty object
         "print({a: 1, b: [2, 3], c: {d: 4}})", // nested
     ];
     for src in cases {
@@ -1109,9 +1115,9 @@ async fn vm_array_object_literals_match_treewalker() {
 #[tokio::test]
 async fn vm_index_read_matches_treewalker() {
     let cases = [
-        "print([10, 20, 30][1])",        // 20
-        "print({a: 1}[\"a\"])",          // 1 (object index by string key)
-        "print({a: 1}[\"missing\"])",    // nil (missing object key → nil)
+        "print([10, 20, 30][1])",                      // 20
+        "print({a: 1}[\"a\"])",                        // 1 (object index by string key)
+        "print({a: 1}[\"missing\"])",                  // nil (missing object key → nil)
         "let a = [1, 2, 3]\nprint(a[0])\nprint(a[2])", // local-array index
         "let o = {x: 9}\nprint(o[\"x\"])",
         "print([[1, 2], [3, 4]][1][0])", // nested index → 3
@@ -1124,9 +1130,9 @@ async fn vm_index_read_matches_treewalker() {
 #[tokio::test]
 async fn vm_member_read_matches_treewalker() {
     let cases = [
-        "let o = {a: 1}\nprint(o.a)",          // 1
-        "print({a: 1, b: 2}.b)",               // 2
-        "let o = {a: 1}\nprint(o.missing)",    // nil (missing object key → nil)
+        "let o = {a: 1}\nprint(o.a)",                        // 1
+        "print({a: 1, b: 2}.b)",                             // 2
+        "let o = {a: 1}\nprint(o.missing)",                  // nil (missing object key → nil)
         "let o = {nested: {deep: 7}}\nprint(o.nested.deep)", // chained member
     ];
     for src in cases {
@@ -1137,8 +1143,8 @@ async fn vm_member_read_matches_treewalker() {
 #[tokio::test]
 async fn vm_opt_member_read_matches_treewalker() {
     let cases = [
-        "let o = nil\nprint(o?.a)",     // nil receiver → nil
-        "let o = {a: 1}\nprint(o?.a)",  // 1
+        "let o = nil\nprint(o?.a)",          // nil receiver → nil
+        "let o = {a: 1}\nprint(o?.a)",       // 1
         "let o = {a: 1}\nprint(o?.missing)", // nil (present receiver, missing key)
     ];
     for src in cases {
@@ -1504,7 +1510,10 @@ async fn both_engines_step_validation_panics_agree() {
     // (the interpolated `{step}`/`{end}` use the canonical number formatting both
     // engines share, so the strings are byte-identical).
     for (src, expected_msg) in [
-        ("for (i in 1..10 step 0) {}", "step must be a finite, non-zero number"),
+        (
+            "for (i in 1..10 step 0) {}",
+            "step must be a finite, non-zero number",
+        ),
         (
             "for (i in 1..10 step -2) {}",
             "step -2 moves away from end (10); range can never progress",
@@ -1514,7 +1523,10 @@ async fn both_engines_step_validation_panics_agree() {
             "step 2 moves away from end (1); range can never progress",
         ),
         // value-position validation panics identically.
-        ("print(1..10 step 0)", "step must be a finite, non-zero number"),
+        (
+            "print(1..10 step 0)",
+            "step must be a finite, non-zero number",
+        ),
         (
             "print(1..10 step -2)",
             "step -2 moves away from end (10); range can never progress",
@@ -1572,26 +1584,62 @@ async fn both_engines_pattern_step_agree() {
     // keeps its pre-existing in-bounds-only behavior (incl. a fractional subject).
     for (src, expected) in [
         // 3 ∈ {1,3,5,7,9}; 4 ∉.
-        ("print(match 3 { 1..=10 step 2 => \"in\", _ => \"out\" })", "in\n"),
-        ("print(match 4 { 1..=10 step 2 => \"in\", _ => \"out\" })", "out\n"),
+        (
+            "print(match 3 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        (
+            "print(match 4 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
         // anchor 0 → even membership.
-        ("print(match 4 { 0..=10 step 2 => \"in\", _ => \"out\" })", "in\n"),
+        (
+            "print(match 4 { 0..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
         // out of bounds.
-        ("print(match 11 { 1..=10 step 2 => \"in\", _ => \"out\" })", "out\n"),
+        (
+            "print(match 11 { 1..=10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
         // exclusive vs inclusive end at the stride endpoint.
-        ("print(match 10 { 0..10 step 2 => \"in\", _ => \"out\" })", "out\n"),
-        ("print(match 10 { 0..=10 step 2 => \"in\", _ => \"out\" })", "in\n"),
+        (
+            "print(match 10 { 0..10 step 2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
+        (
+            "print(match 10 { 0..=10 step 2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
         // descending stepped pattern.
-        ("print(match 8 { 10..=2 step -2 => \"in\", _ => \"out\" })", "in\n"),
-        ("print(match 9 { 10..=2 step -2 => \"in\", _ => \"out\" })", "out\n"),
+        (
+            "print(match 8 { 10..=2 step -2 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        (
+            "print(match 9 { 10..=2 step -2 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
         // float step membership (exact-equality, spec §3.8).
-        ("print(match 0.5 { 0..=1 step 0.25 => \"in\", _ => \"out\" })", "in\n"),
-        ("print(match 0.3 { 0..=1 step 0.25 => \"in\", _ => \"out\" })", "out\n"),
+        (
+            "print(match 0.5 { 0..=1 step 0.25 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        (
+            "print(match 0.3 { 0..=1 step 0.25 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
         // PLAIN ASCENDING (no-step) patterns unchanged — incl. a FRACTIONAL
         // subject, which must still match purely on bounds (no stride test).
         ("print(match 5 { 1..=10 => \"in\", _ => \"out\" })", "in\n"),
-        ("print(match 2.5 { 1..=10 => \"in\", _ => \"out\" })", "in\n"),
-        ("print(match 15 { 1..=10 => \"in\", _ => \"out\" })", "out\n"),
+        (
+            "print(match 2.5 { 1..=10 => \"in\", _ => \"out\" })",
+            "in\n",
+        ),
+        (
+            "print(match 15 { 1..=10 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
         // PLAIN DESCENDING (no-step) pattern — direction is now INFERRED from the
         // bounds (spec §3.1), so `10..=1` is the descending sequence range and
         // matches `[1,10]`. (Old behavior: `n>=lo && n<=hi` = `n>=10 && n<=1` =
@@ -1600,7 +1648,10 @@ async fn both_engines_pattern_step_agree() {
         ("print(match 5 { 10..=1 => \"in\", _ => \"out\" })", "in\n"),
         ("print(match 1 { 10..=1 => \"in\", _ => \"out\" })", "in\n"),
         ("print(match 1 { 10..1 => \"in\", _ => \"out\" })", "out\n"), // exclusive low end
-        ("print(match 11 { 10..=1 => \"in\", _ => \"out\" })", "out\n"),
+        (
+            "print(match 11 { 10..=1 => \"in\", _ => \"out\" })",
+            "out\n",
+        ),
     ] {
         let tw = ascript::run_source(src).await;
         let vm = ascript::vm_run_source(src).await;
@@ -1723,11 +1774,23 @@ async fn vm_for_of_not_iterable_error_matches_treewalker() {
     // sync for-of (they hit the "not iterable" path, NOT element iteration) —
     // byte-identical to the tree-walker's `Stmt::ForOf`.
     for (src, expected) in [
-        ("for (x of 5) { print(x) }", "value of type number is not iterable"),
-        ("for (x of true) { print(x) }", "value of type bool is not iterable"),
-        ("for (x of nil) { print(x) }", "value of type nil is not iterable"),
+        (
+            "for (x of 5) { print(x) }",
+            "value of type number is not iterable",
+        ),
+        (
+            "for (x of true) { print(x) }",
+            "value of type bool is not iterable",
+        ),
+        (
+            "for (x of nil) { print(x) }",
+            "value of type nil is not iterable",
+        ),
         // An OBJECT is not iterable in sync for-of.
-        ("for (x of {a: 1}) { print(x) }", "value of type object is not iterable"),
+        (
+            "for (x of {a: 1}) { print(x) }",
+            "value of type object is not iterable",
+        ),
     ] {
         let tw = ascript::run_source(src).await;
         let vm = ascript::vm_run_source(src).await;
@@ -1793,9 +1856,18 @@ async fn vm_for_in_over_non_iterable_value_matches_treewalker() {
     // and raises the SAME Tier-2 panic (`value of type {t} is not iterable`) at the
     // SAME span on both engines.
     for (src, expected) in [
-        ("for (i in 5) { print(i) }", "value of type number is not iterable"),
-        ("let n = 5\nfor (i in n) { print(i) }", "value of type number is not iterable"),
-        ("for (i in true) { print(i) }", "value of type bool is not iterable"),
+        (
+            "for (i in 5) { print(i) }",
+            "value of type number is not iterable",
+        ),
+        (
+            "let n = 5\nfor (i in n) { print(i) }",
+            "value of type number is not iterable",
+        ),
+        (
+            "for (i in true) { print(i) }",
+            "value of type bool is not iterable",
+        ),
     ] {
         let tw = ascript::run_source(src).await;
         let vm = ascript::vm_run_source(src).await;
@@ -1925,10 +1997,8 @@ async fn vm_recursion_factorial() {
 async fn vm_forward_inter_fn_call() {
     // `a` calls `b` declared LATER: the late-binding cell (allocated nil at frame
     // entry, filled when `b`'s declaration runs) makes the forward reference work.
-    assert_vm_run_matches_treewalker(
-        "fn a() { return b() + 1 }\nfn b() { return 7 }\nprint(a())",
-    )
-    .await;
+    assert_vm_run_matches_treewalker("fn a() { return b() + 1 }\nfn b() { return 7 }\nprint(a())")
+        .await;
 }
 
 #[tokio::test]
@@ -2062,7 +2132,8 @@ async fn vm_param_arity_errors_match_treewalker() {
 #[tokio::test]
 async fn vm_rest_param_matches_treewalker() {
     // Rest collects the trailing args into an array (empty when none are passed).
-    assert_vm_run_matches_treewalker("fn f(a, ...rest) { return a + len(rest) }\nprint(f(1))").await;
+    assert_vm_run_matches_treewalker("fn f(a, ...rest) { return a + len(rest) }\nprint(f(1))")
+        .await;
     assert_vm_run_matches_treewalker(
         "fn f(a, ...rest) { return a + len(rest) }\nprint(f(1, 2, 3))",
     )
@@ -2216,7 +2287,9 @@ async fn vm_panic_through_closure_escapes_recover_message_matches_treewalker() {
     // call_value-bridge concern. The bridge's job, verified here, is that the panic
     // SURFACES out of the VM closure to the top level identically.
     let src = "let bad = (x) => x[9]\nprint(bad([0]))";
-    let tw = ascript::run_source(src).await.expect_err("tree-walker errors");
+    let tw = ascript::run_source(src)
+        .await
+        .expect_err("tree-walker errors");
     let vm = ascript::vm_run_source(src).await.expect_err("vm errors");
     assert_eq!(
         tw.message, vm.message,
@@ -2953,12 +3026,10 @@ async fn vm_unawaited_async_call_is_cancelled_like_treewalker() {
     // `unawaited_async_call_is_cancelled` (which uses `time.sleep` — V12 on the
     // VM). Concretely: `worked` must NOT appear; only `main` is printed.
     // NOTE: we assert the BARE un-awaited call (the true M17 leak class: the
-    // `Value::Future` is dropped at the end of its expression statement). A future
-    // *held* in a local until program end (`let f = work()`) is NOT part of this
-    // class — it interacts with end-of-program task draining and the two engines
-    // legitimately differ there (the tree-walker's end-of-program drain runs the
-    // still-held task; the VM does not). That held-future case is out of scope for
-    // cancel-on-drop and is therefore not asserted here.
+    // `Value::Future` is dropped at the end of its expression statement). The
+    // distinct case of a future *held* in a local until program end
+    // (`let f = work()`) is covered by `vm_held_future_drains_identically_to_treewalker`
+    // (#147): both engines drain it at end-of-program, so its body runs identically.
     let cases = [
         // Bare un-awaited call: the future is dropped at the end of the statement.
         "async fn work() { print(\"worked\") }\nwork()\nprint(\"main\")\n",
@@ -2979,6 +3050,24 @@ async fn vm_unawaited_async_call_is_cancelled_like_treewalker() {
             "VM cancel-on-drop diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn vm_held_future_drains_identically_to_treewalker() {
+    // #147: a future HELD in a local until program end (not the bare cancel-on-drop
+    // case) whose body awaits then prints. Both engines drain spawned tasks at
+    // end-of-program (`local.run_until(..).await; local.await;` in src/lib.rs), so the
+    // body runs on BOTH — byte-identical. (The neighboring test covers the bare
+    // un-awaited cancel-on-drop case.)
+    let src = "async fn work() { await 0\n print(\"worked\") }\nlet f = work()\nprint(\"main\")\n";
+    let tw = ascript::run_source(src).await.expect("tree-walker ok");
+    let (vm, _) = ascript::vm_run_source(src).await.expect("vm ok");
+    let (gen, _) = ascript::vm_run_source_generic(src)
+        .await
+        .expect("generic vm ok");
+    assert_eq!(tw, vm, "specialized VM diverged from tree-walker");
+    assert_eq!(tw, gen, "generic VM diverged from tree-walker");
+    assert_eq!(tw, "main\nworked\n");
 }
 
 #[tokio::test]
@@ -3121,8 +3210,6 @@ async fn vm_generator_yield_used_as_statement() {
     let src = "fn* g() { yield 1\n yield 2\n yield 3 }\nlet it = g()\nlet total = 0\ntotal = total + it.next()\ntotal = total + it.next()\ntotal = total + it.next()\nprint(total)";
     assert_vm_run_matches_treewalker(src).await;
 }
-
-
 
 // ---- V8-T4/T5: for-of / for-await over generators + async generators ------
 //
@@ -3338,7 +3425,13 @@ async fn vm_field_default_spread() {
     // they were previously rejected by `cst_default_expr`).
     assert_field_default_matches("let ys = [1, 2]", "array<number>", "[...ys, 3]", "x").await;
     assert_field_default_matches("let o = {a: 1}", "object", "{...o, b: 2}", "x").await;
-    assert_field_default_matches("fn f(a, b) { return a + b }\nlet ar = [1, 2]", "number", "f(...ar)", "x").await;
+    assert_field_default_matches(
+        "fn f(a, b) { return a + b }\nlet ar = [1, 2]",
+        "number",
+        "f(...ar)",
+        "x",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3395,7 +3488,8 @@ async fn vm_class_typed_field_violation_in_init_panics() {
 async fn vm_class_typed_field_violation_via_member_panics() {
     // Assigning a wrong-typed value to a typed field via `obj.f = wrong` is a
     // Tier-2 contract panic — identical message + span.
-    let src = "class Point {\n  x: number\n  fn init(x) { self.x = x }\n}\nlet p = Point(1)\np.x = true";
+    let src =
+        "class Point {\n  x: number\n  fn init(x) { self.x = x }\n}\nlet p = Point(1)\np.x = true";
     assert_vm_run_error_matches_treewalker(src).await;
 }
 
@@ -3719,7 +3813,8 @@ async fn vm_class_from_missing_field_recovered_matches_treewalker() {
 async fn vm_class_from_uncaught_shape_mismatch_aborts_identically() {
     // Uncaught, the `.from` field-path panic aborts the program with the SAME
     // message AND span on both engines.
-    let src = "class User {\n  name: string\n  age: number\n}\nUser.from({name: \"Bug\", age: \"nope\"})";
+    let src =
+        "class User {\n  name: string\n  age: number\n}\nUser.from({name: \"Bug\", age: \"nope\"})";
     assert_vm_run_error_matches_treewalker(src).await;
 }
 
@@ -3866,7 +3961,9 @@ async fn vm_typed_instance_field_violation_panic_matches_treewalker() {
     // Both engines must produce the identical message AND span.
     let src = "class C { n: number\n fn init() { self.n = 1 } }\n\
                let c = C()\nc.n = \"oops\"\nprint(c.n)";
-    let tw = ascript::run_source(src).await.expect_err("tree-walker errors");
+    let tw = ascript::run_source(src)
+        .await
+        .expect_err("tree-walker errors");
     let vm = ascript::vm_run_source(src).await.expect_err("vm errors");
     assert_eq!(
         tw.message, vm.message,
@@ -3959,7 +4056,9 @@ async fn vm_index_assign_oob_and_wrong_type_panics_match_treewalker() {
         "let a = [1, 2, 3]\na[1.5] = 0\nprint(a)", // non-integer index
         "let o = {}\no[5] = 1\nprint(o)",          // non-string object key
     ] {
-        let tw = ascript::run_source(src).await.expect_err("tree-walker errors");
+        let tw = ascript::run_source(src)
+            .await
+            .expect_err("tree-walker errors");
         let vm = ascript::vm_run_source(src).await.expect_err("vm errors");
         assert_eq!(
             tw.message, vm.message,
@@ -3981,7 +4080,9 @@ async fn vm_index_assign_oob_and_wrong_type_panics_match_treewalker() {
     // span limitation as `Op::SetProp`'s "cannot set property" path, so message-
     // equality is asserted here, not span-equality.
     let src = "let n = 5\nn[0] = 1\nprint(n)";
-    let tw = ascript::run_source(src).await.expect_err("tree-walker errors");
+    let tw = ascript::run_source(src)
+        .await
+        .expect_err("tree-walker errors");
     let vm = ascript::vm_run_source(src).await.expect_err("vm errors");
     assert_eq!(
         tw.message, vm.message,
@@ -4184,9 +4285,9 @@ async fn assert_vm_match_parity(src: &str) {
                 tw_err.message, vm_err.message
             );
         }
-        (tw, vm) => panic!(
-            "VM/tree-walker outcome shape diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
-        ),
+        (tw, vm) => {
+            panic!("VM/tree-walker outcome shape diverged for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}")
+        }
     }
 }
 
@@ -4228,7 +4329,7 @@ async fn vm_match_option_c_compare_vs_bind() {
 async fn vm_match_ranges() {
     let cases = [
         r#"print(match 5 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#,
-        r#"print(match 10 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#,  // 10 excluded from 0..10
+        r#"print(match 10 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#, // 10 excluded from 0..10
         r#"print(match 100 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#, // 100 included in ..=100
         r#"print(match 500 { 0..10 => "small", 10..=100 => "med", _ => "big" })"#,
         // Range against a non-number subject → no match (falls to default).
@@ -4351,11 +4452,9 @@ async fn vm_match_no_arm_panics_identically() {
 async fn vm_match_enum_variant_patterns() {
     // Enum-variant patterns are `LiteralPat`s holding a member expr (`Shape.Circle`)
     // → a value compare against the resolved variant value.
-    let cases = [
-        r#"enum Shape { Circle, Square, Triangle }
+    let cases = [r#"enum Shape { Circle, Square, Triangle }
 fn name(s) { return match s { Shape.Circle => "circle", Shape.Square => "square", _ => "other" } }
-print(name(Shape.Circle)); print(name(Shape.Square)); print(name(Shape.Triangle))"#,
-    ];
+print(name(Shape.Circle)); print(name(Shape.Square)); print(name(Shape.Triangle))"#];
     for src in cases {
         assert_vm_match_parity(src).await;
     }
@@ -4480,10 +4579,9 @@ fn byte_identical_examples() -> Vec<String> {
 async fn vm_matches_recorded_goldens() {
     let mut checked = 0usize;
     for rel in byte_identical_examples() {
-        let src = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&rel),
-        )
-        .unwrap_or_else(|e| panic!("read example {rel}: {e}"));
+        let src =
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(&rel))
+                .unwrap_or_else(|e| panic!("read example {rel}: {e}"));
         // Goldens are recorded under the full-feature build; under a reduced
         // feature config the example may import an unavailable module and cannot
         // reproduce its golden. Skip it for this build (covered by the full build).
@@ -4542,8 +4640,8 @@ fn vm_recorded_goldens_cover_the_byte_identical_set() {
         .collect();
     let dir = vm_goldens_dir();
     let mut found = BTreeSet::new();
-    for entry in std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+    for entry in
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
     {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|x| x.to_str()) == Some("out") {
@@ -4594,7 +4692,10 @@ async fn record_vm_goldens() {
         eprintln!("recorded golden: {} <- {rel}", gpath.display());
         wrote += 1;
     }
-    eprintln!("recorded {wrote} goldens from the tree-walker into {}", dir.display());
+    eprintln!(
+        "recorded {wrote} goldens from the tree-walker into {}",
+        dir.display()
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5209,7 +5310,9 @@ fn verifier_accepts_all_compiled_corpus_chunks() {
         verified >= 20,
         "expected the verifier corpus gate to cover >=20 examples, covered {verified}"
     );
-    eprintln!("verifier corpus gate: {verified} compiled chunks verify OK (fresh + .aso round-trip)");
+    eprintln!(
+        "verifier corpus gate: {verified} compiled chunks verify OK (fresh + .aso round-trip)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5335,7 +5438,8 @@ async fn vm_inner_function_reads_top_level_binding() {
 #[tokio::test]
 async fn vm_mutual_top_level_functions() {
     // Mutual recursion between two top-level fns: `a` forward-references `b`.
-    assert_vm_run_matches_treewalker("fn a() { return b() }\nfn b() { return 1 }\nprint(a())").await;
+    assert_vm_run_matches_treewalker("fn a() { return b() }\nfn b() { return 1 }\nprint(a())")
+        .await;
     // Even/odd mutual recursion exercises repeated forward+backward global reads.
     assert_vm_run_matches_treewalker(
         "fn even(n) { if (n == 0) { return true }\n return odd(n - 1) }\n\
@@ -5432,10 +5536,8 @@ async fn vm_imported_binding_reassignment_errors_match_treewalker() {
     // An IMPORTED name is an immutable module global: reassigning it (in the SAME
     // entry chunk — the cross-MODULE case) is the immutable error on both engines,
     // now via the runtime SET_GLOBAL mutability check.
-    assert_vm_run_error_matches_treewalker(
-        "import { abs } from \"std/math\"\nabs = 3\nprint(abs)",
-    )
-    .await;
+    assert_vm_run_error_matches_treewalker("import { abs } from \"std/math\"\nabs = 3\nprint(abs)")
+        .await;
     // The same name USED first, then reassigned — still immutable.
     assert_vm_run_error_matches_treewalker(
         "import { max } from \"std/math\"\nprint(max(1, 2))\nmax = 9",

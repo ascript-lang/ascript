@@ -355,7 +355,11 @@ fn repl_vm_trailing_expr_prints_value_statements_print_nothing() {
 
     // A `let` statement prints nothing.
     let (out2, _) = run_repl_session("let z = 9\n", false);
-    assert_eq!(out2.trim(), "", "statement prints nothing; stdout: {out2:?}");
+    assert_eq!(
+        out2.trim(),
+        "",
+        "statement prints nothing; stdout: {out2:?}"
+    );
 
     // A trailing `nil` expression prints nothing.
     let (out3, _) = run_repl_session("nil\n", false);
@@ -399,7 +403,10 @@ fn repl_vm_const_reassignment_across_lines_errors_and_keeps_value() {
     // mutate it): the final `k` line prints 1, not 2.
     assert!(vm_out.contains('1'), "VM keeps k=1; stdout: {vm_out:?}");
     assert!(tw_out.contains('1'), "TW keeps k=1; stdout: {tw_out:?}");
-    assert!(!vm_out.contains('2'), "VM must not print 2; stdout: {vm_out:?}");
+    assert!(
+        !vm_out.contains('2'),
+        "VM must not print 2; stdout: {vm_out:?}"
+    );
 }
 
 #[test]
@@ -429,8 +436,14 @@ fn repl_vm_mutable_let_reassignment_across_lines_succeeds() {
     let session = "let m = 1\nm = 2\nm\n";
     let (vm_out, _) = run_repl_session(session, false);
     let (tw_out, _) = run_repl_session(session, true);
-    assert!(vm_out.contains('2'), "VM let reassignment; stdout: {vm_out:?}");
-    assert!(tw_out.contains('2'), "TW let reassignment; stdout: {tw_out:?}");
+    assert!(
+        vm_out.contains('2'),
+        "VM let reassignment; stdout: {vm_out:?}"
+    );
+    assert!(
+        tw_out.contains('2'),
+        "TW let reassignment; stdout: {tw_out:?}"
+    );
 }
 
 #[test]
@@ -534,7 +547,8 @@ fn repl_tree_walker_flag_still_works() {
 #[test]
 fn repl_vm_matches_tree_walker_on_a_shared_session() {
     // A session valid in both engines must produce identical stdout.
-    let session = "let x = 1\nx + 1\nfn sq(n) { return n * n }\nsq(5)\nlet y = x + sq(3)\ny\nexit()\n";
+    let session =
+        "let x = 1\nx + 1\nfn sq(n) { return n * n }\nsq(5)\nlet y = x + sq(3)\ny\nexit()\n";
     let (vm_out, _) = run_repl_session(session, false);
     let (tw_out, _) = run_repl_session(session, true);
     assert_eq!(
@@ -1211,7 +1225,11 @@ fn vm_stepped_for_range_iterates() {
     std::fs::write(&file, "for (i in 1..10 step 2) { print(i) }\n").unwrap();
     let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
     let _ = std::fs::remove_file(&file);
-    assert!(out.status.success(), "stepped for-range must run: {:?}", out);
+    assert!(
+        out.status.success(),
+        "stepped for-range must run: {:?}",
+        out
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n3\n5\n7\n9\n");
 }
 
@@ -1222,7 +1240,11 @@ fn vm_stepped_value_range_materializes() {
     std::fs::write(&file, "print(1..10 step 2)\n").unwrap();
     let out = Command::new(bin).arg("run").arg(&file).output().unwrap();
     let _ = std::fs::remove_file(&file);
-    assert!(out.status.success(), "stepped value range must run: {:?}", out);
+    assert!(
+        out.status.success(),
+        "stepped value range must run: {:?}",
+        out
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[1, 3, 5, 7, 9]\n");
 }
 
@@ -1396,7 +1418,10 @@ fn stepped_ranges_validation_panics_both_engines() {
     // RANGES FEATURE, Phase 3: zero/non-finite step and direction mismatch are
     // Tier-2 panics (exit 1) with byte-identical messages across engines.
     for (i, (src, msg)) in [
-        ("for (i in 1..10 step 0) {}", "step must be a finite, non-zero number"),
+        (
+            "for (i in 1..10 step 0) {}",
+            "step must be a finite, non-zero number",
+        ),
         (
             "for (i in 1..10 step -2) {}",
             "step -2 moves away from end (10); range can never progress",
@@ -1557,10 +1582,7 @@ fn stepped_match_patterns_both_engines() {
             "in\n",
         ),
         // plain (no-step) pattern is UNCHANGED.
-        (
-            "print(match 5 { 1..=10 => \"in\", _ => \"out\" })",
-            "in\n",
-        ),
+        ("print(match 5 { 1..=10 => \"in\", _ => \"out\" })", "in\n"),
     ];
     for (i, (src, expected)) in cases.iter().enumerate() {
         let vm = run_range_src(src, false, &format!("patstep_vm_{i}"));
@@ -1786,8 +1808,10 @@ fn check_unknown_enum_variant_lint_and_allow_suppression() {
     // on a statically-known enum, mirroring the runtime `enum E has no variant 'V'`
     // panic. Configurable: `--allow unknown-enum-variant` suppresses it.
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let file = std::env::temp_dir()
-        .join(format!("ascript_unknown_enum_variant_{}.as", std::process::id()));
+    let file = std::env::temp_dir().join(format!(
+        "ascript_unknown_enum_variant_{}.as",
+        std::process::id()
+    ));
     std::fs::write(&file, "enum Color { Red, Green }\nprint(Color.Reddd)\n").unwrap();
 
     // Default: the diagnostic appears (JSON output for a robust assertion).
@@ -1831,8 +1855,10 @@ fn check_duplicate_member_lint_and_allow_suppression() {
     // one class body (a silent shadow at runtime). Configurable: `--allow
     // duplicate-member` suppresses it.
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let file = std::env::temp_dir()
-        .join(format!("ascript_duplicate_member_{}.as", std::process::id()));
+    let file = std::env::temp_dir().join(format!(
+        "ascript_duplicate_member_{}.as",
+        std::process::id()
+    ));
     std::fs::write(&file, "class C {\n  x: number\n  x: string\n}\n").unwrap();
 
     // Default: the diagnostic appears (JSON output for a robust assertion).
@@ -1920,8 +1946,10 @@ fn check_field_default_type_lint_and_allow_suppression() {
     // default contradicts its declared type (a guaranteed runtime panic at
     // construction). Configurable: `--allow field-default-type` suppresses it.
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let file = std::env::temp_dir()
-        .join(format!("ascript_field_default_type_{}.as", std::process::id()));
+    let file = std::env::temp_dir().join(format!(
+        "ascript_field_default_type_{}.as",
+        std::process::id()
+    ));
     std::fs::write(&file, "class P { n: number = \"x\" }\n").unwrap();
 
     // Default: the diagnostic appears (JSON output for a robust assertion).
@@ -1965,8 +1993,10 @@ fn check_invalid_propagate_lint_and_allow_suppression() {
     // whose declared return type is not a `Result`. Configurable: `--allow
     // invalid-propagate` suppresses it.
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let file = std::env::temp_dir()
-        .join(format!("ascript_invalid_propagate_{}.as", std::process::id()));
+    let file = std::env::temp_dir().join(format!(
+        "ascript_invalid_propagate_{}.as",
+        std::process::id()
+    ));
     std::fs::write(
         &file,
         "fn g(): Result<number> { return [1, nil] }\nfn f(): number { return g()? }\n",
@@ -2008,8 +2038,10 @@ fn check_unresolved_import_lint_and_allow_suppression() {
     // is not a known std module (here a `std/maths` typo). Configurable:
     // `--allow unresolved-import` suppresses it.
     let bin = env!("CARGO_BIN_EXE_ascript");
-    let file = std::env::temp_dir()
-        .join(format!("ascript_unresolved_import_{}.as", std::process::id()));
+    let file = std::env::temp_dir().join(format!(
+        "ascript_unresolved_import_{}.as",
+        std::process::id()
+    ));
     std::fs::write(&file, "import { abs } from \"std/maths\"\nprint(1)\n").unwrap();
 
     let out = Command::new(bin)

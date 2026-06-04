@@ -9,8 +9,11 @@ fn corpus() -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for e in fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
-            if p.is_dir() { walk(&p, out); }
-            else if p.extension().and_then(|x| x.to_str()) == Some("as") { out.push(p); }
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("as") {
+                out.push(p);
+            }
         }
     }
     let mut v = Vec::new();
@@ -23,7 +26,8 @@ fn corpus() -> Vec<PathBuf> {
 /// Multiset of comment texts in source (via the trivia-emitting lexer).
 fn comments_of(src: &str) -> Vec<String> {
     use ascript::syntax::SyntaxKind;
-    let mut v: Vec<String> = ascript::syntax::lex(src).into_iter()
+    let mut v: Vec<String> = ascript::syntax::lex(src)
+        .into_iter()
         .filter(|t| matches!(t.kind, SyntaxKind::LineComment | SyntaxKind::BlockComment))
         .map(|t| t.text.trim_end().to_string())
         .collect();
@@ -37,14 +41,23 @@ fn every_comment_survives_formatting() {
     for path in corpus() {
         let src = fs::read_to_string(&path).unwrap();
         let before = comments_of(&src);
-        if before.is_empty() { continue; }
+        if before.is_empty() {
+            continue;
+        }
         let formatted = ascript::syntax::format_tree(&src);
         let after = comments_of(&formatted);
         if before != after {
-            failures.push(format!("{}: comments changed\n  before={before:?}\n  after ={after:?}", path.display()));
+            failures.push(format!(
+                "{}: comments changed\n  before={before:?}\n  after ={after:?}",
+                path.display()
+            ));
         }
     }
-    assert!(failures.is_empty(), "comment preservation failures:\n{}", failures.join("\n\n"));
+    assert!(
+        failures.is_empty(),
+        "comment preservation failures:\n{}",
+        failures.join("\n\n")
+    );
 }
 
 #[test]
@@ -58,7 +71,11 @@ fn formatting_is_idempotent_over_corpus() {
             failures.push(format!("{} not idempotent", path.display()));
         }
     }
-    assert!(failures.is_empty(), "idempotence failures:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "idempotence failures:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -78,7 +95,10 @@ fn formats_inclusive_and_step_ranges() {
         ("let ys = 1..10 step 2\n", "let ys = 1..10 step 2\n"),
         ("let zs = 1..=5\n", "let zs = 1..=5\n"),
         ("for (i in 1..=5) {\n}\n", "for (i in 1..=5) {\n}\n"),
-        ("for (i in 10..1 step -2) {\n}\n", "for (i in 10..1 step -2) {\n}\n"),
+        (
+            "for (i in 10..1 step -2) {\n}\n",
+            "for (i in 10..1 step -2) {\n}\n",
+        ),
         // `step` stays an ordinary identifier away from a range end.
         ("let step = 1\n", "let step = 1\n"),
     ] {
@@ -104,7 +124,10 @@ fn formats_nil_type_idempotently() {
         "fn g(): number | nil {\n  return nil\n}\n",
     ] {
         let once = ascript::syntax::format_tree(src);
-        assert!(once.contains("nil"), "lost `nil` type formatting {src:?} -> {once:?}");
+        assert!(
+            once.contains("nil"),
+            "lost `nil` type formatting {src:?} -> {once:?}"
+        );
         let twice = ascript::syntax::format_tree(&once);
         assert_eq!(once, twice, "not idempotent for {src:?}");
         assert!(
@@ -124,7 +147,10 @@ fn formats_fn_type_idempotently() {
         "fn h(): fn {\n  return g\n}\n",
     ] {
         let once = ascript::syntax::format_tree(src);
-        assert!(once.contains("fn"), "lost `fn` type formatting {src:?} -> {once:?}");
+        assert!(
+            once.contains("fn"),
+            "lost `fn` type formatting {src:?} -> {once:?}"
+        );
         let twice = ascript::syntax::format_tree(&once);
         assert_eq!(once, twice, "not idempotent for {src:?}");
         assert!(
@@ -140,13 +166,23 @@ fn formatted_corpus_reparses_without_errors() {
     for path in corpus() {
         let src = fs::read_to_string(&path).unwrap();
         // only check files that parse cleanly to begin with
-        if !ascript::syntax::parser::parse(&src).errors.is_empty() { continue; }
+        if !ascript::syntax::parser::parse(&src).errors.is_empty() {
+            continue;
+        }
         let formatted = ascript::syntax::format_tree(&src);
         let errs = ascript::syntax::parser::parse(&formatted).errors;
         if !errs.is_empty() {
-            failures.push(format!("{}: formatted output has {} parse error(s) (content loss?): {:?}",
-                path.display(), errs.len(), errs));
+            failures.push(format!(
+                "{}: formatted output has {} parse error(s) (content loss?): {:?}",
+                path.display(),
+                errs.len(),
+                errs
+            ));
         }
     }
-    assert!(failures.is_empty(), "formatter produced unparseable output:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "formatter produced unparseable output:\n{}",
+        failures.join("\n")
+    );
 }

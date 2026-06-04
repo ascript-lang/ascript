@@ -69,6 +69,11 @@ Range-specific current behavior:
 | `step` | **does not exist** — not a token, keyword, AST field, or production | — |
 | `stream.range(a,b,s?)` | interval + signed step; `range(10,1)` → `[]` | `src/stdlib/stream.rs:285,506-514` |
 
+**Update 2026-06-04:** the rejections in this snapshot were closed by the ranges/step work.
+`print(1..=5)` → `[1,2,3,4,5]` and descending `for (i in 10..=1 step -2)` iterates `10,8,6,4,2`;
+`..=` and descending+`step` now run on both engines (verified). The rows above are the historical
+"status today" snapshot, kept intact for the record.
+
 Tokens already present: `Tok::DotDot` (`..`), `Tok::DotDotEq` (`..=`),
 `Tok::DotDotDot` (`...`, spread/rest — **not** a range token).
 (`src/token.rs:45-48`, `src/syntax/kind.rs:91-93`.)
@@ -268,7 +273,8 @@ A syntax change now costs two front-ends plus the parity machinery. Touch-points
 **Legacy front-end (tree-walker):**
 - `src/lexer.rs` — `step` contextual keyword (tokens `..`/`..=` already lex).
 - `src/parser.rs` — accept `..=` and `step` in for-range and value-range position
-  (currently `..=` is rejected outside patterns).
+  (currently `..=` is rejected outside patterns). **Update 2026-06-04:** done — `..=` and `step`
+  are accepted in for-range and value position; `..=` is no longer rejected outside patterns.
 - `src/ast.rs` — extend `ForRange` (`:248`) and the value-range node (`BinOp::Range`,
   `:467`) with `inclusive: bool` and `step: Option<Expr>`; extend `Pattern::Range` (`:347`)
   with `step: Option<Expr>`.

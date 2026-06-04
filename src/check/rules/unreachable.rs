@@ -66,11 +66,17 @@ mod tests {
     }
     #[test]
     fn flags_after_return() {
-        assert!(has("fn f() { return 1\n print(2) }\nf()\n", "unreachable-code"));
+        assert!(has(
+            "fn f() { return 1\n print(2) }\nf()\n",
+            "unreachable-code"
+        ));
     }
     #[test]
     fn no_unreachable_normal_flow() {
-        assert!(!has("fn f() { print(1)\n return 2 }\nf()\n", "unreachable-code"));
+        assert!(!has(
+            "fn f() { print(1)\n return 2 }\nf()\n",
+            "unreachable-code"
+        ));
     }
 
     /// Line attribution: the diagnostic must point at the dead statement itself,

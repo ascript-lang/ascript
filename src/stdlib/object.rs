@@ -513,7 +513,9 @@ mod tests {
         // deep_clone terminates and yields a distinct (by identity) container
         let mut seen = std::collections::HashMap::new();
         let cloned = deep_clone(&arr_a, &mut seen);
-        assert!(!matches!((&cloned, &arr_a), (Value::Array(c), Value::Array(o)) if crate::gc::cc_ptr_eq(c, o)));
+        assert!(
+            !matches!((&cloned, &arr_a), (Value::Array(c), Value::Array(o)) if crate::gc::cc_ptr_eq(c, o))
+        );
         // deep_equal on the cyclic structure vs itself terminates and is true
         assert!(
             call("deepEqual", &[arr_a.clone(), arr_a.clone()], sp()).unwrap() == Value::Bool(true)

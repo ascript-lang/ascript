@@ -291,13 +291,7 @@ async fn run_baseline() {
     println!();
     println!(
         "{:<28} {:>9} {:>11} {:>11} {:>11} {:>11} {:>11}",
-        "benchmark",
-        "kind",
-        "tw (ms)",
-        "gen (ms)",
-        "spec (ms)",
-        "spec/tw",
-        "spec/gen",
+        "benchmark", "kind", "tw (ms)", "gen (ms)", "spec (ms)", "spec/tw", "spec/gen",
     );
     println!("{}", "-".repeat(28 + 9 + 11 * 5 + 6));
 
@@ -365,11 +359,7 @@ async fn run_baseline() {
             println!("           - {name}: spec/gen {r:.2}x");
         }
     }
-    println!(
-        "  [NOTE] string concat / template build are ALLOCATION-bound (shared Rc<str>);"
-    );
-    println!(
-        "         EXEMPT from the >= 2x compute-bound target, but checked for no-regression."
-    );
+    println!("  [NOTE] string concat / template build are ALLOCATION-bound (shared Rc<str>);");
+    println!("         EXEMPT from the >= 2x compute-bound target, but checked for no-regression.");
     println!();
 }

@@ -30,7 +30,10 @@ mod tests {
     fn cast_source_file_then_find_let() {
         let root = parse_to_tree("let x = 1");
         let file = SourceFile::cast(root).expect("root is SourceFile");
-        let has_let = file.syntax().descendants().any(|n| n.kind() == SyntaxKind::LetStmt);
+        let has_let = file
+            .syntax()
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::LetStmt);
         assert!(has_let);
     }
 
@@ -55,9 +58,18 @@ mod tests {
 
     #[test]
     fn binary_expr_other_operators() {
-        assert_eq!(first::<BinaryExpr>("a * b", SyntaxKind::BinaryExpr).op(), Some(SyntaxKind::Star));
-        assert_eq!(first::<BinaryExpr>("a == b", SyntaxKind::BinaryExpr).op(), Some(SyntaxKind::EqEq));
-        assert_eq!(first::<BinaryExpr>("a && b", SyntaxKind::BinaryExpr).op(), Some(SyntaxKind::AmpAmp));
+        assert_eq!(
+            first::<BinaryExpr>("a * b", SyntaxKind::BinaryExpr).op(),
+            Some(SyntaxKind::Star)
+        );
+        assert_eq!(
+            first::<BinaryExpr>("a == b", SyntaxKind::BinaryExpr).op(),
+            Some(SyntaxKind::EqEq)
+        );
+        assert_eq!(
+            first::<BinaryExpr>("a && b", SyntaxKind::BinaryExpr).op(),
+            Some(SyntaxKind::AmpAmp)
+        );
     }
 
     #[test]
@@ -115,7 +127,10 @@ mod tests {
         let u: UnaryExpr = first("-x", SyntaxKind::UnaryExpr);
         assert_eq!(u.op(), Some(SyntaxKind::Minus));
         assert!(matches!(u.expr(), Some(Expr::NameRef(_))));
-        assert_eq!(first::<UnaryExpr>("!ok", SyntaxKind::UnaryExpr).op(), Some(SyntaxKind::Bang));
+        assert_eq!(
+            first::<UnaryExpr>("!ok", SyntaxKind::UnaryExpr).op(),
+            Some(SyntaxKind::Bang)
+        );
     }
 
     #[test]
@@ -153,8 +168,12 @@ mod tests {
 
     #[test]
     fn return_stmt_value() {
-        assert!(first::<ReturnStmt>("return 1", SyntaxKind::ReturnStmt).expr().is_some());
-        assert!(first::<ReturnStmt>("return", SyntaxKind::ReturnStmt).expr().is_none());
+        assert!(first::<ReturnStmt>("return 1", SyntaxKind::ReturnStmt)
+            .expr()
+            .is_some());
+        assert!(first::<ReturnStmt>("return", SyntaxKind::ReturnStmt)
+            .expr()
+            .is_none());
     }
 
     #[test]
@@ -222,7 +241,10 @@ mod tests {
         let rs: RangeExpr = first("let ys = 1..10 step 2", SyntaxKind::RangeExpr);
         assert!(matches!(rs.start(), Some(Expr::Literal(_))));
         assert!(matches!(rs.end(), Some(Expr::Literal(_))));
-        assert!(matches!(rs.step(), Some(Expr::Literal(_))), "step child present");
+        assert!(
+            matches!(rs.step(), Some(Expr::Literal(_))),
+            "step child present"
+        );
 
         // Inclusive + step together.
         let ris: RangeExpr = first("let zs = 1..=10 step 2", SyntaxKind::RangeExpr);

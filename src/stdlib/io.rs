@@ -135,6 +135,8 @@ impl Interp {
             }
         }
         self.return_resource(STDIN_RESOURCE_ID, ResourceState::StdinReader(reader));
-        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(lines))))
+        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+            lines,
+        ))))
     }
 }

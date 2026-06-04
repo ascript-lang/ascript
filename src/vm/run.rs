@@ -292,9 +292,9 @@ impl Vm {
         // Prefer `.aso` when present AND (no source, OR aso is at least as new).
         let prefer_aso = aso_meta.is_some()
             && match (aso_mtime, src_mtime) {
-                (_, None) => true,                 // no source: must use .aso
-                (Some(a), Some(s)) => a >= s,      // .aso fresh enough
-                (None, Some(_)) => false,          // can't read .aso mtime: recompile
+                (_, None) => true,            // no source: must use .aso
+                (Some(a), Some(s)) => a >= s, // .aso fresh enough
+                (None, Some(_)) => false,     // can't read .aso mtime: recompile
             };
 
         let chunk: crate::vm::chunk::Chunk = if prefer_aso {
@@ -545,8 +545,9 @@ impl Vm {
                     } else {
                         None
                     };
-                    let v =
-                        crate::interp::materialize_range_stepped(&lo, &hi, inclusive, step_v, span)?;
+                    let v = crate::interp::materialize_range_stepped(
+                        &lo, &hi, inclusive, step_v, span,
+                    )?;
                     fiber.push(v);
                 }
 
@@ -695,7 +696,9 @@ impl Vm {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
-                                format!("DEFINE_GLOBAL operand is not a string constant: {other:?}"),
+                                format!(
+                                    "DEFINE_GLOBAL operand is not a string constant: {other:?}"
+                                ),
                             ))
                         }
                     };
@@ -787,7 +790,9 @@ impl Vm {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
-                                format!("IMMUTABLE_ERROR operand is not a string constant: {other:?}"),
+                                format!(
+                                    "IMMUTABLE_ERROR operand is not a string constant: {other:?}"
+                                ),
                             ))
                         }
                     };
@@ -853,23 +858,17 @@ impl Vm {
                         // building the generator). AWAIT DISCIPLINE: no await here;
                         // the fiber is built synchronously and handed to the handle.
                         Value::Closure(callee) if callee.proto.is_generator => {
-                            let call_span =
-                                fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                            let what = callee
-                                .proto
-                                .chunk
-                                .name
-                                .as_deref()
-                                .unwrap_or("function");
+                            let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
                             // Pop the args, then drop the callee value beneath them.
                             let mut args = vec![Value::Nil; argc];
                             for slot in args.iter_mut().rev() {
                                 *slot = fiber.pop();
                             }
                             fiber.pop(); // the callee value at callee_idx
-                            // Bind args (arity + per-param contracts + rest) — shared
-                            // with every other call path. A mismatch is a Tier-2
-                            // panic at the call site, eager (like the tree-walker).
+                                         // Bind args (arity + per-param contracts + rest) — shared
+                                         // with every other call path. A mismatch is a Tier-2
+                                         // panic at the call site, eager (like the tree-walker).
                             let bound = crate::interp::check_call_args(
                                 &callee.proto.params,
                                 args,
@@ -912,8 +911,7 @@ impl Vm {
                         // owned `Rc<Vm>`; no `fiber` RefCell borrow is held across the
                         // spawn/await below.
                         Value::Closure(callee) if callee.proto.is_async => {
-                            let call_span =
-                                fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             // Pop the `argc` args into an owned vec (top of stack is
                             // the LAST arg), then drop the callee value beneath them.
                             let mut args = vec![Value::Nil; argc];
@@ -921,21 +919,20 @@ impl Vm {
                                 *slot = fiber.pop();
                             }
                             fiber.pop(); // the callee value at callee_idx
-                            // Reuse the shared M17 dance (mirrors `call_function`'s
-                            // async branch and `BoundMethod`'s): an owned `Rc<Vm>`
-                            // (Vm self-weak, installed at `Vm::new`) drives the body;
-                            // the task resolves the CELL (never a `SharedFuture` clone)
-                            // so cancel-on-drop works; the inflight guard provides
-                            // backpressure (reused from the shared interp).
+                                         // Reuse the shared M17 dance (mirrors `call_function`'s
+                                         // async branch and `BoundMethod`'s): an owned `Rc<Vm>`
+                                         // (Vm self-weak, installed at `Vm::new`) drives the body;
+                                         // the task resolves the CELL (never a `SharedFuture` clone)
+                                         // so cancel-on-drop works; the inflight guard provides
+                                         // backpressure (reused from the shared interp).
                             let vm = self.rc();
                             let fut = crate::task::SharedFuture::new();
                             let cell = fut.cell();
                             let guard = self.interp.inflight_guard();
                             let handle = tokio::task::spawn_local(async move {
                                 let _g = guard;
-                                let r = vm
-                                    .call_value(Value::Closure(callee), args, call_span)
-                                    .await;
+                                let r =
+                                    vm.call_value(Value::Closure(callee), args, call_span).await;
                                 cell.resolve(r);
                             });
                             fut.set_abort(handle.abort_handle());
@@ -945,16 +942,10 @@ impl Vm {
                         Value::Closure(callee) => {
                             // The call-site span anchors arity/contract/return
                             // panics exactly where the tree-walker's do.
-                            let call_span =
-                                fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             // `what` mirrors the tree-walker's `func.name.as_deref()
                             // .unwrap_or("function")` so the wording matches.
-                            let what = callee
-                                .proto
-                                .chunk
-                                .name
-                                .as_deref()
-                                .unwrap_or("function");
+                            let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
                             // Pop the `argc` args into an owned vec (top of stack is
                             // the LAST arg), then drop the callee value beneath them.
                             let mut args = vec![Value::Nil; argc];
@@ -962,10 +953,10 @@ impl Vm {
                                 *slot = fiber.pop();
                             }
                             fiber.pop(); // the callee value at callee_idx
-                            // Arity + per-param contracts + rest collection, shared
-                            // verbatim with the tree-walker via `check_call_args`. On
-                            // a mismatch this returns a `Control::Panic` carrying the
-                            // identical message anchored at `call_span`.
+                                         // Arity + per-param contracts + rest collection, shared
+                                         // verbatim with the tree-walker via `check_call_args`. On
+                                         // a mismatch this returns a `Control::Panic` carrying the
+                                         // identical message anchored at `call_span`.
                             let bound = crate::interp::check_call_args(
                                 &callee.proto.params,
                                 args,
@@ -1021,8 +1012,7 @@ impl Vm {
                                 *slot = fiber.pop();
                             }
                             let _callee = fiber.pop(); // the Value at callee_idx
-                            let span =
-                                fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             let result = self.call_value(other, args, span).await?;
                             fiber.push(result);
                         }
@@ -1518,9 +1508,10 @@ impl Vm {
                     let iterable = fiber.pop();
                     let items: Vec<Value> = match iterable {
                         Value::Array(arr) => arr.borrow().clone(),
-                        Value::Str(s) => {
-                            s.chars().map(|c| Value::Str(c.to_string().into())).collect()
-                        }
+                        Value::Str(s) => s
+                            .chars()
+                            .map(|c| Value::Str(c.to_string().into()))
+                            .collect(),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -1592,8 +1583,7 @@ impl Vm {
                         };
                         upvalues.push(cell);
                     }
-                    let closure =
-                        crate::vm::value_ext::Closure::with_upvalues(proto, upvalues);
+                    let closure = crate::vm::value_ext::Closure::with_upvalues(proto, upvalues);
                     fiber.push(Value::Closure(closure));
                 }
 
@@ -1633,22 +1623,21 @@ impl Vm {
                     // name, returns its value (or None if absent), plus an ordered list
                     // of export names for the namespace form. For std we wrap the
                     // `ModuleEntry`; for a file module we use its IndexMap directly.
-                    let exports: ModuleExports =
-                        if source.starts_with("std/") {
-                            let entry = self.interp.import_std(&source)?;
-                            // Materialize the std module's exports into an ordered map
-                            // so both import forms share one code path. The std export
-                            // set is unordered (a HashSet); order is irrelevant for the
-                            // named form and matches the tree-walker's unordered
-                            // namespace object for the namespace form.
-                            let mut m = indexmap::IndexMap::new();
-                            for name in entry.exports.borrow().iter() {
-                                m.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
-                            }
-                            Rc::new(RefCell::new(m))
-                        } else {
-                            self.load_file_module(&source, fault_ip, fiber).await?
-                        };
+                    let exports: ModuleExports = if source.starts_with("std/") {
+                        let entry = self.interp.import_std(&source)?;
+                        // Materialize the std module's exports into an ordered map
+                        // so both import forms share one code path. The std export
+                        // set is unordered (a HashSet); order is irrelevant for the
+                        // named form and matches the tree-walker's unordered
+                        // namespace object for the namespace form.
+                        let mut m = indexmap::IndexMap::new();
+                        for name in entry.exports.borrow().iter() {
+                            m.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
+                        }
+                        Rc::new(RefCell::new(m))
+                    } else {
+                        self.load_file_module(&source, fault_ip, fiber).await?
+                    };
 
                     match desc {
                         crate::vm::chunk::ImportDesc::Named { source, names } => {
@@ -1662,9 +1651,7 @@ impl Vm {
                                             return Err(self.panic_at(
                                                 fiber,
                                                 fault_ip,
-                                                format!(
-                                                    "module '{source}' has no export '{name}'"
-                                                ),
+                                                format!("module '{source}' has no export '{name}'"),
                                             ));
                                         }
                                     }
@@ -1799,9 +1786,12 @@ impl Vm {
                         Value::Object(o) => {
                             o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
                         }
-                        Value::Instance(i) => {
-                            i.borrow().fields.get(key.as_ref()).cloned().unwrap_or(Value::Nil)
-                        }
+                        Value::Instance(i) => i
+                            .borrow()
+                            .fields
+                            .get(key.as_ref())
+                            .cloned()
+                            .unwrap_or(Value::Nil),
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -1856,9 +1846,7 @@ impl Vm {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
-                                    format!(
-                                        "OBJECT_REST operand is not a key array: {other:?}"
-                                    ),
+                                    format!("OBJECT_REST operand is not a key array: {other:?}"),
                                 ))
                             }
                         };
@@ -1935,7 +1923,9 @@ impl Vm {
                             return Err(self.panic_at(
                                 fiber,
                                 fault_ip,
-                                format!("MATCH_HAS_KEY operand is not a string constant: {other:?}"),
+                                format!(
+                                    "MATCH_HAS_KEY operand is not a string constant: {other:?}"
+                                ),
                             ))
                         }
                     };
@@ -1986,13 +1976,10 @@ impl Vm {
                             // membership. A plain pattern (step omitted) keeps its
                             // no-stride behavior via the raw `Option`.
                             if step_v.is_some() {
-                                let span =
-                                    fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                                let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                                 crate::interp::resolve_step(*lo, *hi, step_v, span)?;
                             }
-                            crate::interp::range_pattern_contains(
-                                *n, *lo, *hi, step_v, inclusive,
-                            )
+                            crate::interp::range_pattern_contains(*n, *lo, *hi, step_v, inclusive)
                         }
                         _ => false,
                     };
@@ -2150,9 +2137,7 @@ impl Vm {
                     // lazily across iterations.
                     let ok = match fiber.peek(0) {
                         Value::Generator(_) => true,
-                        Value::Native(n) => {
-                            crate::interp::native_stream_method(n.kind).is_some()
-                        }
+                        Value::Native(n) => crate::interp::native_stream_method(n.kind).is_some(),
                         _ => false,
                     };
                     if !ok {
@@ -2214,11 +2199,10 @@ impl Vm {
                                     ))
                                 }
                             };
-                            let bound =
-                                Value::NativeMethod(Rc::new(crate::value::NativeMethod {
-                                    receiver: n,
-                                    method: method.to_string(),
-                                }));
+                            let bound = Value::NativeMethod(Rc::new(crate::value::NativeMethod {
+                                receiver: n,
+                                method: method.to_string(),
+                            }));
                             // Box this edge: `call_value` may re-enter `run`, so
                             // the recursive future needs a finite size.
                             let pair =
@@ -2391,9 +2375,7 @@ impl Vm {
                         }
                     }
                     let mut default_map: HashMap<String, Cc<Closure>> = HashMap::new();
-                    for (i, (name, dv)) in
-                        cp.default_fields.iter().zip(defaults).enumerate()
-                    {
+                    for (i, (name, dv)) in cp.default_fields.iter().zip(defaults).enumerate() {
                         match dv {
                             Value::Closure(c) => {
                                 // Mirror the enclosing-scope names this default
@@ -2412,9 +2394,7 @@ impl Vm {
                                     for (cap_name, up_idx) in caps {
                                         if let Some(cell) = c.upvalues.get(*up_idx as usize) {
                                             let val = cell.borrow().clone();
-                                            if def_env
-                                                .define(cap_name, val.clone(), true)
-                                                .is_err()
+                                            if def_env.define(cap_name, val.clone(), true).is_err()
                                             {
                                                 let _ = def_env.assign(cap_name, val);
                                             }
@@ -2487,8 +2467,8 @@ impl Vm {
                         .as_ref()
                         .and_then(|s| self.find_compiled_method(s, &name))
                     {
-                        Some((_closure, found_class)) => Value::BoundMethod(Rc::new(
-                            crate::value::BoundMethod {
+                        Some((_closure, found_class)) => {
+                            Value::BoundMethod(Rc::new(crate::value::BoundMethod {
                                 receiver,
                                 method: Rc::new(crate::value::Method {
                                     params: Vec::new(),
@@ -2498,8 +2478,8 @@ impl Vm {
                                 }),
                                 defining_class: found_class,
                                 name: name.to_string(),
-                            },
-                        )),
+                            }))
+                        }
                         None => {
                             // Mirror the tree-walker's `Value::Super` member-read
                             // error wording (with/without a superclass).
@@ -2559,7 +2539,8 @@ impl Vm {
                 let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
                 // Arity + per-param contracts + rest collection, shared verbatim
                 // with the tree-walker and the `Op::Call` arm.
-                let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                let bound =
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
                 // Build a one-frame Fiber whose sole frame is the closure, then
                 // place the bound params into its slots (cell slot → cell, plain
                 // slot → stack). `Fiber::new` already reserved `slot_count` Nil
@@ -2663,10 +2644,7 @@ impl Vm {
     /// If `bm` is a bound method on a VM-registered class, return its compiled
     /// method closure (resolved up the chain); else `None` (so a tree-walker
     /// BoundMethod delegates).
-    fn bound_method_is_vm(
-        &self,
-        bm: &crate::value::BoundMethod,
-    ) -> Option<Cc<Closure>> {
+    fn bound_method_is_vm(&self, bm: &crate::value::BoundMethod) -> Option<Cc<Closure>> {
         if let Value::Instance(inst) = &bm.receiver {
             let class = inst.borrow().class.clone();
             // Resolve from the method's DEFINING class (set by `vm_read_member` /
@@ -2860,8 +2838,7 @@ impl Vm {
                     crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
                 let slot_base = fiber.stack.len();
                 let slot_count = closure.proto.chunk.slot_count as usize;
-                let cells =
-                    super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
+                let cells = super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
                 fiber.stack.resize(slot_base + slot_count, Value::Nil);
                 // self -> slot 0 (cell-aware).
                 if let Some(cell) = &cells[0] {
@@ -2969,7 +2946,9 @@ impl Vm {
         }
         // Field / non-VM receiver: shared dispatch (also yields the correct
         // nil-field / nil-receiver behavior, byte-identical to the tree-walker).
-        self.interp.read_member(obj, name, span).map_err(Control::from)
+        self.interp
+            .read_member(obj, name, span)
+            .map_err(Control::from)
     }
 
     /// The BASE shape for `class`'s instances — the declared-field key layout in
@@ -3015,13 +2994,17 @@ impl Vm {
     /// cache hit would still be re-validated by the value's identity — but saturation
     /// keeps the invariant "any write changes the version" exact).
     fn bump_global_version(&self) {
-        self.global_version.set(self.global_version.get().saturating_add(1));
+        self.global_version
+            .set(self.global_version.get().saturating_add(1));
     }
 
     /// Read a module-scope user-global by name. Returns the stored `Value` (cloned)
     /// or `None` if not yet defined.
     fn get_user_global(&self, name: &str) -> Option<Value> {
-        self.user_globals.borrow().get(name).map(|s| s.value.clone())
+        self.user_globals
+            .borrow()
+            .get(name)
+            .map(|s| s.value.clone())
     }
 
     /// Whether a module-scope user-global named `name` exists and is REASSIGNABLE.
@@ -3235,9 +3218,7 @@ impl Vm {
                 let v = self.interp.set_member(obj, name, value, span, span)?;
                 self.resync_object_shape(cell);
                 let new_shape = cell.shape.get();
-                if self.specialize
-                    && new_shape != 0
-                    && !crate::stdlib::schema::is_schema_value(obj)
+                if self.specialize && new_shape != 0 && !crate::stdlib::schema::is_schema_value(obj)
                 {
                     if let Some(idx) = cell.map.borrow().get_index_of(name) {
                         let mut ic = chunk.field_ic(op_off);
@@ -3317,7 +3298,13 @@ impl Vm {
                 .class_defaults
                 .borrow()
                 .get(&key)
-                .map(|m| c.fields.keys().filter(|k| m.contains_key(*k)).cloned().collect())
+                .map(|m| {
+                    c.fields
+                        .keys()
+                        .filter(|k| m.contains_key(*k))
+                        .cloned()
+                        .collect()
+                })
                 .unwrap_or_default();
             for fname in default_names {
                 let thunk = self
@@ -3457,7 +3444,11 @@ impl Vm {
             .expect("return/propagate with no active frame (VM bug)");
         if let Some(ret_ty) = &frame.closure.proto.ret {
             if !crate::interp::check_type(&value, ret_ty) {
-                return Err(crate::interp::contract_panic(ret_ty, &value, frame.ret_span));
+                return Err(crate::interp::contract_panic(
+                    ret_ty,
+                    &value,
+                    frame.ret_span,
+                ));
             }
         }
         fiber.stack.truncate(frame.slot_base);
@@ -3764,11 +3755,9 @@ mod tests {
             ("3", Op::Div, "2", "1.50"),
         ] {
             match run_decimal_binop(a, op, b).expect("decimal arith ok") {
-                RunOutcome::Done(v) => assert_eq!(
-                    v.to_string(),
-                    want,
-                    "{a} {op:?} {b} rendered wrong"
-                ),
+                RunOutcome::Done(v) => {
+                    assert_eq!(v.to_string(), want, "{a} {op:?} {b} rendered wrong")
+                }
                 other => panic!("expected Done, got {other:?}"),
             }
         }
@@ -3873,7 +3862,11 @@ mod tests {
         c.emit(Op::Return, s());
         match run_chunk(c) {
             Err(Control::Panic(e)) => {
-                assert_eq!(e.message, "range bounds must be numbers", "msg: {}", e.message)
+                assert_eq!(
+                    e.message, "range bounds must be numbers",
+                    "msg: {}",
+                    e.message
+                )
             }
             other => panic!("expected Panic, got {other:?}"),
         }
@@ -4145,11 +4138,9 @@ mod tests {
         c.emit(Op::GetIndex, s());
         c.emit(Op::Return, s());
         match run_chunk(c) {
-            Err(Control::Panic(e)) => assert!(
-                e.message.contains("out of bounds"),
-                "msg: {}",
-                e.message
-            ),
+            Err(Control::Panic(e)) => {
+                assert!(e.message.contains("out of bounds"), "msg: {}", e.message)
+            }
             other => panic!("expected Panic, got {other:?}"),
         }
     }
@@ -4414,7 +4405,11 @@ mod tests {
                         other => panic!("non-number in gather result: {other:?}"),
                     })
                     .collect();
-                assert_eq!(got, vec![11.0, 21.0], "gather preserves order over VM futures");
+                assert_eq!(
+                    got,
+                    vec![11.0, 21.0],
+                    "gather preserves order over VM futures"
+                );
             }
             other => panic!("gather should return an array, got {other:?}"),
         }
@@ -4449,11 +4444,7 @@ mod tests {
                 .expect_err("expected a panic")
         });
         match err {
-            Control::Panic(e) => assert!(
-                e.message.contains("out of bounds"),
-                "msg: {}",
-                e.message
-            ),
+            Control::Panic(e) => assert!(e.message.contains("out of bounds"), "msg: {}", e.message),
             other => panic!("expected Panic, got {other:?}"),
         }
     }
@@ -4484,7 +4475,11 @@ mod tests {
         // `Interp::call_value`, exactly like the `Op::Call` non-Closure arm.
         let out = with_vm(|vm| async move {
             let r = vm
-                .call_value(Value::Builtin(Rc::from("print")), vec![Value::Number(7.0)], s())
+                .call_value(
+                    Value::Builtin(Rc::from("print")),
+                    vec![Value::Number(7.0)],
+                    s(),
+                )
                 .await
                 .expect("call ok");
             // print returns nil and writes to the shared sink.
@@ -4734,8 +4729,14 @@ mod tests {
         // pins the default so a future refactor cannot silently flip the switch.
         let (vm, fiber) = adaptive_harness(Op::Add);
         for _ in 0..WARMUP_THRESHOLD {
-            vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Number(1.0))
-                .expect("ok");
+            vm.eval_binop_adaptive(
+                &fiber,
+                0,
+                BinOp::Add,
+                Value::Number(1.0),
+                Value::Number(1.0),
+            )
+            .expect("ok");
         }
         assert!(
             fiber
@@ -4757,16 +4758,33 @@ mod tests {
         // last one flips the side-map cache to Specialized(Number).
         for i in 0..WARMUP_THRESHOLD {
             let v = vm
-                .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(i as f64), Value::Number(1.0))
+                .eval_binop_adaptive(
+                    &fiber,
+                    0,
+                    BinOp::Add,
+                    Value::Number(i as f64),
+                    Value::Number(1.0),
+                )
                 .expect("ok");
             assert_eq!(v, Value::Number(i as f64 + 1.0));
         }
         let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
-        assert_eq!(cache, ArithCache::Specialized { kind: ArithKind::Number });
+        assert_eq!(
+            cache,
+            ArithCache::Specialized {
+                kind: ArithKind::Number
+            }
+        );
         // A subsequent number add still takes the (now specialized) fast path with
         // the byte-identical result.
         let v = vm
-            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(40.0), Value::Number(2.0))
+            .eval_binop_adaptive(
+                &fiber,
+                0,
+                BinOp::Add,
+                Value::Number(40.0),
+                Value::Number(2.0),
+            )
             .expect("ok");
         assert_eq!(v, Value::Number(42.0));
     }
@@ -4775,10 +4793,23 @@ mod tests {
     fn specialized_number_add_deopts_on_string_operand_and_stays_correct() {
         let (vm, fiber) = adaptive_harness(Op::Add);
         for _ in 0..WARMUP_THRESHOLD {
-            vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Number(1.0))
-                .expect("ok");
+            vm.eval_binop_adaptive(
+                &fiber,
+                0,
+                BinOp::Add,
+                Value::Number(1.0),
+                Value::Number(1.0),
+            )
+            .expect("ok");
         }
-        assert!(fiber.frame().closure.proto.chunk.arith_cache(0).specialized().is_some());
+        assert!(fiber
+            .frame()
+            .closure
+            .proto
+            .chunk
+            .arith_cache(0)
+            .specialized()
+            .is_some());
         // Now feed two strings: the Number guard misses → deopt → generic concat.
         let v = vm
             .eval_binop_adaptive(
@@ -4814,10 +4845,21 @@ mod tests {
             assert_eq!(v, Value::Str("xy".into()));
         }
         let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
-        assert_eq!(cache, ArithCache::Specialized { kind: ArithKind::ConcatStr });
+        assert_eq!(
+            cache,
+            ArithCache::Specialized {
+                kind: ArithKind::ConcatStr
+            }
+        );
         // Specialized concat still byte-identical (incl. a key containing braces).
         let v = vm
-            .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Str("1".into()), Value::Str("2".into()))
+            .eval_binop_adaptive(
+                &fiber,
+                0,
+                BinOp::Add,
+                Value::Str("1".into()),
+                Value::Str("2".into()),
+            )
             .expect("ok");
         assert_eq!(v, Value::Str("12".into()));
     }
@@ -4834,13 +4876,19 @@ mod tests {
             assert_eq!(v, Value::Decimal(a + b));
         }
         let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
-        assert_eq!(cache, ArithCache::Specialized { kind: ArithKind::Decimal });
+        assert_eq!(
+            cache,
+            ArithCache::Specialized {
+                kind: ArithKind::Decimal
+            }
+        );
         // Specialized decimal add equals the generic apply_binop result bit-exact.
         let v = vm
             .eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Decimal(a), Value::Decimal(b))
             .expect("ok");
-        let generic = crate::interp::apply_binop(BinOp::Add, Value::Decimal(a), Value::Decimal(b), s())
-            .expect("ok");
+        let generic =
+            crate::interp::apply_binop(BinOp::Add, Value::Decimal(a), Value::Decimal(b), s())
+                .expect("ok");
         assert_eq!(v, generic);
     }
 
@@ -4851,13 +4899,26 @@ mod tests {
             let (a, b, want) = if i % 2 == 0 {
                 (Value::Number(2.0), Value::Number(3.0), Value::Number(5.0))
             } else {
-                (Value::Str("a".into()), Value::Str("b".into()), Value::Str("ab".into()))
+                (
+                    Value::Str("a".into()),
+                    Value::Str("b".into()),
+                    Value::Str("ab".into()),
+                )
             };
-            let v = vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, a, b).expect("ok");
+            let v = vm
+                .eval_binop_adaptive(&fiber, 0, BinOp::Add, a, b)
+                .expect("ok");
             assert_eq!(v, want);
             // Alternating kinds reset the warmup, so the site never specializes.
             assert!(
-                fiber.frame().closure.proto.chunk.arith_cache(0).specialized().is_none(),
+                fiber
+                    .frame()
+                    .closure
+                    .proto
+                    .chunk
+                    .arith_cache(0)
+                    .specialized()
+                    .is_none(),
                 "polymorphic site stays generic at i={i}"
             );
         }
@@ -4869,13 +4930,20 @@ mod tests {
         // Tier-2 panic the generic apply_binop gives (it deopts, then runs generic).
         let (vm, fiber) = adaptive_harness(Op::Add);
         for _ in 0..WARMUP_THRESHOLD {
-            vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Number(1.0))
-                .expect("ok");
+            vm.eval_binop_adaptive(
+                &fiber,
+                0,
+                BinOp::Add,
+                Value::Number(1.0),
+                Value::Number(1.0),
+            )
+            .expect("ok");
         }
         let got = vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Nil);
-        let generic = crate::interp::apply_binop(BinOp::Add, Value::Number(1.0), Value::Nil, Span::new(0, 3));
+        let generic =
+            crate::interp::apply_binop(BinOp::Add, Value::Number(1.0), Value::Nil, Span::new(0, 3));
         match (got, generic) {
-            (Err(Control::Panic(a)), Err(Control::Panic(b)) ) => {
+            (Err(Control::Panic(a)), Err(Control::Panic(b))) => {
                 assert_eq!(a.message, b.message);
                 assert_eq!(a.span, b.span, "deopt path carries the op's span");
             }
@@ -4906,10 +4974,14 @@ mod tests {
         // End-to-end: a loop that references `print` many times prints each line —
         // the GET_GLOBAL_CACHED path must resolve the same builtin every iteration.
         let (out, _code) = {
-            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
             let local = LocalSet::new();
             local.block_on(&rt, async {
-                crate::vm_run_source("for (i in range(0, 5)) { print(i) }").await.unwrap()
+                crate::vm_run_source("for (i in range(0, 5)) { print(i) }")
+                    .await
+                    .unwrap()
             })
         };
         assert_eq!(out, "0\n1\n2\n3\n4\n");

@@ -83,7 +83,10 @@ impl std::fmt::Display for VerifyError {
                 write!(f, "invalid opcode byte {byte} at offset {offset}")
             }
             VerifyError::OperandTruncated { offset } => {
-                write!(f, "operand of opcode at offset {offset} runs past end of code")
+                write!(
+                    f,
+                    "operand of opcode at offset {offset} runs past end of code"
+                )
             }
             VerifyError::OperandOutOfRange {
                 offset,
@@ -122,7 +125,10 @@ impl std::fmt::Display for VerifyError {
                 "stack depth mismatch at join offset {offset}: {expected} vs {found}"
             ),
             VerifyError::FallsOffEnd { offset } => {
-                write!(f, "control flow falls off the end of code (last op at {offset})")
+                write!(
+                    f,
+                    "control flow falls off the end of code (last op at {offset})"
+                )
             }
         }
     }
@@ -195,8 +201,9 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
     use Op::*;
     match op {
         // ---- pushes 1, pops 0 ----
-        Const | Nil | True | False | GetLocal | GetLocalCell | GetUpvalue | GetGlobal
-        | Closure => Effect::new(0, 1),
+        Const | Nil | True | False | GetLocal | GetLocalCell | GetUpvalue | GetGlobal | Closure => {
+            Effect::new(0, 1)
+        }
 
         // GET_SUPER reads slot 0 (self) but does not POP it; pushes the bound method.
         GetSuper => Effect::new(0, 1),
@@ -212,9 +219,8 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Rot3 => Effect::new(3, 3),
 
         // ---- binary arithmetic / comparison / range ----
-        Add | Sub | Mul | Div | Mod | Pow | Lt | Le | Gt | Ge | Eq | Ne | Range | RangeInclusive => {
-            Effect::new(2, 1)
-        }
+        Add | Sub | Mul | Div | Mod | Pow | Lt | Le | Gt | Ge | Eq | Ne | Range
+        | RangeInclusive => Effect::new(2, 1),
         // ---- unary ----
         Neg | Not => Effect::new(1, 1),
 
@@ -389,7 +395,10 @@ fn check_operands(
     let check_name_const = |idx: usize| -> Result<(), VerifyError> {
         check_const(idx)?;
         if !matches!(chunk.consts[idx], crate::value::Value::Str(_)) {
-            return Err(VerifyError::NameConstNotString { offset: off, index: idx });
+            return Err(VerifyError::NameConstNotString {
+                offset: off,
+                index: idx,
+            });
         }
         Ok(())
     };
@@ -504,7 +513,10 @@ fn check_operands(
             }
             let t = target as usize;
             if !boundaries[t] {
-                return Err(VerifyError::JumpIntoInstruction { offset: off, target: t });
+                return Err(VerifyError::JumpIntoInstruction {
+                    offset: off,
+                    target: t,
+                });
             }
         }
 
@@ -567,9 +579,7 @@ fn verify_stack_balance(
             let cp_idx = chunk.read_u16(operand_at) as usize;
             // Pass 2 already range-checked the class-proto index.
             let cp = &chunk.class_protos[cp_idx];
-            let pops = cp.default_fields.len()
-                + cp.method_names.len()
-                + usize::from(cp.has_super);
+            let pops = cp.default_fields.len() + cp.method_names.len() + usize::from(cp.has_super);
             let after = depth_in - pops as isize;
             if after < 0 {
                 return Err(VerifyError::StackUnderflow { offset: off });
@@ -665,7 +675,10 @@ fn push_succ(
     off: usize,
 ) -> Result<(), VerifyError> {
     if target >= boundaries.len() || !boundaries[target] {
-        return Err(VerifyError::JumpIntoInstruction { offset: off, target });
+        return Err(VerifyError::JumpIntoInstruction {
+            offset: off,
+            target,
+        });
     }
     // One-past-the-end is a valid boundary but has no instruction; a jump there is
     // an implicit fall-off, rejected as out-of-bounds-into-nothing.
@@ -739,10 +752,10 @@ impl std::error::Error for FromBytesVerifiedError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::span::Span;
     use crate::value::Value;
     use crate::vm::chunk::Chunk;
     use crate::vm::opcode::Op;
-    use crate::span::Span;
 
     fn compile(src: &str) -> Chunk {
         crate::compile::compile_source(src)
@@ -786,8 +799,7 @@ mod tests {
     fn all_compiler_output_verifies_ok() {
         for &src in PROGRAMS {
             let chunk = compile(src);
-            verify(&chunk)
-                .unwrap_or_else(|e| panic!("verify failed for {src:?}: {e}"));
+            verify(&chunk).unwrap_or_else(|e| panic!("verify failed for {src:?}: {e}"));
         }
     }
 
@@ -841,7 +853,9 @@ mod tests {
         c.emit_u16(Op::Const, 5, s()); // index 5 is out of range
         c.emit(Op::Return, s());
         match verify(&c) {
-            Err(VerifyError::OperandOutOfRange { kind, index, len, .. }) => {
+            Err(VerifyError::OperandOutOfRange {
+                kind, index, len, ..
+            }) => {
                 assert_eq!((kind, index, len), ("const", 5, 1));
             }
             other => panic!("expected OperandOutOfRange, got {other:?}"),
@@ -968,8 +982,7 @@ mod tests {
         // Valid as-is.
         assert_eq!(verify(&chunk), Ok(()));
         // Reach into the first proto's chunk and inject a bad opcode.
-        let proto = std::rc::Rc::get_mut(&mut chunk.protos[0])
-            .expect("unique proto ref");
+        let proto = std::rc::Rc::get_mut(&mut chunk.protos[0]).expect("unique proto ref");
         proto.chunk.code[0] = 0xFD;
         assert!(matches!(verify(&chunk), Err(VerifyError::BadOpcode { .. })));
     }

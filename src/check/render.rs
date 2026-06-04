@@ -16,9 +16,7 @@ pub fn human(path: &str, src: &str, diags: &[AsDiagnostic]) -> String {
         let report = Report::build(kind, (path, d.range.start..d.range.end))
             .with_code(&d.code)
             .with_message(&d.message)
-            .with_label(
-                Label::new((path, d.range.start..d.range.end)).with_message(&d.message),
-            )
+            .with_label(Label::new((path, d.range.start..d.range.end)).with_message(&d.message))
             .finish();
         // Writing to an in-memory buffer cannot fail in practice.
         let _ = report.write((path, Source::from(src)), &mut out);

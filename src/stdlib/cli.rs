@@ -860,7 +860,6 @@ mod tests {
     use crate::value::Value;
     use indexmap::IndexMap;
     use std::cell::RefCell;
-    
 
     fn sp() -> Span {
         Span::new(0, 0)

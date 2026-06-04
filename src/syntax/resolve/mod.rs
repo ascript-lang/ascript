@@ -187,7 +187,13 @@ impl Resolver {
     /// every top-level define-site to `DEFINE_GLOBAL` regardless (it keys on
     /// `module_globals`, not this binding), so the second `DEFINE_GLOBAL` runtime-errors
     /// byte-identically.
-    fn declare_global(&mut self, name: &str, kind: BindingKind, decl_range: TextRange, mutable: bool) {
+    fn declare_global(
+        &mut self,
+        name: &str,
+        kind: BindingKind,
+        decl_range: TextRange,
+        mutable: bool,
+    ) {
         // Record EVERY top-level define-site (incl. a redeclaration) so the compiler
         // lowers each to `DEFINE_GLOBAL`; the second site runtime-errors.
         self.result.global_decl_ranges.insert(decl_range);
@@ -435,7 +441,9 @@ impl Resolver {
     /// wins for mutability (a redeclaration is a runtime error anyway), so this never
     /// downgrades an already-recorded global.
     fn register_global(&mut self, name: String, mutable: bool) {
-        self.module_global_mutable.entry(name.clone()).or_insert(mutable);
+        self.module_global_mutable
+            .entry(name.clone())
+            .or_insert(mutable);
         self.module_globals.insert(name);
     }
 
@@ -873,12 +881,7 @@ impl Resolver {
     }
 
     fn bump_use(&mut self, slot: u32) {
-        if let Some(b) = self
-            .frame()
-            .bindings
-            .iter_mut()
-            .find(|b| b.slot == slot)
-        {
+        if let Some(b) = self.frame().bindings.iter_mut().find(|b| b.slot == slot) {
             b.use_count += 1;
         }
     }
@@ -1133,7 +1136,11 @@ mod tests {
             .iter()
             .find(|b| b.name == "x")
             .expect("binding x exists");
-        assert!(x.use_count >= 1, "nested read should count, got {}", x.use_count);
+        assert!(
+            x.use_count >= 1,
+            "nested read should count, got {}",
+            x.use_count
+        );
     }
 
     #[test]
@@ -1151,7 +1158,10 @@ mod tests {
         let r = resolve(&tree);
         let mut locals = 0;
         let mut globals = 0;
-        for n in tree.descendants().filter(|n| n.kind() == SyntaxKind::NameRef) {
+        for n in tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::NameRef)
+        {
             match r.uses.get(&n.text_range()) {
                 Some(Resolution::Local(_)) => locals += 1,
                 Some(Resolution::Global(_)) => globals += 1,
@@ -1162,7 +1172,11 @@ mod tests {
         assert_eq!(globals, 2, "x and print are both Global");
         // The top-level `x` binding is recorded as a global for the checker, with a
         // use count of 1 (the `print(x)` read).
-        let x = r.bindings.iter().find(|b| b.name == "x").expect("x binding");
+        let x = r
+            .bindings
+            .iter()
+            .find(|b| b.name == "x")
+            .expect("x binding");
         assert!(x.is_global, "top-level let is a module global");
         assert_eq!(x.use_count, 1, "x is used once");
     }
@@ -1175,11 +1189,17 @@ mod tests {
         let r = resolve(&tree);
         let refs: Vec<_> = tree
             .descendants()
-            .filter(|n: &&ResolvedNode| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x"))
+            .filter(|n: &&ResolvedNode| {
+                n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x")
+            })
             .map(|n| r.uses.get(&n.text_range()).cloned())
             .collect();
         assert_eq!(refs[0], Some(Resolution::Local(0)), "inner x is Local");
-        assert_eq!(refs[1], Some(Resolution::Global("x".into())), "outer x is Global");
+        assert_eq!(
+            refs[1],
+            Some(Resolution::Global("x".into())),
+            "outer x is Global"
+        );
     }
 
     #[test]
@@ -1187,7 +1207,10 @@ mod tests {
         let tree = parse_to_tree("fn add(a, b) { return a + b }");
         let r = resolve(&tree);
         let mut local_uses = 0;
-        for n in tree.descendants().filter(|n| n.kind() == SyntaxKind::NameRef) {
+        for n in tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::NameRef)
+        {
             if matches!(r.uses.get(&n.text_range()), Some(Resolution::Local(_))) {
                 local_uses += 1;
             }
@@ -1203,12 +1226,13 @@ mod tests {
             .descendants()
             .find(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x"))
             .unwrap();
-        assert!(matches!(r.uses.get(&x_use.text_range()), Some(Resolution::Upvalue(0))));
+        assert!(matches!(
+            r.uses.get(&x_use.text_range()),
+            Some(Resolution::Upvalue(0))
+        ));
         let inner = tree
             .descendants()
-            .find(|n| {
-                n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("inner")
-            })
+            .find(|n| n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("inner"))
             .unwrap();
         // Hoisting pre-declares `inner` (slot 0), so `x` is slot 1 in `outer`;
         // the captured upvalue therefore points at ParentLocal(1).
@@ -1236,7 +1260,11 @@ mod tests {
             assert_eq!(b.use_count, 1, "{name} is read once");
         }
         // `b` is bound but unread; still a global binding with zero uses.
-        let b = r.bindings.iter().find(|b| b.name == "b").expect("b binding");
+        let b = r
+            .bindings
+            .iter()
+            .find(|b| b.name == "b")
+            .expect("b binding");
         assert!(b.is_global && b.use_count == 0);
     }
 
@@ -1275,7 +1303,10 @@ mod tests {
             .last()
             .unwrap();
         assert!(
-            matches!(r.uses.get(&body_use.text_range()), Some(Resolution::Local(_))),
+            matches!(
+                r.uses.get(&body_use.text_range()),
+                Some(Resolution::Local(_))
+            ),
             "bound pattern name is a Local in the arm body"
         );
     }
@@ -1286,9 +1317,7 @@ mod tests {
         let r = resolve(&tree);
         let outer_x = tree
             .descendants()
-            .filter(|n| {
-                n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x")
-            })
+            .filter(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x"))
             .last()
             .unwrap();
         assert_eq!(
@@ -1301,7 +1330,11 @@ mod tests {
     fn builtins_are_not_flagged_unresolved() {
         // print/len are builtins → Global, not diagnostics.
         let r = resolve(&parse_to_tree("print(len([1,2]))"));
-        assert!(r.diagnostics.is_empty(), "builtins must not be flagged: {:?}", r.diagnostics);
+        assert!(
+            r.diagnostics.is_empty(),
+            "builtins must not be flagged: {:?}",
+            r.diagnostics
+        );
     }
 
     #[test]
@@ -1311,9 +1344,7 @@ mod tests {
         let r = resolve(&tree);
         let body_x = tree
             .descendants()
-            .filter(|n| {
-                n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x")
-            })
+            .filter(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("x"))
             .last()
             .unwrap();
         assert!(
@@ -1336,9 +1367,7 @@ mod tests {
         let r1 = resolve(&immut);
         let oi = immut
             .descendants()
-            .find(|n| {
-                n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o")
-            })
+            .find(|n| n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o"))
             .unwrap();
         // Hoisting pre-declares `i` (slot 0), so `x` is slot 1.
         assert_eq!(
@@ -1355,9 +1384,7 @@ mod tests {
         let r2 = resolve(&mutated);
         let oi2 = mutated
             .descendants()
-            .find(|n| {
-                n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o")
-            })
+            .find(|n| n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o"))
             .unwrap();
         // Hoisting pre-declares `i` (slot 0), so `y` is slot 1.
         assert_eq!(
@@ -1441,9 +1468,7 @@ mod tests {
         for name in ["a", "b"] {
             let use_site = tree
                 .descendants()
-                .find(|n| {
-                    n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some(name)
-                })
+                .find(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some(name))
                 .unwrap();
             assert!(
                 matches!(

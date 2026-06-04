@@ -177,7 +177,11 @@ mod tests {
     #[test]
     fn flags_wrong_primitive_literal() {
         let src = "fn f(n: number) { return n }\nf(\"x\")\n";
-        assert!(has(src, "contract-mismatch"), "{:?}", analyze(src).diagnostics);
+        assert!(
+            has(src, "contract-mismatch"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
@@ -208,7 +212,11 @@ mod tests {
     fn any_and_unannotated_and_nonliteral_silent() {
         // `any` accepts; unannotated param: silent; non-literal arg: silent.
         let src = "fn a(x: any) { return x }\nfn b(y) { return y }\nlet v = 1\nfn c(n: number) { return n }\na(\"s\")\nb(\"s\")\nc(v)\n";
-        assert!(!has(src, "contract-mismatch"), "{:?}", analyze(src).diagnostics);
+        assert!(
+            !has(src, "contract-mismatch"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
@@ -217,19 +225,31 @@ mod tests {
         // the top-level `fn cb(n: number)`. `cb("hello")` must NOT be checked against
         // the top-level fn's contract. (BLOCKER false-positive regression.)
         let src = "fn cb(n: number) { return n }\nfn apply(cb) { return cb(\"hello\") }\nprint(apply((s) => s))\n";
-        assert!(!has(src, "contract-mismatch"), "{:?}", analyze(src).diagnostics);
+        assert!(
+            !has(src, "contract-mismatch"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn block_let_shadow_not_flagged() {
         let src = "fn h(n: number) { return n }\nfn run() {\n  let h = (s) => s\n  return h(\"x\")\n}\nprint(run())\n";
-        assert!(!has(src, "contract-mismatch"), "{:?}", analyze(src).diagnostics);
+        assert!(
+            !has(src, "contract-mismatch"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn genuine_mismatch_still_flagged() {
         let src = "fn f(n: number) { return n }\nf(\"x\")\n";
-        assert!(has(src, "contract-mismatch"), "{:?}", analyze(src).diagnostics);
+        assert!(
+            has(src, "contract-mismatch"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! VM-only runtime types that are *not* (yet) part of [`Value`].
 //!
-//! The bytecode VM needs a closure representation ([`Closure`]) and small
-//! status enums ([`RunOutcome`], [`FiberState`]) that the tree-walker never
-//! used. These live here for now; V4/V5 fold [`Closure`] into [`Value`] once
-//! CALL/RETURN and upvalue capture are wired.
+//! [`Closure`] is now a [`Value`] variant (`Value::Closure`, see `src/value.rs`)
+//! with CALL/RETURN and upvalue capture wired; this module holds its definition
+//! plus the VM-only run-loop status enums ([`RunOutcome`], [`FiberState`]) that
+//! the tree-walker never used.
 
 use crate::value::Value;
 use crate::vm::chunk::FnProto;
@@ -43,7 +43,8 @@ impl Closure {
 }
 
 /// The result of driving a fiber one step / to completion.
-// consumed by V1-T5/V4 (the run loop returns this; not yet driven this task).
+// The run loop (`Vm::run`) returns this; `Done`/`Yielded` are produced by
+// RETURN and YIELD respectively.
 #[allow(dead_code)]
 pub enum RunOutcome {
     Done(Value),

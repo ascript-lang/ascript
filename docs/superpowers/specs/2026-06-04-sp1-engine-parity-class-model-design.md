@@ -136,3 +136,11 @@ Add a differential test (`tests/vm_differential.rs`) that asserts the invariant 
 | Checker | `src/check/rules/*` (duplicate-member namespaces, super-misuse, `static fn from` reservation) |
 | Tests | `tests/vm_differential.rs`, `tests/aso.rs`, `tests/treesitter_conformance.rs`, examples |
 | Docs | `docs/content/*`, language spec class section |
+
+## Known/accepted after implementation (SP7 record)
+
+Recorded by SP7 (`docs/superpowers/specs/2026-06-04-sp7-docs-cleanup-design.md`) so these accepted trade-offs are not later mistaken for bugs:
+
+- **1-column caret-span offset (cosmetic, accepted).** Error diagnostics under the CST front-end can differ by one column in the caret position vs the legacy front-end. The error *message* is always correct; only the caret column can be off by one.
+- **Perf trade ~2.9x -> ~2.5x geomean (accepted).** Routing top-level vars through `GET_GLOBAL` for tree-walker-parity late-binding cost some geomean speedup; still >=2x (meets the perf gate). SP8 (performance) may recover it.
+- **`Op::InstanceOf` reserved for SP2.** The opcode is declared (`src/vm/opcode.rs:290`) but not yet emitted; SP2 reuses it for the `instanceof` operator. Do NOT remove it as dead code.

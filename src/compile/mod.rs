@@ -13,15 +13,13 @@ use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
     ClassDecl, ContinueStmt, EnumDecl, ExportStmt, Expr, FnDecl, ForStmt, IfStmt, ImportStmt,
-    IndexExpr,
-    LetStmt, Literal,
-    MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef, ObjectExpr, ObjectField, OptMemberExpr,
-    ParenExpr, RangeExpr, ReturnStmt, SourceFile, SpreadElem, Stmt, TemplateExpr, TernaryExpr,
-    TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
+    IndexExpr, LetStmt, Literal, MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef, ObjectExpr,
+    ObjectField, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, SpreadElem, Stmt,
+    TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
-use crate::syntax::resolve::types::{ResolveResult, Resolution};
+use crate::syntax::resolve::types::{Resolution, ResolveResult};
 use crate::syntax::{parse_to_tree, resolve::resolve};
 use crate::value::Value;
 use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc};
@@ -169,8 +167,7 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
             Some(acc)
         }
         K::TupleType => {
-            let parts: Vec<crate::ast::Type> =
-                node.children().filter_map(cst_type).collect();
+            let parts: Vec<crate::ast::Type> = node.children().filter_map(cst_type).collect();
             Some(Type::Tuple(parts))
         }
         _ => None,
@@ -240,9 +237,9 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             ExprKind::Ident(name)
         }
         Expr::ParenExpr(p) => {
-            let inner = p
-                .expr()
-                .ok_or_else(|| CompileError::new("parenthesized default has no inner expr", span))?;
+            let inner = p.expr().ok_or_else(|| {
+                CompileError::new("parenthesized default has no inner expr", span)
+            })?;
             ExprKind::Paren(Box::new(cst_default_expr(&inner)?))
         }
         Expr::UnaryExpr(un) => {
@@ -395,9 +392,9 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             }
         }
         Expr::OptMemberExpr(m) => {
-            let object = m
-                .expr()
-                .ok_or_else(|| CompileError::new("optional-member default missing receiver", span))?;
+            let object = m.expr().ok_or_else(|| {
+                CompileError::new("optional-member default missing receiver", span)
+            })?;
             let name = m
                 .ident_token()
                 .ok_or_else(|| {
@@ -482,7 +479,10 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                     }
                 } else if let Some(node) = child.as_node() {
                     let inner = Expr::cast((*node).clone()).ok_or_else(|| {
-                        CompileError::new("template-default interpolation is not an expression", span)
+                        CompileError::new(
+                            "template-default interpolation is not an expression",
+                            span,
+                        )
                     })?;
                     parts.push(crate::ast::TemplatePart::Expr(Box::new(cst_default_expr(
                         &inner,
@@ -676,8 +676,8 @@ fn short_circuit_op(op: SyntaxKind) -> Option<Op> {
 /// statements, compiling the trailing expression and emitting `RETURN`.
 pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     let root = parse_to_tree(src);
-    let file =
-        SourceFile::cast(root.clone()).ok_or_else(|| CompileError::new("expected a source file", Span::new(0, src.len())))?;
+    let file = SourceFile::cast(root.clone())
+        .ok_or_else(|| CompileError::new("expected a source file", Span::new(0, src.len())))?;
 
     // Run the resolver so the compiler can classify identifier uses (e.g. a bare
     // builtin callee in a `print(...)` call resolves to `Resolution::Global`).
@@ -747,8 +747,12 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     // the stack to return — push `Nil` and `RETURN` it so the run loop always
     // terminates with a `Done` value.
     if trailing_expr_node.is_none() {
-        compiler.chunk.emit(Op::Nil, Span::new(src.len(), src.len()));
-        compiler.chunk.emit(Op::Return, Span::new(src.len(), src.len()));
+        compiler
+            .chunk
+            .emit(Op::Nil, Span::new(src.len(), src.len()));
+        compiler
+            .chunk
+            .emit(Op::Return, Span::new(src.len(), src.len()));
     }
 
     Ok(compiler.chunk)
@@ -942,9 +946,8 @@ impl Compiler {
         let key = name_ref.syntax().text_range();
         match self.resolved.uses.get(&key) {
             Some(Resolution::Local(slot)) => {
-                let slot = u16::try_from(*slot).map_err(|_| {
-                    CompileError::new("local slot index exceeds 65535", span)
-                })?;
+                let slot = u16::try_from(*slot)
+                    .map_err(|_| CompileError::new("local slot index exceeds 65535", span))?;
                 self.emit_get_local(slot, span);
                 Ok(())
             }
@@ -970,10 +973,7 @@ impl Compiler {
                 self.chunk.emit_u16(Op::GetGlobal, idx, span);
                 Ok(())
             }
-            Some(Resolution::Unresolved) | None => Err(CompileError::new(
-                "undefined name",
-                span,
-            )),
+            Some(Resolution::Unresolved) | None => Err(CompileError::new("undefined name", span)),
         }
     }
 
@@ -1053,8 +1053,7 @@ impl Compiler {
         if let Some(binop) = compound {
             self.compile_target_read(&target)?;
             self.compile_expr(&value)?;
-            let binop_span =
-                Span::new(node_code_span(&target).start, node_code_span(&value).end);
+            let binop_span = Span::new(node_code_span(&target).start, node_code_span(&value).end);
             self.chunk.emit(binop, binop_span);
         } else {
             self.compile_expr(&value)?;
@@ -1081,8 +1080,10 @@ impl Compiler {
                 // — REPL line-to-line, a main module reassigning an import — that the
                 // compile-time check cannot see).
                 let target_range = name_ref.syntax().text_range();
-                let is_immutable_target =
-                    self.resolved.immutable_assign_targets.contains(&target_range);
+                let is_immutable_target = self
+                    .resolved
+                    .immutable_assign_targets
+                    .contains(&target_range);
                 match self.resolved.uses.get(&name_ref.syntax().text_range()) {
                     Some(Resolution::Local(slot)) if is_immutable_target => {
                         let _ = slot;
@@ -1115,7 +1116,7 @@ impl Compiler {
                     }
                     _ => {
                         return Err(CompileError::new(
-                            "assignment to a non-local target not yet supported (V4)",
+                            "internal: assignment target resolved to an unexpected binding (compiler invariant)",
                             node_span(&target),
                         ))
                     }
@@ -1130,9 +1131,12 @@ impl Compiler {
                 let object = m
                     .expr()
                     .ok_or_else(|| CompileError::new("member assignment missing object", span))?;
-                let field = m.ident_token().map(|t| t.text().to_string()).ok_or_else(|| {
-                    CompileError::new("member assignment missing field name", span)
-                })?;
+                let field = m
+                    .ident_token()
+                    .map(|t| t.text().to_string())
+                    .ok_or_else(|| {
+                        CompileError::new("member assignment missing field name", span)
+                    })?;
                 self.compile_expr(&object)?;
                 self.chunk.emit(Op::Swap, span);
                 let name_idx = self.chunk.add_const(Value::Str(field.into()));
@@ -1206,7 +1210,7 @@ impl Compiler {
             Stmt::ImportStmt(import_stmt) => self.compile_import(import_stmt),
             Stmt::ExportStmt(export_stmt) => self.compile_export(export_stmt),
             other => Err(CompileError::new(
-                "statement kind not yet supported in V2",
+                "internal: unexpected statement kind in compile_stmt (compiler invariant)",
                 stmt_span(other),
             )),
         }
@@ -1496,8 +1500,10 @@ impl Compiler {
     ///   SET_LOCAL <name slot>     ; bind the class to its name (like `fn name`)
     /// ```
     ///
-    /// Superclass (`extends`), `super`, and `instanceof` are V9-T2: a class with an
-    /// `extends` clause is deferred here with a clear error. Each method is compiled
+    /// Superclass (`extends`) and `super` are implemented (see the `extends`
+    /// handling below and `super.<name>` in `compile_expr`). The `instanceof`
+    /// operator remains reserved for SP2 (its `Op::InstanceOf` is declared but not
+    /// yet emitted) — see CLAUDE.md "Current deferrals". Each method is compiled
     /// with `self` already declared by the resolver as the method frame's slot 0
     /// (see `resolve_function`'s `MethodDecl` branch); the receiver is bound into
     /// slot 0 at the method CALL (`Vm::invoke_compiled_method`).
@@ -1607,9 +1613,8 @@ impl Compiler {
                     self.emit_get_local(slot, sup_span);
                 }
                 Some(Resolution::Upvalue(idx)) => {
-                    let idx = u16::try_from(*idx).map_err(|_| {
-                        CompileError::new("upvalue index exceeds 65535", sup_span)
-                    })?;
+                    let idx = u16::try_from(*idx)
+                        .map_err(|_| CompileError::new("upvalue index exceeds 65535", sup_span))?;
                     self.chunk.emit_u16(Op::GetUpvalue, idx, sup_span);
                 }
                 Some(Resolution::Global(gname)) => {
@@ -1693,7 +1698,10 @@ impl Compiler {
             .iter()
             .find(|b| b.decl_range == decl_range)
             .ok_or_else(|| {
-                CompileError::new("class declaration has no resolver binding (compiler bug)", span)
+                CompileError::new(
+                    "class declaration has no resolver binding (compiler bug)",
+                    span,
+                )
             })?;
         u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
@@ -1781,9 +1789,9 @@ impl Compiler {
                 self.const_eval_enum_backing(&inner)
             }
             Expr::UnaryExpr(un) if un.op() == Some(SyntaxKind::Minus) => {
-                let operand = un
-                    .expr()
-                    .ok_or_else(|| CompileError::new("unary minus has no operand", node_span(un)))?;
+                let operand = un.expr().ok_or_else(|| {
+                    CompileError::new("unary minus has no operand", node_span(un))
+                })?;
                 match self.const_eval_enum_backing(&operand)? {
                     Value::Number(n) => Ok(Value::Number(-n)),
                     _ => Err(CompileError::new(
@@ -1811,18 +1819,22 @@ impl Compiler {
             .iter()
             .find(|b| b.decl_range == decl_range)
             .ok_or_else(|| {
-                CompileError::new("enum declaration has no resolver binding (compiler bug)", span)
+                CompileError::new(
+                    "enum declaration has no resolver binding (compiler bug)",
+                    span,
+                )
             })?;
         u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
     }
 
-    /// Compile an `import` statement. V12-T1 handles **stdlib** imports only
-    /// (`source` starts with `"std/"`). Mirrors the tree-walker's `Stmt::Import`
-    /// arm (src/interp.rs): a named list binds each named export, a `* as alias`
-    /// binds the namespace Object; an unknown / feature-disabled module errors at
-    /// run time identically (via the shared `load_std_module`). A non-`std/` (file
-    /// module) source is a documented deferral to V12-T4 — a `CompileError` here.
+    /// Compile an `import` statement — both **stdlib** imports (`source` starts
+    /// with `"std/"`) and file/relative (`./…`) module imports compile (the
+    /// V12-T1 stdlib-only deferral was lifted in V12-T4; see `:5223`). Mirrors the
+    /// tree-walker's `Stmt::Import` arm (src/interp.rs): a named list binds each
+    /// named export, a `* as alias` binds the namespace Object; an unknown /
+    /// feature-disabled module errors at run time identically (via the shared
+    /// `load_std_module`). File-module sources resolve to `.aso`/`.as` at run time.
     ///
     /// Lowering: a single `IMPORT(u16)` whose operand indexes the chunk's `imports`
     /// side table to an [`ImportDesc`] (source + named-vs-namespace + the resolver-
@@ -2012,9 +2024,7 @@ impl Compiler {
             .bindings
             .iter()
             .find(|b| {
-                b.decl_range == import_range
-                    && b.kind == BindingKind::Import
-                    && b.name == name
+                b.decl_range == import_range && b.kind == BindingKind::Import && b.name == name
             })
             .ok_or_else(|| {
                 CompileError::new(
@@ -2039,10 +2049,7 @@ impl Compiler {
     /// declared params occupy slots `1..n+1`. `compile_fn_proto` already builds the
     /// `params`/`ret`/`arity` from the param nodes (which EXCLUDE `self`), so the
     /// proto's `arity` is the user-visible arg count.
-    fn compile_method_proto(
-        &mut self,
-        method: &MethodDecl,
-    ) -> Result<Rc<FnProto>, CompileError> {
+    fn compile_method_proto(&mut self, method: &MethodDecl) -> Result<Rc<FnProto>, CompileError> {
         // A generator method (`fn*`) is out of scope for V9-T1.
         if method
             .syntax()
@@ -2283,7 +2290,10 @@ impl Compiler {
         // `async fn` / `fn*` / `async fn*` flags, read from the fn's own tokens.
         let mut is_async = false;
         let mut is_generator = false;
-        for tok in fn_node.children_with_tokens().filter_map(|el| el.into_token()) {
+        for tok in fn_node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+        {
             match tok.kind() {
                 SyntaxKind::AsyncKw => is_async = true,
                 SyntaxKind::Star => is_generator = true,
@@ -2338,11 +2348,7 @@ impl Compiler {
     /// `self.chunk`. A `Block` body is its statements followed by a fall-off-end
     /// `NIL; RETURN`; an arrow EXPRESSION body is the expression followed by
     /// `RETURN`.
-    fn compile_fn_body(
-        &mut self,
-        fn_node: &ResolvedNode,
-        span: Span,
-    ) -> Result<(), CompileError> {
+    fn compile_fn_body(&mut self, fn_node: &ResolvedNode, span: Span) -> Result<(), CompileError> {
         if let Some(block_node) = fn_node.children().find(|c| c.kind() == SyntaxKind::Block) {
             let block = Block::cast(block_node.clone())
                 .ok_or_else(|| CompileError::new("function body is not a block", span))?;
@@ -2359,9 +2365,7 @@ impl Compiler {
             let expr = fn_node
                 .children()
                 .find_map(|c| Expr::cast(c.clone()))
-                .ok_or_else(|| {
-                    CompileError::new("arrow function has no body expression", span)
-                })?;
+                .ok_or_else(|| CompileError::new("arrow function has no body expression", span))?;
             self.compile_expr(&expr)?;
             self.chunk.emit(Op::Return, span);
             Ok(())
@@ -2433,9 +2437,9 @@ impl Compiler {
         // it is NEVER a range loop (the `await` token is the discriminator, exactly
         // like the tree-walker's `Stmt::ForOf { for_await: true }`).
         if for_stmt.await_token().is_some() {
-            let iter = for_stmt.iter().ok_or_else(|| {
-                CompileError::new("for await statement missing iterable", span)
-            })?;
+            let iter = for_stmt
+                .iter()
+                .ok_or_else(|| CompileError::new("for await statement missing iterable", span))?;
             return self.compile_for_await(for_stmt, &iter, &body);
         }
 
@@ -2860,11 +2864,12 @@ impl Compiler {
 
         // A destructuring binder has an ArrayBindPat/ObjectBindPat child instead
         // of a plain ident token.
-        if let Some(pat) = let_stmt
-            .syntax()
-            .children()
-            .find(|c| matches!(c.kind(), SyntaxKind::ArrayBindPat | SyntaxKind::ObjectBindPat))
-        {
+        if let Some(pat) = let_stmt.syntax().children().find(|c| {
+            matches!(
+                c.kind(),
+                SyntaxKind::ArrayBindPat | SyntaxKind::ObjectBindPat
+            )
+        }) {
             return self.compile_let_destructure(let_stmt, pat);
         }
 
@@ -2952,7 +2957,10 @@ impl Compiler {
             .iter()
             .find(|b| b.decl_range == decl_range)
             .ok_or_else(|| {
-                CompileError::new("let declaration has no resolver binding (compiler bug)", span)
+                CompileError::new(
+                    "let declaration has no resolver binding (compiler bug)",
+                    span,
+                )
             })?;
         u16::try_from(binding.slot)
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
@@ -2984,11 +2992,7 @@ impl Compiler {
     /// destructuring binding) lowers to `DEFINE_GLOBAL name`; otherwise to a
     /// frame-slot store (`SET_LOCAL[_CELL]`). The `slot` is the resolver's slot for
     /// the non-global case (ignored for a global).
-    fn emit_pattern_store(
-        &mut self,
-        entry: &ResolvedNode,
-        span: Span,
-    ) -> Result<(), CompileError> {
+    fn emit_pattern_store(&mut self, entry: &ResolvedNode, span: Span) -> Result<(), CompileError> {
         // A top-level destructuring pattern bind is a module global (its decl_range is
         // the ENTRY node, matching the resolver's `declare_pattern_names`). The bound
         // LOCAL name is the entry's LAST Ident token (`key as local` → `local`; plain
@@ -3085,8 +3089,9 @@ impl Compiler {
                 BindEntry => {
                     // Object entry: key by the FIRST significant token (Ident or
                     // Str); the local name is the resolver binding's slot/global.
-                    let key = bind_entry_key(entry)
-                        .ok_or_else(|| CompileError::new("destructuring entry has no key", espan))?;
+                    let key = bind_entry_key(entry).ok_or_else(|| {
+                        CompileError::new("destructuring entry has no key", espan)
+                    })?;
                     let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
                     bound_keys.push(Value::Str(Rc::from(key.as_str())));
                     self.chunk.emit_u16(Op::GetLocal, temp, span);
@@ -3101,8 +3106,9 @@ impl Compiler {
                     } else {
                         // Leftover keys — those not in `bound_keys`. The bound-key
                         // set is stored as a single Array const referenced by index.
-                        let keys =
-                            Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(bound_keys.clone())));
+                        let keys = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+                            bound_keys.clone(),
+                        )));
                         let keys_idx = self.chunk.add_const(keys);
                         self.chunk.emit_u16(Op::ObjectRest, keys_idx, span);
                     }
@@ -3207,10 +3213,7 @@ impl Compiler {
     /// alternatives are that `OrPat`'s pattern children; a single-pattern arm has
     /// the pattern as a direct child. Returns the raw `ResolvedNode`s (we resolve
     /// binds/compares per node via the resolver, keyed by `text_range`).
-    fn arm_alternatives(
-        &self,
-        arm: &MatchArm,
-    ) -> Result<Vec<ResolvedNode>, CompileError> {
+    fn arm_alternatives(&self, arm: &MatchArm) -> Result<Vec<ResolvedNode>, CompileError> {
         use SyntaxKind::*;
         let mut out: Vec<ResolvedNode> = Vec::new();
         for child in arm.syntax().children() {
@@ -3256,7 +3259,7 @@ impl Compiler {
             ArrayPat => self.compile_array_pattern(pat, subj_temp, span, fail_sites),
             ObjectPat => self.compile_object_pattern(pat, subj_temp, span, fail_sites),
             other => Err(CompileError::new(
-                format!("unsupported match pattern kind {other:?}"),
+                format!("internal: unexpected match pattern kind {other:?} (compiler invariant)"),
                 range_span(pat),
             )),
         }
@@ -3296,11 +3299,17 @@ impl Compiler {
         }
         // A value expression (literal / member like `Shape.Circle` / etc.): eval and
         // compare for equality, exactly like the tree-walker's `Pattern::Value`.
-        let inner = pat.children().find(|c| is_expr_kind(c.kind())).ok_or_else(|| {
-            CompileError::new("literal pattern has no value expression", range_span(pat))
-        })?;
+        let inner = pat
+            .children()
+            .find(|c| is_expr_kind(c.kind()))
+            .ok_or_else(|| {
+                CompileError::new("literal pattern has no value expression", range_span(pat))
+            })?;
         let inner_expr = Expr::cast(inner.clone()).ok_or_else(|| {
-            CompileError::new("literal pattern value is not an expression", range_span(pat))
+            CompileError::new(
+                "literal pattern value is not an expression",
+                range_span(pat),
+            )
         })?;
         self.emit_get_local_temp(subj_temp, span);
         self.compile_expr(&inner_expr)?;
@@ -3342,8 +3351,9 @@ impl Compiler {
             .children_with_tokens()
             .filter_map(|el| el.into_token())
             .any(|t| t.kind() == SyntaxKind::DotDotEq);
-        let lo = Expr::cast(exprs[0].clone())
-            .ok_or_else(|| CompileError::new("range start is not an expression", range_span(pat)))?;
+        let lo = Expr::cast(exprs[0].clone()).ok_or_else(|| {
+            CompileError::new("range start is not an expression", range_span(pat))
+        })?;
         let hi = Expr::cast(exprs[1].clone())
             .ok_or_else(|| CompileError::new("range end is not an expression", range_span(pat)))?;
         let step = match exprs.get(2) {
@@ -3390,20 +3400,15 @@ impl Compiler {
             .filter(|c| is_pattern_kind(c.kind()))
             .cloned()
             .collect();
-        let rest: Option<ResolvedNode> =
-            pat.children().find(|c| c.kind() == PatRest).cloned();
+        let rest: Option<ResolvedNode> = pat.children().find(|c| c.kind() == PatRest).cloned();
         let fixed_len = u16::try_from(fixed.len()).map_err(|_| {
             CompileError::new("array pattern has too many elements", range_span(pat))
         })?;
 
         // Length/type test: `MATCH_ARRAY fixed_len, exact?` → bool.
         self.emit_get_local_temp(subj_temp, span);
-        self.chunk.emit_u16_u8(
-            Op::MatchArray,
-            fixed_len,
-            u8::from(rest.is_none()),
-            span,
-        );
+        self.chunk
+            .emit_u16_u8(Op::MatchArray, fixed_len, u8::from(rest.is_none()), span);
         fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
 
         // Each fixed position: extract `subject[i]` into a fresh temp, recurse.
@@ -3421,9 +3426,10 @@ impl Compiler {
         // `...rest`: bind the tail (`subject[fixed_len..]`) into the rest slot. A
         // bare `...` (no name) is a discard — collect nothing.
         if let Some(rest) = rest {
-            if rest.children_with_tokens().any(|el| {
-                el.as_token().map(|t| t.kind() == Ident).unwrap_or(false)
-            }) {
+            if rest
+                .children_with_tokens()
+                .any(|el| el.as_token().map(|t| t.kind() == Ident).unwrap_or(false))
+            {
                 let slot = self.pattern_bind_slot(&rest, range_span(&rest))?;
                 self.emit_get_local_temp(subj_temp, span);
                 self.chunk.emit_u16(Op::ArrayRest, fixed_len, span);
@@ -3484,9 +3490,10 @@ impl Compiler {
         // `...rest`: bind leftover (unbound) keys into the rest slot. A bare `...`
         // (no name) is a discard.
         if let Some(rest) = pat.children().find(|c| c.kind() == PatRest) {
-            if rest.children_with_tokens().any(|el| {
-                el.as_token().map(|t| t.kind() == Ident).unwrap_or(false)
-            }) {
+            if rest
+                .children_with_tokens()
+                .any(|el| el.as_token().map(|t| t.kind() == Ident).unwrap_or(false))
+            {
                 let slot = self.pattern_bind_slot(rest, range_span(rest))?;
                 let keys = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(bound_keys)));
                 let keys_idx = self.chunk.add_const(keys);
@@ -3508,16 +3515,11 @@ impl Compiler {
     /// dispatch as `compile_name_ref`'s `uses` arm (local / upvalue / bare builtin
     /// global). A compare ident only ever resolves to one of those (the resolver
     /// only records a `use` here when the name was already in scope).
-    fn emit_resolution_read(
-        &mut self,
-        res: &Resolution,
-        span: Span,
-    ) -> Result<(), CompileError> {
+    fn emit_resolution_read(&mut self, res: &Resolution, span: Span) -> Result<(), CompileError> {
         match res {
             Resolution::Local(slot) => {
-                let slot = u16::try_from(*slot).map_err(|_| {
-                    CompileError::new("local slot index exceeds 65535", span)
-                })?;
+                let slot = u16::try_from(*slot)
+                    .map_err(|_| CompileError::new("local slot index exceeds 65535", span))?;
                 self.emit_get_local(slot, span);
                 Ok(())
             }
@@ -3627,9 +3629,9 @@ impl Compiler {
         if let Some(arg_list) = call.arg_list() {
             for arg in arg_list.exprs() {
                 self.compile_expr(&arg)?;
-                argc = argc.checked_add(1).ok_or_else(|| {
-                    CompileError::new("too many call arguments (max 255)", span)
-                })?;
+                argc = argc
+                    .checked_add(1)
+                    .ok_or_else(|| CompileError::new("too many call arguments (max 255)", span))?;
             }
         }
 
@@ -3665,7 +3667,10 @@ impl Compiler {
         for child in arg_list.syntax().children() {
             if let Some(spread) = SpreadElem::cast(child.clone()) {
                 let operand = spread.expr().ok_or_else(|| {
-                    CompileError::new("call argument spread (...) missing operand", node_span(&spread))
+                    CompileError::new(
+                        "call argument spread (...) missing operand",
+                        node_span(&spread),
+                    )
                 })?;
                 let op_span = node_code_span(&operand);
                 self.compile_expr(&operand)?;
@@ -3754,9 +3759,9 @@ impl Compiler {
         if let Some(arg_list) = call.arg_list() {
             for arg in arg_list.exprs() {
                 self.compile_expr(&arg)?;
-                argc = argc.checked_add(1).ok_or_else(|| {
-                    CompileError::new("too many call arguments (max 255)", span)
-                })?;
+                argc = argc
+                    .checked_add(1)
+                    .ok_or_else(|| CompileError::new("too many call arguments (max 255)", span))?;
             }
         }
         let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
@@ -3835,7 +3840,7 @@ impl Compiler {
             // never reach this non-short-circuit dispatch).
             other => {
                 return Err(CompileError::new(
-                    format!("binary operator {other:?} not yet supported in V2"),
+                    format!("internal: unexpected binary operator {other:?} (compiler invariant)"),
                     span,
                 ))
             }
@@ -3919,9 +3924,9 @@ impl Compiler {
             let mut n: u16 = 0;
             for elem in arr.exprs() {
                 self.compile_expr(&elem)?;
-                n = n
-                    .checked_add(1)
-                    .ok_or_else(|| CompileError::new("array literal has too many elements", span))?;
+                n = n.checked_add(1).ok_or_else(|| {
+                    CompileError::new("array literal has too many elements", span)
+                })?;
             }
             self.chunk.emit_u16(Op::NewArray, n, span);
             return Ok(());
@@ -3990,9 +3995,9 @@ impl Compiler {
                 let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
                 self.chunk.emit_u16(Op::Const, key_idx, fspan);
                 self.compile_expr(&value)?;
-                n = n.checked_add(1).ok_or_else(|| {
-                    CompileError::new("object literal has too many fields", span)
-                })?;
+                n = n
+                    .checked_add(1)
+                    .ok_or_else(|| CompileError::new("object literal has too many fields", span))?;
             }
             self.chunk.emit_u16(Op::NewObject, n, span);
             return Ok(());
@@ -4081,9 +4086,9 @@ impl Compiler {
     /// carries the receiver's span, like `GET_PROP`.
     fn compile_opt_member(&mut self, m: &OptMemberExpr) -> Result<(), CompileError> {
         let span = node_span(m);
-        let object = m
-            .expr()
-            .ok_or_else(|| CompileError::new("optional-member expression missing receiver", span))?;
+        let object = m.expr().ok_or_else(|| {
+            CompileError::new("optional-member expression missing receiver", span)
+        })?;
         let name = m
             .ident_token()
             .ok_or_else(|| {
@@ -4121,7 +4126,7 @@ impl Compiler {
             SyntaxKind::Bang => Op::Not,
             other => {
                 return Err(CompileError::new(
-                    format!("unary operator {other:?} not yet supported in V1"),
+                    format!("internal: unexpected unary operator {other:?} (compiler invariant)"),
                     span,
                 ))
             }
@@ -4131,9 +4136,9 @@ impl Compiler {
     }
 
     fn compile_paren(&mut self, paren: &ParenExpr) -> Result<(), CompileError> {
-        let inner = paren.expr().ok_or_else(|| {
-            CompileError::new("empty parenthesized expression", node_span(paren))
-        })?;
+        let inner = paren
+            .expr()
+            .ok_or_else(|| CompileError::new("empty parenthesized expression", node_span(paren)))?;
         // Parens affect only grouping; no opcode is emitted.
         self.compile_expr(&inner)
     }
@@ -4298,7 +4303,10 @@ fn object_field_key(field: &crate::syntax::ast::ObjectField) -> Option<String> {
 /// are `LiteralPat`); `OrPat` is handled by the caller, not as a leaf pattern.
 fn is_pattern_kind(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
-    matches!(kind, WildcardPat | LiteralPat | RangePat | ArrayPat | ObjectPat)
+    matches!(
+        kind,
+        WildcardPat | LiteralPat | RangePat | ArrayPat | ObjectPat
+    )
 }
 
 /// Whether a `SyntaxKind` is an expression node kind. Mirrors the resolver's
@@ -4393,7 +4401,7 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
         SyntaxKind::NilKw => Value::Nil,
         other => {
             return Err(CompileError::new(
-                format!("literal token {other:?} not yet supported in V1"),
+                format!("internal: unexpected literal token {other:?} (compiler invariant)"),
                 span,
             ))
         }
@@ -4425,7 +4433,10 @@ fn literal_token_text(lit: &Literal) -> Option<String> {
 /// Mirrors the lossless slicing the CST lexer's `scan_template_chunk` produces.
 fn strip_template_delims(s: &str) -> &str {
     // Leading delimiter is a single byte: `` ` `` or `}`.
-    let after_open = s.strip_prefix('`').or_else(|| s.strip_prefix('}')).unwrap_or(s);
+    let after_open = s
+        .strip_prefix('`')
+        .or_else(|| s.strip_prefix('}'))
+        .unwrap_or(s);
     // Trailing delimiter is either `${` (interpolation continues) or `` ` ``.
     if let Some(inner) = after_open.strip_suffix("${") {
         inner
@@ -4460,10 +4471,26 @@ mod tests {
         let chunk = compile_source("1 + 2").expect("compiles");
         let text = disasm(&chunk);
         let lines: Vec<&str> = text.lines().collect();
-        assert!(lines.iter().any(|l| l.contains("CONST") && l.ends_with("; 1")), "missing CONST 1 in:\n{text}");
-        assert!(lines.iter().any(|l| l.contains("CONST") && l.ends_with("; 2")), "missing CONST 2 in:\n{text}");
-        assert!(lines.iter().any(|l| l.contains("ADD")), "missing ADD in:\n{text}");
-        assert!(lines.iter().any(|l| l.contains("RETURN")), "missing RETURN in:\n{text}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("CONST") && l.ends_with("; 1")),
+            "missing CONST 1 in:\n{text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("CONST") && l.ends_with("; 2")),
+            "missing CONST 2 in:\n{text}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("ADD")),
+            "missing ADD in:\n{text}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("RETURN")),
+            "missing RETURN in:\n{text}"
+        );
     }
 
     #[test]
@@ -4502,7 +4529,10 @@ mod tests {
         ] {
             let chunk = compile_source(src).expect("compiles");
             let text = disasm(&chunk);
-            assert!(text.contains(mnemonic), "missing {mnemonic} for `{src}` in:\n{text}");
+            assert!(
+                text.contains(mnemonic),
+                "missing {mnemonic} for `{src}` in:\n{text}"
+            );
         }
     }
 
@@ -4593,7 +4623,10 @@ mod tests {
     fn compiles_string_literal() {
         let chunk = compile_source("\"hi\"").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("; \"hi\""), "missing string const in:\n{text}");
+        assert!(
+            text.contains("; \"hi\""),
+            "missing string const in:\n{text}"
+        );
     }
 
     async fn eval_number(src: &str) -> f64 {
@@ -4649,7 +4682,10 @@ mod tests {
     #[test]
     fn compiler_strips_template_delims_then_unescapes() {
         // Full template `` `...` ``.
-        assert_eq!(unescape_template_body(strip_template_delims("`plain`")), "plain");
+        assert_eq!(
+            unescape_template_body(strip_template_delims("`plain`")),
+            "plain"
+        );
         // Start chunk `` `a${ ``.
         assert_eq!(unescape_template_body(strip_template_delims("`a${")), "a");
         // Middle chunk `}b${`.
@@ -4660,8 +4696,14 @@ mod tests {
         assert_eq!(unescape_template_body(strip_template_delims("`${")), "");
         assert_eq!(unescape_template_body(strip_template_delims("}${")), "");
         // Template escapes survive the strip+unescape: \` -> ` and \$ -> $.
-        assert_eq!(unescape_template_body(strip_template_delims("`a\\`b`")), "a`b");
-        assert_eq!(unescape_template_body(strip_template_delims("`a\\$b`")), "a$b");
+        assert_eq!(
+            unescape_template_body(strip_template_delims("`a\\`b`")),
+            "a`b"
+        );
+        assert_eq!(
+            unescape_template_body(strip_template_delims("`a\\$b`")),
+            "a$b"
+        );
     }
 
     #[test]
@@ -4699,8 +4741,14 @@ mod tests {
         // lowers to DEFINE_GLOBAL and its use to GET_GLOBAL (NOT a frame slot).
         let chunk = compile_source("let x = 1\nx").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("DEFINE_GLOBAL"), "missing DEFINE_GLOBAL in:\n{text}");
-        assert!(text.contains("GET_GLOBAL"), "missing GET_GLOBAL in:\n{text}");
+        assert!(
+            text.contains("DEFINE_GLOBAL"),
+            "missing DEFINE_GLOBAL in:\n{text}"
+        );
+        assert!(
+            text.contains("GET_GLOBAL"),
+            "missing GET_GLOBAL in:\n{text}"
+        );
     }
 
     #[test]
@@ -4719,7 +4767,10 @@ mod tests {
         // leaves the value on the stack — an assignment is an expression).
         let chunk = compile_source("let x = 1\nx = 2").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("SET_GLOBAL"), "missing SET_GLOBAL in:\n{text}");
+        assert!(
+            text.contains("SET_GLOBAL"),
+            "missing SET_GLOBAL in:\n{text}"
+        );
     }
 
     #[test]
@@ -4737,15 +4788,22 @@ mod tests {
         // The outer `x` is a module global; the inner block `x` is a frame slot-local.
         // The inner block-local still gets a frame slot (slot_count ≥ 1), and the
         // outer global is read via GET_GLOBAL.
-        let chunk = compile_source("let x = 1\n{ let x = 2\n print(x) }\nprint(x)").expect("compiles");
+        let chunk =
+            compile_source("let x = 1\n{ let x = 2\n print(x) }\nprint(x)").expect("compiles");
         assert!(
             chunk.slot_count >= 1,
             "inner block-local should allocate a slot, got {}",
             chunk.slot_count
         );
         let text = disasm(&chunk);
-        assert!(text.contains("DEFINE_GLOBAL"), "outer x is a module global:\n{text}");
-        assert!(text.contains("SET_LOCAL"), "inner block x is a slot-local:\n{text}");
+        assert!(
+            text.contains("DEFINE_GLOBAL"),
+            "outer x is a module global:\n{text}"
+        );
+        assert!(
+            text.contains("SET_LOCAL"),
+            "inner block x is a slot-local:\n{text}"
+        );
     }
 
     #[test]
@@ -4758,28 +4816,43 @@ mod tests {
             text.contains("CHECK_ARRAY_DESTRUCTURE"),
             "expected RHS type check, got:\n{text}"
         );
-        assert!(text.contains("ARRAY_ELEM"), "expected ARRAY_ELEM, got:\n{text}");
-        assert!(text.contains("SET_LOCAL"), "expected SET_LOCAL store, got:\n{text}");
+        assert!(
+            text.contains("ARRAY_ELEM"),
+            "expected ARRAY_ELEM, got:\n{text}"
+        );
+        assert!(
+            text.contains("SET_LOCAL"),
+            "expected SET_LOCAL store, got:\n{text}"
+        );
     }
 
     #[test]
     fn array_rest_lowers_to_array_rest_op() {
-        let chunk =
-            compile_source("let [a, ...rest] = [1, 2, 3]\nprint(rest)").expect("compiles");
+        let chunk = compile_source("let [a, ...rest] = [1, 2, 3]\nprint(rest)").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("ARRAY_REST"), "expected ARRAY_REST, got:\n{text}");
+        assert!(
+            text.contains("ARRAY_REST"),
+            "expected ARRAY_REST, got:\n{text}"
+        );
     }
 
     #[test]
     fn object_destructure_lowers_to_check_objectkey_and_objectrest() {
-        let chunk = compile_source("let {a, ...rest} = {a: 1, b: 2}\nprint(rest)").expect("compiles");
+        let chunk =
+            compile_source("let {a, ...rest} = {a: 1, b: 2}\nprint(rest)").expect("compiles");
         let text = disasm(&chunk);
         assert!(
             text.contains("CHECK_OBJECT_DESTRUCTURE"),
             "expected RHS type check, got:\n{text}"
         );
-        assert!(text.contains("OBJECT_KEY"), "expected OBJECT_KEY, got:\n{text}");
-        assert!(text.contains("OBJECT_REST"), "expected OBJECT_REST, got:\n{text}");
+        assert!(
+            text.contains("OBJECT_KEY"),
+            "expected OBJECT_KEY, got:\n{text}"
+        );
+        assert!(
+            text.contains("OBJECT_REST"),
+            "expected OBJECT_REST, got:\n{text}"
+        );
     }
 
     #[test]
@@ -4796,8 +4869,10 @@ mod tests {
         );
         // At top level the same `+=` reads+writes the module global.
         let g = disasm(&compile_source("let x = 1\nx += 2\nx").expect("compiles"));
-        assert!(g.contains("ADD") && g.contains("GET_GLOBAL") && g.contains("SET_GLOBAL"),
-            "top-level compound assign uses globals:\n{g}");
+        assert!(
+            g.contains("ADD") && g.contains("GET_GLOBAL") && g.contains("SET_GLOBAL"),
+            "top-level compound assign uses globals:\n{g}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4838,7 +4913,10 @@ mod tests {
         // an unambiguous expression position (an initializer here).
         let chunk = compile_source("let o = {a: 1, b: 2}\no").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("NEW_OBJECT"), "missing NEW_OBJECT in:\n{text}");
+        assert!(
+            text.contains("NEW_OBJECT"),
+            "missing NEW_OBJECT in:\n{text}"
+        );
     }
 
     #[test]
@@ -4852,15 +4930,20 @@ mod tests {
     fn member_read_emits_get_prop() {
         let chunk = compile_source("let o = {a: 1}\no.a").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("GET_PROP") && !text.contains("GET_PROP_OPT"),
-            "missing GET_PROP in:\n{text}");
+        assert!(
+            text.contains("GET_PROP") && !text.contains("GET_PROP_OPT"),
+            "missing GET_PROP in:\n{text}"
+        );
     }
 
     #[test]
     fn opt_member_read_emits_get_prop_opt() {
         let chunk = compile_source("let o = {a: 1}\no?.a").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("GET_PROP_OPT"), "missing GET_PROP_OPT in:\n{text}");
+        assert!(
+            text.contains("GET_PROP_OPT"),
+            "missing GET_PROP_OPT in:\n{text}"
+        );
     }
 
     #[test]
@@ -4869,7 +4952,10 @@ mod tests {
         // `APPEND_ARRAY`/`SPREAD` builder (V10-T2).
         let chunk = compile_source("let a = [1]\nlet b = [0, ...a]\nb").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("APPEND_ARRAY"), "expected APPEND_ARRAY in:\n{text}");
+        assert!(
+            text.contains("APPEND_ARRAY"),
+            "expected APPEND_ARRAY in:\n{text}"
+        );
         assert!(
             text.contains("SPREAD") && !text.contains("SPREAD_OBJECT"),
             "expected SPREAD (array) in:\n{text}"
@@ -4883,7 +4969,10 @@ mod tests {
         let chunk = compile_source("let b = [1, 2, 3]\nb").expect("compiles");
         let text = disasm(&chunk);
         assert!(text.contains("NEW_ARRAY"), "expected NEW_ARRAY in:\n{text}");
-        assert!(!text.contains("APPEND_ARRAY"), "unexpected APPEND_ARRAY in:\n{text}");
+        assert!(
+            !text.contains("APPEND_ARRAY"),
+            "unexpected APPEND_ARRAY in:\n{text}"
+        );
         assert!(!text.contains("SPREAD"), "unexpected SPREAD in:\n{text}");
     }
 
@@ -4893,19 +4982,30 @@ mod tests {
         // `APPEND_OBJECT`/`SPREAD_OBJECT` builder (V10-T2).
         let chunk = compile_source("let o = {a: 1}\nlet p = {...o, b: 2}\np").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("SPREAD_OBJECT"), "expected SPREAD_OBJECT in:\n{text}");
-        assert!(text.contains("APPEND_OBJECT"), "expected APPEND_OBJECT in:\n{text}");
+        assert!(
+            text.contains("SPREAD_OBJECT"),
+            "expected SPREAD_OBJECT in:\n{text}"
+        );
+        assert!(
+            text.contains("APPEND_OBJECT"),
+            "expected APPEND_OBJECT in:\n{text}"
+        );
     }
 
     #[test]
     fn call_spread_uses_call_spread_op() {
         // A spread argument switches the call to the args-array builder +
         // `CALL_SPREAD` (dynamic arity) (V10-T2).
-        let chunk =
-            compile_source("fn f(x) { return x }\nlet a = [1]\nf(...a)").expect("compiles");
+        let chunk = compile_source("fn f(x) { return x }\nlet a = [1]\nf(...a)").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("SPREAD_ARGS"), "expected SPREAD_ARGS in:\n{text}");
-        assert!(text.contains("CALL_SPREAD"), "expected CALL_SPREAD in:\n{text}");
+        assert!(
+            text.contains("SPREAD_ARGS"),
+            "expected SPREAD_ARGS in:\n{text}"
+        );
+        assert!(
+            text.contains("CALL_SPREAD"),
+            "expected CALL_SPREAD in:\n{text}"
+        );
     }
 
     #[test]
@@ -4916,7 +5016,10 @@ mod tests {
         // array is built (`SPREAD_ARGS`), then the op dispatches like `CALL_METHOD`.
         let chunk = compile_source("let o = {}\nlet a = [1]\no.m(...a)").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("SPREAD_ARGS"), "expected SPREAD_ARGS in:\n{text}");
+        assert!(
+            text.contains("SPREAD_ARGS"),
+            "expected SPREAD_ARGS in:\n{text}"
+        );
         assert!(
             text.contains("CALL_METHOD_SPREAD"),
             "expected CALL_METHOD_SPREAD in:\n{text}"
@@ -4930,7 +5033,10 @@ mod tests {
         // into the `[obj, idx, value]` layout SET_INDEX consumes).
         let chunk = compile_source("let a = [1]\na[0] = 9").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("SET_INDEX"), "expected SET_INDEX, got:\n{text}");
+        assert!(
+            text.contains("SET_INDEX"),
+            "expected SET_INDEX, got:\n{text}"
+        );
         assert!(text.contains("ROT3"), "expected ROT3, got:\n{text}");
     }
 
@@ -4986,7 +5092,10 @@ mod tests {
         // condition (RANGE_HAS_NEXT), and a backward LOOP back-edge.
         let chunk = compile_source("for (i in 0..3) { print(i) }").expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("CHECK_NUMBERS"), "no bounds guard in:\n{text}");
+        assert!(
+            text.contains("CHECK_NUMBERS"),
+            "no bounds guard in:\n{text}"
+        );
         assert!(
             text.contains("RANGE_RESOLVE_STEP"),
             "no step resolution in:\n{text}"
@@ -5056,10 +5165,13 @@ mod tests {
     fn for_await_break_emits_iter_close() {
         // A `break` out of a `for await` over a generator closes the iterator,
         // mirroring the tree-walker's `g.close()`.
-        let chunk =
-            compile_source("fn* g() { yield 1 }\nfor await (x of g()) { break }").expect("compiles");
+        let chunk = compile_source("fn* g() { yield 1 }\nfor await (x of g()) { break }")
+            .expect("compiles");
         let text = disasm(&chunk);
-        assert!(text.contains("ITER_CLOSE"), "no ITER_CLOSE on break in:\n{text}");
+        assert!(
+            text.contains("ITER_CLOSE"),
+            "no ITER_CLOSE on break in:\n{text}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5082,8 +5194,14 @@ mod tests {
         let text = disasm(&chunk);
         // Top chunk: CLOSURE 0 referencing proto #0 (named greet) + DEFINE_GLOBAL.
         assert!(text.contains("CLOSURE"), "missing CLOSURE in:\n{text}");
-        assert!(text.contains("proto #0 greet"), "missing named proto ref in:\n{text}");
-        assert!(text.contains("DEFINE_GLOBAL"), "missing DEFINE_GLOBAL (name bind) in:\n{text}");
+        assert!(
+            text.contains("proto #0 greet"),
+            "missing named proto ref in:\n{text}"
+        );
+        assert!(
+            text.contains("DEFINE_GLOBAL"),
+            "missing DEFINE_GLOBAL (name bind) in:\n{text}"
+        );
         // Nested proto header + its body.
         assert!(
             text.contains("== fn greet (proto #0) =="),
@@ -5093,7 +5211,10 @@ mod tests {
             text.contains("CONST") && text.contains("; 1"),
             "missing CONST 1 in proto body:\n{text}"
         );
-        assert!(text.contains("RETURN"), "missing RETURN in proto body:\n{text}");
+        assert!(
+            text.contains("RETURN"),
+            "missing RETURN in proto body:\n{text}"
+        );
     }
 
     #[test]
@@ -5105,11 +5226,20 @@ mod tests {
         let text = disasm(&chunk);
         assert!(text.contains("CLOSURE"), "missing CLOSURE in:\n{text}");
         // `f` is a DIRECT-child top-level `let` → bound as a module global.
-        assert!(text.contains("DEFINE_GLOBAL"), "missing DEFINE_GLOBAL f in:\n{text}");
+        assert!(
+            text.contains("DEFINE_GLOBAL"),
+            "missing DEFINE_GLOBAL f in:\n{text}"
+        );
         // Proto body: GET_LOCAL 0 (x); CONST 1; ADD; RETURN.
-        assert!(text.contains("GET_LOCAL"), "missing GET_LOCAL (param x) in:\n{text}");
+        assert!(
+            text.contains("GET_LOCAL"),
+            "missing GET_LOCAL (param x) in:\n{text}"
+        );
         assert!(text.contains("ADD"), "missing ADD in proto body:\n{text}");
-        assert!(text.contains("RETURN"), "missing RETURN in proto body:\n{text}");
+        assert!(
+            text.contains("RETURN"),
+            "missing RETURN in proto body:\n{text}"
+        );
     }
 
     #[test]
@@ -5145,9 +5275,10 @@ mod tests {
         // (SET_LOCAL_CELL binds it) and `inner` reads it via GET_UPVALUE with a
         // one-entry capture plan. (A top-level `let` would instead be read via
         // GET_GLOBAL — covered by the forward-ref differential tests.)
-        let chunk =
-            compile_source("fn outer() {\n let n = 1\n fn inner() { return n }\n return inner()\n}")
-                .expect("compiles");
+        let chunk = compile_source(
+            "fn outer() {\n let n = 1\n fn inner() { return n }\n return inner()\n}",
+        )
+        .expect("compiles");
         // outer's proto is proto #0; its body binds `n` through a cell.
         let outer = chunk.protos.first().expect("outer proto");
         let outer_text = disasm(&outer.chunk);
@@ -5188,8 +5319,7 @@ mod tests {
 
     #[test]
     fn named_stdlib_import_emits_import_op() {
-        let chunk =
-            compile_source("import { abs } from \"std/math\"\n").expect("compiles");
+        let chunk = compile_source("import { abs } from \"std/math\"\n").expect("compiles");
         let text = disasm(&chunk);
         assert!(
             text.contains("IMPORT") && text.contains("std/math"),
@@ -5208,8 +5338,7 @@ mod tests {
 
     #[test]
     fn namespace_stdlib_import_emits_import_op() {
-        let chunk =
-            compile_source("import * as math from \"std/math\"\n").expect("compiles");
+        let chunk = compile_source("import * as math from \"std/math\"\n").expect("compiles");
         match &chunk.imports[0] {
             ImportDesc::Namespace { source, .. } => assert_eq!(source, "std/math"),
             other => panic!("expected Namespace, got {other:?}"),

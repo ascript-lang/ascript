@@ -35,7 +35,11 @@ fn new_parser_accepts_entire_corpus() {
             failures.push(format!("{}: {:?}", path.display(), p.errors));
         }
     }
-    assert!(failures.is_empty(), "new parser rejected files:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "new parser rejected files:\n{}",
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -49,10 +53,17 @@ fn new_parser_agrees_with_legacy_over_corpus() {
             Err(_) => false,
         };
         if new_ok != legacy_ok {
-            failures.push(format!("{}: new={new_ok} legacy={legacy_ok}", path.display()));
+            failures.push(format!(
+                "{}: new={new_ok} legacy={legacy_ok}",
+                path.display()
+            ));
         }
     }
-    assert!(failures.is_empty(), "parser disagreements:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "parser disagreements:\n{}",
+        failures.join("\n")
+    );
 }
 
 /// Snippets that BOTH parsers must accept (core slice only).
@@ -106,7 +117,11 @@ const ACCEPT: &[&str] = &[
 fn new_parser_accepts_core_slice() {
     for src in ACCEPT {
         let p = ascript::syntax::parser::parse(src);
-        assert!(p.errors.is_empty(), "new parser rejected {src:?}: {:?}", p.errors);
+        assert!(
+            p.errors.is_empty(),
+            "new parser rejected {src:?}: {:?}",
+            p.errors
+        );
     }
 }
 
@@ -114,6 +129,9 @@ fn new_parser_accepts_core_slice() {
 fn legacy_parser_also_accepts_core_slice() {
     for src in ACCEPT {
         let toks = ascript::lexer::lex(src).expect("legacy lex");
-        assert!(ascript::parser::parse(&toks).is_ok(), "legacy rejected {src:?}");
+        assert!(
+            ascript::parser::parse(&toks).is_ok(),
+            "legacy rejected {src:?}"
+        );
     }
 }

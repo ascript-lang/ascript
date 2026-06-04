@@ -92,8 +92,8 @@ async fn main() -> ExitCode {
             // which route `.as` back to `run_file`. The flag takes precedence over the
             // env var; unset/absent (default) = VM. `.aso` is always the VM.
             let is_aso = path.extension().and_then(|e| e.to_str()) == Some("aso");
-            let use_tree_walker = tree_walker
-                || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
+            let use_tree_walker =
+                tree_walker || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
             let result = if is_aso {
                 ascript::run_aso_file(path, &args).await
             } else if use_tree_walker {
@@ -128,8 +128,8 @@ async fn main() -> ExitCode {
             // Default → the bytecode VM REPL (production path). The legacy
             // tree-walker REPL stays reachable via `--tree-walker` OR
             // `ASCRIPT_ENGINE=tree-walker` (flag takes precedence).
-            let use_tree_walker = tree_walker
-                || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
+            let use_tree_walker =
+                tree_walker || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
             let result = if use_tree_walker {
                 ascript::repl::run_repl_tree_walker().await
             } else {
@@ -250,7 +250,10 @@ async fn main() -> ExitCode {
                     }
                 }
                 if json {
-                    println!("{}", ascript::check::render::json(file, &analysis.diagnostics));
+                    println!(
+                        "{}",
+                        ascript::check::render::json(file, &analysis.diagnostics)
+                    );
                 } else {
                     print!(
                         "{}",

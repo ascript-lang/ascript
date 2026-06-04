@@ -144,6 +144,9 @@ mod tests {
             .into_iter()
             .find(|d| d.code == "unresolved-import")
             .unwrap();
-        assert_eq!(d.message, "unresolved import `std/maths`: no such std module");
+        assert_eq!(
+            d.message,
+            "unresolved import `std/maths`: no such std module"
+        );
     }
 }

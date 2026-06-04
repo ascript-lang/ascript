@@ -350,7 +350,8 @@ impl Chunk {
         let mut w = Writer::new();
         w.buf.extend_from_slice(&ASO_MAGIC);
         w.u32(ASO_FORMAT_VERSION);
-        write_chunk(&mut w, self).expect("constant pool must be literals-only (compiler invariant)");
+        write_chunk(&mut w, self)
+            .expect("constant pool must be literals-only (compiler invariant)");
         w.buf
     }
 
@@ -566,9 +567,11 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
                         w.str(&ev.name);
                         write_value(w, &ev.value)?;
                     }
-                    other => return Err(AsoError::NonLiteralConst(
-                        literal_kind(other).err().unwrap_or("enum-variant-payload"),
-                    )),
+                    other => {
+                        return Err(AsoError::NonLiteralConst(
+                            literal_kind(other).err().unwrap_or("enum-variant-payload"),
+                        ))
+                    }
                 }
             }
         }
@@ -641,9 +644,8 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
 
 fn write_proto(w: &mut Writer, p: &FnProto) -> Result<(), AsoError> {
     w.u8(p.arity);
-    let flags = u8::from(p.has_rest)
-        | (u8::from(p.is_async) << 1)
-        | (u8::from(p.is_generator) << 2);
+    let flags =
+        u8::from(p.has_rest) | (u8::from(p.is_async) << 1) | (u8::from(p.is_generator) << 2);
     w.u8(flags);
     // params
     w.len(p.params.len());
@@ -1062,7 +1064,12 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
                 let el = match r.u8()? {
                     EL_ITEM => ArrayElem::Item(read_expr(r)?),
                     EL_SPREAD => ArrayElem::Spread(read_expr(r)?),
-                    tag => return Err(AsoError::BadTag { what: "array-elem", tag }),
+                    tag => {
+                        return Err(AsoError::BadTag {
+                            what: "array-elem",
+                            tag,
+                        })
+                    }
                 };
                 elems.push(el);
             }
@@ -1078,7 +1085,12 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
                         ObjEntry::KV(k, read_expr(r)?)
                     }
                     EL_SPREAD => ObjEntry::Spread(read_expr(r)?),
-                    tag => return Err(AsoError::BadTag { what: "object-entry", tag }),
+                    tag => {
+                        return Err(AsoError::BadTag {
+                            what: "object-entry",
+                            tag,
+                        })
+                    }
                 };
                 entries.push(ent);
             }
@@ -1107,7 +1119,12 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
                 let a = match r.u8()? {
                     EL_ITEM => CallArg::Pos(read_expr(r)?),
                     EL_SPREAD => CallArg::Spread(read_expr(r)?),
-                    tag => return Err(AsoError::BadTag { what: "call-arg", tag }),
+                    tag => {
+                        return Err(AsoError::BadTag {
+                            what: "call-arg",
+                            tag,
+                        })
+                    }
                 };
                 args.push(a);
             }
@@ -1132,7 +1149,12 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
                 let part = match r.u8()? {
                     TP_LIT => TemplatePart::Lit(r.str()?),
                     TP_EXPR => TemplatePart::Expr(Box::new(read_expr(r)?)),
-                    tag => return Err(AsoError::BadTag { what: "template-part", tag }),
+                    tag => {
+                        return Err(AsoError::BadTag {
+                            what: "template-part",
+                            tag,
+                        })
+                    }
                 };
                 parts.push(part);
             }
@@ -1252,7 +1274,12 @@ fn read_class(r: &mut Reader) -> Result<Class, AsoError> {
         let default = match r.u8()? {
             0 => None,
             1 => Some(read_expr(r)?),
-            tag => return Err(AsoError::BadTag { what: "field-default", tag }),
+            tag => {
+                return Err(AsoError::BadTag {
+                    what: "field-default",
+                    tag,
+                })
+            }
         };
         fields.insert(fname, FieldSchema { ty, default });
     }
@@ -1520,7 +1547,10 @@ run()
             Err(AsoError::BadMagic(_))
         ));
         // Too short for even the magic.
-        assert!(matches!(Chunk::from_bytes(&[0, 1]), Err(AsoError::Truncated)));
+        assert!(matches!(
+            Chunk::from_bytes(&[0, 1]),
+            Err(AsoError::Truncated)
+        ));
     }
 
     #[test]
@@ -1528,10 +1558,7 @@ run()
         let bytes = compile(COMPLEX).to_bytes();
         // Drop the tail — header is intact but body is short.
         let half = &bytes[..bytes.len() / 2];
-        assert!(matches!(
-            Chunk::from_bytes(half),
-            Err(AsoError::Truncated)
-        ));
+        assert!(matches!(Chunk::from_bytes(half), Err(AsoError::Truncated)));
     }
 
     #[test]
@@ -1613,8 +1640,9 @@ run()
     fn non_literal_const_self_check_fails() {
         let mut c = Chunk::new();
         // An Object is never poolable.
-        c.consts
-            .push(Value::Object(crate::value::ObjectCell::new(indexmap::IndexMap::new())));
+        c.consts.push(Value::Object(crate::value::ObjectCell::new(
+            indexmap::IndexMap::new(),
+        )));
         assert_eq!(c.check_consts_literal_only(), Err("object"));
     }
 
@@ -1646,9 +1674,11 @@ run()
         // An array containing a non-literal element is still rejected.
         let mut c = Chunk::new();
         c.consts
-            .push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![
-                Value::Object(crate::value::ObjectCell::new(indexmap::IndexMap::new())),
-            ]))));
+            .push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+                vec![Value::Object(crate::value::ObjectCell::new(
+                    indexmap::IndexMap::new(),
+                ))],
+            ))));
         assert_eq!(c.check_consts_literal_only(), Err("object"));
     }
 

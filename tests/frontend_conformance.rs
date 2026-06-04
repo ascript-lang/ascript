@@ -13,8 +13,8 @@
 use ascript::lexer::lex;
 use ascript::parser::parse;
 use ascript::syntax::kind::SyntaxKind;
-use ascript::syntax::parser as cst_parser;
 use ascript::syntax::parse_to_tree;
+use ascript::syntax::parser as cst_parser;
 
 /// Assert that `src` lexes and parses without error under the interpreter's
 /// front end.
@@ -27,7 +27,11 @@ fn accepts(src: &str) {
 /// under the CST front-end (`src/syntax/`).
 fn cst_accepts(src: &str) {
     let parsed = cst_parser::parse(src);
-    assert!(parsed.errors.is_empty(), "CST parse errors for {src:?}: {:?}", parsed.errors);
+    assert!(
+        parsed.errors.is_empty(),
+        "CST parse errors for {src:?}: {:?}",
+        parsed.errors
+    );
     let has_error_node = parse_to_tree(src)
         .descendants()
         .any(|n| n.kind() == SyntaxKind::Error);

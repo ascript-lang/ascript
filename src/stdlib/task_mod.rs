@@ -120,7 +120,9 @@ impl Interp {
                 other => out.push(other),
             }
         }
-        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(out))))
+        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+            out,
+        ))))
     }
 
     /// `race([futures]) -> value`. Resolves to the first input future to complete

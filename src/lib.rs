@@ -1,7 +1,6 @@
 pub mod ast;
 pub mod check;
 pub mod compile;
-pub mod syntax;
 pub mod coro;
 pub mod diagnostics;
 pub mod env;
@@ -17,6 +16,7 @@ pub mod parser;
 pub mod repl;
 pub mod span;
 pub mod stdlib;
+pub mod syntax;
 pub mod task;
 pub mod token;
 pub mod value;
@@ -228,8 +228,10 @@ pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf,
         .map_err(|e| AsError::at(e.message, e.span).with_source(src_info.clone()))?;
     // Defensive: verify before writing so a produced `.aso` is always loadable.
     crate::vm::verify::verify(&chunk).map_err(|e| {
-        AsError::new(format!("internal: produced bytecode failed verification: {e}"))
-            .with_source(src_info)
+        AsError::new(format!(
+            "internal: produced bytecode failed verification: {e}"
+        ))
+        .with_source(src_info)
     })?;
     let bytes = chunk.to_bytes();
     let out_path = match out {
@@ -253,9 +255,8 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
 
     let bytes = std::fs::read(path)
         .map_err(|e| AsError::new(format!("cannot read {}: {}", path.display(), e)))?;
-    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes).map_err(|e| {
-        AsError::new(format!("cannot load {}: {}", path.display(), e))
-    })?;
+    let chunk = crate::vm::chunk::Chunk::from_bytes_verified(&bytes)
+        .map_err(|e| AsError::new(format!("cannot load {}: {}", path.display(), e)))?;
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
@@ -360,10 +361,7 @@ pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, 
 /// [`vm_run_source_generic`] (specialize = false). `specialize` is the kill-switch
 /// flag threaded onto the [`Vm`]; the eventual CLI's `--no-specialize` maps to
 /// `specialize = false` here.
-async fn vm_run_source_with(
-    src: &str,
-    specialize: bool,
-) -> Result<(String, Option<i32>), AsError> {
+async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Option<i32>), AsError> {
     use crate::vm::chunk::FnProto;
     use crate::vm::value_ext::{Closure, RunOutcome};
     use crate::vm::Vm;

@@ -98,7 +98,10 @@ pub fn attach(root: &ResolvedNode) -> CommentMap {
                         map.trailing.entry(a.text_range()).or_insert(text);
                     } else {
                         // Comment before any content: treat as pending leading.
-                        pending.push(Leading { text, blank_before: false });
+                        pending.push(Leading {
+                            text,
+                            blank_before: false,
+                        });
                     }
                 } else {
                     // Own line → leading comment for the next statement.
@@ -153,7 +156,10 @@ mod tests {
         let root = parse_to_tree("// hello\nx\n");
         let map = attach(&root);
         let s = first_stmt(&root); // the ExprStmt for `x`
-        let lead = map.leading.get(&s.text_range()).expect("leading on first stmt");
+        let lead = map
+            .leading
+            .get(&s.text_range())
+            .expect("leading on first stmt");
         assert_eq!(lead.len(), 1);
         assert_eq!(lead[0].text, "// hello");
     }
@@ -163,7 +169,10 @@ mod tests {
         let root = parse_to_tree("x // tail\ny\n");
         let map = attach(&root);
         let s = first_stmt(&root); // ExprStmt for `x`
-        assert_eq!(map.trailing.get(&s.text_range()).map(|t| t.as_str()), Some("// tail"));
+        assert_eq!(
+            map.trailing.get(&s.text_range()).map(|t| t.as_str()),
+            Some("// tail")
+        );
     }
 
     #[test]
@@ -172,6 +181,9 @@ mod tests {
         let map = attach(&root);
         let b = root.children().nth(1).unwrap();
         let lead = map.leading.get(&b.text_range()).expect("leading on b");
-        assert!(lead[0].blank_before, "2+ newlines before comment → blank line preserved");
+        assert!(
+            lead[0].blank_before,
+            "2+ newlines before comment → blank line preserved"
+        );
     }
 }

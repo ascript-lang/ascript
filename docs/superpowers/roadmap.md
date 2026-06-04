@@ -191,6 +191,11 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   "B2"); deterministic/replayable scheduling (needs "B2"). Spec §7 rewritten; ADR at
   `specs/adr/2026-05-30-async-generators.md`. Plan:
   `plans/2026-05-30-async-generators-coroutines.md`.
+  **Update 2026-06-04 (#147 resolved):** end-of-program task-drain parity for a *held*
+  un-awaited future is confirmed — both the tree-walker and the VM run
+  `local.run_until(..).await; local.await;` (`src/lib.rs`), so a held future's body
+  (`let f = work()`) drains and runs identically on both engines. Asserted by
+  `vm_held_future_drains_identically_to_treewalker` in `tests/vm_differential.rs`.
 
 ## Phase 6 — Ergonomics & observability (post-spec extension)
 
@@ -610,8 +615,12 @@ already done and conformance-tested (`examples/async.as`).
   multi-file diagnostics matter most. `SourceInfo` on `AsError` is the groundwork.
 - **REPL is single-line:** multi-line blocks typed across lines aren't accumulated (single-
   line blocks work). Sanctioned v1 limitation; accumulate-on-incomplete is a nice follow-up.
+  **Update 2026-06-04:** shipped — multi-line accumulation lands via the `is_incomplete`
+  token-depth buffer on a `..` prompt (CLAUDE.md "REPL multi-line input"; `src/repl.rs`).
 - **fmt drops comments** (AST pretty-printer) and re-emits string literals with `"` + raw
   contents (round-trips for current corpus). Future fmt hardening.
+  **Update 2026-06-04:** superseded — the lossless CST formatter (`src/syntax/format`) is now
+  the shipped formatter; it preserves comments and round-trips, replacing the AST pretty-printer.
 - **Live module bindings:** imports snapshot values at import time (spec-adequate).
 - **Spec authority:** `docs/superpowers/specs/2026-05-29-ascript-design.md`. The
   Tree-sitter grammar is the syntax source of truth, conformance-tested; keep it in

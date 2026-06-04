@@ -81,9 +81,7 @@ pub fn analyze_with_config(src: &str, config: &LintConfig) -> Analysis {
     // Apply inline `ascript-ignore` suppressions before sorting.
     let supp = suppressions(src);
     let line_starts = line_start_offsets(src);
-    diagnostics.retain(|d| {
-        !supp.suppressed_on_line(line_of(&line_starts, d.range.start), &d.code)
-    });
+    diagnostics.retain(|d| !supp.suppressed_on_line(line_of(&line_starts, d.range.start), &d.code));
 
     // Remap severities through the lint config. `syntax-error` is immune — it is
     // always an Error and is never downgraded or dropped. For every other code,
@@ -101,12 +99,7 @@ pub fn analyze_with_config(src: &str, config: &LintConfig) -> Analysis {
         }
     });
 
-    diagnostics.sort_by(|a, b| {
-        a.range
-            .start
-            .cmp(&b.range.start)
-            .then(a.code.cmp(&b.code))
-    });
+    diagnostics.sort_by(|a, b| a.range.start.cmp(&b.range.start).then(a.code.cmp(&b.code)));
 
     Analysis { diagnostics }
 }
@@ -280,7 +273,11 @@ mod tests {
             "fn f() { return 1 }\nfn f() { return 2 }\nprint(f())\n",
             "fn f() { return 1 }\nlet f = 2\nprint(f)\n",
         ] {
-            let codes: Vec<_> = analyze(src).diagnostics.into_iter().map(|d| d.code).collect();
+            let codes: Vec<_> = analyze(src)
+                .diagnostics
+                .into_iter()
+                .map(|d| d.code)
+                .collect();
             assert!(
                 codes.contains(&"duplicate-binding".to_string()),
                 "expected duplicate-binding for {src:?}, got {codes:?}"
@@ -385,21 +382,23 @@ mod tests {
             .collect();
         assert_eq!(syntax.len(), 1, "got {:?}", a.diagnostics);
         let d = syntax[0];
-        assert!(
-            d.message.contains("unterminated"),
-            "message: {}",
-            d.message
-        );
+        assert!(d.message.contains("unterminated"), "message: {}", d.message);
         assert!(d.range.start < d.range.end, "range: {:?}", d.range);
     }
 
     #[test]
     fn unterminated_block_comment_reported() {
         let a = analyze("/* never closed");
-        let n = a.diagnostics.iter().filter(|d| d.code == "syntax-error").count();
+        let n = a
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "syntax-error")
+            .count();
         assert!(n >= 1, "expected a syntax error, got {:?}", a.diagnostics);
         assert!(
-            a.diagnostics.iter().any(|d| d.message.contains("block comment")),
+            a.diagnostics
+                .iter()
+                .any(|d| d.message.contains("block comment")),
             "got {:?}",
             a.diagnostics
         );
@@ -528,7 +527,10 @@ mod tests {
     #[test]
     fn diagnostic_has_a_plausible_range() {
         let a = analyze("@\n");
-        assert!(!a.diagnostics.is_empty(), "expected at least one diagnostic");
+        assert!(
+            !a.diagnostics.is_empty(),
+            "expected at least one diagnostic"
+        );
         let d = &a.diagnostics[0];
         assert!(
             d.range.start < d.range.end,
