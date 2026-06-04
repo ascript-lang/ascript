@@ -149,6 +149,7 @@ pub struct Method {
     pub ret: Option<crate::ast::Type>,
     pub body: Vec<Stmt>,
     pub is_async: bool,
+    pub is_generator: bool,
 }
 
 #[derive(Clone)]

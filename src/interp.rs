@@ -1307,6 +1307,7 @@ impl Interp {
                             ret: m.ret.clone(),
                             body: m.body.clone(),
                             is_async: m.is_async,
+                            is_generator: m.is_generator,
                         }),
                     );
                 }
@@ -2674,6 +2675,25 @@ impl Interp {
         call_env
             .define("super", super_ref, false)
             .map_err(AsError::new)?;
+        // A generator method (`fn*` / `async fn*`) is NOT run inline and is NOT
+        // spawned as a task — it takes the SAME consumer-driven path standalone
+        // generators do (see `call_function`): its body is built into a boxed future
+        // on a `GeneratorHandle` and driven by `gen.next(v)` / `for await`. `self`
+        // and `super` are already in `call_env`, so a `yield self.x` body sees the
+        // bound instance. Both sync and async generator methods take this path (the
+        // body may itself `await`).
+        if bm.method.is_generator {
+            let vm = self.rc();
+            let method = bm.method.clone();
+            let name = bm.name.clone();
+            let body: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, Control>>>> =
+                Box::pin(async move {
+                    vm.run_method_body(method, args, call_env, span, name).await
+                });
+            return Ok(Value::Generator(Rc::new(
+                crate::coro::GeneratorHandle::new(body),
+            )));
+        }
         // An async method, like an async free function, is scheduled eagerly and
         // returns a `Value::Future`. We move owned copies (the `Rc<Method>`, name,
         // and prepared `call_env`) into the spawned task so the body can outlive
