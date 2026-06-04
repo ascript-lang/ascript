@@ -107,6 +107,24 @@ struct Resolver {
     /// The module-global bindings (one per declared top-level name), recorded for
     /// the checker. They carry no real frame slot (`slot` is unused for globals).
     global_bindings: Vec<Binding>,
+    /// SP8 #136 capture-by-value FIXUPS. Each `ParentLocal` upvalue is recorded with a
+    /// pointer back to its SOURCE binding's `decl_range` and the child frame + upvalue
+    /// index that captured it. The source binding's `mutated` flag is NOT final at
+    /// capture time (a textually-LATER assignment in the parent body can set it after
+    /// the capturing child frame has already popped), so `by_value` is decided in a
+    /// final pass (`finalize_capture_by_value`) once every binding's `mutated` is known.
+    capture_fixups: Vec<CaptureFixup>,
+}
+
+/// A deferred capture-by-value decision (SP8 #136): patch the `by_value` bit of the
+/// `upval_idx`-th upvalue of the frame whose `key` (text range) is `frame_range` from
+/// the FINAL `mutated` flag of the source binding declared at `source_decl_range`. A
+/// TextRange uniquely identifies one node, so the `(_, frame_range)` entry in
+/// `result.frames` is unambiguous.
+struct CaptureFixup {
+    frame_range: TextRange,
+    upval_idx: usize,
+    source_decl_range: TextRange,
 }
 
 impl Resolver {
@@ -119,6 +137,7 @@ impl Resolver {
             module_global_mutable: HashMap::new(),
             global_uses: HashMap::new(),
             global_bindings: Vec::new(),
+            capture_fixups: Vec::new(),
         }
     }
 
@@ -358,7 +377,32 @@ impl Resolver {
             // `unused-binding`/`unused-import` lint does not flag bindings that
             // are only read from a nested function.
             self.bump_use_in(parent, slot);
-            return Some(self.add_upvalue(frame_idx, UpvalueDescriptor::ParentLocal(slot)));
+            // SP8 #136: capture as by-REFERENCE provisionally; the by-value decision
+            // depends on the source binding's FINAL `mutated` flag, which a textually-
+            // later assignment in the parent body can still set, so it is resolved in
+            // `finalize_capture_by_value` (after the whole tree is walked). Record a
+            // fixup pointing at the source binding's `decl_range`.
+            let source_decl_range = self.frames[parent]
+                .bindings
+                .iter()
+                .find(|b| b.slot == slot)
+                .map(|b| b.decl_range);
+            let frame_range = self.frames[frame_idx].key;
+            let upval_idx = self.add_upvalue(
+                frame_idx,
+                UpvalueDescriptor::ParentLocal {
+                    slot,
+                    by_value: false,
+                },
+            );
+            if let Some(source_decl_range) = source_decl_range {
+                self.capture_fixups.push(CaptureFixup {
+                    frame_range,
+                    upval_idx: upval_idx as usize,
+                    source_decl_range,
+                });
+            }
+            return Some(upval_idx);
         }
         if let Some(idx) = self.resolve_upvalue(parent, name) {
             return Some(self.add_upvalue(frame_idx, UpvalueDescriptor::ParentUpvalue(idx)));
@@ -534,23 +578,20 @@ impl Resolver {
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
         self.result.bindings.extend(frame.bindings.iter().cloned());
-        // Baseline VM semantics: EVERY captured local is a by-reference cell
-        // (allocated nil at frame entry, filled when its declaration executes).
-        // This preserves the tree-walker's late binding for forward/mutual/self
-        // references. Capture-by-value for never-forward-referenced immutable
-        // bindings is a FUTURE optimization (V5), not the baseline.
-        let cell_slots: Vec<u32> = frame
-            .bindings
-            .iter()
-            .filter(|b| b.captured)
-            .map(|b| b.slot)
-            .collect();
+        // SP8 #136: a captured local needs a by-reference CELL only if it is also
+        // REASSIGNED (`captured && mutated`) — then a counter closure must observe the
+        // mutation through the shared cell. A captured-but-never-reassigned local
+        // (`captured && !mutated`) is captured BY VALUE (copied into the closure's own
+        // cell at `Op::Closure`) and stays a plain stack local here. `mutated` is FINAL
+        // at this frame's pop (the whole body has been walked).
+        let (cell_slots, value_capture_slots) = split_capture_slots(&frame.bindings);
         self.result.frames.insert(
             (SyntaxKind::SourceFile, frame.key),
             FrameInfo {
                 slot_count: frame.next_slot,
                 upvalues: frame.upvalues,
                 cell_slots,
+                value_capture_slots,
             },
         );
     }
@@ -799,21 +840,17 @@ impl Resolver {
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
         self.result.bindings.extend(frame.bindings.iter().cloned());
-        // See `resolve_file`: every captured local is a by-reference cell. (A field
-        // default never declares its own locals, so `cell_slots` is normally empty;
-        // it is computed uniformly for consistency with other frames.)
-        let cell_slots: Vec<u32> = frame
-            .bindings
-            .iter()
-            .filter(|b| b.captured)
-            .map(|b| b.slot)
-            .collect();
+        // See `resolve_file` (SP8 #136): cells are `captured && mutated`, value-captures
+        // `captured && !mutated`. (A field default never declares its own locals, so
+        // both are normally empty; computed uniformly for consistency.)
+        let (cell_slots, value_capture_slots) = split_capture_slots(&frame.bindings);
         self.result.frames.insert(
             (SyntaxKind::FieldDecl, frame.key),
             FrameInfo {
                 slot_count: frame.next_slot,
                 upvalues: frame.upvalues,
                 cell_slots,
+                value_capture_slots,
             },
         );
     }
@@ -964,19 +1001,16 @@ impl Resolver {
         self.pop_scope();
         let frame = self.frames.pop().unwrap();
         self.result.bindings.extend(frame.bindings.iter().cloned());
-        // See `resolve_file`: every captured local is a by-reference cell.
-        let cell_slots: Vec<u32> = frame
-            .bindings
-            .iter()
-            .filter(|b| b.captured)
-            .map(|b| b.slot)
-            .collect();
+        // See `resolve_file` (SP8 #136): cells are `captured && mutated`, value-captures
+        // `captured && !mutated`. `mutated` is final at this frame's pop.
+        let (cell_slots, value_capture_slots) = split_capture_slots(&frame.bindings);
         self.result.frames.insert(
             (node_kind, frame.key),
             FrameInfo {
                 slot_count: frame.next_slot,
                 upvalues: frame.upvalues,
                 cell_slots,
+                value_capture_slots,
             },
         );
     }
@@ -1067,16 +1101,80 @@ impl Resolver {
         // Merge the module-global bindings into the result, applying their per-name
         // read-use counts so the checker's unused-binding/unused-import lints work
         // (globals have no frame slot, so they could not use the slot-based counter).
-        for mut b in self.global_bindings {
+        for mut b in std::mem::take(&mut self.global_bindings) {
             b.use_count = self.global_uses.get(&b.name).copied().unwrap_or(0);
             self.result.bindings.push(b);
         }
+        // SP8 #136: finalize each captured `ParentLocal` upvalue's `by_value` bit now
+        // that every binding's `mutated` flag is final (an assignment textually AFTER
+        // the capture has been seen). A source binding that is NEVER reassigned
+        // (`!mutated`) is captured by value.
+        self.finalize_capture_by_value();
         // Expose the module-global NAME set so the compiler can lower every top-level
         // define-site to DEFINE_GLOBAL (incl. a redeclaration's second site, which the
         // VM runtime-rejects), independent of any per-declaration binding range.
-        self.result.module_globals = self.module_globals;
+        self.result.module_globals = std::mem::take(&mut self.module_globals);
         self.result
     }
+
+    /// SP8 #136: apply the deferred capture-by-value fixups. For each captured
+    /// `ParentLocal` upvalue, look up its SOURCE binding's FINAL `mutated` flag and set
+    /// `by_value = !mutated`. This MUST run after the whole tree is resolved, because a
+    /// reassignment can appear textually AFTER the capture (the capturing child frame
+    /// has already popped by then), e.g. `fn make() { let n = 0; let f = fn() { return
+    /// n }; n = 1; return f }` — `n` is captured before the `n = 1`, but is `mutated`,
+    /// so it MUST stay by-reference (a cell). Deciding at capture time would wrongly
+    /// pick by-value and diverge.
+    fn finalize_capture_by_value(&mut self) {
+        if self.capture_fixups.is_empty() {
+            return;
+        }
+        // decl_range → final `mutated`. `result.bindings` holds every binding (all
+        // frames + globals merged) with its finalized flags.
+        let mutated: HashMap<TextRange, bool> = self
+            .result
+            .bindings
+            .iter()
+            .map(|b| (b.decl_range, b.mutated))
+            .collect();
+        for fx in &self.capture_fixups {
+            // A never-reassigned source → by value. A source not found (defensive)
+            // stays by-reference (the conservative default already set at capture).
+            let by_value = matches!(mutated.get(&fx.source_decl_range), Some(false));
+            if !by_value {
+                continue;
+            }
+            // Find the frame whose `key` (TextRange) matches and patch the descriptor.
+            if let Some((_k, fi)) = self
+                .result
+                .frames
+                .iter_mut()
+                .find(|((_, range), _)| *range == fx.frame_range)
+            {
+                if let Some(UpvalueDescriptor::ParentLocal { by_value: bv, .. }) =
+                    fi.upvalues.get_mut(fx.upval_idx)
+                {
+                    *bv = true;
+                }
+            }
+        }
+    }
+}
+
+/// SP8 #136: split a frame's captured bindings into the by-REFERENCE cell set
+/// (`captured && mutated`) and the by-VALUE set (`captured && !mutated`). The
+/// `mutated` flag must be final (call only at frame-pop / post-resolution).
+fn split_capture_slots(bindings: &[Binding]) -> (Vec<u32>, Vec<u32>) {
+    let mut cells = Vec::new();
+    let mut values = Vec::new();
+    for b in bindings.iter().filter(|b| b.captured) {
+        if b.mutated {
+            cells.push(b.slot);
+        } else {
+            values.push(b.slot);
+        }
+    }
+    (cells, values)
 }
 
 fn is_pattern(kind: SyntaxKind) -> bool {
@@ -1257,12 +1355,137 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("inner"))
             .unwrap();
         // Hoisting pre-declares `inner` (slot 0), so `x` is slot 1 in `outer`;
-        // the captured upvalue therefore points at ParentLocal(1).
+        // the captured upvalue therefore points at ParentLocal slot 1. `x` is never
+        // reassigned, so SP8 #136 captures it BY VALUE (`by_value: true`).
         let fi = r
             .frames
             .get(&(SyntaxKind::FnDecl, inner.text_range()))
             .expect("inner frame");
-        assert_eq!(fi.upvalues, vec![UpvalueDescriptor::ParentLocal(1)]);
+        assert_eq!(
+            fi.upvalues,
+            vec![UpvalueDescriptor::ParentLocal {
+                slot: 1,
+                by_value: true
+            }]
+        );
+    }
+
+    // ── SP8 #136 capture-by-value eligibility ───────────────────────────────────
+
+    /// The deepest (last-starting) `ArrowExpr` frame — the inner closure in these
+    /// tests (AScript's anonymous closure is the arrow `=>`, not a `fn` expression).
+    fn arrow_frame(tree: &ResolvedNode, r: &ResolveResult) -> FrameInfo {
+        let arrow = tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::ArrowExpr)
+            .max_by_key(|n| u32::from(n.text_range().start()))
+            .expect("an arrow closure");
+        r.frames
+            .get(&(SyntaxKind::ArrowExpr, arrow.text_range()))
+            .expect("inner arrow frame")
+            .clone()
+    }
+
+    fn outer_frame(tree: &ResolvedNode, r: &ResolveResult, name: &str) -> FrameInfo {
+        let outer = tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some(name))
+            .unwrap();
+        r.frames
+            .get(&(SyntaxKind::FnDecl, outer.text_range()))
+            .expect("outer frame")
+            .clone()
+    }
+
+    #[test]
+    fn sp8_captured_never_reassigned_is_by_value() {
+        // `k` is captured and NEVER reassigned → value_capture_slots (NOT cell_slots),
+        // and the inner upvalue descriptor is by_value: true.
+        let tree = parse_to_tree("fn make() {\n let k = 10\n return () => k\n}");
+        let r = resolve(&tree);
+        let outer = outer_frame(&tree, &r, "make");
+        assert!(
+            outer.cell_slots.is_empty(),
+            "never-reassigned capture is not a cell: {:?}",
+            outer.cell_slots
+        );
+        assert_eq!(
+            outer.value_capture_slots.len(),
+            1,
+            "k is captured by value: {:?}",
+            outer.value_capture_slots
+        );
+        let inner = arrow_frame(&tree, &r);
+        assert!(
+            matches!(
+                inner.upvalues.as_slice(),
+                [UpvalueDescriptor::ParentLocal { by_value: true, .. }]
+            ),
+            "upvalue is by_value: {:?}",
+            inner.upvalues
+        );
+    }
+
+    #[test]
+    fn sp8_captured_then_reassigned_stays_by_ref() {
+        // `n` is captured AND reassigned (counter) → cell_slots, by_value: false.
+        let tree =
+            parse_to_tree("fn make() {\n let n = 0\n return () => {\n n = n + 1\n return n\n }\n}");
+        let r = resolve(&tree);
+        let outer = outer_frame(&tree, &r, "make");
+        assert_eq!(
+            outer.cell_slots.len(),
+            1,
+            "reassigned capture stays a cell: {:?}",
+            outer.cell_slots
+        );
+        assert!(
+            outer.value_capture_slots.is_empty(),
+            "reassigned capture is NOT by-value: {:?}",
+            outer.value_capture_slots
+        );
+        let inner = arrow_frame(&tree, &r);
+        assert!(
+            matches!(
+                inner.upvalues.as_slice(),
+                [UpvalueDescriptor::ParentLocal { by_value: false, .. }]
+            ),
+            "upvalue is by_ref: {:?}",
+            inner.upvalues
+        );
+    }
+
+    #[test]
+    fn sp8_capture_before_later_reassignment_stays_by_ref() {
+        // THE SUBTLE CASE: the capture is textually BEFORE the reassignment. `n` is
+        // captured by `f`, THEN `n = 1` runs. Because `n` is `mutated` (the final flag,
+        // set by an assignment AFTER the capture), it MUST stay a cell / by-reference —
+        // a by-value capture would freeze a stale 0. This is exactly the ordering the
+        // `finalize_capture_by_value` post-pass guards.
+        let tree =
+            parse_to_tree("fn make() {\n let n = 0\n let f = () => n\n n = 1\n return f\n}");
+        let r = resolve(&tree);
+        let outer = outer_frame(&tree, &r, "make");
+        assert_eq!(
+            outer.cell_slots.len(),
+            1,
+            "capture-before-later-reassign stays a cell: {:?}",
+            outer.cell_slots
+        );
+        assert!(
+            outer.value_capture_slots.is_empty(),
+            "must NOT be by-value (n is reassigned later): {:?}",
+            outer.value_capture_slots
+        );
+        let inner = arrow_frame(&tree, &r);
+        assert!(
+            matches!(
+                inner.upvalues.as_slice(),
+                [UpvalueDescriptor::ParentLocal { by_value: false, .. }]
+            ),
+            "upvalue MUST be by_ref despite capture preceding the assignment: {:?}",
+            inner.upvalues
+        );
     }
 
     #[test]
@@ -1433,15 +1656,12 @@ mod tests {
     }
 
     #[test]
-    fn captured_local_is_a_cell() {
-        // Baseline VM semantics: EVERY captured local is a by-reference cell,
-        // regardless of mutation. This preserves late binding — the cell is
-        // allocated (nil) at frame entry and filled when its declaration runs,
-        // so a closure that captured it sees the filled value at call time.
-        // (Capture-by-value for immutable, never-forward-referenced bindings is
-        // a FUTURE optimization (V5), not the baseline.)
+    fn captured_local_cell_vs_value() {
+        // SP8 #136: a captured local is a by-reference CELL only if it is ALSO
+        // reassigned (`captured && mutated`). A never-reassigned captured local is
+        // captured BY VALUE (a value_capture_slot, NOT a cell).
         //
-        // x captured but never reassigned → STILL a cell.
+        // x captured but never reassigned → value-capture, NOT a cell.
         let immut = parse_to_tree("fn o() {\n let x = 1\n fn i() { return x }\n}");
         let r1 = resolve(&immut);
         let oi = immut
@@ -1449,16 +1669,19 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o"))
             .unwrap();
         // Hoisting pre-declares `i` (slot 0), so `x` is slot 1.
+        let fi1 = r1.frames.get(&(SyntaxKind::FnDecl, oi.text_range())).unwrap();
+        assert!(
+            fi1.cell_slots.is_empty(),
+            "a never-reassigned captured local is NOT a cell (by value): {:?}",
+            fi1.cell_slots
+        );
         assert_eq!(
-            r1.frames
-                .get(&(SyntaxKind::FnDecl, oi.text_range()))
-                .unwrap()
-                .cell_slots,
+            fi1.value_capture_slots,
             vec![1],
-            "an immutable captured local is a cell under the baseline rule"
+            "a never-reassigned captured local is a value-capture slot"
         );
 
-        // y captured AND reassigned → IS a cell (unchanged).
+        // y captured AND reassigned → IS a cell (the by-reference path, unchanged).
         let mutated = parse_to_tree("fn o() {\n let y = 1\n fn i() { y = 2 }\n}");
         let r2 = resolve(&mutated);
         let oi2 = mutated
@@ -1466,12 +1689,14 @@ mod tests {
             .find(|n| n.kind() == SyntaxKind::FnDecl && ident_text(n).as_deref() == Some("o"))
             .unwrap();
         // Hoisting pre-declares `i` (slot 0), so `y` is slot 1.
-        assert_eq!(
-            r2.frames
-                .get(&(SyntaxKind::FnDecl, oi2.text_range()))
-                .unwrap()
-                .cell_slots,
-            vec![1]
+        let fi2 = r2
+            .frames
+            .get(&(SyntaxKind::FnDecl, oi2.text_range()))
+            .unwrap();
+        assert_eq!(fi2.cell_slots, vec![1], "a reassigned capture stays a cell");
+        assert!(
+            fi2.value_capture_slots.is_empty(),
+            "a reassigned capture is not a value-capture slot"
         );
     }
 

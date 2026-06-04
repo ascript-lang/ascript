@@ -55,7 +55,15 @@ pub struct Binding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpvalueDescriptor {
-    ParentLocal(u32),
+    /// Capture a binding from the IMMEDIATE parent frame's slot `slot`. `by_value`
+    /// (SP8 #136): when the source binding is NEVER reassigned (`!mutated`), the value
+    /// is copied into a fresh private cell at `Op::Closure` instead of sharing the
+    /// parent's heap cell — the parent's slot then needs no cell at all (plain
+    /// `GET_LOCAL`, no `RefCell` borrow). `false` (the V5 baseline) keeps the shared
+    /// by-reference cell, required for a reassigned binding (a counter closure).
+    ParentLocal { slot: u32, by_value: bool },
+    /// Capture a binding the parent itself captured (a transitive upvalue). It KEEPS
+    /// the source upvalue's representation (no new bit — its kind is already fixed).
     ParentUpvalue(u32),
 }
 
@@ -63,7 +71,14 @@ pub enum UpvalueDescriptor {
 pub struct FrameInfo {
     pub slot_count: u32,
     pub upvalues: Vec<UpvalueDescriptor>,
+    /// Slots that need a heap CELL: `captured && mutated` (SP8 #136 narrowed this from
+    /// "every captured"). A `captured && !mutated` slot is NOT here — it is captured
+    /// by value (see `value_capture_slots`) and stays a plain stack local.
     pub cell_slots: Vec<u32>,
+    /// Slots captured BY VALUE: `captured && !mutated` (SP8 #136). They are plain stack
+    /// locals in this frame (no cell, no `FreshCell`); a closure copies the slot's
+    /// value into its own private upvalue cell at `Op::Closure`.
+    pub value_capture_slots: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]

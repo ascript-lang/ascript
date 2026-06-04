@@ -5842,22 +5842,24 @@ mod tests {
 
     #[test]
     fn fn_capturing_outer_local_compiles_with_upvalue() {
-        // A function reading an outer FUNCTION-LOCAL captures it by reference (V4-T3).
-        // Here `n` is a local of `outer` (NOT a module global — only DIRECT-children
-        // of the SourceFile become globals), so it is a CELL SLOT in `outer`'s frame
-        // (SET_LOCAL_CELL binds it) and `inner` reads it via GET_UPVALUE with a
-        // one-entry capture plan. (A top-level `let` would instead be read via
-        // GET_GLOBAL — covered by the forward-ref differential tests.)
+        // A function reading an outer FUNCTION-LOCAL captures it (V4-T3). `n` is a local
+        // of `outer` (NOT a module global — only DIRECT-children of the SourceFile
+        // become globals). SP8 #136: `n` is captured but NEVER reassigned, so it is
+        // captured BY VALUE — `outer` binds it via a PLAIN `SET_LOCAL` (no cell), and
+        // `inner` still reads it via `GET_UPVALUE` from a one-entry capture plan whose
+        // descriptor is `by_value`. A REASSIGNED capture (`mn`) keeps the cell path
+        // (`SET_LOCAL_CELL`). (A top-level `let` would be read via GET_GLOBAL — covered
+        // by the forward-ref differential tests.)
         let chunk = compile_source(
             "fn outer() {\n let n = 1\n fn inner() { return n }\n return inner()\n}",
         )
         .expect("compiles");
-        // outer's proto is proto #0; its body binds `n` through a cell.
+        // outer's proto is proto #0; its by-value capture binds `n` via plain SET_LOCAL.
         let outer = chunk.protos.first().expect("outer proto");
         let outer_text = disasm(&outer.chunk);
         assert!(
-            outer_text.contains("SET_LOCAL_CELL"),
-            "captured `n` should bind via SET_LOCAL_CELL in:\n{outer_text}"
+            !outer_text.contains("SET_LOCAL_CELL"),
+            "a never-reassigned capture is by-value (plain SET_LOCAL, no cell):\n{outer_text}"
         );
         // The inner proto reads the capture via GET_UPVALUE and has a capture plan.
         let inner = outer.chunk.protos.first().expect("inner proto");
@@ -5866,10 +5868,45 @@ mod tests {
             1,
             "inner fn captures exactly one upvalue (`n`)"
         );
+        assert!(
+            matches!(
+                inner.chunk.upvalues.as_slice(),
+                [crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal {
+                    by_value: true,
+                    ..
+                }]
+            ),
+            "never-reassigned capture is by_value: {:?}",
+            inner.chunk.upvalues
+        );
         let inner_text = disasm(&inner.chunk);
         assert!(
             inner_text.contains("GET_UPVALUE"),
             "inner body should read `n` via GET_UPVALUE in:\n{inner_text}"
+        );
+
+        // A REASSIGNED captured local keeps the by-reference CELL path.
+        let chunk2 = compile_source(
+            "fn outer() {\n let mn = 1\n fn inner() { mn = mn + 1\n return mn }\n return inner()\n}",
+        )
+        .expect("compiles");
+        let outer2 = chunk2.protos.first().expect("outer proto");
+        assert!(
+            disasm(&outer2.chunk).contains("SET_LOCAL_CELL"),
+            "a reassigned capture stays a cell (SET_LOCAL_CELL):\n{}",
+            disasm(&outer2.chunk)
+        );
+        let inner2 = outer2.chunk.protos.first().expect("inner proto");
+        assert!(
+            matches!(
+                inner2.chunk.upvalues.as_slice(),
+                [crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal {
+                    by_value: false,
+                    ..
+                }]
+            ),
+            "reassigned capture is by_ref: {:?}",
+            inner2.chunk.upvalues
         );
     }
 

@@ -7012,3 +7012,68 @@ async fn sp8_global_define_then_reread_in_loop() {
     )
     .await;
 }
+
+// ── SP8 Phase B (#136): capture-by-value closure optimization ──────────────
+// A captured-but-never-reassigned binding is captured BY VALUE; a reassigned one
+// stays a shared cell. Both must be byte-identical across all three engines.
+// (AScript's anonymous-closure form is the arrow `=>`, not a `fn` expression.)
+
+#[tokio::test]
+async fn sp8_capture_const() {
+    // Captured-but-never-reassigned constant: by-value eligible (== by-ref result).
+    assert_three_way_matches(
+        "fn make() {\n let k = 10\n return () => k\n}\nlet f = make()\nprint(f())\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sp8_capture_counter() {
+    // Captured AND reassigned (counter): stays a shared cell — mutation visible.
+    assert_three_way_matches(
+        "fn make() {\n let n = 0\n return () => {\n n = n + 1\n return n\n }\n}\n\
+         let c = make()\nprint(c())\nprint(c())\nprint(c())\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sp8_capture_loop_fresh() {
+    // Per-iteration capture freshness: each closure captures its own iteration's `v`
+    // (by value), so the three closures print 0/10/20, not 20/20/20. (Array append is
+    // spread reassignment in AScript — there is no `.push`.)
+    assert_three_way_matches(
+        "let fns = []\nfor (i in 0..3) {\n let v = i * 10\n fns = [...fns, () => v]\n}\n\
+         for (g in fns) { print(g()) }\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sp8_capture_transitive() {
+    // Transitive capture (closure over closure) of a never-reassigned binding.
+    assert_three_way_matches("fn a() {\n let k = 5\n return () => (() => k)\n}\nprint(a()()())\n")
+        .await;
+}
+
+#[tokio::test]
+async fn sp8_capture_mixed() {
+    // Mixed: one captured-constant + one captured-counter in the same closure.
+    assert_three_way_matches(
+        "fn make() {\n let base = 100\n let n = 0\n return () => {\n n = n + 1\n \
+         return base + n\n }\n}\nlet c = make()\nprint(c())\nprint(c())\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sp8_capture_before_later_reassignment() {
+    // THE SUBTLE CASE: capture textually BEFORE a reassignment must stay BY-REF, so
+    // the closure observes the later mutation (prints 7, not 0). A wrong by-value
+    // decision would freeze the captured 0 and diverge.
+    assert_three_way_matches(
+        "fn make() {\n let n = 0\n let f = () => n\n n = 7\n return f\n}\n\
+         let g = make()\nprint(g())\n",
+    )
+    .await;
+}

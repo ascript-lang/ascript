@@ -89,7 +89,11 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   `EX_MAP` field-default expr tag (a `#{…}` literal in field-default position
 ///   serializes as `ExprKind::Map`). Old chunks never contained either, so older
 ///   readers must reject a v14 chunk.
-pub const ASO_FORMAT_VERSION: u32 = 14;
+/// - 15: SP8 #136 capture-by-value — `UpvalueDescriptor::ParentLocal` gained a
+///   `by_value: bool`, serialized as a trailing u8 after the slot. The descriptor
+///   layout changed (a v14 reader would mis-parse the extra byte), so older readers
+///   must reject a v15 chunk and vice versa.
+pub const ASO_FORMAT_VERSION: u32 = 15;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -1583,9 +1587,12 @@ fn read_import(r: &mut Reader) -> Result<ImportDesc, AsoError> {
 
 fn write_upvalue(w: &mut Writer, uv: &UpvalueDescriptor) {
     match uv {
-        UpvalueDescriptor::ParentLocal(i) => {
+        // SP8 #136: ParentLocal carries the `by_value` bit (u8: 1 = by value, copied
+        // into a fresh private cell at Op::Closure; 0 = by reference, shared cell).
+        UpvalueDescriptor::ParentLocal { slot, by_value } => {
             w.u8(UV_PARENT_LOCAL);
-            w.u32(*i);
+            w.u32(*slot);
+            w.u8(u8::from(*by_value));
         }
         UpvalueDescriptor::ParentUpvalue(i) => {
             w.u8(UV_PARENT_UPVALUE);
@@ -1596,7 +1603,11 @@ fn write_upvalue(w: &mut Writer, uv: &UpvalueDescriptor) {
 
 fn read_upvalue(r: &mut Reader) -> Result<UpvalueDescriptor, AsoError> {
     match r.u8()? {
-        UV_PARENT_LOCAL => Ok(UpvalueDescriptor::ParentLocal(r.u32()?)),
+        UV_PARENT_LOCAL => {
+            let slot = r.u32()?;
+            let by_value = r.u8()? != 0;
+            Ok(UpvalueDescriptor::ParentLocal { slot, by_value })
+        }
         UV_PARENT_UPVALUE => Ok(UpvalueDescriptor::ParentUpvalue(r.u32()?)),
         tag => Err(AsoError::BadTag {
             what: "upvalue",
@@ -1731,6 +1742,25 @@ run()
         let direct = run_chunk(compile(COMPLEX));
         let viaso = run_chunk(Chunk::from_bytes(&compile(COMPLEX).to_bytes().expect("serialize")).expect("decode"));
         assert_eq!(direct, viaso, "output differs after .aso round-trip");
+    }
+
+    #[test]
+    fn roundtrip_capture_by_value_upvalue() {
+        // SP8 #136: a closure capturing a never-reassigned local (by VALUE) and one
+        // capturing a reassigned local (by REFERENCE) both serialize their
+        // `UpvalueDescriptor::ParentLocal { by_value }` bit and round-trip to the same
+        // disasm fingerprint AND the same output. Guards the v15 descriptor layout.
+        let src = "fn make() {\n let k = 10\n let n = 0\n return () => {\n n = n + 1\n \
+                   return k + n\n }\n}\nlet c = make()\nprint(c())\nprint(c())\n";
+        let original = compile(src);
+        let bytes = original.to_bytes().expect("serialize");
+        let rt = Chunk::from_bytes(&bytes).expect("decode");
+        assert_eq!(disasm(&original), disasm(&rt), "disasm fingerprint differs");
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(rt),
+            "output differs after capture-by-value .aso round-trip"
+        );
     }
 
     #[test]

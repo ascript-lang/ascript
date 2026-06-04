@@ -1736,34 +1736,48 @@ impl Vm {
                 }
 
                 Op::Closure => {
-                    // Build a closure over a nested proto, capturing its upvalues
-                    // BY REFERENCE per the proto's capture plan
-                    // (`proto.chunk.upvalues`, indexed by upvalue number):
-                    //   - ParentLocal(slot): clone the CURRENT frame's cell for that
-                    //     slot. The resolver guarantees a captured local is a cell
-                    //     slot, so `cells[slot]` is `Some`; a `None` is a
-                    //     compiler/resolver bug (clear panic).
-                    //   - ParentUpvalue(idx): clone the CURRENT closure's upvalue
-                    //     cell (a transitive capture from an outer frame).
-                    // Capturing the cell `Rc` (not its value) is what makes capture
-                    // by-reference: the closure sees later mutation of the cell.
+                    // Build a closure over a nested proto, capturing its upvalues per
+                    // the proto's capture plan (`proto.chunk.upvalues`, indexed by
+                    // upvalue number):
+                    //   - ParentLocal { slot, by_value: false }: BY REFERENCE — clone
+                    //     the CURRENT frame's cell `Cc` for that slot, so the closure
+                    //     sees later mutation. The resolver guarantees a `mutated`
+                    //     captured local is a cell slot, so `cells[slot]` is `Some`; a
+                    //     `None` is a compiler/resolver bug (clear panic).
+                    //   - ParentLocal { slot, by_value: true } (SP8 #136): BY VALUE —
+                    //     the source binding is never reassigned, so its slot is a PLAIN
+                    //     stack local (no cell in the declaring frame). Copy the slot's
+                    //     value into a FRESH private cell owned solely by this closure.
+                    //     Per-iteration loop freshness is automatic: each iteration's
+                    //     Op::Closure copies that iteration's slot value. Byte-identical
+                    //     to a shared cell (the value can never change after capture).
+                    //   - ParentUpvalue(idx): clone the CURRENT closure's upvalue cell
+                    //     (a transitive capture; keeps the source's representation).
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let proto = fiber.frame().closure.proto.chunk.protos[idx].clone();
                     let mut upvalues = Vec::with_capacity(proto.chunk.upvalues.len());
                     for desc in &proto.chunk.upvalues {
                         let cell = match *desc {
-                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal(slot) => {
-                                fiber
-                                    .frame()
-                                    .cells
-                                    .get(slot as usize)
-                                    .and_then(|c| c.as_ref())
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "CLOSURE captures parent local slot {slot} that is not a cell (compiler/resolver bug)"
-                                        )
-                                    })
-                                    .clone()
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal {
+                                slot,
+                                by_value: false,
+                            } => fiber
+                                .frame()
+                                .cells
+                                .get(slot as usize)
+                                .and_then(|c| c.as_ref())
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "CLOSURE captures parent local slot {slot} that is not a cell (compiler/resolver bug)"
+                                    )
+                                })
+                                .clone(),
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal {
+                                slot,
+                                by_value: true,
+                            } => {
+                                let v = fiber.local(slot as usize).clone();
+                                gcmodule::Cc::new(std::cell::RefCell::new(v))
                             }
                             crate::syntax::resolve::types::UpvalueDescriptor::ParentUpvalue(up) => {
                                 fiber.frame().closure.upvalues[up as usize].clone()
