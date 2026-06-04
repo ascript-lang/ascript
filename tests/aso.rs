@@ -113,6 +113,29 @@ fn build_then_run_aso_matches_classes() {
 }
 
 #[test]
+fn build_then_run_aso_matches_record_auto_init() {
+    // SP2 §5 records: a field-only class (NO explicit `init`) auto-derives a
+    // positional constructor at construction time from the proto's field schema —
+    // no new serialized data, no `.aso` version bump. The built `.aso` must
+    // round-trip and run byte-identically to the tree-walker (positional bind,
+    // defaulted-field optional trailing param, base-first inheritance order).
+    let dir = unique_dir("record");
+    write(
+        &dir,
+        "r.as",
+        "class Point {\n  x: number\n  y: number = 0\n}\nclass P3 extends Point { z: number }\n\
+         print(Point(1).y)\nprint(Point(2, 3).y)\nlet r = P3(4, 5, 6)\nprint(r.x)\nprint(r.y)\nprint(r.z)\n",
+    );
+    build(&dir, "r.as");
+    assert!(dir.join("r.aso").exists(), "r.aso should exist");
+
+    let (aso_out, _) = run(&dir, &["run", "r.aso"]);
+    let (as_out, _) = run(&dir, &["run", "--tree-walker", "r.as"]);
+    assert_eq!(aso_out, "0\n3\n4\n5\n6\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+}
+
+#[test]
 fn build_then_run_aso_matches_generator_method() {
     // SP1 Phase B: a class with a `fn*` generator method (using `self`) compiles to
     // a generator `FnProto` that serializes through the `.aso` (generator protos

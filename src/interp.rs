@@ -2552,16 +2552,18 @@ impl Interp {
                 self.invoke_method(&bm, args, span).await?;
             }
             None => {
-                if !args.is_empty() {
-                    return Err(AsError::at(
-                        format!(
-                            "{} has no init but was given {} argument(s)",
-                            class.name,
-                            args.len()
-                        ),
-                        span,
-                    )
-                    .into());
+                // SP2 §5 records: no explicit `init` → auto-derive a positional
+                // constructor over the declared fields (in merged base-first
+                // schema order). Field defaults were already applied above; the
+                // positional args OVERRIDE the supplied leading fields, each
+                // contract-checked against its field type via the SHARED
+                // `auto_init_bindings` helper (identical arity/contract messages to
+                // the VM). A zero-field class with no args keeps today's behavior
+                // (no fields → empty `params` → only `C()` is valid).
+                let fields = crate::value::merged_field_schema(&class);
+                let bindings = auto_init_bindings(&fields, &class.name, args, span)?;
+                for (fname, v) in bindings {
+                    instance.borrow_mut().fields.insert(fname, v);
                 }
             }
         }
@@ -3892,6 +3894,69 @@ pub(crate) fn check_call_args(
     })
 }
 
+/// Auto-derived positional constructor for a field-only class (SP2 §5, "records").
+/// SHARED by both engines (`Interp::construct` and `Vm::vm_construct`) so the
+/// arity check, error wording/span, and contract check cannot diverge.
+///
+/// `fields` is the class's ordered, merged-base-first field schema
+/// (`merged_field_schema(class)`, iterated in declaration order). The auto-init
+/// treats each field as a positional parameter: a field WITHOUT a default is a
+/// required leading param; a field WITH a default is an optional trailing param.
+/// Arity is validated with the SAME `check_call_args` logic used for functions —
+/// `what` is the class name, so the message reads `"<Class> expected N
+/// argument(s), got M"` (or `"at least"/"at most"` with defaults) and `span` is
+/// the construct call site.
+///
+/// Returns the positional field bindings as `(field_name, value)` pairs for the
+/// SUPPLIED args only (each already contract-checked against its field type).
+/// Omitted trailing (defaulted) fields are NOT returned — the caller has already
+/// applied their defaults to the fresh instance, and this auto-init only
+/// OVERRIDES the supplied positions. Defaults are never evaluated here (the
+/// synthesized params carry a sentinel default purely so `check_call_args`
+/// computes the right min/max arity).
+pub(crate) fn auto_init_bindings(
+    fields: &indexmap::IndexMap<String, (crate::value::FieldSchema, std::rc::Rc<crate::value::Class>)>,
+    class_name: &str,
+    args: Vec<Value>,
+    span: Span,
+) -> Result<Vec<(String, Value)>, Control> {
+    // Synthesize one positional `Param` per declared field, in declaration order.
+    // A defaulted field carries a sentinel default expression so `check_call_args`
+    // counts it toward `max` (total) but not `min` (required leading run); the
+    // sentinel is NEVER evaluated (we only consume `supplied`).
+    let params: Vec<crate::ast::Param> = fields
+        .iter()
+        .map(|(name, (schema, _))| crate::ast::Param {
+            name: name.clone(),
+            ty: Some(schema.ty.clone()),
+            name_span: span,
+            rest: false,
+            default: if schema.default.is_some() {
+                Some(crate::ast::Expr {
+                    kind: crate::ast::ExprKind::Nil,
+                    span,
+                })
+            } else {
+                None
+            },
+        })
+        .collect();
+    // Reuse the function-call arity + per-arg contract logic verbatim so messages
+    // and spans are byte-identical to a hand-written `init(x, y)`.
+    let bound = check_call_args(&params, args, span, class_name)?;
+    // Take only the supplied positional args (contract-checked by
+    // `check_call_args`); pair each with its field name. Omitted defaulted fields
+    // keep the default the caller already applied.
+    let names: Vec<&String> = fields.keys().collect();
+    Ok(bound
+        .values
+        .into_iter()
+        .take(bound.supplied)
+        .enumerate()
+        .map(|(i, v)| (names[i].clone(), v))
+        .collect())
+}
+
 pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
     use crate::ast::Type;
     match ty {
@@ -4847,13 +4912,28 @@ print(y)
     }
 
     #[tokio::test]
-    async fn class_without_init_rejects_args() {
+    async fn class_without_init_rejects_excess_args() {
+        // A zero-field class with no init auto-derives a zero-arg constructor
+        // (SP2 §5 records): `Empty(1)` is a too-many-args arity error, with the
+        // SAME wording as a 0-arg function call.
         let src = "class Empty {}\nEmpty(1)";
         let stmts = parse(&lex(src).unwrap()).unwrap();
         let interp = Interp::new();
         let env = global_env();
         let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
-        assert!(err.message.contains("no init"));
+        assert_eq!(err.message, "Empty expected 0 argument(s), got 1");
+    }
+
+    #[tokio::test]
+    async fn class_without_init_auto_derives_positional_constructor() {
+        // SP2 §5 records: a field-only class is constructed positionally, in
+        // field-declaration order, with field contracts enforced.
+        let src = "class Point { x: number\n y: number }\nlet p = Point(1, 2)\nprint(p.x)\nprint(p.y)";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        interp.exec(&stmts, &env).await.unwrap();
+        assert_eq!(interp.output(), "1\n2\n");
     }
 
     #[tokio::test]

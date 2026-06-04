@@ -3517,16 +3517,19 @@ impl Vm {
         if let Some((init, def_class)) = self.find_compiled_method(&class, "init") {
             self.invoke_compiled_method(init, inst_val.clone(), args, span, Some(def_class))
                 .await?;
-        } else if !args.is_empty() {
-            return Err(AsError::at(
-                format!(
-                    "{} has no init but was given {} argument(s)",
-                    class.name,
-                    args.len()
-                ),
-                span,
-            )
-            .into());
+        } else {
+            // SP2 §5 records: no explicit `init` → auto-derive a positional
+            // constructor over the declared fields (merged base-first order).
+            // Defaults were already applied above; the positional args OVERRIDE
+            // the supplied leading fields, each contract-checked via the SHARED
+            // `auto_init_bindings` helper — byte-identical arity/contract messages
+            // to the tree-walker's `construct`. A zero-field class with no args is
+            // unchanged (empty params → only `C()` valid).
+            let fields = crate::value::merged_field_schema(&class);
+            let bindings = crate::interp::auto_init_bindings(&fields, &class.name, args, span)?;
+            for (fname, v) in bindings {
+                instance.borrow_mut().fields.insert(fname, v);
+            }
         }
         // Re-derive the shape from the instance's ACTUAL fields now that defaults +
         // `init` have populated them. The base shape set above reflects the FULL

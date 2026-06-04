@@ -3607,9 +3607,12 @@ async fn vm_class_method_calls_method_via_self() {
 
 #[tokio::test]
 async fn vm_class_no_init_no_args() {
-    // A class with no init, constructed with no args, fields written later via
-    // member assignment; a method reads them.
-    let src = "class Bag {\n  items: number\n  fn total() { return self.items }\n}\nlet b = Bag()\nb.items = 7\nprint(b.total())";
+    // A class with no init now auto-derives a positional constructor over its
+    // declared fields (SP2 §5 records): `Bag(7)` binds `items`, and a method
+    // reads it. (Pre-records this class was `Bag()` + a late `b.items = 7`; that
+    // late-init style is superseded by the record constructor — the required
+    // field must be supplied at construction, identically on both engines.)
+    let src = "class Bag {\n  items: number\n  fn total() { return self.items }\n}\nlet b = Bag(7)\nprint(b.total())";
     assert_vm_run_matches_treewalker(src).await;
 }
 
