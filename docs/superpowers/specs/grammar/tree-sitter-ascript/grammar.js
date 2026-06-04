@@ -333,6 +333,9 @@ module.exports = grammar({
         ['&&', PREC.and],
         ['==', PREC.equality], ['!=', PREC.equality],
         ['<', PREC.compare], ['<=', PREC.compare], ['>', PREC.compare], ['>=', PREC.compare],
+        // `instanceof` is a reserved keyword at the comparison tier (SP2 §1). It is
+        // automatically reserved against `identifier` via `word: $ => $.identifier`.
+        ['instanceof', PREC.compare],
         // NOTE: `..` / `..=` are NOT in this table — a range is its own
         // `range_expression` node (carries `inclusive` + an optional contextual
         // `step`), mirroring the hand-written parser's dedicated `ExprKind::Range`.

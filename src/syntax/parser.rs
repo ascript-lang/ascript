@@ -650,7 +650,7 @@ fn infix_binding_power(kind: SyntaxKind) -> Option<(u8, u8)> {
         PipePipe => (3, 4),
         AmpAmp => (5, 6),
         EqEq | BangEq => (7, 8),
-        Lt | Le | Gt | Ge => (9, 10),
+        Lt | Le | Gt | Ge | InstanceofKw => (9, 10),
         Plus | Minus => (11, 12),
         Star | Slash | Percent => (13, 14),
         StarStar => (18, 17), // right-assoc

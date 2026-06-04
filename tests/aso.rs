@@ -135,6 +135,27 @@ fn build_then_run_aso_matches_generator_method() {
 }
 
 #[test]
+fn build_then_run_aso_matches_instanceof() {
+    // SP2 §1: a program using the `instanceof` operator compiles to the (formerly
+    // dead) `Op::InstanceOf` opcode, which round-trips through the `.aso` (format
+    // v12) and runs byte-identically to the tree-walker.
+    let dir = unique_dir("instanceof");
+    write(
+        &dir,
+        "io.as",
+        "class A {}\nclass B extends A {}\nlet b = B()\nprint(b instanceof A)\nprint(b instanceof B)\nprint(A() instanceof B)\nprint(5 instanceof A)\n",
+    );
+    build(&dir, "io.as");
+    assert!(dir.join("io.aso").exists(), "io.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "io.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "io.as"]);
+    assert_eq!(aso_out, "true\ntrue\nfalse\nfalse\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
 fn build_then_run_aso_matches_static_methods() {
     // SP1 Phase C: a class with a sync `static fn` factory AND a `static async fn`
     // factory (the blessed async-construction pattern) compiles to static protos

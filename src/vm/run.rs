@@ -493,6 +493,7 @@ impl Vm {
                 | Op::Ge
                 | Op::Eq
                 | Op::Ne
+                | Op::InstanceOf
                 | Op::Range => {
                     // The two operands were pushed lhs-then-rhs, so pop rhs first.
                     // The op's span anchors any Tier-2 panic so the VM's
@@ -3675,6 +3676,7 @@ fn binop_of(op: Op) -> BinOp {
         Op::Eq => BinOp::Eq,
         Op::Ne => BinOp::Ne,
         Op::Range => BinOp::Range,
+        Op::InstanceOf => BinOp::InstanceOf,
         _ => unreachable!("binop_of called with non-binary opcode {op:?}"),
     }
 }

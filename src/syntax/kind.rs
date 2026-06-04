@@ -205,6 +205,8 @@ pub enum SyntaxKind {
     InKw,
     #[static_text("of")]
     OfKw,
+    #[static_text("instanceof")]
+    InstanceofKw,
     #[static_text("return")]
     ReturnKw,
     #[static_text("break")]

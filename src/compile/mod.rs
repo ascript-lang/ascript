@@ -290,6 +290,7 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 SyntaxKind::AmpAmp => BinOp::And,
                 SyntaxKind::PipePipe => BinOp::Or,
                 SyntaxKind::QuestionQuestion => BinOp::Coalesce,
+                SyntaxKind::InstanceofKw => BinOp::InstanceOf,
                 other => {
                     return Err(CompileError::new(
                         format!("unsupported binary operator {other:?} in field default"),
@@ -1525,10 +1526,9 @@ impl Compiler {
     ///   SET_LOCAL <name slot>     ; bind the class to its name (like `fn name`)
     /// ```
     ///
-    /// Superclass (`extends`) and `super` are implemented (see the `extends`
-    /// handling below and `super.<name>` in `compile_expr`). The `instanceof`
-    /// operator remains reserved for SP2 (its `Op::InstanceOf` is declared but not
-    /// yet emitted) — see CLAUDE.md "Current deferrals". Each method is compiled
+    /// Superclass (`extends`), `super`, and `instanceof` (SP2 §1, emitted as
+    /// `Op::InstanceOf` from `compile_binary`) are implemented (see the `extends`
+    /// handling below and `super.<name>` in `compile_expr`). Each method is compiled
     /// with `self` already declared by the resolver as the method frame's slot 0
     /// (see `resolve_function`'s `MethodDecl` branch); the receiver is bound into
     /// slot 0 at the method CALL (`Vm::invoke_compiled_method`).
@@ -4180,6 +4180,10 @@ impl Compiler {
             SyntaxKind::Ge => Op::Ge,
             SyntaxKind::EqEq => Op::Eq,
             SyntaxKind::BangEq => Op::Ne,
+            // `x instanceof C` (SP2 §1). `INSTANCE_OF` pops `cls`+`inst`; a non-class
+            // rhs is a Tier-2 panic anchored at this same trivia-trimmed span as the
+            // tree-walker's `apply_binop`, so the message+span are byte-identical.
+            SyntaxKind::InstanceofKw => Op::InstanceOf,
             // `&&`/`||`/`??` are handled by the short-circuit path above (they
             // never reach this non-short-circuit dispatch).
             other => {

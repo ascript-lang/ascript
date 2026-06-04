@@ -377,6 +377,7 @@ fn keyword_kind(s: &str) -> Option<SyntaxKind> {
         "for" => ForKw,
         "in" => InKw,
         "of" => OfKw,
+        "instanceof" => InstanceofKw,
         "return" => ReturnKw,
         "break" => BreakKw,
         "continue" => ContinueKw,

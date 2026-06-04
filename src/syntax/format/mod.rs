@@ -1055,6 +1055,7 @@ fn is_binary_op(kind: SyntaxKind) -> bool {
             | AmpAmp
             | PipePipe
             | QuestionQuestion
+            | InstanceofKw
     )
 }
 

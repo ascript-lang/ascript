@@ -79,7 +79,12 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   re-lowered through the legacy front-end. The class byte layout is unchanged
 ///   (the source rides inside the field-default expr stream). Opcode byte values
 ///   are unchanged.
-pub const ASO_FORMAT_VERSION: u32 = 11;
+/// - 12: `instanceof` operator (SP2 §1) — the compiler now legitimately emits the
+///   formerly-dead `Op::InstanceOf` opcode, and the field-default binop wire-tag
+///   set gained tag 16 (`BinOp::InstanceOf`). Old chunks never contained either, so
+///   older readers must reject a v12 chunk. This is the single SP2 bump; later SP2
+///   phases that touch emitted bytecode reuse it.
+pub const ASO_FORMAT_VERSION: u32 = 12;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
