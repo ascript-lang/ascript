@@ -889,15 +889,18 @@ struct Compiler {
     /// instead, so the access goes through the by-reference cell. Swapped on
     /// function entry (saved/restored in `compile_fn_proto`).
     cur_cells: HashSet<u32>,
-    /// SP3 §B: current `compile_expr` nesting depth. A deeply nested SOURCE
-    /// expression (`((((…))))`, a long binary chain) overflows the
-    /// `#[async_recursion]`-free but still recursive `compile_expr`; this bounds it
-    /// at [`crate::interp::MAX_CALL_DEPTH`] — the SAME limit the tree-walker's
-    /// runtime `eval_expr` uses — so a literally-deeply-nested source trips at the
-    /// same logical nesting on both engines. Over the limit → a `CompileError` whose
-    /// message is the SAME `maximum recursion depth exceeded`; the lib boundary
-    /// surfaces it as an `AsError` with that message, byte-identical (stdout+exit)
-    /// to the tree-walker's runtime panic.
+    /// SP3 §B / O1: current `compile_expr` nesting depth — the VM's EXPRESSION-
+    /// nesting guard, mirroring the tree-walker's `eval_expr`/`expr_depth` guard. A
+    /// deeply nested SOURCE expression (`((((…))))`, a long binary chain) overflows
+    /// the recursive `compile_expr`; this bounds it at
+    /// [`crate::interp::EXPR_NEST_LIMIT`] — the SAME limit the tree-walker's runtime
+    /// `eval_expr` uses — so a literally-deeply-nested source trips at the same
+    /// nesting on both engines. This is a SEPARATE dimension from the per-call
+    /// counter (`Interp.call_depth`/`MAX_CALL_DEPTH`), so expression nesting never
+    /// contaminates the call count. Over the limit → a `CompileError` whose message
+    /// is the SAME `maximum recursion depth exceeded`; the lib boundary surfaces it
+    /// as an `AsError` with that message, byte-identical (stdout+exit) to the
+    /// tree-walker's runtime panic.
     compile_depth: u32,
 }
 
@@ -986,7 +989,7 @@ impl Compiler {
         // carrying the SAME message the tree-walker's runtime `eval_expr` panic
         // uses, so the observable result (stdout + exit) is byte-identical.
         self.compile_depth += 1;
-        if self.compile_depth > crate::interp::MAX_CALL_DEPTH {
+        if self.compile_depth > crate::interp::EXPR_NEST_LIMIT {
             self.compile_depth -= 1;
             return Err(CompileError::new(
                 "maximum recursion depth exceeded",

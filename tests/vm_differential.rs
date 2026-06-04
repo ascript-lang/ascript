@@ -6778,19 +6778,20 @@ async fn record_three_way_matches() {
 //
 // A deep non-yielding recursion (and a deeply nested expression) USED to overflow
 // the native stack and SIGABRT (exit 134) at WILDLY different depths on the two
-// engines. SP3 adds a single shared logical-depth guard (`MAX_CALL_DEPTH`) so both
-// engines raise the SAME clean, catchable Tier-2 panic `maximum recursion depth
-// exceeded` — same message, same (no) stdout, same non-134 exit — before the
+// engines. SP3 adds a single shared logical-CALL counter (`MAX_CALL_DEPTH`,
+// incremented EXACTLY ONCE per logical call on BOTH engines) so they raise the SAME
+// clean, catchable Tier-2 panic `maximum recursion depth exceeded` — same message,
+// same (no) stdout, same non-134 exit — at the SAME logical depth, before the
 // native stack blows. These cases run on an enlarged worker stack
-// (`run_on_worker_stack`, the same headroom the `run` binary uses) so the limit
-// sits comfortably under native capacity on BOTH engines.
+// (`run_on_worker_stack`, the same headroom the `run` binary uses).
 //
-// The depth at which each engine trips differs by an engine-internal factor (the
-// tree-walker also counts runtime expression nesting; the VM counts compiled
-// frames) — but the MESSAGE carries no depth number, so the observable result
-// (stdout + exit) is byte-identical as long as a program is either clearly under
-// the cap (both complete) or clearly over it (both panic). The cases below pick
-// depths far from the per-engine trip band so both engines AGREE.
+// The CEILING is IDENTICAL on both engines: a recursion to `MAX_CALL_DEPTH - 1`
+// completes on both; `MAX_CALL_DEPTH` fails on both. The boundary tests below read
+// the crate const and assert at exactly `MAX-1` (last success) and `MAX` (first
+// failure), so a re-introduced per-call double-count (e.g. counting expression
+// nesting against the call counter) would FAIL them. Deeply nested EXPRESSIONS are
+// a SEPARATE dimension (`EXPR_NEST_LIMIT`, on its own counter so it cannot
+// contaminate the per-call count); they too trip identically on both engines.
 
 /// A self-recursive driver to logical call-depth `n`.
 fn sp3_rec_src(n: usize) -> String {
@@ -6805,10 +6806,10 @@ fn sp3_nested_parens(k: usize) -> String {
 /// Run `src` on BOTH engines (tree-walker + specialized VM + generic VM) on an
 /// enlarged worker stack and assert BYTE-IDENTICAL outcome: either all three
 /// succeed with identical stdout, or all three error with the SAME message. The
-/// recursion panic's diagnostic SPAN differs by engine (the tree-walker anchors at
-/// the innermost subexpression, the VM at the call) — but the observable result
-/// (stdout + the panic message + exit) is what must match, so this compares the
-/// message, not the span.
+/// recursion guard trips at the SAME logical depth on every engine; only the
+/// panic's diagnostic SPAN differs (the tree-walker anchors at the innermost
+/// subexpression, the VM at the call), so this compares the message, not the span
+/// — the observable result (stdout + message + exit) must match exactly.
 fn sp3_assert_three_way_identical(src: &str) {
     let src = src.to_string();
     // `AsError` is `!Send` (it holds `Rc<SourceInfo>`), so the worker thread reduces
@@ -6839,27 +6840,44 @@ fn sp3_assert_three_way_identical(src: &str) {
 }
 
 #[test]
-fn sp3_recursion_under_limit_ok_identical() {
-    // Well under the per-engine trip band → all three engines complete with the
-    // identical numeric result. sum is 500 (f returns the count of 1-additions).
-    sp3_assert_three_way_identical(&sp3_rec_src(500));
+fn sp3_recursion_at_limit_minus_one_ok_identical() {
+    // SPEC §B7 boundary: a recursion to EXACTLY `MAX_CALL_DEPTH - 1` is the LAST
+    // depth that completes — and it must complete IDENTICALLY (same numeric stdout,
+    // exit 0) on all three engines. This is the strong oracle: if the tree-walker
+    // tripped earlier than the VM (the per-call double-count bug), this case would
+    // diverge (tree-walker errors, VM prints the number).
+    let n = (ascript::interp::MAX_CALL_DEPTH - 1) as usize;
+    sp3_assert_three_way_identical(&sp3_rec_src(n));
+}
+
+#[test]
+fn sp3_recursion_at_limit_panics_identical() {
+    // SPEC §B7 boundary: a recursion to EXACTLY `MAX_CALL_DEPTH` is the FIRST depth
+    // that fails — and it must fail IDENTICALLY (same `maximum recursion depth
+    // exceeded` message, no stdout, non-134 exit) on all three engines.
+    let n = ascript::interp::MAX_CALL_DEPTH as usize;
+    sp3_assert_three_way_identical(&sp3_rec_src(n));
 }
 
 #[test]
 fn sp3_recursion_over_limit_panics_identical() {
-    // Far over the cap → all three engines emit `maximum recursion depth exceeded`,
-    // no stdout, non-134 exit — byte-identical (message + outcome).
-    sp3_assert_three_way_identical(&sp3_rec_src(8000));
+    // Comfortably over the cap → all three engines emit the recursion panic, no
+    // stdout, non-134 exit — byte-identical (message + outcome).
+    let n = (ascript::interp::MAX_CALL_DEPTH + 50) as usize;
+    sp3_assert_three_way_identical(&sp3_rec_src(n));
 }
 
 #[test]
 fn sp3_mutual_recursion_over_limit_panics_identical() {
     // Mutual recursion proves the counter is per-LOGICAL-CALL, not per-function:
     // a/b alternate, so neither alone reaches the cap, but their combined depth does.
-    let src = "fn a(n) { if (n <= 0) { return 0 } return b(n - 1) }\n\
-               fn b(n) { if (n <= 0) { return 0 } return a(n - 1) }\n\
-               print(a(8000))\n";
-    sp3_assert_three_way_identical(src);
+    let n = ascript::interp::MAX_CALL_DEPTH + 50;
+    let src = format!(
+        "fn a(n) {{ if (n <= 0) {{ return 0 }} return b(n - 1) }}\n\
+         fn b(n) {{ if (n <= 0) {{ return 0 }} return a(n - 1) }}\n\
+         print(a({n}))\n"
+    );
+    sp3_assert_three_way_identical(&src);
 }
 
 #[test]
@@ -6889,15 +6907,21 @@ fn sp3_recover_then_recurse_resets_depth_identical() {
 }
 
 #[test]
-fn sp3_nested_expr_under_limit_ok_identical() {
-    // Deep-but-under-cap expression nesting compiles + evaluates to `1` on all three.
-    sp3_assert_three_way_identical(&sp3_nested_parens(2000));
+fn sp3_nested_expr_at_limit_minus_one_ok_identical() {
+    // Expression nesting is a SEPARATE dimension (`EXPR_NEST_LIMIT`). At exactly
+    // `EXPR_NEST_LIMIT - 1` it is the LAST nesting that compiles + evaluates — to `1`
+    // on all three engines, identically.
+    let k = (ascript::interp::EXPR_NEST_LIMIT - 1) as usize;
+    sp3_assert_three_way_identical(&sp3_nested_parens(k));
 }
 
 #[test]
-fn sp3_nested_expr_over_limit_panics_identical() {
-    // Expression nesting over the cap → both engines emit the same recursion panic
-    // (the tree-walker trips at runtime `eval_expr`; the VM at `compile_expr`, both
-    // surfaced as the SAME `maximum recursion depth exceeded` message).
-    sp3_assert_three_way_identical(&sp3_nested_parens(8000));
+fn sp3_nested_expr_at_limit_panics_identical() {
+    // At exactly `EXPR_NEST_LIMIT` the nesting trips identically on all three: the
+    // tree-walker at runtime `eval_expr`, the VM at compile-time `compile_expr` —
+    // BOTH surfaced as the SAME `maximum recursion depth exceeded`, no stdout,
+    // non-134 exit. (This far-edge case must NOT reintroduce the call-depth
+    // double-count — the recursion boundary tests above guard against that.)
+    let k = ascript::interp::EXPR_NEST_LIMIT as usize;
+    sp3_assert_three_way_identical(&sp3_nested_parens(k));
 }

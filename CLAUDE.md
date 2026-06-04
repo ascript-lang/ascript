@@ -272,22 +272,39 @@ the persistent session `Interp`+`Environment` (state already persists across lin
     rejection is an honest capacity error, the tree-walker is the debug/oracle engine, and no corpus
     module is remotely near 65535 of anything. A negative-sweep test (`tests/vm_limits.rs`) trips if a
     capacity `.expect`/`panic!` is re-introduced in `chunk.rs`/`aso.rs`.
-  - **(b) Recursion-depth guard, byte-identical on both engines.** A single `Interp.call_depth:
-    Cell<u32>` (shared — the VM reaches it via its `Rc<Interp>`) is bounded by `MAX_CALL_DEPTH = 3000`;
-    over it → a clean, **`recover`-catchable** Tier-2 panic `maximum recursion depth exceeded` BEFORE
-    the native stack overflows (no SIGABRT). Increment points: tree-walker `run_body` (one per call) +
-    `eval_expr` (nested-expression recursion); VM frame-push (`enter_frame_depth`) + non-root
-    `return_from_frame` decrement, a snapshot-restore `DepthRestore` guard at the re-entrant `Vm::run`
-    boundaries (`invoke_compiled_method`/`call_value`, so a panic-unwound `recover` resumes at the right
-    depth), and `compile_expr` nesting (deeply nested SOURCE expr → a `CompileError` with the SAME
-    message). Both engines emit the identical panic + non-134 exit at/over the limit and complete
-    identically under it (the message carries no depth number; the per-engine internal trip factor
-    differs but the observable stdout+exit match — see `tests/vm_differential.rs` `sp3_*`). The entry
-    points (`main`, `run_on_worker_stack`) run the program on a `WORKER_STACK_SIZE = 512 MB` worker
-    thread so 3000 logical frames sit under native capacity with > 2× headroom even for the
-    tree-walker's large debug frames. Use `Cell` (not `RefCell`) — `await_holding_refcell_ref` stays
-    satisfied. **Truly unbounded recursion stays the SP9 architectural non-goal** (needs an
-    explicit-stack VM / stackful coroutines); SP3 turns the crash into a deterministic, catchable error.
+  - **(b) Recursion-depth guard, byte-identical on both engines.** TWO separate `Interp` counters
+    (both `Cell<u32>`, shared — the VM reaches them via its `Rc<Interp>`), so neither contaminates the
+    other:
+    - **`call_depth` (limit `MAX_CALL_DEPTH = 3000`)** counts logical CALLS, incremented **EXACTLY ONCE
+      per call on BOTH engines**: tree-walker in `run_body` (the single call funnel) ONLY; VM at each
+      `CallFrame` push (`enter_frame_depth`) with the matching decrement on the non-root
+      `return_from_frame` pop, plus a snapshot-restore `DepthRestore` guard at the re-entrant `Vm::run`
+      boundaries (`invoke_compiled_method`/`call_value`, so a panic-unwound `recover` resumes at the
+      right depth). **Do NOT also increment `call_depth` in `eval_expr`** — the call sub-expression's
+      `eval_expr` frames are live alongside the `run_body` frame, so that would double-count each call
+      on the tree-walker (trips at ~MAX/2) while the VM counts one per frame (trips at MAX) — a
+      byte-identical-oracle violation on ordinary recursion. The ceiling is now IDENTICAL: `f(MAX-1)`
+      completes on both, `f(MAX)` fails on both.
+    - **`expr_depth` (limit `EXPR_NEST_LIMIT = MAX_CALL_DEPTH`)** is a SEPARATE dimension counting
+      EXPRESSION nesting (pathological `((((…))))`/binary chains, NO calls): tree-walker increments in
+      `eval_expr`, VM in the compiler's `compile_expr`. `run_body` SAVES-and-RESETS `expr_depth` to 0
+      for each call body (`ExprDepthReset`), mirroring the VM's per-body `compile_expr` reset, so a
+      caller's live `eval_expr` frames never count against a callee's body nesting (otherwise deep
+      recursion would trip `expr_depth` at ~half the call depth). Over the limit → the SAME
+      `maximum recursion depth exceeded` (tree-walker a runtime panic, VM a `CompileError` surfaced as
+      an `AsError` with that message), so both error byte-identically.
+    `DepthGuard::Drop` uses `saturating_sub` (never an underflow-panic in a destructor): a GENERATOR
+    body parks at `yield` with its guards live on the suspended future's stack while the main stack
+    mutates the shared counters, so a parked guard may drop against an already-zero counter — that is a
+    no-op, not a panic. Both engines emit the identical panic + non-134 exit at/over either limit and
+    complete identically under it (the message carries no depth number) — see `tests/vm_differential.rs`
+    `sp3_*` (boundary tests at exactly `MAX-1`/`MAX` read the crate const). The entry points (`main`,
+    `run_on_worker_stack`) run the program on a `WORKER_STACK_SIZE = 512 MB` worker thread so 3000
+    logical frames sit under native capacity with > 2× headroom even for the tree-walker's large debug
+    frames (empirically ~82 KB per logical call → 246 MB at 3000). Use `Cell` (not `RefCell`) —
+    `await_holding_refcell_ref` stays satisfied. **Truly unbounded recursion stays the SP9
+    architectural non-goal** (needs an explicit-stack VM / stackful coroutines); SP3 turns the crash
+    into a deterministic, catchable error.
 - `global_env()` builds a fresh environment with builtins installed; programs run in a `.child()` of
   it so they can shadow builtins (`let len = 5`).
 - **Native resource handles:** OS resources (TCP streams, child processes, HTTP bodies/servers, SSE,
