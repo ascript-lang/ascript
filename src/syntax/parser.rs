@@ -93,8 +93,14 @@ impl Parser {
 
     fn start(&mut self) -> Marker {
         let pos = self.events.len();
-        self.events.push(Event::Start { kind: TOMBSTONE, forward_parent: None });
-        Marker { pos, completed: false }
+        self.events.push(Event::Start {
+            kind: TOMBSTONE,
+            forward_parent: None,
+        });
+        Marker {
+            pos,
+            completed: false,
+        }
     }
 
     fn bump(&mut self) {
@@ -116,27 +122,34 @@ impl Parser {
 
     fn precede(&mut self, cm: &CompletedMarker) -> Marker {
         let new_pos = self.events.len();
-        self.events.push(Event::Start { kind: TOMBSTONE, forward_parent: None });
+        self.events.push(Event::Start {
+            kind: TOMBSTONE,
+            forward_parent: None,
+        });
         if let Event::Start { forward_parent, .. } = &mut self.events[cm.pos] {
             *forward_parent = Some(new_pos);
         }
-        Marker { pos: new_pos, completed: false }
+        Marker {
+            pos: new_pos,
+            completed: false,
+        }
     }
 
     /// True if the current token is an `Ident` whose text equals `kw` (a soft
     /// keyword like `as` / `extends` / `from`, which are not reserved).
     fn at_kw(&self, kw: &str) -> bool {
         match self.nontrivia.get(self.pos) {
-            Some(&ti) => {
-                self.tokens[ti].kind == SyntaxKind::Ident && self.tokens[ti].text == kw
-            }
+            Some(&ti) => self.tokens[ti].kind == SyntaxKind::Ident && self.tokens[ti].text == kw,
             None => false,
         }
     }
 
     fn error(&mut self, message: impl Into<String>) {
         let message = message.into();
-        self.errors.push(ParseError { message: message.clone(), token_index: self.pos });
+        self.errors.push(ParseError {
+            message: message.clone(),
+            token_index: self.pos,
+        });
         self.events.push(Event::Error { message });
     }
 }
@@ -154,7 +167,12 @@ pub fn parse(src: &str) -> Parse {
         }
     }
     p.complete(m, SyntaxKind::SourceFile);
-    Parse { events: p.events, errors: p.errors, lex_errors: p.lex_errors, tokens: p.tokens }
+    Parse {
+        events: p.events,
+        errors: p.errors,
+        lex_errors: p.lex_errors,
+        tokens: p.tokens,
+    }
 }
 
 fn stmt(p: &mut Parser) {
@@ -195,7 +213,10 @@ fn stmt(p: &mut Parser) {
 
 /// True if `async fn` starts here (vs an async arrow `async (`).
 fn is_async_fn(p: &Parser) -> bool {
-    matches!(p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind), Some(SyntaxKind::FnKw))
+    matches!(
+        p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
+        Some(SyntaxKind::FnKw)
+    )
 }
 
 fn expr_stmt(p: &mut Parser) {
@@ -212,7 +233,9 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
     let mut lhs_cm = cm;
     loop {
         let op = p.current();
-        let Some((_l_bp, r_bp)) = infix_binding_power(op) else { break };
+        let Some((_l_bp, r_bp)) = infix_binding_power(op) else {
+            break;
+        };
         let m = p.precede(&lhs_cm);
         p.bump();
         expr_bp(p, r_bp);
@@ -223,7 +246,7 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
     if p.at(SyntaxKind::DotDot) || p.at(SyntaxKind::DotDotEq) {
         let m = p.precede(&lhs_cm);
         p.bump(); // .. or ..=
-        // Optional right-hand side (a bare `..` is an open range).
+                  // Optional right-hand side (a bare `..` is an open range).
         if can_start_expr(p) {
             expr_bp(p, 1); // parse rhs at lowest precedence
         }
@@ -236,8 +259,8 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
     if p.at(SyntaxKind::Question) && ternary_ahead(p) {
         let m = p.precede(&lhs_cm);
         p.bump(); // ?
-        // Ternary branches are full sub-expressions whose `=>` (if any) cannot be a
-        // match-arm separator, so arrows are allowed even inside a guard.
+                  // Ternary branches are full sub-expressions whose `=>` (if any) cannot be a
+                  // match-arm separator, so arrows are allowed even inside a guard.
         with_arrows_allowed(p, expr); // then
         if p.at(SyntaxKind::Colon) {
             p.bump();
@@ -252,7 +275,11 @@ fn expr_returning(p: &mut Parser) -> CompletedMarker {
     // assignment() wraps ternary()), so `a ? b : c = d` parses as `(a ? b : c) = d`.
     if matches!(
         p.current(),
-        SyntaxKind::Eq | SyntaxKind::PlusEq | SyntaxKind::MinusEq | SyntaxKind::StarEq | SyntaxKind::SlashEq
+        SyntaxKind::Eq
+            | SyntaxKind::PlusEq
+            | SyntaxKind::MinusEq
+            | SyntaxKind::StarEq
+            | SyntaxKind::SlashEq
     ) {
         let m = p.precede(&lhs_cm);
         p.bump(); // = / += / -= / *= / /=
@@ -387,7 +414,7 @@ fn if_stmt(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // if
-    // AScript requires parentheses around the condition: `if (cond) { ... }`
+              // AScript requires parentheses around the condition: `if (cond) { ... }`
     if p.at(LParen) {
         p.bump(); // (
         expr(p); // condition
@@ -422,7 +449,7 @@ fn while_stmt(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // while
-    // AScript requires parentheses around the condition: `while (cond) { ... }`
+              // AScript requires parentheses around the condition: `while (cond) { ... }`
     if p.at(LParen) {
         p.bump(); // (
         expr(p); // condition
@@ -484,7 +511,9 @@ fn for_stmt(p: &mut Parser) {
     let mut iter_cm = iter;
     loop {
         let op = p.current();
-        let Some((_l, r_bp)) = infix_binding_power(op) else { break };
+        let Some((_l, r_bp)) = infix_binding_power(op) else {
+            break;
+        };
         let bm = p.precede(&iter_cm);
         p.bump();
         expr_bp(p, r_bp);
@@ -494,7 +523,7 @@ fn for_stmt(p: &mut Parser) {
         let rm = p.precede(&iter_cm);
         p.bump(); // .. or ..=
         expr(p); // range end
-        // Trailing contextual `step <expr>` after the range end.
+                 // Trailing contextual `step <expr>` after the range end.
         parse_range_step(p);
         p.complete(rm, RangeExpr);
     }
@@ -524,13 +553,35 @@ fn return_stmt(p: &mut Parser) {
 fn fn_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
-    if p.at(AsyncKw) { p.bump(); }
-    if p.at(FnKw) { p.bump(); } else { p.error("expected 'fn'"); }
-    if p.at(Star) { p.bump(); } // generator
-    if p.at(Ident) { p.bump(); } else { p.error("expected function name"); }
-    if p.at(LParen) { param_list(p); } else { p.error("expected '(' after function name"); }
-    if p.at(Colon) { ret_type(p); }
-    if p.at(LBrace) { block(p); } else { p.error("expected '{' for function body"); }
+    if p.at(AsyncKw) {
+        p.bump();
+    }
+    if p.at(FnKw) {
+        p.bump();
+    } else {
+        p.error("expected 'fn'");
+    }
+    if p.at(Star) {
+        p.bump();
+    } // generator
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected function name");
+    }
+    if p.at(LParen) {
+        param_list(p);
+    } else {
+        p.error("expected '(' after function name");
+    }
+    if p.at(Colon) {
+        ret_type(p);
+    }
+    if p.at(LBrace) {
+        block(p);
+    } else {
+        p.error("expected '{' for function body");
+    }
     p.complete(m, FnDecl);
 }
 
@@ -547,11 +598,24 @@ fn param_list(p: &mut Parser) {
     p.bump(); // (
     while !p.at(RParen) && !p.at_end() {
         let pm = p.start();
-        if p.at(DotDotDot) { p.bump(); } // rest
-        if p.at(Ident) { p.bump(); } else { p.error("expected parameter name"); }
-        if p.at(Colon) { p.bump(); type_ann(p); }
+        if p.at(DotDotDot) {
+            p.bump();
+        } // rest
+        if p.at(Ident) {
+            p.bump();
+        } else {
+            p.error("expected parameter name");
+        }
+        if p.at(Colon) {
+            p.bump();
+            type_ann(p);
+        }
         p.complete(pm, Param);
-        if p.at(Comma) { p.bump(); } else { break; }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
     }
     if p.at(RParen) {
         p.bump();
@@ -604,7 +668,9 @@ fn expr_bp(p: &mut Parser, min_bp: u8) {
     let mut lhs = lhs(p);
     loop {
         let op = p.current();
-        let Some((l_bp, r_bp)) = infix_binding_power(op) else { break };
+        let Some((l_bp, r_bp)) = infix_binding_power(op) else {
+            break;
+        };
         if l_bp < min_bp {
             break;
         }
@@ -621,8 +687,21 @@ fn can_start_expr(p: &Parser) -> bool {
     use SyntaxKind::*;
     matches!(
         p.current(),
-        Number | Str | TrueKw | FalseKw | NilKw | Ident | LParen | LBracket
-            | LBrace | Minus | Bang | TemplateStr | TemplateStart | AwaitKw | YieldKw
+        Number
+            | Str
+            | TrueKw
+            | FalseKw
+            | NilKw
+            | Ident
+            | LParen
+            | LBracket
+            | LBrace
+            | Minus
+            | Bang
+            | TemplateStr
+            | TemplateStart
+            | AwaitKw
+            | YieldKw
     )
 }
 
@@ -646,11 +725,11 @@ fn unary(p: &mut Parser) -> CompletedMarker {
         YieldKw => {
             let m = p.start();
             p.bump(); // yield
-            // `yield`'s operand is parsed at the LOWEST (assignment/expression)
-            // precedence, matching the tree-walker's `assignment()` (spec §7, like
-            // JS `yield`): `yield a + b` is `yield (a + b)` and `yield x = 1` is
-            // `yield (x = 1)`. (Contrast `await`, which is a UNARY-precedence prefix
-            // — `await x` then a binary tail: `await a + b` is `(await a) + b`.)
+                      // `yield`'s operand is parsed at the LOWEST (assignment/expression)
+                      // precedence, matching the tree-walker's `assignment()` (spec §7, like
+                      // JS `yield`): `yield a + b` is `yield (a + b)` and `yield x = 1` is
+                      // `yield (x = 1)`. (Contrast `await`, which is a UNARY-precedence prefix
+                      // — `await x` then a binary tail: `await a + b` is `(await a) + b`.)
             if can_start_expr(p) {
                 let _ = expr_returning(p);
             }
@@ -731,7 +810,11 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.complete(param_m, Param);
             p.complete(pm, ParamList);
             p.bump(); // =>
-            if p.at(LBrace) { block(p); } else { expr(p); }
+            if p.at(LBrace) {
+                block(p);
+            } else {
+                expr(p);
+            }
             p.complete(m, ArrowExpr)
         }
         Ident => {
@@ -754,7 +837,11 @@ fn primary(p: &mut Parser) -> CompletedMarker {
                 param_list(p); // `async (params) => ...`
             }
             p.bump(); // =>
-            if p.at(LBrace) { block(p); } else { expr(p); }
+            if p.at(LBrace) {
+                block(p);
+            } else {
+                expr(p);
+            }
             p.complete(m, ArrowExpr)
         }
         LParen if is_arrow_ahead(p) => {
@@ -1110,12 +1197,24 @@ fn class_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // class
-    if p.at(Ident) { p.bump(); } else { p.error("expected class name"); }
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected class name");
+    }
     if p.at_kw("extends") {
         p.bump(); // extends
-        if p.at(Ident) { p.bump(); } else { p.error("expected superclass name after 'extends'"); }
+        if p.at(Ident) {
+            p.bump();
+        } else {
+            p.error("expected superclass name after 'extends'");
+        }
     }
-    if p.at(LBrace) { p.bump(); } else { p.error("expected '{' for class body"); }
+    if p.at(LBrace) {
+        p.bump();
+    } else {
+        p.error("expected '{' for class body");
+    }
     while !p.at(RBrace) && !p.at_end() {
         let before = p.pos;
         if p.at(AsyncKw) || p.at(FnKw) {
@@ -1126,9 +1225,15 @@ fn class_decl(p: &mut Parser) {
             p.error("expected a field or method");
             p.bump();
         }
-        if p.pos == before { p.bump(); }
+        if p.pos == before {
+            p.bump();
+        }
     }
-    if p.at(RBrace) { p.bump(); } else { p.error("expected '}' to close class"); }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close class");
+    }
     p.complete(m, ClassDecl);
 }
 
@@ -1136,7 +1241,9 @@ fn field_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // field name (Ident)
-    if p.at(Question) { p.bump(); } // optional marker `name?:`
+    if p.at(Question) {
+        p.bump();
+    } // optional marker `name?:`
     if p.at(Colon) {
         p.bump();
         type_ann(p);
@@ -1153,13 +1260,35 @@ fn field_decl(p: &mut Parser) {
 fn method_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
-    if p.at(AsyncKw) { p.bump(); }
-    if p.at(FnKw) { p.bump(); } else { p.error("expected 'fn' in method"); }
-    if p.at(Star) { p.bump(); } // generator method
-    if p.at(Ident) { p.bump(); } else { p.error("expected method name"); }
-    if p.at(LParen) { param_list(p); } else { p.error("expected '(' after method name"); }
-    if p.at(Colon) { ret_type(p); }
-    if p.at(LBrace) { block(p); } else { p.error("expected '{' for method body"); }
+    if p.at(AsyncKw) {
+        p.bump();
+    }
+    if p.at(FnKw) {
+        p.bump();
+    } else {
+        p.error("expected 'fn' in method");
+    }
+    if p.at(Star) {
+        p.bump();
+    } // generator method
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected method name");
+    }
+    if p.at(LParen) {
+        param_list(p);
+    } else {
+        p.error("expected '(' after method name");
+    }
+    if p.at(Colon) {
+        ret_type(p);
+    }
+    if p.at(LBrace) {
+        block(p);
+    } else {
+        p.error("expected '{' for method body");
+    }
     p.complete(m, MethodDecl);
 }
 
@@ -1167,19 +1296,39 @@ fn enum_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
     p.bump(); // enum
-    if p.at(Ident) { p.bump(); } else { p.error("expected enum name"); }
-    if p.at(LBrace) { p.bump(); } else { p.error("expected '{' for enum body"); }
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected enum name");
+    }
+    if p.at(LBrace) {
+        p.bump();
+    } else {
+        p.error("expected '{' for enum body");
+    }
     while !p.at(RBrace) && !p.at_end() {
         let vm = p.start();
-        if p.at(Ident) { p.bump(); } else { p.error("expected variant name"); }
+        if p.at(Ident) {
+            p.bump();
+        } else {
+            p.error("expected variant name");
+        }
         if p.at(Eq) {
             p.bump();
             expr(p);
         }
         p.complete(vm, EnumVariant);
-        if p.at(Comma) { p.bump(); } else { break; }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
     }
-    if p.at(RBrace) { p.bump(); } else { p.error("expected '}' to close enum"); }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close enum");
+    }
     p.complete(m, EnumDecl);
 }
 
@@ -1189,22 +1338,50 @@ fn import_stmt(p: &mut Parser) {
     p.bump(); // import
     if p.at(Star) {
         p.bump(); // *
-        if p.at_kw("as") { p.bump(); } else { p.error("expected 'as' in namespace import"); }
-        if p.at(Ident) { p.bump(); } else { p.error("expected import alias"); }
+        if p.at_kw("as") {
+            p.bump();
+        } else {
+            p.error("expected 'as' in namespace import");
+        }
+        if p.at(Ident) {
+            p.bump();
+        } else {
+            p.error("expected import alias");
+        }
     } else if p.at(LBrace) {
         let l = p.start();
         p.bump(); // {
         while !p.at(RBrace) && !p.at_end() {
-            if p.at(Ident) { p.bump(); } else { p.error("expected an import name"); }
-            if p.at(Comma) { p.bump(); } else { break; }
+            if p.at(Ident) {
+                p.bump();
+            } else {
+                p.error("expected an import name");
+            }
+            if p.at(Comma) {
+                p.bump();
+            } else {
+                break;
+            }
         }
-        if p.at(RBrace) { p.bump(); } else { p.error("expected '}' to close import list"); }
+        if p.at(RBrace) {
+            p.bump();
+        } else {
+            p.error("expected '}' to close import list");
+        }
         p.complete(l, ImportList);
     } else {
         p.error("expected '{' or '*' after import");
     }
-    if p.at_kw("from") { p.bump(); } else { p.error("expected 'from'"); }
-    if p.at(Str) { p.bump(); } else { p.error("expected a module path string"); }
+    if p.at_kw("from") {
+        p.bump();
+    } else {
+        p.error("expected 'from'");
+    }
+    if p.at(Str) {
+        p.bump();
+    } else {
+        p.error("expected a module path string");
+    }
     p.complete(m, ImportStmt);
 }
 
@@ -1283,10 +1460,10 @@ fn match_arm(p: &mut Parser) {
     if p.at(IfKw) {
         let g = p.start();
         p.bump(); // if
-        // Suppress a TOP-LEVEL bare `IDENT =>` (or `async IDENT/(…) =>`) inside the
-        // guard: a guard ending in a bare identifier (`n if n == lim => ...`) must
-        // not swallow the arm's `=>`. Parenthesized/nested arrows still parse
-        // because every bracketed descent clears the flag via `with_arrows_allowed`.
+                  // Suppress a TOP-LEVEL bare `IDENT =>` (or `async IDENT/(…) =>`) inside the
+                  // guard: a guard ending in a bare identifier (`n if n == lim => ...`) must
+                  // not swallow the arm's `=>`. Parenthesized/nested arrows still parse
+                  // because every bracketed descent clears the flag via `with_arrows_allowed`.
         let saved = p.suppress_arrow;
         p.suppress_arrow = true;
         expr(p);
@@ -1323,7 +1500,11 @@ fn primary_no_arrow(p: &mut Parser) -> CompletedMarker {
             let m = p.start();
             p.bump(); // (
             expr(p);
-            if p.at(RParen) { p.bump(); } else { p.error("expected ')'"); }
+            if p.at(RParen) {
+                p.bump();
+            } else {
+                p.error("expected ')'");
+            }
             p.complete(m, ParenExpr)
         }
         _ => {
@@ -1471,7 +1652,11 @@ mod tests {
     fn parses_a_number_statement() {
         assert_eq!(
             node_kinds("42"),
-            vec![SyntaxKind::SourceFile, SyntaxKind::ExprStmt, SyntaxKind::Literal]
+            vec![
+                SyntaxKind::SourceFile,
+                SyntaxKind::ExprStmt,
+                SyntaxKind::Literal
+            ]
         );
         assert!(parse("42").errors.is_empty());
     }
@@ -1480,7 +1665,13 @@ mod tests {
     fn unexpected_token_recovers_not_panics() {
         let p = parse("+");
         assert!(!p.errors.is_empty(), "should record an error");
-        assert!(matches!(p.events.first(), Some(Event::Start { kind: SyntaxKind::SourceFile, .. })));
+        assert!(matches!(
+            p.events.first(),
+            Some(Event::Start {
+                kind: SyntaxKind::SourceFile,
+                ..
+            })
+        ));
     }
 
     fn tree_shape(src: &str) -> Vec<SyntaxKind> {
@@ -1504,11 +1695,13 @@ mod tests {
         assert_eq!(
             shape,
             vec![
-                SyntaxKind::SourceFile, SyntaxKind::ExprStmt,
+                SyntaxKind::SourceFile,
+                SyntaxKind::ExprStmt,
                 SyntaxKind::BinaryExpr,
                 SyntaxKind::Literal,
                 SyntaxKind::BinaryExpr,
-                SyntaxKind::Literal, SyntaxKind::Literal,
+                SyntaxKind::Literal,
+                SyntaxKind::Literal,
             ]
         );
         assert!(parse("1 + 2 * 3").errors.is_empty());
@@ -1519,8 +1712,11 @@ mod tests {
         assert_eq!(
             tree_shape("-(1)"),
             vec![
-                SyntaxKind::SourceFile, SyntaxKind::ExprStmt,
-                SyntaxKind::UnaryExpr, SyntaxKind::ParenExpr, SyntaxKind::Literal,
+                SyntaxKind::SourceFile,
+                SyntaxKind::ExprStmt,
+                SyntaxKind::UnaryExpr,
+                SyntaxKind::ParenExpr,
+                SyntaxKind::Literal,
             ]
         );
     }
@@ -1529,7 +1725,11 @@ mod tests {
     fn name_reference() {
         assert_eq!(
             tree_shape("x"),
-            vec![SyntaxKind::SourceFile, SyntaxKind::ExprStmt, SyntaxKind::NameRef]
+            vec![
+                SyntaxKind::SourceFile,
+                SyntaxKind::ExprStmt,
+                SyntaxKind::NameRef
+            ]
         );
     }
 
@@ -1537,7 +1737,11 @@ mod tests {
     fn let_statement() {
         assert_eq!(
             tree_shape("let x = 1"),
-            vec![SyntaxKind::SourceFile, SyntaxKind::LetStmt, SyntaxKind::Literal]
+            vec![
+                SyntaxKind::SourceFile,
+                SyntaxKind::LetStmt,
+                SyntaxKind::Literal
+            ]
         );
         assert!(parse("let x = 1").errors.is_empty());
     }
@@ -1604,7 +1808,10 @@ mod tests {
         let shape = tree_shape("a = b = c");
         // Two AssignExpr nodes (nested), no error.
         assert_eq!(
-            shape.iter().filter(|k| **k == SyntaxKind::AssignExpr).count(),
+            shape
+                .iter()
+                .filter(|k| **k == SyntaxKind::AssignExpr)
+                .count(),
             2,
             "shape: {shape:?}"
         );
@@ -1662,7 +1869,9 @@ mod tests {
         assert!(shape.contains(&SyntaxKind::ObjectExpr));
         assert!(shape.contains(&SyntaxKind::ObjectField));
         assert!(shape.contains(&SyntaxKind::SpreadElem));
-        assert!(parse(r#"let o = { a: 1, "k": 2, ...rest }"#).errors.is_empty());
+        assert!(parse(r#"let o = { a: 1, "k": 2, ...rest }"#)
+            .errors
+            .is_empty());
     }
 
     #[test]
@@ -1725,11 +1934,18 @@ mod tests {
         // The unwrap tier is looser than unary, so `await x?` = `(await x)?`:
         // in pre-order the TryExpr must appear BEFORE (wrap) the AwaitExpr.
         let shape = tree_shape("await x?");
-        let try_idx = shape.iter().position(|k| *k == SyntaxKind::TryExpr)
+        let try_idx = shape
+            .iter()
+            .position(|k| *k == SyntaxKind::TryExpr)
             .expect("TryExpr present");
-        let await_idx = shape.iter().position(|k| *k == SyntaxKind::AwaitExpr)
+        let await_idx = shape
+            .iter()
+            .position(|k| *k == SyntaxKind::AwaitExpr)
             .expect("AwaitExpr present");
-        assert!(try_idx < await_idx, "expected (await x)? — TryExpr should wrap AwaitExpr");
+        assert!(
+            try_idx < await_idx,
+            "expected (await x)? — TryExpr should wrap AwaitExpr"
+        );
     }
 
     #[test]
@@ -1749,7 +1965,10 @@ mod tests {
         for src in ["x += 1", "x -= 1", "x *= 2", "x /= 2"] {
             let p = parse(src);
             assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
-            assert!(tree_shape(src).contains(&SyntaxKind::AssignExpr), "no assign for {src}");
+            assert!(
+                tree_shape(src).contains(&SyntaxKind::AssignExpr),
+                "no assign for {src}"
+            );
         }
     }
 
@@ -1782,7 +2001,10 @@ mod tests {
         ] {
             let p = parse(src);
             assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
-            assert!(tree_shape(src).contains(&SyntaxKind::ForStmt), "no ForStmt for {src}");
+            assert!(
+                tree_shape(src).contains(&SyntaxKind::ForStmt),
+                "no ForStmt for {src}"
+            );
         }
         assert!(tree_shape("for (i in 1..6) {}").contains(&SyntaxKind::RangeExpr));
     }
@@ -1812,8 +2034,14 @@ mod tests {
         ] {
             let p = parse(src);
             assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
-            assert!(tree_shape(src).contains(&kind), "missing {kind:?} for {src}");
-            assert!(!tree_shape(src).contains(&SyntaxKind::Error), "Error node for {src}");
+            assert!(
+                tree_shape(src).contains(&kind),
+                "missing {kind:?} for {src}"
+            );
+            assert!(
+                !tree_shape(src).contains(&SyntaxKind::Error),
+                "Error node for {src}"
+            );
         }
     }
 
@@ -1828,7 +2056,10 @@ mod tests {
         ] {
             let p = parse(src);
             assert!(p.errors.is_empty(), "errors for {src}: {:?}", p.errors);
-            assert!(tree_shape(src).contains(&SyntaxKind::FnDecl), "no FnDecl for {src}");
+            assert!(
+                tree_shape(src).contains(&SyntaxKind::FnDecl),
+                "no FnDecl for {src}"
+            );
         }
         assert!(tree_shape("fn add(a: number): number {}").contains(&SyntaxKind::RetType));
     }
@@ -1866,9 +2097,15 @@ mod tests {
         assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
         let s = tree_shape(src);
         for k in [
-            SyntaxKind::MatchExpr, SyntaxKind::MatchArm, SyntaxKind::MatchGuard,
-            SyntaxKind::WildcardPat, SyntaxKind::LiteralPat, SyntaxKind::RangePat,
-            SyntaxKind::OrPat, SyntaxKind::ArrayPat, SyntaxKind::ObjectPat,
+            SyntaxKind::MatchExpr,
+            SyntaxKind::MatchArm,
+            SyntaxKind::MatchGuard,
+            SyntaxKind::WildcardPat,
+            SyntaxKind::LiteralPat,
+            SyntaxKind::RangePat,
+            SyntaxKind::OrPat,
+            SyntaxKind::ArrayPat,
+            SyntaxKind::ObjectPat,
             SyntaxKind::PatRest,
         ] {
             assert!(s.contains(&k), "missing {k:?}");
@@ -1890,7 +2127,10 @@ mod tests {
             !s.contains(&SyntaxKind::ArrowExpr),
             "guard was mis-parsed as an arrow: {s:?}"
         );
-        assert!(!s.contains(&SyntaxKind::Error), "unexpected Error node: {s:?}");
+        assert!(
+            !s.contains(&SyntaxKind::Error),
+            "unexpected Error node: {s:?}"
+        );
         // Both arms must have a body: the arm node count should be 2.
         let arms = s.iter().filter(|&&k| k == SyntaxKind::MatchArm).count();
         assert_eq!(arms, 2, "expected 2 arms, got shape {s:?}");
@@ -1914,7 +2154,10 @@ mod tests {
         let p = parse(src);
         assert!(p.errors.is_empty(), "errors: {:?}", p.errors);
         let s = tree_shape(src);
-        assert!(s.contains(&SyntaxKind::ArrowExpr), "paren arrow lost: {s:?}");
+        assert!(
+            s.contains(&SyntaxKind::ArrowExpr),
+            "paren arrow lost: {s:?}"
+        );
         assert!(!s.contains(&SyntaxKind::Error), "unexpected Error: {s:?}");
     }
 

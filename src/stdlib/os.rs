@@ -183,7 +183,10 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                         .collect();
                     make_obj(&[
                         ("name", Value::Str(name.as_str().into())),
-                        ("addresses", Value::Array(gcmodule::Cc::new(RefCell::new(addrs)))),
+                        (
+                            "addresses",
+                            Value::Array(gcmodule::Cc::new(RefCell::new(addrs))),
+                        ),
                     ])
                 })
                 .collect();

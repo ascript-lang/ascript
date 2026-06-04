@@ -174,13 +174,23 @@ mod tests {
     #[test]
     fn too_many_args_flagged() {
         let src = "fn f(a, b) { return a }\nf(1, 2, 3)";
-        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "call-arity"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn too_few_args_flagged() {
         let src = "fn f(a, b) { return a }\nf(1)";
-        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "call-arity"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
@@ -220,7 +230,8 @@ mod tests {
         // `cb` inside `apply` is the PARAMETER (a 1-arg lambda passed in), not the
         // top-level `fn cb(a, b)`. Calling `cb(99)` must NOT be checked against the
         // top-level fn's arity. (BLOCKER false-positive regression.)
-        let src = "fn cb(a, b) { return a }\nfn apply(cb) { return cb(99) }\nprint(apply((n) => n * 2))";
+        let src =
+            "fn cb(a, b) { return a }\nfn apply(cb) { return cb(99) }\nprint(apply((n) => n * 2))";
         assert!(!has(src, "call-arity"), "{:?}", analyze(src).diagnostics);
     }
 
@@ -236,7 +247,12 @@ mod tests {
     fn genuine_mismatch_still_flagged() {
         // The fix must not silence real mismatches to a uniquely-named top-level fn.
         let src = "fn f(a, b) { return a }\nf(1, 2, 3)";
-        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "call-arity"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]

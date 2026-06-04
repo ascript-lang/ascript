@@ -62,7 +62,11 @@ mod tests {
     #[test]
     fn flags_dropped_async_call() {
         let src = "async fn work() { return 1 }\nfn main() { work() }\nmain()\n";
-        assert!(has(src, "unawaited-future"), "{:?}", analyze(src).diagnostics);
+        assert!(
+            has(src, "unawaited-future"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
@@ -73,7 +77,8 @@ mod tests {
 
     #[test]
     fn assigned_or_returned_not_flagged() {
-        let src = "async fn work() { return 1 }\nfn a() { let f = work() }\nfn b() { return work() }\n";
+        let src =
+            "async fn work() { return 1 }\nfn a() { let f = work() }\nfn b() { return work() }\n";
         assert!(!has(src, "unawaited-future"));
     }
 

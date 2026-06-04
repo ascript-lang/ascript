@@ -81,43 +81,78 @@ mod tests {
     #[test]
     fn number_field_string_default_flagged() {
         let src = "class P { n: number = \"x\" }";
-        assert_eq!(count(src, "field-default-type"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "field-default-type"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn string_field_number_default_flagged() {
         let src = "class P { s: string = 5 }";
-        assert_eq!(count(src, "field-default-type"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "field-default-type"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn matching_number_default_ok() {
         let src = "class P { n: number = 5 }";
-        assert_eq!(count(src, "field-default-type"), 0, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "field-default-type"),
+            0,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn matching_string_default_ok() {
         let src = "class P { s: string = \"ok\" }";
-        assert_eq!(count(src, "field-default-type"), 0, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "field-default-type"),
+            0,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn nil_default_to_optional_ok() {
         let src = "class P { n: number? = nil }";
-        assert_eq!(count(src, "field-default-type"), 0, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "field-default-type"),
+            0,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn nil_default_to_non_optional_flagged() {
         let src = "class P { n: number = nil }";
-        assert_eq!(count(src, "field-default-type"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "field-default-type"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn computed_default_skipped() {
         let src = "class P { xs: array<number> = foo() }";
-        assert_eq!(count(src, "field-default-type"), 0, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "field-default-type"),
+            0,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]

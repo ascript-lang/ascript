@@ -46,7 +46,10 @@ fn fn_type_is_not_a_syntax_error() {
     // `fn` is a valid type (Type::Fn); the CST type parser must accept it so the
     // checker does not emit a false `syntax-error`. Regression for the missing
     // `FnKw` arm in `type_primary`.
-    let p = write_tmp("fntype.as", "fn apply(g: fn, x) { return g(x) }\napply((n) => n, 1)\n");
+    let p = write_tmp(
+        "fntype.as",
+        "fn apply(g: fn, x) { return g(x) }\napply((n) => n, 1)\n",
+    );
     let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
     let combined = format!(
         "{}{}",
@@ -99,7 +102,10 @@ fn syntax_error_exits_nonzero_and_reports() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(combined.contains("syntax-error"), "should name the rule: {combined}");
+    assert!(
+        combined.contains("syntax-error"),
+        "should name the rule: {combined}"
+    );
 }
 #[test]
 fn warning_only_exits_zero_without_deny_but_one_with() {
@@ -132,7 +138,10 @@ fn json_output_is_a_json_array() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.trim_start().starts_with('['), "json output: {stdout}");
+    assert!(
+        stdout.trim_start().starts_with('['),
+        "json output: {stdout}"
+    );
     assert!(stdout.contains("\"code\":\"syntax-error\""));
 }
 
@@ -143,7 +152,10 @@ fn deny_promotes_warning_to_error_exit() {
     // `let x = 1` is unused-binding (Warning by default → exit 0).
     let p = write_tmp("deny_warn.as", "let x = 1\n");
     let plain = Command::new(bin()).arg("check").arg(&p).output().unwrap();
-    assert!(plain.status.success(), "warning-only must exit 0 by default");
+    assert!(
+        plain.status.success(),
+        "warning-only must exit 0 by default"
+    );
     // --deny unused-binding promotes it to Error → non-zero exit.
     let denied = Command::new(bin())
         .arg("check")
@@ -344,7 +356,11 @@ mod toml_config {
     fn toml_deny_promotes_warning_to_error_exit() {
         let dir = project("deny");
         let f = write(&dir, "a.as", "let x = 1\n");
-        write(&dir, "ascript.toml", "[lint]\ndeny = [\"unused-binding\"]\n");
+        write(
+            &dir,
+            "ascript.toml",
+            "[lint]\ndeny = [\"unused-binding\"]\n",
+        );
         let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
         assert!(
             !out.status.success(),
@@ -358,7 +374,11 @@ mod toml_config {
         // toml denies, CLI allows → CLI wins → exit 0 (CLI > toml).
         let dir = project("cli_over_toml");
         let f = write(&dir, "a.as", "let x = 1\n");
-        write(&dir, "ascript.toml", "[lint]\ndeny = [\"unused-binding\"]\n");
+        write(
+            &dir,
+            "ascript.toml",
+            "[lint]\ndeny = [\"unused-binding\"]\n",
+        );
         let out = Command::new(bin())
             .arg("check")
             .arg("--allow")
@@ -377,7 +397,11 @@ mod toml_config {
     fn toml_allow_suppresses_rule() {
         let dir = project("allow");
         let f = write(&dir, "a.as", "let x = 1\n");
-        write(&dir, "ascript.toml", "[lint]\nallow = [\"unused-binding\"]\n");
+        write(
+            &dir,
+            "ascript.toml",
+            "[lint]\nallow = [\"unused-binding\"]\n",
+        );
         let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
         assert!(out.status.success(), "toml allow must exit 0");
         assert!(
@@ -421,7 +445,10 @@ mod toml_config {
         let f = write(&dir, "a.as", "let x = 1\n");
         write(&dir, "ascript.toml", "[lint\ndeny = [\n");
         let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
-        assert!(!out.status.success(), "broken toml syntax must exit non-zero");
+        assert!(
+            !out.status.success(),
+            "broken toml syntax must exit non-zero"
+        );
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
             err.contains("ascript.toml"),
@@ -435,7 +462,10 @@ mod toml_config {
         let f = write(&dir, "a.as", "let x = 1\n");
         write(&dir, "ascript.toml", "[lint]\ndeny = [\"bogus\"]\n");
         let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
-        assert!(!out.status.success(), "unknown rule in toml must exit non-zero");
+        assert!(
+            !out.status.success(),
+            "unknown rule in toml must exit non-zero"
+        );
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
             err.contains("ascript.toml") && err.contains("bogus"),
@@ -463,7 +493,11 @@ mod toml_config {
         let sub = dir.join("src").join("nested");
         std::fs::create_dir_all(&sub).unwrap();
         let f = write(&sub, "a.as", "let x = 1\n");
-        write(&dir, "ascript.toml", "[lint]\ndeny = [\"unused-binding\"]\n");
+        write(
+            &dir,
+            "ascript.toml",
+            "[lint]\ndeny = [\"unused-binding\"]\n",
+        );
         let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
         assert!(
             !out.status.success(),
@@ -476,8 +510,16 @@ mod toml_config {
     fn inline_ignore_beats_toml_deny() {
         // inline ascript-ignore always wins over a toml deny.
         let dir = project("inline");
-        let f = write(&dir, "a.as", "let x = 1 // ascript-ignore[unused-binding]\n");
-        write(&dir, "ascript.toml", "[lint]\ndeny = [\"unused-binding\"]\n");
+        let f = write(
+            &dir,
+            "a.as",
+            "let x = 1 // ascript-ignore[unused-binding]\n",
+        );
+        write(
+            &dir,
+            "ascript.toml",
+            "[lint]\ndeny = [\"unused-binding\"]\n",
+        );
         let out = Command::new(bin()).arg("check").arg(&f).output().unwrap();
         assert!(
             out.status.success(),

@@ -23,8 +23,8 @@ fn main() {
 fn generate_ast_nodes() {
     use std::fmt::Write as _;
     println!("cargo:rerun-if-changed=src/syntax/ast/ascript.ungram");
-    let text = std::fs::read_to_string("src/syntax/ast/ascript.ungram")
-        .expect("read ascript.ungram");
+    let text =
+        std::fs::read_to_string("src/syntax/ast/ascript.ungram").expect("read ascript.ungram");
     let grammar: ungrammar::Grammar = text.parse().expect("parse ungrammar");
 
     let mut out = String::new();
@@ -52,7 +52,10 @@ fn generate_ast_nodes() {
             }
             let _ = writeln!(out, "}}");
             let _ = writeln!(out, "impl {name} {{");
-            let _ = writeln!(out, "    pub fn cast(node: ResolvedNode) -> Option<Self> {{");
+            let _ = writeln!(
+                out,
+                "    pub fn cast(node: ResolvedNode) -> Option<Self> {{"
+            );
             let _ = writeln!(out, "        match node.kind() {{");
             for v in &variants {
                 let _ = writeln!(
@@ -84,13 +87,19 @@ fn generate_ast_nodes() {
         let _ = writeln!(out, "#[derive(Debug, Clone)]");
         let _ = writeln!(out, "pub struct {name}(pub ResolvedNode);");
         let _ = writeln!(out, "impl {name} {{");
-        let _ = writeln!(out, "    pub fn cast(node: ResolvedNode) -> Option<Self> {{");
+        let _ = writeln!(
+            out,
+            "    pub fn cast(node: ResolvedNode) -> Option<Self> {{"
+        );
         let _ = writeln!(
             out,
             "        if node.kind() == SyntaxKind::{name} {{ Some(Self(node)) }} else {{ None }}"
         );
         let _ = writeln!(out, "    }}");
-        let _ = writeln!(out, "    pub fn syntax(&self) -> &ResolvedNode {{ &self.0 }}");
+        let _ = writeln!(
+            out,
+            "    pub fn syntax(&self) -> &ResolvedNode {{ &self.0 }}"
+        );
         // Data-driven typed child accessors derived from this node's rule shape.
         emit_accessors(&grammar, node, &mut out);
         let _ = writeln!(out, "}}");
@@ -231,8 +240,8 @@ fn token_kind(name: &str) -> Option<&'static str> {
 fn safe_method(name: &str) -> String {
     // Raw-identifier-able keywords that can appear as derived method names.
     const KW: &[&str] = &[
-        "type", "match", "if", "else", "for", "while", "return", "break", "continue",
-        "fn", "let", "const", "enum", "impl", "struct", "in", "loop", "move", "ref",
+        "type", "match", "if", "else", "for", "while", "return", "break", "continue", "fn", "let",
+        "const", "enum", "impl", "struct", "in", "loop", "move", "ref",
     ];
     if KW.contains(&name) {
         format!("r#{name}")
@@ -277,7 +286,8 @@ fn emit_accessors(grammar: &ungrammar::Grammar, node: ungrammar::Node, out: &mut
     let mut node_fields: Vec<Field> = Vec::new();
     let mut token_fields: Vec<TokenField> = Vec::new();
     // Per-type running count, so the i-th `Expr` child gets index i for nth_child.
-    let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
 
     // Walk a rule, threading the current label down so `lhs:Expr` names the field.
     fn walk(
@@ -291,19 +301,51 @@ fn emit_accessors(grammar: &ungrammar::Grammar, node: ungrammar::Node, out: &mut
     ) {
         match rule {
             Rule::Labeled { label, rule } => {
-                walk(grammar, rule, Some(label), repeated, node_fields, token_fields, type_counts);
+                walk(
+                    grammar,
+                    rule,
+                    Some(label),
+                    repeated,
+                    node_fields,
+                    token_fields,
+                    type_counts,
+                );
             }
             Rule::Seq(rules) => {
                 for r in rules {
-                    walk(grammar, r, None, repeated, node_fields, token_fields, type_counts);
+                    walk(
+                        grammar,
+                        r,
+                        None,
+                        repeated,
+                        node_fields,
+                        token_fields,
+                        type_counts,
+                    );
                 }
             }
             Rule::Opt(inner) => {
                 // Optional doesn't change arity for our purposes (single → Option<T>).
-                walk(grammar, inner, label, repeated, node_fields, token_fields, type_counts);
+                walk(
+                    grammar,
+                    inner,
+                    label,
+                    repeated,
+                    node_fields,
+                    token_fields,
+                    type_counts,
+                );
             }
             Rule::Rep(inner) => {
-                walk(grammar, inner, label, true, node_fields, token_fields, type_counts);
+                walk(
+                    grammar,
+                    inner,
+                    label,
+                    true,
+                    node_fields,
+                    token_fields,
+                    type_counts,
+                );
             }
             Rule::Node(n) => {
                 let ty = grammar[*n].name.clone();
@@ -314,7 +356,12 @@ fn emit_accessors(grammar: &ungrammar::Grammar, node: ungrammar::Node, out: &mut
                     None if repeated => plural(&ty),
                     None => to_snake(&ty),
                 };
-                node_fields.push(Field { method, ty, repeated, index: idx });
+                node_fields.push(Field {
+                    method,
+                    ty,
+                    repeated,
+                    index: idx,
+                });
             }
             Rule::Token(t) => {
                 // Single significant token. Only surface ident/keyword/literal tokens
@@ -355,13 +402,25 @@ fn emit_accessors(grammar: &ungrammar::Grammar, node: ungrammar::Node, out: &mut
                     }
                     if !kinds.is_empty() {
                         let method = label.unwrap_or("op").to_string();
-                        token_fields.push(TokenField { method, kinds, is_alt: true });
+                        token_fields.push(TokenField {
+                            method,
+                            kinds,
+                            is_alt: true,
+                        });
                     }
                 } else {
                     // Mixed alt of nodes/tokens (e.g. `Block | Expr`): recurse so each
                     // node alternative still gets a single-child accessor.
                     for a in alts {
-                        walk(grammar, a, label, repeated, node_fields, token_fields, type_counts);
+                        walk(
+                            grammar,
+                            a,
+                            label,
+                            repeated,
+                            node_fields,
+                            token_fields,
+                            type_counts,
+                        );
                     }
                 }
             }
@@ -395,7 +454,10 @@ fn emit_accessors(grammar: &ungrammar::Grammar, node: ungrammar::Node, out: &mut
             );
         } else {
             // Use nth_child when ≥1 sibling shares this type, else child().
-            let same_type = node_fields.iter().filter(|g| g.ty == f.ty && !g.repeated).count();
+            let same_type = node_fields
+                .iter()
+                .filter(|g| g.ty == f.ty && !g.repeated)
+                .count();
             if same_type > 1 {
                 let _ = writeln!(
                     out,
@@ -420,7 +482,11 @@ fn emit_accessors(grammar: &ungrammar::Grammar, node: ungrammar::Node, out: &mut
             continue;
         }
         if tf.is_alt {
-            let kinds: Vec<String> = tf.kinds.iter().map(|k| format!("SyntaxKind::{k}")).collect();
+            let kinds: Vec<String> = tf
+                .kinds
+                .iter()
+                .map(|k| format!("SyntaxKind::{k}"))
+                .collect();
             let _ = writeln!(
                 out,
                 "    pub fn {m}(&self) -> Option<SyntaxKind> {{ support::token_in(&self.0, &[{ks}]).map(|t| t.kind()) }}",

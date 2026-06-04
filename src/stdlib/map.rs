@@ -212,9 +212,9 @@ mod tests {
             Err(Control::Panic(_))
         ));
         // wrong-arity entry → panic
-        let bad = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Array(gcmodule::Cc::new(
-            RefCell::new(vec![Value::Number(1.0)]),
-        ))])));
+        let bad = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Array(
+            gcmodule::Cc::new(RefCell::new(vec![Value::Number(1.0)])),
+        )])));
         assert!(matches!(call("new", &[bad], sp), Err(Control::Panic(_))));
     }
 

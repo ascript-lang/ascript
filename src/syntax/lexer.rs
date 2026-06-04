@@ -132,7 +132,8 @@ pub fn lex_with_errors(src: &str) -> (Vec<LexToken>, Vec<LexError>) {
 
         // templates: `...` with ${ } interpolations
         if c == '`' {
-            let (kind, j, terminated) = scan_template_chunk(&chars, i, /*from_backtick=*/ true);
+            let (kind, j, terminated) =
+                scan_template_chunk(&chars, i, /*from_backtick=*/ true);
             push!(kind, start, j);
             i = j;
             if kind == SyntaxKind::TemplateStart {
@@ -149,7 +150,8 @@ pub fn lex_with_errors(src: &str) -> (Vec<LexToken>, Vec<LexError>) {
 
         // a `}` that closes a template interpolation resumes template text
         if c == '}' && template_stack.last().map(|&(d, _)| d) == Some(brace_depth) {
-            let (kind, j, terminated) = scan_template_chunk(&chars, i, /*from_backtick=*/ false);
+            let (kind, j, terminated) =
+                scan_template_chunk(&chars, i, /*from_backtick=*/ false);
             push!(kind, start, j);
             i = j;
             if kind == SyntaxKind::TemplateEnd {
@@ -333,17 +335,29 @@ fn scan_template_chunk(chars: &[char], i: usize, from_backtick: bool) -> (Syntax
         match chars[j] {
             '\\' if j + 1 < n => j += 2,
             '`' => {
-                let kind = if from_backtick { TemplateStr } else { TemplateEnd };
+                let kind = if from_backtick {
+                    TemplateStr
+                } else {
+                    TemplateEnd
+                };
                 return (kind, j + 1, true);
             }
             '$' if j + 1 < n && chars[j + 1] == '{' => {
-                let kind = if from_backtick { TemplateStart } else { TemplateMiddle };
+                let kind = if from_backtick {
+                    TemplateStart
+                } else {
+                    TemplateMiddle
+                };
                 return (kind, j + 2, true); // include the ${
             }
             _ => j += 1,
         }
     }
-    let kind = if from_backtick { TemplateStr } else { TemplateEnd };
+    let kind = if from_backtick {
+        TemplateStr
+    } else {
+        TemplateEnd
+    };
     (kind, n, false)
 }
 
@@ -352,13 +366,29 @@ fn scan_template_chunk(chars: &[char], i: usize, from_backtick: bool) -> (Syntax
 fn keyword_kind(s: &str) -> Option<SyntaxKind> {
     use SyntaxKind::*;
     Some(match s {
-        "true" => TrueKw, "false" => FalseKw, "nil" => NilKw,
-        "let" => LetKw, "const" => ConstKw, "if" => IfKw, "else" => ElseKw,
-        "while" => WhileKw, "for" => ForKw, "in" => InKw, "of" => OfKw,
-        "return" => ReturnKw, "break" => BreakKw, "continue" => ContinueKw,
-        "fn" => FnKw, "enum" => EnumKw, "match" => MatchKw, "class" => ClassKw,
-        "import" => ImportKw, "export" => ExportKw, "async" => AsyncKw,
-        "await" => AwaitKw, "yield" => YieldKw,
+        "true" => TrueKw,
+        "false" => FalseKw,
+        "nil" => NilKw,
+        "let" => LetKw,
+        "const" => ConstKw,
+        "if" => IfKw,
+        "else" => ElseKw,
+        "while" => WhileKw,
+        "for" => ForKw,
+        "in" => InKw,
+        "of" => OfKw,
+        "return" => ReturnKw,
+        "break" => BreakKw,
+        "continue" => ContinueKw,
+        "fn" => FnKw,
+        "enum" => EnumKw,
+        "match" => MatchKw,
+        "class" => ClassKw,
+        "import" => ImportKw,
+        "export" => ExportKw,
+        "async" => AsyncKw,
+        "await" => AwaitKw,
+        "yield" => YieldKw,
         _ => return None,
     })
 }
@@ -380,7 +410,10 @@ mod tests {
     #[test]
     fn classifies_trivia_kinds() {
         use SyntaxKind::*;
-        assert_eq!(kinds("  \n// c\n"), vec![Whitespace, Newline, LineComment, Newline]);
+        assert_eq!(
+            kinds("  \n// c\n"),
+            vec![Whitespace, Newline, LineComment, Newline]
+        );
     }
 
     #[test]
@@ -393,7 +426,11 @@ mod tests {
     fn unterminated_string_reports_error() {
         let (tokens, errors) = lex_with_errors("\"oops");
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
-        assert!(errors[0].message.contains("unterminated"), "msg: {}", errors[0].message);
+        assert!(
+            errors[0].message.contains("unterminated"),
+            "msg: {}",
+            errors[0].message
+        );
         assert_eq!(tokens[errors[0].token].kind, SyntaxKind::Str);
         // Losslessness preserved.
         assert_eq!(render(&tokens), "\"oops");
@@ -412,7 +449,11 @@ mod tests {
     fn unterminated_block_comment_reports_error() {
         let (tokens, errors) = lex_with_errors("/* nope");
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
-        assert!(errors[0].message.contains("block comment"), "msg: {}", errors[0].message);
+        assert!(
+            errors[0].message.contains("block comment"),
+            "msg: {}",
+            errors[0].message
+        );
         assert_eq!(render(&tokens), "/* nope");
     }
 
@@ -420,7 +461,11 @@ mod tests {
     fn unterminated_template_reports_error() {
         let (_tokens, errors) = lex_with_errors("`abc");
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
-        assert!(errors[0].message.contains("template"), "msg: {}", errors[0].message);
+        assert!(
+            errors[0].message.contains("template"),
+            "msg: {}",
+            errors[0].message
+        );
     }
 
     #[test]
@@ -428,7 +473,11 @@ mod tests {
         // `` `a${b `` — the TemplateStart closed (by `${`) but never reached a `` ` ``.
         let (tokens, errors) = lex_with_errors("`a${b");
         assert_eq!(errors.len(), 1, "errors: {errors:?}");
-        assert!(errors[0].message.contains("template"), "msg: {}", errors[0].message);
+        assert!(
+            errors[0].message.contains("template"),
+            "msg: {}",
+            errors[0].message
+        );
         assert_eq!(tokens[errors[0].token].kind, SyntaxKind::TemplateStart);
         assert_eq!(render(&tokens), "`a${b");
     }
@@ -439,21 +488,31 @@ mod tests {
         assert_eq!(kinds("let x"), vec![LetKw, Whitespace, Ident]);
         assert_eq!(kinds("return"), vec![ReturnKw]);
         assert_eq!(kinds("await x"), vec![AwaitKw, Whitespace, Ident]);
-        assert_eq!(kinds("as"), vec![Ident]);       // soft keyword stays Ident
-        assert_eq!(kinds("trueish"), vec![Ident]);  // not the `true` keyword
+        assert_eq!(kinds("as"), vec![Ident]); // soft keyword stays Ident
+        assert_eq!(kinds("trueish"), vec![Ident]); // not the `true` keyword
         assert_eq!(kinds("_foo123"), vec![Ident]);
     }
 
     #[test]
     fn operators_and_numbers() {
         use SyntaxKind::*;
-        assert_eq!(kinds("1 + 2"), vec![Number, Whitespace, Plus, Whitespace, Number]);
+        assert_eq!(
+            kinds("1 + 2"),
+            vec![Number, Whitespace, Plus, Whitespace, Number]
+        );
         assert_eq!(kinds("a**=b"), vec![Ident, StarStar, Eq, Ident]); // ** wins, then =
         assert_eq!(
             kinds("x ?? y ?. z"),
             vec![
-                Ident, Whitespace, QuestionQuestion, Whitespace, Ident, Whitespace, QuestionDot,
-                Whitespace, Ident,
+                Ident,
+                Whitespace,
+                QuestionQuestion,
+                Whitespace,
+                Ident,
+                Whitespace,
+                QuestionDot,
+                Whitespace,
+                Ident,
             ]
         );
         assert_eq!(kinds("0..=10"), vec![Number, DotDotEq, Number]);
@@ -487,7 +546,10 @@ mod tests {
     #[test]
     fn operators_and_numbers_isolated() {
         use SyntaxKind::*;
-        assert_eq!(kinds("1 + 2"), vec![Number, Whitespace, Plus, Whitespace, Number]);
+        assert_eq!(
+            kinds("1 + 2"),
+            vec![Number, Whitespace, Plus, Whitespace, Number]
+        );
         assert_eq!(
             kinds("** = =="),
             vec![StarStar, Whitespace, Eq, Whitespace, EqEq]

@@ -14,7 +14,9 @@ use crate::syntax::parser::Parse;
 use cstree::build::GreenNodeBuilder;
 
 pub fn build_tree(parse: Parse) -> ResolvedNode {
-    let Parse { mut events, tokens, .. } = parse;
+    let Parse {
+        mut events, tokens, ..
+    } = parse;
 
     let mut builder: GreenNodeBuilder<SyntaxKind> = GreenNodeBuilder::new();
     let mut token_pos = 0usize; // cursor into `tokens` (incl. trivia)
@@ -74,12 +76,22 @@ fn resolve_forward_parents(events: &mut [Event]) -> Vec<Event> {
     let mut out: Vec<Event> = Vec::with_capacity(events.len());
     for i in 0..events.len() {
         match events[i].clone() {
-            Event::Start { kind, forward_parent } if kind != TOMBSTONE => {
+            Event::Start {
+                kind,
+                forward_parent,
+            } if kind != TOMBSTONE => {
                 let mut chain = vec![kind];
                 let mut fp = forward_parent;
                 while let Some(idx) = fp {
-                    if let Event::Start { kind: pk, forward_parent: pfp } = events[idx].clone() {
-                        events[idx] = Event::Start { kind: TOMBSTONE, forward_parent: None };
+                    if let Event::Start {
+                        kind: pk,
+                        forward_parent: pfp,
+                    } = events[idx].clone()
+                    {
+                        events[idx] = Event::Start {
+                            kind: TOMBSTONE,
+                            forward_parent: None,
+                        };
                         chain.push(pk);
                         fp = pfp;
                     } else {
@@ -87,7 +99,10 @@ fn resolve_forward_parents(events: &mut [Event]) -> Vec<Event> {
                     }
                 }
                 for k in chain.into_iter().rev() {
-                    out.push(Event::Start { kind: k, forward_parent: None });
+                    out.push(Event::Start {
+                        kind: k,
+                        forward_parent: None,
+                    });
                 }
             }
             Event::Start { .. } => { /* consumed/tombstone: skip */ }
@@ -106,6 +121,10 @@ mod tests {
     fn structured_tree_round_trips() {
         let src = "  42 // trailing\n";
         let node = build_tree(parse(src));
-        assert_eq!(node.text().to_string(), src, "structured tree must be lossless");
+        assert_eq!(
+            node.text().to_string(),
+            src,
+            "structured tree must be lossless"
+        );
     }
 }

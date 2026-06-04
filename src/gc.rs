@@ -785,7 +785,10 @@ mod tests {
                           // COLLECT_GROWTH_THRESHOLD, so maybe_collect must skip.
         let v = Value::Array(Cc::new(RefCell::new(vec![Value::Number(1.0)])));
         let reclaimed = super::maybe_collect();
-        assert_eq!(reclaimed, 0, "maybe_collect must skip below the growth threshold");
+        assert_eq!(
+            reclaimed, 0,
+            "maybe_collect must skip below the growth threshold"
+        );
         drop(v);
     }
 

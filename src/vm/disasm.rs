@@ -81,7 +81,11 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
             let idx = chunk.read_u16(at + 1);
             let mutable = chunk.read_u8(at + 3);
             let kind = if mutable == 1 { "let" } else { "const" };
-            let _ = write!(line, "{idx:>5} {mutable} ; {kind} {}", const_repr(chunk, idx));
+            let _ = write!(
+                line,
+                "{idx:>5} {mutable} ; {kind} {}",
+                const_repr(chunk, idx)
+            );
         }
         // i16 relative jump → show the absolute target offset.
         Op::Jump | Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpIfNotNil | Op::Loop => {
@@ -125,8 +129,7 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
                 use crate::vm::chunk::ImportDesc;
                 match desc {
                     ImportDesc::Named { source, names } => {
-                        let list: Vec<&str> =
-                            names.iter().map(|(n, _, _, _)| n.as_str()).collect();
+                        let list: Vec<&str> = names.iter().map(|(n, _, _, _)| n.as_str()).collect();
                         let _ = write!(line, " ; import {{{}}} from \"{source}\"", list.join(", "));
                     }
                     ImportDesc::Namespace { source, slot, .. } => {
@@ -389,9 +392,15 @@ mod tests {
         assert!(closure_line.contains("greet"), "got {closure_line:?}");
 
         // The nested proto gets its own header and instructions.
-        assert!(text.contains("== fn greet (proto #0) =="), "missing proto header in:\n{text}");
+        assert!(
+            text.contains("== fn greet (proto #0) =="),
+            "missing proto header in:\n{text}"
+        );
         // Two scripts' worth of RETURN: the inner proto's body is present.
-        assert!(text.lines().any(|l| l.contains("NIL")), "missing inner NIL in:\n{text}");
+        assert!(
+            text.lines().any(|l| l.contains("NIL")),
+            "missing inner NIL in:\n{text}"
+        );
     }
 
     #[test]

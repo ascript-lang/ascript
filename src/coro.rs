@@ -130,7 +130,9 @@ impl GeneratorHandle {
         let (out, inp) = match &self.inner {
             GenImpl::Body { out, inp, .. } => (out, inp),
             GenImpl::Vm { .. } => {
-                unreachable!("GeneratorHandle::yield_ called on a VM-backed generator (use Op::Yield)")
+                unreachable!(
+                    "GeneratorHandle::yield_ called on a VM-backed generator (use Op::Yield)"
+                )
             }
         };
         *out.borrow_mut() = Some(v);

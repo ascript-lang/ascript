@@ -172,9 +172,12 @@ impl Fiber {
     /// If `slot` is not a cell slot (the compiler only emits `GET_LOCAL_CELL` for
     /// resolver cell slots, so a `None` here is a compiler/resolver bug).
     pub fn get_local_cell(&self, slot: usize) -> Value {
-        let cell = self.frame().cells.get(slot).and_then(|c| c.as_ref()).expect(
-            "Fiber::get_local_cell on a non-cell slot (compiler/resolver bug)",
-        );
+        let cell = self
+            .frame()
+            .cells
+            .get(slot)
+            .and_then(|c| c.as_ref())
+            .expect("Fiber::get_local_cell on a non-cell slot (compiler/resolver bug)");
         cell.borrow().clone()
     }
 
@@ -183,9 +186,12 @@ impl Fiber {
     /// # Panics
     /// If `slot` is not a cell slot (a compiler/resolver bug, as above).
     pub fn set_local_cell(&self, slot: usize, v: Value) {
-        let cell = self.frame().cells.get(slot).and_then(|c| c.as_ref()).expect(
-            "Fiber::set_local_cell on a non-cell slot (compiler/resolver bug)",
-        );
+        let cell = self
+            .frame()
+            .cells
+            .get(slot)
+            .and_then(|c| c.as_ref())
+            .expect("Fiber::set_local_cell on a non-cell slot (compiler/resolver bug)");
         *cell.borrow_mut() = v;
     }
 

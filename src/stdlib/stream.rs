@@ -632,7 +632,9 @@ impl Interp {
         while let Some(v) = self.pull_next(id, span).await? {
             out.push(v);
         }
-        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(out))))
+        Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+            out,
+        ))))
     }
 
     /// `stream.forEach(s, fn)` — pull every item and call `fn(value)` for its effect.

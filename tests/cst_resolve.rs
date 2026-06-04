@@ -9,8 +9,11 @@ fn corpus() -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for e in fs::read_dir(dir).unwrap() {
             let p = e.unwrap().path();
-            if p.is_dir() { walk(&p, out); }
-            else if p.extension().and_then(|x| x.to_str()) == Some("as") { out.push(p); }
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("as") {
+                out.push(p);
+            }
         }
     }
     let mut v = Vec::new();

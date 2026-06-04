@@ -613,13 +613,54 @@ impl Op {
             CallMethod | MatchArray | DefineGlobal => 3,
 
             // Zero-operand ops.
-            Nil | True | False | Pop | Dup | Swap | Rot3 | Add | Sub | Mul | Div | Mod | Pow
-            | Neg | Not | Eq | Ne | Lt | Le | Gt | Ge | Range | RangeInclusive | CheckNumbers
-            | Return | Spread
-            | SpreadArgs | AppendArray | AppendObject | SpreadObject | CallSpread | GetIndex
-            | SetIndex | InstanceOf | Await | Yield | MakeGenerator | Propagate
-            | Unwrap | GetIter | IterNext | IterClose | IterSnapshot | ArrayLen
-            | CheckArrayDestructure | CheckObjectDestructure | MatchObject | MatchNoArm => 0,
+            Nil
+            | True
+            | False
+            | Pop
+            | Dup
+            | Swap
+            | Rot3
+            | Add
+            | Sub
+            | Mul
+            | Div
+            | Mod
+            | Pow
+            | Neg
+            | Not
+            | Eq
+            | Ne
+            | Lt
+            | Le
+            | Gt
+            | Ge
+            | Range
+            | RangeInclusive
+            | CheckNumbers
+            | Return
+            | Spread
+            | SpreadArgs
+            | AppendArray
+            | AppendObject
+            | SpreadObject
+            | CallSpread
+            | GetIndex
+            | SetIndex
+            | InstanceOf
+            | Await
+            | Yield
+            | MakeGenerator
+            | Propagate
+            | Unwrap
+            | GetIter
+            | IterNext
+            | IterClose
+            | IterSnapshot
+            | ArrayLen
+            | CheckArrayDestructure
+            | CheckObjectDestructure
+            | MatchObject
+            | MatchNoArm => 0,
         }
     }
 
@@ -738,7 +779,11 @@ mod tests {
     #[test]
     fn from_u8_round_trips_every_variant() {
         for &op in ALL {
-            assert_eq!(Op::from_u8(op as u8), Some(op), "round-trip failed for {op:?}");
+            assert_eq!(
+                Op::from_u8(op as u8),
+                Some(op),
+                "round-trip failed for {op:?}"
+            );
         }
     }
 

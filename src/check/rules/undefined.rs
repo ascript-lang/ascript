@@ -27,11 +27,18 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         .bindings
         .iter()
         .filter(|b| {
-            b.is_global || matches!(b.kind, BindingKind::Fn | BindingKind::Class | BindingKind::Enum)
+            b.is_global
+                || matches!(
+                    b.kind,
+                    BindingKind::Fn | BindingKind::Class | BindingKind::Enum
+                )
         })
         .map(|b| b.name.as_str())
         .collect();
-    for n in tree.descendants().filter(|n| n.kind() == SyntaxKind::NameRef) {
+    for n in tree
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::NameRef)
+    {
         if let Some(Resolution::Global(name)) = resolved.uses.get(&n.text_range()) {
             if !is_allowed_global(name) && !hoisted.contains(name.as_str()) {
                 out.push(AsDiagnostic {
@@ -52,7 +59,11 @@ mod tests {
     use crate::check::analyze;
 
     fn codes(src: &str) -> Vec<String> {
-        analyze(src).diagnostics.into_iter().map(|d| d.code).collect()
+        analyze(src)
+            .diagnostics
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
     }
 
     #[test]

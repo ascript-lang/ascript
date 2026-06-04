@@ -16,7 +16,11 @@ struct Out {
 
 impl Out {
     fn new() -> Self {
-        Out { buf: String::new(), indent: 0, at_line_start: true }
+        Out {
+            buf: String::new(),
+            indent: 0,
+            at_line_start: true,
+        }
     }
     /// Emit raw text on the current line (writing pending indentation first).
     fn text(&mut self, s: &str) {
@@ -44,8 +48,12 @@ impl Out {
         self.buf.push('\n');
         self.at_line_start = true;
     }
-    fn indent(&mut self) { self.indent += 1; }
-    fn dedent(&mut self) { self.indent = self.indent.saturating_sub(1); }
+    fn indent(&mut self) {
+        self.indent += 1;
+    }
+    fn dedent(&mut self) {
+        self.indent = self.indent.saturating_sub(1);
+    }
 
     /// Append ` <comment>` at the end of the last non-empty line (before its
     /// trailing newline). For same-line trailing comments.
@@ -64,7 +72,10 @@ impl Out {
 pub fn format(root: &ResolvedNode) -> String {
     let comments = comments::attach(root);
     let mut out = Out::new();
-    let mut p = Printer { out: &mut out, comments: &comments };
+    let mut p = Printer {
+        out: &mut out,
+        comments: &comments,
+    };
     p.source_file(root);
     let mut s = out.buf;
     while s.ends_with('\n') {
@@ -170,8 +181,11 @@ impl Printer<'_> {
                     self.expr(cond);
                 }
                 self.out.text(") ");
-                let blocks: Vec<&ResolvedNode> =
-                    parts.iter().copied().filter(|c| c.kind() == Block).collect();
+                let blocks: Vec<&ResolvedNode> = parts
+                    .iter()
+                    .copied()
+                    .filter(|c| c.kind() == Block)
+                    .collect();
                 if let Some(then) = blocks.first() {
                     self.block_inline(then);
                 }
@@ -259,16 +273,28 @@ impl Printer<'_> {
 
     fn fn_decl(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
-        let toks: Vec<SyntaxKind> = node.children_with_tokens().filter_map(|el| el.into_token()).map(|t| t.kind()).collect();
-        if toks.contains(&AsyncKw) { self.out.text("async "); }
+        let toks: Vec<SyntaxKind> = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .map(|t| t.kind())
+            .collect();
+        if toks.contains(&AsyncKw) {
+            self.out.text("async ");
+        }
         self.out.text("fn");
-        if toks.contains(&Star) { self.out.text("*"); }
+        if toks.contains(&Star) {
+            self.out.text("*");
+        }
         self.out.text(" ");
-        if let Some(name) = first_ident_text(node) { self.out.text(&name); }
+        if let Some(name) = first_ident_text(node) {
+            self.out.text(&name);
+        }
         self.params(node);
         if let Some(rt) = node.children().find(|c| c.kind() == RetType) {
             self.out.text(": ");
-            if let Some(ty) = rt.children().find(|c| is_type_kind(c.kind())) { self.type_ann(ty); }
+            if let Some(ty) = rt.children().find(|c| is_type_kind(c.kind())) {
+                self.type_ann(ty);
+            }
         }
         self.out.text(" ");
         if let Some(body) = node.children().find(|c| c.kind() == Block) {
@@ -304,15 +330,25 @@ impl Printer<'_> {
             .children()
             .filter(|c| matches!(c.kind(), FieldDecl | MethodDecl))
             .collect();
-        let ordered: Vec<&ResolvedNode> = members.iter().copied().filter(|m| m.kind() == FieldDecl)
+        let ordered: Vec<&ResolvedNode> = members
+            .iter()
+            .copied()
+            .filter(|m| m.kind() == FieldDecl)
             .chain(members.iter().copied().filter(|m| m.kind() == MethodDecl))
             .collect();
 
         for (i, m) in ordered.iter().enumerate() {
             if i > 0 {
-                let blank = self.comments.leading.get(&m.text_range())
-                    .and_then(|l| l.first()).map(|c| c.blank_before).unwrap_or(false);
-                if blank { self.out.blank(); }
+                let blank = self
+                    .comments
+                    .leading
+                    .get(&m.text_range())
+                    .and_then(|l| l.first())
+                    .map(|c| c.blank_before)
+                    .unwrap_or(false);
+                if blank {
+                    self.out.blank();
+                }
             }
             self.emit_leading(m);
             self.member(m);
@@ -391,13 +427,21 @@ impl Printer<'_> {
         use SyntaxKind::*;
         self.out.text("(");
         if let Some(list) = node.children().find(|c| c.kind() == ParamList) {
-            let params: Vec<&ResolvedNode> = list.children().filter(|c| c.kind() == Param).collect();
+            let params: Vec<&ResolvedNode> =
+                list.children().filter(|c| c.kind() == Param).collect();
             for (i, p) in params.iter().enumerate() {
-                if i > 0 { self.out.text(", "); }
-                if p.children_with_tokens().filter_map(|el| el.into_token()).any(|t| t.kind() == DotDotDot) {
+                if i > 0 {
+                    self.out.text(", ");
+                }
+                if p.children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .any(|t| t.kind() == DotDotDot)
+                {
                     self.out.text("...");
                 }
-                if let Some(name) = first_ident_text(p) { self.out.text(&name); }
+                if let Some(name) = first_ident_text(p) {
+                    self.out.text(&name);
+                }
                 if let Some(ty) = p.children().find(|c| is_type_kind(c.kind())) {
                     self.out.text(": ");
                     self.type_ann(ty);
@@ -413,11 +457,18 @@ impl Printer<'_> {
         self.out.text("(");
         let params: Vec<&ResolvedNode> = list.children().filter(|c| c.kind() == Param).collect();
         for (i, p) in params.iter().enumerate() {
-            if i > 0 { self.out.text(", "); }
-            if p.children_with_tokens().filter_map(|el| el.into_token()).any(|t| t.kind() == DotDotDot) {
+            if i > 0 {
+                self.out.text(", ");
+            }
+            if p.children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == DotDotDot)
+            {
                 self.out.text("...");
             }
-            if let Some(name) = first_ident_text(p) { self.out.text(&name); }
+            if let Some(name) = first_ident_text(p) {
+                self.out.text(&name);
+            }
             if let Some(ty) = p.children().find(|c| is_type_kind(c.kind())) {
                 self.out.text(": ");
                 self.type_ann(ty);
@@ -549,9 +600,7 @@ impl Printer<'_> {
             }
             CallExpr => {
                 let kids: Vec<&ResolvedNode> = node.children().collect();
-                if let Some(callee) =
-                    kids.iter().copied().find(|c| is_expr_kind(c.kind()))
-                {
+                if let Some(callee) = kids.iter().copied().find(|c| is_expr_kind(c.kind())) {
                     self.expr(callee);
                 }
                 if let Some(args) = kids.iter().copied().find(|c| c.kind() == ArgList) {
@@ -727,7 +776,9 @@ impl Printer<'_> {
 
     fn literal_text(&self, node: &ResolvedNode) -> String {
         // numbers/bools/nil verbatim; strings re-quoted canonically (double quotes).
-        let tok = node.children_with_tokens().filter_map(|el| el.into_token())
+        let tok = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
             .find(|t| !t.kind().is_trivia());
         match tok {
             Some(t) if t.kind() == SyntaxKind::Str => requote(t.text()),
@@ -738,13 +789,19 @@ impl Printer<'_> {
 
     fn object_key(&self, node: &ResolvedNode) -> String {
         use SyntaxKind::*;
-        let key_tok = node.children_with_tokens().filter_map(|el| el.into_token())
+        let key_tok = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
             .find(|t| matches!(t.kind(), Ident | Str));
         match key_tok {
             Some(t) if t.kind() == Ident => t.text().to_string(),
             Some(t) => {
                 let inner = unquote(t.text());
-                if crate::token::is_ident_like(&inner) { inner } else { requote(t.text()) }
+                if crate::token::is_ident_like(&inner) {
+                    inner
+                } else {
+                    requote(t.text())
+                }
             }
             None => String::new(),
         }
@@ -752,7 +809,11 @@ impl Printer<'_> {
 
     fn arrow_expr(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
-        if node.children_with_tokens().filter_map(|el| el.into_token()).any(|t| t.kind() == AsyncKw) {
+        if node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == AsyncKw)
+        {
             self.out.text("async ");
         }
         // All arrow forms (bare `x =>`, parenthesized `(x,y) =>`) produce a ParamList.
@@ -785,7 +846,9 @@ impl Printer<'_> {
     fn match_expr(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         self.out.text("match ");
-        if let Some(subj) = node.children().find(|c| is_expr_kind(c.kind())) { self.expr(subj); }
+        if let Some(subj) = node.children().find(|c| is_expr_kind(c.kind())) {
+            self.expr(subj);
+        }
         self.out.text(" {");
         self.out.newline();
         self.out.indent();
@@ -801,14 +864,21 @@ impl Printer<'_> {
 
     fn match_arm(&mut self, arm: &ResolvedNode) {
         use SyntaxKind::*;
-        let pats: Vec<&ResolvedNode> = arm.children().filter(|c| is_pattern_kind(c.kind())).collect();
+        let pats: Vec<&ResolvedNode> = arm
+            .children()
+            .filter(|c| is_pattern_kind(c.kind()))
+            .collect();
         for (i, p) in pats.iter().enumerate() {
-            if i > 0 { self.out.text(" | "); }
+            if i > 0 {
+                self.out.text(" | ");
+            }
             self.out.text(p.text().to_string().trim()); // patterns re-emit compactly via text
         }
         if let Some(g) = arm.children().find(|c| c.kind() == MatchGuard) {
             self.out.text(" if ");
-            if let Some(e) = g.children().find(|c| is_expr_kind(c.kind())) { self.expr(e); }
+            if let Some(e) = g.children().find(|c| is_expr_kind(c.kind())) {
+                self.expr(e);
+            }
         }
         self.out.text(" => ");
         if let Some(body) = arm.children().filter(|c| is_expr_kind(c.kind())).last() {
@@ -823,33 +893,46 @@ impl Printer<'_> {
         match node.kind() {
             NamedType => self.out.text(node_first_ident_or_text(node).trim()),
             GenericType => {
-                if let Some(name) = first_ident_text(node) { self.out.text(&name); }
+                if let Some(name) = first_ident_text(node) {
+                    self.out.text(&name);
+                }
                 self.out.text("<");
                 if let Some(args) = node.children().find(|c| c.kind() == TypeArgs) {
-                    let ts: Vec<&ResolvedNode> = args.children().filter(|c| is_type_kind(c.kind())).collect();
+                    let ts: Vec<&ResolvedNode> =
+                        args.children().filter(|c| is_type_kind(c.kind())).collect();
                     for (i, t) in ts.iter().enumerate() {
-                        if i > 0 { self.out.text(", "); }
+                        if i > 0 {
+                            self.out.text(", ");
+                        }
                         self.type_ann(t);
                     }
                 }
                 self.out.text(">");
             }
             OptionalType => {
-                if let Some(inner) = node.children().find(|c| is_type_kind(c.kind())) { self.type_ann(inner); }
+                if let Some(inner) = node.children().find(|c| is_type_kind(c.kind())) {
+                    self.type_ann(inner);
+                }
                 self.out.text("?");
             }
             UnionType => {
-                let ts: Vec<&ResolvedNode> = node.children().filter(|c| is_type_kind(c.kind())).collect();
+                let ts: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_type_kind(c.kind())).collect();
                 for (i, t) in ts.iter().enumerate() {
-                    if i > 0 { self.out.text(" | "); }
+                    if i > 0 {
+                        self.out.text(" | ");
+                    }
                     self.type_ann(t);
                 }
             }
             TupleType => {
                 self.out.text("[");
-                let ts: Vec<&ResolvedNode> = node.children().filter(|c| is_type_kind(c.kind())).collect();
+                let ts: Vec<&ResolvedNode> =
+                    node.children().filter(|c| is_type_kind(c.kind())).collect();
                 for (i, t) in ts.iter().enumerate() {
-                    if i > 0 { self.out.text(", "); }
+                    if i > 0 {
+                        self.out.text(", ");
+                    }
                     self.type_ann(t);
                 }
                 self.out.text("]");
@@ -907,12 +990,18 @@ fn first_ident_text(node: &ResolvedNode) -> Option<String> {
 
 fn is_pattern_kind(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
-    matches!(kind, WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat)
+    matches!(
+        kind,
+        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat
+    )
 }
 
 fn is_type_kind(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
-    matches!(kind, NamedType | GenericType | OptionalType | UnionType | TupleType)
+    matches!(
+        kind,
+        NamedType | GenericType | OptionalType | UnionType | TupleType
+    )
 }
 
 fn is_expr_kind(kind: SyntaxKind) -> bool {
@@ -945,8 +1034,23 @@ fn is_expr_kind(kind: SyntaxKind) -> bool {
 
 fn is_binary_op(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
-    matches!(kind, Plus | Minus | Star | Slash | Percent | StarStar | EqEq | BangEq
-        | Lt | Le | Gt | Ge | AmpAmp | PipePipe | QuestionQuestion)
+    matches!(
+        kind,
+        Plus | Minus
+            | Star
+            | Slash
+            | Percent
+            | StarStar
+            | EqEq
+            | BangEq
+            | Lt
+            | Le
+            | Gt
+            | Ge
+            | AmpAmp
+            | PipePipe
+            | QuestionQuestion
+    )
 }
 
 fn leading_op(node: &ResolvedNode) -> String {
@@ -1028,7 +1132,8 @@ fn member_name(node: &ResolvedNode) -> String {
 }
 
 fn node_first_ident_or_text(node: &ResolvedNode) -> String {
-    node.children_with_tokens().filter_map(|el| el.into_token())
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
         .find(|t| !t.kind().is_trivia())
         .map(|t| t.text().to_string())
         .unwrap_or_else(|| node.text().to_string())
@@ -1127,8 +1232,8 @@ mod tests {
     #[test]
     fn blank_line_rule() {
         assert_eq!(fmt("a\n\n\n\nb\n"), "a\n\nb\n"); // 2+ blanks collapse to 1
-        assert_eq!(fmt("a\n\nb\n"), "a\n\nb\n");       // one blank preserved
-        assert_eq!(fmt("a\nb\n"), "a\nb\n");           // none stays none
+        assert_eq!(fmt("a\n\nb\n"), "a\n\nb\n"); // one blank preserved
+        assert_eq!(fmt("a\nb\n"), "a\nb\n"); // none stays none
     }
 
     #[test]
@@ -1148,11 +1253,20 @@ mod tests {
         let out = fmt(src);
         let name_pos = out.find("name: string").expect("field present");
         let greet_pos = out.find("fn greet").expect("method present");
-        assert!(name_pos < greet_pos, "fields must be reordered before methods:\n{out}");
-        let name_c = out.find("// the name field").expect("field comment present");
-        let greet_c = out.find("// the greet method").expect("method comment present");
-        assert!(name_c < name_pos && name_pos < greet_c,
-            "each comment must travel with its member:\n{out}");
+        assert!(
+            name_pos < greet_pos,
+            "fields must be reordered before methods:\n{out}"
+        );
+        let name_c = out
+            .find("// the name field")
+            .expect("field comment present");
+        let greet_c = out
+            .find("// the greet method")
+            .expect("method comment present");
+        assert!(
+            name_c < name_pos && name_pos < greet_c,
+            "each comment must travel with its member:\n{out}"
+        );
     }
 
     #[test]
@@ -1170,30 +1284,46 @@ mod tests {
 
     #[test]
     fn formats_statements() {
-        assert_eq!(fmt("if(x){return 1}else{return 2}\n"),
-            "if (x) {\n  return 1\n} else {\n  return 2\n}\n");
+        assert_eq!(
+            fmt("if(x){return 1}else{return 2}\n"),
+            "if (x) {\n  return 1\n} else {\n  return 2\n}\n"
+        );
         assert_eq!(fmt("while(x){ x=0 }\n"), "while (x) {\n  x = 0\n}\n");
-        assert_eq!(fmt("for(i in 1..6){print(i)}\n"),
-            "for (i in 1..6) {\n  print(i)\n}\n");
+        assert_eq!(
+            fmt("for(i in 1..6){print(i)}\n"),
+            "for (i in 1..6) {\n  print(i)\n}\n"
+        );
         assert_eq!(fmt("x=5\n"), "x = 5\n");
         assert_eq!(fmt("break\n"), "break\n");
-        assert_eq!(fmt(r#"import * as t from "std/task""#), "import * as t from \"std/task\"\n");
+        assert_eq!(
+            fmt(r#"import * as t from "std/task""#),
+            "import * as t from \"std/task\"\n"
+        );
         assert_eq!(fmt("enum E{A,B=2}\n"), "enum E {\n  A,\n  B = 2,\n}\n");
     }
 
     #[test]
     fn formats_functions_arrows_match() {
-        assert_eq!(fmt("async fn f(){return 1}\n"), "async fn f() {\n  return 1\n}\n");
+        assert_eq!(
+            fmt("async fn f(){return 1}\n"),
+            "async fn f() {\n  return 1\n}\n"
+        );
         assert_eq!(fmt("fn* g(){yield 1}\n"), "fn* g() {\n  yield 1\n}\n");
-        assert_eq!(fmt("fn add(a:number,b:number):number{return a+b}\n"),
-            "fn add(a: number, b: number): number {\n  return a + b\n}\n");
-        assert_eq!(fmt("fn v(first,...rest){return rest}\n"),
-            "fn v(first, ...rest) {\n  return rest\n}\n");
+        assert_eq!(
+            fmt("fn add(a:number,b:number):number{return a+b}\n"),
+            "fn add(a: number, b: number): number {\n  return a + b\n}\n"
+        );
+        assert_eq!(
+            fmt("fn v(first,...rest){return rest}\n"),
+            "fn v(first, ...rest) {\n  return rest\n}\n"
+        );
         assert_eq!(fmt("let f=(x)=>x+1\n"), "let f = (x) => x + 1\n");
         assert_eq!(fmt("let g=x=>x+1\n"), "let g = x => x + 1\n");
         assert_eq!(fmt("let h=async (x)=>x\n"), "let h = async (x) => x\n");
-        assert_eq!(fmt(r#"let r=match n{0=>"z",_=>"o"}"#),
-            "let r = match n {\n  0 => \"z\",\n  _ => \"o\",\n}\n");
+        assert_eq!(
+            fmt(r#"let r=match n{0=>"z",_=>"o"}"#),
+            "let r = match n {\n  0 => \"z\",\n  _ => \"o\",\n}\n"
+        );
     }
 
     #[test]
@@ -1202,7 +1332,10 @@ mod tests {
         let src = "class Dog extends Animal{ fn greet(){return 1} nickname?:string id:number=0 }\n";
         let out = fmt(src);
         assert!(out.contains("class Dog extends Animal {"), "{out}");
-        assert!(out.contains("nickname: string?"), "name?: T -> name: T?:\n{out}");
+        assert!(
+            out.contains("nickname: string?"),
+            "name?: T -> name: T?:\n{out}"
+        );
         assert!(out.contains("id: number = 0"), "{out}");
         let id = out.find("id:").unwrap();
         let greet = out.find("fn greet").unwrap();
@@ -1211,18 +1344,36 @@ mod tests {
 
     #[test]
     fn formats_types_and_keys() {
-        assert_eq!(fmt("let x: array< number > = []\n"), "let x: array<number> = []\n");
-        assert_eq!(fmt("let x: map<string,number> = m\n"), "let x: map<string, number> = m\n");
-        assert_eq!(fmt("let x: number|string = 1\n"), "let x: number | string = 1\n");
+        assert_eq!(
+            fmt("let x: array< number > = []\n"),
+            "let x: array<number> = []\n"
+        );
+        assert_eq!(
+            fmt("let x: map<string,number> = m\n"),
+            "let x: map<string, number> = m\n"
+        );
+        assert_eq!(
+            fmt("let x: number|string = 1\n"),
+            "let x: number | string = 1\n"
+        );
         assert_eq!(fmt("let x: number ? = nil\n"), "let x: number? = nil\n");
         // non-identifier object keys quoted; identifier-like keys bare.
-        assert_eq!(fmt(r#"let o = { "a-b": 1, c: 2 }"#), "let o = {\"a-b\": 1, c: 2}\n");
+        assert_eq!(
+            fmt(r#"let o = { "a-b": 1, c: 2 }"#),
+            "let o = {\"a-b\": 1, c: 2}\n"
+        );
     }
 
     #[test]
     fn formats_destructuring_let() {
-        assert_eq!(fmt("let [a, b, ...rest]=xs\n"), "let [a, b, ...rest] = xs\n");
-        assert_eq!(fmt("let {a, b as local, ...rest}=obj\n"), "let {a, b as local, ...rest} = obj\n");
+        assert_eq!(
+            fmt("let [a, b, ...rest]=xs\n"),
+            "let [a, b, ...rest] = xs\n"
+        );
+        assert_eq!(
+            fmt("let {a, b as local, ...rest}=obj\n"),
+            "let {a, b as local, ...rest} = obj\n"
+        );
     }
 
     #[test]
@@ -1238,7 +1389,10 @@ mod tests {
         ] {
             let once = fmt(src);
             let twice = fmt(&once);
-            assert_eq!(once, twice, "fmt not idempotent for {src:?}:\n{once}\n---\n{twice}");
+            assert_eq!(
+                once, twice,
+                "fmt not idempotent for {src:?}:\n{once}\n---\n{twice}"
+            );
         }
     }
 }

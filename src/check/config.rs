@@ -65,7 +65,8 @@ impl LintConfig {
 
     /// Force `code` to error severity.
     pub fn deny(&mut self, code: &str) {
-        self.overrides.insert(code.to_string(), Some(Severity::Error));
+        self.overrides
+            .insert(code.to_string(), Some(Severity::Error));
     }
 
     /// Force `code` to warning severity.
@@ -101,15 +102,24 @@ mod tests {
     fn allow_suppresses_warn_promotes() {
         let mut cfg = LintConfig::default();
         // No override → default passes through.
-        assert_eq!(cfg.effective("x", Severity::Warning), Some(Severity::Warning));
+        assert_eq!(
+            cfg.effective("x", Severity::Warning),
+            Some(Severity::Warning)
+        );
 
         cfg.allow("suppressed");
         assert_eq!(cfg.effective("suppressed", Severity::Error), None);
 
         cfg.deny("strict");
-        assert_eq!(cfg.effective("strict", Severity::Warning), Some(Severity::Error));
+        assert_eq!(
+            cfg.effective("strict", Severity::Warning),
+            Some(Severity::Error)
+        );
 
         cfg.warn("relaxed");
-        assert_eq!(cfg.effective("relaxed", Severity::Error), Some(Severity::Warning));
+        assert_eq!(
+            cfg.effective("relaxed", Severity::Error),
+            Some(Severity::Warning)
+        );
     }
 }

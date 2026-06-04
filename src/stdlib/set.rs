@@ -24,7 +24,11 @@ pub fn exports() -> Vec<(&'static str, Value)> {
     ]
 }
 
-fn want_set(v: &Value, span: Span, ctx: &str) -> Result<gcmodule::Cc<crate::value::SetCell>, Control> {
+fn want_set(
+    v: &Value,
+    span: Span,
+    ctx: &str,
+) -> Result<gcmodule::Cc<crate::value::SetCell>, Control> {
     match v {
         Value::Set(s) => Ok(s.clone()),
         _ => Err(AsError::at(
@@ -167,7 +171,6 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     fn sp() -> Span {
         Span::new(0, 0)
@@ -314,9 +317,9 @@ mod tests {
 
     #[test]
     fn non_hashable_from_panics() {
-        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Array(gcmodule::Cc::new(
-            RefCell::new(vec![Value::Number(1.0)]),
-        ))])));
+        let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Array(
+            gcmodule::Cc::new(RefCell::new(vec![Value::Number(1.0)])),
+        )])));
         assert!(matches!(call("from", &[arr], sp()), Err(Control::Panic(_))));
     }
 

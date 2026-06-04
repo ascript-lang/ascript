@@ -56,7 +56,12 @@ fn flat_tree_is_lossless_over_corpus() {
     for path in corpus() {
         let src = fs::read_to_string(&path).unwrap();
         let node = ascript::syntax::build_flat_tree(&src);
-        assert_eq!(node.text().to_string(), src, "tree not lossless for {}", path.display());
+        assert_eq!(
+            node.text().to_string(),
+            src,
+            "tree not lossless for {}",
+            path.display()
+        );
     }
 }
 
@@ -74,9 +79,12 @@ fn nontrivia_token_count_matches_legacy() {
             .filter(|t| !t.kind.is_trivia())
             .count();
         assert_eq!(
-            new_count, legacy_count,
+            new_count,
+            legacy_count,
             "token count mismatch for {} (new={}, legacy={})",
-            path.display(), new_count, legacy_count
+            path.display(),
+            new_count,
+            legacy_count
         );
     }
 }

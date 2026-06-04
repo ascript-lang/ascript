@@ -70,7 +70,10 @@ fn definitely_returns(block: &ResolvedNode) -> bool {
             if !has_else {
                 return false;
             }
-            let then_ok = blocks.first().map(|b| definitely_returns(b)).unwrap_or(false);
+            let then_ok = blocks
+                .first()
+                .map(|b| definitely_returns(b))
+                .unwrap_or(false);
             let else_ok = if let Some(elif) = last.children().find(|c| c.kind() == IfStmt) {
                 // else-if chain: treat as a nested block requirement
                 definitely_returns_ifchain(elif)
@@ -90,7 +93,10 @@ fn definitely_returns(block: &ResolvedNode) -> bool {
 fn definitely_returns_ifchain(if_stmt: &ResolvedNode) -> bool {
     use SyntaxKind::*;
     let blocks: Vec<_> = if_stmt.children().filter(|c| c.kind() == Block).collect();
-    let then_ok = blocks.first().map(|b| definitely_returns(b)).unwrap_or(false);
+    let then_ok = blocks
+        .first()
+        .map(|b| definitely_returns(b))
+        .unwrap_or(false);
     let else_ok = if let Some(elif) = if_stmt.children().find(|c| c.kind() == IfStmt) {
         definitely_returns_ifchain(elif)
     } else {
@@ -144,12 +150,18 @@ mod tests {
     #[test]
     fn no_flag_when_ends_in_expression() {
         // ends in a match/expr statement — treated as a possible value (no FP)
-        assert!(!has("fn f(x): number { match x { _ => 0 } }\nf(1)\n", "missing-return"));
+        assert!(!has(
+            "fn f(x): number { match x { _ => 0 } }\nf(1)\n",
+            "missing-return"
+        ));
     }
     #[test]
     fn nullable_return_exempt() {
         // `?` suffix makes nil acceptable, so falling off the end is fine.
-        assert!(!has("fn f(): number? { let x = 1 }\nf()\n", "missing-return"));
+        assert!(!has(
+            "fn f(): number? { let x = 1 }\nf()\n",
+            "missing-return"
+        ));
     }
     #[test]
     fn nil_return_exempt() {

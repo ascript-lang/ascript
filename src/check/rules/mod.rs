@@ -89,9 +89,10 @@ pub fn dropped_local_call(
         // A module-scope user-global callee is file-declared iff its name has a
         // binding recorded for this file (a top-level `fn`/`let`/… — NOT a bare
         // builtin, which has no binding).
-        Some(Resolution::Global(gname)) => {
-            resolved.bindings.iter().any(|b| b.is_global && &b.name == gname)
-        }
+        Some(Resolution::Global(gname)) => resolved
+            .bindings
+            .iter()
+            .any(|b| b.is_global && &b.name == gname),
         _ => false,
     };
     if !file_declared {

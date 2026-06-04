@@ -52,7 +52,11 @@ fn unused(b: &Binding, code: &str, fix_title: &str) -> AsDiagnostic {
 mod tests {
     use crate::check::analyze;
     fn codes(src: &str) -> Vec<String> {
-        analyze(src).diagnostics.into_iter().map(|d| d.code).collect()
+        analyze(src)
+            .diagnostics
+            .into_iter()
+            .map(|d| d.code)
+            .collect()
     }
     #[test]
     fn flags_unused_let() {

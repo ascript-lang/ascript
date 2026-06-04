@@ -62,9 +62,9 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
         serde_json::Value::Bool(b) => Value::Bool(*b),
         serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
         serde_json::Value::String(s) => Value::Str(s.as_str().into()),
-        serde_json::Value::Array(a) => {
-            Value::Array(gcmodule::Cc::new(RefCell::new(a.iter().map(to_ascript).collect())))
-        }
+        serde_json::Value::Array(a) => Value::Array(gcmodule::Cc::new(RefCell::new(
+            a.iter().map(to_ascript).collect(),
+        ))),
         serde_json::Value::Object(o) => {
             let mut m = IndexMap::new();
             for (k, v) in o {

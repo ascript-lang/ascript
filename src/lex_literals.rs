@@ -85,7 +85,11 @@ pub(crate) fn unescape_template_body(body: &str) -> String {
 pub(crate) fn parse_number_text(text: &str) -> Option<f64> {
     let bytes = text.as_bytes();
     if bytes.len() >= 2 && bytes[0] == b'0' && matches!(bytes[1], b'x' | b'X' | b'b' | b'B') {
-        let radix = if matches!(bytes[1], b'x' | b'X') { 16 } else { 2 };
+        let radix = if matches!(bytes[1], b'x' | b'X') {
+            16
+        } else {
+            2
+        };
         let digits: String = text[2..].chars().filter(|&c| c != '_').collect();
         if digits.is_empty() {
             return None;

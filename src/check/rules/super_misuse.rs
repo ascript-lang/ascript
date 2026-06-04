@@ -71,13 +71,23 @@ mod tests {
     #[test]
     fn super_without_superclass_flagged() {
         let src = "class A {\n  fn init() { super.init() }\n}";
-        assert_eq!(count(src, "super-misuse"), 1, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "super-misuse"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
     fn super_with_superclass_ok() {
         let src = "class A {}\nclass B extends A {\n  fn init() { super.init() }\n}";
-        assert_eq!(count(src, "super-misuse"), 0, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "super-misuse"),
+            0,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 
     #[test]
@@ -88,12 +98,20 @@ mod tests {
             .into_iter()
             .find(|d| d.code == "super-misuse")
             .unwrap();
-        assert_eq!(d.message, "`super` used in class A, which has no superclass");
+        assert_eq!(
+            d.message,
+            "`super` used in class A, which has no superclass"
+        );
     }
 
     #[test]
     fn no_super_no_flag() {
         let src = "class A {\n  fn init() { self.x = 1 }\n}";
-        assert_eq!(count(src, "super-misuse"), 0, "{:?}", analyze(src).diagnostics);
+        assert_eq!(
+            count(src, "super-misuse"),
+            0,
+            "{:?}",
+            analyze(src).diagnostics
+        );
     }
 }
