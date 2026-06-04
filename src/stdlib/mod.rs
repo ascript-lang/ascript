@@ -493,7 +493,7 @@ pub(crate) fn want_array(
     v: &Value,
     span: Span,
     ctx: &str,
-) -> Result<gcmodule::Cc<std::cell::RefCell<Vec<Value>>>, Control> {
+) -> Result<gcmodule::Cc<crate::value::ArrayCell>, Control> {
     match v {
         Value::Array(a) => Ok(a.clone()),
         _ => Err(AsError::at(

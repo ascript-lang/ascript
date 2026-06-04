@@ -89,7 +89,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .iter()
                 .map(|&x| Value::Number(x as f64))
                 .collect();
-            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(arr))))
+            Ok(Value::Array(crate::value::ArrayCell::new(arr)))
         }
         "get" => {
             let b = want_bytes(&arg(args, 0), span, &ctx("get"))?;

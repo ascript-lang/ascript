@@ -139,7 +139,7 @@ impl Interp {
                 let conn = self.sqlite_conn(id).expect("checked present");
                 match query_sql(&conn, &sql, &params) {
                     Ok(rows) => Ok(make_pair(
-                        Value::Array(gcmodule::Cc::new(RefCell::new(rows))),
+                        Value::Array(crate::value::ArrayCell::new(rows)),
                         Value::Nil,
                     )),
                     Err(e) => Ok(err_pair(format!("connection.query failed: {}", e))),
@@ -215,7 +215,7 @@ impl Interp {
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
                 match query_cached(&conn, &sql, &params) {
                     Ok(rows) => Ok(make_pair(
-                        Value::Array(gcmodule::Cc::new(RefCell::new(rows))),
+                        Value::Array(crate::value::ArrayCell::new(rows)),
                         Value::Nil,
                     )),
                     Err(e) => Ok(err_pair(format!("statement.all failed: {}", e))),

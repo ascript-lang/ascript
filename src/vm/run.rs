@@ -1240,7 +1240,7 @@ impl Vm {
                     for slot in values.iter_mut().rev() {
                         *slot = fiber.pop();
                     }
-                    fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(values))));
+                    fiber.push(Value::Array(crate::value::ArrayCell::new(values)));
                 }
 
                 Op::NewObject => {
@@ -1609,7 +1609,7 @@ impl Vm {
                             ))
                         }
                     };
-                    fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(items))));
+                    fiber.push(Value::Array(crate::value::ArrayCell::new(items)));
                 }
 
                 Op::ArrayLen => {
@@ -1899,7 +1899,7 @@ impl Vm {
                         Value::Array(arr) => {
                             let tail: Vec<Value> =
                                 arr.borrow().iter().skip(start).cloned().collect();
-                            fiber.push(Value::Array(gcmodule::Cc::new(RefCell::new(tail))));
+                            fiber.push(Value::Array(crate::value::ArrayCell::new(tail)));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -3453,6 +3453,7 @@ impl Vm {
             // Give the instance its class's BASE shape (the declared-field layout,
             // in declaration order). V11-T3 inline caches key on this.
             shape_id: std::cell::Cell::new(self.class_base_shape(&class)),
+            frozen: std::cell::Cell::new(false),
         }));
         let inst_val = Value::Instance(instance.clone());
 
@@ -4673,7 +4674,7 @@ mod tests {
         let out = with_vm(|vm| async move {
             let a = spawn_vm_future(&vm, f.clone(), vec![Value::Number(10.0)]);
             let b = spawn_vm_future(&vm, f, vec![Value::Number(20.0)]);
-            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![a, b])));
+            let arr = Value::Array(crate::value::ArrayCell::new(vec![a, b]));
             vm.interp()
                 .call_task("gather", &[arr], s())
                 .await
@@ -4706,7 +4707,7 @@ mod tests {
         let f = compile_closure("(n) => n * 2");
         let out = with_vm(|vm| async move {
             let a = spawn_vm_future(&vm, f, vec![Value::Number(21.0)]);
-            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![a])));
+            let arr = Value::Array(crate::value::ArrayCell::new(vec![a]));
             vm.interp()
                 .call_task("race", &[arr], s())
                 .await
@@ -4722,7 +4723,7 @@ mod tests {
         // `(x) => x[9]` indexes a 1-element array out of bounds at runtime.
         let f = compile_closure("(x) => x[9]");
         let err = with_vm(|vm| async move {
-            let arr = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Number(0.0)])));
+            let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(0.0)]));
             vm.call_value(f, vec![arr], s())
                 .await
                 .expect_err("expected a panic")

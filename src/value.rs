@@ -23,14 +23,21 @@ use std::rc::Rc;
 pub struct ObjectCell {
     pub map: RefCell<IndexMap<String, Value>>,
     pub shape: Cell<u32>,
+    /// `object.freeze` flag (SP2 §4). Defaults `false`. A `Cell` (not `RefCell`)
+    /// so a `&self` engine can set/read it without a borrow conflict and with no
+    /// await-holding-borrow risk; it is `Copy` and adds no GC-traceable edge, so
+    /// `Value::trace`/the cycle collector are unaffected.
+    pub frozen: Cell<bool>,
 }
 
 impl ObjectCell {
-    /// Wrap an `IndexMap` into a shared `ObjectCell` with shape `0` (unset).
+    /// Wrap an `IndexMap` into a shared `ObjectCell` with shape `0` (unset),
+    /// unfrozen.
     pub fn new(map: IndexMap<String, Value>) -> Cc<ObjectCell> {
         Cc::new(ObjectCell {
             map: RefCell::new(map),
             shape: Cell::new(0),
+            frozen: Cell::new(false),
         })
     }
 
@@ -43,6 +50,60 @@ impl ObjectCell {
     pub fn borrow_mut(&self) -> RefMut<'_, IndexMap<String, Value>> {
         self.map.borrow_mut()
     }
+
+    /// Whether this object has been frozen by `object.freeze`.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.get()
+    }
+
+    /// Mark this object frozen (one-way; idempotent).
+    pub fn freeze(&self) {
+        self.frozen.set(true);
+    }
+}
+
+/// The heap payload behind `Value::Array` (SP2 §4 / decision D3). Wraps the
+/// element `Vec<Value>` together with an `object.freeze` flag. The wrapper exists
+/// ONLY to carry the `frozen` flag beside the vector — exactly mirroring the
+/// V11-T2 `ObjectCell` migration — so the `borrow()`/`borrow_mut()` shims keep the
+/// vast majority of array access sites textually unchanged. `frozen` is a
+/// `Cell<bool>` (`Copy`, no-op `Trace`): it adds no GC-traceable edge, so
+/// `Value::trace` is unaffected.
+pub struct ArrayCell {
+    pub vec: RefCell<Vec<Value>>,
+    pub frozen: Cell<bool>,
+}
+
+impl ArrayCell {
+    /// Wrap a `Vec<Value>` into a shared, `Cc`-managed `ArrayCell` (unfrozen).
+    pub fn new(vec: Vec<Value>) -> Cc<ArrayCell> {
+        Cc::new(ArrayCell {
+            vec: RefCell::new(vec),
+            frozen: Cell::new(false),
+        })
+    }
+
+    /// Immutable borrow of the element vector (drop-in for the old
+    /// `Cc<RefCell<Vec<Value>>>`).
+    pub fn borrow(&self) -> Ref<'_, Vec<Value>> {
+        self.vec.borrow()
+    }
+
+    /// Mutable borrow of the element vector (drop-in for the old
+    /// `Cc<RefCell<Vec<Value>>>`).
+    pub fn borrow_mut(&self) -> RefMut<'_, Vec<Value>> {
+        self.vec.borrow_mut()
+    }
+
+    /// Whether this array has been frozen by `object.freeze`.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.get()
+    }
+
+    /// Mark this array frozen (one-way; idempotent).
+    pub fn freeze(&self) {
+        self.frozen.set(true);
+    }
 }
 
 /// The heap payload behind `Value::Map`. A thin newtype around the entry
@@ -52,38 +113,72 @@ impl ObjectCell {
 /// this local newtype lets `Cc<MapCell>` satisfy `T: Trace` while the cycle
 /// collector still reaches the contained `Value`s. `Deref`s to the inner
 /// `RefCell` so every `m.borrow()`/`m.borrow_mut()` access site is unchanged.
-pub struct MapCell(pub RefCell<IndexMap<MapKey, Value>>);
+pub struct MapCell {
+    pub map: RefCell<IndexMap<MapKey, Value>>,
+    /// `object.freeze` flag (SP2 §4). Defaults `false`. See [`ObjectCell::frozen`].
+    pub frozen: Cell<bool>,
+}
 
 impl MapCell {
-    /// Wrap an `IndexMap` into a shared, `Cc`-managed `MapCell`.
+    /// Wrap an `IndexMap` into a shared, `Cc`-managed `MapCell` (unfrozen).
     pub fn new(map: IndexMap<MapKey, Value>) -> Cc<MapCell> {
-        Cc::new(MapCell(RefCell::new(map)))
+        Cc::new(MapCell {
+            map: RefCell::new(map),
+            frozen: Cell::new(false),
+        })
+    }
+
+    /// Whether this map has been frozen by `object.freeze`.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.get()
+    }
+
+    /// Mark this map frozen (one-way; idempotent).
+    pub fn freeze(&self) {
+        self.frozen.set(true);
     }
 }
 
 impl std::ops::Deref for MapCell {
     type Target = RefCell<IndexMap<MapKey, Value>>;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.map
     }
 }
 
 /// The heap payload behind `Value::Set`. See [`MapCell`] — same story, a local
 /// newtype over `RefCell<IndexSet<…>>` so it can carry a `Trace` impl (foreign
 /// `IndexSet` cannot) and `Cc<SetCell>` satisfies `T: Trace`.
-pub struct SetCell(pub RefCell<IndexSet<MapKey>>);
+pub struct SetCell {
+    pub set: RefCell<IndexSet<MapKey>>,
+    /// `object.freeze` flag (SP2 §4). Defaults `false`. See [`ObjectCell::frozen`].
+    pub frozen: Cell<bool>,
+}
 
 impl SetCell {
-    /// Wrap an `IndexSet` into a shared, `Cc`-managed `SetCell`.
+    /// Wrap an `IndexSet` into a shared, `Cc`-managed `SetCell` (unfrozen).
     pub fn new(set: IndexSet<MapKey>) -> Cc<SetCell> {
-        Cc::new(SetCell(RefCell::new(set)))
+        Cc::new(SetCell {
+            set: RefCell::new(set),
+            frozen: Cell::new(false),
+        })
+    }
+
+    /// Whether this set has been frozen by `object.freeze`.
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.get()
+    }
+
+    /// Mark this set frozen (one-way; idempotent).
+    pub fn freeze(&self) {
+        self.frozen.set(true);
     }
 }
 
 impl std::ops::Deref for SetCell {
     type Target = RefCell<IndexSet<MapKey>>;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.set
     }
 }
 
@@ -179,6 +274,10 @@ pub struct Instance {
     /// shape (and transitions it if a field is added). `Cell` so a `&self` VM
     /// method can update it without a mutable instance borrow.
     pub shape_id: Cell<u32>,
+    /// `object.freeze` flag (SP2 §4). Defaults `false`. `Cell` so a `&self`
+    /// engine can set/read it without a mutable instance borrow; see
+    /// [`ObjectCell::frozen`].
+    pub frozen: Cell<bool>,
 }
 
 pub struct BoundMethod {
@@ -408,7 +507,7 @@ pub enum Value {
     /// cells. Behaves like `Function` to the user (same `type()`/display);
     /// identity equality. Produced by the VM (V4+); inert in the tree-walker.
     Closure(Cc<crate::vm::value_ext::Closure>),
-    Array(Cc<RefCell<Vec<Value>>>),
+    Array(Cc<ArrayCell>),
     Object(Cc<ObjectCell>),
     // IndexMap (not HashMap) is deliberate: insertion order is required for
     // deterministic keys/values/entries/display and to match `Object`.
@@ -721,16 +820,16 @@ mod tests {
 
     #[test]
     fn arrays_compare_by_identity_and_display() {
-        use std::cell::RefCell;
+        
 
-        let a = Value::Array(gcmodule::Cc::new(RefCell::new(vec![
+        let a = Value::Array(crate::value::ArrayCell::new(vec![
             Value::Number(1.0),
             Value::Str("two".into()),
-        ])));
+        ]));
         assert_eq!(a.to_string(), "[1, \"two\"]");
         // identity: a clone of the SAME Rc is equal; a fresh array is not
         assert_eq!(a.clone(), a);
-        let b = Value::Array(gcmodule::Cc::new(RefCell::new(vec![Value::Number(1.0)])));
+        let b = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
         assert_ne!(a, b);
         assert!(a.is_truthy());
     }
@@ -747,7 +846,7 @@ mod tests {
         assert!(map.is_truthy());
         assert!(MapKey::from_value(&Value::Number(0.0)).is_some());
         assert!(
-            MapKey::from_value(&Value::Array(gcmodule::Cc::new(RefCell::new(vec![])))).is_none()
+            MapKey::from_value(&Value::Array(crate::value::ArrayCell::new(vec![]))).is_none()
         );
     }
 

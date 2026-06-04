@@ -5,7 +5,6 @@ use crate::error::AsError;
 use crate::interp::{make_error, make_pair, Control};
 use crate::span::Span;
 use crate::value::Value;
-use std::cell::RefCell;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -15,7 +14,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
+    Value::Array(crate::value::ArrayCell::new(v))
 }
 fn str_v(s: &str) -> Value {
     Value::Str(s.into())

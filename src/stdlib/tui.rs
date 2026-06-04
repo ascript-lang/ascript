@@ -1068,9 +1068,9 @@ mod tests {
     }
 
     fn arr(items: Vec<f64>) -> Value {
-        Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+        Value::Array(crate::value::ArrayCell::new(
             items.into_iter().map(Value::Number).collect(),
-        )))
+        ))
     }
 
     #[test]

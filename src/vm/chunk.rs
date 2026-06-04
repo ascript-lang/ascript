@@ -611,12 +611,12 @@ mod tests {
     #[test]
     fn add_const_does_not_dedup_nondedupable() {
         let mut c = Chunk::new();
-        let arr1 = c.add_const(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+        let arr1 = c.add_const(Value::Array(crate::value::ArrayCell::new(
             vec![],
-        ))));
-        let arr2 = c.add_const(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+        )));
+        let arr2 = c.add_const(Value::Array(crate::value::ArrayCell::new(
             vec![],
-        ))));
+        )));
         assert_ne!(arr1, arr2, "non-dedupable values are always appended");
     }
 

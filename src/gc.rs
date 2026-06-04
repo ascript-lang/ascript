@@ -40,7 +40,7 @@
 //! The [`Trace`] impl on [`Value`] therefore visits ONLY the container variants
 //! and is a no-op for everything else.
 
-use crate::value::{Instance, MapCell, MapKey, ObjectCell, SetCell, Value};
+use crate::value::{ArrayCell, Instance, MapCell, MapKey, ObjectCell, SetCell, Value};
 use crate::vm::value_ext::Closure;
 use gcmodule::{Cc, Trace, Tracer};
 use indexmap::{IndexMap, IndexSet};
@@ -220,9 +220,28 @@ impl Trace for ObjectCell {
         // `map: RefCell<IndexMap<String, Value>>`. Avoid holding the borrow if
         // it is already mutably borrowed (mirrors gcmodule's `RefCell` impl:
         // an outstanding borrow implies an outstanding reference, so skipping
-        // is safe). `shape: Cell<u32>` is acyclic.
+        // is safe). `shape: Cell<u32>` and `frozen: Cell<bool>` are acyclic.
         if let Ok(map) = self.map.try_borrow() {
             trace_index_map(&map, tracer);
+        }
+    }
+
+    fn is_type_tracked() -> bool {
+        true
+    }
+}
+
+/// `ArrayCell` (`Value::Array` payload, SP2 §4): wraps `vec: RefCell<Vec<Value>>`
+/// beside a `frozen: Cell<bool>`. Only the vector can hold cycles; the `Cell<bool>`
+/// is acyclic (`Copy`, no traceable edge). Avoid holding the borrow if it is
+/// already mutably borrowed (an outstanding borrow implies an outstanding
+/// reference, so skipping is safe — mirrors gcmodule's `RefCell` impl). `Vec<T:
+/// Trace>` has a gcmodule blanket impl, so this delegates straight through to
+/// `Value::trace`.
+impl Trace for ArrayCell {
+    fn trace(&self, tracer: &mut Tracer) {
+        if let Ok(vec) = self.vec.try_borrow() {
+            vec.trace(tracer);
         }
     }
 
@@ -397,7 +416,7 @@ mod tests {
             m.insert("k".to_string(), Value::Number(1.0));
             Value::Object(ObjectCell::new(m))
         };
-        let arr = Value::Array(Cc::new(RefCell::new(vec![inner.clone(), Value::Nil])));
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![inner.clone(), Value::Nil]));
         let mut mm: IndexMap<MapKey, Value> = IndexMap::new();
         mm.insert(MapKey::Str("a".into()), arr.clone());
         let map = Value::Map(MapCell::new(mm));
@@ -461,7 +480,7 @@ mod tests {
         // `Cc<RefCell<Vec<Value>>>` now has an internal edge from its own slot, so
         // dropping the external `a` leaves refcount 1 (the self-edge) → it is NOT
         // freed by refcounting and would leak without cycle collection.
-        let a = Value::Array(Cc::new(RefCell::new(Vec::new())));
+        let a = Value::Array(crate::value::ArrayCell::new(Vec::new()));
         if let Value::Array(arr) = &a {
             arr.borrow_mut().push(a.clone());
         }
@@ -525,7 +544,7 @@ mod tests {
 
         let mut held = Vec::with_capacity(N);
         for _ in 0..N {
-            let a = Value::Array(Cc::new(RefCell::new(Vec::new())));
+            let a = Value::Array(crate::value::ArrayCell::new(Vec::new()));
             if let Value::Array(arr) = &a {
                 arr.borrow_mut().push(a.clone()); // self-edge
             }
@@ -588,6 +607,7 @@ mod tests {
                     class: class.clone(),
                     fields: IndexMap::new(),
                     shape_id: Cell::new(0),
+                    frozen: Cell::new(false),
                 })))
             };
             let a = mk();
@@ -717,7 +737,7 @@ mod tests {
                 anon_proto(),
                 vec![env_cell.clone()], // body captures its environment
             ));
-            let arr = Value::Array(Cc::new(RefCell::new(vec![body])));
+            let arr = Value::Array(crate::value::ArrayCell::new(vec![body]));
             *env_cell.borrow_mut() = arr; // environment references the body's container
             held.push(env_cell);
         }
@@ -756,9 +776,9 @@ mod tests {
 
         let mut held = Vec::with_capacity(N);
         for i in 0..N {
-            held.push(Value::Array(Cc::new(RefCell::new(vec![Value::Number(
+            held.push(Value::Array(crate::value::ArrayCell::new(vec![Value::Number(
                 i as f64,
-            )]))));
+            )])));
         }
         assert!(gcmodule::count_thread_tracked() >= before + N);
 
@@ -784,7 +804,7 @@ mod tests {
         super::collect(); // reset baseline
                           // A single tiny acyclic allocation is far below the
                           // COLLECT_GROWTH_THRESHOLD, so maybe_collect must skip.
-        let v = Value::Array(Cc::new(RefCell::new(vec![Value::Number(1.0)])));
+        let v = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
         let reclaimed = super::maybe_collect();
         assert_eq!(
             reclaimed, 0,

@@ -70,7 +70,7 @@ pub fn global_env() -> Environment {
 /// Build a `[value, err]` Result pair.
 // pub(crate): used by std/* modules (std/convert) later in M10.
 pub(crate) fn make_pair(value: Value, err: Value) -> Value {
-    Value::Array(gcmodule::Cc::new(RefCell::new(vec![value, err])))
+    Value::Array(crate::value::ArrayCell::new(vec![value, err]))
 }
 
 /// Build an error object `{ message: <msg> }`.
@@ -408,7 +408,7 @@ impl Interp {
             .iter()
             .map(|s| Value::Str(s.clone()))
             .collect();
-        Value::Array(gcmodule::Cc::new(RefCell::new(args)))
+        Value::Array(crate::value::ArrayCell::new(args))
     }
 
     /// Register one newly-spawned async task: bump `inflight` (and the high-water
@@ -1030,7 +1030,7 @@ impl Interp {
                 }
                 if let Some((rest_name, _)) = rest {
                     let tail: Vec<Value> = items.iter().skip(names.len()).cloned().collect();
-                    let arr = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(tail)));
+                    let arr = Value::Array(crate::value::ArrayCell::new(tail));
                     env.define(rest_name, arr, *mutable).map_err(AsError::new)?;
                 }
                 Ok(Flow::Normal)
@@ -1493,7 +1493,7 @@ impl Interp {
                         }
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(values))))
+                Ok(Value::Array(crate::value::ArrayCell::new(values)))
             }
             ExprKind::Object(entries) => {
                 let mut map = indexmap::IndexMap::with_capacity(entries.len());
@@ -1800,7 +1800,7 @@ impl Interp {
                     let remainder: Vec<Value> = items[pats.len()..].to_vec();
                     bindings.push((
                         rest_name.clone(),
-                        Value::Array(gcmodule::Cc::new(RefCell::new(remainder))),
+                        Value::Array(crate::value::ArrayCell::new(remainder)),
                     ));
                 }
                 Ok(true)
@@ -2523,6 +2523,7 @@ impl Interp {
             class: class.clone(),
             fields: indexmap::IndexMap::new(),
             shape_id: std::cell::Cell::new(0),
+            frozen: std::cell::Cell::new(false),
         }));
         let inst_val = Value::Instance(instance.clone());
         // Pre-populate declared-field defaults (merged base-class first so a
@@ -2656,6 +2657,7 @@ impl Interp {
                 class: class.clone(),
                 fields: inst_fields,
                 shape_id: std::cell::Cell::new(0),
+                frozen: std::cell::Cell::new(false),
             },
         ))))
     }
@@ -2697,9 +2699,9 @@ impl Interp {
                         let p = format!("{}[{}]", path, i);
                         out.push(self.coerce_field(elem, it, env, strict, &p, span).await?);
                     }
-                    Ok(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+                    Ok(Value::Array(crate::value::ArrayCell::new(
                         out,
-                    ))))
+                    )))
                 }
                 _ => Ok(val),
             },
@@ -3036,7 +3038,7 @@ impl Interp {
                         i += step;
                     }
                 }
-                Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+                Ok(Value::Array(crate::value::ArrayCell::new(out)))
             }
             other => {
                 if let Some((module, func)) = other.split_once('.') {
@@ -3245,7 +3247,7 @@ pub(crate) fn materialize_range_stepped(
         items.push(Value::Number(i));
         i += step;
     }
-    Ok(Value::Array(gcmodule::Cc::new(RefCell::new(items))))
+    Ok(Value::Array(crate::value::ArrayCell::new(items)))
 }
 
 /// The direction-aware loop predicate shared by the for-range loop and value
@@ -3858,9 +3860,9 @@ pub(crate) fn check_call_args(
             }
             rest_vals.push(a);
         }
-        values.push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+        values.push(Value::Array(crate::value::ArrayCell::new(
             rest_vals,
-        ))));
+        )));
     }
     Ok(BoundArgs {
         values,

@@ -195,7 +195,7 @@ mod tests {
     fn additional_misuse_and_overflow() {
         let sp = sp();
         // toNumber on a non-string, non-coercible value (array) → Tier-2 panic (distinct arm)
-        let arr = Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(vec![])));
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![]));
         assert!(matches!(
             call("toNumber", &[arr], sp),
             Err(Control::Panic(_))
@@ -212,9 +212,9 @@ mod tests {
         assert_eq!(
             call(
                 "toString",
-                &[Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+                &[Value::Array(crate::value::ArrayCell::new(
                     vec![Value::Number(1.0), Value::Number(2.0)]
-                )))],
+                ))],
                 sp
             )
             .unwrap()

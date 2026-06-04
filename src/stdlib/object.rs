@@ -109,7 +109,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
             if let Some(c) = seen.get(&key) {
                 return c.clone();
             }
-            let out = gcmodule::Cc::new(RefCell::new(Vec::new()));
+            let out = crate::value::ArrayCell::new(Vec::new());
             let cloned = Value::Array(out.clone());
             seen.insert(key, cloned.clone());
             let src = rc.borrow().clone();
@@ -179,6 +179,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
                 class,
                 fields: IndexMap::new(),
                 shape_id: std::cell::Cell::new(0),
+                frozen: std::cell::Cell::new(false),
             }));
             let cloned = Value::Instance(out.clone());
             seen.insert(key, cloned.clone());
@@ -195,7 +196,7 @@ pub(crate) fn deep_clone(v: &Value, seen: &mut HashMap<usize, Value>) -> Value {
 }
 
 fn arr(v: Vec<Value>) -> Value {
-    Value::Array(gcmodule::Cc::new(RefCell::new(v)))
+    Value::Array(crate::value::ArrayCell::new(v))
 }
 
 /// Clone the field map of an object-like value (Object or class Instance).
@@ -507,7 +508,7 @@ mod tests {
     #[test]
     fn deep_clone_and_equal_handle_cycles() {
         // self-referential array: a = [a]
-        let a: gcmodule::Cc<RefCell<Vec<Value>>> = gcmodule::Cc::new(RefCell::new(Vec::new()));
+        let a: gcmodule::Cc<crate::value::ArrayCell> = crate::value::ArrayCell::new(Vec::new());
         let arr_a = Value::Array(a.clone());
         a.borrow_mut().push(arr_a.clone());
         // deep_clone terminates and yields a distinct (by identity) container

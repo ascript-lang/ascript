@@ -5,7 +5,6 @@ use crate::error::AsError;
 use crate::interp::Control;
 use crate::span::Span;
 use crate::value::Value;
-use std::cell::RefCell;
 
 pub fn exports() -> Vec<(&'static str, Value)> {
     vec![
@@ -50,7 +49,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     .map(|p| str_val(p.to_string()))
                     .collect()
             };
-            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(parts))))
+            Ok(Value::Array(crate::value::ArrayCell::new(parts)))
         }
         "join" => {
             let arr = want_array(&arg(args, 0), span, &ctx("join"))?;
@@ -173,12 +172,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .chars()
                 .map(|c| Value::Str(c.to_string().into()))
                 .collect();
-            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+            Ok(Value::Array(crate::value::ArrayCell::new(out)))
         }
         "lines" => {
             let s = want_string(&arg(args, 0), span, &ctx("lines"))?;
             let out: Vec<Value> = s.lines().map(|l| Value::Str(l.into())).collect();
-            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+            Ok(Value::Array(crate::value::ArrayCell::new(out)))
         }
         "reverse" => {
             let s = want_string(&arg(args, 0), span, &ctx("reverse"))?;
@@ -206,7 +205,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .splitn(n, sep.as_ref())
                 .map(|p| Value::Str(p.into()))
                 .collect();
-            Ok(Value::Array(gcmodule::Cc::new(RefCell::new(out))))
+            Ok(Value::Array(crate::value::ArrayCell::new(out)))
         }
         _ => Err(AsError::at(format!("std/string has no function '{}'", func), span).into()),
     }
