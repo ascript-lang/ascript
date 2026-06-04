@@ -221,3 +221,39 @@ fn formatted_corpus_reparses_without_errors() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn consecutive_comments_stay_together_no_inserted_blank() {
+    // Regression (SP1 BUGFIX 1): the formatter wrongly inserted a blank line
+    // between consecutive `//` comment lines (the comment line's terminating
+    // newline was double-counted toward the next comment's `blank_before`).
+    // Consecutive comments — including a run that precedes a declaration — must
+    // stay together with NO inserted blank; genuine author blanks are preserved.
+    let cases: &[(&str, &str)] = &[
+        // The exact repro from the bug report: 3 comments + a decl, no blanks.
+        (
+            "// a\n// b\n// c\nlet x = 1\n",
+            "// a\n// b\n// c\nlet x = 1\n",
+        ),
+        // A genuine author blank between two comments is preserved.
+        ("// a\n\n// c\nlet x = 1\n", "// a\n\n// c\nlet x = 1\n"),
+        // Consecutive comments leading a function declaration (the body is
+        // canonicalized to multiline, but the comments stay together, no blank).
+        (
+            "// one\n// two\nfn f() { return 1 }\n",
+            "// one\n// two\nfn f() {\n  return 1\n}\n",
+        ),
+        // Mixed: a blank then a run of consecutive comments.
+        (
+            "let a = 1\n\n// x\n// y\nlet b = 2\n",
+            "let a = 1\n\n// x\n// y\nlet b = 2\n",
+        ),
+    ];
+    for (src, expected) in cases {
+        let once = ascript::syntax::format_tree(src);
+        assert_eq!(&once, expected, "fmt mismatch for {src:?}");
+        // …and idempotent.
+        let twice = ascript::syntax::format_tree(&once);
+        assert_eq!(once, twice, "not idempotent for {src:?}");
+    }
+}
