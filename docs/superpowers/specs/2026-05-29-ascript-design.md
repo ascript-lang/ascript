@@ -30,7 +30,9 @@ Design priorities, in strict order:
 ### Non-goals (v1)
 
 - No static type inference or compile-time type checking (types are runtime contracts).
-- No bytecode VM or JIT (tree-walker only).
+- No bytecode VM or JIT (tree-walker only). **Superseded 2026-06-04:** a bytecode VM is now
+  the **default** engine and the tree-walker is the byte-identical reference oracle (`--tree-walker`;
+  CLAUDE.md architecture, `src/lib.rs` `vm_run_source`). JIT remains a non-goal.
 - No multithreading in user code (single-threaded event loop; see §7).
 - No macro system, operator overloading, or metaprogramming.
 - No package manager / registry (deferred to a future spec).

@@ -413,7 +413,7 @@ stream.close()
 
 ## std/http/server
 
-A minimal HTTP/1 server whose request handlers are AScript functions. Because handlers need `&mut Interp` on the single-threaded runtime, requests are handled **strictly sequentially** (one request per connection, fully awaited before the next). Concurrent connections are a documented v1 limitation.
+A minimal HTTP/1 server whose request handlers are AScript functions. Each accepted connection is handled on its **own `spawn_local` task**, so a slow handler does not block other clients (no head-of-line blocking) — the accept loop continues accepting immediately. In-flight handler concurrency is bounded by a `tokio::sync::Semaphore` (default 256, configurable via the `maxConcurrent` serve option) for backpressure under load.
 
 ```ascript
 import { create } from "std/http/server"
