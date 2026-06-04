@@ -42,6 +42,8 @@ pub const RULE_CODES: &[&str] = &[
     "unresolved-import",
     "unknown-enum-variant",
     "duplicate-member",
+    "super-misuse",
+    "field-default-type",
 ];
 
 /// Per-code severity overrides plus global warning promotion.

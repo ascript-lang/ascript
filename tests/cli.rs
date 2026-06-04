@@ -1871,6 +1871,95 @@ fn check_duplicate_member_lint_and_allow_suppression() {
 }
 
 #[test]
+fn check_super_misuse_lint_and_allow_suppression() {
+    // The `super-misuse` static lint flags `super` used in a class with no
+    // superclass (a guaranteed runtime panic). Configurable: `--allow
+    // super-misuse` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir().join(format!("ascript_super_misuse_{}.as", std::process::id()));
+    std::fs::write(&file, "class A {\n  fn init() { super.init() }\n}\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"super-misuse\""),
+        "expected a super-misuse diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("which has no superclass"),
+        "expected the descriptive message, got:\n{stdout}"
+    );
+
+    // `--allow super-misuse` suppresses it.
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("super-misuse")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"super-misuse\""),
+        "--allow super-misuse should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_field_default_type_lint_and_allow_suppression() {
+    // The `field-default-type` static lint flags a class field whose literal
+    // default contradicts its declared type (a guaranteed runtime panic at
+    // construction). Configurable: `--allow field-default-type` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_field_default_type_{}.as", std::process::id()));
+    std::fs::write(&file, "class P { n: number = \"x\" }\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"field-default-type\""),
+        "expected a field-default-type diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("field 'n' default is string"),
+        "expected the descriptive message, got:\n{stdout}"
+    );
+
+    // `--allow field-default-type` suppresses it.
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("field-default-type")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"field-default-type\""),
+        "--allow field-default-type should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn check_invalid_propagate_lint_and_allow_suppression() {
     // The `invalid-propagate` static lint flags a postfix `?` inside a function
     // whose declared return type is not a `Result`. Configurable: `--allow
