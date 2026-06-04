@@ -658,7 +658,7 @@ fn cst_param(node: &crate::syntax::cst::ResolvedNode) -> crate::ast::Param {
     let default = node
         .children()
         .any(|c| Expr::cast(c.clone()).is_some())
-        .then(|| crate::ast::Expr {
+        .then_some(crate::ast::Expr {
             kind: crate::ast::ExprKind::Nil,
             span: name_span,
         });
@@ -2537,7 +2537,7 @@ impl Compiler {
             let Some(default) = param.children().find_map(|c| Expr::cast(c.clone())) else {
                 continue;
             };
-            let pspan = range_span(&param);
+            let pspan = range_span(param);
             let param_index = u16::try_from(idx).map_err(|_| {
                 CompileError::new("too many parameters (max 65535)", pspan)
             })?;

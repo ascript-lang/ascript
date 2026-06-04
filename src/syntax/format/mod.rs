@@ -451,6 +451,10 @@ impl Printer<'_> {
                     self.out.text(": ");
                     self.type_ann(ty);
                 }
+                if let Some(default) = p.children().find(|c| is_expr_kind(c.kind())) {
+                    self.out.text(" = ");
+                    self.expr(default);
+                }
             }
         }
         self.out.text(")");
@@ -477,6 +481,10 @@ impl Printer<'_> {
             if let Some(ty) = p.children().find(|c| is_type_kind(c.kind())) {
                 self.out.text(": ");
                 self.type_ann(ty);
+            }
+            if let Some(default) = p.children().find(|c| is_expr_kind(c.kind())) {
+                self.out.text(" = ");
+                self.expr(default);
             }
         }
         self.out.text(")");

@@ -12,11 +12,13 @@
 //! - callee is not a plain name (a method call `x.m(...)`, a computed callee);
 //! - the name is unresolved / a bare global builtin / an import / a parameter /
 //!   has multiple decls / is shadowed (only a unique file-declared `fn` proceeds);
-//! - the function has a REST parameter (`...rest`) — arity is a range, not exact;
+//! - the function has a REST parameter (`...rest`) — the MAX is unbounded, so a
+//!   too-MANY call is never flagged (a too-FEW call below the min is still flagged);
 //! - any call argument is a SPREAD (`f(...xs)`) — the count is unknown.
 //!
-//! (AScript has no default-parameter syntax — `fn f(a, b = 1)` does not parse —
-//! so there is no default-value case to skip.)
+//! Default parameters (SP2 §2) make arity a RANGE: `min` = the leading run of
+//! params with no default; `max` = the param count (or ∞ with a rest). A call is
+//! flagged when `arg_count < min` or (no rest and `arg_count > max`).
 
 use crate::check::diagnostic::{AsDiagnostic, Severity};
 use crate::check::rules::{code_range, fn_name, is_expr_kind};
@@ -65,10 +67,9 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
             continue;
         }
 
-        // A rest parameter makes the arity a range, not exact → skip.
-        let Some(param_count) = fixed_param_count(fn_decl) else {
-            continue;
-        };
+        // Compute the callee's arity RANGE: `min` required, `max` total (None = a
+        // rest param makes the max unbounded).
+        let Arity { min, max } = fn_arity(fn_decl);
 
         let Some(arg_list) = call.children().find(|c| c.kind() == ArgList) else {
             continue;
@@ -82,13 +83,23 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
             .filter(|c| is_expr_kind(c.kind()))
             .count();
 
-        if arg_count != param_count {
+        // Too few (below the required min) or, when the arity is bounded, too many.
+        let too_few = arg_count < min;
+        let too_many = max.is_some_and(|m| arg_count > m);
+        if too_few || too_many {
+            // Describe the expected count: an exact `N` when min == max, else a
+            // range (`at least N` with a rest, `N to M` otherwise).
+            let expected = match max {
+                Some(m) if m == min => format!("{min} argument(s)"),
+                Some(m) => format!("{min} to {m} argument(s)"),
+                None => format!("at least {min} argument(s)"),
+            };
             out.push(AsDiagnostic {
                 range: code_range(call),
                 severity: Severity::Warning,
                 code: "call-arity".to_string(),
                 message: format!(
-                    "{name} expects {param_count} argument(s) but is called with {arg_count}"
+                    "{name} expects {expected} but is called with {arg_count}"
                 ),
                 fix: None,
             });
@@ -97,27 +108,50 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
     out
 }
 
-/// The number of FIXED (positional) parameters of a `FnDecl`, or `None` if it has
-/// a REST parameter (`...name`) — in which case the arity is a range and the call
-/// must not be flagged. A param is a rest iff it carries a `DotDotDot` token
-/// (same detection as `contract.rs::param_types`).
-fn fixed_param_count(fn_decl: &ResolvedNode) -> Option<usize> {
+/// The arity range of a `FnDecl`: `min` leading required params (no default),
+/// `max` total positional params, or `None` when a `...rest` makes it unbounded.
+struct Arity {
+    min: usize,
+    max: Option<usize>,
+}
+
+/// The arity range of a `FnDecl`. `min` is the leading run of POSITIONAL params
+/// with no default (SP2 §2: a required param may not follow a defaulted one, so
+/// this is the count of params before the first defaulted one); `max` is the
+/// positional param count, or `None` when a `...rest` param makes it unbounded. A
+/// param is a rest iff it carries a `DotDotDot` token; it has a default iff it has
+/// an EXPRESSION child (the `= expr` part — distinct from its TYPE child).
+fn fn_arity(fn_decl: &ResolvedNode) -> Arity {
     use SyntaxKind::*;
     let Some(list) = fn_decl.children().find(|c| c.kind() == ParamList) else {
-        return Some(0); // no param list ⇒ zero params
+        return Arity {
+            min: 0,
+            max: Some(0),
+        };
     };
-    let mut count = 0usize;
+    let mut min = 0usize;
+    let mut positional = 0usize;
+    let mut seen_default = false;
     for p in list.children().filter(|c| c.kind() == Param) {
         let is_rest = p
             .children_with_tokens()
             .filter_map(|el| el.into_token())
             .any(|t| t.kind() == DotDotDot);
         if is_rest {
-            return None; // variadic — arity not exact
+            return Arity { min, max: None }; // variadic — max unbounded
         }
-        count += 1;
+        positional += 1;
+        let has_default = p.children().any(|c| is_expr_kind(c.kind()));
+        if has_default {
+            seen_default = true;
+        } else if !seen_default {
+            min += 1;
+        }
     }
-    Some(count)
+    Arity {
+        min,
+        max: Some(positional),
+    }
 }
 
 /// Does the callee `NameRef` resolve to the genuine binding of the unique top-level
@@ -264,5 +298,61 @@ mod tests {
             .find(|d| d.code == "call-arity")
             .unwrap();
         assert_eq!(d.message, "f expects 2 argument(s) but is called with 3");
+    }
+
+    // ---- SP2 §2: default-parameter arity range -----------------------------
+
+    #[test]
+    fn default_param_in_range_not_flagged() {
+        // `fn f(a, b = 1)` accepts 1 OR 2 args — both are in range.
+        assert!(
+            !has("fn f(a, b = 1) { return a }\nf(1)", "call-arity"),
+            "{:?}",
+            analyze("fn f(a, b = 1) { return a }\nf(1)").diagnostics
+        );
+        assert!(
+            !has("fn f(a, b = 1) { return a }\nf(1, 2)", "call-arity"),
+            "{:?}",
+            analyze("fn f(a, b = 1) { return a }\nf(1, 2)").diagnostics
+        );
+    }
+
+    #[test]
+    fn default_param_too_few_flagged() {
+        // Below the required min (1) → flagged.
+        let src = "fn f(a, b = 1) { return a }\nf()";
+        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "call-arity")
+            .unwrap();
+        assert_eq!(d.message, "f expects 1 to 2 argument(s) but is called with 0");
+    }
+
+    #[test]
+    fn default_param_too_many_flagged() {
+        // Above the max (2, no rest) → flagged.
+        let src = "fn f(a, b = 1) { return a }\nf(1, 2, 3)";
+        assert_eq!(count(src, "call-arity"), 1, "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn default_with_rest_only_too_few_flagged() {
+        // `fn f(a, b = 2, ...xs)`: min 1, max unbounded. Too-few (0) flagged; any
+        // count >= 1 is in range (never too-many).
+        let too_few = "fn f(a, b = 2, ...xs) { return a }\nf()";
+        assert_eq!(
+            count(too_few, "call-arity"),
+            1,
+            "{:?}",
+            analyze(too_few).diagnostics
+        );
+        let in_range = "fn f(a, b = 2, ...xs) { return a }\nf(1)\nf(1, 2, 3, 4)";
+        assert!(
+            !has(in_range, "call-arity"),
+            "{:?}",
+            analyze(in_range).diagnostics
+        );
     }
 }
