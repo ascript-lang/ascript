@@ -200,6 +200,60 @@ fn build_then_run_aso_matches_stepped_field_default() {
     assert_eq!(aso_code, as_code);
 }
 
+#[test]
+fn build_then_run_aso_matches_arrow_and_match_field_defaults() {
+    // SP1 Phase E (E2): a class with an ARROW field default AND a `match` field
+    // default. The VM lowers these by RE-PARSING the node source text through the
+    // legacy front-end (`cst_default_expr` → `reparse_default_expr`); the `.aso`
+    // serializer persists that source text and re-lowers it on load, so the built
+    // bytecode runs byte-identically to the tree-walker oracle. Before E2, `ascript
+    // build` rejected these defaults (`NonLiteralConst("arrow-default")`).
+    let dir = unique_dir("arrowmatch");
+    write(
+        &dir,
+        "f.as",
+        "let base = 100\n\
+         class C {\n  \
+         f: fn = (n) => n + base\n  \
+         label: string = match 2 { 1 => \"one\", 2 => \"two\", _ => \"many\" }\n  \
+         doubled: array<number> = 1..=3\n  \
+         fn init() {}\n}\n\
+         let c = C()\nprint(c.f(5))\nprint(c.label)\nprint(c.doubled)\n",
+    );
+    build(&dir, "f.as");
+    assert!(dir.join("f.aso").exists(), "f.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "f.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "f.as"]);
+    assert_eq!(aso_out, "105\ntwo\n[1, 2, 3]\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
+fn build_then_run_aso_matches_arrow_match_via_from() {
+    // The `.from` path reads `FieldSchema.default` and EVALUATES it (the construct
+    // path uses the compiled thunk). Both come from the SAME re-parsed source, so a
+    // missing field filled by an arrow/match default through `.from` must also be
+    // byte-identical after the `.aso` round-trip.
+    let dir = unique_dir("arrowmatchfrom");
+    write(
+        &dir,
+        "f.as",
+        "class C {\n  \
+         id: number\n  \
+         label: string = match 1 { 1 => \"one\", _ => \"z\" }\n}\n\
+         let c = C.from({id: 7})\nprint(c.id)\nprint(c.label)\n",
+    );
+    build(&dir, "f.as");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "f.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "f.as"]);
+    assert_eq!(aso_out, "7\none\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
 // ---------------------------------------------------------------------------
 // FILE-module import resolution (named + namespace)
 // ---------------------------------------------------------------------------

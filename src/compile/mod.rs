@@ -581,25 +581,39 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
 /// whose bodies are arbitrary statement/pattern subtrees. The slice is left-padded
 /// with spaces up to the node's start offset so the produced ast spans keep their
 /// original-file byte offsets (matching what the structural lowering produces).
+/// The left-padded source text a [`reparse_default_expr`] re-lexes/re-parses for an
+/// arrow/`match` field default. The node's code span (trivia-trimmed) is the exact
+/// expression source; it is padded with leading spaces up to the node's start byte
+/// offset so the produced token/ast spans keep their original-file offsets. This is
+/// also the exact string the `.aso` serializer persists (`ClassProto.default_sources`)
+/// so a built `.aso` re-lowers the default to an identical `Expr` on load.
+fn reparse_default_source(node: &crate::syntax::cst::ResolvedNode) -> String {
+    let text = node.text().to_string();
+    let start = usize::from(node.text_range().start());
+    format!("{}{}", " ".repeat(start), text)
+}
+
 fn reparse_default_expr(
     node: &crate::syntax::cst::ResolvedNode,
     span: Span,
 ) -> Result<crate::ast::Expr, CompileError> {
-    // The node's code span (trivia-trimmed) is the exact expression source; pad with
-    // leading spaces so token offsets line up with the original file.
-    let text = node.text().to_string();
-    let start = usize::from(node.text_range().start());
-    let padded = format!("{}{}", " ".repeat(start), text);
-    let tokens = crate::lexer::lex(&padded)
-        .map_err(|e| CompileError::new(format!("re-parsing field default: {}", e.message), span))?;
-    let stmts = crate::parser::parse(&tokens)
-        .map_err(|e| CompileError::new(format!("re-parsing field default: {}", e.message), span))?;
+    let padded = reparse_default_source(node);
+    reparse_default_from_source(&padded)
+        .map_err(|msg| CompileError::new(format!("re-parsing field default: {msg}"), span))
+}
+
+/// Re-lower a field default from its (already left-padded) source text through the
+/// legacy front-end — the shared core of [`reparse_default_expr`] (compile time) and
+/// the `.aso` deserializer (load time, `EX_REPARSE`). Both call the SAME
+/// lexer/parser the tree-walker uses, so a default round-tripped through an `.aso`
+/// re-lowers to the identical [`crate::ast::Expr`]. Returns a short error message on
+/// a lex/parse failure or a non-single-expression body (a corrupt `.aso`).
+pub fn reparse_default_from_source(padded: &str) -> Result<crate::ast::Expr, String> {
+    let tokens = crate::lexer::lex(padded).map_err(|e| e.message)?;
+    let stmts = crate::parser::parse(&tokens).map_err(|e| e.message)?;
     match stmts.into_iter().next() {
         Some(crate::ast::Stmt::Expr(e)) => Ok(e),
-        _ => Err(CompileError::new(
-            "field default did not re-parse to a single expression",
-            span,
-        )),
+        _ => Err("field default did not re-parse to a single expression".to_string()),
     }
 }
 
@@ -1549,6 +1563,12 @@ impl Compiler {
         // mutable default (e.g. `[]`) yields a FRESH value per instance, exactly
         // like the tree-walker (which evals the default expr per `construct`).
         let mut default_fields: Vec<String> = Vec::new();
+        // Field defaults that `cst_default_expr` lowers by RE-PARSING source text
+        // (arrow / `match`) — captured here as `(field, padded source)` so `.aso`
+        // serialization can persist the source and re-lower it on load (the flat
+        // expr serializer cannot encode their statement/pattern subtrees). Empty for
+        // the common case. See `ClassProto.default_sources`.
+        let mut default_sources: Vec<(String, String)> = Vec::new();
         for field in class_decl.field_decls() {
             let fname = field
                 .ident_token()
@@ -1584,8 +1604,15 @@ impl Compiler {
                 Some(d) => Some(cst_default_expr(d)?),
                 None => None,
             };
-            if default.is_some() {
+            if let Some(d) = &default {
                 default_fields.push(fname.clone());
+                // Arrow / `match` defaults are lowered via `reparse_default_expr`;
+                // their flat serialization persists the source text. Capture the
+                // SAME padded source `reparse_default_expr` reconstructs from, so the
+                // `.aso` round-trip re-lowers to an identical `Expr`.
+                if matches!(d, Expr::ArrowExpr(_) | Expr::MatchExpr(_)) {
+                    default_sources.push((fname.clone(), reparse_default_source(d.syntax())));
+                }
             }
             field_map.insert(
                 fname,
@@ -1735,6 +1762,7 @@ impl Compiler {
         let class_proto = Rc::new(ClassProto {
             class,
             default_fields,
+            default_sources,
             method_names,
             static_method_names,
             default_captures,

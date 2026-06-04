@@ -86,6 +86,19 @@ pub struct ClassProto {
     /// resolve the SAME enclosing binding (e.g. a module-top-level `const`).
     /// Normally empty (a literal default captures nothing).
     pub default_captures: Vec<Vec<(String, u16)>>,
+    /// Source-text for field defaults that are lowered by RE-PARSING the legacy
+    /// front-end (`cst_default_expr` → `reparse_default_expr`): arrow and `match`
+    /// defaults, whose bodies are arbitrary statement/pattern subtrees the flat
+    /// `.aso` expr serializer does not encode structurally. Each entry is
+    /// `(field name, padded source)` where the source is left-padded with spaces up
+    /// to the node's start byte offset (so re-lexing keeps the original spans). The
+    /// `.aso` writer consults this map and emits an `EX_REPARSE` tag carrying the
+    /// source inline; on load the reader re-lowers it through the SAME legacy
+    /// lexer/parser the tree-walker uses, so the reconstructed default is identical.
+    /// Empty for the common case (every default is structurally lowered). NOT used
+    /// by the in-memory VM run path (which keeps the reparsed `Expr` directly); it
+    /// exists only to make `ascript build` round-trip arrow/match defaults (SP1 §4).
+    pub default_sources: Vec<(String, String)>,
     /// The method names, in declaration order, matching the method closures
     /// pushed immediately before `Op::Class` (after the default thunks).
     pub method_names: Vec<String>,
