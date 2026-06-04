@@ -156,6 +156,34 @@ fn build_then_run_aso_matches_instanceof() {
 }
 
 #[test]
+fn build_then_run_aso_matches_default_params() {
+    // SP2 §2: a function with default parameters — including a default that
+    // references an EARLIER param and one composing with a rest param — compiles
+    // its default-eval prologue into the body chunk (the param's default-presence
+    // flag round-trips, format v13) and runs byte-identically to the tree-walker.
+    let dir = unique_dir("defaultparams");
+    write(
+        &dir,
+        "d.as",
+        "fn f(a, b = a + 1, c = 10) { return [a, b, c] }\n\
+         fn h(a, b = 2, ...xs) { return [a, b, xs] }\n\
+         print(f(1))\nprint(f(1, 5))\nprint(f(1, 5, 6))\n\
+         print(h(1))\nprint(h(1, 9, 8, 7))\n",
+    );
+    build(&dir, "d.as");
+    assert!(dir.join("d.aso").exists(), "d.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "d.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "d.as"]);
+    assert_eq!(
+        aso_out,
+        "[1, 2, 10]\n[1, 5, 10]\n[1, 5, 6]\n[1, 2, []]\n[1, 9, [8, 7]]\n"
+    );
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
 fn build_then_run_aso_matches_static_methods() {
     // SP1 Phase C: a class with a sync `static fn` factory AND a `static async fn`
     // factory (the blessed async-construction pattern) compiles to static protos

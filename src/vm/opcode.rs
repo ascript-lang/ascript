@@ -185,6 +185,19 @@ pub enum Op {
     JumpIfNotNil,
     /// `LOOP(i16)` — unconditional backward relative jump (negative displacement).
     Loop,
+    /// `JUMP_IF_ARG_SUPPLIED(u16 param_index, i16 offset)` — default-parameter
+    /// prologue guard. If the current frame's `argc` (count of SUPPLIED positional
+    /// args) is `> param_index`, the caller passed this param, so jump FORWARD by
+    /// `offset` to skip its default-eval code. Otherwise fall through and run the
+    /// default. Touches no operand stack. Emitted only in a function prologue.
+    JumpIfArgSupplied,
+    /// `CHECK_PARAM(u16 param_index)` — contract-check the value on TOS (the just-
+    /// evaluated default) against `proto.params[param_index]`'s declared type. A
+    /// mismatch is a Tier-2 panic anchored at the frame's call span (`ret_span`),
+    /// byte-identical to the tree-walker's default contract check. Leaves TOS in
+    /// place (the following `SET_LOCAL` stores it). A no-op-emit when the param is
+    /// untyped (the compiler skips it).
+    CheckParam,
 
     // ---- calls / returns --------------------------------------------------
     /// `CALL(u8)` — call with `argc` arguments already on the stack above the
@@ -525,6 +538,8 @@ impl Op {
             x if x == JumpIfTrue as u8 => JumpIfTrue,
             x if x == JumpIfNotNil as u8 => JumpIfNotNil,
             x if x == Loop as u8 => Loop,
+            x if x == JumpIfArgSupplied as u8 => JumpIfArgSupplied,
+            x if x == CheckParam as u8 => CheckParam,
 
             x if x == Call as u8 => Call,
             x if x == CallMethod as u8 => CallMethod,
@@ -599,7 +614,7 @@ impl Op {
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | ImmutableError | Closure
             | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper
             | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey
-            | CallMethodSpread | DefineExport => 2,
+            | CallMethodSpread | DefineExport | CheckParam => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -611,6 +626,10 @@ impl Op {
             // DEFINE_GLOBAL: u16 name-const index + u8 mutability flag (1 = `let`,
             // 0 = immutable `const`/`fn`/`class`/`enum`/`import`).
             CallMethod | MatchArray | DefineGlobal => 3,
+
+            // u16 + i16 operand op.
+            // JUMP_IF_ARG_SUPPLIED: u16 param-index + i16 forward jump offset.
+            JumpIfArgSupplied => 4,
 
             // Zero-operand ops.
             Nil
@@ -725,6 +744,8 @@ mod tests {
         Op::JumpIfTrue,
         Op::JumpIfNotNil,
         Op::Loop,
+        Op::JumpIfArgSupplied,
+        Op::CheckParam,
         Op::Call,
         Op::CallMethod,
         Op::CallMethodSpread,

@@ -312,6 +312,20 @@ impl Chunk {
         self.code[site..site + 2].copy_from_slice(&disp.to_le_bytes());
     }
 
+    /// Emit `JUMP_IF_ARG_SUPPLIED(u16 param_index, i16 disp)` with a placeholder
+    /// `0` displacement. Returns the patch site (the i16 operand offset) for a
+    /// later [`Chunk::patch_jump`] — the same `from = site + 2` accounting the
+    /// 2-byte jumps use, since the run loop measures the target from the byte
+    /// after the i16 displacement (the instruction end).
+    pub fn emit_jump_if_arg_supplied(&mut self, param_index: u16, span: Span) -> usize {
+        self.record_span(span);
+        self.code.push(Op::JumpIfArgSupplied as u8);
+        self.code.extend_from_slice(&param_index.to_le_bytes());
+        let site = self.code.len();
+        self.code.extend_from_slice(&0i16.to_le_bytes());
+        site
+    }
+
     /// Emit a backward (loop) jump whose displacement lands at `target`. The
     /// displacement is measured from the byte after the operand to `target`, so it
     /// is negative for a real backward jump.

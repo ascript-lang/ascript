@@ -2360,8 +2360,34 @@ impl Interp {
         // Arity + parameter contracts + rest collection. Shared verbatim with the
         // bytecode VM (`src/vm/run.rs` CALL) so both engines bind args identically.
         let bound = check_call_args(params, args, span, what)?;
-        for (p, a) in params.iter().zip(bound.into_iter()) {
+        let defaults = bound.defaults.clone();
+        // Bind the SUPPLIED params (and the rest array) — but NOT the omitted
+        // defaulted positions, whose `bound.values` entries are placeholders. They
+        // are bound below, AFTER their default is evaluated, so each default sees
+        // the earlier params and `define` is called exactly once per name.
+        for (i, (p, a)) in params.iter().zip(bound.values.into_iter()).enumerate() {
+            if defaults.contains(&i) {
+                continue;
+            }
             call_env.define(&p.name, a, true).map_err(AsError::new)?;
+        }
+        // Evaluate omitted trailing defaults LEFT-TO-RIGHT in the callee frame, so
+        // a default sees earlier already-bound params (and outer scope/globals).
+        // Each default value is contract-checked against the param's type, then
+        // bound. Never hold a borrow across the `.await`.
+        for i in defaults {
+            let p = &params[i];
+            let def = p
+                .default
+                .as_ref()
+                .expect("default range only covers defaulted params");
+            let dv = self.eval_expr(def, call_env).await?;
+            if let Some(ty) = &p.ty {
+                if !check_type(&dv, ty) {
+                    return Err(contract_panic(ty, &dv, span));
+                }
+            }
+            call_env.define(&p.name, dv, true).map_err(AsError::new)?;
         }
         let result = match self.exec(body, call_env).await {
             Ok(Flow::Return(v)) => v,
@@ -3683,63 +3709,114 @@ fn control_to_aserror(c: Control, span: Span) -> AsError {
 /// arity/contract/rest behavior — message wording AND span — is byte-identical
 /// across both engines. `span` is the CALL-site span; `what` is the callee's
 /// name/description (e.g. the function name, `"function"`, or a method name).
+/// The outcome of [`check_call_args`]: the args bound into their param slots,
+/// plus enough information for each engine to fill any OMITTED trailing defaulted
+/// params in the callee frame (left-to-right, seeing earlier params).
+///
+/// `values` has length `params.len()`. Supplied positional args occupy
+/// `0..supplied` (already contract-checked); the trailing missing-defaulted
+/// positions (`defaults`) hold a placeholder `Value::Nil` to be OVERWRITTEN by
+/// the engine's default evaluation; the rest param (last, if present) holds the
+/// collected tail array. `supplied` is the count of supplied positional
+/// (non-rest) args. `defaults` is the half-open range of param indices whose
+/// default must be evaluated (empty when every positional param was supplied).
+///
+/// Defaults are NOT evaluated here: a default expression can reference earlier
+/// params and run arbitrary code, so the engine (tree-walker `run_body` / VM
+/// prologue) evaluates them in the callee frame. This keeps `check_call_args`
+/// pure and synchronous.
+pub(crate) struct BoundArgs {
+    pub values: Vec<Value>,
+    pub supplied: usize,
+    pub defaults: std::ops::Range<usize>,
+}
+
 pub(crate) fn check_call_args(
     params: &[crate::ast::Param],
     args: Vec<Value>,
     span: Span,
     what: &str,
-) -> Result<Vec<Value>, Control> {
+) -> Result<BoundArgs, Control> {
     let has_rest = params.last().is_some_and(|p| p.rest);
-    if !has_rest {
-        // Exact arity.
-        if args.len() != params.len() {
-            return Err(AsError::at(
-                format!(
-                    "{} expected {} argument(s), got {}",
-                    what,
-                    params.len(),
-                    args.len()
-                ),
-                span,
-            )
-            .into());
-        }
-        let mut bound = Vec::with_capacity(params.len());
-        for (p, a) in params.iter().zip(args.into_iter()) {
-            if let Some(ty) = &p.ty {
-                if !check_type(&a, ty) {
-                    return Err(contract_panic(ty, &a, span));
-                }
-            }
-            bound.push(a);
-        }
-        Ok(bound)
+    // Count of POSITIONAL params (excludes a trailing `...rest`).
+    let n_positional = if has_rest {
+        params.len() - 1
     } else {
-        let n_fixed = params.len() - 1;
-        if args.len() < n_fixed {
-            return Err(AsError::at(
-                format!(
-                    "{} expected at least {} argument(s), got {}",
-                    what,
-                    n_fixed,
-                    args.len()
-                ),
-                span,
+        params.len()
+    };
+    // Min-arity = leading run of positional params with NO default (a required
+    // param may not follow a defaulted one, enforced at parse/compile time, so
+    // this is exactly the index of the first defaulted positional param).
+    let min = params[..n_positional]
+        .iter()
+        .take_while(|p| p.default.is_none())
+        .count();
+
+    // Too few arguments.
+    if args.len() < min {
+        // Preserve the EXACT pre-existing wording so goldens stay byte-identical:
+        // exact-arity (no rest, no defaults → min == max == len) keeps the
+        // "expected N" message; everything else (rest or defaults) uses
+        // "at least min".
+        let msg = if !has_rest && min == params.len() {
+            format!(
+                "{} expected {} argument(s), got {}",
+                what,
+                params.len(),
+                args.len()
             )
-            .into());
-        }
-        let mut bound = Vec::with_capacity(params.len());
-        let mut it = args.into_iter();
-        for p in &params[..n_fixed] {
-            let a = it.next().unwrap();
-            if let Some(ty) = &p.ty {
-                if !check_type(&a, ty) {
-                    return Err(contract_panic(ty, &a, span));
-                }
+        } else {
+            format!(
+                "{} expected at least {} argument(s), got {}",
+                what,
+                min,
+                args.len()
+            )
+        };
+        return Err(AsError::at(msg, span).into());
+    }
+    // Too many arguments (only possible without a rest param, which is unbounded).
+    if !has_rest && args.len() > n_positional {
+        let msg = if min == params.len() {
+            // No defaults → exact arity; keep the existing wording.
+            format!(
+                "{} expected {} argument(s), got {}",
+                what,
+                params.len(),
+                args.len()
+            )
+        } else {
+            format!(
+                "{} expected at most {} argument(s), got {}",
+                what, n_positional, args.len()
+            )
+        };
+        return Err(AsError::at(msg, span).into());
+    }
+
+    let mut values: Vec<Value> = Vec::with_capacity(params.len());
+    let mut it = args.into_iter();
+    // Bind the supplied positional args (contract-checking each), capping at the
+    // positional count so any surplus is collected by the rest param.
+    let supplied = it.len().min(n_positional);
+    for p in &params[..supplied] {
+        let a = it.next().unwrap();
+        if let Some(ty) = &p.ty {
+            if !check_type(&a, ty) {
+                return Err(contract_panic(ty, &a, span));
             }
-            bound.push(a);
         }
-        let rest_p = &params[n_fixed];
+        values.push(a);
+    }
+    // Placeholders for the omitted trailing defaulted positions (filled by the
+    // engine in the callee frame).
+    let defaults = supplied..n_positional;
+    for _ in defaults.clone() {
+        values.push(Value::Nil);
+    }
+    // Collect the rest param's tail (any args beyond the positional count).
+    if has_rest {
+        let rest_p = &params[n_positional];
         let elem_ty = match &rest_p.ty {
             Some(crate::ast::Type::Array(inner)) => Some(inner.as_ref()),
             Some(other) => {
@@ -3763,11 +3840,15 @@ pub(crate) fn check_call_args(
             }
             rest_vals.push(a);
         }
-        bound.push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
+        values.push(Value::Array(gcmodule::Cc::new(std::cell::RefCell::new(
             rest_vals,
         ))));
-        Ok(bound)
     }
+    Ok(BoundArgs {
+        values,
+        supplied,
+        defaults,
+    })
 }
 
 pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {

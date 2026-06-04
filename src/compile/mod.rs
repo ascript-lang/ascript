@@ -2473,6 +2473,10 @@ impl Compiler {
     /// `NIL; RETURN`; an arrow EXPRESSION body is the expression followed by
     /// `RETURN`.
     fn compile_fn_body(&mut self, fn_node: &ResolvedNode, span: Span) -> Result<(), CompileError> {
+        // Default-parameter prologue: for each defaulted param, if the caller
+        // omitted it, evaluate the default into the param's slot. Runs FIRST so the
+        // default sees earlier params (already bound in their slots).
+        self.compile_default_prologue(fn_node)?;
         if let Some(block_node) = fn_node.children().find(|c| c.kind() == SyntaxKind::Block) {
             let block = Block::cast(block_node.clone())
                 .ok_or_else(|| CompileError::new("function body is not a block", span))?;
@@ -2494,6 +2498,82 @@ impl Compiler {
             self.chunk.emit(Op::Return, span);
             Ok(())
         }
+    }
+
+    /// Emit the default-parameter prologue at the start of a function body. For
+    /// each positional param with a default expression, emit:
+    ///
+    /// ```text
+    ///   JUMP_IF_ARG_SUPPLIED param_index -> L_skip   ; argc > param_index ? skip
+    ///   <default expr>                               ; pushes the default value
+    ///   CHECK_PARAM param_index                      ; contract-check (typed only)
+    ///   SET_LOCAL[_CELL] slot                        ; store into the param slot
+    /// L_skip:
+    /// ```
+    ///
+    /// This is byte-identical in effect to the tree-walker's `run_body`, which
+    /// evaluates each omitted default LEFT-TO-RIGHT in the callee frame, contract-
+    /// checks it, and binds it. `param_index` is the param's 0-based position
+    /// (what the VM's `frame.argc` is compared against and what `proto.params`
+    /// indexes); `slot` is its resolver-assigned local slot. A `...rest` param
+    /// never carries a default (parser-enforced), so it is skipped here.
+    fn compile_default_prologue(
+        &mut self,
+        fn_node: &ResolvedNode,
+    ) -> Result<(), CompileError> {
+        let Some(param_list) = fn_node
+            .children()
+            .find(|c| c.kind() == SyntaxKind::ParamList)
+        else {
+            return Ok(());
+        };
+        for (idx, param) in param_list
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::Param)
+            .enumerate()
+        {
+            // The default is the param's expression child (the resolver already
+            // resolved its names against the earlier params/outer scope).
+            let Some(default) = param.children().find_map(|c| Expr::cast(c.clone())) else {
+                continue;
+            };
+            let pspan = range_span(&param);
+            let param_index = u16::try_from(idx).map_err(|_| {
+                CompileError::new("too many parameters (max 65535)", pspan)
+            })?;
+            // The param's local slot comes from its resolver binding, keyed by the
+            // Param node's text range (the resolver declares params with that
+            // `decl_range`).
+            let prange = param.text_range();
+            let slot = self
+                .resolved
+                .bindings
+                .iter()
+                .find(|b| {
+                    b.decl_range == prange
+                        && b.kind == crate::syntax::resolve::types::BindingKind::Param
+                })
+                .map(|b| b.slot)
+                .ok_or_else(|| {
+                    CompileError::new("defaulted parameter has no resolver binding", pspan)
+                })?;
+            let slot = u16::try_from(slot).map_err(|_| {
+                CompileError::new("parameter slot exceeds 65535", pspan)
+            })?;
+            // Whether this param has a declared type contract (→ emit CHECK_PARAM).
+            let typed = param.children().any(|c| is_type_node(c.kind()));
+
+            let skip = self
+                .chunk
+                .emit_jump_if_arg_supplied(param_index, pspan);
+            self.compile_expr(&default)?;
+            if typed {
+                self.chunk.emit_u16(Op::CheckParam, param_index, pspan);
+            }
+            self.emit_set_local(slot, pspan);
+            self.chunk.patch_jump(skip);
+        }
+        Ok(())
     }
 
     /// Allocate a fresh anonymous scratch slot ABOVE the resolver's named-local

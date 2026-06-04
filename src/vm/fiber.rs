@@ -41,6 +41,13 @@ pub struct CallFrame {
     /// `super.<name>` lookup starting at `def_class.superclass`, mirroring the
     /// tree-walker's `bm.defining_class.superclass` super binding.
     pub def_class: Option<Rc<crate::value::Class>>,
+    /// The number of SUPPLIED positional (non-rest) arguments at the call that
+    /// built this frame. The default-parameter PROLOGUE (`Op::JumpIfArgSupplied`)
+    /// reads it to decide, per defaulted param, whether the caller passed a value
+    /// (skip the default) or omitted it (evaluate the default into the slot).
+    /// `0` for frames built without an arg count (the bottom script frame and any
+    /// frame whose function declares no defaults — its prologue is empty).
+    pub argc: usize,
 }
 
 /// Build the per-slot cell vector for a frame from its proto's `cell_slots`
@@ -82,6 +89,7 @@ impl Fiber {
             cells,
             ret_span: Span::new(0, 0),
             def_class: None,
+            argc: 0,
         };
         Fiber {
             frames: vec![frame],

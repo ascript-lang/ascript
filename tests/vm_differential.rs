@@ -6097,18 +6097,16 @@ async fn vm_default_param_arrow_matches_treewalker() {
 
 #[tokio::test]
 async fn vm_default_param_side_effect_only_when_omitted_matches_treewalker() {
-    // The default expr's side effect must run ONLY when the arg is omitted, and
-    // LEFT-TO-RIGHT across multiple omitted defaults.
-    let src = "let log = []\n\
-fn note(tag, v) { log.push(tag)\n return v }\n\
+    // The default expr's side effect (a `print`) must run ONLY when the arg is
+    // omitted, and LEFT-TO-RIGHT across multiple omitted defaults.
+    let src = "fn note(tag, v) { print(tag)\n return v }\n\
 fn f(a, b = note(\"b\", 2), c = note(\"c\", 3)) { return [a, b, c] }\n\
+print(\"--- f(1): both defaults run, b then c\")\n\
 print(f(1))\n\
-print(log)\n\
-let log2 = []\n\
-fn note2(tag, v) { log2.push(tag)\n return v }\n\
-fn h(a, b = note2(\"b\", 2), c = note2(\"c\", 3)) { return [a, b, c] }\n\
-print(h(1, 9))\n\
-print(log2)\n";
+print(\"--- f(1, 9): only c default runs\")\n\
+print(f(1, 9))\n\
+print(\"--- f(1, 9, 8): no default runs\")\n\
+print(f(1, 9, 8))\n";
     assert_vm_run_matches_treewalker(src).await;
 }
 
