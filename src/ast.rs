@@ -46,6 +46,12 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     Object(Vec<ObjEntry>),
+    /// `#{ keyExpr: valueExpr, … }` — a map literal producing a `Value::Map`.
+    /// Unlike object literals, the KEY is an arbitrary evaluated expression
+    /// (converted via `MapKey::from_value`), not a bare identifier name.
+    /// Spread is not representable (out of scope for SP2; a `...` inside `#{}`
+    /// is a parse error). Later-key-wins; insertion order = first-seen key.
+    Map(Vec<MapEntry>),
     Member {
         object: Box<Expr>,
         name: String,
@@ -112,6 +118,15 @@ pub enum ArrayElem {
 pub enum ObjEntry {
     KV(String, Expr),
     Spread(Expr),
+}
+
+/// An entry in a `#{…}` map literal: `key: value`, where BOTH the key and the
+/// value are arbitrary evaluated expressions. The key is converted to a
+/// `MapKey` at eval (an unhashable key is a Tier-2 panic). Later-key-wins.
+#[derive(Debug, Clone)]
+pub struct MapEntry {
+    pub key: Expr,
+    pub value: Expr,
 }
 
 /// A call argument: positional `x` or a spread `...args`.
@@ -596,6 +611,16 @@ impl fmt::Display for ExprKind {
                         ObjEntry::KV(k, v) => write!(f, "{}: {}", k, v)?,
                         ObjEntry::Spread(x) => write!(f, "...{}", x)?,
                     }
+                }
+                write!(f, "}}")
+            }
+            ExprKind::Map(entries) => {
+                write!(f, "#{{")?;
+                for (i, e) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}: {}", e.key, e.value)?;
                 }
                 write!(f, "}}")
             }

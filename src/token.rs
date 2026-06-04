@@ -39,6 +39,9 @@ pub enum Tok {
     SlashEq,
     LBrace,
     RBrace,
+    /// `#{` — opens a map literal (`#{ keyExpr: valueExpr, … }`). Lexed as ONE
+    /// token so it cannot be confused with `#` + `{`. `#` alone is a lex error.
+    HashBrace,
     If,
     Else,
     While,

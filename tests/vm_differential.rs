@@ -6161,3 +6161,103 @@ print(g(4))\n",
     )
     .await;
 }
+
+// ---- Phase C: #{…} map literals ----------------------------------------
+
+#[tokio::test]
+async fn vm_map_lit_empty_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{})\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_string_keys_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{ \"a\": 1, \"b\": 2 })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_numeric_keys_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{ 1: \"x\", 2: \"y\" })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_mixed_type_keys_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{ 1: \"x\", true: \"y\", nil: \"z\", \"k\": 4 })\n")
+        .await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_expr_key_uses_value_matches_treewalker() {
+    // The key expression is EVALUATED — `k` is keyed by its value "x", not "k".
+    assert_vm_run_matches_treewalker("let k = \"x\"\nprint(#{ k: 1 })\n").await;
+    assert_vm_run_matches_treewalker("let a = 2\nlet b = 3\nprint(#{ a + b: \"sum\" })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_later_key_wins_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(#{ 1: \"a\", 1: \"b\" })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_neg_zero_nan_canon_matches_treewalker() {
+    // -0.0 canonicalizes to +0.0; both keys collapse, later wins.
+    assert_vm_run_matches_treewalker("print(#{ -0.0: \"neg\", 0.0: \"pos\" })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_read_back_matches_treewalker() {
+    assert_vm_run_matches_treewalker(
+        "import * as map from \"std/map\"\nlet m = #{ \"a\": 1, \"b\": 2 }\nprint(map.get(m, \"a\"))\nprint(map.get(m, \"b\"))\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_is_real_map_matches_treewalker() {
+    assert_vm_run_matches_treewalker("print(type(#{ \"a\": 1 }))\n").await;
+    assert_vm_run_matches_treewalker("print(type(#{}))\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_unhashable_key_errors_match_treewalker() {
+    assert_vm_run_error_matches_treewalker("print(#{ [1]: 2 })\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_spread_is_parse_error_both_engines() {
+    // D4: a `...` spread element inside `#{}` is a clean parse error on BOTH
+    // front-ends (legacy oracle + CST/VM) — no panic, exit non-zero. The two
+    // independent parsers legitimately word the error differently, so we assert
+    // BOTH reject (Err), not message-equality (that's the conformance test's job).
+    let src = "let m = #{ \"a\": 1 }\nprint(#{ ...m })\n";
+    let tw = ascript::run_source(src).await;
+    let vm = ascript::vm_run_source(src).await;
+    assert!(
+        tw.is_err(),
+        "tree-walker (legacy parser) must reject `...` in a map literal, got {tw:?}"
+    );
+    assert!(
+        vm.is_err(),
+        "VM (CST parser) must reject `...` in a map literal, got {vm:?}"
+    );
+}
+
+#[tokio::test]
+async fn vm_map_lit_in_function_matches_treewalker() {
+    assert_vm_run_matches_treewalker("fn f() { return #{ 1: \"x\" } }\nprint(f())\n").await;
+}
+
+#[tokio::test]
+async fn vm_map_lit_three_way_matches() {
+    assert_three_way_matches(
+        "import * as map from \"std/map\"\n\
+let k = \"dyn\"\n\
+let m = #{ \"a\": 1, 2: \"two\", true: \"t\", k: 9, 2: \"two-again\" }\n\
+print(m)\n\
+print(map.get(m, \"a\"))\n\
+print(map.get(m, 2))\n\
+print(map.get(m, \"dyn\"))\n\
+print(map.get(m, 2))\n\
+print(#{})\n",
+    )
+    .await;
+}

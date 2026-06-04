@@ -1691,6 +1691,41 @@ impl<'a> Parser<'a> {
                     span,
                 });
             }
+            Tok::HashBrace => {
+                let mut entries = Vec::new();
+                if *self.peek() != Tok::RBrace {
+                    loop {
+                        // D4: spread is out of scope for map literals in SP2 — a
+                        // `...` element is a clean parse error (no panic).
+                        if *self.peek() == Tok::DotDotDot {
+                            return Err(AsError::at(
+                                "spread is not allowed in a map literal",
+                                self.span(),
+                            ));
+                        }
+                        // The KEY is an arbitrary evaluated expression (unlike
+                        // object literals, where the key is a bare name/string).
+                        let key = self.expr()?;
+                        self.eat(&Tok::Colon)?;
+                        let value = self.expr()?;
+                        entries.push(crate::ast::MapEntry { key, value });
+                        if *self.peek() == Tok::Comma {
+                            self.advance();
+                            if *self.peek() == Tok::RBrace {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.eat(&Tok::RBrace)?;
+                let span = Span::new(tok_span.start, self.prev_end());
+                return Ok(Expr {
+                    kind: ExprKind::Map(entries),
+                    span,
+                });
+            }
             Tok::TemplateStr(s) => {
                 let parts = vec![crate::ast::TemplatePart::Lit(s)];
                 let span = Span::new(tok_span.start, self.prev_end());
@@ -1794,6 +1829,7 @@ fn starts_expression(tok: &Tok) -> bool {
             | Tok::LParen
             | Tok::LBracket
             | Tok::LBrace
+            | Tok::HashBrace
             | Tok::Minus
             | Tok::Bang
             | Tok::Await

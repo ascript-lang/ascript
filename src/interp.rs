@@ -1527,6 +1527,24 @@ impl Interp {
                 }
                 Ok(Value::Object(crate::value::ObjectCell::new(map)))
             }
+            ExprKind::Map(entries) => {
+                let mut map = indexmap::IndexMap::with_capacity(entries.len());
+                for entry in entries {
+                    // Evaluate key then value, left-to-right.
+                    let key_val = self.eval_expr(&entry.key, env).await?;
+                    let key = crate::value::MapKey::from_value(&key_val).ok_or_else(|| {
+                        AsError::at(
+                            format!("cannot use {} as a map key", type_name(&key_val)),
+                            entry.key.span,
+                        )
+                    })?;
+                    let value = self.eval_expr(&entry.value, env).await?;
+                    // Later-key-wins: an IndexMap insert overwrites the value
+                    // while keeping the key's first-seen position.
+                    map.insert(key, value);
+                }
+                Ok(Value::Map(crate::value::MapCell::new(map)))
+            }
             ExprKind::Template { parts } => {
                 let mut out = String::new();
                 for part in parts {
