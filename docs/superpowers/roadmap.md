@@ -191,6 +191,11 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   "B2"); deterministic/replayable scheduling (needs "B2"). Spec §7 rewritten; ADR at
   `specs/adr/2026-05-30-async-generators.md`. Plan:
   `plans/2026-05-30-async-generators-coroutines.md`.
+  **Update 2026-06-04 (#147 resolved):** end-of-program task-drain parity for a *held*
+  un-awaited future is confirmed — both the tree-walker and the VM run
+  `local.run_until(..).await; local.await;` (`src/lib.rs`), so a held future's body
+  (`let f = work()`) drains and runs identically on both engines. Asserted by
+  `vm_held_future_drains_identically_to_treewalker` in `tests/vm_differential.rs`.
 
 ## Phase 6 — Ergonomics & observability (post-spec extension)
 

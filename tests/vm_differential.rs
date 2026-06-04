@@ -2953,12 +2953,10 @@ async fn vm_unawaited_async_call_is_cancelled_like_treewalker() {
     // `unawaited_async_call_is_cancelled` (which uses `time.sleep` — V12 on the
     // VM). Concretely: `worked` must NOT appear; only `main` is printed.
     // NOTE: we assert the BARE un-awaited call (the true M17 leak class: the
-    // `Value::Future` is dropped at the end of its expression statement). A future
-    // *held* in a local until program end (`let f = work()`) is NOT part of this
-    // class — it interacts with end-of-program task draining and the two engines
-    // legitimately differ there (the tree-walker's end-of-program drain runs the
-    // still-held task; the VM does not). That held-future case is out of scope for
-    // cancel-on-drop and is therefore not asserted here.
+    // `Value::Future` is dropped at the end of its expression statement). The
+    // distinct case of a future *held* in a local until program end
+    // (`let f = work()`) is covered by `vm_held_future_drains_identically_to_treewalker`
+    // (#147): both engines drain it at end-of-program, so its body runs identically.
     let cases = [
         // Bare un-awaited call: the future is dropped at the end of the statement.
         "async fn work() { print(\"worked\") }\nwork()\nprint(\"main\")\n",
@@ -2979,6 +2977,22 @@ async fn vm_unawaited_async_call_is_cancelled_like_treewalker() {
             "VM cancel-on-drop diverged from tree-walker for `{src}`\n  tw: {tw:?}\n  vm: {vm:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn vm_held_future_drains_identically_to_treewalker() {
+    // #147: a future HELD in a local until program end (not the bare cancel-on-drop
+    // case) whose body awaits then prints. Both engines drain spawned tasks at
+    // end-of-program (`local.run_until(..).await; local.await;` in src/lib.rs), so the
+    // body runs on BOTH — byte-identical. (The neighboring test covers the bare
+    // un-awaited cancel-on-drop case.)
+    let src = "async fn work() { await 0\n print(\"worked\") }\nlet f = work()\nprint(\"main\")\n";
+    let tw = ascript::run_source(src).await.expect("tree-walker ok");
+    let (vm, _) = ascript::vm_run_source(src).await.expect("vm ok");
+    let (gen, _) = ascript::vm_run_source_generic(src).await.expect("generic vm ok");
+    assert_eq!(tw, vm, "specialized VM diverged from tree-walker");
+    assert_eq!(tw, gen, "generic VM diverged from tree-walker");
+    assert_eq!(tw, "main\nworked\n");
 }
 
 #[tokio::test]
