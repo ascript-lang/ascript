@@ -622,6 +622,13 @@ fn param_list(p: &mut Parser) {
             p.bump();
             type_ann(p);
         }
+        // Optional default value: `= <expr>`. The expression becomes an `Expr`
+        // child of the `Param` node (no wrapper); the compiler finds it via
+        // `Expr::cast`.
+        if p.at(Eq) {
+            p.bump();
+            expr(p);
+        }
         p.complete(pm, Param);
         if p.at(Comma) {
             p.bump();

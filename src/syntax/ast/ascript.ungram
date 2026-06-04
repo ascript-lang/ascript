@@ -11,7 +11,7 @@ WhileStmt = 'while' cond:Expr body:Block
 ReturnStmt = 'return' Expr?
 FnDecl = 'fn' 'ident' ParamList Block
 ParamList = '(' Param* ')'
-Param = 'ident'
+Param = '...'? 'ident' (':' Type)? ('=' Expr)?
 Expr =
     Literal | NameRef | UnaryExpr | BinaryExpr | ParenExpr | CallExpr
   | MemberExpr | IndexExpr | ArrowExpr | AssignExpr

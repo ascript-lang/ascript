@@ -220,6 +220,7 @@ module.exports = grammar({
     parameter: $ => seq(
       field('name', $.identifier),
       optional(seq(':', field('type', $._type))),
+      optional(seq('=', field('default', $._expression))),
     ),
     // `...name[: array<T>]` rest parameter — collects trailing args (must be last).
     rest_parameter: $ => seq(

@@ -934,6 +934,13 @@ impl Resolver {
         }
         if let Some(params) = node.children().find(|c| c.kind() == ParamList) {
             for p in params.children().filter(|c| c.kind() == Param) {
+                // A default-value expression resolves in a scope where the EARLIER
+                // params are already bound but THIS param is not yet (so `b = a`
+                // sees `a`, and `a = b` cannot see a later `b`). Resolve the
+                // default child BEFORE declaring this param.
+                for d in p.children().filter(|c| is_expr(c.kind())) {
+                    self.resolve_expr(d);
+                }
                 if let Some(name) = ident_text(p) {
                     self.declare(&name, BindingKind::Param, p.text_range());
                 }
@@ -1379,6 +1386,32 @@ mod tests {
             r.diagnostics.is_empty(),
             "builtins must not be flagged: {:?}",
             r.diagnostics
+        );
+    }
+
+    #[test]
+    fn param_default_resolves_earlier_param_as_local() {
+        // In `fn f(a, b = a) { return b }`, the `a` inside `b`'s default must
+        // resolve to the EARLIER param `a` (a Local), not an upvalue/global.
+        let tree = parse_to_tree("fn f(a, b = a) { return b }\nprint(f(5))");
+        let r = resolve(&tree);
+        // The `a` use inside the default is the NameRef whose range is inside the
+        // ParamList (the first `a` use after the params are declared).
+        let param_list = tree
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ParamList)
+            .unwrap();
+        let default_a = param_list
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("a"))
+            .expect("default references `a`");
+        assert!(
+            matches!(
+                r.uses.get(&default_a.text_range()),
+                Some(Resolution::Local(_))
+            ),
+            "param default must resolve an earlier param as Local, got {:?}",
+            r.uses.get(&default_a.text_range())
         );
     }
 

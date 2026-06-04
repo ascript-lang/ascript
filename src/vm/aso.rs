@@ -84,7 +84,7 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   set gained tag 16 (`BinOp::InstanceOf`). Old chunks never contained either, so
 ///   older readers must reject a v12 chunk. This is the single SP2 bump; later SP2
 ///   phases that touch emitted bytecode reuse it.
-pub const ASO_FORMAT_VERSION: u32 = 12;
+pub const ASO_FORMAT_VERSION: u32 = 13;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -714,6 +714,12 @@ fn write_param(w: &mut Writer, p: &Param) {
     w.usize(p.name_span.start);
     w.usize(p.name_span.end);
     w.u8(u8::from(p.rest));
+    // Only the PRESENCE of a default matters here: the VM evaluates defaults via
+    // the function body's compiled prologue (already serialized in the chunk
+    // code), and `check_call_args` reads only `default.is_some()` to compute
+    // min-arity. So serialize a single presence flag; reconstruct a placeholder
+    // `Expr` on read (its content is never inspected by the VM).
+    w.u8(u8::from(p.default.is_some()));
 }
 
 fn read_param(r: &mut Reader) -> Result<Param, AsoError> {
@@ -722,11 +728,17 @@ fn read_param(r: &mut Reader) -> Result<Param, AsoError> {
     let start = r.usize()?;
     let end = r.usize()?;
     let rest = r.u8()? != 0;
+    let has_default = r.u8()? != 0;
+    let default = has_default.then(|| crate::ast::Expr {
+        kind: crate::ast::ExprKind::Nil,
+        span: Span::new(start, end),
+    });
     Ok(Param {
         name,
         ty,
         name_span: Span::new(start, end),
         rest,
+        default,
     })
 }
 

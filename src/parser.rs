@@ -574,11 +574,31 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
+                // Optional default value: `name = expr` (not for a rest param).
+                let default = if !is_rest && *self.peek() == Tok::Eq {
+                    self.advance();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                // A required (no-default) param may not follow a defaulted one.
+                if default.is_none()
+                    && !is_rest
+                    && params
+                        .iter()
+                        .any(|p: &crate::ast::Param| p.default.is_some())
+                {
+                    return Err(AsError::at(
+                        "a required parameter cannot follow a defaulted parameter",
+                        name_span,
+                    ));
+                }
                 params.push(crate::ast::Param {
                     name,
                     ty,
                     name_span,
                     rest: is_rest,
+                    default,
                 });
                 if is_rest {
                     if *self.peek() == Tok::Comma {
@@ -1044,6 +1064,7 @@ impl<'a> Parser<'a> {
                             ty: None,
                             name_span,
                             rest: false,
+                            default: None,
                         }],
                         body: Box::new(body),
                         is_async,

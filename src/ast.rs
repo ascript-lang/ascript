@@ -155,6 +155,12 @@ pub struct Param {
     /// `true` if this is a rest parameter (`...name`), which collects trailing
     /// arguments into an array. A rest parameter must be the last parameter.
     pub rest: bool,
+    /// Default value expression (`fn f(a, b = expr)`), evaluated at CALL time in
+    /// the callee frame when the corresponding trailing argument is omitted. A
+    /// default may reference earlier already-bound params and the enclosing
+    /// scope. A required (no-default) param may not follow a defaulted one
+    /// (parse/compile error). Mirrors `FieldDecl.default`.
+    pub default: Option<Expr>,
 }
 
 /// One `{key as binding}` entry in an object-destructuring pattern. `key` is the

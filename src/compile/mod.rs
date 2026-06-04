@@ -651,11 +651,23 @@ fn cst_param(node: &crate::syntax::cst::ResolvedNode) -> crate::ast::Param {
         .children()
         .find(|c| is_type_node(c.kind()))
         .and_then(cst_type);
+    // A default-value child is the (only) expression child of the param node.
+    // Only its PRESENCE matters for `check_call_args` min-arity; the VM applies
+    // defaults via the compiled body prologue (`compile_default_prologue`), not
+    // this AST node, so a placeholder is sufficient.
+    let default = node
+        .children()
+        .any(|c| Expr::cast(c.clone()).is_some())
+        .then(|| crate::ast::Expr {
+            kind: crate::ast::ExprKind::Nil,
+            span: name_span,
+        });
     crate::ast::Param {
         name,
         ty,
         name_span,
         rest,
+        default,
     }
 }
 
@@ -2374,6 +2386,25 @@ impl Compiler {
         // per-param contracts, rest collection, and the return contract are
         // byte-identical across engines (message + span).
         let proto_params: Vec<crate::ast::Param> = params.iter().map(|p| cst_param(p)).collect();
+        // A required (no-default) param may not follow a defaulted one — same
+        // rule + message + span the legacy parser enforces, so both engines
+        // reject `fn f(a = 1, b)` identically.
+        {
+            let mut seen_default = false;
+            for p in &proto_params {
+                if p.rest {
+                    continue;
+                }
+                if p.default.is_some() {
+                    seen_default = true;
+                } else if seen_default {
+                    return Err(CompileError::new(
+                        "a required parameter cannot follow a defaulted parameter",
+                        p.name_span,
+                    ));
+                }
+            }
+        }
         let ret_type = fn_node
             .children()
             .find(|c| c.kind() == SyntaxKind::RetType)
