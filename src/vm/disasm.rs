@@ -246,6 +246,8 @@ fn op_name(op: Op) -> &'static str {
         Closure => "CLOSURE",
         NewArray => "NEW_ARRAY",
         NewObject => "NEW_OBJECT",
+        NewMap => "NEW_MAP",
+        MapEntry => "MAP_ENTRY",
         Spread => "SPREAD",
         SpreadArgs => "SPREAD_ARGS",
         AppendArray => "APPEND_ARRAY",

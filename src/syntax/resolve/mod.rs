@@ -54,6 +54,7 @@ fn is_expr(kind: SyntaxKind) -> bool {
             | AssignExpr
             | ArrayExpr
             | ObjectExpr
+            | MapExpr
             | TemplateExpr
             | OptMemberExpr
             | TryExpr

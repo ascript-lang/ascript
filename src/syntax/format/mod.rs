@@ -648,6 +648,7 @@ impl Printer<'_> {
             }
             ArrayExpr => self.comma_seq("[", "]", node),
             ObjectExpr => self.object_expr(node),
+            MapExpr => self.map_expr(node),
             SpreadElem => {
                 self.out.text("...");
                 if let Some(e) = node.children().find(|c| is_expr_kind(c.kind())) {
@@ -785,6 +786,36 @@ impl Printer<'_> {
             }
         }
         self.out.text("}");
+    }
+
+    /// Format a `#{ keyExpr: valueExpr, … }` map literal; `#{}` for empty. Unlike
+    /// `object_expr`, the key is an arbitrary EXPRESSION (not the object-key quoting
+    /// logic), so each entry formats both children as expressions.
+    fn map_expr(&mut self, node: &ResolvedNode) {
+        use SyntaxKind::*;
+        let entries: Vec<&ResolvedNode> = node
+            .children()
+            .filter(|c| c.kind() == MapEntry)
+            .collect();
+        if entries.is_empty() {
+            self.out.text("#{}");
+            return;
+        }
+        self.out.text("#{ ");
+        for (i, ent) in entries.iter().enumerate() {
+            if i > 0 {
+                self.out.text(", ");
+            }
+            let mut kids = ent.children().filter(|c| is_expr_kind(c.kind()));
+            if let Some(key) = kids.next() {
+                self.expr(key);
+            }
+            self.out.text(": ");
+            if let Some(value) = kids.next() {
+                self.expr(value);
+            }
+        }
+        self.out.text(" }");
     }
 
     fn literal_text(&self, node: &ResolvedNode) -> String {
@@ -1033,6 +1064,7 @@ fn is_expr_kind(kind: SyntaxKind) -> bool {
             | AssignExpr
             | ArrayExpr
             | ObjectExpr
+            | MapExpr
             | TemplateExpr
             | OptMemberExpr
             | TryExpr

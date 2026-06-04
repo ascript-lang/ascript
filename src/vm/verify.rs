@@ -243,6 +243,10 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // ---- collections / builders ----
         NewArray => Effect::new(argc_or_n, 1),
         NewObject => Effect::new(2 * argc_or_n, 1),
+        // `#{…}` builder: NEW_MAP pushes an empty map (pops 0); MAP_ENTRY pops the
+        // map+key+value and pushes the map back (like APPEND_OBJECT).
+        NewMap => Effect::new(0, 1),
+        MapEntry => Effect::new(3, 1),
         Spread | SpreadArgs | AppendArray | SpreadObject => Effect::new(2, 1),
         AppendObject => Effect::new(3, 1),
         GetIndex => Effect::new(2, 1),

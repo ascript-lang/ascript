@@ -1279,6 +1279,51 @@ impl Vm {
                     fiber.push(Value::Object(cell));
                 }
 
+                Op::NewMap => {
+                    // Push a fresh, empty `Value::Map`. The `#{…}` builder runs one
+                    // `MAP_ENTRY` per entry after this (or nothing for `#{}`).
+                    let cell = crate::value::MapCell::new(indexmap::IndexMap::new());
+                    fiber.push(Value::Map(cell));
+                }
+
+                Op::MapEntry => {
+                    // `[map, key, val] -- [map]` — convert `key` to a `MapKey` and
+                    // insert later-wins into the builder `map`. Byte-identical to the
+                    // tree-walker's `ExprKind::Map`: an unhashable key is the SAME
+                    // Tier-2 panic `cannot use {type} as a map key`, anchored at this
+                    // op's span (the key's trivia-trimmed code span).
+                    let val = fiber.pop();
+                    let key_val = fiber.pop();
+                    let key = match crate::value::MapKey::from_value(&key_val) {
+                        Some(k) => k,
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "cannot use {} as a map key",
+                                    crate::interp::type_name(&key_val)
+                                ),
+                            ))
+                        }
+                    };
+                    match fiber.peek(0) {
+                        Value::Map(m) => {
+                            m.borrow_mut().insert(key, val);
+                        }
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "MAP_ENTRY target is not a map: {}",
+                                    crate::interp::type_name(other)
+                                ),
+                            ))
+                        }
+                    }
+                }
+
                 Op::Spread | Op::SpreadArgs => {
                     // `[arr, operand] -- [arr]` — flatten the spread `operand` (an
                     // Array) into the under-construction array `arr` below it.

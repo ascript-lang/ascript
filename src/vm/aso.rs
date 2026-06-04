@@ -84,7 +84,12 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   set gained tag 16 (`BinOp::InstanceOf`). Old chunks never contained either, so
 ///   older readers must reject a v12 chunk. This is the single SP2 bump; later SP2
 ///   phases that touch emitted bytecode reuse it.
-pub const ASO_FORMAT_VERSION: u32 = 13;
+/// - 14: `#{…}` map literals (SP2 §3) — two new opcodes (`Op::NewMap`/`Op::MapEntry`,
+///   inserted after `NewObject`, shifting all later opcode byte values) and a new
+///   `EX_MAP` field-default expr tag (a `#{…}` literal in field-default position
+///   serializes as `ExprKind::Map`). Old chunks never contained either, so older
+///   readers must reject a v14 chunk.
+pub const ASO_FORMAT_VERSION: u32 = 14;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -204,6 +209,9 @@ const EX_RANGE: u8 = 20;
 /// to the identical `Expr`. Emitted by `write_field_default` (consulting the class's
 /// `default_sources`), NOT by the generic `write_expr` (which never sees these forms).
 const EX_REPARSE: u8 = 21;
+/// A `#{…}` map literal field default (`ExprKind::Map`, SP2 §3). Followed by a
+/// `len`-prefixed sequence of (key-expr, value-expr) pairs.
+const EX_MAP: u8 = 22;
 
 // Template-part tags (within an `EX_TEMPLATE`).
 const TP_LIT: u8 = 0;
@@ -922,6 +930,14 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
                 }
             }
         }
+        ExprKind::Map(entries) => {
+            w.u8(EX_MAP);
+            w.len(entries.len());
+            for ent in entries {
+                write_expr(w, &ent.key)?;
+                write_expr(w, &ent.value)?;
+            }
+        }
         ExprKind::Member { object, name } => {
             w.u8(EX_MEMBER);
             w.str(name);
@@ -1141,6 +1157,16 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
                 entries.push(ent);
             }
             ExprKind::Object(entries)
+        }
+        EX_MAP => {
+            let n = r.len()?;
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let key = read_expr(r)?;
+                let value = read_expr(r)?;
+                entries.push(crate::ast::MapEntry { key, value });
+            }
+            ExprKind::Map(entries)
         }
         EX_MEMBER => {
             let name = r.str()?;

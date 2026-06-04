@@ -13,8 +13,9 @@ use crate::span::Span;
 use crate::syntax::ast::{
     ArrayExpr, ArrowExpr, AssignExpr, AstNode, AwaitExpr, BinaryExpr, Block, BreakStmt, CallExpr,
     ClassDecl, ContinueStmt, EnumDecl, ExportStmt, Expr, FnDecl, ForStmt, IfStmt, ImportStmt,
-    IndexExpr, LetStmt, Literal, MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef, ObjectExpr,
-    ObjectField, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile, SpreadElem, Stmt,
+    IndexExpr, LetStmt, Literal, MapExpr, MatchArm, MatchExpr, MemberExpr, MethodDecl, NameRef,
+    ObjectExpr, ObjectField, OptMemberExpr, ParenExpr, RangeExpr, ReturnStmt, SourceFile,
+    SpreadElem, Stmt,
     TemplateExpr, TernaryExpr, TryExpr, UnaryExpr, UnwrapExpr, WhileStmt, YieldExpr,
 };
 use crate::syntax::cst::ResolvedNode;
@@ -377,6 +378,26 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 }
             }
             ExprKind::Object(entries)
+        }
+        // `#{ keyExpr: valueExpr, … }` map literal as a field default (SP2 §3).
+        // Lower each entry's key/value through the same path; the tree-walker
+        // evaluates the lowered `ExprKind::Map` at construct time.
+        Expr::MapExpr(map) => {
+            let mut entries = Vec::new();
+            for entry in map.map_entrys() {
+                let espan = node_span(&entry);
+                let key = entry
+                    .key()
+                    .ok_or_else(|| CompileError::new("map-default entry has no key", espan))?;
+                let value = entry
+                    .value()
+                    .ok_or_else(|| CompileError::new("map-default entry has no value", espan))?;
+                entries.push(crate::ast::MapEntry {
+                    key: cst_default_expr(&key)?,
+                    value: cst_default_expr(&value)?,
+                });
+            }
+            ExprKind::Map(entries)
         }
         Expr::MemberExpr(m) => {
             let object = m
@@ -957,6 +978,7 @@ impl Compiler {
             Expr::RangeExpr(range) => self.compile_range(range),
             Expr::ArrayExpr(arr) => self.compile_array(arr),
             Expr::ObjectExpr(obj) => self.compile_object(obj),
+            Expr::MapExpr(map) => self.compile_map(map),
             Expr::IndexExpr(ix) => self.compile_index(ix),
             Expr::MemberExpr(m) => self.compile_member(m),
             Expr::OptMemberExpr(m) => self.compile_opt_member(m),
@@ -4485,6 +4507,34 @@ impl Compiler {
                 self.chunk.emit(Op::AppendObject, fspan);
             }
             // Tokens (`{`, `,`, `}`) and trivia are skipped.
+        }
+        Ok(())
+    }
+
+    /// Lower a `#{ keyExpr: valueExpr, … }` map literal. Mirrors the tree-walker's
+    /// `ExprKind::Map`: `NEW_MAP` pushes an empty `Value::Map`, then each entry (in
+    /// source order) compiles `key`, compiles `value`, and emits `MAP_ENTRY` (which
+    /// converts the key to a `MapKey` — panicking on an unhashable key — and inserts
+    /// later-wins). `#{}` is just `NEW_MAP`. The `MAP_ENTRY` op carries the entry's
+    /// trivia-trimmed code span so the unhashable-key panic anchors at the key.
+    fn compile_map(&mut self, map: &MapExpr) -> Result<(), CompileError> {
+        let span = node_span(map);
+        self.chunk.emit(Op::NewMap, span);
+        for entry in map.map_entrys() {
+            let espan = node_code_span(&entry);
+            let key = entry
+                .key()
+                .ok_or_else(|| CompileError::new("map entry has no key", espan))?;
+            let value = entry
+                .value()
+                .ok_or_else(|| CompileError::new("map entry has no value", espan))?;
+            // The MAP_ENTRY op carries the KEY's trivia-trimmed code span so the
+            // unhashable-key panic anchors exactly where the tree-walker's
+            // `ExprKind::Map` arm anchors it (`entry.key.span`).
+            let key_span = node_code_span(&key);
+            self.compile_expr(&key)?;
+            self.compile_expr(&value)?;
+            self.chunk.emit(Op::MapEntry, key_span);
         }
         Ok(())
     }

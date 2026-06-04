@@ -271,3 +271,56 @@ fn interpreter_parses_examples_dir() {
     }
     assert!(count > 0, "no example .as files found");
 }
+
+// ---- SP2 Phase C: `#{…}` map literals -------------------------------------
+
+/// Assert `src` is REJECTED by the legacy front-end (a lex OR parse error).
+fn legacy_rejects(src: &str) {
+    let toks = match lex(src) {
+        Ok(t) => t,
+        Err(_) => return, // lex error is a valid rejection
+    };
+    assert!(
+        parse(&toks).is_err(),
+        "legacy front-end should REJECT {src:?}, but it parsed"
+    );
+}
+
+/// Assert `src` is REJECTED by the CST front-end (a parse error OR an Error node).
+fn cst_rejects(src: &str) {
+    let parsed = cst_parser::parse(src);
+    let has_error_node = parse_to_tree(src)
+        .descendants()
+        .any(|n| n.kind() == SyntaxKind::Error);
+    assert!(
+        !parsed.errors.is_empty() || has_error_node,
+        "CST front-end should REJECT {src:?}, but it parsed clean"
+    );
+}
+
+#[test]
+fn both_frontends_accept_map_literals() {
+    both_accept("let m = #{}");
+    both_accept("let m = #{ \"a\": 1, \"b\": 2 }");
+    both_accept("let m = #{ 1: \"x\", 2: \"y\" }");
+    both_accept("let k = \"x\"\nlet m = #{ k: 1, true: 2, nil: 3 }");
+    both_accept("let m = #{ 1 + 2: \"three\", }"); // trailing comma
+    both_accept("fn f() { return #{ 1: \"x\" } }");
+}
+
+#[test]
+fn both_frontends_reject_map_spread() {
+    // D4: a `...` spread element inside `#{}` is a clean parse error on BOTH
+    // front-ends (no panic). The two parsers word it differently; we only assert
+    // that each rejects.
+    legacy_rejects("let n = #{}\nlet m = #{ ...n }");
+    cst_rejects("let n = #{}\nlet m = #{ ...n }");
+}
+
+#[test]
+fn both_frontends_reject_bare_hash() {
+    // `#` not followed by `{` is a lex error on the legacy lexer and an Error
+    // token on the CST lexer — both front-ends reject it.
+    legacy_rejects("let x = # 5");
+    cst_rejects("let x = # 5");
+}

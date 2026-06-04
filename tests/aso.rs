@@ -303,6 +303,36 @@ fn build_then_run_aso_matches_arrow_match_via_from() {
     assert_eq!(aso_code, as_code);
 }
 
+#[test]
+fn build_then_run_aso_matches_map_literals() {
+    // SP2 Phase C: `#{…}` map literals must round-trip through `.aso` (the new
+    // `Op::NewMap`/`Op::MapEntry` opcodes + a `#{…}` class-field default that the
+    // field-default serializer persists as `EX_MAP`). Built bytecode must run
+    // byte-identically to the tree-walker oracle.
+    let dir = unique_dir("maplit");
+    write(
+        &dir,
+        "f.as",
+        "import * as map from \"std/map\"\n\
+         class C {\n  \
+         m: map<string, number> = #{ \"a\": 1, \"b\": 2 }\n  \
+         fn init() {}\n}\n\
+         let c = C()\n\
+         let top = #{ 1: \"x\", 2: \"y\", 1: \"z\" }\n\
+         print(map.get(c.m, \"b\"))\n\
+         print(map.get(top, 1))\n\
+         print(#{})\n",
+    );
+    build(&dir, "f.as");
+    assert!(dir.join("f.aso").exists(), "f.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "f.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "f.as"]);
+    assert_eq!(aso_out, "2\nz\nmap {}\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
 // ---------------------------------------------------------------------------
 // FILE-module import resolution (named + namespace)
 // ---------------------------------------------------------------------------

@@ -586,6 +586,7 @@ module.exports = grammar({
       $.nil,
       $.array_literal,
       $.object_literal,
+      $.map_literal,
       $.parenthesized_expression,
     ),
 
@@ -608,6 +609,19 @@ module.exports = grammar({
     )),
     object_entry: $ => seq(
       field('key', choice($.identifier, $.string)),
+      ':',
+      field('value', $._expression),
+    ),
+
+    // `#{ keyExpr: valueExpr, … }` map literal (SP2 §3). Unlike `object_entry`,
+    // the key is an `_expression` — its VALUE is the map key. Spread inside `#{}`
+    // is out of scope (D4): there is no spread alternative, so a `...` element is
+    // a parse error.
+    map_literal: $ => prec(PREC.primary, seq(
+      '#{', commaSep($.map_entry), optional(','), '}',
+    )),
+    map_entry: $ => seq(
+      field('key', $._expression),
       ':',
       field('value', $._expression),
     ),

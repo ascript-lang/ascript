@@ -586,6 +586,24 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                 out.push_str(" }");
             }
         }
+        ExprKind::Map(entries) => {
+            if entries.is_empty() {
+                out.push_str("#{}");
+            } else {
+                out.push_str("#{ ");
+                for (i, e) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    // The map-key is an arbitrary expression (NOT the object-key
+                    // quoting logic): format it as an expression.
+                    write_expr(out, &e.key, PREC_ASSIGN);
+                    out.push_str(": ");
+                    write_expr(out, &e.value, PREC_ASSIGN);
+                }
+                out.push_str(" }");
+            }
+        }
         ExprKind::Member { object, name } => {
             write_expr(out, object, PREC_POSTFIX);
             out.push('.');

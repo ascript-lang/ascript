@@ -236,6 +236,18 @@ pub enum Op {
     NewArray,
     /// `NEW_OBJECT(u16)` — pop `n` key/value pairs, push a new object.
     NewObject,
+    /// `NEW_MAP` — push a new, empty `Value::Map`. The `#{…}` map-literal builder
+    /// starts here, then runs one [`Op::MapEntry`] per entry. (`#{}` is just this
+    /// op.)
+    NewMap,
+    /// `[map, key, val] -- [map]` — convert `key` to a `MapKey` and insert
+    /// `key -> val` into the under-construction `map` (which sits below the
+    /// key/value). Mirrors the tree-walker's `ExprKind::Map`: an unhashable `key`
+    /// (a container/function/instance — `MapKey::from_value` returns `None`) raises
+    /// the SAME Tier-2 panic `cannot use {type} as a map key`, anchored at this op's
+    /// span (the entry's trivia-trimmed code span = the key span). A later duplicate
+    /// key OVERWRITES the value but KEEPS the first-seen position (IndexMap insert).
+    MapEntry,
     /// `[arr, v] -- [arr]` — flatten the spread operand `v` into the
     /// under-construction array `arr` (which sits just below `v` on the stack).
     /// Used for BOTH array-literal spreads `[...a]` AND call-argument spreads
@@ -549,6 +561,8 @@ impl Op {
 
             x if x == NewArray as u8 => NewArray,
             x if x == NewObject as u8 => NewObject,
+            x if x == NewMap as u8 => NewMap,
+            x if x == MapEntry as u8 => MapEntry,
             x if x == Spread as u8 => Spread,
             x if x == SpreadArgs as u8 => SpreadArgs,
             x if x == AppendArray as u8 => AppendArray,
@@ -679,6 +693,8 @@ impl Op {
             | CheckArrayDestructure
             | CheckObjectDestructure
             | MatchObject
+            | NewMap
+            | MapEntry
             | MatchNoArm => 0,
         }
     }
@@ -753,6 +769,8 @@ mod tests {
         Op::Closure,
         Op::NewArray,
         Op::NewObject,
+        Op::NewMap,
+        Op::MapEntry,
         Op::Spread,
         Op::SpreadArgs,
         Op::AppendArray,
