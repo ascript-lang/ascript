@@ -332,6 +332,22 @@ cfg?.cache?.ttl         // nil — the chain short-circuits, no panic
 cfg?.cache?.ttl ?? 60   // 60 — fall back to a default
 ```
 
+`?.` also guards **method calls** — `a?.m(args)`:
+
+```ascript
+class Box { fn get() { return 42 } }
+let b = Box()
+b?.get()                // 42 — ordinary bound method call
+let n = nil
+n?.get()                // nil — nil receiver short-circuits the whole chain
+n?.get().more.x         // nil — the rest of the postfix chain is skipped
+n?.get(expensive())     // nil — and the arguments are NOT evaluated
+```
+
+When the receiver is `nil`, the call yields `nil`, the rest of the chain (`.more.x`) is skipped, and
+the argument expressions never run. When the receiver is non-`nil`, it is an ordinary method call (so
+a missing method still panics with *"value is not callable"*).
+
 > [!NOTE] Reading a *missing* key of an existing object returns `nil` (not a panic) — e.g.
 > `({a: 1}).b` is `nil`. Only a `nil` *receiver* and an out-of-bounds `arr[i]` index panic. Use
 > `?.` when the receiver itself might be `nil`.
