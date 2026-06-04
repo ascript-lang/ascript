@@ -24,6 +24,22 @@ pub fn check(tree: &ResolvedNode, _resolved: &ResolveResult, _src: &str) -> Vec<
         if crate::syntax::resolve::ident_text(name_ref).as_deref() != Some("super") {
             continue;
         }
+        // `super` inside a STATIC method (SP1 §3) is ALWAYS invalid — a static call
+        // has no instance/parent receiver — regardless of whether the class extends.
+        // Flag at the nearest enclosing `MethodDecl` that carries `static`.
+        if let Some(method) = name_ref.ancestors().find(|a| a.kind() == MethodDecl) {
+            if crate::syntax::resolve::is_static_method(method) {
+                out.push(AsDiagnostic {
+                    range: code_range(name_ref),
+                    severity: Severity::Warning,
+                    code: "super-misuse".to_string(),
+                    message: "`super` is not valid in a static method (no instance/parent receiver)"
+                        .to_string(),
+                    fix: None,
+                });
+                continue;
+            }
+        }
         // Find the nearest enclosing class declaration. Skip if there is none
         // (a bare `super` outside a class is a separate compile error, not ours).
         let Some(class) = name_ref.ancestors().find(|a| a.kind() == ClassDecl) else {
@@ -101,6 +117,27 @@ mod tests {
         assert_eq!(
             d.message,
             "`super` used in class A, which has no superclass"
+        );
+    }
+
+    #[test]
+    fn super_in_static_method_flagged_even_with_superclass() {
+        // SP1 §3: `super` in a static is invalid regardless of `extends`.
+        let src = "class A {}\nclass B extends A {\n  static fn s() { super.s() }\n}";
+        assert_eq!(
+            count(src, "super-misuse"),
+            1,
+            "{:?}",
+            analyze(src).diagnostics
+        );
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "super-misuse")
+            .unwrap();
+        assert_eq!(
+            d.message,
+            "`super` is not valid in a static method (no instance/parent receiver)"
         );
     }
 
