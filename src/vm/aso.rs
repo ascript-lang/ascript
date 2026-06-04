@@ -117,6 +117,12 @@ pub enum AsoError {
     /// compiler invariant violation (the pool must hold only literal scalars +
     /// prebuilt enums). Carries a short description of the offending kind.
     NonLiteralConst(&'static str),
+    /// A field exceeded the `.aso` wire-format capacity during ENCODING (SP3 §A):
+    /// a single string/bytes literal > `u32::MAX` bytes (`what = "byte field"`), or
+    /// a serialized collection with > `u32::MAX` entries (`what = "collection"`).
+    /// Returned from `to_bytes` instead of panicking; the `build` command maps it
+    /// to a clean message + non-zero exit.
+    TooLarge { what: &'static str, len: usize },
 }
 
 impl std::fmt::Display for AsoError {
@@ -138,6 +144,16 @@ impl std::fmt::Display for AsoError {
             AsoError::NonLiteralConst(kind) => {
                 write!(f, "non-literal value ({kind}) in constant pool (compiler bug)")
             }
+            AsoError::TooLarge { what, .. } => match *what {
+                "byte field" => write!(
+                    f,
+                    "value too large to serialize (a single string or bytes literal exceeds 4 GB)"
+                ),
+                _ => write!(
+                    f,
+                    "module too large to serialize (a table exceeds 4 billion entries); split the module into smaller files"
+                ),
+            },
         }
     }
 }
@@ -237,11 +253,34 @@ const IMP_NAMESPACE: u8 = 1;
 /// A minimal little-endian byte sink.
 struct Writer {
     buf: Vec<u8>,
+    /// The FIRST capacity overflow hit while writing (SP3 §A), sticky / first-wins.
+    /// `bytes`/`len` record here and write a placeholder length instead of
+    /// panicking; `to_bytes` checks it once after writing the whole chunk and
+    /// returns the typed error. `None` for every in-range module.
+    overflow: Option<AsoError>,
 }
 
 impl Writer {
     fn new() -> Self {
-        Writer { buf: Vec::new() }
+        Writer {
+            buf: Vec::new(),
+            overflow: None,
+        }
+    }
+    /// Encode `n` as a `u32` length prefix; on overflow (> `u32::MAX`) record a
+    /// sticky [`AsoError::TooLarge`] (`what`) and write the clamped placeholder.
+    /// Pure (no allocation), so the > 4 GB capacity path is unit-testable without
+    /// materializing the data.
+    fn write_len(&mut self, n: usize, what: &'static str) {
+        match u32::try_from(n) {
+            Ok(v) => self.u32(v),
+            Err(_) => {
+                if self.overflow.is_none() {
+                    self.overflow = Some(AsoError::TooLarge { what, len: n });
+                }
+                self.u32(u32::MAX);
+            }
+        }
     }
     fn u8(&mut self, v: u8) {
         self.buf.push(v);
@@ -260,7 +299,7 @@ impl Writer {
         self.buf.extend_from_slice(&v.to_bits().to_le_bytes());
     }
     fn bytes(&mut self, b: &[u8]) {
-        self.u32(u32::try_from(b.len()).expect(".aso byte field exceeds u32::MAX"));
+        self.write_len(b.len(), "byte field");
         self.buf.extend_from_slice(b);
     }
     fn str(&mut self, s: &str) {
@@ -281,7 +320,7 @@ impl Writer {
         self.u64(v as u64);
     }
     fn len(&mut self, n: usize) {
-        self.u32(u32::try_from(n).expect(".aso collection exceeds u32::MAX"));
+        self.write_len(n, "collection");
     }
 }
 
@@ -373,18 +412,26 @@ impl Chunk {
     /// Serialize this chunk to a self-contained `.aso` byte vector: the magic
     /// header, the format version, then the chunk body.
     ///
+    /// Returns [`AsoError::TooLarge`] if a single string/bytes literal exceeds 4 GB
+    /// or a serialized table exceeds `u32::MAX` entries (SP3 §A) — a clean error,
+    /// never a panic.
+    ///
     /// # Panics
     /// If the constant pool holds a non-literal value (a compiler invariant
     /// violation). Use [`Chunk::check_consts_literal_only`] for a non-panicking
     /// check. (The literal-only invariant is also asserted per-value during
     /// encoding via [`write_value`].)
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, AsoError> {
         let mut w = Writer::new();
         w.buf.extend_from_slice(&ASO_MAGIC);
         w.u32(ASO_FORMAT_VERSION);
         write_chunk(&mut w, self)
             .expect("constant pool must be literals-only (compiler invariant)");
-        w.buf
+        // SP3 §A: surface a wire-format capacity overflow as a clean typed error.
+        if let Some(e) = w.overflow {
+            return Err(e);
+        }
+        Ok(w.buf)
     }
 
     /// Deserialize a chunk from an `.aso` byte stream, validating the magic and
@@ -1656,7 +1703,7 @@ run()
     #[test]
     fn header_layout() {
         let chunk = compile("print(1 + 2)");
-        let bytes = chunk.to_bytes();
+        let bytes = chunk.to_bytes().expect("serialize");
         assert_eq!(&bytes[0..4], &ASO_MAGIC);
         let ver = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         assert_eq!(ver, ASO_FORMAT_VERSION);
@@ -1665,7 +1712,7 @@ run()
     #[test]
     fn roundtrip_structural_equality_simple() {
         let original = compile("let a = 1\nlet b = \"hi\"\nprint(a)\nprint(b)");
-        let bytes = original.to_bytes();
+        let bytes = original.to_bytes().expect("serialize");
         let rt = Chunk::from_bytes(&bytes).expect("decode");
         assert_eq!(disasm(&original), disasm(&rt), "disasm fingerprint differs");
     }
@@ -1673,7 +1720,7 @@ run()
     #[test]
     fn roundtrip_structural_equality_complex() {
         let original = compile(COMPLEX);
-        let bytes = original.to_bytes();
+        let bytes = original.to_bytes().expect("serialize");
         let rt = Chunk::from_bytes(&bytes).expect("decode");
         assert_eq!(disasm(&original), disasm(&rt), "disasm fingerprint differs");
     }
@@ -1682,23 +1729,23 @@ run()
     fn roundtrip_produces_same_output() {
         // compile→run  vs  compile→to_bytes→from_bytes→run must be byte-identical.
         let direct = run_chunk(compile(COMPLEX));
-        let viaso = run_chunk(Chunk::from_bytes(&compile(COMPLEX).to_bytes()).expect("decode"));
+        let viaso = run_chunk(Chunk::from_bytes(&compile(COMPLEX).to_bytes().expect("serialize")).expect("decode"));
         assert_eq!(direct, viaso, "output differs after .aso round-trip");
     }
 
     #[test]
     fn double_roundtrip_is_stable() {
         let original = compile(COMPLEX);
-        let once = Chunk::from_bytes(&original.to_bytes()).expect("decode 1");
-        let twice = Chunk::from_bytes(&once.to_bytes()).expect("decode 2");
+        let once = Chunk::from_bytes(&original.to_bytes().expect("serialize")).expect("decode 1");
+        let twice = Chunk::from_bytes(&once.to_bytes().expect("serialize")).expect("decode 2");
         assert_eq!(disasm(&original), disasm(&twice));
         // Bytes themselves are stable across re-encode.
-        assert_eq!(once.to_bytes(), twice.to_bytes());
+        assert_eq!(once.to_bytes().expect("serialize"), twice.to_bytes().expect("serialize"));
     }
 
     #[test]
     fn version_mismatch_detected() {
-        let mut bytes = compile("print(1)").to_bytes();
+        let mut bytes = compile("print(1)").to_bytes().expect("serialize");
         // Corrupt the version u32 (bytes 4..8).
         bytes[4] = bytes[4].wrapping_add(1);
         match Chunk::from_bytes(&bytes) {
@@ -1712,7 +1759,7 @@ run()
 
     #[test]
     fn bad_magic_detected() {
-        let mut bytes = compile("print(1)").to_bytes();
+        let mut bytes = compile("print(1)").to_bytes().expect("serialize");
         bytes[0] = b'X';
         assert!(matches!(
             Chunk::from_bytes(&bytes),
@@ -1727,7 +1774,7 @@ run()
 
     #[test]
     fn truncated_detected() {
-        let bytes = compile(COMPLEX).to_bytes();
+        let bytes = compile(COMPLEX).to_bytes().expect("serialize");
         // Drop the tail — header is intact but body is short.
         let half = &bytes[..bytes.len() / 2];
         assert!(matches!(Chunk::from_bytes(half), Err(AsoError::Truncated)));
@@ -1735,7 +1782,7 @@ run()
 
     #[test]
     fn trailing_bytes_detected() {
-        let mut bytes = compile("print(1)").to_bytes();
+        let mut bytes = compile("print(1)").to_bytes().expect("serialize");
         bytes.push(0xAB);
         assert!(matches!(
             Chunk::from_bytes(&bytes),
@@ -1765,7 +1812,7 @@ run()
         assert!(!original.class_protos.is_empty(), "expected class_protos");
         assert!(!original.protos.is_empty(), "expected nested protos");
 
-        let rt = Chunk::from_bytes(&original.to_bytes()).expect("decode");
+        let rt = Chunk::from_bytes(&original.to_bytes().expect("serialize")).expect("decode");
         assert_eq!(original.imports.len(), rt.imports.len());
         assert_eq!(original.class_protos.len(), rt.class_protos.len());
         assert_eq!(original.protos.len(), rt.protos.len());
@@ -1782,7 +1829,7 @@ run()
         let original = compile(COMPLEX);
         // Populate a runtime cache on the ORIGINAL chunk; it must NOT travel.
         original.set_field_ic(0, crate::vm::ic::InlineCache::default());
-        let rt = Chunk::from_bytes(&original.to_bytes()).expect("decode");
+        let rt = Chunk::from_bytes(&original.to_bytes().expect("serialize")).expect("decode");
         assert!(rt.field_ics.borrow().is_empty());
         assert!(rt.method_ics.borrow().is_empty());
         assert!(rt.arith_caches.borrow().is_empty());
@@ -1798,7 +1845,7 @@ run()
         c.add_const(Value::Number(-0.0));
         c.add_const(Value::Number(f64::INFINITY));
         c.add_const(Value::Decimal(Decimal::from_str("1.50").unwrap()));
-        let rt = Chunk::from_bytes(&c.to_bytes()).expect("decode");
+        let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
         assert!(matches!(rt.consts[0], Value::Number(n) if n.is_nan()));
         assert!(matches!(rt.consts[1], Value::Number(n) if n == 0.0 && n.is_sign_negative()));
         assert!(matches!(rt.consts[2], Value::Number(n) if n.is_infinite()));
@@ -1829,7 +1876,7 @@ run()
         ]));
         c.add_const(keys);
         assert_eq!(c.check_consts_literal_only(), Ok(()));
-        let rt = Chunk::from_bytes(&c.to_bytes()).expect("decode");
+        let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
         match &rt.consts[0] {
             Value::Array(a) => {
                 let a = a.borrow();
@@ -1902,7 +1949,7 @@ print(c.iseq)
 print(c.merged)
 "#;
         let original = compile(src);
-        let bytes = original.to_bytes();
+        let bytes = original.to_bytes().expect("serialize");
         let rt = Chunk::from_bytes(&bytes).expect("decode");
         assert_eq!(
             disasm(&original),
@@ -1913,7 +1960,7 @@ print(c.merged)
         // disasm, so also assert run-output parity through the round-trip.
         assert_eq!(
             run_chunk(compile(src)),
-            run_chunk(Chunk::from_bytes(&compile(src).to_bytes()).expect("decode")),
+            run_chunk(Chunk::from_bytes(&compile(src).to_bytes().expect("serialize")).expect("decode")),
             "computed-default output differs after .aso round-trip"
         );
     }
@@ -1940,16 +1987,74 @@ print(c.label)
 "#;
         assert_eq!(
             run_chunk(compile(src)),
-            run_chunk(Chunk::from_bytes(&compile(src).to_bytes()).expect("decode")),
+            run_chunk(Chunk::from_bytes(&compile(src).to_bytes().expect("serialize")).expect("decode")),
             "arrow/match field-default output differs after .aso round-trip"
         );
         // Idempotence: encode → decode → encode must be byte-stable.
-        let once = Chunk::from_bytes(&compile(src).to_bytes()).expect("decode 1");
-        let twice = Chunk::from_bytes(&once.to_bytes()).expect("decode 2");
+        let once = Chunk::from_bytes(&compile(src).to_bytes().expect("serialize")).expect("decode 1");
+        let twice = Chunk::from_bytes(&once.to_bytes().expect("serialize")).expect("decode 2");
         assert_eq!(
-            once.to_bytes(),
-            twice.to_bytes(),
+            once.to_bytes().expect("serialize"),
+            twice.to_bytes().expect("serialize"),
             "arrow/match field-default .aso re-serialization is not idempotent"
+        );
+    }
+
+    // SP3 §A: the `.aso` writer's > u32::MAX capacity paths are exercised via a
+    // FAKE length (no 4 GB allocation). `write_len` is pure: it records the sticky
+    // overflow and writes a clamped placeholder, and `to_bytes` returns the typed
+    // error. A length that fits is encoded with no overflow.
+
+    #[test]
+    fn write_len_byte_field_over_u32_is_clean_error() {
+        let mut w = Writer::new();
+        w.write_len((u32::MAX as usize) + 1, "byte field");
+        match w.overflow {
+            Some(AsoError::TooLarge { what, len }) => {
+                assert_eq!(what, "byte field");
+                assert_eq!(len, (u32::MAX as usize) + 1);
+            }
+            other => panic!("expected TooLarge byte-field overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_len_collection_over_u32_is_clean_error() {
+        let mut w = Writer::new();
+        w.write_len((u32::MAX as usize) + 1, "collection");
+        match w.overflow {
+            Some(AsoError::TooLarge { what, len }) => {
+                assert_eq!(what, "collection");
+                assert_eq!(len, (u32::MAX as usize) + 1);
+            }
+            other => panic!("expected TooLarge collection overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_len_in_range_does_not_overflow() {
+        let mut w = Writer::new();
+        w.write_len(42, "collection");
+        assert!(w.overflow.is_none());
+        assert_eq!(w.buf, 42u32.to_le_bytes());
+    }
+
+    #[test]
+    fn too_large_messages_are_actionable() {
+        let byte = AsoError::TooLarge {
+            what: "byte field",
+            len: 0,
+        }
+        .to_string();
+        assert!(byte.contains("4 GB"), "byte-field message: {byte}");
+        let coll = AsoError::TooLarge {
+            what: "collection",
+            len: 0,
+        }
+        .to_string();
+        assert!(
+            coll.contains("4 billion entries"),
+            "collection message: {coll}"
         );
     }
 }

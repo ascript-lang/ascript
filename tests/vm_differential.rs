@@ -5946,7 +5946,9 @@ fn verifier_accepts_all_compiled_corpus_chunks() {
         //    documented gap), it must survive an `.aso` round-trip AND re-verify on
         //    load.
         if chunk_is_serializable(&chunk) {
-            let bytes = chunk.to_bytes();
+            let bytes = chunk
+                .to_bytes()
+                .unwrap_or_else(|e| panic!("to_bytes failed for `{rel}`: {e}"));
             ascript::vm::chunk::Chunk::from_bytes_verified(&bytes)
                 .unwrap_or_else(|e| panic!("from_bytes_verified rejected `{rel}`: {e}"));
         }

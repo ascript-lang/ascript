@@ -38,7 +38,7 @@ pub struct CompileError {
 }
 
 impl CompileError {
-    fn new(message: impl Into<String>, span: Span) -> Self {
+    pub fn new(message: impl Into<String>, span: Span) -> Self {
         CompileError {
             message: message.into(),
             span,
@@ -803,6 +803,13 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
             .emit(Op::Return, Span::new(src.len(), src.len()));
     }
 
+    // SP3 §A: a bytecode-capacity overflow (const pool / proto / class-proto /
+    // import table / jump-loop displacement) on the TOP chunk recorded a sticky
+    // flag instead of panicking — surface it as a clean compile error.
+    if let Some(limit) = compiler.chunk.take_overflow() {
+        return Err(limit.into_compile_error());
+    }
+
     Ok(compiler.chunk)
 }
 
@@ -935,6 +942,12 @@ impl Compiler {
                 && body_range.contains_range(b.decl_range)
                 && b.decl_range != body_range
             {
+                // SP3 §A4: this `try_from` can never fall through to a silent skip.
+                // `b.slot` is a slot INDEX within this frame, and the frame's
+                // `slot_count` was already validated to fit `u16` (compile_source
+                // :741 / function frame :2378 / field default :2262) BEFORE any
+                // fresh-cell emit — so `b.slot < slot_count <= u16::MAX` always
+                // holds and the `Ok` arm is always taken. No capacity truncation.
                 if let Ok(slot) = u16::try_from(b.slot) {
                     slots.push(slot);
                 }
@@ -2088,6 +2101,10 @@ impl Compiler {
             if b.is_global {
                 exports.push((None, b.name.clone()));
             } else if let Ok(slot) = u16::try_from(b.slot) {
+                // SP3 §A4: same invariant as `loop_refresh_slots` — `b.slot` is a
+                // frame slot index < the frame's `slot_count`, which is validated to
+                // fit `u16` before any emit, so this `Ok` arm is always taken (no
+                // silent capacity truncation).
                 exports.push((Some(slot), b.name.clone()));
             }
         };
@@ -2287,6 +2304,13 @@ impl Compiler {
         };
         body_chunk.emit(Op::Return, span);
 
+        // SP3 §A: surface any bytecode-capacity overflow on this sealed nested
+        // chunk as a clean compile error (one check per sealed chunk catches a
+        // nested-function overflow too).
+        if let Some(limit) = body_chunk.take_overflow() {
+            return Err(limit.into_compile_error());
+        }
+
         Ok(Rc::new(FnProto {
             chunk: body_chunk,
             arity: 0,
@@ -2478,6 +2502,12 @@ impl Compiler {
         self.next_temp = saved_next_temp;
         self.cur_cells = saved_cells;
         result?;
+
+        // SP3 §A: surface any bytecode-capacity overflow on this sealed function
+        // body as a clean compile error (one check per sealed chunk).
+        if let Some(limit) = body_chunk.take_overflow() {
+            return Err(limit.into_compile_error());
+        }
 
         Ok(Rc::new(FnProto {
             chunk: body_chunk,

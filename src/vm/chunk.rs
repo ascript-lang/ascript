@@ -167,6 +167,69 @@ impl ImportDesc {
     }
 }
 
+/// A bytecode-capacity limit that a [`Chunk`] hit while being built (SP3 §A). The
+/// chunk builder records the **first** such overflow (sticky / first-wins) into
+/// `Chunk::overflow` and returns a safe placeholder index / skips the emit instead
+/// of panicking; the compiler checks the flag after sealing each chunk and turns it
+/// into a clean [`crate::compile::CompileError`] (non-zero exit, never a SIGABRT).
+/// Each variant carries the [`Span`] of the triggering construct for the diagnostic.
+#[derive(Debug, Clone, Copy)]
+pub enum ChunkLimit {
+    /// The constant pool would exceed `u16::MAX` entries.
+    Consts(Span),
+    /// The proto (nested-function) table would exceed `u16::MAX` entries.
+    Protos(Span),
+    /// The class-proto table would exceed `u16::MAX` entries.
+    ClassProtos(Span),
+    /// The import table would exceed `u16::MAX` entries.
+    Imports(Span),
+    /// A forward jump displacement would exceed the `i16` range (a single function
+    /// body emits > 32 KB of bytecode between a jump and its target).
+    Jump(Span),
+    /// A backward loop displacement would exceed the `i16` range.
+    Loop(Span),
+}
+
+impl ChunkLimit {
+    /// The triggering span (for the diagnostic).
+    fn span(self) -> Span {
+        match self {
+            ChunkLimit::Consts(s)
+            | ChunkLimit::Protos(s)
+            | ChunkLimit::ClassProtos(s)
+            | ChunkLimit::Imports(s)
+            | ChunkLimit::Jump(s)
+            | ChunkLimit::Loop(s) => s,
+        }
+    }
+
+    /// The actionable message (SP3 §A2).
+    fn message(self) -> &'static str {
+        match self {
+            ChunkLimit::Consts(_) => {
+                "module exceeds 65535 constants; split the module into smaller files"
+            }
+            ChunkLimit::Protos(_) => {
+                "module exceeds 65535 function definitions; split the module into smaller files"
+            }
+            ChunkLimit::ClassProtos(_) => {
+                "module exceeds 65535 class definitions; split the module into smaller files"
+            }
+            ChunkLimit::Imports(_) => {
+                "module exceeds 65535 imports; split the module into smaller files"
+            }
+            ChunkLimit::Jump(_) | ChunkLimit::Loop(_) => {
+                "function body too large to compile (a single jump exceeds 32 KB of bytecode); split it into smaller functions"
+            }
+        }
+    }
+
+    /// Lower this capacity overflow into a clean compile error.
+    pub fn into_compile_error(self) -> crate::compile::CompileError {
+        crate::compile::CompileError::new(self.message(), self.span())
+    }
+}
+
 /// A compiled function body (or top-level script body) plus its metadata.
 #[derive(Debug, Default)]
 pub struct Chunk {
@@ -226,6 +289,13 @@ pub struct Chunk {
     pub imports: Vec<ImportDesc>,
     /// Optional name (function name / `<script>`), for the disassembler & traces.
     pub name: Option<String>,
+    /// The FIRST bytecode-capacity overflow this chunk hit while being built
+    /// (SP3 §A). Sticky / first-wins: a capacity site records here and returns a
+    /// safe placeholder instead of panicking; the compiler checks it after sealing
+    /// each chunk ([`Chunk::take_overflow`]) and returns a clean `CompileError`.
+    /// `None` for every valid (sub-65535) module — the placeholder is never
+    /// executed because compile aborts the moment the flag is observed set.
+    pub overflow: std::cell::Cell<Option<ChunkLimit>>,
 }
 
 /// A compiled function prototype: a [`Chunk`] plus the calling-convention flags
@@ -301,14 +371,18 @@ impl Chunk {
     /// end of `code`. The displacement is measured from the byte *after* the
     /// operand (`site + 2`) to the target.
     ///
-    /// # Panics
-    /// If the forward distance does not fit in an `i16`.
+    /// On capacity overflow (displacement out of `i16` range — a function body
+    /// emitting > 32 KB of bytecode between the jump and its target) records a
+    /// sticky [`ChunkLimit::Jump`] and writes a `0` placeholder (SP3 §A); the
+    /// compiler turns the recorded overflow into a clean `CompileError`.
     pub fn patch_jump(&mut self, site: usize) {
         let target = self.code.len();
         let from = site + 2;
         let disp = i64::try_from(target).unwrap() - i64::try_from(from).unwrap();
-        let disp = i16::try_from(disp)
-            .unwrap_or_else(|_| panic!("jump displacement {disp} out of i16 range"));
+        let disp = i16::try_from(disp).unwrap_or_else(|_| {
+            self.record_overflow(ChunkLimit::Jump(self.cur_span()));
+            0
+        });
         self.code[site..site + 2].copy_from_slice(&disp.to_le_bytes());
     }
 
@@ -330,15 +404,19 @@ impl Chunk {
     /// displacement is measured from the byte after the operand to `target`, so it
     /// is negative for a real backward jump.
     ///
-    /// # Panics
-    /// If the backward distance does not fit in an `i16`.
+    /// On capacity overflow (displacement out of `i16` range — a loop body > 32 KB
+    /// of bytecode) records a sticky [`ChunkLimit::Loop`] and writes a `0`
+    /// placeholder (SP3 §A); the compiler turns the recorded overflow into a clean
+    /// `CompileError`.
     pub fn emit_loop(&mut self, op: Op, target: usize, span: Span) {
         self.record_span(span);
         self.code.push(op as u8);
         let from = self.code.len() + 2;
         let disp = i64::try_from(target).unwrap() - i64::try_from(from).unwrap();
-        let disp = i16::try_from(disp)
-            .unwrap_or_else(|_| panic!("loop displacement {disp} out of i16 range"));
+        let disp = i16::try_from(disp).unwrap_or_else(|_| {
+            self.record_overflow(ChunkLimit::Loop(span));
+            0
+        });
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
@@ -349,49 +427,69 @@ impl Chunk {
     /// value (numbers by *bit pattern*, so `NaN` folds together and `-0.0`/`0.0`
     /// stay distinct); non-dedupable values are always appended.
     ///
-    /// # Panics
-    /// If the pool would exceed `u16::MAX` entries.
+    /// On capacity overflow (> `u16::MAX` entries) this records a sticky
+    /// [`ChunkLimit::Consts`] and returns the placeholder index `u16::MAX` instead
+    /// of panicking (SP3 §A); the compiler turns the recorded overflow into a clean
+    /// `CompileError` after sealing the chunk, so the placeholder never executes.
     pub fn add_const(&mut self, v: Value) -> u16 {
         if const_is_dedupable(&v) {
             if let Some(i) = self.consts.iter().position(|e| const_eq(e, &v)) {
-                return u16::try_from(i).expect("const index fits u16");
+                // A dedup hit only returns a valid index past `u16::MAX` once the
+                // pool is already oversized; record + clamp consistently with the
+                // append path below.
+                return u16::try_from(i).unwrap_or_else(|_| {
+                    self.record_overflow(ChunkLimit::Consts(self.cur_span()));
+                    u16::MAX
+                });
             }
         }
         let idx = self.consts.len();
-        let idx = u16::try_from(idx).expect("const pool exceeded u16::MAX");
+        let idx = u16::try_from(idx).unwrap_or_else(|_| {
+            self.record_overflow(ChunkLimit::Consts(self.cur_span()));
+            u16::MAX
+        });
         self.consts.push(v);
         idx
     }
 
     /// Append a function prototype, returning its index.
     ///
-    /// # Panics
-    /// If the proto table would exceed `u16::MAX` entries.
+    /// On capacity overflow (> `u16::MAX` protos) records a sticky
+    /// [`ChunkLimit::Protos`] and returns the placeholder `u16::MAX` (SP3 §A).
     pub fn add_proto(&mut self, p: Rc<FnProto>) -> u16 {
         let idx = self.protos.len();
-        let idx = u16::try_from(idx).expect("proto table exceeded u16::MAX");
+        let idx = u16::try_from(idx).unwrap_or_else(|_| {
+            self.record_overflow(ChunkLimit::Protos(self.cur_span()));
+            u16::MAX
+        });
         self.protos.push(p);
         idx
     }
 
     /// Append a class definition, returning its index.
     ///
-    /// # Panics
-    /// If the class-proto table would exceed `u16::MAX` entries.
+    /// On capacity overflow (> `u16::MAX` classes) records a sticky
+    /// [`ChunkLimit::ClassProtos`] and returns the placeholder `u16::MAX` (SP3 §A).
     pub fn add_class_proto(&mut self, p: Rc<ClassProto>) -> u16 {
         let idx = self.class_protos.len();
-        let idx = u16::try_from(idx).expect("class-proto table exceeded u16::MAX");
+        let idx = u16::try_from(idx).unwrap_or_else(|_| {
+            self.record_overflow(ChunkLimit::ClassProtos(self.cur_span()));
+            u16::MAX
+        });
         self.class_protos.push(p);
         idx
     }
 
     /// Append an import descriptor, returning its index (the `IMPORT` operand).
     ///
-    /// # Panics
-    /// If the import table would exceed `u16::MAX` entries.
+    /// On capacity overflow (> `u16::MAX` imports) records a sticky
+    /// [`ChunkLimit::Imports`] and returns the placeholder `u16::MAX` (SP3 §A).
     pub fn add_import(&mut self, desc: ImportDesc) -> u16 {
         let idx = self.imports.len();
-        let idx = u16::try_from(idx).expect("import table exceeded u16::MAX");
+        let idx = u16::try_from(idx).unwrap_or_else(|_| {
+            self.record_overflow(ChunkLimit::Imports(self.cur_span()));
+            u16::MAX
+        });
         self.imports.push(desc);
         idx
     }
@@ -505,6 +603,32 @@ impl Chunk {
     /// length. Kept sorted by construction (offsets are monotonic).
     fn record_span(&mut self, span: Span) {
         self.spans.push((self.code.len(), span));
+    }
+
+    /// The most-recently recorded instruction span (or an empty span if none yet).
+    /// Pool-capacity sites (`add_const`/`add_proto`/…) have no `Span` argument, so
+    /// they attribute their overflow diagnostic to the last instruction emitted —
+    /// close enough to point the user at the offending region.
+    fn cur_span(&self) -> Span {
+        self.spans
+            .last()
+            .map(|(_, s)| *s)
+            .unwrap_or_else(|| Span::new(0, 0))
+    }
+
+    /// Record the FIRST bytecode-capacity overflow (sticky / first-wins). Later
+    /// overflows are ignored so the diagnostic points at the first offending
+    /// construct.
+    fn record_overflow(&self, limit: ChunkLimit) {
+        if self.overflow.get().is_none() {
+            self.overflow.set(Some(limit));
+        }
+    }
+
+    /// Take the recorded capacity overflow, if any. The compiler calls this after
+    /// sealing each chunk; a `Some` becomes a clean `CompileError`.
+    pub fn take_overflow(&self) -> Option<ChunkLimit> {
+        self.overflow.take()
     }
 }
 

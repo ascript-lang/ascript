@@ -233,7 +233,9 @@ pub fn build_file(file: &Path, out: Option<&Path>) -> Result<std::path::PathBuf,
         ))
         .with_source(src_info)
     })?;
-    let bytes = chunk.to_bytes();
+    let bytes = chunk
+        .to_bytes()
+        .map_err(|e| AsError::new(format!("cannot serialize bytecode: {e}")))?;
     let out_path = match out {
         Some(p) => p.to_path_buf(),
         None => file.with_extension("aso"),
