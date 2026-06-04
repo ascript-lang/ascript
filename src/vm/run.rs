@@ -139,6 +139,15 @@ pub struct Vm {
     /// Top-level defines run once at load, then the version is stable, so the caches
     /// stay hot for the steady-state hot loops.
     global_version: std::cell::Cell<u64>,
+    /// STRUCTURAL generation (SP8). Bumped ONLY when a NEW global is DEFINED/inserted
+    /// (`define_user_global`), NEVER on a plain reassignment (`update_user_global`).
+    /// The SP8 index-stable `GET_GLOBAL`/`SET_GLOBAL` cache (`GlobalCache::IndexBound`)
+    /// guards its cached `IndexMap` index with this generation: only a define can
+    /// change which index a name maps to (or introduce a shadow), so a hot reassigned
+    /// top-level `let` loop never bumps it — the index cache stays hot every iteration
+    /// (no thrash). Distinct from `global_version`, which keeps serving the builtin
+    /// `Cached` path (and DOES bump on define).
+    struct_gen: std::cell::Cell<u64>,
 }
 
 impl Vm {
@@ -174,6 +183,7 @@ impl Vm {
             module_dir: RefCell::new(std::env::current_dir().unwrap_or_else(|_| ".".into())),
             user_globals: RefCell::new(indexmap::IndexMap::new()),
             global_version: std::cell::Cell::new(0),
+            struct_gen: std::cell::Cell::new(0),
         });
         *vm.self_weak.borrow_mut() = Rc::downgrade(&vm);
         // Register the VM on the shared interpreter so a native higher-order
@@ -694,17 +704,34 @@ impl Vm {
                     // record the global cache — always re-resolve generically. The
                     // resolved value is identical either way, so generic and
                     // specialized stay byte-identical.
+                    // SP8 INDEX-STABLE user-global cache: when specializing, consult
+                    // the site cache for an `IndexBound { idx, struct_gen }` entry. A
+                    // `struct_gen` hit reads the user-global by its STABLE IndexMap
+                    // index (no string hash) — this is the regression recovery for a
+                    // hot reassigned top-level `let` (a SET never bumps `struct_gen`).
                     let version = self.global_version();
                     let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
+                    if self.specialize {
+                        if let Some(idx) = cache.get_index(self.struct_gen()) {
+                            fiber.push(self.user_global_value_at(idx));
+                            continue;
+                        }
+                    }
                     if let Some(v) = cache.get(version).filter(|_| self.specialize) {
                         fiber.push(v);
-                    } else if let Some(v) = self.get_user_global(&name) {
-                        // A user global is a cheap IndexMap lookup and its VALUE is
-                        // MUTABLE (a top-level `let` reassigned in a hot loop). We do
-                        // NOT cache it: caching the value would thrash (every
-                        // SET_GLOBAL bumps the version, invalidating the entry each
-                        // iteration) AND would risk serving a stale value. Only the
-                        // IMMUTABLE bare builtins below are cached.
+                    } else if let Some((idx, v)) = self.get_user_global_full(&name) {
+                        // A user global resolves by name (the cold/miss path); when
+                        // specializing, RECORD its stable IndexMap index so subsequent
+                        // executions of this site hit the index fast path above. We
+                        // cache the INDEX (not the value), so a value reassignment is
+                        // immediately visible (the next read re-reads the slot) — no
+                        // thrash, no stale value.
+                        if self.specialize {
+                            fiber.frame().closure.proto.chunk.set_global_cache(
+                                fault_ip,
+                                crate::vm::adapt::GlobalCache::index_bound(idx, self.struct_gen()),
+                            );
+                        }
                         fiber.push(v);
                     } else if crate::interp::BUILTIN_NAMES.contains(&name.as_ref()) {
                         let v = Value::Builtin(name);
@@ -789,14 +816,52 @@ impl Vm {
                     //     tree-walker's `Environment::assign`.
                     //   - Absent name → `cannot assign to undefined variable '<n>'`.
                     //   - Mutable global (`let`) → update in place. We do NOT bump the
-                    //     global version: user-global reads are never cached (only
-                    //     immutable builtins are), and a value update cannot change which
-                    //     NAME a cached builtin entry resolves to — so no cache can go
-                    //     stale. Keeps a hot reassignment loop cheap (no per-iteration
-                    //     cache invalidation), matching the generic VM.
+                    //     global version OR `struct_gen`: a SET is not a define, so it
+                    //     cannot move any index or change a cached name's target — no
+                    //     cache can go stale. Keeps a hot reassignment loop cheap (no
+                    //     per-iteration cache invalidation), matching the generic VM.
+                    //
+                    // SP8 INDEX-STABLE set cache: when specializing, consult the site
+                    // cache (a distinct bytecode offset from any GET_GLOBAL, so the
+                    // offset-keyed `global_caches` disambiguates GET vs SET sites). A
+                    // `struct_gen` hit writes by the stable index (one `get_index_mut`,
+                    // no string hash). On a miss, fall through to the name-keyed path
+                    // AND record the index for next time.
                     let v = fiber.peek(0).clone();
+                    let cache = fiber.frame().closure.proto.chunk.global_cache(fault_ip);
+                    if self.specialize {
+                        if let Some(idx) = cache.get_index(self.struct_gen()) {
+                            match self.set_user_global_at(idx, v.clone()) {
+                                Some(true) => continue,
+                                Some(false) => {
+                                    return Err(self.panic_at(
+                                        fiber,
+                                        fault_ip,
+                                        format!("cannot assign to immutable binding '{name}'"),
+                                    ));
+                                }
+                                // Out-of-range cached index (impossible while the
+                                // struct_gen matches, since user-globals are never
+                                // removed) — defensively fall through to re-resolve.
+                                None => {}
+                            }
+                        }
+                    }
                     match self.user_global_mutable(name.as_ref()) {
-                        Some(true) => self.update_user_global(&name, v),
+                        Some(true) => {
+                            self.update_user_global(&name, v);
+                            if self.specialize {
+                                if let Some((idx, _)) = self.get_user_global_full(name.as_ref()) {
+                                    fiber.frame().closure.proto.chunk.set_global_cache(
+                                        fault_ip,
+                                        crate::vm::adapt::GlobalCache::index_bound(
+                                            idx,
+                                            self.struct_gen(),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                         Some(false) => {
                             return Err(self.panic_at(
                                 fiber,
@@ -1671,34 +1736,48 @@ impl Vm {
                 }
 
                 Op::Closure => {
-                    // Build a closure over a nested proto, capturing its upvalues
-                    // BY REFERENCE per the proto's capture plan
-                    // (`proto.chunk.upvalues`, indexed by upvalue number):
-                    //   - ParentLocal(slot): clone the CURRENT frame's cell for that
-                    //     slot. The resolver guarantees a captured local is a cell
-                    //     slot, so `cells[slot]` is `Some`; a `None` is a
-                    //     compiler/resolver bug (clear panic).
-                    //   - ParentUpvalue(idx): clone the CURRENT closure's upvalue
-                    //     cell (a transitive capture from an outer frame).
-                    // Capturing the cell `Rc` (not its value) is what makes capture
-                    // by-reference: the closure sees later mutation of the cell.
+                    // Build a closure over a nested proto, capturing its upvalues per
+                    // the proto's capture plan (`proto.chunk.upvalues`, indexed by
+                    // upvalue number):
+                    //   - ParentLocal { slot, by_value: false }: BY REFERENCE — clone
+                    //     the CURRENT frame's cell `Cc` for that slot, so the closure
+                    //     sees later mutation. The resolver guarantees a `mutated`
+                    //     captured local is a cell slot, so `cells[slot]` is `Some`; a
+                    //     `None` is a compiler/resolver bug (clear panic).
+                    //   - ParentLocal { slot, by_value: true } (SP8 #136): BY VALUE —
+                    //     the source binding is never reassigned, so its slot is a PLAIN
+                    //     stack local (no cell in the declaring frame). Copy the slot's
+                    //     value into a FRESH private cell owned solely by this closure.
+                    //     Per-iteration loop freshness is automatic: each iteration's
+                    //     Op::Closure copies that iteration's slot value. Byte-identical
+                    //     to a shared cell (the value can never change after capture).
+                    //   - ParentUpvalue(idx): clone the CURRENT closure's upvalue cell
+                    //     (a transitive capture; keeps the source's representation).
                     let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
                     let proto = fiber.frame().closure.proto.chunk.protos[idx].clone();
                     let mut upvalues = Vec::with_capacity(proto.chunk.upvalues.len());
                     for desc in &proto.chunk.upvalues {
                         let cell = match *desc {
-                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal(slot) => {
-                                fiber
-                                    .frame()
-                                    .cells
-                                    .get(slot as usize)
-                                    .and_then(|c| c.as_ref())
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "CLOSURE captures parent local slot {slot} that is not a cell (compiler/resolver bug)"
-                                        )
-                                    })
-                                    .clone()
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal {
+                                slot,
+                                by_value: false,
+                            } => fiber
+                                .frame()
+                                .cells
+                                .get(slot as usize)
+                                .and_then(|c| c.as_ref())
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "CLOSURE captures parent local slot {slot} that is not a cell (compiler/resolver bug)"
+                                    )
+                                })
+                                .clone(),
+                            crate::syntax::resolve::types::UpvalueDescriptor::ParentLocal {
+                                slot,
+                                by_value: true,
+                            } => {
+                                let v = fiber.local(slot as usize).clone();
+                                gcmodule::Cc::new(std::cell::RefCell::new(v))
                             }
                             crate::syntax::resolve::types::UpvalueDescriptor::ParentUpvalue(up) => {
                                 fiber.frame().closure.upvalues[up as usize].clone()
@@ -3226,13 +3305,54 @@ impl Vm {
             .set(self.global_version.get().saturating_add(1));
     }
 
-    /// Read a module-scope user-global by name. Returns the stored `Value` (cloned)
-    /// or `None` if not yet defined.
-    fn get_user_global(&self, name: &str) -> Option<Value> {
+    /// The current STRUCTURAL generation (SP8). Bumped ONLY on a user-global DEFINE
+    /// (insertion), never on a reassignment. The SP8 `IndexBound` global cache guards
+    /// its stable `IndexMap` index with this generation.
+    fn struct_gen(&self) -> u64 {
+        self.struct_gen.get()
+    }
+
+    /// Resolve a module-scope user-global by name, returning BOTH its stable
+    /// `IndexMap` index and its (cloned) `Value`, or `None` if not yet defined (SP8).
+    /// The index is stable for the `Vm`'s life (user-globals are only ever inserted),
+    /// so the `GET_GLOBAL` site can cache it as `GlobalCache::IndexBound`.
+    fn get_user_global_full(&self, name: &str) -> Option<(usize, Value)> {
         self.user_globals
             .borrow()
-            .get(name)
-            .map(|s| s.value.clone())
+            .get_full(name)
+            .map(|(idx, _k, s)| (idx, s.value.clone()))
+    }
+
+    /// Read a user-global's (cloned) `Value` by its stable index (SP8 fast path).
+    /// The caller has a live `IndexBound` cache entry, so the index is in range.
+    fn user_global_value_at(&self, idx: usize) -> Value {
+        self.user_globals
+            .borrow()
+            .get_index(idx)
+            .map(|(_k, s)| s.value.clone())
+            .expect("IndexBound cache holds an in-range user-global index")
+    }
+
+    /// Update a user-global's value IN PLACE by its stable index, returning its
+    /// `mutable` flag for the SET mutability check (`Some(true)` → updated;
+    /// `Some(false)` → immutable, caller errors; `None` → index out of range, caller
+    /// re-resolves). Keeps the class `def_env` in sync (the same invariant as
+    /// `update_user_global`). Does NOT bump any generation (a SET is not a define).
+    fn set_user_global_at(&self, idx: usize, value: Value) -> Option<bool> {
+        let (mutable, name) = {
+            let map = self.user_globals.borrow();
+            let (name, slot) = map.get_index(idx)?;
+            (slot.mutable, name.clone())
+        };
+        if mutable {
+            if let Some((_k, slot)) = self.user_globals.borrow_mut().get_index_mut(idx) {
+                slot.value = value.clone();
+            }
+            if let Some(env) = self.class_env.borrow().as_ref() {
+                let _ = env.assign(&name, value);
+            }
+        }
+        Some(mutable)
     }
 
     /// Whether a module-scope user-global named `name` exists and is REASSIGNABLE.
@@ -3243,9 +3363,11 @@ impl Vm {
     }
 
     /// Update an EXISTING module-scope user-global's value (preserving its mutability
-    /// flag) WITHOUT bumping the global version (a value update cannot invalidate any
-    /// cache — user-global reads are never cached, and builtin caches key on the
-    /// NAME's resolution target, which an in-place value update does not change).
+    /// flag) WITHOUT bumping the global version OR `struct_gen` (a value update cannot
+    /// invalidate any cache — the SP8 user-global cache stores the STABLE INDEX, which
+    /// an in-place value update does not move, and builtin caches key on the NAME's
+    /// resolution target, which a value update does not change). This is exactly why a
+    /// hot reassigned top-level `let` loop keeps the index cache hot every iteration.
     /// Keeps the class `def_env` in sync for `.from`/typed-parse default resolution.
     /// Caller has confirmed the key exists AND is mutable.
     fn update_user_global(&self, name: &str, value: Value) {
@@ -3269,6 +3391,12 @@ impl Vm {
             },
         );
         self.bump_global_version();
+        // SP8: a DEFINE (insertion) is the ONLY event that can change which stable
+        // index a name maps to (a new entry) or introduce a shadow, so it invalidates
+        // every `IndexBound` cache. A plain reassignment (`update_user_global`) does
+        // NOT bump this — that is the whole point (a hot reassigned-`let` loop keeps
+        // the index cache hot). Saturating for an extremely long-lived `Vm`.
+        self.struct_gen.set(self.struct_gen.get().saturating_add(1));
         // Keep the lazily-built class `def_env` (used by the SHARED `validate_into`
         // for `.from`/typed-parse field-default resolution) in sync, so a default
         // that references this top-level binding resolves on the `.from` path too.

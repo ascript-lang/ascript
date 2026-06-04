@@ -77,6 +77,53 @@
 //!       >= 2× target. They still pass the no-regression check (spec/gen >= 1.0×)
 //!       and even beat the tree-walker (1.2-1.3× spec/tw).
 //! ───────────────────────────────────────────────────────────────────────────────
+//! GATE RESULT — PASS (recorded SP8 Phase A, 2026-06-04, release; same machine as the
+//! SP8 A0 baseline). The SP8 index-stable global-access cache (`GlobalCache::IndexBound`
+//! guarded by `struct_gen`, which bumps only on DEFINE, never on a reassigning
+//! SET_GLOBAL) recovers the user-global regression. Both gate conditions held.
+//!
+//!   benchmark                  kind     spec/tw   spec/gen   (A0 baseline spec/tw)
+//!   fib(30) recursion          compute    4.88x     1.03x     (4.88x)
+//!   sum recursion (500 x2000)  compute    5.83x     1.11x     (5.34x → recovered)
+//!   numeric loop (1e6)         compute    2.82x     1.21x     (2.96x; index-dominated)
+//!   while loop (1e6)           compute    4.43x     1.49x     (3.23x → recovered)
+//!   property r/w (1e6)         compute    2.96x     1.56x     (3.09x)
+//!   method dispatch (1e6)      compute    2.85x     1.79x     (2.69x)
+//!   string concat (50000)      alloc      1.25x     1.00x     (EXEMPT; allocator noise)
+//!   template build (50000)     alloc      1.16x     0.99x     (EXEMPT)
+//!   geomean spec/tw = 2.82x   (A0 baseline 2.73x → 2.82x)
+//!
+//!   The regression-target globals recovered most: `while loop` 3.23x → 4.43x (both
+//!   `i` and `sum` are reassigned globals read+written twice/iter — the index cache
+//!   hits every iteration), `sum recursion` 5.34x → 5.83x (back to the V11-T6 figure).
+//!   `numeric loop`/`property r/w` are dominated by the frame-LOCAL for-range index,
+//!   not the global, so they moved little (within run-to-run noise). NO spec-vs-generic
+//!   regression (the alloc benches hover at ~1.0x spec/gen with allocator jitter).
+//! ───────────────────────────────────────────────────────────────────────────────
+//! GATE RESULT — PASS (recorded SP8 final / Phase B+C, 2026-06-04, release; same
+//! machine). Phase B added #136 capture-by-value upvalues (never-reassigned captures
+//! copied into a fresh private cell at Op::Closure; the declaring frame keeps a plain
+//! stack local — no cell alloc, no per-access RefCell borrow) + the `closure capture`
+//! bench. Both gate conditions held; geomean recovered toward the V11-T6 2.92x.
+//!
+//!   benchmark                  kind     spec/tw   spec/gen
+//!   fib(30) recursion          compute    4.97x     1.02x
+//!   sum recursion (500 x2000)  compute    5.79x     1.10x
+//!   numeric loop (1e6)         compute    2.87x     1.23x
+//!   while loop (1e6)           compute    3.32x     1.42x
+//!   property r/w (1e6)         compute    3.00x     1.57x
+//!   method dispatch (1e6)      compute    2.90x     1.87x
+//!   string concat (50000)      alloc      1.25x     1.05x   (EXEMPT from >= 2x)
+//!   template build (50000)     alloc      1.09x     0.99x   (EXEMPT)
+//!   closure capture (1e6)      compute    4.26x     1.13x   (NEW — SP8 #136)
+//!   geomean spec/tw = 2.88x   (A0 baseline 2.73x → 2.88x; V11-T6 was 2.92x)
+//!
+//!   (a) COMPUTE-BOUND >= 2x spec/tw: PASS (all 7 compute benches, min 2.87x).
+//!   (b) NO spec-vs-generic regression: PASS (every bench; alloc benches at ~1.0x
+//!       spec/gen with allocator jitter).
+//!   (c) The new `closure capture` bench (a closure capturing a never-reassigned `k`
+//!       each iteration — by-value eligible) lands at 4.26x spec/tw, 1.13x spec/gen.
+//! ───────────────────────────────────────────────────────────────────────────────
 
 use std::time::{Duration, Instant};
 
@@ -244,6 +291,27 @@ print(len(s))
 let s = ""
 for (i in 0..50000) { s = `${s}y` }
 print(len(s))
+"#,
+        },
+        // ── closure capture (SP8 #136 capture-by-value) ──────────────────────
+        // Each iteration builds a closure capturing a NEVER-reassigned local `k`.
+        // Under SP8 #136 `k` is captured BY VALUE: no cell allocation in `make`'s
+        // declaring frame and a plain GET_LOCAL (no RefCell borrow), vs the old
+        // per-iteration cell allocation + borrow.
+        Bench {
+            name: "closure capture (1e6)",
+            compute_bound: true,
+            src: r#"
+fn make(base) {
+  let k = base + 1
+  return () => k
+}
+let total = 0
+for (i in 0..1000000) {
+  let f = make(i)
+  total = total + f()
+}
+print(total)
 "#,
         },
     ]

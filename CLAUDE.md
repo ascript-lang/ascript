@@ -366,10 +366,15 @@ eager pre-pass) and a top-level reassignment to `Op::SetGlobal`; reads are the e
 `global_version: Cell<u64>`. `GET_GLOBAL` consults `user_globals` FIRST, then `BUILTIN_NAMES` (so a user
 name shadows a builtin), else `undefined variable '<n>'`. This closes the forward-reference divergence
 (a fn/thunk/field-default referencing a top-level binding declared LATER late-binds at run time, matching
-the tree-walker); use-before-init stays a SYMMETRIC error on both engines. The `GET_GLOBAL` inline cache
-records ONLY immutable builtins — a user-global read is an uncached IndexMap lookup and `SET_GLOBAL`
-updates in place WITHOUT bumping the version (so a hot reassigned-top-level-`let` loop does not thrash the
-cache; `DefineGlobal`, which can shadow a builtin, DOES bump). `.from`/typed-parse field defaults resolve
+the tree-walker); use-before-init stays a SYMMETRIC error on both engines. **Global-access fast path
+(SP8 §1):** the immutable-builtin `Cached`/version path is unchanged, AND a user-global read/write now
+warms to a `GlobalCache::IndexBound { idx, struct_gen }` — the global's STABLE `IndexMap` index (an
+inserted global is never removed, so its index is fixed) guarded by a NEW `struct_gen: Cell<u64>` that
+bumps ONLY on `DefineGlobal` (insertion/shadow), NEVER on `SetGlobal` (reassignment). So a hot
+reassigned-top-level-`let` loop hits the index cache every iteration with no thrash; `SET_GLOBAL` still
+updates in place without bumping `global_version` OR `struct_gen`. Gated on `self.specialize`
+(kill-switch/three-way parity); byte-identical (the index resolves to the same slot the name would).
+`.from`/typed-parse field defaults resolve
 through the lazily-built `class_env` (`def_env`), which is seeded from `user_globals` and kept in sync by
 `define_user_global`/`update_user_global`. The checker treats an `is_global` binding name as defined
 (`undefined-variable` exempt) and as a file-declared callee (`dropped_local_call`/contract rules).
@@ -377,6 +382,19 @@ through the lazily-built `class_env` (`def_env`), which is seeded from `user_glo
 `user_globals`. This is also the REPL's cross-line persistence (one `Vm` kept alive). `.aso`
 `ASO_FORMAT_VERSION` bumped 3→4 (new opcode + ImportDesc layout). The whole-corpus three-way differential
 stays byte-identical.
+
+**Capture-by-value upvalues (SP8 §2 / #136).** The resolver narrows `FrameInfo.cell_slots` to
+`captured && mutated` and adds `value_capture_slots = captured && !mutated`;
+`UpvalueDescriptor::ParentLocal { slot, by_value }` carries the eligibility bit. CRITICAL ORDERING: the
+`by_value` decision depends on the source binding's FINAL `mutated` flag (an assignment textually AFTER the
+capture, once the capturing child frame has popped, still counts), so it is resolved in a post-resolution
+pass `finalize_capture_by_value` — NOT at capture time. A by-value slot is excluded from the compiler's
+`cur_cells`, so it emits plain `GET_LOCAL`/`SET_LOCAL` and no `FreshCell`; `Op::Closure` copies the plain
+slot value into a FRESH private `Cc<RefCell<Value>>` (recommended approach (a): no `value.rs`/`Closure`
+shape change). Per-iteration loop freshness is automatic (each iteration copies its own value). A reassigned
+capture keeps the V5 shared-cell by-reference path. Byte-identical (a never-reassigned binding's value is
+the same copied or shared). `.aso` `ASO_FORMAT_VERSION` bumped 14→15 (`ParentLocal` gained a trailing
+`by_value` u8). The whole-corpus three-way differential stays byte-identical.
 
 **Redeclaration + const immutability (WS1 follow-ups, both RUNTIME-timed).** The tree-walker enforces
 both via `Environment::define`/`assign` at RUNTIME — so a redeclaration / const-reassignment in
