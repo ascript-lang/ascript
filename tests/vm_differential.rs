@@ -5363,6 +5363,43 @@ async fn three_way_smoke_basic_constructs() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  SP1 Phase B — generator methods (`fn*` / `async fn*`) in classes.
+//
+//  A `fn*`/`async fn*` method dispatched as `c.g(args)` returns a generator bound
+//  to the instance `self`, behaving exactly like a standalone generator (yield /
+//  .next() / for await / close) with method dispatch + arity/contracts + inherit/
+//  override. Both engines gain the feature in lockstep — byte-identical.
+// ─────────────────────────────────────────────────────────────────────────────
+#[tokio::test]
+async fn three_way_generator_methods() {
+    let progs: &[&str] = &[
+        // Basic fn* method consumed via `for await`.
+        "class C { fn* g() { yield 1\n yield 2\n yield 3 } }\nlet c = C()\nfor await (v in c.g()) { print(v) }\n",
+        // fn* method using `self` (set in init), consumed via `.next()`.
+        "class C { fn init() { self.n = 10 }\n fn* g() { yield self.n\n yield self.n + 1 } }\n\
+         let c = C()\nlet it = c.g()\nprint(it.next())\nprint(it.next())\n",
+        // async fn* method (yield + await), consumed via `for await`.
+        "class C { async fn* g() { yield 1\n let x = await 2\n yield x } }\n\
+         let c = C()\nfor await (v in c.g()) { print(v) }\n",
+        // Inheritance / override: subclass overrides a fn* method.
+        "class A { fn* g() { yield 1 } }\nclass B extends A { fn* g() { yield 2\n yield 3 } }\n\
+         for await (v in B().g()) { print(v) }\n",
+        // Inheritance WITHOUT override: subclass inherits the parent's fn* method.
+        "class A { fn* g() { yield 7\n yield 8 } }\nclass B extends A {}\n\
+         for await (v in B().g()) { print(v) }\n",
+        // Generator method with args + self interacting.
+        "class C { fn init() { self.base = 100 }\n fn* g(a, b) { yield self.base + a\n yield self.base + b } }\n\
+         let c = C()\nfor await (v in c.g(1, 2)) { print(v) }\n",
+        // .close() on a generator method handle.
+        "class C { fn* g() { yield 1\n yield 2\n yield 3 } }\nlet c = C()\nlet it = c.g()\n\
+         print(it.next())\nit.close()\nprint(\"closed\")\n",
+    ];
+    for src in progs {
+        assert_three_way_matches(src).await;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  V12-T3: bytecode verifier — every chunk the compiler emits must VERIFY OK.
 //
 //  The verifier (`ascript::vm::verify`) is the load-time guard for `.aso`: it walks
