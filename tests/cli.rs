@@ -2072,3 +2072,122 @@ fn check_unresolved_import_lint_and_allow_suppression() {
 
     let _ = std::fs::remove_file(&file);
 }
+
+#[test]
+fn check_fix_removes_unused_import_and_exits_zero() {
+    // `--fix` removes an unused import in place and (since that was the only
+    // issue) exits 0; the rest of the file is intact.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_fix_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("f.as");
+    std::fs::write(&file, "import { abs } from \"std/math\"\nprint(1)\n").unwrap();
+
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--fix")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "expected exit 0, got {:?}", out.status);
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(after, "print(1)\n", "file after --fix: {after:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_fix_multi_name_import_keeps_used_clause() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_fix_multi_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("g.as");
+    std::fs::write(&file, "import { abs, max } from \"std/math\"\nprint(max(1, 2))\n").unwrap();
+
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--fix")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let after = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        after, "import { max } from \"std/math\"\nprint(max(1, 2))\n",
+        "file after --fix: {after:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_fix_dry_run_prints_diff_and_leaves_file_unchanged() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_fix_dry_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("h.as");
+    let original = "import { abs } from \"std/math\"\nprint(1)\n";
+    std::fs::write(&file, original).unwrap();
+
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--fix-dry-run")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--- a/"), "expected a diff header, got:\n{stdout}");
+    assert!(
+        stdout.lines().any(|l| l.starts_with('-') && l.contains("import")),
+        "expected a removed import line in the diff, got:\n{stdout}"
+    );
+    // The file is byte-identical (dry-run never writes).
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_fix_is_idempotent() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_fix_idem_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("i.as");
+    std::fs::write(&file, "import { abs } from \"std/math\"\nprint(1)\n").unwrap();
+
+    let run = || {
+        Command::new(bin)
+            .arg("check")
+            .arg("--fix")
+            .arg(&file)
+            .output()
+            .unwrap();
+    };
+    run();
+    let after_one = std::fs::read_to_string(&file).unwrap();
+    run();
+    let after_two = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(after_one, after_two, "second --fix changed the file");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_fix_and_fix_dry_run_together_is_usage_error() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let dir = std::env::temp_dir().join(format!("ascript_fix_both_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("j.as");
+    std::fs::write(&file, "print(1)\n").unwrap();
+
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--fix")
+        .arg("--fix-dry-run")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "expected usage exit 2");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
