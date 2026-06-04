@@ -5555,6 +5555,155 @@ async fn three_way_forbidden_init() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  SP1 Phase F — parser-accepts-runs invariant gate.
+//
+//  THE closing invariant of SP1: every grammar-accepted construct that SP1 touched
+//  must RUN on the VM (no "parser accepts but engine rejects valid code" hole) and
+//  be byte-identical to the tree-walker oracle. The front-end audit (spec §5) found
+//  exactly two such holes — `a?.m()` optional calls and `fn*` generator methods —
+//  and §§1–3 closed them; statics and the richer field-default forms widened the
+//  accepted surface further. This curated set re-asserts that the whole surface
+//  RUNS, so a future change that re-introduces a rejection trips this gate.
+//
+//  The ONLY legitimate compile-time rejections remaining are genuine, SYMMETRIC
+//  errors — the engines reject them identically because they are real errors, not
+//  engine gaps. They are listed (and asserted symmetric) in
+//  `vm_parser_accepts_runs_legitimate_rejections` below:
+//    • `async fn init` / `fn* init` — a constructor cannot be async/generator.
+//    • `static fn from`              — `from` is a reserved class member.
+//    • `yield` field default         — `yield` is never valid outside a generator.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every grammar-accepted construct SP1 touched, as a runnable program. Each MUST
+/// run (no compile rejection) on BOTH VM modes and be byte-identical to the
+/// tree-walker — that is the parser-accepts-runs invariant.
+const PARSER_ACCEPTS_RUNS_PROGRAMS: &[&str] = &[
+    // ── §1 optional method calls `a?.m()` + chains ──────────────────────────────
+    // nil receiver short-circuits; the arg's side effect must NOT run.
+    "fn se() { print(\"ARG\")\n return 1 }\nlet a = nil\nprint(a?.m(se()))\n",
+    // non-nil receiver → ordinary bound method call.
+    "class C { fn m(x) { return x + 1 } }\nlet c = C()\nprint(c?.m(10))\n",
+    // a whole postfix chain short-circuits when the receiver is nil.
+    "let a = nil\nprint(a?.m().n().o)\n",
+    // mixed optional member + optional call in one chain.
+    "class C { fn m() { return 5 } }\nlet c = C()\nprint(c?.m())\nlet a = nil\nprint(a?.b?.m())\n",
+    // optional call with multiple args on a live receiver.
+    "class C { fn add(a, b) { return a + b } }\nlet c = C()\nprint(c?.add(3, 4))\n",
+
+    // ── §2 generator methods `fn*` / `async fn*` ───────────────────────────────
+    // basic fn* method consumed via for-await.
+    "class C { fn* g() { yield 1\n yield 2 } }\nfor await (v in C().g()) { print(v) }\n",
+    // fn* method using `self`, consumed via .next().
+    "class C { fn init() { self.n = 10 }\n fn* g() { yield self.n\n yield self.n + 1 } }\n\
+     let it = C().g()\nprint(it.next())\nprint(it.next())\n",
+    // async fn* method (yield + await).
+    "class C { async fn* g() { yield 1\n let x = await 2\n yield x } }\nfor await (v in C().g()) { print(v) }\n",
+    // inherited (no override) fn* method.
+    "class A { fn* g() { yield 7\n yield 8 } }\nclass B extends A {}\nfor await (v in B().g()) { print(v) }\n",
+
+    // ── §3 static methods (sync / async / fn* / inherited / C.name()) ───────────
+    // sync static factory called as C.make().
+    "class C { fn init() { self.x = 1 } static fn make() { return C() } }\nprint(C.make().x)\n",
+    // static async factory awaited → instance.
+    "class C { fn init() { self.x = 0 } static async fn create() { let c = C()\n c.x = await 5\n return c } }\nprint((await C.create()).x)\n",
+    // static fn* generator consumed via for-await.
+    "class C { static fn* seq() { yield 1\n yield 2 } }\nfor await (v in C.seq()) { print(v) }\n",
+    // inherited static resolved up the superclass chain.
+    "class A { static fn who() { return \"A\" } }\nclass B extends A {}\nprint(B.who())\n",
+    // instance + static of the SAME name coexist (separate namespaces).
+    "class C { fn init() { self.v = 9 } fn x() { return self.v } static fn x() { return 42 } }\nlet c = C()\nprint(c.x())\nprint(C.x())\n",
+
+    // ── §4 richer field-default forms (computed / arrow / match) ────────────────
+    // computed (binary) field default via C() and C.from({}).
+    "class C { x: number = 10 + 5 }\nprint(C().x)\nprint(C.from({}).x)\n",
+    // arrow field default — the value is the arrow itself, called to verify.
+    "class C { f: fn = (a, b) => a + b }\nprint(C().f(2, 3))\n",
+    // match field default.
+    "let n = 2\nclass C { label: string = match n { 1 => \"one\", 2 => \"two\", _ => \"many\" } }\nprint(C().label)\n",
+    // inclusive-range (`..=`) field default — a valid range expression, NOT a hole.
+    "class C { r: any = 1..=3 }\nprint(C().r)\n",
+    // stepped inclusive-range field default.
+    "class C { r: any = 1..=10 step 2 }\nprint(C().r)\n",
+];
+
+/// F1 — the parser-accepts-runs invariant: every grammar-accepted construct SP1
+/// touched RUNS on both VM modes and is byte-identical to the tree-walker. A new
+/// "parser accepts but engine rejects valid code" hole trips this gate.
+#[tokio::test]
+async fn vm_parser_accepts_runs() {
+    for src in PARSER_ACCEPTS_RUNS_PROGRAMS {
+        // Each program must run to a value on the tree-walker AND both VM modes —
+        // i.e. NONE of them is a compile rejection. (A genuine runtime outcome is
+        // fine; a compile-time "not supported" rejection on only one engine is the
+        // hole this gate forbids.)
+        let tw = ascript::run_source_exit(src).await;
+        assert!(
+            tw.is_ok(),
+            "tree-walker rejected a parser-accepted program (should RUN):\n  src: {src:?}\n  err: {tw:?}"
+        );
+        let spec = ascript::vm_run_source(src).await;
+        assert!(
+            spec.is_ok(),
+            "specialized VM rejected a parser-accepted program (parser-accepts-runs hole):\n  \
+             src: {src:?}\n  err: {spec:?}"
+        );
+        let generic = ascript::vm_run_source_generic(src).await;
+        assert!(
+            generic.is_ok(),
+            "generic VM rejected a parser-accepted program (parser-accepts-runs hole):\n  \
+             src: {src:?}\n  err: {generic:?}"
+        );
+        // …and all three agree byte-for-byte.
+        assert_three_way_matches(src).await;
+    }
+}
+
+/// F1 (companion) — the ONLY legitimate compile-time rejections after SP1 are
+/// genuine, SYMMETRIC errors: every engine rejects them, with byte-identical
+/// outcomes. This pins down that the remaining rejections are real errors (not
+/// engine gaps) so the invariant above stays meaningful.
+#[tokio::test]
+async fn vm_parser_accepts_runs_legitimate_rejections() {
+    // These reject byte-identically (same message + exit) on all three engines —
+    // a structural compile/resolve error knowable before execution.
+    let symmetric_message_rejections: &[&str] = &[
+        // async constructor — there is no caller to await it.
+        "class C { async fn init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+        // generator constructor — makes no sense.
+        "class C { fn* init() { self.x = 1 } }\nlet c = C()\nprint(c.x)\n",
+        // `from` is a reserved class member (the built-in validator).
+        "class C { static fn from() { return 1 } }\nprint(C.from())\n",
+    ];
+    for src in symmetric_message_rejections {
+        // Every engine must REJECT (these are real errors, not engine gaps)…
+        let tw = ascript::run_source_exit(src).await;
+        assert!(
+            tw.is_err(),
+            "expected the tree-walker to reject a genuine error, but it ran:\n  src: {src:?}\n  ok: {tw:?}"
+        );
+        // …and reject byte-identically across all three engines.
+        assert_three_way_matches(src).await;
+    }
+
+    // `yield` as a field default is rejected by every engine, but the VM rejects it
+    // at COMPILE time (`cst_default_expr`) and the tree-walker at default-EVAL time,
+    // so the message/timing legitimately differ (documented in
+    // `vm_field_default_yield_rejected_symmetrically`). Assert symmetry-of-rejection
+    // (all three `Err`), not byte-identical text.
+    for default in ["yield 1", "yield"] {
+        let src = format!("class C {{ y: any = {default}\n  fn init() {{}} }}\nprint(C().y)\n");
+        let tw = ascript::run_source(&src).await;
+        let spec = ascript::vm_run_source(&src).await;
+        let generic = ascript::vm_run_source_generic(&src).await;
+        assert!(
+            tw.is_err() && spec.is_err() && generic.is_err(),
+            "expected ALL engines to reject the `{default}` field default\n  \
+             tree-walker: {tw:?}\n  spec: {spec:?}\n  generic: {generic:?}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  V12-T3: bytecode verifier — every chunk the compiler emits must VERIFY OK.
 //
 //  The verifier (`ascript::vm::verify`) is the load-time guard for `.aso`: it walks
