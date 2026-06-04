@@ -7,6 +7,7 @@ use crate::syntax::resolve::types::{Resolution, ResolveResult};
 pub mod call_arity;
 pub mod contract;
 pub mod dead_recover;
+pub mod duplicate_member;
 pub mod ignored_result;
 pub mod invalid_propagate;
 pub mod missing_return;
@@ -14,6 +15,7 @@ pub mod range_step;
 pub mod shadowing;
 pub mod unawaited;
 pub mod undefined;
+pub mod unknown_enum_variant;
 pub mod unreachable;
 pub mod unresolved_import;
 pub mod unused;
@@ -35,6 +37,8 @@ pub static ALL: &[Rule] = &[
     range_step::check,
     invalid_propagate::check,
     unresolved_import::check,
+    unknown_enum_variant::check,
+    duplicate_member::check,
 ];
 
 /// The `CallExpr` directly dropped by an `ExprStmt` (result unused). `None` if the

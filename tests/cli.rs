@@ -1781,6 +1781,96 @@ fn check_call_arity_lint_and_allow_suppression() {
 }
 
 #[test]
+fn check_unknown_enum_variant_lint_and_allow_suppression() {
+    // The `unknown-enum-variant` static lint flags access of a non-existent variant
+    // on a statically-known enum, mirroring the runtime `enum E has no variant 'V'`
+    // panic. Configurable: `--allow unknown-enum-variant` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_unknown_enum_variant_{}.as", std::process::id()));
+    std::fs::write(&file, "enum Color { Red, Green }\nprint(Color.Reddd)\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"unknown-enum-variant\""),
+        "expected an unknown-enum-variant diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("enum Color has no variant 'Reddd'"),
+        "expected the runtime-matching message, got:\n{stdout}"
+    );
+
+    // `--allow unknown-enum-variant` suppresses it.
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("unknown-enum-variant")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"unknown-enum-variant\""),
+        "--allow unknown-enum-variant should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn check_duplicate_member_lint_and_allow_suppression() {
+    // The `duplicate-member` static lint flags two members with the same name in
+    // one class body (a silent shadow at runtime). Configurable: `--allow
+    // duplicate-member` suppresses it.
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let file = std::env::temp_dir()
+        .join(format!("ascript_duplicate_member_{}.as", std::process::id()));
+    std::fs::write(&file, "class C {\n  x: number\n  x: string\n}\n").unwrap();
+
+    // Default: the diagnostic appears (JSON output for a robust assertion).
+    let out = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"code\":\"duplicate-member\""),
+        "expected a duplicate-member diagnostic, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("duplicate member 'x' in class C"),
+        "expected the descriptive message, got:\n{stdout}"
+    );
+
+    // `--allow duplicate-member` suppresses it.
+    let allowed = Command::new(bin)
+        .arg("check")
+        .arg("--json")
+        .arg("--allow")
+        .arg("duplicate-member")
+        .arg(&file)
+        .output()
+        .unwrap();
+    let allowed_out = String::from_utf8_lossy(&allowed.stdout);
+    assert!(
+        !allowed_out.contains("\"code\":\"duplicate-member\""),
+        "--allow duplicate-member should suppress the diagnostic, got:\n{allowed_out}"
+    );
+
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
 fn check_invalid_propagate_lint_and_allow_suppression() {
     // The `invalid-propagate` static lint flags a postfix `?` inside a function
     // whose declared return type is not a `Result`. Configurable: `--allow

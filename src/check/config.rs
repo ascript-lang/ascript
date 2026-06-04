@@ -40,6 +40,8 @@ pub const RULE_CODES: &[&str] = &[
     "range-step",
     "invalid-propagate",
     "unresolved-import",
+    "unknown-enum-variant",
+    "duplicate-member",
 ];
 
 /// Per-code severity overrides plus global warning promotion.
