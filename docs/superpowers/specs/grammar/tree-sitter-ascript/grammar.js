@@ -248,6 +248,7 @@ module.exports = grammar({
       optional(seq('=', field('default', $._expression))),
     ),
     method_definition: $ => seq(
+      optional($.static_keyword),  // `static fn` / `static async fn` / `static fn*` (SP1 §3)
       optional('async'),
       'fn',
       optional('*'),  // `fn*` generator method (§7, M17)
@@ -373,6 +374,16 @@ module.exports = grammar({
     // NOT promote `step` into the reserved word set — it stays a normal identifier
     // everywhere except immediately after a range's end bound.
     step_keyword: _ => 'step',
+    // The contextual `static` soft-keyword (SP1 §3): the class-member modifier on
+    // `fn` / `async fn` / `fn*`. `static` is NOT in the global reserved set, so it
+    // stays an ordinary identifier in every NON-class-member position (`let static`,
+    // `fn static`, `static(x)`, member access). The one tree-sitter-only limitation
+    // (no external scanner): a class FIELD literally named `static` (`static: T`)
+    // is not accepted by this grammar because at class-member start the lexer
+    // commits to the `static` keyword token; the hand-written CST/legacy parsers
+    // (which use a token of lookahead) do accept it. No corpus/example program
+    // names a field `static`, so the three parsers agree on all real code.
+    static_keyword: _ => 'static',
 
     unary_expression: $ => prec.right(PREC.unary, seq(
       field('operator', choice('!', '-')),

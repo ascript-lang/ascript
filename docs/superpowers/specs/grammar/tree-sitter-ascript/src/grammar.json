@@ -1133,6 +1133,18 @@
           "type": "CHOICE",
           "members": [
             {
+              "type": "SYMBOL",
+              "name": "static_keyword"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
               "type": "STRING",
               "value": "async"
             },
@@ -2259,6 +2271,10 @@
     "step_keyword": {
       "type": "STRING",
       "value": "step"
+    },
+    "static_keyword": {
+      "type": "STRING",
+      "value": "static"
     },
     "unary_expression": {
       "type": "PREC_RIGHT",

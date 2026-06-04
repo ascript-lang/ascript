@@ -3353,6 +3353,16 @@
           }
         ]
       }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "static_keyword",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -6156,6 +6166,10 @@
   {
     "type": "return",
     "named": false
+  },
+  {
+    "type": "static_keyword",
+    "named": true
   },
   {
     "type": "step_keyword",

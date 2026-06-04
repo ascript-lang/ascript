@@ -68,6 +68,27 @@ fn cst_keeps_step_as_a_plain_identifier() {
     cst_accepts("step(3)");
 }
 
+/// `static` is a member modifier on `fn` / `async fn` / `fn*` inside a class
+/// body — both front-ends must accept it (SP1 Phase C).
+#[test]
+fn both_frontends_accept_static_methods() {
+    both_accept("class C { static fn make() { return C() } }");
+    both_accept("class C { static async fn create() { return C() } }");
+    both_accept("class C { static fn* gen() { yield 1 } }");
+    both_accept("class C { fn m() { return 1 }\n static fn s() { return 2 } }");
+}
+
+/// `static` is a CONTEXTUAL/soft keyword — it must remain usable as an ordinary
+/// identifier where unambiguous (variable, fn name, member, field name).
+#[test]
+fn cst_keeps_static_as_a_plain_identifier() {
+    cst_accepts("let static = 1");
+    cst_accepts("fn static(n) { n }");
+    cst_accepts("let x = static + 1");
+    cst_accepts("static(3)");
+    cst_accepts("class C { static: number = 0 }");
+}
+
 #[test]
 fn interpreter_parses_each_grammar_construct() {
     let snippets = [

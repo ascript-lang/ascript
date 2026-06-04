@@ -331,6 +331,9 @@ pub struct MethodDecl {
     pub body: Vec<Stmt>,
     pub is_async: bool,
     pub is_generator: bool,
+    /// `static fn` / `static async fn` / `static fn*` — a class-level method with
+    /// no `self`, called as `C.name(args)` (SP1 Phase C).
+    pub is_static: bool,
     /// Span of the method (for LSP symbol range).
     pub span: Span,
     /// Span of just the method name (for LSP selection range).

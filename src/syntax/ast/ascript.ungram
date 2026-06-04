@@ -53,7 +53,7 @@ EnumDecl = 'enum' 'ident' '{' EnumVariant* '}'
 EnumVariant = 'ident' ('=' Expr)?
 ClassDecl = 'class' 'ident' ('extends' 'ident')? '{' (FieldDecl | MethodDecl)* '}'
 FieldDecl = 'ident' '?'? ':' Type ('=' Expr)?
-MethodDecl = 'async'? 'fn' '*'? 'ident' ParamList RetType? Block
+MethodDecl = 'static'? 'async'? 'fn' '*'? 'ident' ParamList RetType? Block
 ImportStmt = 'import' (ImportList | '*' 'as' 'ident') 'from' 'string'
 ImportList = '{' 'ident'* '}'
 ExportStmt = 'export' Stmt
