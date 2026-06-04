@@ -71,7 +71,10 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   plain `inclusive` flag to a `flags` byte (bit0 = inclusive, bit1 = step
 ///   PRESENT) and its stack shape grew from `subject lo hi` to `subject lo hi step`
 ///   (a `nil` step placeholder when omitted). Opcode byte values are unchanged.
-pub const ASO_FORMAT_VERSION: u32 = 9;
+/// - 10: static methods (SP1 §3) — `ClassProto` gained a `static_method_names`
+///   list (written right after `method_names`), so the class-proto byte layout
+///   grew. Opcode byte values are unchanged.
+pub const ASO_FORMAT_VERSION: u32 = 10;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.

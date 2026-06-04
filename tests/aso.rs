@@ -135,6 +135,28 @@ fn build_then_run_aso_matches_generator_method() {
 }
 
 #[test]
+fn build_then_run_aso_matches_static_methods() {
+    // SP1 Phase C: a class with a sync `static fn` factory AND a `static async fn`
+    // factory (the blessed async-construction pattern) compiles to static protos
+    // that round-trip through the `.aso` (format v10) and run byte-identically to
+    // the tree-walker.
+    let dir = unique_dir("staticmethods");
+    write(
+        &dir,
+        "s.as",
+        "class C {\n  fn init() { self.x = 0 }\n  static fn make(v) { let c = C()\n    c.x = v\n    return c }\n  static async fn create() { let c = C()\n    c.x = await 7\n    return c }\n}\nprint(C.make(3).x)\nlet c = await C.create()\nprint(c.x)\n",
+    );
+    build(&dir, "s.as");
+    assert!(dir.join("s.aso").exists(), "s.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "s.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "s.as"]);
+    assert_eq!(aso_out, "3\n7\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
 fn build_then_run_aso_matches_stepped_match_pattern() {
     // RANGES FEATURE, Phase 5: a stepped MATCH-RANGE pattern (strided membership)
     // serializes through the `.aso` (the `Op::MATCH_RANGE` flags byte + the step
