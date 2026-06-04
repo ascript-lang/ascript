@@ -90,6 +90,38 @@ pub fn dropped_local_call(
     Some((name, call))
 }
 
+/// The CST expression kinds that can appear in an expression position. Mirrors
+/// `is_expr_kind` in `src/compile/mod.rs` for the cases the checker recurses into.
+/// Shared by the rules that need to pick out the expression children of a node
+/// (e.g. `range_step` operands, `call_arity` positional args).
+pub(crate) fn is_expr_kind(k: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        k,
+        Literal
+            | NameRef
+            | UnaryExpr
+            | BinaryExpr
+            | ParenExpr
+            | CallExpr
+            | MemberExpr
+            | IndexExpr
+            | ArrowExpr
+            | AssignExpr
+            | ArrayExpr
+            | ObjectExpr
+            | TemplateExpr
+            | OptMemberExpr
+            | TryExpr
+            | UnwrapExpr
+            | TernaryExpr
+            | AwaitExpr
+            | YieldExpr
+            | MatchExpr
+            | RangeExpr
+    )
+}
+
 /// Byte span of `node` starting at its first *non-trivia* token (a CST node's
 /// `text_range()` begins at any leading whitespace/comment/newline trivia, which
 /// would misattribute a diagnostic — and its inline `ascript-ignore` suppression —

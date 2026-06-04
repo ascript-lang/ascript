@@ -20,7 +20,7 @@
 //! positives on computed bounds/steps).
 
 use crate::check::diagnostic::{AsDiagnostic, Severity};
-use crate::check::rules::code_range;
+use crate::check::rules::{code_range, is_expr_kind};
 use crate::interp::format_number;
 use crate::lex_literals::parse_number_text;
 use crate::syntax::cst::ResolvedNode;
@@ -146,36 +146,6 @@ fn literal_number(node: &ResolvedNode) -> Option<f64> {
         }
         _ => None,
     }
-}
-
-/// The CST expression kinds that can appear as a range operand (start/end/step).
-/// Mirrors `is_expr_kind` in `src/compile/mod.rs` for the cases we recurse into.
-fn is_expr_kind(kind: SyntaxKind) -> bool {
-    use SyntaxKind::*;
-    matches!(
-        kind,
-        Literal
-            | NameRef
-            | UnaryExpr
-            | BinaryExpr
-            | ParenExpr
-            | CallExpr
-            | MemberExpr
-            | IndexExpr
-            | ArrowExpr
-            | AssignExpr
-            | ArrayExpr
-            | ObjectExpr
-            | TemplateExpr
-            | OptMemberExpr
-            | TryExpr
-            | UnwrapExpr
-            | TernaryExpr
-            | AwaitExpr
-            | YieldExpr
-            | MatchExpr
-            | RangeExpr
-    )
 }
 
 #[cfg(test)]
