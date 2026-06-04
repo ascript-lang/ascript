@@ -3,26 +3,13 @@
 //! `fn f(n: number)`, or `nil` for a non-`T?` param. Silent on anything uncertain.
 
 use crate::check::diagnostic::{AsDiagnostic, Severity};
-use crate::check::rules::{code_range, fn_name};
+use crate::check::rules::{
+    code_range, fn_name, is_type_kind, lit_name, literal_kind, type_compat, Compat,
+};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{Resolution, ResolveResult};
 use std::collections::HashMap;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LitKind {
-    Number,
-    String,
-    Bool,
-    Nil,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Compat {
-    Yes,
-    No,
-    Unknown,
-}
 
 pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
     use SyntaxKind::*;
@@ -84,7 +71,7 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
             let Some(ptype) = &params[i] else {
                 continue;
             }; // only annotated params
-            if param_compat(ptype, lit) == Compat::No {
+            if type_compat(ptype, lit) == Compat::No {
                 out.push(AsDiagnostic {
                     range: code_range(arg),
                     severity: Severity::Warning,
@@ -117,102 +104,8 @@ fn param_types(fn_decl: &ResolvedNode) -> Vec<Option<ResolvedNode>> {
                 .filter_map(|el| el.into_token())
                 .any(|t| t.kind() == DotDotDot)
         })
-        .map(|p| p.children().find(|c| is_type(c.kind())).cloned())
+        .map(|p| p.children().find(|c| is_type_kind(c.kind())).cloned())
         .collect()
-}
-
-fn literal_kind(arg: &ResolvedNode) -> Option<LitKind> {
-    use SyntaxKind::*;
-    match arg.kind() {
-        TemplateExpr => Some(LitKind::String),
-        Literal => {
-            let t = arg
-                .children_with_tokens()
-                .filter_map(|el| el.into_token())
-                .find(|t| !t.kind().is_trivia())?;
-            Some(match t.kind() {
-                Number => LitKind::Number,
-                Str => LitKind::String,
-                TrueKw | FalseKw => LitKind::Bool,
-                NilKw => LitKind::Nil,
-                _ => return None,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Is the literal PROVABLY incompatible with the (possibly composite) type?
-/// Yes = definitely accepts; No = definitely rejects (the only thing we flag);
-/// Unknown = can't tell (any / named class / generic / partial union) → silent.
-fn param_compat(ty: &ResolvedNode, lit: LitKind) -> Compat {
-    use SyntaxKind::*;
-    match ty.kind() {
-        NamedType => match ty.text().to_string().trim() {
-            "any" => Compat::Yes,
-            "number" => prim(lit, LitKind::Number),
-            "string" => prim(lit, LitKind::String),
-            "bool" => prim(lit, LitKind::Bool),
-            "nil" => prim(lit, LitKind::Nil),
-            _ => Compat::Unknown, // a class / named type — unknowable from a literal
-        },
-        OptionalType => {
-            if lit == LitKind::Nil {
-                Compat::Yes // T? accepts nil
-            } else if let Some(inner) = ty.children().find(|c| is_type(c.kind())) {
-                param_compat(inner, lit)
-            } else {
-                Compat::Unknown
-            }
-        }
-        UnionType => {
-            let members: Vec<_> = ty.children().filter(|c| is_type(c.kind())).collect();
-            let mut all_no = !members.is_empty();
-            for m in &members {
-                match param_compat(m, lit) {
-                    Compat::Yes => return Compat::Yes, // any member accepts → accepts
-                    Compat::Unknown => all_no = false, // a member might accept → uncertain
-                    Compat::No => {}
-                }
-            }
-            if all_no {
-                Compat::No
-            } else {
-                Compat::Unknown
-            }
-        }
-        // array<T> / map / tuple / future: a scalar literal *could* be wrong, but
-        // proving it requires more than a literal kind → stay silent.
-        GenericType | TupleType => Compat::Unknown,
-        _ => Compat::Unknown,
-    }
-}
-
-/// A known-primitive annotation: matches the expected kind → Yes, else No
-/// (every LitKind is a concrete primitive, so a mismatch is provable).
-fn prim(lit: LitKind, expected: LitKind) -> Compat {
-    if lit == expected {
-        Compat::Yes
-    } else {
-        Compat::No
-    }
-}
-
-fn lit_name(lit: LitKind) -> &'static str {
-    match lit {
-        LitKind::Number => "number",
-        LitKind::String => "string",
-        LitKind::Bool => "bool",
-        LitKind::Nil => "nil",
-    }
-}
-
-fn is_type(kind: SyntaxKind) -> bool {
-    use SyntaxKind::*;
-    matches!(
-        kind,
-        NamedType | GenericType | OptionalType | UnionType | TupleType
-    )
 }
 
 fn is_expr(kind: SyntaxKind) -> bool {
