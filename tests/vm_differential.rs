@@ -6422,3 +6422,127 @@ print(live)\n",
     )
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// SP2 Phase E — records / auto-derived `init`. A class declaring fields but no
+// explicit `init` gets an auto-derived positional constructor (params in
+// field-declaration order, defaults compose with §2 arity, field contracts
+// enforced). A class WITH an explicit `init` is unchanged. Both engines must be
+// byte-identical.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn record_auto_init_positional_matches_treewalker() {
+    // Positional auto-constructor in field-declaration order.
+    assert_vm_run_matches_treewalker(
+        "class Point { x: number\n y: number }\nlet p = Point(1, 2)\nprint(p.x)\nprint(p.y)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_auto_init_defaulted_field_matches_treewalker() {
+    // A defaulted field becomes an optional trailing param: P(1) uses the
+    // default (0), P(1, 2) overrides it.
+    assert_vm_run_matches_treewalker(
+        "class P { x: number\n y: number = 0 }\nprint(P(1).y)\nprint(P(1, 2).y)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_auto_init_arity_errors_match_treewalker() {
+    // Too few / too many args -> identical message + span both engines.
+    assert_vm_run_error_matches_treewalker("class Point { x: number\n y: number }\nPoint(1)\n")
+        .await;
+    assert_vm_run_error_matches_treewalker(
+        "class Point { x: number\n y: number }\nPoint(1, 2, 3)\n",
+    )
+    .await;
+    // Defaulted-field arity bounds (at least 1 / at most 2).
+    assert_vm_run_error_matches_treewalker("class P { x: number\n y: number = 0 }\nP()\n").await;
+    assert_vm_run_error_matches_treewalker(
+        "class P { x: number\n y: number = 0 }\nP(1, 2, 3)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_auto_init_contract_mismatch_matches_treewalker() {
+    // A positional arg failing the field's type contract -> identical panic.
+    assert_vm_run_error_matches_treewalker(
+        "class Point { x: number\n y: number }\nPoint(\"a\", 2)\n",
+    )
+    .await;
+    // Mismatch on the second positional arg likewise.
+    assert_vm_run_error_matches_treewalker(
+        "class Point { x: number\n y: number }\nPoint(1, \"b\")\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_class_with_explicit_init_unchanged() {
+    // A class WITH an explicit init is unchanged (auto-init NOT applied): the
+    // init body runs, fields bound via self.x.
+    assert_vm_run_matches_treewalker(
+        "class C { x: number = 0\n fn init(v) { self.x = v + 1 } }\nprint(C(5).x)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_zero_field_class_unchanged() {
+    // A class with no fields and no init keeps the zero-arg-only behavior.
+    assert_vm_run_matches_treewalker("class E {}\nlet e = E()\nprint(type(e))\n").await;
+    assert_vm_run_error_matches_treewalker("class E {}\nE(1)\n").await;
+}
+
+#[tokio::test]
+async fn record_inheritance_positional_matches_treewalker() {
+    // Inheritance: base fields then subclass fields, positional, base-first.
+    assert_vm_run_matches_treewalker(
+        "class A { a: number }\nclass B extends A { b: number }\n\
+         let x = B(1, 2)\nprint(x.a)\nprint(x.b)\n",
+    )
+    .await;
+    // Defaulted base field then required subclass field: positional binding in
+    // merged (base-first) order; arity bounds identical both engines.
+    assert_vm_run_matches_treewalker(
+        "class A { a: number\n b: number = 5 }\nclass B extends A { c: number }\n\
+         let x = B(1, 2, 3)\nprint(x.a)\nprint(x.b)\nprint(x.c)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_from_still_works_on_auto_init_class() {
+    // `.from` is independent of init; it must still validate/coerce an auto-init
+    // (record) class, applying field defaults.
+    assert_vm_run_matches_treewalker(
+        "class P { x: number\n y: number = 0 }\n\
+         let p = P.from({x: 1})\nprint(p.x)\nprint(p.y)\n\
+         let q = P.from({x: 3, y: 4})\nprint(q.x)\nprint(q.y)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn record_three_way_matches() {
+    // The full record surface through all three engines (tree-walker ==
+    // specialized-VM == generic-VM), including instanceof + freeze interop.
+    assert_three_way_matches(
+        "import * as object from \"std/object\"\n\
+         class Point { x: number\n y: number = 0 }\n\
+         class P3 extends Point { z: number }\n\
+         let p = Point(1)\n\
+         print(p.x)\nprint(p.y)\n\
+         let q = Point(2, 3)\nprint(q.y)\n\
+         let r = P3(4, 5, 6)\nprint(r.x)\nprint(r.y)\nprint(r.z)\n\
+         print(p instanceof Point)\n\
+         print(r instanceof Point)\n\
+         object.freeze(p)\n\
+         print(object.isFrozen(p))\n",
+    )
+    .await;
+}
