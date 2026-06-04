@@ -235,6 +235,375 @@ impl WorkspaceIndex {
         })?;
         Some(crate::check::rules::decl_arity(fn_decl))
     }
+
+    // ---- D-arity: index-backed file-module call-arity ---------------------
+
+    /// Extra `call-arity` diagnostics for calls to IMPORTED FILE-module functions
+    /// in `path` (D-arity). The path-less `crate::check::analyze` cannot see across
+    /// files; this uses the index's `exported_fn_arity` to flag a call to a
+    /// uniquely-imported file fn with too few / too many args. Zero-FP: only flags
+    /// when the import resolves to an indexed, cleanly-parsed module that exports
+    /// exactly one fn of that name with a derivable arity; skips spreads and any
+    /// uncertainty. Returns diagnostics over `text` (byte ranges).
+    pub fn file_module_arity(&self, path: &Path, text: &str) -> Vec<crate::check::AsDiagnostic> {
+        use crate::check::diagnostic::{AsDiagnostic, Severity};
+        use SyntaxKind::*;
+        let canon = canonicalize(path);
+        let Some(file) = self.files.get(&canon) else {
+            return Vec::new();
+        };
+        if !file.parsed_ok {
+            return Vec::new();
+        }
+        // Map each uniquely-imported name -> its resolved FILE-module path.
+        let mut import_count: HashMap<&str, usize> = HashMap::new();
+        let mut import_path: HashMap<&str, &PathBuf> = HashMap::new();
+        for e in &file.imports {
+            if let Some(target) = &e.resolved {
+                for n in &e.names {
+                    *import_count.entry(n.as_str()).or_default() += 1;
+                    import_path.insert(n.as_str(), target);
+                }
+            }
+        }
+
+        let parsed = crate::syntax::parser::parse(text);
+        if !parsed.errors.is_empty() || !parsed.lex_errors.is_empty() {
+            return Vec::new();
+        }
+        let tree = crate::syntax::tree_builder::build_tree(parsed);
+        let mut out = Vec::new();
+        for call in tree.descendants().filter(|n| n.kind() == CallExpr) {
+            let Some(callee) = call.children().find(|c| c.kind() == NameRef) else {
+                continue;
+            };
+            let Some(name) = crate::syntax::resolve::ident_text(callee) else {
+                continue;
+            };
+            if import_count.get(name.as_str()).copied() != Some(1) {
+                continue;
+            }
+            let Some(module) = import_path.get(name.as_str()) else {
+                continue;
+            };
+            let Some(arity) = self.exported_fn_arity(module, &name) else {
+                continue; // not an exported fn / parse error / ambiguous → skip
+            };
+            let Some(arg_list) = call.children().find(|c| c.kind() == ArgList) else {
+                continue;
+            };
+            if arg_list.children().any(|c| c.kind() == SpreadElem) {
+                continue; // spread → unknown count
+            }
+            let argc = arg_list
+                .children()
+                .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+                .count();
+            let too_few = argc < arity.min;
+            let too_many = arity.max.is_some_and(|m| argc > m);
+            if too_few || too_many {
+                let expected = match arity.max {
+                    Some(m) if m == arity.min => format!("{} argument(s)", arity.min),
+                    Some(m) => format!("{} to {m} argument(s)", arity.min),
+                    None => format!("at least {} argument(s)", arity.min),
+                };
+                out.push(AsDiagnostic {
+                    range: crate::check::rules::code_range(call),
+                    severity: Severity::Warning,
+                    code: "call-arity".to_string(),
+                    message: format!("{name} expects {expected} but is called with {argc}"),
+                    fix: None,
+                });
+            }
+        }
+        out
+    }
+
+    // ---- L2: cross-file go-to-definition ----------------------------------
+
+    /// Resolve the use at byte `offset` in `path` to a defining `(path, range)`.
+    /// Cross-file when the use is an imported name (links via the import edge to
+    /// the target file's export); same-file otherwise. `None` if no use is at the
+    /// cursor or it does not resolve to a known def.
+    pub fn definition_at(&self, path: &Path, offset: usize) -> Option<(PathBuf, ByteSpan)> {
+        let canon = canonicalize(path);
+        let file = self.files.get(&canon)?;
+        let site = file
+            .uses
+            .iter()
+            .find(|u| offset >= u.range.start && offset < u.range.end)?;
+        match &site.target {
+            ResolvedTarget::LocalDef(span) => Some((canon, *span)),
+            ResolvedTarget::Imported {
+                module: Some(module),
+                name,
+            } => {
+                let target = self.files.get(module)?;
+                let def = target.exports.get(name)?;
+                Some((module.clone(), def.name_range))
+            }
+            _ => None,
+        }
+    }
+
+    // ---- L3: workspace symbols + find-references ---------------------------
+
+    /// Every workspace symbol whose name contains `query` (case-insensitive), as
+    /// `(def)`. An empty query returns all defs. Skips `Import` re-bindings (they
+    /// are not new symbols).
+    pub fn workspace_symbols(&self, query: &str) -> Vec<SymbolDef> {
+        let q = query.to_lowercase();
+        let mut out: Vec<SymbolDef> = Vec::new();
+        for defs in self.defs_by_name.values() {
+            for d in defs {
+                if d.kind == DefKind::Import {
+                    continue;
+                }
+                if q.is_empty() || d.name.to_lowercase().contains(&q) {
+                    out.push(d.clone());
+                }
+            }
+        }
+        // Deterministic order: by name then path.
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
+        out
+    }
+
+    /// Find all references to the definition at byte `offset` in `path`: the def's
+    /// own name range + every `UseSite` targeting it across the def's file and its
+    /// importers. `include_decl` controls whether the declaration's own name range
+    /// is included. Returns `(path, range)` locations.
+    pub fn references_at(
+        &self,
+        path: &Path,
+        offset: usize,
+        include_decl: bool,
+    ) -> Vec<(PathBuf, ByteSpan)> {
+        // Resolve the cursor to a canonical definition (path + name + range).
+        let Some((def_path, def_name, def_range)) = self.def_at(path, offset) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(PathBuf, ByteSpan)> = Vec::new();
+        if include_decl {
+            out.push((def_path.clone(), def_range));
+        }
+        // Scan the def's own file + every importer of it for uses targeting it.
+        let mut scan: Vec<PathBuf> = vec![def_path.clone()];
+        if let Some(importers) = self.importers.get(&def_path) {
+            scan.extend(importers.iter().cloned());
+        }
+        for file_path in scan {
+            let Some(file) = self.files.get(&file_path) else {
+                continue;
+            };
+            for u in &file.uses {
+                if u.name != def_name {
+                    continue;
+                }
+                let hit = match &u.target {
+                    ResolvedTarget::LocalDef(span) => {
+                        file_path == def_path && *span == def_range
+                    }
+                    ResolvedTarget::Imported {
+                        module: Some(m),
+                        name,
+                    } => *m == def_path && *name == def_name,
+                    _ => false,
+                };
+                if hit {
+                    out.push((file_path.clone(), u.range));
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve the cursor to the CANONICAL definition it refers to (following an
+    /// import to the defining file), as `(def_path, name, name_range)`. The cursor
+    /// may be on the definition itself, a same-file use, or an imported use.
+    pub fn def_at(&self, path: &Path, offset: usize) -> Option<(PathBuf, String, ByteSpan)> {
+        let canon = canonicalize(path);
+        let file = self.files.get(&canon)?;
+        // On a definition's own name?
+        for d in &file.defs {
+            if offset >= d.name_range.start && offset < d.name_range.end {
+                // If it's an import binding, follow it to the real def.
+                if d.kind == DefKind::Import {
+                    if let Some((m, span)) = self.definition_at(&canon, offset) {
+                        return Some((m, d.name.clone(), span));
+                    }
+                }
+                return Some((canon, d.name.clone(), d.name_range));
+            }
+        }
+        // On a use? Resolve it to the def.
+        let (def_path, def_range) = self.definition_at(&canon, offset)?;
+        let name = file
+            .uses
+            .iter()
+            .find(|u| offset >= u.range.start && offset < u.range.end)
+            .map(|u| u.name.clone())?;
+        Some((def_path, name, def_range))
+    }
+
+    // ---- L4: rename across files ------------------------------------------
+
+    /// Whether the definition at `offset` in `path` is renameable: it must resolve
+    /// to a known def AND every touched file (the def's file + its importers) must
+    /// have parsed cleanly. Returns the def's current name + name range for a
+    /// `prepareRename`.
+    pub fn prepare_rename(&self, path: &Path, offset: usize) -> Option<(String, ByteSpan)> {
+        let (def_path, name, range) = self.def_at(path, offset)?;
+        if !self.rename_scope_is_clean(&def_path) {
+            return None;
+        }
+        // The cursor's own file range (for the prepare highlight) — find the token
+        // under the cursor in THIS file.
+        let canon = canonicalize(path);
+        let file = self.files.get(&canon)?;
+        let here = file
+            .defs
+            .iter()
+            .find(|d| offset >= d.name_range.start && offset < d.name_range.end)
+            .map(|d| d.name_range)
+            .or_else(|| {
+                file.uses
+                    .iter()
+                    .find(|u| offset >= u.range.start && offset < u.range.end)
+                    .map(|u| u.range)
+            })?;
+        let _ = range;
+        Some((name, here))
+    }
+
+    /// Build the rename edit set: every reference to the def at `offset` (decl +
+    /// import clauses + use sites) across the def's file and its direct importers,
+    /// as `(path, range)` to replace with `new_name`. Returns `None` (refuse) if
+    /// the position is not renameable, the new name collides with an existing
+    /// top-level def in a touched file, or any touched file has a parse error.
+    pub fn rename_edits(
+        &self,
+        path: &Path,
+        offset: usize,
+        new_name: &str,
+    ) -> Option<Vec<(PathBuf, ByteSpan)>> {
+        let (def_path, name, _range) = self.def_at(path, offset)?;
+        if !self.rename_scope_is_clean(&def_path) {
+            return None;
+        }
+        // Collision guard: the new name must not already be a top-level def in the
+        // def's file or any importer.
+        let mut touched: Vec<PathBuf> = vec![def_path.clone()];
+        if let Some(importers) = self.importers.get(&def_path) {
+            touched.extend(importers.iter().cloned());
+        }
+        for fp in &touched {
+            if let Some(file) = self.files.get(fp) {
+                if file.defs.iter().any(|d| d.name == new_name) {
+                    return None; // collision in a touched scope
+                }
+            }
+        }
+        // Collect: the def's name range + every reference (uses + the importers'
+        // import clauses that name it).
+        let mut edits = self.references_at(&def_path, def_range_offset(self, &def_path, &name)?, true);
+        // Add import-clause name tokens in importers (they are `defs` of kind
+        // Import in those files with the same name).
+        if let Some(importers) = self.importers.get(&def_path) {
+            for imp in importers {
+                if let Some(file) = self.files.get(imp) {
+                    for d in &file.defs {
+                        if d.kind == DefKind::Import && d.name == name {
+                            let loc = (imp.clone(), d.name_range);
+                            if !edits.contains(&loc) {
+                                edits.push(loc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(edits)
+    }
+
+    /// Every file touched by a rename of a def in `def_path` (the file + its
+    /// importers) must have parsed cleanly, else the edit would be unsafe.
+    fn rename_scope_is_clean(&self, def_path: &Path) -> bool {
+        let ok = |p: &Path| self.files.get(p).map(|f| f.parsed_ok).unwrap_or(false);
+        if !ok(def_path) {
+            return false;
+        }
+        if let Some(importers) = self.importers.get(def_path) {
+            importers.iter().all(|p| ok(p))
+        } else {
+            true
+        }
+    }
+}
+
+/// Find the byte offset of the def NAMED `name` in `def_path` (its name-range
+/// start), so `references_at` can be re-anchored on the canonical decl.
+fn def_range_offset(idx: &WorkspaceIndex, def_path: &Path, name: &str) -> Option<usize> {
+    let file = idx.files.get(def_path)?;
+    file.defs
+        .iter()
+        .find(|d| d.name == name && d.kind != DefKind::Import)
+        .map(|d| d.name_range.start)
+}
+
+/// Convert a [`ByteSpan`] into an LSP `Range` against `text` (byte→char→UTF-16
+/// position). Shared by the LSP providers.
+pub fn byte_span_to_range(text: &str, span: ByteSpan) -> tower_lsp::lsp_types::Range {
+    let index = crate::lsp::line_index::LineIndex::new(text);
+    let start = index.position(byte_to_char(text, span.start));
+    let end = index.position(byte_to_char(text, span.end));
+    tower_lsp::lsp_types::Range { start, end }
+}
+
+/// Byte offset → char offset (clamped to a char boundary), mirroring
+/// `analysis::byte_to_char`.
+fn byte_to_char(text: &str, byte: usize) -> usize {
+    let mut b = byte.min(text.len());
+    while b > 0 && !text.is_char_boundary(b) {
+        b -= 1;
+    }
+    text[..b].chars().count()
+}
+
+/// The canonical (lexical) form of a path — public so the server keys the index
+/// the same way the index does.
+pub fn canon(path: &Path) -> PathBuf {
+    canonicalize(path)
+}
+
+/// Recursively discover `*.as` files under `root` (depth-bounded, skipping
+/// hidden/`target` dirs). Used to warm the index from a workspace folder.
+pub fn discover_as_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    discover_into(root, 0, &mut out);
+    out
+}
+
+fn discover_into(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 32 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+        if path.is_dir() {
+            discover_into(&path, depth + 1, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("as") {
+            out.push(path);
+        }
+    }
 }
 
 /// Lexically canonicalize a path (resolve `.`/`..` components) WITHOUT touching
@@ -534,7 +903,9 @@ mod tests {
             .find(|d| d.kind == DefKind::Fn)
             .expect("a fn def for f");
         assert_eq!(fn_def.path, PathBuf::from("/ws/a.as"));
-        assert!(fs.iter().any(|d| d.kind == DefKind::Import && d.path == PathBuf::from("/ws/b.as")));
+        assert!(fs
+            .iter()
+            .any(|d| d.kind == DefKind::Import && d.path == Path::new("/ws/b.as")));
         assert!(idx.defs_by_name.contains_key("unrelated"));
     }
 
@@ -603,6 +974,154 @@ mod tests {
         // The last-good defs/uses survive (navigation still works).
         assert_eq!(now.uses, good.uses);
         assert_eq!(now.imports, good.imports);
+    }
+
+    // ---- L2: cross-file go-to-definition ----------------------------------
+
+    #[test]
+    fn definition_of_b_use_of_f_points_into_a() {
+        let idx = fixture();
+        let b = PathBuf::from("/ws/b.as");
+        let text = &idx.files[&b].text;
+        // Cursor on `f` in `print(f(1))` (the use, not the import clause).
+        let offset = text.rfind("f(1)").unwrap();
+        let (def_path, span) = idx.definition_at(&b, offset).expect("cross-file def");
+        assert_eq!(def_path, PathBuf::from("/ws/a.as"));
+        // The span is `f`'s name range in a.as.
+        let a_text = &idx.files[&PathBuf::from("/ws/a.as")].text;
+        assert_eq!(&a_text[span.start..span.end], "f");
+    }
+
+    // ---- L3: workspace symbols + find-references ---------------------------
+
+    #[test]
+    fn workspace_symbols_match_across_files() {
+        let idx = fixture();
+        let syms = idx.workspace_symbols("f");
+        assert!(syms.iter().any(|d| d.name == "f" && d.kind == DefKind::Fn));
+        // Query filters by substring; "unrel" matches `unrelated`.
+        let u = idx.workspace_symbols("unrel");
+        assert!(u.iter().any(|d| d.name == "unrelated"));
+        // Import re-bindings are excluded from workspace symbols.
+        assert!(!idx.workspace_symbols("f").iter().any(|d| d.kind == DefKind::Import));
+    }
+
+    #[test]
+    fn references_of_f_find_a_decl_and_b_use() {
+        let idx = fixture();
+        let a = PathBuf::from("/ws/a.as");
+        let a_text = &idx.files[&a].text;
+        // Cursor on `f`'s declaration in a.as.
+        let offset = a_text.find("f(x)").unwrap();
+        let refs = idx.references_at(&a, offset, true);
+        // The decl in a + the use in b.
+        assert!(
+            refs.iter().any(|(p, _)| *p == a),
+            "should include a's decl: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|(p, _)| p == Path::new("/ws/b.as")),
+            "should include b's use: {refs:?}"
+        );
+    }
+
+    // ---- L4: rename across files ------------------------------------------
+
+    #[test]
+    fn rename_f_rewrites_decl_import_and_use() {
+        let idx = fixture();
+        let a = PathBuf::from("/ws/a.as");
+        let b = PathBuf::from("/ws/b.as");
+        let a_text = &idx.files[&a].text;
+        let offset = a_text.find("f(x)").unwrap();
+        let edits = idx.rename_edits(&a, offset, "g").expect("renameable");
+        // The decl name in a, the import clause in b, and b's use are all edited.
+        assert!(edits.iter().any(|(p, _)| *p == a), "decl edit: {edits:?}");
+        let b_edits: Vec<_> = edits.iter().filter(|(p, _)| *p == b).collect();
+        assert!(b_edits.len() >= 2, "import clause + use in b: {edits:?}");
+    }
+
+    #[test]
+    fn rename_refused_on_collision() {
+        // b imports `f` AND defines `print`-shadowing... use a real collision:
+        // rename `f` to `unrelated` is fine (different file), but rename to a name
+        // already a top-level def in a TOUCHED file is refused.
+        let a = (
+            PathBuf::from("/ws/a.as"),
+            "export fn f(x) { return x }\nfn taken() { return 0 }\n".to_string(),
+        );
+        let b = (
+            PathBuf::from("/ws/b.as"),
+            "import { f } from \"./a\"\nprint(f(1))\n".to_string(),
+        );
+        let idx = WorkspaceIndex::build_from_files(&[a, b]);
+        let a_path = PathBuf::from("/ws/a.as");
+        let a_text = &idx.files[&a_path].text;
+        let offset = a_text.find("f(x)").unwrap();
+        // `taken` already exists in a.as → collision → refused.
+        assert!(idx.rename_edits(&a_path, offset, "taken").is_none());
+    }
+
+    #[test]
+    fn rename_refused_on_parse_error_in_importer() {
+        let mut idx = fixture();
+        let b = PathBuf::from("/ws/b.as");
+        idx.reindex_file(&b, "import { f } from \"./a\"\nprint(f(@@@\n");
+        let a = PathBuf::from("/ws/a.as");
+        let a_text = &idx.files[&a].text;
+        let offset = a_text.find("f(x)").unwrap();
+        // An importer (b) has a parse error → rename refused (unsafe edit).
+        assert!(idx.rename_edits(&a, offset, "g").is_none());
+    }
+
+    // ---- D-arity: index-backed file-module call-arity ---------------------
+
+    #[test]
+    fn file_module_arity_flags_wrong_arity() {
+        let a = (
+            PathBuf::from("/ws/a.as"),
+            "export fn add(x, y) { return x }\n".to_string(),
+        );
+        let b_text = "import { add } from \"./a\"\nprint(add(1))\n".to_string();
+        let b = (PathBuf::from("/ws/b.as"), b_text.clone());
+        let idx = WorkspaceIndex::build_from_files(&[a, b]);
+        let diags = idx.file_module_arity(&PathBuf::from("/ws/b.as"), &b_text);
+        assert_eq!(diags.len(), 1, "{diags:?}");
+        assert_eq!(diags[0].code, "call-arity");
+        assert!(diags[0].message.contains("2 argument(s)"), "{:?}", diags[0]);
+    }
+
+    #[test]
+    fn file_module_arity_correct_call_not_flagged() {
+        let a = (
+            PathBuf::from("/ws/a.as"),
+            "export fn add(x, y) { return x }\n".to_string(),
+        );
+        let b_text = "import { add } from \"./a\"\nprint(add(1, 2))\n".to_string();
+        let idx = WorkspaceIndex::build_from_files(&[
+            a,
+            (PathBuf::from("/ws/b.as"), b_text.clone()),
+        ]);
+        assert!(idx
+            .file_module_arity(&PathBuf::from("/ws/b.as"), &b_text)
+            .is_empty());
+    }
+
+    #[test]
+    fn file_module_arity_skips_unparseable_target() {
+        // The import target a.as has a parse error → arity unknown → not flagged.
+        let a = (
+            PathBuf::from("/ws/a.as"),
+            "export fn add(x, y) { @@@ }\n".to_string(),
+        );
+        let b_text = "import { add } from \"./a\"\nprint(add(1))\n".to_string();
+        let idx = WorkspaceIndex::build_from_files(&[
+            a,
+            (PathBuf::from("/ws/b.as"), b_text.clone()),
+        ]);
+        assert!(idx
+            .file_module_arity(&PathBuf::from("/ws/b.as"), &b_text)
+            .is_empty());
     }
 
     #[test]

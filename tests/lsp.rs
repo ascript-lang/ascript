@@ -356,3 +356,99 @@ fn lsp_protocol_end_to_end() {
         "server did not exit cleanly after `exit`"
     );
 }
+
+#[test]
+fn lsp_cross_file_goto_definition_and_rename() {
+    // SP4 §4: open two files (a defines + exports `f`, b imports + uses it) under
+    // a workspace root; goto-definition on b's use of `f` lands in a.as, and a
+    // workspace symbol query + rename span the files.
+    let dir = std::env::temp_dir().join(format!("ascript_lsp_xfile_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let a_path = dir.join("a.as");
+    let b_path = dir.join("b.as");
+    std::fs::write(&a_path, "export fn f(x) { return x }\n").unwrap();
+    std::fs::write(&b_path, "import { f } from \"./a\"\nprint(f(1))\n").unwrap();
+    let a_uri = format!("file://{}", a_path.display());
+    let b_uri = format!("file://{}", b_path.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let overall = Instant::now() + Duration::from_secs(30);
+    let mut client = LspClient::spawn();
+
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let resp = client.read_response(1, overall);
+    let caps = &resp["result"]["capabilities"];
+    assert!(!caps["referencesProvider"].is_null(), "missing references: {resp}");
+    assert!(!caps["renameProvider"].is_null(), "missing rename: {resp}");
+    assert!(
+        !caps["workspaceSymbolProvider"].is_null(),
+        "missing workspace symbols: {resp}"
+    );
+    client.notify("initialized", json!({}));
+
+    // Open both files so the server has their text (didOpen also reindexes).
+    for (uri, text) in [
+        (&a_uri, "export fn f(x) { return x }\n"),
+        (&b_uri, "import { f } from \"./a\"\nprint(f(1))\n"),
+    ] {
+        client.notify(
+            "textDocument/didOpen",
+            json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text } }),
+        );
+        // Drain the diagnostics notification.
+        let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+    }
+
+    // goto-definition on b's use of `f` (line 1 `print(f(1))`, `f` at char 6).
+    client.request(
+        2,
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": b_uri },
+            "position": { "line": 1, "character": 6 }
+        }),
+    );
+    let def = client.read_response(2, overall);
+    let loc = &def["result"];
+    let def_uri = loc["uri"].as_str().unwrap_or_else(|| loc[0]["uri"].as_str().unwrap_or(""));
+    assert!(
+        def_uri.ends_with("a.as"),
+        "cross-file goto-def should land in a.as, got: {def}"
+    );
+
+    // workspace/symbol "f" returns a match.
+    client.request(3, "workspace/symbol", json!({ "query": "f" }));
+    let syms = client.read_response(3, overall);
+    let arr = syms["result"].as_array().expect("symbol array");
+    assert!(
+        arr.iter().any(|s| s["name"] == "f"),
+        "workspace symbol f missing: {syms}"
+    );
+
+    // rename `f` (at its decl in a.as line 0 char 10) to `g` → edits in a + b.
+    client.request(
+        4,
+        "textDocument/rename",
+        json!({
+            "textDocument": { "uri": a_uri },
+            "position": { "line": 0, "character": 10 },
+            "newName": "g"
+        }),
+    );
+    let ren = client.read_response(4, overall);
+    let changes = &ren["result"]["changes"];
+    assert!(
+        changes.get(&a_uri).is_some() && changes.get(&b_uri).is_some(),
+        "rename should edit both a.as and b.as: {ren}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
