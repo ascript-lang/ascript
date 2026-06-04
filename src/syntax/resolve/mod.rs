@@ -28,6 +28,15 @@ pub fn use_key(node: &ResolvedNode) -> TextRange {
     node.text_range()
 }
 
+/// True if `node` is a `MethodDecl` carrying the `static` modifier (SP1 §3),
+/// detected by a direct `StaticKw` child token. Shared by the resolver, compiler,
+/// formatter, and checker so the three engines agree on what is a static method.
+pub fn is_static_method(node: &ResolvedNode) -> bool {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == SyntaxKind::StaticKw)
+}
+
 fn is_expr(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
@@ -915,7 +924,12 @@ impl Resolver {
         // as `BindingKind::Param` so it is EXEMPT from the unused-binding lint
         // exactly like a parameter (a method that never reads `self` is fine). The
         // declaration range is the method node itself (there is no `self` token).
-        if node_kind == MethodDecl {
+        //
+        // A STATIC method (`static fn …`, SP1 §3) is a class-level call with NO
+        // receiver, so it gets NO `self` slot: a `self` reference inside a static
+        // is left unresolved (→ a Global lookup that fails at runtime on both
+        // engines; `super` inside a static is flagged by the `super-misuse` lint).
+        if node_kind == MethodDecl && !is_static_method(node) {
             self.declare("self", BindingKind::Param, key);
         }
         if let Some(params) = node.children().find(|c| c.kind() == ParamList) {
@@ -1286,6 +1300,37 @@ mod tests {
         assert!(
             r.bindings.iter().any(|b| b.name == "C" && b.is_global),
             "C has a module-global binding"
+        );
+    }
+
+    #[test]
+    fn static_method_has_no_self_slot() {
+        // SP1 §3: a `static fn` body has NO `self` binding — a `self` reference
+        // there is unresolved (a Global lookup) — while a sibling instance method
+        // still binds `self` to Local(0).
+        let src = "class C {\n  fn inst() { return self }\n  static fn stat() { return self }\n}";
+        let tree = parse_to_tree(src);
+        let r = resolve(&tree);
+        // Find the two `self` NameRef uses in document order: first = instance, second = static.
+        let self_uses: Vec<_> = tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::NameRef && ident_text(n).as_deref() == Some("self"))
+            .collect();
+        assert_eq!(self_uses.len(), 2, "two `self` references");
+        assert!(
+            matches!(
+                r.uses.get(&self_uses[0].text_range()),
+                Some(Resolution::Local(0))
+            ),
+            "`self` in the instance method resolves to Local(0)"
+        );
+        assert!(
+            matches!(
+                r.uses.get(&self_uses[1].text_range()),
+                Some(Resolution::Global(n)) if n == "self"
+            ),
+            "`self` in the static method is unresolved (a Global), got {:?}",
+            r.uses.get(&self_uses[1].text_range())
         );
     }
 
