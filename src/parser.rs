@@ -1209,6 +1209,7 @@ impl<'a> Parser<'a> {
                 Tok::Le => BinOp::Le,
                 Tok::Gt => BinOp::Gt,
                 Tok::Ge => BinOp::Ge,
+                Tok::Instanceof => BinOp::InstanceOf,
                 _ => break,
             };
             self.advance();

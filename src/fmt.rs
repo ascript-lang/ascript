@@ -386,7 +386,7 @@ fn bin_prec(op: BinOp) -> u8 {
         BinOp::And => 2,
         BinOp::Coalesce => 3,
         BinOp::Eq | BinOp::Ne => 4,
-        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 5,
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::InstanceOf => 5,
         // Range binds looser than additive but tighter than comparison
         // (grammar PREC.range = 7, between compare = 6 and add = 8).
         BinOp::Range => 6,

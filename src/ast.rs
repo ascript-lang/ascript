@@ -492,6 +492,7 @@ pub enum BinOp {
     Or,
     Coalesce,
     Range,
+    InstanceOf,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -519,6 +520,7 @@ impl fmt::Display for BinOp {
             BinOp::Or => "||",
             BinOp::Coalesce => "??",
             BinOp::Range => "..",
+            BinOp::InstanceOf => "instanceof",
         };
         write!(f, "{}", s)
     }

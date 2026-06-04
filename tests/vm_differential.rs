@@ -6019,3 +6019,57 @@ async fn vm_mutable_let_and_param_reassign_still_work() {
     assert_vm_run_matches_treewalker("fn f(a) { a = 5\n return a }\nprint(f(1))").await;
     assert_vm_run_matches_treewalker("let [a, b] = [1, 2]\na = 9\nprint(a)").await;
 }
+
+#[tokio::test]
+async fn vm_instanceof_basic_matches_treewalker() {
+    // SP2 §1 — an instance `instanceof` its own class is true.
+    assert_vm_run_matches_treewalker("class C {}\nlet c = C()\nprint(c instanceof C)\n").await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_subclass_matches_treewalker() {
+    // Subclass instance `instanceof` parent → true; parent instance NOT instanceof
+    // subclass → false (walk the `extends` chain).
+    assert_vm_run_matches_treewalker(
+        "class A {}\nclass B extends A {}\nprint(B() instanceof A)\nprint(A() instanceof B)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_non_instance_matches_treewalker() {
+    // Non-instances are always false, never panic.
+    assert_vm_run_matches_treewalker(
+        "class C {}\nprint(5 instanceof C)\nprint(\"x\" instanceof C)\nprint(nil instanceof C)\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_precedence_matches_treewalker() {
+    // Precedence: binds like a comparison — `c instanceof C && true` parses as
+    // `(c instanceof C) && true`.
+    assert_vm_run_matches_treewalker("class C {}\nlet c = C()\nprint(c instanceof C && true)\n")
+        .await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_in_if_matches_treewalker() {
+    // `instanceof` as the condition of an `if`.
+    assert_vm_run_matches_treewalker(
+        "class C {}\nlet c = C()\nif (c instanceof C) { print(\"yes\") } else { print(\"no\") }\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_rhs_not_class_errors_match_treewalker() {
+    // RHS not a class → identical Tier-2 panic on both engines.
+    assert_vm_run_error_matches_treewalker("let c = 1\nprint(c instanceof 5)\n").await;
+    assert_vm_run_error_matches_treewalker("class C {}\nprint(C() instanceof nil)\n").await;
+}
+
+#[tokio::test]
+async fn vm_instanceof_three_way_matches() {
+    assert_three_way_matches("class A {}\nclass B extends A {}\nlet b = B()\nprint(b instanceof A)\nprint(b instanceof B)\nprint(5 instanceof A)\n").await;
+}

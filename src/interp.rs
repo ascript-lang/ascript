@@ -3292,6 +3292,20 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         return materialize_range(&l, &r, false, span);
     }
 
+    // `x instanceof C` (SP2 §1): bool. The rhs MUST be a class; a non-class rhs is
+    // a Tier-2 panic anchored at the (whole-expression) span — byte-identical to the
+    // VM's `Op::InstanceOf`. A non-instance lhs is `false`, never an error.
+    if let BinOp::InstanceOf = op {
+        let Value::Class(cls) = &r else {
+            return Err(AsError::at(
+                "instanceof requires a class on the right-hand side",
+                span,
+            )
+            .into());
+        };
+        return Ok(Value::Bool(crate::value::is_instance_of(&l, cls)));
+    }
+
     // String concatenation: `+` joins two strings.
     if let BinOp::Add = op {
         if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
@@ -3341,7 +3355,9 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
                     )
                     .into())
                 }
-                BinOp::Eq | BinOp::Ne | BinOp::Range => unreachable!("handled above"),
+                BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
+                    unreachable!("handled above")
+                }
                 BinOp::And | BinOp::Or | BinOp::Coalesce => {
                     unreachable!("short-circuit ops are not dispatched through apply_binop")
                 }
@@ -3373,7 +3389,9 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         BinOp::Le => Value::Bool(a <= b),
         BinOp::Gt => Value::Bool(a > b),
         BinOp::Ge => Value::Bool(a >= b),
-        BinOp::Eq | BinOp::Ne | BinOp::Range => unreachable!("handled above"),
+        BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
+            unreachable!("handled above")
+        }
         BinOp::And | BinOp::Or | BinOp::Coalesce => {
             unreachable!("short-circuit ops are not dispatched through apply_binop")
         }

@@ -323,6 +323,26 @@ pub fn find_method(class: &Rc<Class>, name: &str) -> Option<(Rc<Method>, Rc<Clas
     None
 }
 
+/// `x instanceof class` (SP2 §1): `true` iff `v` is a `Value::Instance` whose class
+/// is `class` or a subclass of it. Walks the `superclass` chain by `Rc::as_ptr`
+/// identity — the same identity `find_method`/`super` use. Any non-`Instance` `v`
+/// (number, string, object, nil, enum, …) is `false`, never an error. Single source
+/// of truth shared by the tree-walker (`apply_binop`) and the VM (`Op::InstanceOf`).
+pub(crate) fn is_instance_of(v: &Value, class: &Rc<Class>) -> bool {
+    let Value::Instance(inst) = v else {
+        return false;
+    };
+    let target = Rc::as_ptr(class);
+    let mut cur = Some(inst.borrow().class.clone());
+    while let Some(c) = cur {
+        if Rc::as_ptr(&c) == target {
+            return true;
+        }
+        cur = c.superclass.clone();
+    }
+    false
+}
+
 /// Walk a class chain for a STATIC method (SP1 §3), returning it plus the class
 /// that defined it. Mirrors `find_method` but over the `static_methods` namespace
 /// so a subclass resolves an unknown static up its superclass chain.

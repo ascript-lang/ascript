@@ -501,6 +501,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     "for" => Tok::For,
                     "in" => Tok::In,
                     "of" => Tok::Of,
+                    "instanceof" => Tok::Instanceof,
                     "return" => Tok::Return,
                     "break" => Tok::Break,
                     "continue" => Tok::Continue,

@@ -1027,6 +1027,7 @@ fn binop_tag(op: BinOp) -> u8 {
         BinOp::Or => 13,
         BinOp::Coalesce => 14,
         BinOp::Range => 15,
+        BinOp::InstanceOf => 16,
     }
 }
 
@@ -1049,6 +1050,7 @@ fn binop_from_tag(tag: u8) -> Result<BinOp, AsoError> {
         13 => BinOp::Or,
         14 => BinOp::Coalesce,
         15 => BinOp::Range,
+        16 => BinOp::InstanceOf,
         tag => return Err(AsoError::BadTag { what: "binop", tag }),
     })
 }

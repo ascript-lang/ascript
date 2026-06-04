@@ -59,6 +59,7 @@ pub enum Tok {
     Colon,
     QuestionDot,
     Of,
+    Instanceof,
     TemplateStr(String),    // a complete template with no interpolation: `...`
     TemplateStart(String),  // `...${   — text before the first interpolation
     TemplateMiddle(String), // }...${    — text between interpolations
