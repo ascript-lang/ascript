@@ -9,15 +9,16 @@
 //! but additionally lets a periodic collector reclaim *unreachable cycles* by
 //! tracing through [`Trace`] impls.
 //!
-//! ### Phasing
-//! - **V13-T1 (this task):** add the `gcmodule` dependency and implement
-//!   [`Trace`] for every cycle-capable runtime type, **WITHOUT** migrating any
-//!   `Rc` to `Cc`. The impls compile and are exercised by a unit test, but are
-//!   not yet wired into a `Cc`-backed graph — they become load-bearing in T2.
+//! ### Phasing (all complete)
+//! - **V13-T1:** added the `gcmodule` dependency and implemented [`Trace`] for
+//!   every cycle-capable runtime type (no `Rc`→`Cc` migration yet at this point).
 //! - **V13-T2:** the one-pass migration of the cycle-capable [`Value`] variants
 //!   (`Array`/`Object`/`Map`/`Set`/`Instance`/`Closure` + upvalue cells) from
-//!   `Rc` to `Cc`. The [`Trace`] impls here are what the collector will call.
-//! - **V13-T3+:** enable and tune collection; soundness / soak / Drop gates.
+//!   `Rc` to `Cc` (see `src/value.rs` `Cc<…>` variants).
+//! - **V13-T3:** enabled and tuned collection; soundness / soak / Drop gates.
+//!
+//! The [`Trace`] impls below are **load-bearing**: the collector calls them when
+//! reclaiming unreachable cycles (`gc::collect`).
 //!
 //! ### What is traced vs. what stays acyclic (deterministic-Drop invariant)
 //! Only types that can transitively contain another [`Value`] (and therefore

@@ -8,7 +8,7 @@
 #[repr(u32)]
 #[derive(cstree::Syntax)]
 pub enum SyntaxKind {
-    // --- nodes (only Root for now; the parser plan adds the rest) ---
+    // --- core node kinds ---
     Root,
 
     // --- nodes (Plan 2) ---

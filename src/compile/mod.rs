@@ -1496,8 +1496,10 @@ impl Compiler {
     ///   SET_LOCAL <name slot>     ; bind the class to its name (like `fn name`)
     /// ```
     ///
-    /// Superclass (`extends`), `super`, and `instanceof` are V9-T2: a class with an
-    /// `extends` clause is deferred here with a clear error. Each method is compiled
+    /// Superclass (`extends`) and `super` are implemented (see the `extends`
+    /// handling below and `super.<name>` in `compile_expr`). The `instanceof`
+    /// operator remains reserved for SP2 (its `Op::InstanceOf` is declared but not
+    /// yet emitted) — see CLAUDE.md "Current deferrals". Each method is compiled
     /// with `self` already declared by the resolver as the method frame's slot 0
     /// (see `resolve_function`'s `MethodDecl` branch); the receiver is bound into
     /// slot 0 at the method CALL (`Vm::invoke_compiled_method`).
@@ -1817,12 +1819,13 @@ impl Compiler {
             .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
     }
 
-    /// Compile an `import` statement. V12-T1 handles **stdlib** imports only
-    /// (`source` starts with `"std/"`). Mirrors the tree-walker's `Stmt::Import`
-    /// arm (src/interp.rs): a named list binds each named export, a `* as alias`
-    /// binds the namespace Object; an unknown / feature-disabled module errors at
-    /// run time identically (via the shared `load_std_module`). A non-`std/` (file
-    /// module) source is a documented deferral to V12-T4 — a `CompileError` here.
+    /// Compile an `import` statement — both **stdlib** imports (`source` starts
+    /// with `"std/"`) and file/relative (`./…`) module imports compile (the
+    /// V12-T1 stdlib-only deferral was lifted in V12-T4; see `:5223`). Mirrors the
+    /// tree-walker's `Stmt::Import` arm (src/interp.rs): a named list binds each
+    /// named export, a `* as alias` binds the namespace Object; an unknown /
+    /// feature-disabled module errors at run time identically (via the shared
+    /// `load_std_module`). File-module sources resolve to `.aso`/`.as` at run time.
     ///
     /// Lowering: a single `IMPORT(u16)` whose operand indexes the chunk's `imports`
     /// side table to an [`ImportDesc`] (source + named-vs-namespace + the resolver-

@@ -1,7 +1,8 @@
 //! Lossless concrete-syntax-tree front-end (cstree-backed).
 //!
-//! Built in parallel with the legacy `lexer`/`token`/`parser`/`ast` front-end;
-//! does not yet drive the binary.
+//! This CST front-end is the production front-end: it drives `compile` → the
+//! default VM engine. The legacy `lexer`/`token`/`parser`/`ast` front-end now
+//! backs only the `--tree-walker` reference oracle.
 
 pub mod ast;
 pub mod cst;
