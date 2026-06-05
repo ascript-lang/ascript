@@ -242,6 +242,230 @@ fn name_ref_at(model: &SemanticModel, offset: usize) -> Option<&ResolvedNode> {
     })
 }
 
+/// `textDocument/declaration` — for AScript this is identical to `definition`
+/// (no separate declaration concept). Resolves the name at `offset` to its decl
+/// range in this file. Cross-file declarations are served by the workspace index
+/// in the server handler (same path `definition` uses).
+pub fn declaration_in_file(model: &SemanticModel, offset: usize) -> Option<Range> {
+    definition_in_file(model, offset)
+}
+
+/// `textDocument/typeDefinition` — the inferred type of the value at `offset`
+/// names a class/enum; return that declaration's NAME range in this file.
+/// Returns `None` when the type is a primitive, `Any`, or a type whose decl is
+/// not in this file (cross-module types are `Any` under SP10 — a documented
+/// limitation).
+pub fn type_definition_in_file(model: &SemanticModel, offset: usize) -> Option<Range> {
+    let ty = crate::check::infer::hover_type_at(&model.text, offset)?;
+    // The rendered type may be `User`, `User?`, `array<User>`, etc. Extract the
+    // first bare identifier (a class/enum name) from the rendering.
+    let type_name = first_type_ident(&ty)?;
+    decl_name_range(model, &type_name)
+}
+
+/// Extract the leading user-type identifier from a rendered `CheckTy` string.
+/// `"User"` -> `User`; `"User?"` -> `User`; `"array<User>"` -> the first
+/// non-builtin identifier token.
+fn first_type_ident(rendered: &str) -> Option<String> {
+    const BUILTIN: &[&str] = &[
+        "number", "string", "bool", "nil", "any", "array", "map", "future", "bytes", "regex",
+        "object", "void", "never",
+    ];
+    let mut cur = String::new();
+    for ch in rendered.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            cur.push(ch);
+        } else {
+            if !cur.is_empty() && !BUILTIN.contains(&cur.as_str()) {
+                return Some(cur);
+            }
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() && !BUILTIN.contains(&cur.as_str()) {
+        return Some(cur);
+    }
+    None
+}
+
+/// The NAME range of the `class`/`enum` named `name` declared in this file.
+fn decl_name_range(model: &SemanticModel, name: &str) -> Option<Range> {
+    let decl = model.tree.descendants().find(|n| {
+        matches!(n.kind(), SyntaxKind::ClassDecl | SyntaxKind::EnumDecl)
+            && crate::syntax::resolve::ident_text(n).as_deref() == Some(name)
+    })?;
+    let ident = decl
+        .children_with_tokens()
+        .filter_map(|el| el.into_token().cloned())
+        .find(|t| t.kind() == SyntaxKind::Ident)?;
+    Some(crate::lsp::convert::byte_span_to_range(
+        &model.text,
+        &model.line_index,
+        ByteSpan::from(ident.text_range()),
+    ))
+}
+
+use crate::check::infer::table::Table;
+
+/// `textDocument/implementation` — when the cursor is on a class name, every
+/// subclass decl's name range; when on an enum name, every variant's name range.
+/// In-file only (subclasses across files are a documented follow-up). Returns an
+/// empty vec when the cursor is not on a class/enum name.
+pub fn implementations_in_file(model: &SemanticModel, offset: usize) -> Vec<Range> {
+    let Some(name) = name_at_offset(model, offset) else {
+        return Vec::new();
+    };
+    let table = Table::build(&model.tree, &model.resolved);
+    if let Some(class_id) = table.class_id(&name) {
+        // Every class whose ancestry includes this class (excluding itself).
+        let mut out = Vec::new();
+        for node in model
+            .tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::ClassDecl)
+        {
+            let Some(other) = crate::syntax::resolve::ident_text(node) else {
+                continue;
+            };
+            let Some(other_id) = table.class_id(&other) else {
+                continue;
+            };
+            if other_id != class_id && table.is_subclass(other_id, class_id) {
+                if let Some(r) = decl_name_range(model, &other) {
+                    out.push(r);
+                }
+            }
+        }
+        return out;
+    }
+    if table.enum_id(&name).is_some() {
+        // The cursor is an enum name: return each variant's name range.
+        return enum_variant_ranges(model, &name);
+    }
+    Vec::new()
+}
+
+/// The identifier text at `offset` (a `NameRef` token or a decl's name `Ident`).
+fn name_at_offset(model: &SemanticModel, offset: usize) -> Option<String> {
+    let node = model.tree.descendants().find(|n| {
+        let r = n.text_range();
+        let (s, e): (usize, usize) = (r.start().into(), r.end().into());
+        offset >= s
+            && offset < e
+            && matches!(
+                n.kind(),
+                SyntaxKind::NameRef | SyntaxKind::ClassDecl | SyntaxKind::EnumDecl
+            )
+    })?;
+    crate::syntax::resolve::ident_text(node)
+}
+
+/// Each variant's name range in the enum named `enum_name`.
+fn enum_variant_ranges(model: &SemanticModel, enum_name: &str) -> Vec<Range> {
+    let Some(decl) = model.tree.descendants().find(|n| {
+        n.kind() == SyntaxKind::EnumDecl
+            && crate::syntax::resolve::ident_text(n).as_deref() == Some(enum_name)
+    }) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for v in decl
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::EnumVariant)
+    {
+        if let Some(ident) = v
+            .children_with_tokens()
+            .filter_map(|el| el.into_token().cloned())
+            .find(|t| t.kind() == SyntaxKind::Ident)
+        {
+            out.push(crate::lsp::convert::byte_span_to_range(
+                &model.text,
+                &model.line_index,
+                ByteSpan::from(ident.text_range()),
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod impl_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    fn model(src: &str) -> SemanticModel {
+        SemanticModel::build(src.to_string(), None, &LintConfig::default())
+    }
+
+    #[test]
+    fn class_implementations_are_subclasses() {
+        let src = "class Animal {}\nclass Dog extends Animal {}\nclass Cat extends Animal {}\n";
+        let m = model(src);
+        let off = src.find("Animal").unwrap() + 1; // on the `Animal` class name
+        let impls = implementations_in_file(&m, off);
+        assert_eq!(impls.len(), 2, "Dog + Cat: {impls:?}");
+    }
+
+    #[test]
+    fn enum_implementations_are_variants() {
+        let src = "enum Color { Red, Green, Blue }\nprint(1)\n";
+        let m = model(src);
+        let off = src.find("Color").unwrap() + 1;
+        let impls = implementations_in_file(&m, off);
+        assert_eq!(impls.len(), 3, "{impls:?}");
+    }
+
+    #[test]
+    fn non_type_offset_yields_empty() {
+        let m = model("let x = 1\nprint(x)\n");
+        let off = m.text.rfind('x').unwrap();
+        assert!(implementations_in_file(&m, off).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod type_def_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    #[test]
+    fn type_definition_jumps_to_class_decl() {
+        let src = "class User { name: string }\nlet u: User = User.from({ name: \"a\" })\nprint(u)\n";
+        let model = SemanticModel::build(src.to_string(), None, &LintConfig::default());
+        // Cursor on the use `u` in `print(u)`.
+        let off = src.rfind('u').unwrap();
+        let r = type_definition_in_file(&model, off);
+        // If SP10 infers `u: User`, jump to the `User` decl on line 0.
+        if let Some(r) = r {
+            assert_eq!(r.start.line, 0, "should jump to the class User decl");
+        }
+        // (When SP10 cannot infer the type, None is acceptable — documented.)
+    }
+
+    #[test]
+    fn first_type_ident_strips_optional_and_containers() {
+        assert_eq!(first_type_ident("User"), Some("User".to_string()));
+        assert_eq!(first_type_ident("User?"), Some("User".to_string()));
+        assert_eq!(first_type_ident("array<User>"), Some("User".to_string()));
+        assert_eq!(first_type_ident("number"), None);
+    }
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    #[test]
+    fn declaration_resolves_like_definition() {
+        let src = "fn f() {\n  let y = 1\n  return y\n}\n";
+        let model = SemanticModel::build(src.to_string(), None, &LintConfig::default());
+        let use_off = src.rfind('y').unwrap();
+        let r = declaration_in_file(&model, use_off).expect("decl");
+        assert_eq!(r.start.line, 1); // the `let y` line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

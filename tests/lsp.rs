@@ -268,6 +268,47 @@ fn lsp_protocol_end_to_end() {
         "signatureHelp trigger chars: {trigger_strs:?}"
     );
 
+    // Phase 3 capabilities: navigation + structure depth.
+    assert!(
+        !caps["declarationProvider"].is_null(),
+        "missing declarationProvider: {resp}"
+    );
+    assert!(
+        !caps["typeDefinitionProvider"].is_null(),
+        "missing typeDefinitionProvider: {resp}"
+    );
+    assert!(
+        !caps["implementationProvider"].is_null(),
+        "missing implementationProvider: {resp}"
+    );
+    assert!(
+        !caps["foldingRangeProvider"].is_null(),
+        "missing foldingRangeProvider: {resp}"
+    );
+    assert!(
+        !caps["selectionRangeProvider"].is_null(),
+        "missing selectionRangeProvider: {resp}"
+    );
+    assert!(
+        !caps["documentLinkProvider"].is_null(),
+        "missing documentLinkProvider: {resp}"
+    );
+    assert!(
+        !caps["callHierarchyProvider"].is_null(),
+        "missing callHierarchyProvider: {resp}"
+    );
+    // type hierarchy is advertised via the experimental escape hatch (lsp-types 0.94
+    // has no standard `typeHierarchyProvider` capability field).
+    assert_eq!(
+        caps["experimental"]["typeHierarchyProvider"], true,
+        "missing experimental.typeHierarchyProvider: {resp}"
+    );
+    // workspaceSymbol advertises lazy resolve.
+    assert_eq!(
+        caps["workspaceSymbolProvider"]["resolveProvider"], true,
+        "missing workspaceSymbol resolveProvider: {resp}"
+    );
+
     // 2. initialized notification.
     client.notify("initialized", json!({}));
 
@@ -528,6 +569,59 @@ fn lsp_protocol_end_to_end() {
         "expected a WRITE highlight: {hl_resp}"
     );
 
+    // Phase 3 end-to-end: foldingRange on the symbols doc -> >=1 fold (the
+    // multi-line class/fn bodies).
+    client.request(
+        10,
+        "textDocument/foldingRange",
+        json!({ "textDocument": { "uri": sym_uri } }),
+    );
+    let fold_resp = client.read_response(10, overall);
+    let folds = fold_resp["result"]
+        .as_array()
+        .expect("foldingRange array result");
+    assert!(!folds.is_empty(), "expected >=1 fold: {fold_resp}");
+
+    // prepareTypeHierarchy on `Point` (line 1, char 6) -> a CLASS item. (This uses
+    // the in-memory model, not the path index, so it works for any document URI.
+    // prepareCallHierarchy is index-backed and exercised in the file-based
+    // cross-file test below, where real `file://` paths resolve.)
+    client.request(
+        12,
+        "textDocument/prepareTypeHierarchy",
+        json!({
+            "textDocument": { "uri": sym_uri },
+            "position": { "line": 1, "character": 6 }
+        }),
+    );
+    let th_resp = client.read_response(12, overall);
+    let th_items = th_resp["result"]
+        .as_array()
+        .expect("prepareTypeHierarchy array result");
+    assert!(
+        th_items.iter().any(|i| i["name"].as_str() == Some("Point")),
+        "expected a `Point` type-hierarchy item: {th_resp}"
+    );
+
+    // selectionRange at the `name` use (line 0, char 24) -> a non-null chain.
+    client.request(
+        13,
+        "textDocument/selectionRange",
+        json!({
+            "textDocument": { "uri": sym_uri },
+            "positions": [{ "line": 0, "character": 24 }]
+        }),
+    );
+    let sel_resp = client.read_response(13, overall);
+    let sels = sel_resp["result"]
+        .as_array()
+        .expect("selectionRange array result");
+    assert!(!sels.is_empty(), "expected a selection range: {sel_resp}");
+    assert!(
+        !sels[0]["range"].is_null(),
+        "selection range has a range: {sel_resp}"
+    );
+
     // 6. shutdown -> result; exit -> clean exit.
     client.request_no_params(4, "shutdown");
     let shutdown_resp = client.read_response(4, overall);
@@ -631,6 +725,34 @@ fn lsp_cross_file_goto_definition_and_rename() {
     assert!(
         changes.get(&a_uri).is_some() && changes.get(&b_uri).is_some(),
         "rename should edit both a.as and b.as: {ren}"
+    );
+
+    // prepareCallHierarchy on `f`'s decl in a.as (line 0 char 10) -> a FUNCTION item,
+    // then its incoming calls include b.as (where `f` is called).
+    client.request(
+        5,
+        "textDocument/prepareCallHierarchy",
+        json!({
+            "textDocument": { "uri": a_uri },
+            "position": { "line": 0, "character": 10 }
+        }),
+    );
+    let ch = client.read_response(5, overall);
+    let ch_items = ch["result"].as_array().expect("call-hierarchy items");
+    let item = ch_items
+        .iter()
+        .find(|i| i["name"].as_str() == Some("f"))
+        .unwrap_or_else(|| panic!("expected an `f` call-hierarchy item: {ch}"))
+        .clone();
+
+    client.request(6, "callHierarchy/incomingCalls", json!({ "item": item }));
+    let inc = client.read_response(6, overall);
+    let calls = inc["result"].as_array().expect("incomingCalls array");
+    assert!(
+        calls.iter().any(|c| c["from"]["uri"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("b.as"))),
+        "incoming calls should include b.as: {inc}"
     );
 
     client.request_no_params(99, "shutdown");
