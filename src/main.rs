@@ -22,6 +22,11 @@ enum Command {
         /// takes precedence over the env var. Ignored for `.aso` (always VM).
         #[arg(long = "tree-walker")]
         tree_walker: bool,
+        /// Offline-deterministic: resolve dependencies EXACTLY from `ascript.lock`
+        /// (no network), failing on any drift, missing lock, or integrity
+        /// mismatch. For CI / sandboxes.
+        #[arg(long = "locked")]
+        locked: bool,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
@@ -77,7 +82,13 @@ enum Command {
         fix_dry_run: bool,
     },
     /// Run .as test files
-    Test { files: Vec<String> },
+    Test {
+        files: Vec<String>,
+        /// Offline-deterministic: resolve dependencies EXACTLY from `ascript.lock`
+        /// (no network), failing on drift / missing lock / integrity mismatch.
+        #[arg(long = "locked")]
+        locked: bool,
+    },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
     Lsp,
@@ -170,6 +181,7 @@ async fn real_main() -> ExitCode {
     match cli.command {
         Command::Run {
             tree_walker,
+            locked,
             file,
             args,
         } => {
@@ -184,19 +196,23 @@ async fn real_main() -> ExitCode {
             let is_aso = path.extension().and_then(|e| e.to_str()) == Some("aso");
             let use_tree_walker =
                 tree_walker || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
-            // SP6: build the resolved package map (path deps for now; the full
-            // MVS resolve + fetch + lock lands in Phase E) from the entry file's
-            // nearest `ascript.toml` and inject it onto the interpreter so a bare
-            // `import "pkg"` resolves identically on both engines. `.aso` runs
-            // skip this (a compiled module's imports were resolved at compile
-            // time / load against its own dir). Under `--no-default-features` the
-            // `pkg` feature is off → no map → bare specifier is "unknown package".
+            // SP6: ensure the lock is satisfied (MVS resolve + fetch-on-miss, or
+            // `--locked` offline against ascript.lock), assemble the resolved
+            // package map, and inject it so a bare `import "pkg"` resolves
+            // identically on both engines. `.aso` runs skip this (a compiled
+            // module's imports were resolved against its own dir). Under
+            // `--no-default-features` the `pkg` feature is off → no map → bare
+            // specifier is "unknown package".
             #[cfg(feature = "pkg")]
-            let packages = match pkg::build_path_dep_map(path) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::from(1);
+            let packages = if is_aso {
+                None
+            } else {
+                match pkg::commands::ensure_lock(path, locked) {
+                    Ok(outcome) => outcome.map(|o| o.map),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(1);
+                    }
                 }
             };
             let result = if is_aso {
@@ -430,7 +446,32 @@ async fn real_main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        Command::Test { files } => match ascript::run_tests(&files).await {
+        Command::Test { files, locked } => {
+            // SP6: ensure the lock is satisfied for the test files' nearest
+            // manifest (resolve+fetch-on-miss, or `--locked` offline) and inject
+            // the resolved package map so a bare `import "pkg"` in a test works.
+            #[cfg(feature = "pkg")]
+            let test_result = {
+                let packages = match files.first() {
+                    Some(first) => {
+                        match pkg::commands::ensure_lock(std::path::Path::new(first), locked) {
+                            Ok(outcome) => outcome.map(|o| o.map),
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                return ExitCode::from(1);
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                ascript::run_tests_with_packages(&files, packages).await
+            };
+            #[cfg(not(feature = "pkg"))]
+            let test_result = {
+                let _ = locked;
+                ascript::run_tests(&files).await
+            };
+            match test_result {
             Ok(summary) => {
                 for (name, message) in &summary.failures {
                     println!("FAIL {}: {}", name, message);
@@ -446,7 +487,8 @@ async fn real_main() -> ExitCode {
                 ascript::diagnostics::report(&e);
                 ExitCode::from(1)
             }
-        },
+            }
+        }
         #[cfg(feature = "lsp")]
         Command::Lsp => {
             ascript::lsp::run_server().await;

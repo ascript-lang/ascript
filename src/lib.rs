@@ -122,7 +122,19 @@ pub async fn run_file_with_packages(
 /// Load each file as a module (running its `test(...)` registrations) on a
 /// single `Interp`, then run all registered tests and return a summary.
 pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
+    run_tests_with_packages(files, None).await
+}
+
+/// Like [`run_tests`] but installs a CLI-resolved package map (SP6) so a bare
+/// `import "pkg"` in a test file resolves through it. `None` = no resolver.
+pub async fn run_tests_with_packages(
+    files: &[String],
+    packages: Option<crate::interp::PackageMap>,
+) -> Result<TestSummary, AsError> {
     let interp = Rc::new(Interp::new());
+    if let Some(map) = packages {
+        interp.set_package_resolver(map);
+    }
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result: Result<TestSummary, AsError> = local

@@ -1,0 +1,11 @@
+version = 1
+
+[[package]]
+name = "@scope/x"
+source = "path+../scope"
+resolved = "../scope"
+
+[[package]]
+name = "lib"
+source = "path+../lib"
+resolved = "../lib"

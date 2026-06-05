@@ -67,6 +67,44 @@ pub async fn fetch(src: &DepSource, manifest_dir: &Path) -> Result<Fetched, Stri
     }
 }
 
+/// Synchronous fetch for the (sync) MVS resolver driver. path/git are already
+/// synchronous; a url download is run on a throwaway current-thread runtime on a
+/// fresh thread (so it never nests inside the caller's runtime). A `file://` url
+/// is read straight from disk with no runtime. Used by `commands.rs`'s resolver.
+pub fn fetch_blocking(src: &DepSource, manifest_dir: &Path) -> Result<Fetched, String> {
+    match src {
+        DepSource::Path { path } => fetch_path(path, manifest_dir),
+        DepSource::Git { url, pin } => fetch_git(url, pin),
+        DepSource::Url { url } if url.starts_with("file://") => {
+            // No network → no runtime needed; reuse the async arm's body via a
+            // minimal blocking runtime would also work, but the file:// path is
+            // pure sync IO, so run it on a tiny dedicated runtime for uniformity.
+            block_on_url(url)
+        }
+        DepSource::Url { url } => block_on_url(url),
+        DepSource::Registry { req } => Err(format!(
+            "bare-version dependency '{req}' requires a registry, which is not available yet"
+        )),
+    }
+}
+
+/// Block on the async url fetch using a fresh current-thread runtime on a NEW
+/// thread, so it is safe even when the caller is already inside a tokio runtime.
+fn block_on_url(url: &str) -> Result<Fetched, String> {
+    let url = url.to_string();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("cannot build fetch runtime: {e}"))?;
+            rt.block_on(fetch_url(&url))
+        })
+        .join()
+        .map_err(|_| "url fetch thread panicked".to_string())?
+    })
+}
+
 /// Path dep: the package root is the local directory (relative to the manifest
 /// dir), loaded in place. No copy, no integrity.
 fn fetch_path(path: &str, manifest_dir: &Path) -> Result<Fetched, String> {

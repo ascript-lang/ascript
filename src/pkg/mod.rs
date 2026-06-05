@@ -27,7 +27,7 @@ pub mod lock;
 pub mod manifest;
 pub mod resolve;
 
-use ascript::interp::{PackageMap, ResolvedPkg};
+use ascript::interp::ResolvedPkg;
 use manifest::{Manifest, PackageMeta};
 use std::path::{Path, PathBuf};
 
@@ -92,27 +92,3 @@ pub fn resolved_pkg_for(root: &Path) -> Result<ResolvedPkg, String> {
     })
 }
 
-/// Build a [`PackageMap`] for the nearest manifest's PATH dependencies only
-/// (Phase D — no fetch). Each path dep's directory is read in place, its entry
-/// resolved, and keyed by its declared dependency name. The full git/url resolver
-/// (Phase E) supersedes this; it exists so path deps work end-to-end and prove
-/// the dual-engine bare-specifier branch. `Ok(None)` if there is no manifest.
-pub fn build_path_dep_map(entry_file: &Path) -> Result<Option<PackageMap>, String> {
-    let Some((manifest_dir, manifest)) = Manifest::load_nearest(entry_file)? else {
-        return Ok(None);
-    };
-    let mut map = PackageMap::new();
-    for (name, src) in &manifest.dependencies {
-        if let manifest::DepSource::Path { path } = src {
-            let root = manifest_dir.join(path);
-            let root = root
-                .canonicalize()
-                .map_err(|e| format!("path dependency '{name}' not found: {e}"))?;
-            let resolved = resolved_pkg_for(&root)?;
-            map.insert(name.clone(), resolved);
-        }
-        // git/url/registry deps are handled by the Phase-E resolver; a path-only
-        // project resolves fully here.
-    }
-    Ok(Some(map))
-}

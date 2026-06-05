@@ -20,6 +20,7 @@
 
 use super::manifest::{DepSource, GitPin, Version};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// The metadata a fetch yields for one package, fed back into the resolver so it
 /// can record lock fields and read transitive requirements.
@@ -32,15 +33,20 @@ pub struct FetchedDep {
     pub rev: Option<String>,
     /// `asum1-…` integrity (git/url; `None` for path).
     pub integrity: Option<String>,
+    /// The fetched package's loadable ROOT dir (so a transitive path dep resolves
+    /// relative to it).
+    pub root: PathBuf,
     /// The fetched package's OWN `[dependencies]` (transitive requirements).
     pub deps: Vec<(String, DepSource)>,
 }
 
 /// Abstracts "acquire a dependency and read its transitive deps", so the MVS walk
-/// is testable without IO. The real impl fetches via `fetch.rs`.
+/// is testable without IO. The real impl fetches via `fetch.rs`. `base_dir` is the
+/// requiring package's root, against which a PATH dep is resolved.
 pub trait DepFetcher {
-    /// Fetch `src` (declared as `name`) and return its metadata + transitive deps.
-    fn fetch(&mut self, name: &str, src: &DepSource) -> Result<FetchedDep, String>;
+    /// Fetch `src` (declared as `name`, required from `base_dir`) and return its
+    /// metadata + transitive deps.
+    fn fetch(&mut self, name: &str, src: &DepSource, base_dir: &Path) -> Result<FetchedDep, String>;
 }
 
 /// One fully-resolved package in the flat output set.
@@ -55,6 +61,8 @@ pub struct Resolved {
     pub resolved: String,
     pub rev: Option<String>,
     pub integrity: Option<String>,
+    /// The loadable root dir of the selected package (for building the PackageMap).
+    pub root: PathBuf,
 }
 
 /// Internal per-name selection state during the walk.
@@ -70,16 +78,19 @@ struct Selection {
 }
 
 /// Run MVS over `root_deps` (the root manifest's `[dependencies]`), using
-/// `fetcher` to acquire each dep + read its transitive requirements. Returns the
-/// flat resolved set sorted by name, or a clear conflict / cycle / registry error.
+/// `fetcher` to acquire each dep + read its transitive requirements. `root_dir` is
+/// the root manifest's directory (a root path dep resolves against it). Returns
+/// the flat resolved set sorted by name, or a clear conflict / cycle / registry
+/// error.
 pub fn resolve(
     root_deps: &[(String, DepSource)],
+    root_dir: &Path,
     fetcher: &mut dyn DepFetcher,
 ) -> Result<Vec<Resolved>, String> {
     let mut selected: BTreeMap<String, Selection> = BTreeMap::new();
     // `stack` carries the active requirer chain for cycle detection + messages.
     let mut stack: Vec<String> = Vec::new();
-    walk("(root)", root_deps, fetcher, &mut selected, &mut stack)?;
+    walk("(root)", root_deps, root_dir, fetcher, &mut selected, &mut stack)?;
 
     let mut out: Vec<Resolved> = selected
         .into_iter()
@@ -98,6 +109,7 @@ pub fn resolve(
                 resolved: sel.fetched.resolved,
                 rev: sel.fetched.rev,
                 integrity: sel.fetched.integrity,
+                root: sel.fetched.root,
             }
         })
         .collect();
@@ -105,11 +117,13 @@ pub fn resolve(
     Ok(out)
 }
 
-/// Process `deps` required by `requirer`, recursing into each dep's transitive
-/// requirements (depth-first). `stack` holds the active requirer-name chain.
+/// Process `deps` required by `requirer` (whose root is `base_dir`), recursing
+/// into each dep's transitive requirements (depth-first). `stack` holds the active
+/// requirer-name chain.
 fn walk(
     requirer: &str,
     deps: &[(String, DepSource)],
+    base_dir: &Path,
     fetcher: &mut dyn DepFetcher,
     selected: &mut BTreeMap<String, Selection>,
     stack: &mut Vec<String>,
@@ -136,9 +150,10 @@ fn walk(
         match selected.get(name) {
             None => {
                 // First time we see this name: fetch + select + recurse.
-                let fetched = fetcher.fetch(name, src)?;
+                let fetched = fetcher.fetch(name, src, base_dir)?;
                 let version = tag_version(name, src)?;
                 let transitive = fetched.deps.clone();
+                let child_dir = fetched.root.clone();
                 selected.insert(
                     name.clone(),
                     Selection {
@@ -149,7 +164,7 @@ fn walk(
                     },
                 );
                 stack.push(name.clone());
-                walk(name, &transitive, fetcher, selected, stack)?;
+                walk(name, &transitive, &child_dir, fetcher, selected, stack)?;
                 stack.pop();
             }
             Some(existing) => {
@@ -174,8 +189,9 @@ fn walk(
                         if new > cur {
                             // The new requirement wins: re-fetch at the higher tag
                             // and recurse into ITS transitive deps.
-                            let fetched = fetcher.fetch(name, src)?;
+                            let fetched = fetcher.fetch(name, src, base_dir)?;
                             let transitive = fetched.deps.clone();
+                            let child_dir = fetched.root.clone();
                             selected.insert(
                                 name.clone(),
                                 Selection {
@@ -186,7 +202,7 @@ fn walk(
                                 },
                             );
                             stack.push(name.clone());
-                            walk(name, &transitive, fetcher, selected, stack)?;
+                            walk(name, &transitive, &child_dir, fetcher, selected, stack)?;
                             stack.pop();
                         }
                         // else: keep the existing (higher-or-equal) selection.
@@ -301,7 +317,12 @@ mod tests {
     }
 
     impl DepFetcher for MockFetcher {
-        fn fetch(&mut self, _name: &str, src: &DepSource) -> Result<FetchedDep, String> {
+        fn fetch(
+            &mut self,
+            _name: &str,
+            src: &DepSource,
+            _base_dir: &Path,
+        ) -> Result<FetchedDep, String> {
             let deps = self.graph.get(&key(src)).cloned().unwrap_or_default();
             let resolved = match src {
                 DepSource::Git { pin: GitPin::Tag(t), .. } => t.clone(),
@@ -319,6 +340,7 @@ mod tests {
                 resolved,
                 rev: matches!(src, DepSource::Git { .. }).then(|| "deadbeef".to_string()),
                 integrity,
+                root: PathBuf::from("/mock"),
                 deps,
             })
         }
@@ -346,7 +368,7 @@ mod tests {
             ("a".into(), git_tag(url_a, "1.0.0")),
             ("b".into(), git_tag("https://x/b", "1.0.0")),
         ];
-        let out = resolve(&roots, &mut m).unwrap();
+        let out = resolve(&roots, Path::new("/root"), &mut m).unwrap();
         let a = out.iter().find(|r| r.name == "a").unwrap();
         assert_eq!(a.resolved, "1.2.0", "MVS picks the highest required");
     }
@@ -366,7 +388,7 @@ mod tests {
             ("a".into(), git_tag(url_a, "1.5.0")),
             ("b".into(), git_tag("https://x/b", "1.0.0")),
         ];
-        let out = resolve(&roots, &mut m).unwrap();
+        let out = resolve(&roots, Path::new("/root"), &mut m).unwrap();
         let a = out.iter().find(|r| r.name == "a").unwrap();
         assert_eq!(a.resolved, "1.5.0");
     }
@@ -376,7 +398,7 @@ mod tests {
         let mut m = MockFetcher::new();
         let src = DepSource::Path { path: "../u".into() };
         m.add(&src, vec![]);
-        let out = resolve(&[("u".into(), src)], &mut m).unwrap();
+        let out = resolve(&[("u".into(), src)], Path::new("/root"), &mut m).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].resolved, "../u");
         assert!(out[0].integrity.is_none(), "path dep has no integrity");
@@ -398,7 +420,7 @@ mod tests {
             ("u".into(), u1),
             ("b".into(), git_tag("https://x/b", "1.0.0")),
         ];
-        let e = resolve(&roots, &mut m).unwrap_err();
+        let e = resolve(&roots, Path::new("/root"), &mut m).unwrap_err();
         assert!(e.contains("conflict on 'u'"), "{e}");
         assert!(e.contains("(root)") && e.contains("b"), "names both requirers: {e}");
         assert!(e.contains("../u1") && e.contains("../u2"), "names both sources: {e}");
@@ -416,7 +438,7 @@ mod tests {
             ("c".into(), r1),
             ("b".into(), git_tag("https://x/b", "1.0.0")),
         ];
-        let e = resolve(&roots, &mut m).unwrap_err();
+        let e = resolve(&roots, Path::new("/root"), &mut m).unwrap_err();
         assert!(e.contains("conflict on 'c'"), "{e}");
     }
 
@@ -433,7 +455,7 @@ mod tests {
             vec![("a".into(), git_tag("https://x/a", "1.0.0"))],
         );
         let roots = vec![("a".into(), git_tag("https://x/a", "1.0.0"))];
-        let e = resolve(&roots, &mut m).unwrap_err();
+        let e = resolve(&roots, Path::new("/root"), &mut m).unwrap_err();
         assert!(e.contains("cycle"), "{e}");
         assert!(e.contains("a -> b -> a"), "cycle path: {e}");
     }
@@ -445,7 +467,7 @@ mod tests {
             "color".into(),
             DepSource::Registry { req: "^1.2.0".into() },
         )];
-        let e = resolve(&roots, &mut m).unwrap_err();
+        let e = resolve(&roots, Path::new("/root"), &mut m).unwrap_err();
         assert!(e.contains("requires a registry"), "{e}");
     }
 
@@ -460,7 +482,7 @@ mod tests {
             ("u".into(), u),
             ("b".into(), git_tag("https://x/b", "1.0.0")),
         ];
-        let out = resolve(&roots, &mut m).unwrap();
+        let out = resolve(&roots, Path::new("/root"), &mut m).unwrap();
         assert_eq!(out.iter().filter(|r| r.name == "u").count(), 1);
     }
 
@@ -471,7 +493,7 @@ mod tests {
         let a = DepSource::Path { path: "../a".into() };
         m.add(&z, vec![]);
         m.add(&a, vec![]);
-        let out = resolve(&[("zeta".into(), z), ("alpha".into(), a)], &mut m).unwrap();
+        let out = resolve(&[("zeta".into(), z), ("alpha".into(), a)], Path::new("/root"), &mut m).unwrap();
         assert_eq!(out[0].name, "alpha");
         assert_eq!(out[1].name, "zeta");
     }
