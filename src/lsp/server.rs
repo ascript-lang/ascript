@@ -1,13 +1,13 @@
-//! tower-lsp `LanguageServer` implementation: a thin async adapter over the pure
-//! `analysis` layer plus a cached `SemanticModel` document store.
+//! tower-lsp `LanguageServer` implementation: a thin async adapter over the cached
+//! `SemanticModel` document store and the pure `providers`.
 //!
-//! The backend is `Send + Sync` because it holds only `Send + Sync` types: the
-//! `Client`, and a `tokio::sync::Mutex<DocumentStore>` of per-document semantic
-//! models. No interpreter state (`Rc`/`RefCell`/`Value`) is ever held, so this
-//! compiles on the `current_thread` tokio runtime AND satisfies tower-lsp's
-//! `Send + Sync` bounds.
+//! Every capability runs on the CST front-end + cached `SemanticModel` — the legacy
+//! `ast`/`lexer`/`parser` front-end is NOT used here. The backend is `Send + Sync`
+//! because it holds only `Send + Sync` types: the `Client`, and a
+//! `tokio::sync::Mutex<DocumentStore>` of per-document semantic models. No
+//! interpreter state (`Rc`/`RefCell`/`Value`) is ever held, so this compiles on the
+//! `current_thread` tokio runtime AND satisfies tower-lsp's `Send + Sync` bounds.
 
-use crate::lsp::analysis;
 use crate::lsp::model::DocumentStore;
 use crate::lsp::workspace::{self, WorkspaceIndex};
 use std::collections::HashMap;
@@ -63,7 +63,7 @@ impl Backend {
         if let Some(path) = url_to_canon(&uri) {
             if let Ok(idx) = self.index.read() {
                 for d in idx.file_module_arity(&path, &text) {
-                    diags.push(analysis::byte_diagnostic_to_lsp(&text, &d));
+                    diags.push(crate::lsp::convert::byte_diagnostic_to_lsp(&text, &d));
                 }
             }
         }

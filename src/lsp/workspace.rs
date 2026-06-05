@@ -561,7 +561,7 @@ pub fn byte_span_to_range(text: &str, span: ByteSpan) -> tower_lsp::lsp_types::R
 }
 
 /// Byte offset → char offset (clamped to a char boundary), mirroring
-/// `analysis::byte_to_char`.
+/// `convert::byte_to_char`.
 fn byte_to_char(text: &str, byte: usize) -> usize {
     let mut b = byte.min(text.len());
     while b > 0 && !text.is_char_boundary(b) {
