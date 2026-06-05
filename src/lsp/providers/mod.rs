@@ -8,5 +8,6 @@ pub mod highlight;
 pub mod hover;
 pub mod navigation;
 pub mod semantic_tokens;
+pub mod signature;
 pub mod symbols;
 pub mod token_spans;
