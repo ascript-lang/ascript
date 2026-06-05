@@ -1,0 +1,20 @@
+{
+  "id": "s",
+  "object": "chat.completion",
+  "model": "gpt-4.1",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "Sorry, I can't do that."
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 5,
+    "completion_tokens": 5,
+    "total_tokens": 10
+  }
+}

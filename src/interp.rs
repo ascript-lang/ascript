@@ -321,6 +321,13 @@ pub(crate) enum ResourceState {
     // export, then the resource is removed. Boxed to keep the enum compact.
     #[cfg(feature = "telemetry")]
     TelemetrySpan(Box<crate::stdlib::telemetry::model::OpenSpan>),
+    // SP11 std/ai: a live streaming chat (`ai.stream`). Holds the genai
+    // `ChatStream` (a `Stream` of events) plus the running terminal aggregate
+    // (`stream.result()`). `next()`/`textOnly()` poll one event per call via the
+    // take-out-across-await pattern; `result()` returns the aggregate. Boxed to keep
+    // the `ResourceState` enum compact. Feature `ai`.
+    #[cfg(feature = "ai")]
+    AiStream(Box<crate::stdlib::ai::AiStreamState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -453,6 +460,14 @@ pub struct Interp {
     /// Empty unless set by [`Interp::set_cli_args`] (i.e. the REPL and test
     /// runner always see `[]`, which is correct).
     cli_args: RefCell<Vec<Rc<str>>>,
+    /// SP11 std/ai state: the lazily-built genai `Client` (one per `Interp`, with
+    /// our pooled reqwest client injected) and an optional fixture-replay seam used
+    /// by tests to serve recorded JSON/SSE bodies with no socket/secret. `None`
+    /// until the first `ai.*` call materializes it. State lives behind this
+    /// `RefCell` so the `&self` `call_ai` path can take the client OUT across each
+    /// `.await` (take-out-across-await), never holding a borrow over a genai await.
+    #[cfg(feature = "ai")]
+    ai: RefCell<crate::stdlib::ai::AiClient>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -673,6 +688,8 @@ impl Interp {
             telemetry: RefCell::new(None),
             #[cfg(feature = "telemetry")]
             telemetry_capture: RefCell::new(Vec::new()),
+            #[cfg(feature = "ai")]
+            ai: RefCell::new(crate::stdlib::ai::AiClient::default()),
             cli_args: RefCell::new(Vec::new()),
         }
     }
@@ -1439,6 +1456,29 @@ impl Interp {
         crate::stdlib::telemetry::dispatch(self, func, args, span).await
     }
 
+    /// `std/ai` dispatch (SP11). Delegates to the ai module, which owns the genai
+    /// request/response mapping; the `Interp` owns the genai `Client` lifetime
+    /// (`self.ai`) + resource handles. Borrow discipline: the genai client is taken
+    /// OUT of `self.ai` across each `.await` (take-out-across-await) so no `RefCell`
+    /// borrow is ever held over a genai future.
+    #[cfg(feature = "ai")]
+    pub(crate) async fn call_ai(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        crate::stdlib::ai::dispatch(self, func, args, span).await
+    }
+
+    /// Mutable borrow of the per-`Interp` AI client state. SP11 take-out-across-await
+    /// helper: callers clone out the genai `Client` (cheap `Arc` inside) before any
+    /// `.await`, never holding this borrow across one.
+    #[cfg(feature = "ai")]
+    pub(crate) fn ai_state(&self) -> std::cell::RefMut<'_, crate::stdlib::ai::AiClient> {
+        self.ai.borrow_mut()
+    }
+
     /// Is the captured output buffer empty? (REPL flush check.) Always true under
     /// `Live`.
     pub(crate) fn output_is_empty(&self) -> bool {
@@ -1486,6 +1526,48 @@ impl Interp {
             kind,
             fields,
         }))
+    }
+
+    /// Mint a `Value::Native` handle carrying only plain readable `fields` and NO
+    /// backing OS resource (no `resources` table entry). Used by SP11 std/ai's
+    /// provider/model/tool handles, which are pure config data — there is nothing to
+    /// reclaim on drop, so they need no `ResourceState`. The id is still unique.
+    #[cfg(feature = "ai")]
+    pub(crate) fn make_native_data(
+        &self,
+        kind: crate::value::NativeKind,
+        fields: indexmap::IndexMap<String, Value>,
+    ) -> Value {
+        let id = self.next_id();
+        Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
+    }
+
+    /// Drive a value to completion if it is a `Value::Future` (an `async fn`
+    /// return), else return it unchanged. SP11's tool loop uses this to await an
+    /// `async fn` tool `execute` (mirrors the `await` operator's semantics:
+    /// `await` on a non-future is identity). A panic in the spawned task
+    /// re-surfaces here.
+    #[cfg(feature = "ai")]
+    pub(crate) async fn await_if_future(&self, v: Value) -> Result<Value, Control> {
+        match v {
+            Value::Future(f) => f.get().await,
+            other => Ok(other),
+        }
+    }
+
+    /// Project a `shape:` argument (a `Value::Class` or a `std/schema` tagged
+    /// Object) into a JSON Schema (`serde_json::Value`) for SP11 structured output.
+    /// A class's nested `Type::Named` fields resolve through the class's `def_env`
+    /// (the same environment `validate_into` uses), so nested-class / `array<Class>` /
+    /// `map<K,Class>` fields project to their full nested schema.
+    #[cfg(feature = "ai")]
+    pub(crate) fn project_shape_json(&self, shape: &Value) -> serde_json::Value {
+        match shape {
+            Value::Class(c) => {
+                crate::stdlib::ai::json_schema::class_to_json_schema_env(c, &c.def_env)
+            }
+            other => crate::stdlib::ai::json_schema::schema_value_to_json_schema(other),
+        }
     }
 
     /// Remove and return the resource for `id` (used by `close`/`kill`/EOF, and to
@@ -3039,6 +3121,13 @@ impl Interp {
                 return self.call_terminal_method(&m, args, span).await;
             }
         }
+        #[cfg(feature = "ai")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, AiProvider | AiModel | AiStream | AiTextStream | AiTool) {
+                return crate::stdlib::ai::call_method(self, &m, args, span).await;
+            }
+        }
         {
             use crate::value::NativeKind::*;
             if matches!(m.receiver.kind, Interval) {
@@ -4477,15 +4566,20 @@ pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'s
     {
         use crate::value::NativeKind::*;
         match kind {
-            WsConnection => Some("recv"),
-            SseStream => Some("next"),
-            _ => None,
+            WsConnection => return Some("recv"),
+            SseStream => return Some("next"),
+            _ => {}
         }
     }
-    #[cfg(not(feature = "net"))]
+    #[cfg(feature = "ai")]
     {
-        None
+        use crate::value::NativeKind::*;
+        if matches!(kind, AiStream | AiTextStream) {
+            return Some("next");
+        }
     }
+    let _ = kind;
+    None
 }
 
 /// Human-readable type name for diagnostics.

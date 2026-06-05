@@ -438,6 +438,30 @@ pub enum NativeKind {
     // initialized — every method is a no-op. Feature `telemetry`.
     #[cfg(feature = "telemetry")]
     TelemetryNoop,
+    // SP11 std/ai: a provider handle (`ai.provider(kind, config)`). Pure config in
+    // `fields` (kind/baseUrl/apiKey/apiVersion/headers) — no OS resource. Method:
+    // `.model(id)` → an AiModel handle. Feature `ai`.
+    #[cfg(feature = "ai")]
+    AiProvider,
+    // SP11 std/ai: a model handle (`provider.model(id)`). Carries the resolved
+    // provider config + model name in `fields`; consumed by ai.generate/stream/embed
+    // as the `model:` argument. Feature `ai`.
+    #[cfg(feature = "ai")]
+    AiModel,
+    // SP11 std/ai: a streaming chat handle (`ai.stream(...)`). Backed by an
+    // `AiStream` resource; methods `next()`/`textOnly()`/`result()`, consumable by
+    // `for await`. Feature `ai`.
+    #[cfg(feature = "ai")]
+    AiStream,
+    // SP11 std/ai: a text-only streaming adapter (`stream.textOnly()`), yielding bare
+    // text strings; shares the underlying `AiStream` resource. Feature `ai`.
+    #[cfg(feature = "ai")]
+    AiTextStream,
+    // SP11 std/ai: a tool definition (`ai.tool({description, input, execute})`).
+    // Carries description/input-schema/execute fn in `fields`; consumed by
+    // ai.generate's `tools:` map. Feature `ai`.
+    #[cfg(feature = "ai")]
+    AiTool,
 }
 
 impl NativeKind {
@@ -477,6 +501,16 @@ impl NativeKind {
             NativeKind::TelemetryInstrument => "instrument",
             #[cfg(feature = "telemetry")]
             NativeKind::TelemetryNoop => "telemetryNoop",
+            #[cfg(feature = "ai")]
+            NativeKind::AiProvider => "aiProvider",
+            #[cfg(feature = "ai")]
+            NativeKind::AiModel => "aiModel",
+            #[cfg(feature = "ai")]
+            NativeKind::AiStream => "aiStream",
+            #[cfg(feature = "ai")]
+            NativeKind::AiTextStream => "aiTextStream",
+            #[cfg(feature = "ai")]
+            NativeKind::AiTool => "aiTool",
         }
     }
 }

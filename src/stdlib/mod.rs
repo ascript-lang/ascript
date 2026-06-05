@@ -4,6 +4,8 @@
 //! qualified builtin names (`"math.abs"`) to. Per spec §11.3, native functions
 //! are ordinary `function` values; argument-type misuse is a Tier-2 panic.
 
+#[cfg(feature = "ai")]
+pub mod ai;
 pub mod array;
 pub mod assert_mod;
 pub mod bench;
@@ -104,6 +106,8 @@ pub(crate) fn bi(qualified: &str) -> Value {
 /// if `path` is not a known stdlib module.
 pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
     let list: Vec<(&'static str, Value)> = match path {
+        #[cfg(feature = "ai")]
+        "std/ai" => ai::exports(),
         "std/assert" => assert_mod::exports(),
         "std/bench" => bench::exports(),
         "std/cli" => cli::exports(),
@@ -201,6 +205,7 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
 /// here even in a `--no-default-features` build. Keep this in sync with
 /// `std_module_exports` (and the `call` routing) whenever a module is added.
 pub const STD_MODULES: &[&str] = &[
+    "std/ai",
     "std/assert",
     "std/bench",
     "std/cli",
@@ -352,6 +357,8 @@ impl Interp {
             }
         }
         match module {
+            #[cfg(feature = "ai")]
+            "ai" => self.call_ai(func, args, span).await,
             "assert" => self.call_assert(func, args, span).await,
             "bench" => self.call_bench(func, args, span).await,
             "cli" => self.call_cli(func, args, span).await,

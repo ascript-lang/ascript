@@ -843,6 +843,14 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/sse_client.as",
         SkipReason::Nondeterministic,
     ),
+    // SP11 std/ai examples: their output is environment-dependent — with no provider
+    // key they print Tier-1 "no credential" messages, but the OpenAI-compatible local
+    // line ("local model unavailable: <reqwest error>") depends on whether a local
+    // Ollama is listening, and a real key would print a live model response. So the
+    // output is not a stable two-run constant. They are exercised by the dedicated
+    // fixture-replay suite (`tests/ai.rs`), not this stdout-equality corpus oracle.
+    ("examples/advanced/ai_chat.as", SkipReason::Nondeterministic),
+    ("examples/advanced/ai_tools.as", SkipReason::Nondeterministic),
     // `typed_api.as` is byte-identical on the VM EXCEPT for the ephemeral bound
     // port it prints (`server bound on http://127.0.0.1:<port>`): the OS assigns a
     // fresh port to each of the two separate runs (tree-walker then VM), so the
