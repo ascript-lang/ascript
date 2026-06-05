@@ -132,6 +132,54 @@ fn treesitter_parses_static_methods() {
     }
 }
 
+fn query_files() -> Vec<PathBuf> {
+    // Resolve relative to the crate manifest so the test is cwd-independent.
+    let query_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("docs/superpowers/specs/grammar/tree-sitter-ascript/queries");
+    let mut files = Vec::new();
+    let entries = fs::read_dir(&query_dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", query_dir.display()));
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|s| s.to_str()) == Some("scm") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no queries/*.scm files found in {}",
+        query_dir.display()
+    );
+    files
+}
+
+/// Drift guard: every `queries/*.scm` must compile against the grammar. A grammar
+/// change that renames/removes a node or field (without updating the queries) makes
+/// `Query::new` fail here — so query drift breaks CI, not an editor at runtime.
+///
+/// The set is enumerated dynamically so any newly added query file is auto-covered.
+#[test]
+fn queries_compile_against_grammar() {
+    let lang = language();
+
+    let mut failed = Vec::new();
+    let files = query_files();
+    for path in &files {
+        let src = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        if let Err(e) = tree_sitter::Query::new(&lang, &src) {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("?");
+            failed.push(format!("{name}: {e:?}"));
+        }
+    }
+
+    assert!(
+        failed.is_empty(),
+        "queries failed to compile against the grammar: {failed:?}"
+    );
+}
+
 #[test]
 fn interpreter_parser_accepts_all_examples() {
     let mut failures = Vec::new();
