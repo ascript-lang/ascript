@@ -50,7 +50,7 @@ pub fn parse_hex_body(body: &str) -> Option<Rgba> {
     }
     let hx = |s: &str| u8::from_str_radix(s, 16).ok();
     let dup = |c: char| {
-        let s: String = std::iter::repeat(c).take(2).collect();
+        let s: String = std::iter::repeat_n(c, 2).collect();
         u8::from_str_radix(&s, 16).ok()
     };
     match body.len() {
@@ -141,7 +141,7 @@ fn recognize_rgb_calls(model: &SemanticModel, out: &mut Vec<ColorHit>) {
         let Some(member) = call.children().find(|c| c.kind() == SyntaxKind::MemberExpr) else {
             continue;
         };
-        let Some((recv, method)) = member_recv_method(&member) else {
+        let Some((recv, method)) = member_recv_method(member) else {
             continue;
         };
         if recv != "color" {
@@ -186,7 +186,7 @@ fn member_recv_method(member: &ResolvedNode) -> Option<(String, String)> {
     let recv = member
         .children()
         .find(|c| c.kind() == SyntaxKind::NameRef)
-        .and_then(|n| crate::syntax::resolve::ident_text(&n))?;
+        .and_then(crate::syntax::resolve::ident_text)?;
     // The member name is the trailing `Ident` token of the MemberExpr.
     let method = member
         .children_with_tokens()
@@ -264,7 +264,7 @@ fn string_in_color_sink(_model: &SemanticModel, str_node: &ResolvedNode) -> bool
     let Some(member) = call.children().find(|c| c.kind() == SyntaxKind::MemberExpr) else {
         return false;
     };
-    let Some((recv, method)) = member_recv_method(&member) else {
+    let Some((recv, method)) = member_recv_method(member) else {
         return false;
     };
     // The string's arg index = its position among the arglist's expression children.
@@ -326,10 +326,10 @@ fn recognize_color_strings(
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::Literal)
     {
-        let Some((body, quote)) = string_body(&s) else {
+        let Some((body, quote)) = string_body(s) else {
             continue;
         };
-        if !detect_everywhere && !string_in_color_sink(model, &s) {
+        if !detect_everywhere && !string_in_color_sink(model, s) {
             continue; // THE #100 GUARD: an ungated label string is never a swatch.
         }
         let span = ByteSpan::from(s.text_range());
@@ -412,6 +412,100 @@ fn hsl_to_rgba(h: f64, s: f64, l: f64, a: u8) -> Rgba {
     let m = l - c / 2.0;
     let q = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
     Rgba { r: q(r1), g: q(g1), b: q(b1), a }
+}
+
+use tower_lsp::lsp_types::{ColorInformation, ColorPresentation, TextEdit};
+
+/// All detected colors in the document (the documentColor provider). Runs the
+/// recognizer registry; `detect_hex_strings_everywhere` broadens the string
+/// recognizers past the color-sink gate (default off).
+pub fn document_colors(
+    model: &SemanticModel,
+    detect_hex_strings_everywhere: bool,
+) -> Vec<ColorInformation> {
+    let mut hits: Vec<ColorHit> = Vec::new();
+    recognize_rgb_calls(model, &mut hits);
+    recognize_rgb_arrays(model, &mut hits);
+    recognize_color_strings(model, detect_hex_strings_everywhere, &mut hits);
+    hits.into_iter()
+        .map(|h| ColorInformation {
+            range: crate::lsp::convert::byte_span_to_range(&model.text, &model.line_index, h.span),
+            color: h.color.to_lsp(),
+        })
+        .collect()
+}
+
+/// Format-preserving presentations for the color picked at `range`, plus
+/// cross-format alternatives. The FIRST presentation preserves the source form;
+/// the rest offer hex6/hex8/rgb/rgba (and a `color.rgb(...)` arg edit for a call
+/// form). The `form` is recovered by re-detecting the hit at `range`.
+pub fn color_presentations(
+    model: &SemanticModel,
+    color: Rgba,
+    range: tower_lsp::lsp_types::Range,
+) -> Vec<ColorPresentation> {
+    // Re-detect the hit covering `range` to know its source form.
+    let target = range_to_byte_span(model, range);
+    let form = find_form_at(model, target);
+    let mut out: Vec<ColorPresentation> = Vec::new();
+    let edit = |label: String, text: String| ColorPresentation {
+        label,
+        text_edit: Some(TextEdit { range, new_text: text }),
+        additional_text_edits: None,
+    };
+    let hex6 = format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b);
+    let hex8 = format!("#{:02x}{:02x}{:02x}{:02x}", color.r, color.g, color.b, color.a);
+    let rgb = format!("rgb({}, {}, {})", color.r, color.g, color.b);
+    let rgba = format!(
+        "rgba({}, {}, {}, {:.3})",
+        color.r,
+        color.g,
+        color.b,
+        color.a as f32 / 255.0
+    );
+    match form {
+        Some(ColorForm::RgbCall { bg, .. }) => {
+            // Edit the numeric args in place (the range is the args span).
+            out.push(edit(
+                format!("color.{}", if bg { "bgRgb" } else { "rgb" }),
+                format!("{}, {}, {}", color.r, color.g, color.b),
+            ));
+        }
+        Some(ColorForm::ArrayLiteral) => {
+            out.push(edit(
+                "[r, g, b]".into(),
+                format!("[{}, {}, {}]", color.r, color.g, color.b),
+            ));
+        }
+        Some(ColorForm::HexString { quote }) | Some(ColorForm::FunctionalString { quote }) => {
+            let h = if color.a == 255 { &hex6 } else { &hex8 };
+            out.push(edit(h.clone(), format!("{quote}{h}{quote}")));
+            out.push(edit(rgb.clone(), format!("{quote}{rgb}{quote}")));
+            out.push(edit(rgba.clone(), format!("{quote}{rgba}{quote}")));
+        }
+        None => {
+            // Unknown form (range did not re-detect): offer bare hex.
+            out.push(edit(hex6.clone(), hex6.clone()));
+        }
+    }
+    out
+}
+
+fn range_to_byte_span(model: &SemanticModel, range: tower_lsp::lsp_types::Range) -> ByteSpan {
+    let start =
+        crate::lsp::convert::char_to_byte(&model.text, model.line_index.offset(range.start));
+    let end = crate::lsp::convert::char_to_byte(&model.text, model.line_index.offset(range.end));
+    ByteSpan { start, end }
+}
+
+fn find_form_at(model: &SemanticModel, target: ByteSpan) -> Option<ColorForm> {
+    let mut hits = Vec::new();
+    recognize_rgb_calls(model, &mut hits);
+    recognize_rgb_arrays(model, &mut hits);
+    recognize_color_strings(model, true, &mut hits);
+    hits.into_iter()
+        .find(|h| h.span == target || (h.span.start <= target.start && h.span.end >= target.end))
+        .map(|h| h.form)
 }
 
 #[cfg(test)]
@@ -538,5 +632,34 @@ mod string_context_tests {
         assert_eq!(parse_functional("rgba(0, 0, 0, 0.5)").unwrap().a, 128);
         assert_eq!(parse_functional("hsl(0, 100%, 50%)"), Some(Rgba::rgb(255, 0, 0)));
         assert_eq!(parse_functional("nope(1,2)"), None);
+    }
+}
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    fn model(src: &str) -> SemanticModel {
+        SemanticModel::build(src.to_string(), None, &LintConfig::default())
+    }
+
+    #[test]
+    fn document_colors_finds_rgb_call() {
+        let m = model("let s = color.rgb(255, 0, 0, \"x\")\n");
+        let cs = document_colors(&m, false);
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].color.red, 1.0);
+    }
+
+    #[test]
+    fn presentation_for_rgb_call_edits_args() {
+        let m = model("let s = color.rgb(255, 0, 0, \"x\")\n");
+        let cs = document_colors(&m, false);
+        let r = cs[0].range;
+        let ps = color_presentations(&m, Rgba::rgb(0, 128, 255), r);
+        assert!(!ps.is_empty());
+        let te = ps[0].text_edit.as_ref().unwrap();
+        assert_eq!(te.new_text, "0, 128, 255");
     }
 }
