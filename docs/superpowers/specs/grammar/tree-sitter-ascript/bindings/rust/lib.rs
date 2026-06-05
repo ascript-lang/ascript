@@ -31,9 +31,9 @@ pub const TEXTOBJECTS_QUERY: &str = include_str!("../../queries/textobjects.scm"
 
 /// The symbol-tagging query (nav / ctags-style indexing) for this grammar.
 pub const TAGS_QUERY: &str = include_str!("../../queries/tags.scm");
-// NOTE: the BRACKETS query constant is
-// added by its creating task (Phase 5 Task 10) so this crate always compiles —
-// `include_str!` requires the target file to exist.
+
+/// The bracket-matching query for this grammar.
+pub const BRACKETS_QUERY: &str = include_str!("../../queries/brackets.scm");
 
 #[cfg(test)]
 mod tests {
