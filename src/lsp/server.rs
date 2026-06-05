@@ -238,23 +238,20 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let store = self.documents.lock().await;
-        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
+        let byte = crate::lsp::providers::docs::byte_offset_at(model, position);
         // SP4 §4: try the cross-file index first — if the use at the cursor is an
-        // imported/cross-file name, return a `Location` in the TARGET file.
+        // imported/cross-file name (or a top-level/module global), return a
+        // `Location` in the TARGET file.
         if let Some(path) = url_to_canon(&uri) {
-            let xfile = self
-                .index
-                .read()
-                .ok()
-                .and_then(|idx| idx.definition_at(&path, char_to_byte(text, offset)).map(
-                    |(def_path, span)| {
-                        let target_text = idx_text(&idx, &def_path).unwrap_or_default();
-                        (def_path, workspace::byte_span_to_range(&target_text, span))
-                    },
-                ));
+            let xfile = self.index.read().ok().and_then(|idx| {
+                idx.definition_at(&path, byte).map(|(def_path, span)| {
+                    let target_text = idx_text(&idx, &def_path).unwrap_or_default();
+                    (def_path, workspace::byte_span_to_range(&target_text, span))
+                })
+            });
             if let Some((def_path, range)) = xfile {
                 if let Some(target_uri) = canon_to_url(&def_path) {
                     return Ok(Some(GotoDefinitionResponse::Scalar(Location {
@@ -264,8 +261,9 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        // Fall back to the single-file analysis (same-file local/decl).
-        let Some(range) = analysis::definition(text, offset) else {
+        // Fall back to the single-file resolver provider (same-file local/param/
+        // upvalue bindings the cross-file index does not track).
+        let Some(range) = crate::lsp::providers::navigation::definition_in_file(model, byte) else {
             return Ok(None);
         };
         Ok(Some(GotoDefinitionResponse::Scalar(Location {
