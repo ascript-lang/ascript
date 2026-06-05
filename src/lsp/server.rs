@@ -153,8 +153,18 @@ pub fn server_capabilities() -> ServerCapabilities {
         // Phase 3: call hierarchy (prepare/incoming/outgoing) over the workspace
         // index call graph.
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+        // Phase 3: type hierarchy (prepare/supertypes/subtypes) for classes/enums.
+        // `lsp-types` 0.94 `ServerCapabilities` has NO `type_hierarchy_provider`
+        // field, so it is advertised through the `experimental` escape hatch
+        // (tower-lsp routes the `textDocument/prepareTypeHierarchy` method
+        // regardless of the advertised capability shape).
+        experimental: Some(serde_json::json!({ "typeHierarchyProvider": true })),
         // SP4 §4: cross-file navigation providers backed by the workspace index.
-        workspace_symbol_provider: Some(OneOf::Left(true)),
+        // Phase 3: advertise lazy `workspaceSymbol/resolve` via the options form.
+        workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+            resolve_provider: Some(true),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         references_provider: Some(OneOf::Left(true)),
         rename_provider: Some(OneOf::Right(RenameOptions {
             prepare_provider: Some(true),
@@ -893,6 +903,15 @@ impl LanguageServer for Backend {
             });
         }
         Ok(Some(out))
+    }
+
+    async fn symbol_resolve(
+        &self,
+        params: WorkspaceSymbol,
+    ) -> tower_lsp::jsonrpc::Result<WorkspaceSymbol> {
+        Ok(crate::lsp::providers::symbols::resolve_workspace_symbol(
+            params,
+        ))
     }
 
     async fn prepare_rename(

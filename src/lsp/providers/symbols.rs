@@ -211,6 +211,40 @@ fn enum_children(model: &SemanticModel, enm: &ResolvedNode) -> Vec<DocumentSymbo
     out
 }
 
+use tower_lsp::lsp_types::WorkspaceSymbol;
+
+/// Resolve a `WorkspaceSymbol` lazily: v1 is a no-op pass-through (the initial
+/// `workspaceSymbol` response is already fully formed for AScript's flat symbol
+/// set), provided as the resolve hook so the capability can advertise
+/// `resolve_provider: true` and grow detail later (container, signature) without a
+/// protocol change.
+pub fn resolve_workspace_symbol(symbol: WorkspaceSymbol) -> WorkspaceSymbol {
+    symbol
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use tower_lsp::lsp_types::{Location, OneOf, SymbolKind, Url};
+
+    #[test]
+    fn resolve_is_identity_v1() {
+        let sym = WorkspaceSymbol {
+            name: "f".to_string(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            container_name: None,
+            location: OneOf::Left(Location {
+                uri: Url::parse("file:///ws/a.as").unwrap(),
+                range: Default::default(),
+            }),
+            data: None,
+        };
+        let resolved = resolve_workspace_symbol(sym.clone());
+        assert_eq!(resolved.name, sym.name);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
