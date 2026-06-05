@@ -26,6 +26,11 @@ use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::ResolveResult;
 use std::collections::HashMap;
 
+/// A flow refinement: a binding narrowed to a `CheckTy` within a branch.
+type Refinement = (BindingKey, CheckTy);
+/// The (then-branch, else-branch) refinements computed for an `if` condition.
+type BranchRefinements = (Vec<Refinement>, Vec<Refinement>);
+
 /// A collected hover type: the byte span of a name use and its rendered `CheckTy`.
 pub struct HoverType {
     pub range: ByteSpan,
@@ -294,12 +299,7 @@ impl<'a> Pass<'a> {
     /// truthiness `x` (narrows away `Nil` only — AScript `0`/`""` are truthy), and
     /// `!x`. Keys off the resolved binding (`BindingKey`), never the textual name.
     /// Returns refinements only for a binding whose current type is `T?`.
-    #[allow(clippy::type_complexity)]
-    fn condition_narrowing(
-        &self,
-        cond: &ResolvedNode,
-        env: &Env,
-    ) -> (Vec<(BindingKey, CheckTy)>, Vec<(BindingKey, CheckTy)>) {
+    fn condition_narrowing(&self, cond: &ResolvedNode, env: &Env) -> BranchRefinements {
         use SyntaxKind::*;
         match cond.kind() {
             ParenExpr => first_expr_child(cond)
@@ -381,12 +381,7 @@ impl<'a> Pass<'a> {
     /// Narrowing for `x instanceof C` (§4 form 2). then: x → `Class(C)`; else:
     /// meet-subtract `Class(C)` from x when x is currently a union of classes (for
     /// `Any`/non-class-union x, the else refinement is omitted — stays gradual).
-    #[allow(clippy::type_complexity)]
-    fn instanceof_narrowing(
-        &self,
-        cond: &ResolvedNode,
-        env: &Env,
-    ) -> (Vec<(BindingKey, CheckTy)>, Vec<(BindingKey, CheckTy)>) {
+    fn instanceof_narrowing(&self, cond: &ResolvedNode, env: &Env) -> BranchRefinements {
         let operands: Vec<ResolvedNode> = cond
             .children()
             .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
