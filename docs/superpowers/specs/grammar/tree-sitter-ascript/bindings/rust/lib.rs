@@ -22,8 +22,11 @@ pub const LOCALS_QUERY: &str = include_str!("../../queries/locals.scm");
 
 /// The code-folding query for this grammar.
 pub const FOLDS_QUERY: &str = include_str!("../../queries/folds.scm");
-// NOTE: INDENTS/TEXTOBJECTS/TAGS/BRACKETS query constants are
-// added by their creating tasks (Phase 5 Tasks 7–10) so this crate always compiles —
+
+/// The indentation query for this grammar.
+pub const INDENTS_QUERY: &str = include_str!("../../queries/indents.scm");
+// NOTE: TEXTOBJECTS/TAGS/BRACKETS query constants are
+// added by their creating tasks (Phase 5 Tasks 8–10) so this crate always compiles —
 // `include_str!` requires the target file to exist.
 
 #[cfg(test)]
