@@ -13,6 +13,7 @@ const NAV = [
     ['introduction', 'Overview'],
     ['getting-started', 'Getting started'],
     ['cli', 'The ascript CLI'],
+    ['packages', 'Packages & dependencies'],
     ['runtime', 'Compilation & runtime'],
   ]},
   { title: 'Language', items: [
