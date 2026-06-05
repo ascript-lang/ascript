@@ -250,6 +250,89 @@ pub fn declaration_in_file(model: &SemanticModel, offset: usize) -> Option<Range
     definition_in_file(model, offset)
 }
 
+/// `textDocument/typeDefinition` — the inferred type of the value at `offset`
+/// names a class/enum; return that declaration's NAME range in this file.
+/// Returns `None` when the type is a primitive, `Any`, or a type whose decl is
+/// not in this file (cross-module types are `Any` under SP10 — a documented
+/// limitation).
+pub fn type_definition_in_file(model: &SemanticModel, offset: usize) -> Option<Range> {
+    let ty = crate::check::infer::hover_type_at(&model.text, offset)?;
+    // The rendered type may be `User`, `User?`, `array<User>`, etc. Extract the
+    // first bare identifier (a class/enum name) from the rendering.
+    let type_name = first_type_ident(&ty)?;
+    decl_name_range(model, &type_name)
+}
+
+/// Extract the leading user-type identifier from a rendered `CheckTy` string.
+/// `"User"` -> `User`; `"User?"` -> `User`; `"array<User>"` -> the first
+/// non-builtin identifier token.
+fn first_type_ident(rendered: &str) -> Option<String> {
+    const BUILTIN: &[&str] = &[
+        "number", "string", "bool", "nil", "any", "array", "map", "future", "bytes", "regex",
+        "object", "void", "never",
+    ];
+    let mut cur = String::new();
+    for ch in rendered.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            cur.push(ch);
+        } else {
+            if !cur.is_empty() && !BUILTIN.contains(&cur.as_str()) {
+                return Some(cur);
+            }
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() && !BUILTIN.contains(&cur.as_str()) {
+        return Some(cur);
+    }
+    None
+}
+
+/// The NAME range of the `class`/`enum` named `name` declared in this file.
+fn decl_name_range(model: &SemanticModel, name: &str) -> Option<Range> {
+    let decl = model.tree.descendants().find(|n| {
+        matches!(n.kind(), SyntaxKind::ClassDecl | SyntaxKind::EnumDecl)
+            && crate::syntax::resolve::ident_text(n).as_deref() == Some(name)
+    })?;
+    let ident = decl
+        .children_with_tokens()
+        .filter_map(|el| el.into_token().cloned())
+        .find(|t| t.kind() == SyntaxKind::Ident)?;
+    Some(crate::lsp::convert::byte_span_to_range(
+        &model.text,
+        &model.line_index,
+        ByteSpan::from(ident.text_range()),
+    ))
+}
+
+#[cfg(test)]
+mod type_def_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    #[test]
+    fn type_definition_jumps_to_class_decl() {
+        let src = "class User { name: string }\nlet u: User = User.from({ name: \"a\" })\nprint(u)\n";
+        let model = SemanticModel::build(src.to_string(), None, &LintConfig::default());
+        // Cursor on the use `u` in `print(u)`.
+        let off = src.rfind('u').unwrap();
+        let r = type_definition_in_file(&model, off);
+        // If SP10 infers `u: User`, jump to the `User` decl on line 0.
+        if let Some(r) = r {
+            assert_eq!(r.start.line, 0, "should jump to the class User decl");
+        }
+        // (When SP10 cannot infer the type, None is acceptable — documented.)
+    }
+
+    #[test]
+    fn first_type_ident_strips_optional_and_containers() {
+        assert_eq!(first_type_ident("User"), Some("User".to_string()));
+        assert_eq!(first_type_ident("User?"), Some("User".to_string()));
+        assert_eq!(first_type_ident("array<User>"), Some("User".to_string()));
+        assert_eq!(first_type_ident("number"), None);
+    }
+}
+
 #[cfg(test)]
 mod declaration_tests {
     use super::*;

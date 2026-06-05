@@ -91,6 +91,8 @@ pub fn server_capabilities() -> ServerCapabilities {
         // Phase 3: declaration ≈ definition for AScript (no separate forward
         // declaration concept).
         declaration_provider: Some(DeclarationCapability::Simple(true)),
+        // Phase 3: jump to the inferred type's class/enum decl (in-file).
+        type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
         code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
@@ -528,6 +530,23 @@ impl LanguageServer for Backend {
         Ok(
             crate::lsp::providers::navigation::declaration_in_file(model, offset)
                 .map(|range| request::GotoDeclarationResponse::Scalar(Location { uri, range })),
+        )
+    }
+
+    async fn goto_type_definition(
+        &self,
+        params: request::GotoTypeDefinitionParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<request::GotoTypeDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(
+            crate::lsp::providers::navigation::type_definition_in_file(model, offset)
+                .map(|range| request::GotoTypeDefinitionResponse::Scalar(Location { uri, range })),
         )
     }
 
