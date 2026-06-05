@@ -119,6 +119,9 @@ pub fn server_capabilities() -> ServerCapabilities {
             commands: vec![crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string()],
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
+        // Phase 3: call hierarchy (prepare/incoming/outgoing) over the workspace
+        // index call graph.
+        call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
         // SP4 §4: cross-file navigation providers backed by the workspace index.
         workspace_symbol_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
@@ -586,6 +589,125 @@ impl LanguageServer for Backend {
         Ok(Some(request::GotoImplementationResponse::Array(locs)))
     }
 
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(path) = url_to_canon(&uri) else {
+            return Ok(None);
+        };
+        let offset = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            crate::lsp::providers::docs::byte_offset_at(model, position)
+        };
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_call(&idx, &path, offset)
+        else {
+            return Ok(None);
+        };
+        let Some(item) = call_item(&idx, &anchor.path, &anchor.name, anchor.name_range) else {
+            return Ok(None);
+        };
+        Ok(Some(vec![item]))
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let item = params.item;
+        let Some(path) = url_to_canon(&item.uri) else {
+            return Ok(None);
+        };
+        let offset = {
+            let Ok(idx) = self.index.read() else {
+                return Ok(None);
+            };
+            let text = idx_text(&idx, &path).unwrap_or_default();
+            range_start_byte(&text, item.selection_range)
+        };
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_call(&idx, &path, offset)
+        else {
+            return Ok(None);
+        };
+        // Group the incoming reference sites by the file they occur in.
+        let mut by_file: HashMap<PathBuf, Vec<Range>> = HashMap::new();
+        for (p, span) in crate::lsp::providers::hierarchy::incoming_calls(&idx, &anchor) {
+            let text = idx_text(&idx, &p).unwrap_or_default();
+            by_file
+                .entry(p)
+                .or_default()
+                .push(workspace::byte_span_to_range(&text, span));
+        }
+        let mut out = Vec::new();
+        for (p, from_ranges) in by_file {
+            // The caller item: the FILE that contains the reference (its own name
+            // is the file stem — a coarse but valid "from" item per LSP).
+            let Some(from) = file_call_item(&idx, &p) else {
+                continue;
+            };
+            out.push(CallHierarchyIncomingCall { from, from_ranges });
+        }
+        Ok(Some(out))
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let item = params.item;
+        let Some(path) = url_to_canon(&item.uri) else {
+            return Ok(None);
+        };
+        // The anchor file's cached model drives the CST walk of the fn body.
+        let model_text = {
+            let store = self.documents.lock().await;
+            store.get(&item.uri).map(|m| m.text.clone())
+        };
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let text = model_text
+            .clone()
+            .or_else(|| idx_text(&idx, &path))
+            .unwrap_or_default();
+        let offset = range_start_byte(&text, item.selection_range);
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_call(&idx, &path, offset)
+        else {
+            return Ok(None);
+        };
+        let model = crate::lsp::model::SemanticModel::build(
+            text,
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        let mut out = Vec::new();
+        for call in crate::lsp::providers::hierarchy::outgoing_calls(&idx, &model, &anchor) {
+            let Some((def_path, def_span)) = call.def else {
+                continue; // unresolved callee — skip
+            };
+            let Some(to) = call_item(&idx, &def_path, &call.name, def_span) else {
+                continue;
+            };
+            let from_range = workspace::byte_span_to_range(&model.text, call.call_site);
+            out.push(CallHierarchyOutgoingCall {
+                to,
+                from_ranges: vec![from_range],
+            });
+        }
+        Ok(Some(out))
+    }
+
     async fn folding_range(
         &self,
         params: FoldingRangeParams,
@@ -776,6 +898,61 @@ impl LanguageServer for Backend {
 /// The text of an indexed file (from its `FileIndex.text`).
 fn idx_text(idx: &WorkspaceIndex, path: &std::path::Path) -> Option<String> {
     idx.files.get(path).map(|f| f.text.clone())
+}
+
+/// Build a `CallHierarchyItem` for a named callable defined at `name_range` in
+/// `path` (kind `FUNCTION`; `range`/`selection_range` are the name span).
+fn call_item(
+    idx: &WorkspaceIndex,
+    path: &std::path::Path,
+    name: &str,
+    name_range: crate::check::ByteSpan,
+) -> Option<CallHierarchyItem> {
+    let uri = canon_to_url(path)?;
+    let text = idx_text(idx, path).unwrap_or_default();
+    let range = workspace::byte_span_to_range(&text, name_range);
+    #[allow(deprecated)]
+    Some(CallHierarchyItem {
+        name: name.to_string(),
+        kind: SymbolKind::FUNCTION,
+        tags: None,
+        detail: None,
+        uri,
+        range,
+        selection_range: range,
+        data: None,
+    })
+}
+
+/// Build a coarse file-level `CallHierarchyItem` for an INCOMING-call caller: the
+/// item is the file itself (kind `FILE`, name = file stem), with the call sites in
+/// `from_ranges`. Used when a reference's enclosing function is not separately
+/// resolved.
+fn file_call_item(idx: &WorkspaceIndex, path: &std::path::Path) -> Option<CallHierarchyItem> {
+    let uri = canon_to_url(path)?;
+    let _ = idx_text(idx, path); // ensure the file is known to the index
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<file>".to_string());
+    let zero = Range::new(Position::new(0, 0), Position::new(0, 0));
+    #[allow(deprecated)]
+    Some(CallHierarchyItem {
+        name,
+        kind: SymbolKind::FILE,
+        tags: None,
+        detail: None,
+        uri,
+        range: zero,
+        selection_range: zero,
+        data: None,
+    })
+}
+
+/// The byte offset of `range`'s start within `text` (LSP position → char → byte).
+fn range_start_byte(text: &str, range: Range) -> usize {
+    let char_off = crate::lsp::line_index::LineIndex::new(text).offset(range.start);
+    char_to_byte(text, char_off)
 }
 
 /// Char offset → byte offset within `text` (the index keys on bytes; LSP

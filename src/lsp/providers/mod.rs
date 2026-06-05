@@ -5,6 +5,7 @@ pub mod completion;
 pub mod docs;
 pub mod folding;
 pub mod formatting;
+pub mod hierarchy;
 pub mod highlight;
 pub mod hover;
 pub mod inlay;
