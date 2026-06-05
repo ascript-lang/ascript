@@ -8,7 +8,9 @@
 
 use crate::lsp::model::SemanticModel;
 use crate::syntax::resolve::types::BindingKind;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat};
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
+};
 
 /// The AScript keywords offered as completions (KEYWORD kind). Mirrors the lexer's
 /// keyword table plus `match`.
@@ -128,6 +130,42 @@ fn snippet_completions() -> Vec<CompletionItem> {
         .collect()
 }
 
+/// Auto-import candidates: every std export NOT already imported, each carrying an
+/// `additionalTextEdits` that inserts an `import { name } from "<path>"` line at the
+/// top of the file. Reuses the `STD_MODULE_PATHS` set the import-path-string context
+/// offers; the LSP never stores a `Value` (mirrors the namespace-member branch — it
+/// takes ONLY the export name).
+fn auto_import_candidates(model: &SemanticModel) -> Vec<CompletionItem> {
+    // Names already imported (named or namespace) — never re-offer these.
+    let imported: std::collections::HashSet<String> = model
+        .resolved
+        .bindings
+        .iter()
+        .filter(|b| matches!(b.kind, BindingKind::Import))
+        .map(|b| b.name.clone())
+        .collect();
+
+    let mut out = Vec::new();
+    for path in STD_MODULE_PATHS {
+        let Some(exports) = crate::stdlib::std_module_exports(path) else {
+            continue;
+        };
+        for (name, _value) in exports {
+            if imported.contains(&name) {
+                continue;
+            }
+            let mut ci = item(&name, CompletionItemKind::FUNCTION);
+            ci.detail = Some(format!("auto-import from {path}"));
+            ci.additional_text_edits = Some(vec![TextEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                new_text: format!("import {{ {name} }} from \"{path}\"\n"),
+            }]);
+            out.push(ci);
+        }
+    }
+    out
+}
+
 /// Completions at char `offset` in the model's text. Pure and robust: never panics,
 /// and always returns at least the baseline (keywords + builtins) even on partial or
 /// syntactically broken input (completion is requested mid-edit).
@@ -196,6 +234,7 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
     let mut base = baseline_completions();
     base.extend(binding_completions(model));
     base.extend(snippet_completions());
+    base.extend(auto_import_candidates(model));
     base
 }
 
@@ -401,6 +440,27 @@ mod tests {
             .find(|i| i.label == "yield")
             .expect("yield keyword in baseline");
         assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn auto_import_offers_import_edit_for_known_std_export() {
+        // `abs` is exported by std/math; nothing imports it yet.
+        let src = "ab\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let items = completions(&model, 2);
+        let abs = items
+            .iter()
+            .find(|i| i.label == "abs")
+            .expect("abs auto-import offered");
+        let edits = abs.additional_text_edits.as_ref().expect("has import edit");
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits[0].new_text.contains("import") && edits[0].new_text.contains("std/math"),
+            "import edit text: {:?}",
+            edits[0].new_text
+        );
+        // The import is inserted at the top of the file (line 0).
+        assert_eq!(edits[0].range.start.line, 0);
     }
 
     #[test]
