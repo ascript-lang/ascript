@@ -1,12 +1,14 @@
-//! tower-lsp `LanguageServer` implementation: a thin async adapter over the pure
-//! `analysis` layer plus a document store.
+//! tower-lsp `LanguageServer` implementation: a thin async adapter over the cached
+//! `SemanticModel` document store and the pure `providers`.
 //!
-//! The backend is `Send + Sync` because it holds only `Send + Sync` types: the
-//! `Client`, and a `tokio::sync::Mutex<HashMap<Url, String>>` of document text. No
+//! Every capability runs on the CST front-end + cached `SemanticModel` — the legacy
+//! `ast`/`lexer`/`parser` front-end is NOT used here. The backend is `Send + Sync`
+//! because it holds only `Send + Sync` types: the `Client`, and a
+//! `tokio::sync::Mutex<DocumentStore>` of per-document semantic models. No
 //! interpreter state (`Rc`/`RefCell`/`Value`) is ever held, so this compiles on the
 //! `current_thread` tokio runtime AND satisfies tower-lsp's `Send + Sync` bounds.
 
-use crate::lsp::analysis;
+use crate::lsp::model::DocumentStore;
 use crate::lsp::workspace::{self, WorkspaceIndex};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,7 +19,7 @@ use tower_lsp::{Client, LanguageServer};
 
 pub struct Backend {
     client: Client,
-    documents: Mutex<HashMap<Url, String>>,
+    documents: Mutex<DocumentStore>,
     /// The cross-file symbol index (SP4 §4). `RwLock` (not the interpreter's
     /// `RefCell`) keeps the backend `Send + Sync`; it holds only owned
     /// `String`/`PathBuf`/range data, never a `Value`.
@@ -31,7 +33,7 @@ impl Backend {
     pub fn new(client: Client) -> Self {
         Backend {
             client,
-            documents: Mutex::new(HashMap::new()),
+            documents: Mutex::new(DocumentStore::new()),
             index: RwLock::new(WorkspaceIndex::new()),
             roots: RwLock::new(Vec::new()),
         }
@@ -46,19 +48,25 @@ impl Backend {
         }
     }
 
-    /// Store the document text and publish its diagnostics. Merges the path-less
-    /// `analysis::diagnostics` with the index-backed file-module call-arity
-    /// (D-arity), which the single-file analysis cannot compute.
+    /// Build/cache the document's `SemanticModel` and publish its diagnostics.
+    /// Merges the model's config-aware single-file diagnostics with the
+    /// index-backed file-module call-arity (D-arity), which the single-file
+    /// analysis cannot compute.
     async fn analyze_and_publish(&self, uri: Url, text: String, version: Option<i32>) {
-        let mut diags = analysis::diagnostics(&text);
+        let mut diags;
+        {
+            let mut store = self.documents.lock().await;
+            store.set(uri.clone(), text.clone(), version);
+            diags = store.get(&uri).map(|m| m.lsp_diagnostics()).unwrap_or_default();
+        }
+        // Index-backed cross-file arity (cannot be computed single-file).
         if let Some(path) = url_to_canon(&uri) {
             if let Ok(idx) = self.index.read() {
                 for d in idx.file_module_arity(&path, &text) {
-                    diags.push(analysis::byte_diagnostic_to_lsp(&text, &d));
+                    diags.push(crate::lsp::convert::byte_diagnostic_to_lsp(&text, &d));
                 }
             }
         }
-        self.documents.lock().await.insert(uri.clone(), text);
         self.client.publish_diagnostics(uri, diags, version).await;
     }
 }
@@ -68,7 +76,9 @@ impl Backend {
 /// later tasks add completion/hover/definition/documentSymbol providers.
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::INCREMENTAL,
+        )),
         document_symbol_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
@@ -162,16 +172,17 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // Full-document sync: the last content change holds the entire new text.
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.reindex_uri(&params.text_document.uri, &change.text);
-            self.analyze_and_publish(
-                params.text_document.uri,
-                change.text,
-                Some(params.text_document.version),
-            )
-            .await;
-        }
+        // Incremental sync: apply the ranged content changes against the cached
+        // text, then rebuild the model from the resulting full text.
+        let uri = params.text_document.uri;
+        let version = Some(params.text_document.version);
+        let new_text = {
+            let store = self.documents.lock().await;
+            let base = store.get(&uri).map(|m| m.text.clone()).unwrap_or_default();
+            crate::lsp::model::apply_changes(&base, &params.content_changes)
+        };
+        self.reindex_uri(&uri, &new_text);
+        self.analyze_and_publish(uri, new_text, version).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -186,23 +197,23 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> tower_lsp::jsonrpc::Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let symbols = analysis::document_symbols(text);
+        let symbols = crate::lsp::providers::symbols::document_symbols(model);
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
     async fn hover(&self, params: HoverParams) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
-        Ok(analysis::hover(text, offset))
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::hover::hover(model, offset))
     }
 
     async fn completion(
@@ -211,12 +222,13 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
-        let items = analysis::completions(text, offset);
+        // The completion provider scans raw chars, so it takes a CHAR offset.
+        let offset = model.line_index.offset(position);
+        let items = crate::lsp::providers::completion::completions(model, offset);
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -226,24 +238,21 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
+        let byte = crate::lsp::providers::docs::byte_offset_at(model, position);
         // SP4 §4: try the cross-file index first — if the use at the cursor is an
-        // imported/cross-file name, return a `Location` in the TARGET file.
+        // imported/cross-file name (or a top-level/module global), return a
+        // `Location` in the TARGET file.
         if let Some(path) = url_to_canon(&uri) {
-            let xfile = self
-                .index
-                .read()
-                .ok()
-                .and_then(|idx| idx.definition_at(&path, char_to_byte(text, offset)).map(
-                    |(def_path, span)| {
-                        let target_text = idx_text(&idx, &def_path).unwrap_or_default();
-                        (def_path, workspace::byte_span_to_range(&target_text, span))
-                    },
-                ));
+            let xfile = self.index.read().ok().and_then(|idx| {
+                idx.definition_at(&path, byte).map(|(def_path, span)| {
+                    let target_text = idx_text(&idx, &def_path).unwrap_or_default();
+                    (def_path, workspace::byte_span_to_range(&target_text, span))
+                })
+            });
             if let Some((def_path, range)) = xfile {
                 if let Some(target_uri) = canon_to_url(&def_path) {
                     return Ok(Some(GotoDefinitionResponse::Scalar(Location {
@@ -253,8 +262,9 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        // Fall back to the single-file analysis (same-file local/decl).
-        let Some(range) = analysis::definition(text, offset) else {
+        // Fall back to the single-file resolver provider (same-file local/param/
+        // upvalue bindings the cross-file index does not track).
+        let Some(range) = crate::lsp::providers::navigation::definition_in_file(model, byte) else {
             return Ok(None);
         };
         Ok(Some(GotoDefinitionResponse::Scalar(Location {
@@ -270,8 +280,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_decl = params.context.include_declaration;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -332,8 +342,8 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri;
         let position = params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -359,8 +369,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -456,13 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_advertise_full_sync() {
+    fn capabilities_advertise_incremental_sync() {
         let caps = server_capabilities();
         match caps.text_document_sync {
             Some(TextDocumentSyncCapability::Kind(kind)) => {
-                assert_eq!(kind, TextDocumentSyncKind::FULL);
+                assert_eq!(kind, TextDocumentSyncKind::INCREMENTAL);
             }
-            other => panic!("expected FULL text document sync, got {:?}", other),
+            other => panic!("expected INCREMENTAL text document sync, got {:?}", other),
         }
     }
 

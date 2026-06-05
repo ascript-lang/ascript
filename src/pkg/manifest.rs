@@ -1,6 +1,6 @@
 //! Parse the `ascript.toml` `[package]` + `[dependencies]` tables (SP6 §2).
 //!
-//! This sits beside `src/lint_config_toml.rs` in the CLI binary and follows the
+//! This follows the same model as `ascript::check::config_toml` and
 //! same model: parse a `toml::Table`, read only the tables we own (`[package]` /
 //! `[dependencies]` — `[lint]` is left to the lint parser), and emit clear,
 //! file-named errors (`ascript.toml: <ctx>: …`). The package parser is orthogonal
@@ -189,7 +189,7 @@ impl Manifest {
     /// lint-config upward-walk discovery so a file is governed by the config
     /// nearest to it. `Ok(None)` means no `ascript.toml` was found in the chain.
     pub fn load_nearest(file: &Path) -> Result<Option<(PathBuf, Manifest)>, String> {
-        let Some(path) = crate::lint_config_toml::discover(file) else {
+        let Some(path) = ascript::check::config_toml::discover(file) else {
             return Ok(None);
         };
         let text = std::fs::read_to_string(&path)

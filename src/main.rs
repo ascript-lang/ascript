@@ -1,7 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
-mod lint_config_toml;
 #[cfg(feature = "pkg")]
 mod pkg;
 
@@ -403,8 +402,9 @@ async fn real_main() -> ExitCode {
                 // Seed the config from the nearest `ascript.toml [lint]`, then
                 // overlay the CLI flags. A toml problem (malformed / wrong type /
                 // unknown rule) is a clear, file-named usage error → exit 2.
-                let mut config = match lint_config_toml::config_for_file(std::path::Path::new(file))
-                {
+                let mut config =
+                    match ascript::check::config_toml::config_for_file(std::path::Path::new(file))
+                    {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("error: {e}");

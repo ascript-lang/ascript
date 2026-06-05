@@ -1,0 +1,334 @@
+//! `textDocument/completion` over the model.
+//!
+//! Phase 0 keeps completion's CURRENT behavior (baseline keywords + builtins,
+//! import-path string context, and namespace-member access) but reads from the
+//! cached [`SemanticModel`]'s text instead of re-lexing/parsing. The full,
+//! resolver-aware rewrite is Phase 1; the logic here is byte-identical to the
+//! legacy `analysis::completions`.
+
+use crate::lsp::model::SemanticModel;
+use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
+
+/// The AScript keywords offered as completions (KEYWORD kind). Mirrors the lexer's
+/// keyword table plus `match`.
+const KEYWORDS: &[&str] = &[
+    "let", "const", "fn", "return", "if", "else", "while", "for", "of", "in", "match", "async",
+    "await", "yield", "class", "enum", "import", "export", "nil", "true", "false", "break",
+    "continue",
+];
+
+/// The global builtins offered as completions (FUNCTION kind). Mirrors `builtin_doc`.
+const BUILTINS: &[&str] = &[
+    "print", "len", "type", "assert", "range", "Ok", "Err", "recover", "test", "exit",
+];
+
+/// The known stdlib module paths offered when completing an `import ... from "..."`
+/// string. Hardcoded (rather than derived from `std_module_exports`) so the list is
+/// stable regardless of which cargo features are enabled at build time — editors
+/// should see every documented module path. Kept in sync with `std_module_exports`
+/// in `src/stdlib/mod.rs`.
+const STD_MODULE_PATHS: &[&str] = &[
+    "std/string",
+    "std/array",
+    "std/object",
+    "std/map",
+    "std/math",
+    "std/convert",
+    "std/json",
+    "std/regex",
+    "std/encoding",
+    "std/bytes",
+    "std/uuid",
+    "std/csv",
+    "std/toml",
+    "std/yaml",
+    "std/time",
+    "std/date",
+    "std/intl",
+    "std/env",
+    "std/fs",
+    "std/process",
+    "std/crypto",
+    "std/compress",
+    "std/sqlite",
+    "std/net/tcp",
+    "std/net/http",
+    "std/http/server",
+    "std/net/ws",
+    "std/tui",
+];
+
+/// A baseline completion item (keyword or builtin).
+fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
+    CompletionItem {
+        label: label.to_string(),
+        kind: Some(kind),
+        ..CompletionItem::default()
+    }
+}
+
+/// The always-offered baseline completions: every keyword + every global builtin.
+fn baseline_completions() -> Vec<CompletionItem> {
+    let mut out = Vec::with_capacity(KEYWORDS.len() + BUILTINS.len());
+    for kw in KEYWORDS {
+        out.push(item(kw, CompletionItemKind::KEYWORD));
+    }
+    for b in BUILTINS {
+        out.push(item(b, CompletionItemKind::FUNCTION));
+    }
+    out
+}
+
+/// Completions at char `offset` in the model's text. Pure and robust: never panics,
+/// and always returns at least the baseline (keywords + builtins) even on partial or
+/// syntactically broken input (completion is requested mid-edit).
+///
+/// Context detection is done by simple, parser-free scanning of the raw text around
+/// the cursor, so it works on documents that do not yet parse:
+/// - inside an `import ... from "..."` / `'...'` string → stdlib module paths;
+/// - right after `<ident>.` where `<ident>` is a `import * as <ident>` namespace of a
+///   known std module → that module's exports.
+pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> {
+    let text = &model.text;
+    let chars: Vec<char> = text.chars().collect();
+    let offset = offset.min(chars.len());
+
+    // Context 1: inside an import-from string literal → offer module paths.
+    if in_import_path_string(&chars, offset) {
+        return STD_MODULE_PATHS
+            .iter()
+            .map(|p| item(p, CompletionItemKind::MODULE))
+            .collect();
+    }
+
+    // Context 2: member access `<ident>.` where ident is a namespace import.
+    if let Some(alias) = member_access_alias(&chars, offset) {
+        if let Some(module) = namespace_import_module(text, &alias) {
+            if let Some(exports) = crate::stdlib::std_module_exports(&module) {
+                if !exports.is_empty() {
+                    return exports
+                        .into_iter()
+                        .map(|(name, _)| item(&name, CompletionItemKind::FUNCTION))
+                        .collect();
+                }
+            }
+        }
+    }
+
+    baseline_completions()
+}
+
+/// Whether `offset` sits inside the still-open string of a `from "..."` / `from '...'`
+/// on the current line. Scans backward from the cursor within the current line for an
+/// opening quote with no closing quote before the cursor, then checks the text before
+/// that quote ends with `from`.
+fn in_import_path_string(chars: &[char], offset: usize) -> bool {
+    // Restrict to the current line (imports are single-line).
+    let line_start = chars[..offset]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map_or(0, |p| p + 1);
+    let line = &chars[line_start..offset];
+
+    // The cursor is inside a string iff the most recent quote on the line has no
+    // matching close before the cursor — i.e. it's the last quote on the line.
+    let Some(rel_quote) = line.iter().rposition(|&c| c == '"' || c == '\'') else {
+        return false;
+    };
+    // Check the text before that opening quote ends with `from` (allowing whitespace).
+    let before: String = line[..rel_quote].iter().collect();
+    before.trim_end().ends_with("from")
+}
+
+/// If the text immediately before `offset` is `<ident>.`, return `<ident>`.
+fn member_access_alias(chars: &[char], offset: usize) -> Option<String> {
+    if offset == 0 {
+        return None;
+    }
+    // The char right before the cursor must be a dot.
+    if chars[offset - 1] != '.' {
+        return None;
+    }
+    // Collect the identifier ending just before the dot.
+    let dot = offset - 1;
+    let mut start = dot;
+    while start > 0 && is_ident_char(chars[start - 1]) {
+        start -= 1;
+    }
+    if start == dot {
+        return None; // no ident before the dot
+    }
+    // The first char must be a valid identifier start (not a digit).
+    if chars[start].is_ascii_digit() {
+        return None;
+    }
+    Some(chars[start..dot].iter().collect())
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Scan `text` for `import * as <alias> from "std/<mod>"` and return the module path.
+/// Parser-free (works on broken docs): a regex-like manual scan per line.
+fn namespace_import_module(text: &str, alias: &str) -> Option<String> {
+    for line in text.lines() {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix("import") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix('*') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix("as") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        // The alias is the next identifier.
+        let name: String = rest.chars().take_while(|&c| is_ident_char(c)).collect();
+        if name != alias {
+            continue;
+        }
+        let rest = &rest[name.len()..];
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix("from") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        // Extract the quoted module path.
+        let mut chars = rest.chars();
+        let q = chars.next()?;
+        if q != '"' && q != '\'' {
+            continue;
+        }
+        let path: String = chars.take_while(|&c| c != q).collect();
+        return Some(path);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    /// Build a model and complete at the END of `src` (its char count).
+    fn items(src: &str) -> Vec<CompletionItem> {
+        let model = SemanticModel::build(src.to_string(), None, &LintConfig::default());
+        completions(&model, src.chars().count())
+    }
+
+    fn labels(items: &[CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
+
+    #[test]
+    fn completions_baseline_has_keywords_and_builtins() {
+        let it = items("let x = 1\n");
+        let ls = labels(&it);
+        for expected in ["fn", "let", "match", "print", "Ok"] {
+            assert!(
+                ls.contains(&expected),
+                "baseline should contain {expected:?}: {ls:?}"
+            );
+        }
+        // Kinds are set.
+        let fnkw = it.iter().find(|i| i.label == "fn").unwrap();
+        assert_eq!(fnkw.kind, Some(CompletionItemKind::KEYWORD));
+        let pr = it.iter().find(|i| i.label == "print").unwrap();
+        assert_eq!(pr.kind, Some(CompletionItemKind::FUNCTION));
+    }
+
+    #[test]
+    fn completions_in_import_path_offers_module_paths() {
+        let it = items("import { x } from \"std/");
+        let ls = labels(&it);
+        for expected in ["std/string", "std/json", "std/net/http"] {
+            assert!(
+                ls.contains(&expected),
+                "import ctx should contain {expected:?}: {ls:?}"
+            );
+        }
+        assert!(it.iter().all(|i| i.kind == Some(CompletionItemKind::MODULE)));
+    }
+
+    #[test]
+    fn completions_in_import_path_single_quote() {
+        let it = items("import { x } from 'std/ma");
+        assert!(labels(&it).contains(&"std/math"));
+    }
+
+    #[test]
+    fn completions_member_access_offers_module_exports() {
+        let it = items("import * as math from \"std/math\"\nlet y = math.");
+        let ls = labels(&it);
+        for expected in ["sqrt", "abs", "pi"] {
+            assert!(
+                ls.contains(&expected),
+                "math. should contain {expected:?}: {ls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_member_access_unknown_alias_falls_back_to_baseline() {
+        // `foo` is not a namespace import → baseline.
+        let it = items("let foo = 1\nfoo.");
+        assert!(labels(&it).contains(&"print"));
+    }
+
+    #[test]
+    fn completions_on_garbage_returns_baseline_no_panic() {
+        for src in ["", "@#$%^", "fn fn fn (((", "import * as", "\"unterminated"] {
+            let it = items(src);
+            assert!(
+                labels(&it).contains(&"let"),
+                "garbage {src:?} should still yield baseline"
+            );
+        }
+        // An out-of-range offset must not panic.
+        let model = SemanticModel::build("let x".to_string(), None, &LintConfig::default());
+        let _ = completions(&model, 9999);
+    }
+
+    #[test]
+    fn std_module_paths_all_resolve_under_default_features() {
+        // Every advertised import path must be a real registered module, so the const
+        // can't silently drift from `std_module_exports`. (cargo test enables all
+        // default features, so every default-gated path resolves.)
+        for path in STD_MODULE_PATHS {
+            assert!(
+                crate::stdlib::std_module_exports(path).is_some(),
+                "STD_MODULE_PATHS entry {path:?} is not a known stdlib module"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_in_import_path_offers_process() {
+        let it = items("import { run } from \"std/proc");
+        assert!(labels(&it).contains(&"std/process"));
+    }
+
+    #[test]
+    fn completions_baseline_includes_yield_keyword() {
+        let it = items("");
+        let y = it
+            .iter()
+            .find(|i| i.label == "yield")
+            .expect("yield keyword in baseline");
+        assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn completions_baseline_includes_test_builtin() {
+        let it = items("");
+        let t = it
+            .iter()
+            .find(|i| i.label == "test")
+            .expect("test builtin in baseline");
+        assert_eq!(t.kind, Some(CompletionItemKind::FUNCTION));
+    }
+}
