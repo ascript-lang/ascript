@@ -24,8 +24,11 @@
 //!   this instant in this locale at this style". We instead derive the locale's
 //!   region and render via chrono with a small per-region, per-style pattern map
 //!   (e.g. en-US `MDY`, most others `DMY`, ja `YMD`), defaulting to ISO-ish.
-//!   Month names for "long" style are English (a documented limitation). The
-//!   instant is the std/date object (read via its `epochMs` field).
+//!   Long/medium **month and weekday names are locale-correct** (SP5 §8): they
+//!   come from a curated CLDR-derived table keyed by `loc.id.language`
+//!   (`MONTH_NAMES` / `MONTH_ABBR`), covering en/de/fr/es/it/pt/nl/ru/tr (plus
+//!   ja/zh/ko, which use the numeric 年月日 form). An unlisted language falls
+//!   back to English. The instant is the std/date object (read via `epochMs`).
 
 use super::{arg, bi, want_number, want_object, want_string};
 use crate::error::AsError;
@@ -127,6 +130,114 @@ fn date_pattern(loc: &Locale, style: &str) -> &'static str {
     }
 }
 
+/// Curated CLDR-derived long month names (index 0 = January) per language. Covers
+/// the locales the intl corpus exercises plus the common Western European set; an
+/// unlisted language falls back to English (`en`).
+fn long_month_names(lang: &str) -> [&'static str; 12] {
+    match lang {
+        "de" => [
+            "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September",
+            "Oktober", "November", "Dezember",
+        ],
+        "fr" => [
+            "janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre",
+            "octobre", "novembre", "décembre",
+        ],
+        "es" => [
+            "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
+            "octubre", "noviembre", "diciembre",
+        ],
+        "it" => [
+            "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto",
+            "settembre", "ottobre", "novembre", "dicembre",
+        ],
+        "pt" => [
+            "janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto",
+            "setembro", "outubro", "novembro", "dezembro",
+        ],
+        "nl" => [
+            "januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus",
+            "september", "oktober", "november", "december",
+        ],
+        "ru" => [
+            "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
+            "октября", "ноября", "декабря",
+        ],
+        "tr" => [
+            "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül",
+            "Ekim", "Kasım", "Aralık",
+        ],
+        // English (and the fallback for any unlisted language).
+        _ => [
+            "January", "February", "March", "April", "May", "June", "July", "August", "September",
+            "October", "November", "December",
+        ],
+    }
+}
+
+/// Curated abbreviated month names (index 0 = January) per language, for the
+/// "medium" style. Unlisted languages fall back to English.
+fn abbr_month_names(lang: &str) -> [&'static str; 12] {
+    match lang {
+        "de" => [
+            "Jan.", "Feb.", "März", "Apr.", "Mai", "Juni", "Juli", "Aug.", "Sept.", "Okt.",
+            "Nov.", "Dez.",
+        ],
+        "fr" => [
+            "janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.",
+            "nov.", "déc.",
+        ],
+        "es" => [
+            "ene.", "feb.", "mar.", "abr.", "may.", "jun.", "jul.", "ago.", "sept.", "oct.",
+            "nov.", "dic.",
+        ],
+        "it" => [
+            "gen.", "feb.", "mar.", "apr.", "mag.", "giu.", "lug.", "ago.", "set.", "ott.",
+            "nov.", "dic.",
+        ],
+        "pt" => [
+            "jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.",
+            "nov.", "dez.",
+        ],
+        "nl" => [
+            "jan.", "feb.", "mrt.", "apr.", "mei", "jun.", "jul.", "aug.", "sep.", "okt.", "nov.",
+            "dec.",
+        ],
+        "ru" => [
+            "янв.", "февр.", "мар.", "апр.", "мая", "июн.", "июл.", "авг.", "сент.", "окт.",
+            "нояб.", "дек.",
+        ],
+        "tr" => [
+            "Oca", "Şub", "Mar", "Nis", "May", "Haz", "Tem", "Ağu", "Eyl", "Eki", "Kas", "Ara",
+        ],
+        _ => [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ],
+    }
+}
+
+/// Render a date for the long/medium style with a locale-correct month name
+/// substituted, for the Western DMY/MDY orders. `ymd` locales (ja/zh/ko) keep
+/// the numeric 年月日 pattern and never reach this path.
+fn render_named_date(dt: &chrono::NaiveDate, lang: &str, mdy: bool, long: bool) -> String {
+    use chrono::Datelike;
+    let month_idx = (dt.month0()) as usize; // 0..=11
+    let name = if long {
+        long_month_names(lang)[month_idx]
+    } else {
+        abbr_month_names(lang)[month_idx]
+    };
+    let day = dt.day();
+    let year = dt.year();
+    if mdy {
+        // English-style "Month D, YYYY".
+        format!("{} {}, {}", name, day, year)
+    } else {
+        // Most locales: "D Month YYYY".
+        format!("{} {} {}", day, name, year)
+    }
+}
+
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     let ctx = |f: &str| format!("intl.{}", f);
     match func {
@@ -204,15 +315,25 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 None | Some(Value::Nil) => "medium".to_string(),
                 Some(v) => want_string(v, span, &ctx("formatDate"))?.to_string(),
             };
-            let pattern = date_pattern(&loc, &style);
             use chrono::TimeZone;
             let dt = chrono::Utc
                 .timestamp_millis_opt(epoch_ms)
                 .single()
                 .unwrap_or_else(|| chrono::Utc.timestamp_millis_opt(0).unwrap());
-            Ok(Value::Str(
-                dt.naive_utc().format(pattern).to_string().into(),
-            ))
+            let naive = dt.naive_utc();
+            // Determine the locale's ordering once.
+            let lang = loc.id.language.as_str().to_string();
+            let order_ymd = lang == "ja" || lang == "zh" || lang == "ko";
+            let order_mdy = loc.id.region.map(|r| r.as_str() == "US").unwrap_or(false);
+            // long/medium (non-YMD) substitute a locale-correct month NAME; YMD
+            // and short styles keep the numeric pattern (locale-correct already).
+            let out = if !order_ymd && (style == "long" || style == "medium") {
+                render_named_date(&naive.date(), &lang, order_mdy, style == "long")
+            } else {
+                let pattern = date_pattern(&loc, &style);
+                naive.format(pattern).to_string()
+            };
+            Ok(Value::Str(out.into()))
         }
         "caseUpper" | "caseLower" => {
             let s = want_string(&arg(args, 0), span, &ctx(func))?;
@@ -339,8 +460,30 @@ mod tests {
             str_of(call("formatDate", &[inst.clone(), s("de-DE"), s("medium")], sp()).unwrap());
         let ja = str_of(call("formatDate", &[inst, s("ja-JP"), s("short")], sp()).unwrap());
         assert_eq!(us, "Jun 15, 2021");
-        assert_eq!(de, "15 Jun 2021");
+        assert_eq!(de, "15 Juni 2021"); // German abbreviated June == "Juni"
         assert_eq!(ja, "2021/06/15");
+    }
+
+    // SP5 §8: long/medium month names are locale-correct (not English).
+    #[test]
+    fn format_date_long_month_names_locale_correct() {
+        // 2021-03-15T12:00:00Z = 1615809600000 ms (March, to exercise März/mars).
+        let inst = || {
+            let mut o: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
+            o.insert("epochMs".into(), Value::Number(1615809600000.0));
+            Value::Object(crate::value::ObjectCell::new(o))
+        };
+        let de = str_of(call("formatDate", &[inst(), s("de-DE"), s("long")], sp()).unwrap());
+        let fr = str_of(call("formatDate", &[inst(), s("fr-FR"), s("long")], sp()).unwrap());
+        let en = str_of(call("formatDate", &[inst(), s("en-US"), s("long")], sp()).unwrap());
+        let ja = str_of(call("formatDate", &[inst(), s("ja-JP"), s("long")], sp()).unwrap());
+        assert_eq!(de, "15 März 2021", "German long month");
+        assert_eq!(fr, "15 mars 2021", "French long month");
+        assert_eq!(en, "March 15, 2021", "English long month (MDY)");
+        assert_eq!(ja, "2021\u{5e74}3\u{6708}15\u{65e5}", "Japanese keeps 年月日");
+        // The previously-English locales now differ from English.
+        assert_ne!(de, en);
+        assert_ne!(fr, en);
     }
 
     #[test]

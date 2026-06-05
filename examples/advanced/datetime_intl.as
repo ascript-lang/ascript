@@ -55,6 +55,13 @@ async fn main() {
   // Turkish-locale upper-casing: dotted/dotless i handled per language rules.
   print(`upper(tr)    = ${intl.caseUpper("istanbul", "tr")}`)
   print(`upper(en)    = ${intl.caseUpper("istanbul", "en")}`)
+
+  // Locale-correct long month names (SP5 §8) — the month NAME differs per locale,
+  // not just the field order.
+  print(`date en-US (long) = ${intl.formatDate(inst, "en-US", "long")}`)
+  print(`date de-DE (long) = ${intl.formatDate(inst, "de-DE", "long")}`)
+  print(`date fr-FR (long) = ${intl.formatDate(inst, "fr-FR", "long")}`)
+  print(`date ja-JP (long) = ${intl.formatDate(inst, "ja-JP", "long")}`)
 }
 
 await main()

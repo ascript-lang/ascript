@@ -335,7 +335,7 @@ date.diffMs(plus1, base)   // 86400000  (one day in ms)
 Locale-aware number, currency and date formatting, case folding, and collation. Locales are BCP-47 strings such as `"en-US"`, `"de-DE"`, or `"tr"`.
 
 > [!NOTE]
-> `std/intl` is a **pragmatic subset of ICU**. `formatNumber`, `caseUpper`, `caseLower`, and `compare` use real ICU algorithms. `formatCurrency` and `formatDate` are **pragmatic fallbacks**: currency formatting always uses a small symbol table placed as a prefix (not full CLDR currency patterns), and `formatDate`'s long-style month names are always English. An invalid locale string is a **Tier-2 panic** (`intl.X: invalid locale '...'`), since locales are normally literals.
+> `std/intl` is a **pragmatic subset of ICU**. `formatNumber`, `caseUpper`, `caseLower`, and `compare` use real ICU algorithms. `formatCurrency` and `formatDate` are **pragmatic fallbacks**: currency formatting always uses a small symbol table placed as a prefix (not full CLDR currency patterns). `formatDate`'s long/medium **month names are locale-correct** (from a curated CLDR-derived table covering en/de/fr/es/it/pt/nl/ru/tr, plus ja/zh/ko which use the numeric 年月日 form); an unlisted language falls back to English. An invalid locale string is a **Tier-2 panic** (`intl.X: invalid locale '...'`), since locales are normally literals.
 
 ### formatNumber
 
@@ -375,7 +375,7 @@ Renders a `std/date` instant in a locale-appropriate style (pragmatic fallback).
   - `style` (string, optional) — `"short"`, `"medium"` (default), or `"long"`.
 - **Returns:** string.
 
-The field order is derived from the locale's region (US → month-day-year; CJK → year-month-day; most others → day-month-year). Long-style month names are English.
+The field order is derived from the locale's region (US → month-day-year; CJK → year-month-day; most others → day-month-year). Long/medium-style month names are **locale-correct** (e.g. `"long"` for `de-DE` → "15 März 2021", `fr-FR` → "15 mars 2021").
 
 ```ascript
 let inst = date.fromEpochMs(1623760200000)   // 2021-06-15T12:30:00Z
