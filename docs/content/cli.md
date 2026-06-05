@@ -227,6 +227,19 @@ Beyond navigation, the server also offers editing assistance:
   **control-flow snippets** and **auto-import** items that add the matching `import` statement for a
   known stdlib export, with `completionItem/resolve` filling in detail and documentation lazily.
 
+Beyond the highlights above, the server answers the full modern LSP surface: **hover** with inferred
+types, **signature help**, **semantic tokens** (full + range), **inlay hints**, **document
+highlight**, **folding** and **selection ranges**, **document links**, **code lenses**, **call and
+type hierarchy**, **document color** swatches, **linked editing**, **pull diagnostics**, multi-root
+workspaces, and **rename-on-move** import rewriting. Editing stays responsive under load — rapid
+keystrokes coalesce into one rebuild, stale completion/hover results are dropped, and very large
+files degrade gracefully (semantic tokens go range-only and inlay hints are skipped above ~256 KiB;
+token/inlay/folding/color providers go quiet above ~2 MiB) while diagnostics and navigation always
+run.
+
+See [editor setup](tooling/editor-setup) for VS Code, Zed, and Neovim configuration, and the
+[LSP capability reference](tooling/lsp-capabilities) for every method the server answers.
+
 > [!NOTE] The language server is **static-analysis only** — it lexes, parses, and resolves your
 > source to produce diagnostics and navigation; it never runs the interpreter, so the whole layer
 > stays `Send + Sync` and free of runtime state.
