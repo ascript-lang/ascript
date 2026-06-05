@@ -110,6 +110,32 @@ pub fn server_capabilities() -> ServerCapabilities {
             prepare_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
+        // Phase 2: read/write occurrence highlighting of the symbol under the cursor.
+        document_highlight_provider: Some(OneOf::Left(true)),
+        // Phase 2: signature help while typing a call's arguments. Triggered on `(`
+        // (open the call) and `,` (advance the active parameter / retrigger).
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: Some(vec![",".to_string()]),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
+        // Phase 2: inferred-type + parameter-name inlay hints (with lazy resolve).
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions {
+                resolve_provider: Some(true),
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            },
+        ))),
+        // Phase 2: semantic-token highlighting (full document + range), with the
+        // provider's legend.
+        semantic_tokens_provider: Some(
+            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                legend: crate::lsp::providers::semantic_tokens::legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: Some(true),
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            }),
+        ),
         ..ServerCapabilities::default()
     }
 }
@@ -289,6 +315,81 @@ impl LanguageServer for Backend {
             model,
             params.range,
         )))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::highlight::document_highlights(model, offset))
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::signature::signature_help(model, offset))
+    }
+
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::inlay::inlay_hints(model, range)))
+    }
+
+    async fn inlay_hint_resolve(
+        &self,
+        hint: InlayHint,
+    ) -> tower_lsp::jsonrpc::Result<InlayHint> {
+        Ok(crate::lsp::providers::inlay::resolve(hint))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let tokens = crate::lsp::providers::semantic_tokens::semantic_tokens_full(model);
+        Ok(Some(SemanticTokensResult::Tokens(tokens)))
+    }
+
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensRangeResult>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let tokens = crate::lsp::providers::semantic_tokens::semantic_tokens_range(model, range);
+        Ok(Some(SemanticTokensRangeResult::Tokens(tokens)))
     }
 
     async fn code_action(
@@ -638,6 +739,47 @@ mod tests {
             ),
             "expected a definition provider, got {:?}",
             caps.definition_provider
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_semantic_tokens() {
+        let caps = server_capabilities();
+        assert!(
+            caps.semantic_tokens_provider.is_some(),
+            "expected a semantic-tokens provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_document_highlight() {
+        let caps = server_capabilities();
+        assert!(
+            matches!(
+                caps.document_highlight_provider,
+                Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+            ),
+            "expected a document-highlight provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_signature_help() {
+        let caps = server_capabilities();
+        let sig = caps
+            .signature_help_provider
+            .expect("signature-help provider");
+        let triggers = sig.trigger_characters.expect("trigger chars");
+        assert!(triggers.contains(&"(".to_string()));
+        assert!(triggers.contains(&",".to_string()));
+    }
+
+    #[test]
+    fn capabilities_advertise_inlay_hints() {
+        let caps = server_capabilities();
+        assert!(
+            caps.inlay_hint_provider.is_some(),
+            "expected an inlay-hint provider"
         );
     }
 

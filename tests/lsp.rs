@@ -241,6 +241,32 @@ fn lsp_protocol_end_to_end() {
         caps["completionProvider"]["resolveProvider"], true,
         "completion resolve advertised: {resp}"
     );
+    // Phase 2 capabilities.
+    assert!(
+        !caps["semanticTokensProvider"].is_null(),
+        "missing semanticTokensProvider: {resp}"
+    );
+    assert!(
+        !caps["documentHighlightProvider"].is_null(),
+        "missing documentHighlightProvider: {resp}"
+    );
+    assert!(
+        !caps["signatureHelpProvider"].is_null(),
+        "missing signatureHelpProvider: {resp}"
+    );
+    assert!(
+        !caps["inlayHintProvider"].is_null(),
+        "missing inlayHintProvider: {resp}"
+    );
+    // signatureHelp trigger chars `(` and `,`.
+    let sig_triggers = caps["signatureHelpProvider"]["triggerCharacters"]
+        .as_array()
+        .expect("signatureHelp triggerCharacters");
+    let trigger_strs: Vec<&str> = sig_triggers.iter().filter_map(|t| t.as_str()).collect();
+    assert!(
+        trigger_strs.contains(&"(") && trigger_strs.contains(&","),
+        "signatureHelp trigger chars: {trigger_strs:?}"
+    );
 
     // 2. initialized notification.
     client.notify("initialized", json!({}));
@@ -395,6 +421,111 @@ fn lsp_protocol_end_to_end() {
     assert!(
         snippet["insertText"].as_str().is_some_and(|t| t.contains("$")),
         "snippet has a tab-stop: {snippet}"
+    );
+
+    // 5c. semanticTokens/full on the symbols doc -> a non-empty token stream.
+    client.request(
+        6,
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": sym_uri } }),
+    );
+    let st_resp = client.read_response(6, overall);
+    let st_data = st_resp["result"]["data"]
+        .as_array()
+        .expect("semanticTokens data array");
+    assert!(
+        !st_data.is_empty() && st_data.len().is_multiple_of(5),
+        "semantic tokens are 5-int-per-token and non-empty: {}",
+        st_data.len()
+    );
+
+    // 5d. A doc exercising signatureHelp, inlayHint, documentHighlight.
+    let p2_uri = "ascript-test://p2.as";
+    let p2_text = "fn add(a, b) { return a + b }\nlet total = 1\ntotal = add(total, 2)\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": p2_uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": p2_text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // signatureHelp inside `add(` on line 2 (after "total = add(").
+    client.request(
+        7,
+        "textDocument/signatureHelp",
+        json!({
+            "textDocument": { "uri": p2_uri },
+            "position": { "line": 2, "character": 11 }
+        }),
+    );
+    let sig_resp = client.read_response(7, overall);
+    let signatures = sig_resp["result"]["signatures"]
+        .as_array()
+        .expect("signatureHelp signatures array");
+    assert!(
+        signatures
+            .iter()
+            .any(|s| s["label"].as_str() == Some("add(a, b)")),
+        "expected `add(a, b)` signature: {sig_resp}"
+    );
+
+    // inlayHint over the whole p2 doc -> a type hint (`: number` for total) AND
+    // parameter-name hints (`a:`, `b:`) at the call args.
+    client.request(
+        8,
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": p2_uri },
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 3, "character": 0 }
+            }
+        }),
+    );
+    let inlay_resp = client.read_response(8, overall);
+    let hints = inlay_resp["result"]
+        .as_array()
+        .expect("inlayHint array result");
+    let labels: Vec<String> = hints
+        .iter()
+        .filter_map(|h| h["label"].as_str().map(|s| s.to_string()))
+        .collect();
+    assert!(
+        labels.iter().any(|l| l.contains("number")),
+        "expected an inferred-type hint mentioning number: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l == "a:") && labels.iter().any(|l| l == "b:"),
+        "expected parameter-name hints a:/b:: {labels:?}"
+    );
+
+    // documentHighlight on `total` (line 1, char 4) -> read + write occurrences.
+    client.request(
+        9,
+        "textDocument/documentHighlight",
+        json!({
+            "textDocument": { "uri": p2_uri },
+            "position": { "line": 1, "character": 4 }
+        }),
+    );
+    let hl_resp = client.read_response(9, overall);
+    let highlights = hl_resp["result"]
+        .as_array()
+        .expect("documentHighlight array result");
+    assert!(
+        highlights.len() >= 2,
+        "expected >=2 occurrences of `total`: {hl_resp}"
+    );
+    // At least one WRITE (kind 3) occurrence (the reassignment target / decl).
+    assert!(
+        highlights.iter().any(|h| h["kind"].as_i64() == Some(3)),
+        "expected a WRITE highlight: {hl_resp}"
     );
 
     // 6. shutdown -> result; exit -> clean exit.

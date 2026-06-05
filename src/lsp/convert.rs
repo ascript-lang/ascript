@@ -114,6 +114,13 @@ mod tests {
             "providers/formatting.rs",
             "providers/completion.rs",
             "providers/code_action.rs",
+            // Phase 2: the semantic-visualization providers must also be in scope so
+            // they can never re-introduce a legacy front-end import.
+            "providers/token_spans.rs",
+            "providers/semantic_tokens.rs",
+            "providers/highlight.rs",
+            "providers/signature.rs",
+            "providers/inlay.rs",
         ] {
             let want = std::path::Path::new(&lsp_dir).join(required);
             assert!(
