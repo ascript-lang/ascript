@@ -221,6 +221,26 @@ fn lsp_protocol_end_to_end() {
         !caps["documentSymbolProvider"].is_null(),
         "missing documentSymbolProvider: {resp}"
     );
+    assert!(
+        !caps["documentFormattingProvider"].is_null(),
+        "missing documentFormattingProvider: {resp}"
+    );
+    assert!(
+        !caps["documentRangeFormattingProvider"].is_null(),
+        "missing documentRangeFormattingProvider: {resp}"
+    );
+    assert!(
+        !caps["codeActionProvider"].is_null(),
+        "missing codeActionProvider: {resp}"
+    );
+    assert!(
+        !caps["executeCommandProvider"].is_null(),
+        "missing executeCommandProvider: {resp}"
+    );
+    assert_eq!(
+        caps["completionProvider"]["resolveProvider"], true,
+        "completion resolve advertised: {resp}"
+    );
 
     // 2. initialized notification.
     client.notify("initialized", json!({}));
@@ -339,6 +359,42 @@ fn lsp_protocol_end_to_end() {
     assert!(
         hover_resp.get("result").is_some(),
         "hover response missing result: {hover_resp}"
+    );
+
+    // 5b. completion on the symbols doc -> the rewritten scope-aware provider
+    // offers in-scope bindings (`greet`, `Point`) AND control-flow snippets.
+    client.request(
+        5,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": sym_uri },
+            "position": { "line": 5, "character": 0 }
+        }),
+    );
+    let comp_resp = client.read_response(5, overall);
+    let comp_items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let comp_labels: Vec<&str> = comp_items
+        .iter()
+        .filter_map(|i| i["label"].as_str())
+        .collect();
+    assert!(
+        comp_labels.contains(&"greet") && comp_labels.contains(&"Point"),
+        "completion should offer in-scope bindings: {comp_labels:?}"
+    );
+    assert!(
+        comp_labels.contains(&"print") && comp_labels.contains(&"let"),
+        "completion should preserve builtins + keywords: {comp_labels:?}"
+    );
+    // A snippet item (`match`) carries insertTextFormat == Snippet (2).
+    let snippet = comp_items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("match") && i["insertTextFormat"].as_i64() == Some(2))
+        .expect("a snippet completion item");
+    assert!(
+        snippet["insertText"].as_str().is_some_and(|t| t.contains("$")),
+        "snippet has a tab-stop: {snippet}"
     );
 
     // 6. shutdown -> result; exit -> clean exit.

@@ -1,13 +1,23 @@
-//! `textDocument/completion` over the model.
+//! `textDocument/completion` (and `completionItem/resolve`) over the cached
+//! [`SemanticModel`].
 //!
-//! Phase 0 keeps completion's CURRENT behavior (baseline keywords + builtins,
-//! import-path string context, and namespace-member access) but reads from the
-//! cached [`SemanticModel`]'s text instead of re-lexing/parsing. The full,
-//! resolver-aware rewrite is Phase 1; the logic here is byte-identical to the
-//! legacy `analysis::completions`.
+//! Scope-aware completion driven by the resolver result rather than raw lexing:
+//! keywords + builtins, in-scope user bindings, member access on a class / enum /
+//! module namespace (offering its members or exports), import-path string context,
+//! curated control-flow snippets, and auto-import items that add the matching
+//! `import … from "std/…"` edit for a known stdlib export. `resolve_completion`
+//! lazily fills in detail/documentation for builtins and keywords.
+//!
+//! In-scope bindings are taken from the resolved set (de-duplicated by name); the
+//! list is not yet frame-precise, so a sibling-scope name may be over-offered — a
+//! documented Phase-2 refinement.
 
 use crate::lsp::model::SemanticModel;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
+use crate::syntax::resolve::types::BindingKind;
+use tower_lsp::lsp_types::{
+    CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
+    Position, Range, TextEdit,
+};
 
 /// The AScript keywords offered as completions (KEYWORD kind). Mirrors the lexer's
 /// keyword table plus `match`.
@@ -79,6 +89,90 @@ fn baseline_completions() -> Vec<CompletionItem> {
     out
 }
 
+/// In-scope user bindings as completion items. Phase 1 v1 offers EVERY binding in
+/// the resolved set (de-duplicated by name, last decl wins) — precise per-cursor
+/// scope filtering by frame is a Phase-2 refinement; over-offering a sibling-scope
+/// name is a benign, non-misleading suggestion. The binding KIND maps to an icon.
+fn binding_completions(model: &SemanticModel) -> Vec<CompletionItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for b in &model.resolved.bindings {
+        if !seen.insert(b.name.clone()) {
+            continue;
+        }
+        let kind = match b.kind {
+            BindingKind::Fn => CompletionItemKind::FUNCTION,
+            BindingKind::Class => CompletionItemKind::CLASS,
+            BindingKind::Enum => CompletionItemKind::ENUM,
+            BindingKind::Const => CompletionItemKind::CONSTANT,
+            BindingKind::Param => CompletionItemKind::VARIABLE,
+            BindingKind::Import => CompletionItemKind::MODULE,
+            _ => CompletionItemKind::VARIABLE,
+        };
+        out.push(item(&b.name, kind));
+    }
+    out
+}
+
+/// Curated control-flow snippets. Each is a SNIPPET-format item with `${n:…}`
+/// tab-stops and a `$0` final cursor.
+fn snippet_completions() -> Vec<CompletionItem> {
+    const SNIPPETS: &[(&str, &str)] = &[
+        ("fn", "fn ${1:name}(${2:params}) {\n  $0\n}"),
+        ("if", "if (${1:cond}) {\n  $0\n}"),
+        ("for", "for (${1:item} of ${2:iter}) {\n  $0\n}"),
+        ("while", "while (${1:cond}) {\n  $0\n}"),
+        ("match", "match ${1:subject} {\n  ${2:pattern} => $0,\n}"),
+        ("class", "class ${1:Name} {\n  $0\n}"),
+    ];
+    SNIPPETS
+        .iter()
+        .map(|(label, body)| CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            insert_text: Some(body.to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..CompletionItem::default()
+        })
+        .collect()
+}
+
+/// Auto-import candidates: every std export NOT already imported, each carrying an
+/// `additionalTextEdits` that inserts an `import { name } from "<path>"` line at the
+/// top of the file. Reuses the `STD_MODULE_PATHS` set the import-path-string context
+/// offers; the LSP never stores a `Value` (mirrors the namespace-member branch — it
+/// takes ONLY the export name).
+fn auto_import_candidates(model: &SemanticModel) -> Vec<CompletionItem> {
+    // Names already imported (named or namespace) — never re-offer these.
+    let imported: std::collections::HashSet<String> = model
+        .resolved
+        .bindings
+        .iter()
+        .filter(|b| matches!(b.kind, BindingKind::Import))
+        .map(|b| b.name.clone())
+        .collect();
+
+    let mut out = Vec::new();
+    for path in STD_MODULE_PATHS {
+        let Some(exports) = crate::stdlib::std_module_exports(path) else {
+            continue;
+        };
+        for (name, _value) in exports {
+            if imported.contains(&name) {
+                continue;
+            }
+            let mut ci = item(&name, CompletionItemKind::FUNCTION);
+            ci.detail = Some(format!("auto-import from {path}"));
+            ci.additional_text_edits = Some(vec![TextEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                new_text: format!("import {{ {name} }} from \"{path}\"\n"),
+            }]);
+            out.push(ci);
+        }
+    }
+    out
+}
+
 /// Completions at char `offset` in the model's text. Pure and robust: never panics,
 /// and always returns at least the baseline (keywords + builtins) even on partial or
 /// syntactically broken input (completion is requested mid-edit).
@@ -113,9 +207,71 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
                 }
             }
         }
+
+        // Context 3: member access on a class/enum NAME — offer its static surface
+        // (enum variants, or the class's declared fields + methods) from the SP10
+        // table. This only runs when the alias is NOT a namespace import.
+        let table = crate::check::infer::table::Table::build(&model.tree, &model.resolved);
+        if let Some(eid) = table.enum_id(&alias) {
+            if let Some(info) = table.enum_info(eid) {
+                return info
+                    .variants
+                    .iter()
+                    .map(|v| item(v, CompletionItemKind::ENUM_MEMBER))
+                    .collect();
+            }
+        }
+        if let Some(cid) = table.class_id(&alias) {
+            if let Some(info) = table.class(cid) {
+                let mut out: Vec<CompletionItem> = info
+                    .fields
+                    .keys()
+                    .map(|f| item(f, CompletionItemKind::FIELD))
+                    .collect();
+                out.extend(
+                    info.methods
+                        .keys()
+                        .map(|m| item(m, CompletionItemKind::METHOD)),
+                );
+                return out;
+            }
+        }
     }
 
-    baseline_completions()
+    let mut base = baseline_completions();
+    base.extend(binding_completions(model));
+    base.extend(snippet_completions());
+    base.extend(auto_import_candidates(model));
+    base
+}
+
+/// Fill `detail`/`documentation` for an item that the cheap pass left bare. v1
+/// resolves builtins/keywords from the shared docs table; bindings are left as-is
+/// (their kind icon already conveys the essential info).
+///
+/// API adaptation vs the plan: `docs::keyword_doc` takes a `SyntaxKind`, not a
+/// `&str`, so a keyword label is lexed to its leading token kind before lookup;
+/// `docs::builtin_doc` takes the `&str` label directly.
+pub fn resolve_completion(_model: &SemanticModel, item: &mut CompletionItem) {
+    if item.documentation.is_some() {
+        return;
+    }
+    let doc = crate::lsp::providers::docs::builtin_doc(&item.label)
+        .map(str::to_string)
+        .or_else(|| keyword_doc_for_label(&item.label).map(str::to_string));
+    if let Some(doc) = doc {
+        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc,
+        }));
+    }
+}
+
+/// The keyword doc for a label string, by lexing it to its leading token kind and
+/// consulting the shared `docs::keyword_doc(SyntaxKind)` table.
+fn keyword_doc_for_label(label: &str) -> Option<&'static str> {
+    let kind = crate::syntax::lex(label).first().map(|t| t.kind)?;
+    crate::lsp::providers::docs::keyword_doc(kind)
 }
 
 /// Whether `offset` sits inside the still-open string of a `from "..."` / `from '...'`
@@ -320,6 +476,99 @@ mod tests {
             .find(|i| i.label == "yield")
             .expect("yield keyword in baseline");
         assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn resolve_fills_detail_for_builtin() {
+        let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
+        let mut print_item = item("print", CompletionItemKind::FUNCTION);
+        assert!(print_item.documentation.is_none());
+        resolve_completion(&model, &mut print_item);
+        assert!(
+            print_item.documentation.is_some() || print_item.detail.is_some(),
+            "resolve should add detail/docs for a builtin"
+        );
+    }
+
+    #[test]
+    fn resolve_fills_detail_for_keyword() {
+        let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
+        let mut let_item = item("let", CompletionItemKind::KEYWORD);
+        resolve_completion(&model, &mut let_item);
+        assert!(
+            let_item.documentation.is_some(),
+            "resolve should add docs for a keyword"
+        );
+    }
+
+    #[test]
+    fn auto_import_offers_import_edit_for_known_std_export() {
+        // `abs` is exported by std/math; nothing imports it yet.
+        let src = "ab\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let items = completions(&model, 2);
+        let abs = items
+            .iter()
+            .find(|i| i.label == "abs")
+            .expect("abs auto-import offered");
+        let edits = abs.additional_text_edits.as_ref().expect("has import edit");
+        assert_eq!(edits.len(), 1);
+        assert!(
+            edits[0].new_text.contains("import") && edits[0].new_text.contains("std/math"),
+            "import edit text: {:?}",
+            edits[0].new_text
+        );
+        // The import is inserted at the top of the file (line 0).
+        assert_eq!(edits[0].range.start.line, 0);
+    }
+
+    #[test]
+    fn baseline_includes_snippets() {
+        let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
+        let items = completions(&model, 1);
+        let fn_snip = items
+            .iter()
+            .find(|i| i.label == "fn" && i.insert_text_format == Some(InsertTextFormat::SNIPPET))
+            .expect("fn snippet present");
+        assert!(
+            fn_snip.insert_text.as_deref().unwrap_or("").contains("$0")
+                || fn_snip.insert_text.as_deref().unwrap_or("").contains("${1"),
+            "snippet has a tab-stop: {:?}",
+            fn_snip.insert_text
+        );
+    }
+
+    #[test]
+    fn member_access_offers_enum_variants_and_class_members() {
+        let src = "enum Color { Red, Green }\nclass Point { x: number\n  fn dist() { return 0 } }\nColor.\nPoint.\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+
+        let color_off = src.find("Color.\n").unwrap() + "Color.".len();
+        let cl = completions(&model, color_off);
+        let cls: Vec<&str> = cl.iter().map(|i| i.label.as_str()).collect();
+        assert!(cls.contains(&"Red") && cls.contains(&"Green"), "enum variants: {cls:?}");
+
+        let point_off = src.find("Point.\n").unwrap() + "Point.".len();
+        let pl = completions(&model, point_off);
+        let pls: Vec<&str> = pl.iter().map(|i| i.label.as_str()).collect();
+        assert!(pls.contains(&"x"), "class field: {pls:?}");
+        assert!(pls.contains(&"dist"), "class method: {pls:?}");
+    }
+
+    #[test]
+    fn baseline_includes_in_scope_bindings() {
+        // A top-level `let` and a fn name are in scope at the cursor and should be
+        // offered alongside keywords/builtins.
+        let src = "let total = 1\nfn helper() {}\nt\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let off = src.rfind('t').unwrap() + 1; // just after the `t` on the last line
+        let items = completions(&model, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"total"), "missing local binding: {labels:?}");
+        assert!(labels.contains(&"helper"), "missing fn binding: {labels:?}");
+        // Keywords + builtins still present (subset preserved).
+        assert!(labels.contains(&"let"), "keyword missing: {labels:?}");
+        assert!(labels.contains(&"print"), "builtin missing: {labels:?}");
     }
 
     #[test]

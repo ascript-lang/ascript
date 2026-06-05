@@ -84,9 +84,25 @@ pub fn server_capabilities() -> ServerCapabilities {
         completion_provider: Some(CompletionOptions {
             // `.` for member-access completions; `"` / `'` for import-path strings.
             trigger_characters: Some(vec![".".to_string(), "\"".to_string(), "'".to_string()]),
+            resolve_provider: Some(true),
             ..CompletionOptions::default()
         }),
         definition_provider: Some(OneOf::Left(true)),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        document_range_formatting_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![
+                CodeActionKind::QUICKFIX,
+                CodeActionKind::SOURCE_FIX_ALL,
+                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            ]),
+            resolve_provider: Some(true),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: vec![crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string()],
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
         // SP4 §4: cross-file navigation providers backed by the workspace index.
         workspace_symbol_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
@@ -230,6 +246,110 @@ impl LanguageServer for Backend {
         let offset = model.line_index.offset(position);
         let items = crate::lsp::providers::completion::completions(model, offset);
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn completion_resolve(
+        &self,
+        mut item: CompletionItem,
+    ) -> tower_lsp::jsonrpc::Result<CompletionItem> {
+        // Resolve uses the docs table only (no document context needed); a
+        // synthetic empty model is sufficient because `resolve_completion`
+        // ignores the model for builtins/keywords.
+        let model = crate::lsp::model::SemanticModel::build(
+            String::new(),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        crate::lsp::providers::completion::resolve_completion(&model, &mut item);
+        Ok(item)
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::formatting::format_document(model)))
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::formatting::format_range(
+            model,
+            params.range,
+        )))
+    }
+
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let actions = crate::lsp::providers::code_action::code_actions(
+            model,
+            &uri,
+            params.range,
+            &params.context,
+        );
+        Ok(Some(actions))
+    }
+
+    async fn code_action_resolve(
+        &self,
+        action: CodeAction,
+    ) -> tower_lsp::jsonrpc::Result<CodeAction> {
+        // The target URI rides in `action.data`.
+        let uri = action
+            .data
+            .as_ref()
+            .and_then(|d| serde_json::from_value::<Url>(d.clone()).ok());
+        let Some(uri) = uri else { return Ok(action) };
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(action);
+        };
+        Ok(crate::lsp::providers::code_action::resolve_code_action(
+            model, action,
+        ))
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<serde_json::Value>> {
+        if params.command == crate::lsp::providers::code_action::FIX_ALL_COMMAND {
+            // The first argument is the target document URI.
+            if let Some(arg) = params.arguments.first() {
+                if let Ok(uri) = serde_json::from_value::<Url>(arg.clone()) {
+                    let edit = {
+                        let store = self.documents.lock().await;
+                        store.get(&uri).and_then(|m| {
+                            crate::lsp::providers::code_action::fix_all_action(m, &uri)
+                                .and_then(|a| a.edit)
+                        })
+                    };
+                    if let Some(edit) = edit {
+                        let _ = self.client.apply_edit(edit).await;
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn goto_definition(
@@ -518,6 +638,19 @@ mod tests {
             ),
             "expected a definition provider, got {:?}",
             caps.definition_provider
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_formatting() {
+        let caps = server_capabilities();
+        assert!(
+            caps.document_formatting_provider.is_some(),
+            "formatting advertised"
+        );
+        assert!(
+            caps.document_range_formatting_provider.is_some(),
+            "range formatting advertised"
         );
     }
 }
