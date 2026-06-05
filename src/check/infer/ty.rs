@@ -475,6 +475,57 @@ impl CheckTy {
     }
 }
 
+impl CheckTy {
+    /// Render this type for a diagnostic message / LSP hover. Internal narrowing
+    /// artifacts (`Literal`/`EnumVariant`/`Never`) are widened first. A class/enum is
+    /// rendered by its declared name via the table.
+    pub fn display(&self, table: &Table) -> String {
+        use CheckTy::*;
+        match self.widen() {
+            Any => "any".into(),
+            Never => "never".into(),
+            Number => "number".into(),
+            String => "string".into(),
+            Bool => "bool".into(),
+            Nil => "nil".into(),
+            Bytes => "bytes".into(),
+            Object => "object".into(),
+            Regex => "regex".into(),
+            Error => "error".into(),
+            Fn => "fn".into(),
+            Array(inner) => format!("array<{}>", inner.display(table)),
+            Map(k, v) => format!("map<{}, {}>", k.display(table), v.display(table)),
+            Tuple(ms) => {
+                let inner: Vec<_> = ms.iter().map(|m| m.display(table)).collect();
+                format!("[{}]", inner.join(", "))
+            }
+            Result(inner) => format!("Result<{}>", inner.display(table)),
+            Future(inner) => format!("future<{}>", inner.display(table)),
+            Union(ms) => {
+                // canonical T? rendering when exactly [T, Nil].
+                if ms.len() == 2 && ms.iter().any(|m| matches!(m, Nil)) {
+                    let base = ms.iter().find(|m| !matches!(m, Nil)).unwrap();
+                    return format!("{}?", base.display(table));
+                }
+                let inner: Vec<_> = ms.iter().map(|m| m.display(table)).collect();
+                inner.join(" | ")
+            }
+            Class(id) => table
+                .class(id)
+                .map(|c| c.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "object".into()),
+            Enum(id) => table
+                .enum_info(id)
+                .map(|e| e.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "enum".into()),
+            // widened away above
+            EnumVariant(_, _) | Literal(_) => unreachable!("widened above"),
+        }
+    }
+}
+
 /// True for a concrete container constructor (used in the "concrete vs concrete"
 /// provable-`No` guard so two distinct containers reject).
 fn is_concrete_ctor(t: &CheckTy) -> bool {

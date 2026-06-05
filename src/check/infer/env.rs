@@ -68,6 +68,11 @@ impl Env {
         self.base.get(key).cloned()
     }
 
+    /// Iterate the BASE bindings (for seeding a child block's environment).
+    pub fn iter_base(&self) -> impl Iterator<Item = (&BindingKey, &CheckTy)> {
+        self.base.iter()
+    }
+
     /// Push a fresh narrowing scope (a branch boundary).
     pub fn push_narrowing(&mut self) {
         self.overlay.push(HashMap::new());
