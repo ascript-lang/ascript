@@ -85,6 +85,11 @@ impl DocumentStore {
     pub fn remove(&mut self, uri: &Url) {
         self.models.remove(uri);
     }
+
+    /// The URIs of every currently-open document (republish on config change).
+    pub fn uris(&self) -> Vec<Url> {
+        self.models.keys().cloned().collect()
+    }
 }
 
 /// Discover the lint config for a document URL (nearest `ascript.toml [lint]`).

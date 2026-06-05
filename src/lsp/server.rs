@@ -111,6 +111,37 @@ impl Backend {
         }
         self.client.publish_diagnostics(uri, diags, version).await;
     }
+
+    /// Rebuild + re-publish diagnostics for every open document. Used when the
+    /// effective lint config may have changed (an `ascript.toml` edit), since the
+    /// model's config is discovered from the document's path at build time.
+    async fn republish_all_open(&self) {
+        let docs: Vec<(Url, String, Option<i32>)> = {
+            let store = self.documents.lock().await;
+            store
+                .uris()
+                .into_iter()
+                .filter_map(|uri| {
+                    store
+                        .get(&uri)
+                        .map(|m| (uri.clone(), m.text.clone(), m.version))
+                })
+                .collect()
+        };
+        for (uri, text, version) in docs {
+            self.analyze_and_publish(uri, text, version).await;
+        }
+    }
+}
+
+/// Parse the `ascript.color.detectHexStringsEverywhere` boolean out of a
+/// `didChangeConfiguration` settings payload, if present.
+fn parse_detect_setting(settings: &serde_json::Value) -> Option<bool> {
+    settings
+        .get("ascript")
+        .and_then(|a| a.get("color"))
+        .and_then(|c| c.get("detectHexStringsEverywhere"))
+        .and_then(|v| v.as_bool())
 }
 
 /// The set of capabilities the server advertises. Factored out so it can be unit
@@ -325,6 +356,33 @@ impl LanguageServer for Backend {
                 idx.reindex_file(path, text);
             }
         }
+        // Dynamically register a file watcher for `*.as` + `ascript.toml` so the
+        // client sends `workspace/didChangeWatchedFiles` (best-effort — a client
+        // without dynamic-registration support simply ignores it).
+        let registration = Registration {
+            id: "ascript-watch".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.as".to_string()),
+                        kind: None,
+                    },
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/ascript.toml".to_string()),
+                        kind: None,
+                    },
+                ],
+            })
+            .ok(),
+        };
+        // Spawned (not awaited inline): `register_capability` is a server→client
+        // REQUEST whose response we do not need; awaiting it inline would stall the
+        // `initialized` handler against a client that never answers.
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let _ = client.register_capability(vec![registration]).await;
+        });
         self.client
             .log_message(MessageType::INFO, "ascript language server initialized")
             .await;
@@ -1281,6 +1339,43 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut reconfig = false;
+        for change in &params.changes {
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            let is_as = path.extension().and_then(|e| e.to_str()) == Some("as");
+            let is_toml = path.file_name().and_then(|n| n.to_str()) == Some("ascript.toml");
+            if is_as {
+                if change.typ == FileChangeType::DELETED {
+                    if let Ok(mut idx) = self.index.write() {
+                        idx.files.remove(&workspace::canon(&path));
+                    }
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    if let Ok(mut idx) = self.index.write() {
+                        idx.reindex_file(&path, &text);
+                    }
+                }
+            } else if is_toml {
+                // The lint config changed: every open document's diagnostics may
+                // change (its config is path-discovered).
+                reconfig = true;
+            }
+        }
+        if reconfig {
+            self.republish_all_open().await;
+        }
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        if let Some(detect) = parse_detect_setting(&params.settings) {
+            if let Ok(mut s) = self.settings.write() {
+                s.detect_hex_strings_everywhere = detect;
+            }
+        }
+    }
+
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
         Ok(())
     }
@@ -1541,6 +1636,24 @@ mod tests {
             .commands
             .iter()
             .any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND));
+    }
+
+    #[test]
+    fn parse_detect_setting_reads_color_flag() {
+        let on = serde_json::json!({
+            "ascript": { "color": { "detectHexStringsEverywhere": true } }
+        });
+        assert_eq!(parse_detect_setting(&on), Some(true));
+        let off = serde_json::json!({
+            "ascript": { "color": { "detectHexStringsEverywhere": false } }
+        });
+        assert_eq!(parse_detect_setting(&off), Some(false));
+        // Absent → None (no change).
+        assert_eq!(parse_detect_setting(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_detect_setting(&serde_json::json!({ "ascript": {} })),
+            None
+        );
     }
 
     #[test]
