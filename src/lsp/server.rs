@@ -17,6 +17,14 @@ use tokio::sync::Mutex;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+/// Client-configurable settings (subset). Updated by `didChangeConfiguration`.
+#[derive(Debug, Clone, Default)]
+pub struct LspSettings {
+    /// `ascript.color.detectHexStringsEverywhere` — broaden hex-string color
+    /// detection past the color-sink gate. Default `false`.
+    pub detect_hex_strings_everywhere: bool,
+}
+
 pub struct Backend {
     client: Client,
     documents: Mutex<DocumentStore>,
@@ -27,6 +35,8 @@ pub struct Backend {
     /// Workspace root folders captured in `initialize`, walked for `*.as` files
     /// when the index is first built.
     roots: RwLock<Vec<PathBuf>>,
+    /// Client-configurable settings (`didChangeConfiguration`).
+    settings: RwLock<LspSettings>,
 }
 
 impl Backend {
@@ -36,6 +46,7 @@ impl Backend {
             documents: Mutex::new(DocumentStore::new()),
             index: RwLock::new(WorkspaceIndex::new()),
             roots: RwLock::new(Vec::new()),
+            settings: RwLock::new(LspSettings::default()),
         }
     }
 
@@ -100,6 +111,37 @@ impl Backend {
         }
         self.client.publish_diagnostics(uri, diags, version).await;
     }
+
+    /// Rebuild + re-publish diagnostics for every open document. Used when the
+    /// effective lint config may have changed (an `ascript.toml` edit), since the
+    /// model's config is discovered from the document's path at build time.
+    async fn republish_all_open(&self) {
+        let docs: Vec<(Url, String, Option<i32>)> = {
+            let store = self.documents.lock().await;
+            store
+                .uris()
+                .into_iter()
+                .filter_map(|uri| {
+                    store
+                        .get(&uri)
+                        .map(|m| (uri.clone(), m.text.clone(), m.version))
+                })
+                .collect()
+        };
+        for (uri, text, version) in docs {
+            self.analyze_and_publish(uri, text, version).await;
+        }
+    }
+}
+
+/// Parse the `ascript.color.detectHexStringsEverywhere` boolean out of a
+/// `didChangeConfiguration` settings payload, if present.
+fn parse_detect_setting(settings: &serde_json::Value) -> Option<bool> {
+    settings
+        .get("ascript")
+        .and_then(|a| a.get("color"))
+        .and_then(|c| c.get("detectHexStringsEverywhere"))
+        .and_then(|v| v.as_bool())
 }
 
 /// The set of capabilities the server advertises. Factored out so it can be unit
@@ -146,8 +188,19 @@ pub fn server_capabilities() -> ServerCapabilities {
             resolve_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
+        // Phase 4: codeLens (run-test/run-main + reference counts) resolved lazily.
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(true),
+        }),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec![crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string()],
+            commands: vec![
+                crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string(),
+                // Phase 4: codeLens run/runTest commands (acknowledged, not executed
+                // by the server — the static-only invariant: the editor extension
+                // binds these to a terminal task).
+                "ascript.run".to_string(),
+                "ascript.runTest".to_string(),
+            ],
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         // Phase 3: call hierarchy (prepare/incoming/outgoing) over the workspace
@@ -172,6 +225,20 @@ pub fn server_capabilities() -> ServerCapabilities {
         })),
         // Phase 2: read/write occurrence highlighting of the symbol under the cursor.
         document_highlight_provider: Some(OneOf::Left(true)),
+        // Phase 4: documentColor / colorPresentation swatches (color.rgb/bgRgb,
+        // [r,g,b] tui arrays, gated hex/functional color strings).
+        color_provider: Some(ColorProviderCapability::Simple(true)),
+        // Phase 4: linkedEditingRange — live rename of a local identifier's same-file
+        // occurrences (globals refused).
+        linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
+        // Phase 4: pull diagnostics (textDocument/diagnostic + workspace/diagnostic),
+        // returning the same diagnostics as the push path.
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+            identifier: Some("ascript".to_string()),
+            inter_file_dependencies: true,
+            workspace_diagnostics: true,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         // Phase 2: signature help while typing a call's arguments. Triggered on `(`
         // (open the call) and `,` (advance the active parameter / retrigger).
         signature_help_provider: Some(SignatureHelpOptions {
@@ -186,6 +253,19 @@ pub fn server_capabilities() -> ServerCapabilities {
                 work_done_progress_options: WorkDoneProgressOptions::default(),
             },
         ))),
+        // Phase 4: multi-root workspace folders + file-operations (willRenameFiles /
+        // didRenameFiles import rewrite, restricted to `*.as` files).
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
+            file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                will_rename: Some(as_file_rename_filter()),
+                did_rename: Some(as_file_rename_filter()),
+                ..WorkspaceFileOperationsServerCapabilities::default()
+            }),
+        }),
         // Phase 2: semantic-token highlighting (full document + range), with the
         // provider's legend.
         semantic_tokens_provider: Some(
@@ -197,6 +277,21 @@ pub fn server_capabilities() -> ServerCapabilities {
             }),
         ),
         ..ServerCapabilities::default()
+    }
+}
+
+/// A `FileOperationRegistrationOptions` matching `file://**/*.as` (the scheme +
+/// glob both `willRenameFiles` and `didRenameFiles` register on).
+fn as_file_rename_filter() -> FileOperationRegistrationOptions {
+    FileOperationRegistrationOptions {
+        filters: vec![FileOperationFilter {
+            scheme: Some("file".to_string()),
+            pattern: FileOperationPattern {
+                glob: "**/*.as".to_string(),
+                matches: Some(FileOperationPatternKind::File),
+                options: None,
+            },
+        }],
     }
 }
 
@@ -246,8 +341,36 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _params: InitializedParams) {
-        // Warm the cross-file index: walk each root for `*.as` and index them.
+        // Warm the cross-file index over ALL workspace roots (multi-root), wrapped
+        // in a best-effort work-done progress report.
         let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+        let token = NumberOrString::String("ascript-index".to_string());
+        // Create + Begin (spawned: the create is a server→client request whose
+        // response we do not need; a client without progress support ignores it).
+        {
+            let client = self.client.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                let _ = client
+                    .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                        token: token.clone(),
+                    })
+                    .await;
+                client
+                    .send_notification::<notification::Progress>(ProgressParams {
+                        token,
+                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                            WorkDoneProgressBegin {
+                                title: "Indexing AScript workspace".to_string(),
+                                cancellable: Some(false),
+                                message: None,
+                                percentage: None,
+                            },
+                        )),
+                    })
+                    .await;
+            });
+        }
         let mut files: Vec<(PathBuf, String)> = Vec::new();
         for root in &roots {
             for path in workspace::discover_as_files(root) {
@@ -261,6 +384,42 @@ impl LanguageServer for Backend {
                 idx.reindex_file(path, text);
             }
         }
+        // End the progress with the indexed-file count.
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                    message: Some(format!("{} files indexed", files.len())),
+                })),
+            })
+            .await;
+        // Dynamically register a file watcher for `*.as` + `ascript.toml` so the
+        // client sends `workspace/didChangeWatchedFiles` (best-effort — a client
+        // without dynamic-registration support simply ignores it).
+        let registration = Registration {
+            id: "ascript-watch".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.as".to_string()),
+                        kind: None,
+                    },
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/ascript.toml".to_string()),
+                        kind: None,
+                    },
+                ],
+            })
+            .ok(),
+        };
+        // Spawned (not awaited inline): `register_capability` is a server→client
+        // REQUEST whose response we do not need; awaiting it inline would stall the
+        // `initialized` handler against a client that never answers.
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let _ = client.register_capability(vec![registration]).await;
+        });
         self.client
             .log_message(MessageType::INFO, "ascript language server initialized")
             .await;
@@ -391,6 +550,51 @@ impl LanguageServer for Backend {
         Ok(crate::lsp::providers::highlight::document_highlights(model, offset))
     }
 
+    async fn document_color(
+        &self,
+        params: DocumentColorParams,
+    ) -> tower_lsp::jsonrpc::Result<Vec<ColorInformation>> {
+        let uri = params.text_document.uri;
+        let everywhere = self
+            .settings
+            .read()
+            .map(|s| s.detect_hex_strings_everywhere)
+            .unwrap_or(false);
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        Ok(crate::lsp::providers::color::document_colors(model, everywhere))
+    }
+
+    async fn color_presentation(
+        &self,
+        params: ColorPresentationParams,
+    ) -> tower_lsp::jsonrpc::Result<Vec<ColorPresentation>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let rgba = crate::lsp::providers::color::Rgba::from_lsp(params.color);
+        Ok(crate::lsp::providers::color::color_presentations(model, rgba, params.range))
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<LinkedEditingRanges>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::rename::linked_editing_ranges(model, offset)
+            .map(|ranges| LinkedEditingRanges { ranges, word_pattern: None }))
+    }
+
     async fn signature_help(
         &self,
         params: SignatureHelpParams,
@@ -489,6 +693,131 @@ impl LanguageServer for Backend {
         ))
     }
 
+    async fn code_lens(
+        &self,
+        params: CodeLensParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CodeLens>>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::lens::code_lenses(
+            model,
+            uri.as_str(),
+        )))
+    }
+
+    async fn code_lens_resolve(
+        &self,
+        mut lens: CodeLens,
+    ) -> tower_lsp::jsonrpc::Result<CodeLens> {
+        // A refs lens carries `{ kind:"refs", uri, name }`; fill its title.
+        let Some(data) = lens.data.clone() else {
+            return Ok(lens);
+        };
+        let (Some(uri_s), Some(name)) = (
+            data.get("uri").and_then(|v| v.as_str()).map(str::to_string),
+            data.get("name").and_then(|v| v.as_str()).map(str::to_string),
+        ) else {
+            return Ok(lens);
+        };
+        let Ok(uri) = Url::parse(&uri_s) else {
+            return Ok(lens);
+        };
+        // Same-file count from the cached model + cross-file from the index.
+        let same_file = {
+            let store = self.documents.lock().await;
+            store
+                .get(&uri)
+                .map(|m| crate::lsp::providers::lens::resolve_same_file_ref_count(m, &name))
+                .unwrap_or(0)
+        };
+        let mut count = same_file;
+        if let Some(path) = url_to_canon(&uri) {
+            if let Ok(idx) = self.index.read() {
+                // Cross-file references: every use of this name in an importer of
+                // the def's file (the same-file count is authoritative; this adds
+                // the importers' uses, anchored on the def's name range).
+                if let Some(file) = idx.files.get(&path) {
+                    if let Some(def) = file
+                        .defs
+                        .iter()
+                        .find(|d| d.name == name)
+                        .map(|d| d.name_range)
+                    {
+                        let cross = idx
+                            .references_at(&path, def.start, false)
+                            .into_iter()
+                            .filter(|(p, _)| *p != path)
+                            .count();
+                        count += cross;
+                    }
+                }
+            }
+        }
+        lens.command = Some(Command {
+            title: format!("{count} reference(s)"),
+            command: String::new(),
+            arguments: None,
+        });
+        Ok(lens)
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> tower_lsp::jsonrpc::Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        match store.get(&uri) {
+            Some(model) => Ok(crate::lsp::providers::diagnostic::document_report(model)),
+            None => Ok(DocumentDiagnosticReportResult::Report(
+                DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport::default()),
+            )),
+        }
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> tower_lsp::jsonrpc::Result<WorkspaceDiagnosticReportResult> {
+        // Project-wide: every indexed file → a workspace full report. Build a model
+        // per file off its cached text (config-aware via the per-path lint config),
+        // returning the SAME diagnostics the push/document-pull paths compute.
+        let files: Vec<(PathBuf, String)> = {
+            match self.index.read().ok() {
+                Some(idx) => idx
+                    .files
+                    .iter()
+                    .map(|(p, f)| (p.clone(), f.text.clone()))
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        let mut items: Vec<WorkspaceDocumentDiagnosticReport> = Vec::with_capacity(files.len());
+        for (path, text) in files {
+            let Some(uri) = canon_to_url(&path) else {
+                continue;
+            };
+            let config = crate::lsp::model::config_for_path(&path);
+            let model = crate::lsp::model::SemanticModel::build(text, None, &config);
+            items.push(WorkspaceDocumentDiagnosticReport::Full(
+                WorkspaceFullDocumentDiagnosticReport {
+                    uri,
+                    version: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: model.lsp_diagnostics(),
+                    },
+                },
+            ));
+        }
+        Ok(WorkspaceDiagnosticReportResult::Report(
+            WorkspaceDiagnosticReport { items },
+        ))
+    }
+
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,
@@ -509,6 +838,16 @@ impl LanguageServer for Backend {
                     }
                 }
             }
+        } else if params.command == "ascript.run" || params.command == "ascript.runTest" {
+            // Static-only invariant: the server NEVER runs the interpreter. It only
+            // acknowledges the intent; the editor extension binds these commands to
+            // a terminal task that invokes `ascript run`/`ascript test` (Phase 6).
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("execute {}: {:?}", params.command, params.arguments),
+                )
+                .await;
         }
         Ok(None)
     }
@@ -981,6 +1320,127 @@ impl LanguageServer for Backend {
         }))
     }
 
+    async fn will_rename_files(
+        &self,
+        params: RenameFilesParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<WorkspaceEdit>> {
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for f in &params.files {
+            let (Some(old), Some(new)) = (
+                Url::parse(&f.old_uri).ok().and_then(|u| u.to_file_path().ok()),
+                Url::parse(&f.new_uri).ok().and_then(|u| u.to_file_path().ok()),
+            ) else {
+                continue;
+            };
+            for (importer, range, new_spec) in idx.import_rewrite_edits(&old, &new) {
+                let Some(uri) = canon_to_url(&importer) else {
+                    continue;
+                };
+                let Some(text) = idx_text(&idx, &workspace::canon(&importer)) else {
+                    continue;
+                };
+                changes.entry(uri).or_default().push(TextEdit {
+                    range: workspace::byte_span_to_range(&text, range),
+                    new_text: new_spec,
+                });
+            }
+        }
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
+    }
+
+    async fn did_rename_files(&self, params: RenameFilesParams) {
+        // Re-key the index: drop the old path, index the new one off disk.
+        for f in &params.files {
+            let (Some(old), Some(new)) = (
+                Url::parse(&f.old_uri).ok().and_then(|u| u.to_file_path().ok()),
+                Url::parse(&f.new_uri).ok().and_then(|u| u.to_file_path().ok()),
+            ) else {
+                continue;
+            };
+            if let Ok(mut idx) = self.index.write() {
+                idx.files.remove(&workspace::canon(&old));
+                if let Ok(text) = std::fs::read_to_string(&new) {
+                    idx.reindex_file(&new, &text);
+                }
+            }
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut reconfig = false;
+        for change in &params.changes {
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            let is_as = path.extension().and_then(|e| e.to_str()) == Some("as");
+            let is_toml = path.file_name().and_then(|n| n.to_str()) == Some("ascript.toml");
+            if is_as {
+                if change.typ == FileChangeType::DELETED {
+                    if let Ok(mut idx) = self.index.write() {
+                        idx.files.remove(&workspace::canon(&path));
+                    }
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    if let Ok(mut idx) = self.index.write() {
+                        idx.reindex_file(&path, &text);
+                    }
+                }
+            } else if is_toml {
+                // The lint config changed: every open document's diagnostics may
+                // change (its config is path-discovered).
+                reconfig = true;
+            }
+        }
+        if reconfig {
+            self.republish_all_open().await;
+        }
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        if let Some(detect) = parse_detect_setting(&params.settings) {
+            if let Ok(mut s) = self.settings.write() {
+                s.detect_hex_strings_everywhere = detect;
+            }
+        }
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        if let Ok(mut roots) = self.roots.write() {
+            for added in &params.event.added {
+                if let Ok(p) = added.uri.to_file_path() {
+                    if !roots.contains(&p) {
+                        roots.push(p);
+                    }
+                }
+            }
+            for removed in &params.event.removed {
+                if let Ok(p) = removed.uri.to_file_path() {
+                    roots.retain(|r| r != &p);
+                }
+            }
+        }
+        // Re-warm the index over the (new) root set.
+        let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+        if let Ok(mut idx) = self.index.write() {
+            for root in &roots {
+                for path in workspace::discover_as_files(root) {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        idx.reindex_file(&path, &text);
+                    }
+                }
+            }
+        }
+    }
+
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
         Ok(())
     }
@@ -1214,6 +1674,108 @@ mod tests {
                 Some(OneOf::Left(true)) | Some(OneOf::Right(_))
             ),
             "expected a document-highlight provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_color_provider() {
+        let caps = server_capabilities();
+        assert!(
+            caps.color_provider.is_some(),
+            "expected a documentColor provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_code_lens_and_run_commands() {
+        let caps = server_capabilities();
+        let lens = caps.code_lens_provider.expect("code-lens provider");
+        assert_eq!(lens.resolve_provider, Some(true));
+        let exec = caps
+            .execute_command_provider
+            .expect("execute-command provider");
+        assert!(exec.commands.iter().any(|c| c == "ascript.run"));
+        assert!(exec.commands.iter().any(|c| c == "ascript.runTest"));
+        // The Phase 1 fix-all command is still present (extended, not overwritten).
+        assert!(exec
+            .commands
+            .iter()
+            .any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND));
+    }
+
+    #[test]
+    fn index_covers_multiple_roots() {
+        // Two distinct roots, each with a `.as` file: discover + reindex composes
+        // across roots so the index holds entries from BOTH (multi-root).
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let a = root_a.path().join("alpha.as");
+        let b = root_b.path().join("beta.as");
+        std::fs::write(&a, "export fn alpha() {}\n").unwrap();
+        std::fs::write(&b, "export fn beta() {}\n").unwrap();
+        let mut idx = WorkspaceIndex::new();
+        for root in [root_a.path(), root_b.path()] {
+            for path in workspace::discover_as_files(root) {
+                let text = std::fs::read_to_string(&path).unwrap();
+                idx.reindex_file(&path, &text);
+            }
+        }
+        let names: Vec<&str> = idx.defs_by_name.keys().map(String::as_str).collect();
+        assert!(names.contains(&"alpha"), "alpha from root A: {names:?}");
+        assert!(names.contains(&"beta"), "beta from root B: {names:?}");
+    }
+
+    #[test]
+    fn parse_detect_setting_reads_color_flag() {
+        let on = serde_json::json!({
+            "ascript": { "color": { "detectHexStringsEverywhere": true } }
+        });
+        assert_eq!(parse_detect_setting(&on), Some(true));
+        let off = serde_json::json!({
+            "ascript": { "color": { "detectHexStringsEverywhere": false } }
+        });
+        assert_eq!(parse_detect_setting(&off), Some(false));
+        // Absent → None (no change).
+        assert_eq!(parse_detect_setting(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_detect_setting(&serde_json::json!({ "ascript": {} })),
+            None
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_file_operations_and_multiroot() {
+        let caps = server_capabilities();
+        let ws = caps.workspace.expect("workspace capabilities");
+        let folders = ws.workspace_folders.expect("workspace folders");
+        assert_eq!(folders.supported, Some(true));
+        let ops = ws.file_operations.expect("file operations");
+        let will = ops.will_rename.expect("willRename registered");
+        assert!(will
+            .filters
+            .iter()
+            .any(|f| f.pattern.glob == "**/*.as"));
+        assert!(ops.did_rename.is_some(), "didRename registered");
+    }
+
+    #[test]
+    fn capabilities_advertise_pull_diagnostics() {
+        let caps = server_capabilities();
+        match caps.diagnostic_provider {
+            Some(DiagnosticServerCapabilities::Options(opts)) => {
+                assert!(opts.workspace_diagnostics, "workspace diagnostics on");
+                assert!(opts.inter_file_dependencies, "inter-file deps on");
+            }
+            other => panic!("expected DiagnosticOptions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capabilities_advertise_linked_editing_range() {
+        let caps = server_capabilities();
+        assert!(
+            caps.linked_editing_range_provider.is_some(),
+            "expected a linkedEditingRange provider"
         );
     }
 
