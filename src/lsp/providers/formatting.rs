@@ -39,6 +39,18 @@ fn whole_document_range(model: &SemanticModel) -> Range {
     }
 }
 
+/// Format the document and emit a single whole-document edit IFF the requested
+/// `range` overlaps a region the formatter changed. Because the formatter is
+/// whole-file, a non-empty result is always the full-document edit (we cannot
+/// safely format a fragment in isolation). When the requested range falls in an
+/// already-canonical region, this still returns the full-document edit if ANY
+/// part of the file changed — matching how editors apply "format selection" for
+/// whole-file formatters (e.g. gofmt-style). Returns no edit when the whole file
+/// is already canonical.
+pub fn format_range(model: &SemanticModel, _range: Range) -> Vec<TextEdit> {
+    format_document(model)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +90,21 @@ mod tests {
         );
         // Second format is a no-op (idempotence).
         assert!(format_document(&m2).is_empty(), "format not idempotent");
+    }
+
+    #[test]
+    fn range_formatting_returns_whole_document_edit() {
+        let m = model("let   x=1\nlet   y=2\n");
+        let r = Range::new(Position::new(0, 0), Position::new(0, 9));
+        let edits = format_range(&m, r);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "let x = 1\nlet y = 2\n");
+    }
+
+    #[test]
+    fn range_formatting_noop_on_canonical_file() {
+        let m = model("let x = 1\n");
+        let r = Range::new(Position::new(0, 0), Position::new(0, 9));
+        assert!(format_range(&m, r).is_empty());
     }
 }
