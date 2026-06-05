@@ -233,6 +233,24 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
 
 ---
 
+## SP5 — Stdlib breadth ✅ COMPLETE (2026-06)
+
+Post-cutover gap sub-project SP5 (`specs/2026-06-04-sp5-stdlib-breadth-design.md`,
+`plans/2026-06-04-sp5-stdlib-breadth.md`). Nine phases, all additive + engine-agnostic
+(dispatched through the shared native `Interp::call_stdlib`, so the three-way differential
+is preserved — no opcode/Value eval change):
+1. `schema.parseAll` collect-all-errors validation mode.
+2. HTTP `std/http/server` typed `{params, query, body}` route schemas (coerced; `where` field).
+3. Typed `parse(text, Class|schema)` for csv/toml/yaml via the shared `typed_decode` helper.
+4. `std/msgpack` + `std/cbor` binary serialization (`binary` feature; rmpv/ciborium).
+5. `std/compress` extended with zstd + brotli codecs + tar archives.
+6. `std/postgres` + `std/redis` async network clients (native-resource handles, take-out-
+   across-await; `postgres`/`redis` features; live tests env-gated, green with no infra).
+7. `std/lru` + `std/events` + `std/template` core utilities (un-gated).
+8. `intl.formatDate` locale-correct long/medium month names (curated CLDR table; drops the
+   English-`%B` limitation).
+9. Docs/README/holistic.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred
