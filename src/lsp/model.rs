@@ -126,3 +126,42 @@ mod store_tests {
         assert!(!m.diagnostics.is_empty(), "v2 has a syntax error");
     }
 }
+
+use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString};
+
+impl SemanticModel {
+    /// The model's diagnostics as LSP `Diagnostic`s (severity + code + range).
+    pub fn lsp_diagnostics(&self) -> Vec<Diagnostic> {
+        self.diagnostics
+            .iter()
+            .map(|d| Diagnostic {
+                range: crate::lsp::convert::byte_span_to_range(&self.text, &self.line_index, d.range),
+                severity: Some(match d.severity {
+                    crate::check::Severity::Error => DiagnosticSeverity::ERROR,
+                    crate::check::Severity::Warning => DiagnosticSeverity::WARNING,
+                    crate::check::Severity::Info => DiagnosticSeverity::INFORMATION,
+                    crate::check::Severity::Hint => DiagnosticSeverity::HINT,
+                }),
+                code: Some(NumberOrString::String(d.code.clone())),
+                source: Some("ascript".to_string()),
+                message: d.message.clone(),
+                ..Diagnostic::default()
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    #[test]
+    fn lsp_diagnostics_carry_code_and_severity() {
+        let m = SemanticModel::build("let = 1\n".to_string(), None, &LintConfig::default());
+        let ds = m.lsp_diagnostics();
+        assert!(!ds.is_empty());
+        let d = &ds[0];
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(matches!(&d.code, Some(NumberOrString::String(c)) if c == "syntax-error"));
+    }
+}
