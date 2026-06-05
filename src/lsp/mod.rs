@@ -12,6 +12,7 @@
 //! `Rc`/`RefCell` types. See `analysis` (pure) and `server` (the thin adapter).
 
 pub mod analysis;
+pub mod convert;
 pub mod line_index;
 pub mod server;
 pub mod workspace;
