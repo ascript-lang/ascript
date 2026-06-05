@@ -78,6 +78,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         // `schema.enum` is a parse error; the internal `__kind` tag is "oneOf".
         ("oneOf", bi("schema.oneOf")),
         ("parse", bi("schema.parse")),
+        // collect-all-errors terminal (SP5 §1): returns EVERY validation error.
+        ("parseAll", bi("schema.parseAll")),
         // ── 6c constraints / refinements / coerce ────────────────────────────
         ("min", bi("schema.min")),
         ("max", bi("schema.max")),
@@ -205,6 +207,7 @@ pub(crate) fn is_schema_method(name: &str) -> bool {
             | "optional"
             | "strict"
             | "parse"
+            | "parseAll"
     )
 }
 
@@ -924,6 +927,340 @@ impl Interp {
         Ok(validated)
     }
 
+    /// Collect-all-errors variant of [`parse_value`] (SP5 §1).
+    ///
+    /// Mirrors `parse_value` but, in the composite arms (object/array/map/union),
+    /// instead of `return Err(Mismatch)` on the FIRST failing child it pushes the
+    /// child's `{path, message}` error Object(s) into `errors` and KEEPS GOING,
+    /// substituting `Value::Nil` for the failed sub-value so traversal proceeds.
+    ///
+    /// `InvalidSchema` (malformed schema) and `Control` (a panic/propagate from a
+    /// user `refine` fn) still short-circuit via `?` — collect-all only accumulates
+    /// Tier-1 `Mismatch`es, never swallows a programmer error.
+    ///
+    /// Leaf arms (string/number/bool/nil/any/literal) and the constraint/refine
+    /// checks delegate to the fail-fast `parse_value` (each leaf produces exactly
+    /// one error), so leaf wording is byte-identical between the two engines. A
+    /// leaf `Mismatch` is pushed into `errors` and `Value::Nil` returned.
+    ///
+    /// Returns the validated (best-effort, Nil-substituted) value; the caller
+    /// reports failure iff `errors` is non-empty.
+    ///
+    /// ## Invariant
+    /// Never hold a `RefCell` borrow across an `.await` — composite arms clone the
+    /// child values out under a short borrow before recursing.
+    #[async_recursion::async_recursion(?Send)]
+    pub(crate) async fn parse_value_collect(
+        &self,
+        schema: &Value,
+        value: &Value,
+        path: &str,
+        coerce: bool,
+        span: Span,
+        errors: &mut Vec<Value>,
+    ) -> Result<Value, ParseFail> {
+        let kind = match schema_kind(schema) {
+            Some(k) => k,
+            None => {
+                return Err(ParseFail::InvalidSchema(format!(
+                    "schema.parse: not a valid schema object (missing __kind){}",
+                    if path.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" at '{}'", path)
+                    }
+                )))
+            }
+        };
+
+        // Only the composite arms differ between collect and fail-fast; primitive
+        // and leaf-constraint arms (incl. default/coerce) delegate to parse_value
+        // so their error wording stays byte-identical.
+        match kind.as_ref() {
+            // ── array: validate every element, accumulating errors ────────────
+            "array" => {
+                let elem_schema = obj_field(schema, "elem").ok_or_else(|| {
+                    ParseFail::InvalidSchema("schema.parse: 'array' schema missing 'elem'".into())
+                })?;
+                // default/coerce on the array value itself: nil default short-circuit
+                if matches!(value, Value::Nil) {
+                    if let Some(default_val) = obj_field(schema, "default") {
+                        return Ok(default_val);
+                    }
+                }
+                match value {
+                    Value::Array(arr) => {
+                        let items: Vec<Value> = arr.borrow().clone();
+                        let mut out = Vec::with_capacity(items.len());
+                        for (i, item) in items.iter().enumerate() {
+                            let item_path = format!("{}[{}]", path, i);
+                            match self
+                                .parse_value_collect(
+                                    &elem_schema,
+                                    item,
+                                    &item_path,
+                                    coerce,
+                                    span,
+                                    errors,
+                                )
+                                .await
+                            {
+                                Ok(v) => out.push(v),
+                                Err(ParseFail::Mismatch(e)) => {
+                                    errors.push(e);
+                                    out.push(Value::Nil);
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        // minLength / maxLength on the validated array
+                        if let Some(Value::Number(min)) = obj_field(schema, "minLength") {
+                            if (out.len() as f64) < min {
+                                errors.push(err_obj(
+                                    path,
+                                    format!(
+                                        "expected array with minLength {}, got length {}",
+                                        min,
+                                        out.len()
+                                    ),
+                                ));
+                            }
+                        }
+                        if let Some(Value::Number(max)) = obj_field(schema, "maxLength") {
+                            if (out.len() as f64) > max {
+                                errors.push(err_obj(
+                                    path,
+                                    format!(
+                                        "expected array with maxLength {}, got length {}",
+                                        max,
+                                        out.len()
+                                    ),
+                                ));
+                            }
+                        }
+                        Ok(Value::Array(crate::value::ArrayCell::new(out)))
+                    }
+                    _ => {
+                        errors.push(err_obj(
+                            path,
+                            format!("expected array, got {}", type_name(value)),
+                        ));
+                        Ok(Value::Nil)
+                    }
+                }
+            }
+
+            // ── object: validate every declared field, accumulating errors ────
+            "object" => {
+                let fields_schema = obj_field(schema, "fields").ok_or_else(|| {
+                    ParseFail::InvalidSchema(
+                        "schema.parse: 'object' schema missing 'fields'".into(),
+                    )
+                })?;
+                let is_strict = matches!(obj_field(schema, "strict"), Some(Value::Bool(true)));
+                if matches!(value, Value::Nil) {
+                    if let Some(default_val) = obj_field(schema, "default") {
+                        return Ok(default_val);
+                    }
+                }
+                match value {
+                    Value::Object(val_obj) => {
+                        let field_pairs: Vec<(String, Value)> = match &fields_schema {
+                            Value::Object(fs) => fs
+                                .borrow()
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                            _ => {
+                                return Err(ParseFail::InvalidSchema(
+                                    "schema.parse: 'fields' must be an Object".into(),
+                                ))
+                            }
+                        };
+
+                        // strict: collect EVERY unknown key (not just the first).
+                        if is_strict {
+                            let declared: std::collections::HashSet<&str> =
+                                field_pairs.iter().map(|(k, _)| k.as_str()).collect();
+                            let extra: Vec<String> = {
+                                let val_borrow = val_obj.borrow();
+                                val_borrow
+                                    .keys()
+                                    .filter(|k| !declared.contains(k.as_str()))
+                                    .cloned()
+                                    .collect()
+                            };
+                            for k in extra {
+                                let key_path = if path.is_empty() {
+                                    k.clone()
+                                } else {
+                                    format!("{}.{}", path, k)
+                                };
+                                errors.push(err_obj(
+                                    &key_path,
+                                    format!("unknown key '{}' not allowed in strict object", k),
+                                ));
+                            }
+                        }
+
+                        let mut out: IndexMap<String, Value> = IndexMap::new();
+                        for (field_name, field_schema) in &field_pairs {
+                            let field_val = val_obj
+                                .borrow()
+                                .get(field_name)
+                                .cloned()
+                                .unwrap_or(Value::Nil);
+                            let field_path = if path.is_empty() {
+                                field_name.clone()
+                            } else {
+                                format!("{}.{}", path, field_name)
+                            };
+                            match self
+                                .parse_value_collect(
+                                    field_schema,
+                                    &field_val,
+                                    &field_path,
+                                    coerce,
+                                    span,
+                                    errors,
+                                )
+                                .await
+                            {
+                                Ok(v) => {
+                                    out.insert(field_name.clone(), v);
+                                }
+                                Err(ParseFail::Mismatch(e)) => {
+                                    errors.push(e);
+                                    out.insert(field_name.clone(), Value::Nil);
+                                }
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        Ok(Value::Object(crate::value::ObjectCell::new(out)))
+                    }
+                    _ => {
+                        errors.push(err_obj(
+                            path,
+                            format!("expected object, got {}", type_name(value)),
+                        ));
+                        Ok(Value::Nil)
+                    }
+                }
+            }
+
+            // ── map: validate every entry, accumulating errors ────────────────
+            "map" => {
+                use crate::value::MapKey;
+                let key_schema = obj_field(schema, "key").ok_or_else(|| {
+                    ParseFail::InvalidSchema("schema.parse: 'map' schema missing 'key'".into())
+                })?;
+                let val_schema = obj_field(schema, "val").ok_or_else(|| {
+                    ParseFail::InvalidSchema("schema.parse: 'map' schema missing 'val'".into())
+                })?;
+                if matches!(value, Value::Nil) {
+                    if let Some(default_val) = obj_field(schema, "default") {
+                        return Ok(default_val);
+                    }
+                }
+                let entries: Vec<(Value, Value)> = match value {
+                    Value::Map(m) => m
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (k.to_value(), v.clone()))
+                        .collect(),
+                    Value::Object(o) => o
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| (Value::Str(k.as_str().into()), v.clone()))
+                        .collect(),
+                    _ => {
+                        errors.push(err_obj(
+                            path,
+                            format!("expected map or object, got {}", type_name(value)),
+                        ));
+                        return Ok(Value::Nil);
+                    }
+                };
+
+                let mut out: IndexMap<MapKey, Value> = IndexMap::new();
+                for (raw_key, raw_val) in entries {
+                    let val_path = format!("{}[{}]", path, raw_key);
+                    let key_path = format!("{} (key)", val_path);
+                    let parsed_key = match self
+                        .parse_value_collect(&key_schema, &raw_key, &key_path, coerce, span, errors)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(ParseFail::Mismatch(e)) => {
+                            errors.push(e);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    let parsed_val = match self
+                        .parse_value_collect(&val_schema, &raw_val, &val_path, coerce, span, errors)
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(ParseFail::Mismatch(e)) => {
+                            errors.push(e);
+                            Value::Nil
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    match MapKey::from_value(&parsed_key) {
+                        Some(map_key) => {
+                            out.insert(map_key, parsed_val);
+                        }
+                        None => errors.push(err_obj(
+                            &key_path,
+                            format!("map key type {} is not hashable", type_name(&parsed_key)),
+                        )),
+                    }
+                }
+                Ok(Value::Map(crate::value::MapCell::new(out)))
+            }
+
+            // ── optional: nil short-circuits, else recurse-collect inner ──────
+            "optional" => {
+                if matches!(value, Value::Nil) {
+                    return Ok(Value::Nil);
+                }
+                let inner = obj_field(schema, "inner").ok_or_else(|| {
+                    ParseFail::InvalidSchema(
+                        "schema.parse: 'optional' schema missing 'inner'".into(),
+                    )
+                })?;
+                self.parse_value_collect(&inner, value, path, coerce, span, errors)
+                    .await
+            }
+
+            // ── union: a single composite error (no useful per-arm accumulation)
+            // The fail-fast engine already produces one error listing all arms;
+            // reuse it so wording is identical. (Collecting per-arm would be
+            // misleading — a union failure is "matched none", not N failures.)
+            "union" => match self.parse_value(schema, value, path, coerce, span).await {
+                Ok(v) => Ok(v),
+                Err(ParseFail::Mismatch(e)) => {
+                    errors.push(e);
+                    Ok(Value::Nil)
+                }
+                Err(e) => Err(e),
+            },
+
+            // ── all leaf / primitive / oneOf arms: delegate to fail-fast ──────
+            // Each produces at most one error; push it and substitute Nil.
+            _ => match self.parse_value(schema, value, path, coerce, span).await {
+                Ok(v) => Ok(v),
+                Err(ParseFail::Mismatch(e)) => {
+                    errors.push(e);
+                    Ok(Value::Nil)
+                }
+                Err(e) => Err(e),
+            },
+        }
+    }
+
     pub(crate) async fn call_schema(
         &self,
         func: &str,
@@ -1199,6 +1536,57 @@ impl Interp {
                 }
             }
 
+            // ── schema.parseAll(schema, value[, options]) → [value, errors] ──
+            //
+            // Collect-all-errors mode (SP5 §1): returns EVERY validation error
+            // instead of stopping at the first. On success `errors` is `nil` and
+            // `value` is the validated value (identical to `parse`). On failure
+            // `value` is `nil` and `errors` is an Array of `{path, message}`
+            // Objects (the SAME shape as `parse`'s single err), one per leaf
+            // failure in deterministic document order. A failure always carries
+            // ≥1 error (an empty array is never a failure).
+            "parseAll" => {
+                let schema = arg(args, 0);
+                let value = arg(args, 1);
+                let coerce = match args.get(2) {
+                    Some(Value::Object(o)) => {
+                        matches!(o.borrow().get("coerce"), Some(Value::Bool(true)))
+                    }
+                    _ => false,
+                };
+
+                let mut errors: Vec<Value> = Vec::new();
+                match self
+                    .parse_value_collect(&schema, &value, "", coerce, span, &mut errors)
+                    .await
+                {
+                    Ok(v) => {
+                        if errors.is_empty() {
+                            Ok(make_pair(v, Value::Nil))
+                        } else {
+                            Ok(make_pair(
+                                Value::Nil,
+                                Value::Array(crate::value::ArrayCell::new(errors)),
+                            ))
+                        }
+                    }
+                    // Tier-2 programmer error (malformed schema) → panic.
+                    Err(ParseFail::InvalidSchema(msg)) => Err(AsError::at(msg, span).into()),
+                    // A panic/propagate from inside a refine fn — re-raise unchanged.
+                    Err(ParseFail::Control(c)) => Err(c),
+                    // A top-level Mismatch can't escape parse_value_collect (it
+                    // pushes into `errors` and returns Ok), but handle it for
+                    // totality: treat as a single-error failure.
+                    Err(ParseFail::Mismatch(e)) => {
+                        errors.push(e);
+                        Ok(make_pair(
+                            Value::Nil,
+                            Value::Array(crate::value::ArrayCell::new(errors)),
+                        ))
+                    }
+                }
+            }
+
             // ── 6d: schema.fromClass(Class) → object schema ───────────────────
             //
             // Derives a `{__kind:"object", fields:{...}, strict:false}` schema
@@ -1307,6 +1695,7 @@ mod tests {
             "optional",
             "strict",
             "parse",
+            "parseAll",
         ] {
             assert!(is_schema_method(m), "{m} should be a schema method");
         }
@@ -2653,5 +3042,157 @@ mod tests {
             .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
         assert!(matches!(err_val(&pair), Value::Object(_)));
+    }
+
+    // ── SP5 §1: parseAll collect-all-errors ──────────────────────────────────
+
+    /// Build `{__kind:"object", fields:{...}, strict:false}` from (name, schema).
+    fn obj_schema(fields: &[(&str, Value)]) -> Value {
+        let mut fm: IndexMap<String, Value> = IndexMap::new();
+        for (k, v) in fields {
+            fm.insert((*k).to_string(), v.clone());
+        }
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        m.insert("__kind".to_string(), Value::Str("object".into()));
+        m.insert(
+            "fields".to_string(),
+            Value::Object(crate::value::ObjectCell::new(fm)),
+        );
+        m.insert("strict".to_string(), Value::Bool(false));
+        Value::Object(crate::value::ObjectCell::new(m))
+    }
+
+    fn errs_array(pair: &Value) -> Vec<Value> {
+        match err_val(pair) {
+            Value::Array(a) => a.borrow().clone(),
+            other => panic!("expected errors array, got {:?}", other),
+        }
+    }
+
+    fn val_obj(fields: &[(&str, Value)]) -> Value {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        for (k, v) in fields {
+            m.insert((*k).to_string(), v.clone());
+        }
+        Value::Object(crate::value::ObjectCell::new(m))
+    }
+
+    #[tokio::test]
+    async fn parse_all_collects_three_object_errors_in_order() {
+        let interp = crate::interp::Interp::new();
+        let schema = obj_schema(&[
+            ("a", make_schema("string")),
+            ("b", make_schema("number")),
+            ("c", make_schema("string")),
+        ]);
+        // all three wrong types
+        let value = val_obj(&[
+            ("a", Value::Number(1.0)),
+            ("b", Value::Str("x".into())),
+            ("c", Value::Number(2.0)),
+        ]);
+        let pair = interp
+            .call_schema("parseAll", &[schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(ok_val(&pair), Value::Nil);
+        let errs = errs_array(&pair);
+        assert_eq!(errs.len(), 3, "expected 3 errors, got {:?}", errs);
+        // deterministic declared-field order: a, b, c
+        assert_eq!(field(&errs[0], "path"), Value::Str("a".into()));
+        assert_eq!(field(&errs[1], "path"), Value::Str("b".into()));
+        assert_eq!(field(&errs[2], "path"), Value::Str("c".into()));
+    }
+
+    #[tokio::test]
+    async fn parse_all_success_returns_value_nil_errors() {
+        let interp = crate::interp::Interp::new();
+        let schema = obj_schema(&[("a", make_schema("string")), ("b", make_schema("number"))]);
+        let value = val_obj(&[("a", Value::Str("hi".into())), ("b", Value::Number(2.0))]);
+        let pair = interp
+            .call_schema("parseAll", &[schema, value], sp())
+            .await
+            .unwrap();
+        assert_eq!(err_val(&pair), Value::Nil);
+        assert!(matches!(ok_val(&pair), Value::Object(_)));
+    }
+
+    #[tokio::test]
+    async fn parse_all_nested_dotted_and_indexed_paths() {
+        let interp = crate::interp::Interp::new();
+        // { user: { name: string }, tags: array<number> }
+        let user_schema = obj_schema(&[("name", make_schema("string"))]);
+        let mut arr_m: IndexMap<String, Value> = IndexMap::new();
+        arr_m.insert("__kind".to_string(), Value::Str("array".into()));
+        arr_m.insert("elem".to_string(), make_schema("number"));
+        let arr_schema = Value::Object(crate::value::ObjectCell::new(arr_m));
+        let schema = obj_schema(&[("user", user_schema), ("tags", arr_schema)]);
+
+        let value = val_obj(&[
+            ("user", val_obj(&[("name", Value::Number(7.0))])),
+            (
+                "tags",
+                Value::Array(crate::value::ArrayCell::new(vec![
+                    Value::Number(1.0),
+                    Value::Str("bad".into()),
+                ])),
+            ),
+        ]);
+        let pair = interp
+            .call_schema("parseAll", &[schema, value], sp())
+            .await
+            .unwrap();
+        let errs = errs_array(&pair);
+        let paths: Vec<String> = errs
+            .iter()
+            .map(|e| match field(e, "path") {
+                Value::Str(s) => s.to_string(),
+                _ => String::new(),
+            })
+            .collect();
+        assert!(paths.contains(&"user.name".to_string()), "paths: {:?}", paths);
+        assert!(paths.contains(&"tags[1]".to_string()), "paths: {:?}", paths);
+    }
+
+    #[tokio::test]
+    async fn parse_fail_fast_still_returns_single_error() {
+        // Regression: `parse` (not parseAll) stops at the first error and returns
+        // a single {path, message} Object, NOT an array.
+        let interp = crate::interp::Interp::new();
+        let schema = obj_schema(&[
+            ("a", make_schema("string")),
+            ("b", make_schema("number")),
+            ("c", make_schema("string")),
+        ]);
+        let value = val_obj(&[
+            ("a", Value::Number(1.0)),
+            ("b", Value::Str("x".into())),
+            ("c", Value::Number(2.0)),
+        ]);
+        let pair = interp
+            .call_schema("parse", &[schema, value], sp())
+            .await
+            .unwrap();
+        // single Object, not an array
+        match err_val(&pair) {
+            Value::Object(_) => {}
+            other => panic!("expected single error Object, got {:?}", other),
+        }
+        assert_eq!(field(&err_val(&pair), "path"), Value::Str("a".into()));
+    }
+
+    #[tokio::test]
+    async fn parse_all_refine_panic_still_escalates() {
+        // A refine fn that panics must NOT be collected as a Tier-1 error — it
+        // re-raises as a Control. We can't easily build a panicking refine fn at
+        // the Rust unit level, so assert an InvalidSchema (malformed nested
+        // schema) escalates through parseAll as a Tier-2 panic instead.
+        let interp = crate::interp::Interp::new();
+        // object with a field whose schema is a non-schema object (no __kind)
+        let bad_field = Value::Object(crate::value::ObjectCell::new(IndexMap::new()));
+        let schema = obj_schema(&[("a", bad_field)]);
+        let value = val_obj(&[("a", Value::Number(1.0))]);
+        let res = interp.call_schema("parseAll", &[schema, value], sp()).await;
+        assert!(res.is_err(), "malformed nested schema must escalate, not collect");
     }
 }

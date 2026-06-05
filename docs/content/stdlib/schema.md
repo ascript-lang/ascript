@@ -157,6 +157,45 @@ receiver schema, so they stay `schema.*(...)` module functions — they are the 
 > collision between a refiner method and the constraint field it stores. Fluent chaining always uses
 > call position, so every intended use works.
 
+## Collect all errors — `schema.parseAll`
+
+`schema.parse` is **fail-fast**: it stops at the first failing field and returns a single
+`{ path, message }` error. `schema.parseAll(schema, value[, options])` is the **collect-all** mode:
+it keeps going and returns **every** validation error.
+
+> [!TIER1] `schema.parseAll` returns `[value, errors]`. On success `errors` is `nil` and `value` is
+> the validated value (exactly like `parse`). On failure `value` is `nil` and `errors` is an
+> **array** of `{ path, message }` objects — one per leaf failure, in deterministic document order
+> (object fields in declared order, array elements by index, map entries in iteration order). A
+> failure always carries at least one error.
+
+```ascript
+let form = schema.object({
+  name:  schema.minLength(schema.string(), 1),
+  age:   schema.min(schema.number(), 0),
+  email: schema.string(),
+})
+
+let [val, errs] = schema.parseAll(form, { name: "", age: -3, email: 42 })
+// val == nil; errs has THREE entries:
+//   { path: "name",  message: "expected string with minLength 1, got length 0" }
+//   { path: "age",   message: "expected number >= 0 (min), got -3" }
+//   { path: "email", message: "expected string, got number" }
+
+for (e in errs) { print(`${e.path}: ${e.message}`) }
+
+// Fluent method form works too:
+let [_v, errs2] = form.parseAll({ name: "", age: -3, email: 42 })
+```
+
+Nested errors carry full dotted/indexed paths (`user.name`, `tags[1]`). The error messages are
+**byte-identical** to `parse`'s — only the accumulation differs. A `union` failure stays a single
+error (a union failure means "matched none", not N failures). A malformed schema or a panic from a
+`refine` function still escalates as a Tier-2 panic — collect-all only accumulates Tier-1
+validation mismatches, never swallows a programmer error.
+
+`parseAll` is a method too — it appears in the same method set as `parse`.
+
 ## Constraints
 
 Constraints are chainable modifiers that clone the schema and add a check. They are applied

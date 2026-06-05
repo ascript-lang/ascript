@@ -1,0 +1,5 @@
+# exit: none
+name: expected string with minLength 1, got length 0
+age: expected number >= 0 (min), got -3
+email: expected string, got number
+schema_collect: all assertions passed
