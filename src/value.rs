@@ -420,6 +420,12 @@ pub enum NativeKind {
     // SP5 §6 std/redis: an async Redis connection (feature `redis`).
     // Methods: command/get/set/del/incr/expire/exists/close.
     RedisConnection,
+    // SP5 §7 std/lru: a bounded LRU cache (core). Methods: get/set/has/delete/
+    // clear/len/keys.
+    Lru,
+    // SP5 §7 std/events: an event-emitter (core). Methods: on/once/off/emit/
+    // listenerCount.
+    Events,
 }
 
 impl NativeKind {
@@ -451,6 +457,8 @@ impl NativeKind {
             NativeKind::Stream => "stream",
             NativeKind::PostgresConnection => "postgresConnection",
             NativeKind::RedisConnection => "redisConnection",
+            NativeKind::Lru => "lru",
+            NativeKind::Events => "emitter",
         }
     }
 }

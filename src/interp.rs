@@ -236,6 +236,11 @@ pub(crate) enum ResourceState {
     // keep the enum compact (MultiplexedConnection is sizeable).
     #[cfg(feature = "redis")]
     RedisConnection(Box<redis::aio::MultiplexedConnection>),
+    // SP5 §7 std/lru: a bounded LRU cache (core, not feature-gated). Boxed to keep
+    // the enum compact (the IndexMap can grow).
+    Lru(Box<crate::stdlib::lru::LruState>),
+    // SP5 §7 std/events: an event-emitter's per-event listener lists (core).
+    Events(Box<crate::stdlib::events::EventsState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -2478,6 +2483,12 @@ impl Interp {
             }
             if matches!(m.receiver.kind, RateLimiter) {
                 return self.call_rate_limiter_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, Lru) {
+                return self.call_lru_method(&m, &args, span);
+            }
+            if matches!(m.receiver.kind, Events) {
+                return self.call_events_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())

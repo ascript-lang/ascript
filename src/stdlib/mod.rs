@@ -17,6 +17,7 @@ pub mod compress;
 pub mod convert;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+pub mod events;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "datetime")]
@@ -38,6 +39,7 @@ pub mod io;
 pub mod json;
 #[cfg(feature = "log")]
 pub mod log;
+pub mod lru;
 pub mod map;
 pub mod math;
 #[cfg(feature = "binary")]
@@ -71,6 +73,7 @@ pub mod stream;
 pub mod string;
 pub mod sync;
 pub mod task_mod;
+pub mod template;
 pub mod time;
 pub mod time_timers;
 #[cfg(feature = "data")]
@@ -111,6 +114,9 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/map" => map::exports(),
         "std/schema" => schema::exports(),
         "std/set" => set::exports(),
+        "std/lru" => lru::exports(),
+        "std/events" => events::exports(),
+        "std/template" => template::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
         "std/task" => task_mod::exports(),
@@ -203,6 +209,9 @@ pub const STD_MODULES: &[&str] = &[
     "std/map",
     "std/schema",
     "std/set",
+    "std/lru",
+    "std/events",
+    "std/template",
     "std/bytes",
     "std/convert",
     "std/task",
@@ -350,6 +359,9 @@ impl Interp {
             "map" => map::call(func, args, span),
             "schema" => self.call_schema(func, args, span).await,
             "set" => set::call(func, args, span),
+            "lru" => self.call_lru_new(func, args, span),
+            "events" => self.call_events_new(func, args, span),
+            "template" => template::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
             "task" => self.call_task(func, args, span).await,

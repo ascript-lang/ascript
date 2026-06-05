@@ -26,6 +26,7 @@ const NAV = [
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
     ['stdlib/collections', 'Core & collections'],
+    ['stdlib/utilities', 'Utilities (LRU, events, templates)'],
     ['stdlib/data', 'Data & serialization'],
     ['stdlib/system', 'System & files'],
     ['stdlib/db', 'Databases (Postgres & Redis)'],
