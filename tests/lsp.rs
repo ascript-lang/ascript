@@ -3,7 +3,7 @@
 //! This spawns the real `ascript lsp` binary as a subprocess and speaks LSP
 //! JSON-RPC (`Content-Length`-framed messages) over its stdin/stdout, proving the
 //! server actually talks the protocol — distinct from the pure-analysis unit tests
-//! in `src/lsp/analysis.rs`, which never touch the wire.
+//! in `src/lsp/providers/` and `src/lsp/model.rs`, which never touch the wire.
 //!
 //! Gated on the `lsp` feature; under `--no-default-features` the whole file (and
 //! the `ascript lsp` subcommand) compiles out, so the file is empty there.

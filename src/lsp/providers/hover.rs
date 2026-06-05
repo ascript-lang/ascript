@@ -49,6 +49,35 @@ mod tests {
     }
 
     #[test]
+    fn hover_shows_inferred_return_type() {
+        // Hovering `y` (= id(1); id returns number) shows the INFERRED `number`,
+        // even though `y` itself is unannotated. (Re-establishes the coverage of the
+        // deleted analysis.rs::hover_shows_inferred_return_type.)
+        let src = "fn id(x: number) { return x }\nlet y = id(1)\nprint(y)\n";
+        let m = model(src);
+        let off = src.rfind('y').unwrap();
+        let h = hover(&m, off).expect("hover on y");
+        let HoverContents::Markup(mk) = h.contents else {
+            panic!()
+        };
+        assert!(mk.value.contains("number"), "got {}", mk.value);
+    }
+
+    #[test]
+    fn hover_shows_any_for_unannotated() {
+        // An unannotated param's use hovers as `any`. (Re-establishes the coverage of
+        // the deleted analysis.rs::hover_shows_any_for_unannotated.)
+        let src = "fn g(p) { return p }\n";
+        let m = model(src);
+        let off = src.rfind('p').unwrap(); // the use in `return p`
+        let h = hover(&m, off).expect("hover on p");
+        let HoverContents::Markup(mk) = h.contents else {
+            panic!()
+        };
+        assert!(mk.value.contains("any"), "got {}", mk.value);
+    }
+
+    #[test]
     fn hover_on_builtin_print_mentions_print() {
         let src = "print(1)\n";
         let m = model(src);
