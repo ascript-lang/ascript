@@ -10,6 +10,7 @@ pub mod hierarchy;
 pub mod highlight;
 pub mod hover;
 pub mod inlay;
+pub mod lens;
 pub mod navigation;
 pub mod rename;
 pub mod semantic_tokens;
