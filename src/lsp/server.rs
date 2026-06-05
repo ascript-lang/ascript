@@ -223,11 +223,12 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let store = self.documents.lock().await;
-        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
-        let items = analysis::completions(text, offset);
+        // The completion provider scans raw chars, so it takes a CHAR offset.
+        let offset = model.line_index.offset(position);
+        let items = crate::lsp::providers::completion::completions(model, offset);
         Ok(Some(CompletionResponse::Array(items)))
     }
 
