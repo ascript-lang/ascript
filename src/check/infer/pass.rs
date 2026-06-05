@@ -282,6 +282,11 @@ impl<'a> Pass<'a> {
                 .unwrap_or_default(),
             BinaryExpr => {
                 let op = binary_op(cond);
+                // `x instanceof C` (SP2): then narrows x to Class(C); else
+                // meet-subtracts Class(C) from a class union (§4 form 2).
+                if op == Some(InstanceofKw) {
+                    return self.instanceof_narrowing(cond, env);
+                }
                 if !matches!(op, Some(EqEq | BangEq)) {
                     return Default::default();
                 }
@@ -346,6 +351,51 @@ impl<'a> Pass<'a> {
             }
             _ => Default::default(),
         }
+    }
+
+    /// Narrowing for `x instanceof C` (§4 form 2). then: x → `Class(C)`; else:
+    /// meet-subtract `Class(C)` from x when x is currently a union of classes (for
+    /// `Any`/non-class-union x, the else refinement is omitted — stays gradual).
+    #[allow(clippy::type_complexity)]
+    fn instanceof_narrowing(
+        &self,
+        cond: &ResolvedNode,
+        env: &Env,
+    ) -> (Vec<(BindingKey, CheckTy)>, Vec<(BindingKey, CheckTy)>) {
+        let operands: Vec<ResolvedNode> = cond
+            .children()
+            .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        let (Some(lhs), Some(rhs)) = (operands.first(), operands.get(1)) else {
+            return Default::default();
+        };
+        if lhs.kind() != SyntaxKind::NameRef || rhs.kind() != SyntaxKind::NameRef {
+            return Default::default();
+        }
+        // RHS must name a known class.
+        let class_name = crate::syntax::resolve::ident_text(rhs).unwrap_or_default();
+        let Some(cid) = self.table.class_id(&class_name) else {
+            return Default::default();
+        };
+        let Some(key) = self.key_for_use(&lhs.text_range()) else {
+            return Default::default();
+        };
+        let cur = env.lookup(&key).unwrap_or(CheckTy::Any);
+        let then = vec![(key.clone(), CheckTy::Class(cid))];
+        // else: subtract Class(cid) from a class union; otherwise no refinement.
+        let else_ref = match &cur {
+            CheckTy::Union(ms) if ms.iter().all(|m| matches!(m, CheckTy::Class(_))) => {
+                let kept: Vec<CheckTy> = ms
+                    .iter()
+                    .filter(|m| !matches!(m, CheckTy::Class(c) if *c == cid))
+                    .cloned()
+                    .collect();
+                vec![(key, crate::check::infer::ty::normalize(CheckTy::Union(kept)))]
+            }
+            _ => Vec::new(),
+        };
+        (then, else_ref)
     }
 
     /// The `BindingKey` of a `NameRef` whose CURRENT type is a provable `T?` (so
@@ -538,10 +588,7 @@ impl<'a> Pass<'a> {
                 self.synth_children_exprs(expr, env);
                 CheckTy::Any
             }
-            MatchExpr => {
-                self.synth_children_exprs(expr, env);
-                CheckTy::Any
-            }
+            MatchExpr => self.synth_match(expr, env),
             _ => {
                 self.synth_children_exprs(expr, env);
                 CheckTy::Any
@@ -791,6 +838,70 @@ impl<'a> Pass<'a> {
             .map(|e| self.synth(e, env))
             .unwrap_or(CheckTy::Any);
         t.join(&f, self.table)
+    }
+
+    /// Synthesize a `match` expression with per-arm subject narrowing (§4 form 3).
+    /// The subject is synthesized once; for each `match`-arm that is a proper child
+    /// of the `MatchExpr`, the subject binding is narrowed per the arm's pattern (a
+    /// `nil` pattern → `Nil`; a non-nil literal/variant pattern → `without_nil`)
+    /// while synthesizing that arm's body. The result is the join of arm-body synths
+    /// (or `Any`). NOTE: the CST front-end nests only the FIRST arm under `MatchExpr`
+    /// (subsequent arms are sibling statements walked by `walk_stmts`); this narrows
+    /// what is reachable and stays silent (Any) on the rest — never a false positive.
+    fn synth_match(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {
+        // The subject is the first expression-kind child (a ParenExpr or bare expr).
+        let subject = first_expr_child(expr);
+        let subject_key = subject.as_ref().and_then(|s| {
+            let inner = if s.kind() == SyntaxKind::ParenExpr {
+                first_expr_child(s)
+            } else {
+                Some(s.clone())
+            }?;
+            if inner.kind() == SyntaxKind::NameRef {
+                self.key_for_use(&inner.text_range())
+            } else {
+                None
+            }
+        });
+        if let Some(s) = &subject {
+            self.synth(s, env);
+        }
+
+        let mut result = CheckTy::Never;
+        for arm in expr.children().filter(|c| c.kind() == SyntaxKind::MatchArm) {
+            // The arm body is its trailing expression-kind child.
+            let body = arm
+                .children()
+                .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+                .last()
+                .cloned();
+            // Narrow the subject for this arm per its pattern.
+            let refinement = subject_key.as_ref().and_then(|key| {
+                let pat = arm.children().find(|c| is_pattern_kind(c.kind()))?;
+                let cur = env.lookup(key).unwrap_or(CheckTy::Any);
+                if pattern_is_nil(pat) {
+                    Some((key.clone(), cur.only_nil()))
+                } else {
+                    // a concrete non-nil pattern → subject is non-nil in this arm.
+                    Some((key.clone(), cur.without_nil()))
+                }
+            });
+            let arm_ty = if let Some((k, ty)) = refinement {
+                env.push_narrowing();
+                env.narrow(k, ty);
+                let t = body.map(|b| self.synth(&b, env)).unwrap_or(CheckTy::Any);
+                env.pop_narrowing();
+                t
+            } else {
+                body.map(|b| self.synth(&b, env)).unwrap_or(CheckTy::Any)
+            };
+            result = result.join(&arm_ty.widen(), self.table);
+        }
+        if matches!(result, CheckTy::Never) {
+            CheckTy::Any
+        } else {
+            result
+        }
     }
 
     fn synth_member(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {
@@ -1075,6 +1186,24 @@ fn first_expr_child(node: &ResolvedNode) -> Option<ResolvedNode> {
     node.children()
         .find(|c| crate::check::rules::is_expr_kind(c.kind()))
         .cloned()
+}
+
+/// Is `kind` a match-pattern node kind?
+fn is_pattern_kind(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        kind,
+        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat
+    )
+}
+
+/// Is this pattern the `nil` literal pattern (`LiteralPat` wrapping `nil`)?
+fn pattern_is_nil(pat: &ResolvedNode) -> bool {
+    pat.kind() == SyntaxKind::LiteralPat
+        && pat
+            .descendants_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == SyntaxKind::NilKw)
 }
 
 /// Is `node` the `nil` literal?
@@ -1389,5 +1518,32 @@ mod tests {
         // an unannotated (Any) param → no possibly-nil.
         let src = "fn f(x) { return x + 1 }\n";
         assert!(!has(src, "possibly-nil"));
+    }
+
+    // ----- T4 instanceof narrowing (SP2 landed) -----
+
+    #[test]
+    fn instanceof_narrows_then_branch() {
+        // x narrowed to Dog → x.bark() member resolves; no diagnostics.
+        let src = "class Dog { fn bark(): nil { return nil } }\nfn f(x) {\n  if (x instanceof Dog) { return x.name }\n  return nil\n}\n";
+        assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+        assert!(!has(src, "type-error"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn instanceof_unknown_class_silent() {
+        // RHS not a known class → no narrowing, no FP.
+        let src = "fn f(x) {\n  if (x instanceof Nonexistent) { return x }\n  return nil\n}\n";
+        assert!(!has(src, "type-error"), "{:?}", analyze(src).diagnostics);
+        assert!(!has(src, "possibly-nil"));
+    }
+
+    // ----- T4 early-return flow merge (also exercised in T3) -----
+
+    #[test]
+    fn early_return_break_narrows_tail_in_loop_free_block() {
+        // after `if (x == nil) { return 0 }` the tail sees x : number.
+        let src = "fn f(x: number?): number {\n  if (x == nil) { return 0 }\n  let y = x + 1\n  return y\n}\n";
+        assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
     }
 }
