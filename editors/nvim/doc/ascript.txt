@@ -1,0 +1,42 @@
+*ascript.txt*  AScript language support for Neovim
+
+==============================================================================
+INTRODUCTION                                                  *ascript-nvim*
+
+ascript.nvim wires the AScript language server (`ascript lsp`), tree-sitter
+highlighting, filetype detection for *.as, and formatting (`ascript fmt`).
+
+Requirements: `ascript` on PATH (>= 0.6.0); nvim-lspconfig; optionally
+nvim-treesitter and conform.nvim.
+
+==============================================================================
+SETUP                                                   *ascript-nvim-setup*
+
+>lua
+    require("ascript").setup({
+      lsp = { on_attach = my_on_attach },
+      treesitter = true,
+      format_on_save = false,
+    })
+<
+
+Or wire lspconfig directly:
+
+>lua
+    require("ascript.lspconfig").setup({})
+<
+
+==============================================================================
+FORMATTING                                            *ascript-nvim-format*
+
+LSP formatting works out of the box (`:lua vim.lsp.buf.format()`). For
+conform.nvim:
+
+>lua
+    require("conform").setup({
+      formatters = { ascript_fmt = require("ascript.format").conform_formatter },
+      formatters_by_ft = { ascript = { "ascript_fmt" } },
+    })
+<
+
+ vim:tw=78:ts=8:ft=help:norl:
