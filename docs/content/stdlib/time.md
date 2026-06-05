@@ -14,6 +14,12 @@ Feature gates:
 
 Wall-clock time, a monotonic clock for measuring elapsed time, asynchronous sleep, and duration-unit helpers. All values are numbers of milliseconds.
 
+> **Deterministic mode (SP9).** Inside a `std/workflow` run (or deterministic mode),
+> `time.now`/`time.monotonic`/`date.now` read a recorded **virtual clock** and `time.sleep`
+> advances that clock without sleeping real time — so a workflow replays its timing exactly.
+> Outside deterministic mode these read the real wall/monotonic clock (no behavior change).
+> See [Workflows](?p=stdlib/workflow).
+
 ### now
 
 Current wall-clock time as Unix epoch milliseconds (UTC).

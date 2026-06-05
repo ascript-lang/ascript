@@ -41,6 +41,8 @@ pub mod io;
 pub mod json;
 #[cfg(feature = "log")]
 pub mod log;
+#[cfg(feature = "workflow")]
+pub mod workflow;
 pub mod lru;
 pub mod map;
 pub mod math;
@@ -137,6 +139,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/json" => json::exports(),
         #[cfg(feature = "log")]
         "std/log" => log::exports(),
+        #[cfg(feature = "workflow")]
+        "std/workflow" => workflow::exports(),
         #[cfg(feature = "telemetry")]
         "std/telemetry" => telemetry::exports(),
         #[cfg(feature = "data")]
@@ -231,6 +235,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/intl",
     "std/json",
     "std/log",
+    "std/workflow",
     "std/telemetry",
     "std/encoding",
     "std/crypto",
@@ -364,7 +369,7 @@ impl Interp {
             "cli" => self.call_cli(func, args, span).await,
             "color" => color::call(func, args, span),
             "decimal" => decimal::call(func, args, span),
-            "math" => math::call(func, args, span),
+            "math" => math::call(self, func, args, span),
             "string" => string::call(func, args, span),
             "array" => self.call_array(func, args, span).await,
             "object" => self.call_object(func, args, span).await,
@@ -381,6 +386,15 @@ impl Interp {
             "sync" => self.call_sync(func, args, span).await,
             "stream" => self.call_stream(func, args, span).await,
             #[cfg(feature = "datetime")]
+            // SP9 §3 clock seam: `date.now` reads the virtual/recorded clock in
+            // deterministic mode (else the real `Utc::now`). `date::now_from_ms`
+            // builds the same instant `date.now` would from an explicit ms-epoch, so
+            // the deterministic and default forms are identical apart from the time
+            // source. All other `date.*` functions are pure and delegate unchanged.
+            "date" if func == "now" && self.is_deterministic() => {
+                Ok(date::now_from_ms(self.clock_now_ms()))
+            }
+            #[cfg(feature = "datetime")]
             "date" => date::call(func, args, span),
             #[cfg(feature = "intl")]
             "intl" => intl::call(func, args, span),
@@ -388,12 +402,14 @@ impl Interp {
             "json" => json::call(func, args, span),
             #[cfg(feature = "log")]
             "log" => self.call_log(func, args, span).await,
+            #[cfg(feature = "workflow")]
+            "workflow" => self.call_workflow(func, args, span).await,
             #[cfg(feature = "telemetry")]
             "telemetry" => self.call_telemetry(func, args, span).await,
             #[cfg(feature = "data")]
             "encoding" => encoding::call(func, args, span),
             #[cfg(feature = "crypto")]
-            "crypto" => crypto::call(func, args, span),
+            "crypto" => crypto::call(self, func, args, span),
             #[cfg(feature = "compress")]
             "compress" => compress::call(func, args, span),
             #[cfg(feature = "sys")]
@@ -436,7 +452,7 @@ impl Interp {
             #[cfg(feature = "data")]
             "url" => url::call(func, args, span),
             #[cfg(feature = "data")]
-            "uuid" => uuid::call(func, args, span),
+            "uuid" => uuid::call(self, func, args, span),
             #[cfg(feature = "data")]
             "csv" => csv::call(func, args, span),
             #[cfg(feature = "data")]
@@ -604,10 +620,39 @@ impl Interp {
         args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
+        // SP9 §3 clock seam: in deterministic mode `time.now`/`time.monotonic` read
+        // the virtual/recorded clock (so two same-seed runs agree); otherwise the
+        // real clock (byte-identical to pre-SP9). Handled here because `call_time`
+        // has `&self` (the determinism context lives on the `Interp`); the sync
+        // `time::call` keeps its real-clock arms for any direct callers.
+        if self.is_deterministic() {
+            match func {
+                "now" => return Ok(Value::Number(self.clock_now_ms())),
+                "monotonic" => {
+                    let real = time::real_monotonic_ms();
+                    return Ok(Value::Number(self.clock_monotonic_ms(real)));
+                }
+                _ => {}
+            }
+        }
         if func == "sleep" {
             let ms = want_number(&arg(args, 0), span, "time.sleep")?;
             if ms < 0.0 {
                 return Err(AsError::at("time.sleep duration must be non-negative", span).into());
+            }
+            // SP9 §3: in deterministic mode do NOT sleep real time — advance the
+            // virtual clock by `ms` and record a durable timer; replay/resume then
+            // fast-forwards with no real delay. Default mode sleeps for real.
+            if self
+                .with_determinism_mut(|ctx| {
+                    ctx.clock.advance(ms);
+                    ctx.events.push(crate::det::DetEvent::TimerSet {
+                        wake: ctx.clock.now_ms(),
+                    });
+                })
+                .is_some()
+            {
+                return Ok(Value::Nil);
             }
             // `ms as u64` truncates toward zero: a fractional `sleep(20.7)`
             // sleeps for 20 whole milliseconds.

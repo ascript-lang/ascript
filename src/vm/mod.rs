@@ -13,6 +13,7 @@ pub mod ic;
 pub mod opcode;
 pub mod run;
 pub mod shape;
+pub mod stack;
 pub mod value_ext;
 pub mod verify;
 

@@ -59,7 +59,12 @@ fn source_bytes(v: &Value, span: Span, ctx: &str) -> Result<Vec<u8>, Control> {
     }
 }
 
-pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+pub fn call(
+    interp: &crate::interp::Interp,
+    func: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, Control> {
     let ctx = |f: &str| format!("crypto.{}", f);
     match func {
         "sha256" => {
@@ -102,7 +107,12 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             }
             let n = n as usize;
             let mut buf = vec![0u8; n];
-            rand::thread_rng().fill_bytes(&mut buf);
+            // SP9 §3: deterministic mode draws from the per-`Interp` seeded PRNG (so
+            // `crypto.randomBytes` is reproducible under `workflow`/replay); the
+            // default path is the real CSPRNG, BYTE-IDENTICAL to pre-SP9.
+            if !interp.fill_seeded_bytes(&mut buf) {
+                rand::thread_rng().fill_bytes(&mut buf);
+            }
             Ok(bytes_val(buf))
         }
         "hashPassword" => {
@@ -181,6 +191,11 @@ mod tests {
     }
     fn s(x: &str) -> Value {
         Value::Str(x.into())
+    }
+    /// Dispatch with a fresh non-deterministic `Interp` (the default real-RNG path).
+    fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+        let interp = crate::interp::Interp::new();
+        super::call(&interp, func, args, span)
     }
 
     #[test]

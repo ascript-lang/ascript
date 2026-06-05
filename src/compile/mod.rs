@@ -996,7 +996,13 @@ impl Compiler {
                 node_span(expr),
             ));
         }
-        let result = self.compile_expr_inner(expr);
+        // SP9 §1: grow the native stack at this synchronous re-entry funnel so a
+        // deeply nested SOURCE expression (`((((…))))`) reaches the logical
+        // EXPR_NEST_LIMIT cap cleanly instead of overflowing the native Rust stack
+        // first. Inert (a cheap probe) until the stack runs low. Byte-identical:
+        // the cap above is still what fires; `grow` only ensures the recursion can
+        // get there without a SIGABRT.
+        let result = crate::vm::stack::grow(|| self.compile_expr_inner(expr));
         self.compile_depth -= 1;
         result
     }

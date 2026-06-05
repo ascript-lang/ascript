@@ -74,23 +74,45 @@ outlives `main`). The single new interpreter-internal invariant is **"never hold
   engine's existing suspension point gives generators, bidirectional coroutines, and
   `for await` without new machinery.
 
-## Deferrals (require a different engine)
+## Deferrals — RECLASSIFIED by SP9 (2026-06-04)
 
-These are deliberate, documented architectural boundaries of Architecture A — not TODOs.
-Each is impossible on a stackless-async tree-walker and is tagged with the engine that
-would be required.
+The three items below were originally tagged "require a different engine (B1/B2)". The
+SP9 sub-project (`docs/superpowers/specs/2026-06-04-sp9-recursion-durability-determinism-design.md`,
+plan `…/plans/2026-06-04-sp9-…`) took the owner decision to **unbundle them and deliver
+everything achievable WITHOUT a full model-2b VM**. The reclassified status:
 
-1. **Durable / serialize-to-disk continuations** — checkpoint a paused workflow to disk and
-   resume it after a process restart. Async suspension state lives in compiler-generated
-   Rust stackframes, not a reified serializable object. **Requires an explicit-stack VM with
-   reified continuations (B2).**
-2. **Robust unbounded recursion over very deep data** — deep *non-yielding* script recursion
-   still consumes the native call stack and can overflow it, because stackless async does not
-   move recursion off the host stack. **Requires stackful coroutines (B1) or an
-   explicit-stack VM (B2).**
-3. **Deterministic / replayable task scheduling** — Tokio owns task interleaving, so runs are
-   not bit-for-bit reproducible or deterministically replayable. **Requires a custom
-   scheduler over an explicit-stack VM (B2).**
+1. **Durable execution — DELIVERED as replay (not "needs B2").** The original framing
+   (serialize a paused continuation to disk) is **won't-do**: it is architecturally impossible
+   with live native handles (open sockets / DB connections / child processes / TUI in flight),
+   which is the universal industry finding. Instead SP9 §2 ships **`std/workflow`** — durable
+   execution by **event-sourced deterministic replay** (the Temporal/Restate/Cloudflare model):
+   deterministic workflow code re-runs on an ordinary stack and replays completed activities
+   from an append-only JSON event log; native handles live only inside activities and never
+   cross the log boundary. Needs **no B2 VM**. (Continuation serialization remains the one
+   documented *won't-do form*, not a silent drop.)
+
+2. **Robust unbounded recursion — DELIVERED via `stacker` (not "needs B1/B2").** SP9 §1 inserts
+   `stacker::maybe_grow` guards at the narrow native re-entry points (VM `call_value` /
+   `invoke_compiled_method` / `vm_construct`, generator `resume_vm`, the compiler's
+   `compile_expr`, both parsers, the resolver, and the tree-walker's `eval_expr`/`run_body`),
+   which grow a fresh heap-backed native-stack segment on demand. Deep recursion now reaches
+   SP3's clean `maximum recursion depth exceeded` logical cap (`MAX_CALL_DEPTH`) instead of
+   `SIGABRT`ing the native stack first, on BOTH engines, byte-identically. `stacker` is the one
+   sanctioned non-std crate; no `unsafe` is added by AScript's own code. (The explicit
+   `Fiber.frames` stack of the bytecode VM already handles straight script recursion off the
+   native stack; SP9 §1 closes the residual native-re-entry sliver.) Needs **no B1/B2 VM**.
+
+3. **Deterministic scheduling — SUBSET DELIVERED (seams); one named B2 residual.** SP9 §3 ships
+   the achievable-without-B2 subset behind a per-`Interp` inert-by-default `DeterminismContext`:
+   an injectable **virtual clock** (`time.now`/`date.now`/`time.monotonic`/`time.sleep`), a
+   **seeded RNG** (`math.random`/`randomInt`/`shuffle`/`uuid.v4`/`crypto.randomBytes`), and
+   **recorded effect ordering** consumed by the workflow replay engine. Same-seed-same-output is
+   reproducible for single-task and workflow runs; tokio is NOT replaced. The **one genuine B2
+   residual** is **bit-for-bit reproducible interleaving of arbitrary concurrent tokio tasks**
+   (a program that races N un-coordinated `task.spawn`s and expects the scheduler order to be
+   reproducible) — that needs an owned single-threaded cooperative scheduler replacing tokio's
+   `LocalSet`/`spawn_local`, which SP9 does NOT build. This is the sole explicitly-out item
+   (spec §3.6); everything else in non-goal #3 is delivered on the 2a engine.
 
 ## Refinement (post-implementation): structured concurrency / cancel-on-drop
 

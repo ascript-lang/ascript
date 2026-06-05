@@ -77,6 +77,14 @@ fn instant_epoch(v: &Value, span: Span, ctx: &str) -> Result<i64, Control> {
     }
 }
 
+/// Build the `date.now` instant from an explicit ms-epoch — the SP9 §3 determinism
+/// seam for `date.now` (the dispatcher passes the virtual/recorded clock value).
+/// Identical to `date.now`'s default `make_instant(Utc::now().timestamp_millis())`
+/// apart from the time source.
+pub fn now_from_ms(epoch_ms: f64) -> Value {
+    make_instant(epoch_ms as i64)
+}
+
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
     let ctx = |f: &str| format!("date.{}", f);
     match func {

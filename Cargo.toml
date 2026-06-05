@@ -15,6 +15,13 @@ path = "src/main.rs"
 rust_decimal = { version = "1", features = ["maths"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 async-recursion = "1"
+# Probe-and-grow native stack (SP9 §1): `stacker::maybe_grow` allocates a fresh
+# heap-backed stack segment at the native re-entry points (VM/generator/compiler/
+# tree-walker) when the remaining native stack falls below the red zone, so deep
+# recursion reaches the `MAX_CALL_DEPTH` logical cap cleanly instead of SIGABRTing
+# the native stack first. CORE/unconditional (must build under
+# --no-default-features); the only `unsafe` is the crate's own (sanctioned).
+stacker = "0.1"
 indexmap = "2"
 # Cyclic GC (Bacon–Rajan trial-deletion over refcounted `Cc<T>`). CORE runtime,
 # NOT feature-gated: the GC must be present in --no-default-features too. V13-T1
@@ -88,7 +95,7 @@ ungrammar = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:serde_yaml", "dep:percent-encoding", "dep:url"]
 # SP5 §4: std/msgpack + std/cbor binary serialization via the rmpv / ciborium
 # dynamic-value models (no serde derive — bridged by hand like json). Typed decode
@@ -98,6 +105,11 @@ binary = ["dep:rmpv", "dep:ciborium", "data"]
 # serializer (behind `data`), so it pulls in `data`. Default-on; cfg's out
 # cleanly under --no-default-features.
 log = ["data"]
+# SP9 §2: std/workflow — durable execution via event-sourced replay. The event
+# log persists `Value`s through json's total `to_json_lossy` serializer (behind
+# `data`), so it pulls in `data`. Default-on; cfg's out cleanly under
+# --no-default-features (where `import "std/workflow"` is an unknown-module error).
+workflow = ["data"]
 datetime = ["dep:chrono"]
 intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
 # Task 2 wires `dotenvy` for std/env; Task 3 (fs) adds walkdir/ignore/regex; Task 7

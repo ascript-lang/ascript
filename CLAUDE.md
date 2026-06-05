@@ -141,6 +141,31 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > merge as fields; reserved `level`/`msg` always win; a thunk first-arg (incl. `async fn`, awaited)
 > defers message work past the level filter. Default level from `ASCRIPT_LOG`.
 >
+> **SP9 — robust recursion / determinism seams / durable workflows.** Three independent
+> workstreams realizing the M17 async non-goals on the model-2a engine, no model-2b VM:
+> **(1) Robust recursion (`src/vm/stack.rs`):** `stacker::maybe_grow` guards at every native
+> re-entry funnel — `grow()` (sync: compiler `compile_expr`, both parsers' expr entry, resolver
+> `resolve_expr`) and `grow_future()` (a no-`unsafe` per-poll wrapper returning a type-erased
+> boxed future, breaking the `#[async_recursion]` cycle: VM `call_value`/`invoke_compiled_method`/
+> `invoke_compiled_static`, `coro::resume_vm`, tree-walker `run_body` + a coarse-checkpoint
+> `eval_expr`). RED_ZONE=1 MiB / STACK_SIZE=8 MiB (tuned to the measured ~200 KiB/step debug
+> frame). Deep recursion now reaches SP3's `MAX_CALL_DEPTH` cap cleanly instead of SIGABRTing;
+> the cap stays the ceiling on BOTH engines (byte-identical). **(2) Determinism seams
+> (`src/det.rs`):** a per-`Interp` `determinism: RefCell<Option<DeterminismContext>>` (Record/
+> Replay, `VirtualClock`, `SeededRng`, `DetEvent`), INERT by default (the `None` branch of every
+> seam = the exact pre-SP9 path, so the differential is byte-identical). When `Some`, the RNG
+> (`math.rs::next_random`, `uuid.v4`, `crypto.randomBytes` — these now take `&Interp`) and the
+> clock (`time.now`/`monotonic`/`date.now`/`time.sleep` via `call_time`/dispatch) route through
+> it. Never hold the `determinism` `RefCell` across `.await` (accessors take the value out).
+> **(3) Durable execution (`src/stdlib/workflow.rs`, `workflow = ["data"]` feature, default-on):**
+> event-sourced REPLAY (Temporal-style, NOT continuation serialization). `activity`/`run`/`resume`/
+> `ctx` as tagged Objects (no new `Value` variant); `ctx.<method>` routed via the SAME call-site
+> hook `std/schema` uses (`is_ctx_value`+`is_ctx_method` in both engines → `call_workflow_ctx`).
+> Append-only newline-JSON event log via `json::to_json_lossy`; replay-mismatch detection
+> (signature = name+args-hash); durable `ctx.sleep`; serialization constraint on activity results;
+> additive zero-FP `workflow-determinism` checker lint. The ONE documented model-2b residual is
+> arbitrary-concurrent-task-interleaving determinism (spec §3.6 / the async-generators ADR).
+>
 > **Phase 8 — match pattern extensions.** `MatchArm` (in `ast.rs`) holds `patterns: Vec<Pattern>` (the
 > `|`-alternatives) and `guard: Option<Expr>` (the `if` guard). The `Pattern` enum has these variants:
 > `Wildcard` (`_`), `Ident(Rc<str>)`, `Value(Box<Expr>)`, `Range { start, end, inclusive }`,

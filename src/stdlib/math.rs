@@ -77,7 +77,12 @@ fn want_number_vec(v: &Value, span: Span, ctx: &str) -> Result<Vec<f64>, Control
     Ok(out)
 }
 
-pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+pub fn call(
+    interp: &crate::interp::Interp,
+    func: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, Control> {
     let ctx = |f: &str| format!("math.{}", f);
     match func {
         "abs" => Ok(Value::Number(
@@ -120,7 +125,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             };
             Ok(Value::Number(acc))
         }
-        "random" => Ok(Value::Number(next_random())),
+        "random" => Ok(Value::Number(next_random(interp))),
         "sin" => Ok(Value::Number(
             want_number(&arg(args, 0), span, &ctx("sin"))?.sin(),
         )),
@@ -290,7 +295,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 return Err(AsError::at("math.randomInt requires min <= max", span).into());
             }
             let span_len = (max - min + 1) as f64;
-            let v = min + (next_random() * span_len).floor() as i64;
+            let v = min + (next_random(interp) * span_len).floor() as i64;
             Ok(Value::Number(v as f64))
         }
         "shuffle" => {
@@ -298,7 +303,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let mut items = a.borrow().clone();
             let len = items.len();
             for i in (1..len).rev() {
-                let j = (next_random() * (i as f64 + 1.0)).floor() as usize;
+                let j = (next_random(interp) * (i as f64 + 1.0)).floor() as usize;
                 items.swap(i, j.min(i));
             }
             Ok(Value::Array(crate::value::ArrayCell::new(items)))
@@ -309,7 +314,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             if b.is_empty() {
                 return Ok(Value::Nil);
             }
-            let idx = (next_random() * b.len() as f64).floor() as usize;
+            let idx = (next_random(interp) * b.len() as f64).floor() as usize;
             Ok(b[idx.min(b.len() - 1)].clone())
         }
         _ => Err(AsError::at(format!("std/math has no function '{}'", func), span).into()),
@@ -334,7 +339,14 @@ fn seed() -> u64 {
     (nanos ^ addr).max(1)
 }
 
-fn next_random() -> f64 {
+/// The next `[0,1)` random value. SP9 §3: in deterministic mode (an `interp` with a
+/// determinism context) it draws from the per-`Interp` seeded PRNG (recorded /
+/// replayed); otherwise it uses the thread-local xorshift — BYTE-IDENTICAL to the
+/// pre-SP9 path (the conversion math is identical; only the seed source differs).
+fn next_random(interp: &crate::interp::Interp) -> f64 {
+    if let Some(v) = interp.next_seeded_f64() {
+        return v;
+    }
     RNG.with(|cell| {
         let mut x = cell.get();
         x ^= x >> 12;
@@ -356,6 +368,15 @@ mod tests {
 
     fn sp() -> Span {
         Span::new(0, 0)
+    }
+
+    /// Test helper: dispatch `math::call` with a fresh (non-deterministic) `Interp`,
+    /// so the `random*` seam takes its thread-local default path. Mirrors the old
+    /// `call(func, args, span)` signature the tests used before the SP9 `&Interp`
+    /// parameter was added.
+    fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
+        let interp = crate::interp::Interp::new();
+        super::call(&interp, func, args, span)
     }
 
     #[test]
@@ -406,8 +427,9 @@ mod tests {
 
     #[test]
     fn random_in_range() {
+        let interp = crate::interp::Interp::new();
         for _ in 0..1000 {
-            let r = next_random();
+            let r = next_random(&interp);
             assert!((0.0..1.0).contains(&r), "random out of range: {r}");
         }
     }

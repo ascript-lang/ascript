@@ -468,12 +468,33 @@ pub struct Interp {
     /// `.await` (take-out-across-await), never holding a borrow over a genai await.
     #[cfg(feature = "ai")]
     ai: RefCell<crate::stdlib::ai::AiClient>,
+    /// SP9 §3 determinism context. `None` (default) = INERT: the clock/RNG/sleep
+    /// seams take their existing real paths and behavior is byte-identical to
+    /// pre-SP9. `Some(..)` = deterministic mode (entered by `workflow.run`/`resume`):
+    /// the seams route through the [`crate::det::DeterminismContext`]'s virtual
+    /// clock, seeded RNG, and recorded event stream. State lives behind this
+    /// `RefCell` so the `&self` seam accessors can read/advance it through
+    /// short-lived borrows, NEVER held across an `.await` (the accessors take the
+    /// value out / drop the borrow before returning, like the `resources`
+    /// discipline).
+    determinism: RefCell<Option<crate::det::DeterminismContext>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
 /// after spawning so the executor can reap finished/cancelled tasks. Keeps a
 /// no-await loop of un-awaited async calls bounded instead of growing to N.
 const INFLIGHT_YIELD_CAP: u64 = 256;
+
+/// The real wall clock in ms since the Unix epoch (the value `time.now`/`date.now`
+/// return when NOT in deterministic mode). Shared so the determinism seam and the
+/// stdlib seams agree on the format. Saturating to 0 on a pre-epoch clock.
+pub(crate) fn real_now_ms() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
 
 /// The maximum LOGICAL call/eval recursion depth (SP3 §B). Exceeding it raises a
 /// clean, catchable Tier-2 panic `maximum recursion depth exceeded` BEFORE the
@@ -490,6 +511,18 @@ const INFLIGHT_YIELD_CAP: u64 = 256;
 /// the debug worst case, so a 512 MB worker stack gives > 2× headroom. Truly
 /// unbounded recursion stays the SP9 architectural non-goal (needs an
 /// explicit-stack VM); SP3 turns the crash into a deterministic, catchable error.
+///
+/// **SP9 §1 coordination (robust recursion):** SP9 inserts `stacker::maybe_grow`
+/// guards at the native re-entry funnels (VM `call_value`/method dispatch, generator
+/// `resume_vm`, both parsers, the resolver, `compile_expr`, and the tree-walker
+/// `eval_expr`/`run_body` — see `src/vm/stack.rs`). Those guards grow the native
+/// stack on demand so the narrow native-re-entry paths (deep `map`/reduce callbacks,
+/// nested generator composition, deeply nested expressions) REACH this logical cap
+/// cleanly instead of SIGABRTing the native stack first — even off the enlarged
+/// worker thread. This cap stays the product default and the safety backstop (it
+/// also bounds heap-`frames` growth, which `stacker` does not); SP9 chose the
+/// "always-on stacker, cap stays the ceiling" option (spec §1.6), so the value is
+/// unchanged and both engines still trip at the SAME `MAX_CALL_DEPTH`.
 pub const MAX_CALL_DEPTH: u32 = 3000;
 
 /// The maximum EXPRESSION-NESTING depth (SP3 §B / O1) — a SEPARATE limit from
@@ -691,6 +724,7 @@ impl Interp {
             #[cfg(feature = "ai")]
             ai: RefCell::new(crate::stdlib::ai::AiClient::default()),
             cli_args: RefCell::new(Vec::new()),
+            determinism: RefCell::new(None),
         }
     }
 
@@ -771,6 +805,114 @@ impl Interp {
     /// logical depth. Used by the VM (which holds an `Rc<Interp>`) and the compiler.
     pub(crate) fn call_depth_cell(&self) -> &Cell<u32> {
         &self.call_depth
+    }
+
+    // ===================================================================== //
+    // SP9 §3 — determinism seams. The accessors below read/advance the        //
+    // `determinism` context through SHORT borrows that are always dropped     //
+    // before returning (never held across an `.await`).                       //
+    // ===================================================================== //
+
+    /// Enter deterministic Record mode with `seed`, the virtual clock started at a
+    /// FIXED, seed-derived epoch (NOT the real wall clock) so two same-seed runs are
+    /// byte-identical on the clock too (the determinism oracle, spec §3.5). Installs a
+    /// fresh [`crate::det::DeterminismContext`]; used by the `--deterministic` test
+    /// seam. Returns the previous context (if any) so a caller can restore it.
+    pub(crate) fn enter_deterministic(
+        &self,
+        seed: u64,
+    ) -> Option<crate::det::DeterminismContext> {
+        let start_ms = crate::det::deterministic_start_ms(seed);
+        self.determinism
+            .borrow_mut()
+            .replace(crate::det::DeterminismContext::record(seed, start_ms))
+    }
+
+    /// Install an explicit determinism context (Record or Replay), returning the
+    /// previous one. Used by `workflow.resume` to prime a Replay context with the
+    /// recorded event stream.
+    #[cfg(feature = "workflow")]
+    pub(crate) fn install_determinism(
+        &self,
+        ctx: crate::det::DeterminismContext,
+    ) -> Option<crate::det::DeterminismContext> {
+        self.determinism.borrow_mut().replace(ctx)
+    }
+
+    /// Remove and return the current determinism context (end of a workflow), so the
+    /// caller can read the recorded `events` to persist + restore the previous one.
+    #[cfg(feature = "workflow")]
+    pub(crate) fn take_determinism(&self) -> Option<crate::det::DeterminismContext> {
+        self.determinism.borrow_mut().take()
+    }
+
+    /// Restore a previously-saved determinism context (or clear it when `None`).
+    #[cfg(feature = "workflow")]
+    pub(crate) fn restore_determinism(&self, prev: Option<crate::det::DeterminismContext>) {
+        *self.determinism.borrow_mut() = prev;
+    }
+
+    /// True iff deterministic mode is active. A cheap `is_some` check on the seam
+    /// fast paths (the default `None` path is byte-identical to pre-SP9).
+    pub(crate) fn is_deterministic(&self) -> bool {
+        self.determinism.borrow().is_some()
+    }
+
+    /// The wall clock in ms-epoch: the virtual/recorded clock when deterministic,
+    /// else the real wall clock. The seam for `time.now` / `date.now`.
+    pub(crate) fn clock_now_ms(&self) -> f64 {
+        let mut guard = self.determinism.borrow_mut();
+        match guard.as_mut() {
+            Some(ctx) => ctx.clock_now_ms(),
+            None => real_now_ms(),
+        }
+    }
+
+    /// The monotonic clock in ms: the virtual/recorded clock when deterministic, else
+    /// the real monotonic clock (caller passes the real value for the `None` path so
+    /// this module needs no `Instant` baseline). The seam for `time.monotonic`.
+    pub(crate) fn clock_monotonic_ms(&self, real_value: f64) -> f64 {
+        let mut guard = self.determinism.borrow_mut();
+        match guard.as_mut() {
+            Some(ctx) => ctx.clock_monotonic_ms(),
+            None => real_value,
+        }
+    }
+
+    /// The next seeded `[0,1)` random value when deterministic, or `None` when not
+    /// (so the caller falls back to today's thread-local PRNG — byte-identical).
+    pub(crate) fn next_seeded_f64(&self) -> Option<f64> {
+        let mut guard = self.determinism.borrow_mut();
+        guard.as_mut().map(|ctx| ctx.next_random_f64())
+    }
+
+    /// Fill `buf` with deterministic bytes when in deterministic mode (for
+    /// `uuid.v4` / `crypto.randomBytes`), returning `true` if it did; `false` means
+    /// not deterministic and the caller uses its real RNG (byte-identical default).
+    /// Gated on the features whose modules call it so it is not dead under
+    /// `--no-default-features` (where `uuid`/`crypto` are compiled out).
+    #[cfg(any(feature = "data", feature = "crypto"))]
+    pub(crate) fn fill_seeded_bytes(&self, buf: &mut [u8]) -> bool {
+        let mut guard = self.determinism.borrow_mut();
+        match guard.as_mut() {
+            Some(ctx) => {
+                ctx.rng.fill_bytes(buf);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Run `f` with a mutable borrow of the determinism context, if active. Used by
+    /// `std/workflow` to append/consume activity + timer events. `None` when not in
+    /// deterministic mode. The borrow is local to `f` and never spans an `.await`
+    /// (callers pass a synchronous closure).
+    pub(crate) fn with_determinism_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::det::DeterminismContext) -> R,
+    ) -> Option<R> {
+        let mut guard = self.determinism.borrow_mut();
+        guard.as_mut().map(f)
     }
 
     /// Acquire a SNAPSHOT-RESTORE depth guard for a VM re-entrant `Vm::run`
@@ -2248,8 +2390,30 @@ impl Interp {
         }
     }
 
-    #[async_recursion(?Send)]
+    /// SP9 §1: native re-entry guard for the tree-walker expression evaluator. A
+    /// deeply nested SOURCE expression (`((((…))))`) recurses `eval_expr→eval_expr`
+    /// without passing through `run_body`, so the per-call `run_body` stack guard
+    /// does NOT cover it. Grow the native stack here too — but only at a coarse
+    /// checkpoint (every `STACK_CHECK_INTERVAL` nesting levels), so the cheap probe
+    /// runs once per checkpoint instead of once per expression (avoids a `Box::pin`
+    /// on every `eval_expr` call — the tree-walker hot path). The interval × the
+    /// largest per-`eval_expr` frame stays well under `RED_ZONE`, so the guard still
+    /// re-grows before any segment overflows. Inert until the stack runs low.
     pub async fn eval_expr(&self, expr: &Expr, env: &Environment) -> Result<Value, Control> {
+        // A coarse checkpoint: only the levels that are a multiple of the interval
+        // pay the (boxed) grow wrapper; all others go straight to the inner
+        // evaluator. `expr_depth` is the live nesting counter incremented in
+        // `eval_expr_inner` below.
+        const STACK_CHECK_INTERVAL: u32 = 16;
+        if self.expr_depth.get().is_multiple_of(STACK_CHECK_INTERVAL) {
+            crate::vm::stack::grow_future(self.eval_expr_inner(expr, env)).await
+        } else {
+            self.eval_expr_inner(expr, env).await
+        }
+    }
+
+    #[async_recursion(?Send)]
+    async fn eval_expr_inner(&self, expr: &Expr, env: &Environment) -> Result<Value, Control> {
         // SP3 §B / O1: bound EXPRESSION nesting (deeply nested `((((…))))`, long
         // binary chains) on its OWN counter — NOT `call_depth`. Counting expr
         // nesting against the per-call counter would double-count each logical call
@@ -2769,6 +2933,23 @@ impl Interp {
                         sargs.push(recv);
                         sargs.extend(values);
                         return Ok((self.call_schema(name, &sargs, expr.span).await?, false));
+                    }
+                    // SP9 §2: the SAME call-site hook for a workflow `ctx.<method>()`
+                    // (`ctx.call`/`now`/`random`/`uuid`/`sleep`). Receiver first,
+                    // then args, into `call_workflow_ctx`. Call-position only (a bare
+                    // `ctx.now` member read falls through, like schema).
+                    #[cfg(feature = "workflow")]
+                    if crate::stdlib::workflow::is_ctx_value(&recv)
+                        && crate::stdlib::workflow::is_ctx_method(name)
+                    {
+                        let values = self.eval_call_args(args, env).await?;
+                        let mut wargs = Vec::with_capacity(values.len() + 1);
+                        wargs.push(recv);
+                        wargs.extend(values);
+                        return Ok((
+                            self.call_workflow_ctx(name, &wargs, expr.span).await?,
+                            false,
+                        ));
                     }
                     // Fallback — byte-for-byte with the prior
                     // `eval_chain(callee) → eval_args → call_value` path: read
@@ -3325,7 +3506,12 @@ impl Interp {
             }
             call_env.define(&p.name, dv, true).map_err(AsError::new)?;
         }
-        let result = match self.exec(body, call_env).await {
+        // SP9 §1: `run_body` is the single native re-entry funnel every script call
+        // passes through (`#[async_recursion]`, the actual native-stack deepener).
+        // Grow the native stack per poll so deep recursion (functions / methods /
+        // HOF callbacks) reaches the logical `MAX_CALL_DEPTH` cap cleanly instead of
+        // SIGABRTing the native stack first — matching the VM's re-entry guards.
+        let result = match crate::vm::stack::grow_future(self.exec(body, call_env)).await {
             Ok(Flow::Return(v)) => v,
             Ok(Flow::Normal) => Value::Nil,
             Ok(Flow::Break) => return Err(AsError::at("'break' outside of a loop", span).into()),
