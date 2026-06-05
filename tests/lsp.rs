@@ -434,7 +434,7 @@ fn lsp_protocol_end_to_end() {
         .as_array()
         .expect("semanticTokens data array");
     assert!(
-        !st_data.is_empty() && st_data.len() % 5 == 0,
+        !st_data.is_empty() && st_data.len().is_multiple_of(5),
         "semantic tokens are 5-int-per-token and non-empty: {}",
         st_data.len()
     );
