@@ -50,7 +50,7 @@ pub fn document_highlights(model: &SemanticModel, offset: usize) -> Option<Vec<D
             continue;
         };
         let (s, e) = (usize::from(span.start()), usize::from(span.end()));
-        if &model.text[s..e] != name {
+        if model.text[s..e] != *name {
             continue;
         }
         let kind = if write_spans.contains(&(s, e)) {

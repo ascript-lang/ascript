@@ -110,6 +110,8 @@ pub fn server_capabilities() -> ServerCapabilities {
             prepare_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
+        // Phase 2: read/write occurrence highlighting of the symbol under the cursor.
+        document_highlight_provider: Some(OneOf::Left(true)),
         // Phase 2: semantic-token highlighting (full document + range), with the
         // provider's legend.
         semantic_tokens_provider: Some(
@@ -299,6 +301,20 @@ impl LanguageServer for Backend {
             model,
             params.range,
         )))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::highlight::document_highlights(model, offset))
     }
 
     async fn semantic_tokens_full(
@@ -684,6 +700,18 @@ mod tests {
         assert!(
             caps.semantic_tokens_provider.is_some(),
             "expected a semantic-tokens provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_document_highlight() {
+        let caps = server_capabilities();
+        assert!(
+            matches!(
+                caps.document_highlight_provider,
+                Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+            ),
+            "expected a document-highlight provider"
         );
     }
 
