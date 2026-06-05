@@ -148,6 +148,177 @@ fn fn_name_range(
     Some(crate::check::diagnostic::ByteSpan::from(ident.text_range()))
 }
 
+use crate::check::infer::table::Table;
+
+/// A resolved type-hierarchy anchor: the class/enum name + its decl name-range in
+/// the file it is declared in (in-file resolution; cross-file extends is a
+/// follow-up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeAnchor {
+    pub name: String,
+    pub name_range: crate::check::diagnostic::ByteSpan,
+    pub is_class: bool,
+}
+
+/// Resolve the cursor at `offset` to a class/enum type anchor in `model`.
+pub fn prepare_type(model: &SemanticModel, offset: usize) -> Option<TypeAnchor> {
+    let name = type_name_at(model, offset)?;
+    let table = Table::build(&model.tree, &model.resolved);
+    let (is_class, decl_kind) = if table.class_id(&name).is_some() {
+        (true, SyntaxKind::ClassDecl)
+    } else if table.enum_id(&name).is_some() {
+        (false, SyntaxKind::EnumDecl)
+    } else {
+        return None;
+    };
+    let range = decl_name_byte_range(model, &name, decl_kind)?;
+    Some(TypeAnchor {
+        name,
+        name_range: range,
+        is_class,
+    })
+}
+
+/// The supertype names (the `extends` chain, nearest first) of the class `name`.
+pub fn supertypes(
+    model: &SemanticModel,
+    name: &str,
+) -> Vec<(String, crate::check::diagnostic::ByteSpan)> {
+    let table = Table::build(&model.tree, &model.resolved);
+    let mut out = Vec::new();
+    let mut cur = table.class_id(name);
+    let mut visited = Vec::new();
+    while let Some(id) = cur {
+        if visited.contains(&id) {
+            break;
+        }
+        visited.push(id);
+        let Some(ci) = table.class(id) else { break };
+        let Some(parent) = ci.parent else { break };
+        let Some(pinfo) = table.class(parent) else {
+            break;
+        };
+        if let Some(r) = decl_name_byte_range(model, &pinfo.name, SyntaxKind::ClassDecl) {
+            out.push((pinfo.name.clone(), r));
+        }
+        cur = Some(parent);
+    }
+    out
+}
+
+/// The direct-subtype names of the class `name` (every class whose immediate
+/// parent is `name`).
+pub fn subtypes(
+    model: &SemanticModel,
+    name: &str,
+) -> Vec<(String, crate::check::diagnostic::ByteSpan)> {
+    let table = Table::build(&model.tree, &model.resolved);
+    let Some(target) = table.class_id(name) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for node in model
+        .tree
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::ClassDecl)
+    {
+        let Some(other) = crate::syntax::resolve::ident_text(node) else {
+            continue;
+        };
+        let Some(oid) = table.class_id(&other) else {
+            continue;
+        };
+        if let Some(ci) = table.class(oid) {
+            if ci.parent == Some(target) {
+                if let Some(r) = decl_name_byte_range(model, &other, SyntaxKind::ClassDecl) {
+                    out.push((other, r));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The identifier text at `offset` if it is a class/enum NAME or NameRef.
+fn type_name_at(model: &SemanticModel, offset: usize) -> Option<String> {
+    let node = model.tree.descendants().find(|n| {
+        let r = n.text_range();
+        let (s, e): (usize, usize) = (r.start().into(), r.end().into());
+        offset >= s
+            && offset < e
+            && matches!(
+                n.kind(),
+                SyntaxKind::NameRef | SyntaxKind::ClassDecl | SyntaxKind::EnumDecl
+            )
+    })?;
+    crate::syntax::resolve::ident_text(&node)
+}
+
+/// The byte span of the name `Ident` of the `kind` decl named `name`.
+fn decl_name_byte_range(
+    model: &SemanticModel,
+    name: &str,
+    kind: SyntaxKind,
+) -> Option<crate::check::diagnostic::ByteSpan> {
+    let decl = model.tree.descendants().find(|n| {
+        n.kind() == kind && crate::syntax::resolve::ident_text(n).as_deref() == Some(name)
+    })?;
+    let ident = decl
+        .children_with_tokens()
+        .filter_map(|el| el.into_token().cloned())
+        .find(|t| t.kind() == SyntaxKind::Ident)?;
+    Some(crate::check::diagnostic::ByteSpan::from(ident.text_range()))
+}
+
+#[cfg(test)]
+mod type_hierarchy_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    fn model(src: &str) -> SemanticModel {
+        SemanticModel::build(src.to_string(), None, &LintConfig::default())
+    }
+
+    #[test]
+    fn supertypes_walk_the_extends_chain() {
+        let src = "class A {}\nclass B extends A {}\nclass C extends B {}\n";
+        let m = model(src);
+        let sup = supertypes(&m, "C");
+        let names: Vec<&str> = sup.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["B", "A"]);
+    }
+
+    #[test]
+    fn subtypes_are_direct_children() {
+        let src = "class A {}\nclass B extends A {}\nclass C extends A {}\n";
+        let m = model(src);
+        let sub = subtypes(&m, "A");
+        let mut names: Vec<&str> = sub.iter().map(|(n, _)| n.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["B", "C"]);
+    }
+
+    #[test]
+    fn prepare_resolves_a_class() {
+        let m = model("class A {}\nclass B extends A {}\n");
+        let off = m.text.find("class A").unwrap() + 6;
+        let anchor = prepare_type(&m, off).expect("anchor");
+        assert_eq!(anchor.name, "A");
+        assert!(anchor.is_class);
+    }
+
+    #[test]
+    fn prepare_resolves_an_enum_with_empty_hierarchy() {
+        let m = model("enum Color { Red, Green }\n");
+        let off = m.text.find("Color").unwrap() + 1;
+        let anchor = prepare_type(&m, off).expect("enum anchor");
+        assert_eq!(anchor.name, "Color");
+        assert!(!anchor.is_class);
+        assert!(supertypes(&m, "Color").is_empty());
+        assert!(subtypes(&m, "Color").is_empty());
+    }
+}
+
 #[cfg(test)]
 mod outgoing_tests {
     use super::*;

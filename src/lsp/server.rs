@@ -48,6 +48,37 @@ impl Backend {
         }
     }
 
+    /// Resolve a type-hierarchy step (`supertypes` when `up`, else `subtypes`) for
+    /// a `TypeHierarchyItem`: re-anchor it in its document model by name, then map
+    /// the provider's `(name, span)` pairs to `TypeHierarchyItem`s in the same file.
+    async fn type_hierarchy_step(&self, item: TypeHierarchyItem, up: bool) -> Vec<TypeHierarchyItem> {
+        let uri = item.uri.clone();
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Vec::new();
+        };
+        let offset = range_start_byte(&model.text, item.selection_range);
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_type(model, offset) else {
+            return Vec::new();
+        };
+        let pairs = if up {
+            crate::lsp::providers::hierarchy::supertypes(model, &anchor.name)
+        } else {
+            crate::lsp::providers::hierarchy::subtypes(model, &anchor.name)
+        };
+        pairs
+            .into_iter()
+            .map(|(name, span)| {
+                let range = crate::lsp::convert::byte_span_to_range(
+                    &model.text,
+                    &model.line_index,
+                    span,
+                );
+                type_item(name, SymbolKind::CLASS, uri.clone(), range)
+            })
+            .collect()
+    }
+
     /// Build/cache the document's `SemanticModel` and publish its diagnostics.
     /// Merges the model's config-aware single-file diagnostics with the
     /// index-backed file-module call-arity (D-arity), which the single-file
@@ -708,6 +739,47 @@ impl LanguageServer for Backend {
         Ok(Some(out))
     }
 
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TypeHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_type(model, offset) else {
+            return Ok(None);
+        };
+        let range = crate::lsp::convert::byte_span_to_range(
+            &model.text,
+            &model.line_index,
+            anchor.name_range,
+        );
+        let kind = if anchor.is_class {
+            SymbolKind::CLASS
+        } else {
+            SymbolKind::ENUM
+        };
+        Ok(Some(vec![type_item(anchor.name, kind, uri, range)]))
+    }
+
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TypeHierarchyItem>>> {
+        Ok(Some(self.type_hierarchy_step(params.item, true).await))
+    }
+
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TypeHierarchyItem>>> {
+        Ok(Some(self.type_hierarchy_step(params.item, false).await))
+    }
+
     async fn folding_range(
         &self,
         params: FoldingRangeParams,
@@ -947,6 +1019,20 @@ fn file_call_item(idx: &WorkspaceIndex, path: &std::path::Path) -> Option<CallHi
         selection_range: zero,
         data: None,
     })
+}
+
+/// Build a `TypeHierarchyItem` for a class/enum `name` at `range` in `uri`.
+fn type_item(name: String, kind: SymbolKind, uri: Url, range: Range) -> TypeHierarchyItem {
+    TypeHierarchyItem {
+        name,
+        kind,
+        tags: None,
+        detail: None,
+        uri,
+        range,
+        selection_range: range,
+        data: None,
+    }
 }
 
 /// The byte offset of `range`'s start within `text` (LSP position → char → byte).
