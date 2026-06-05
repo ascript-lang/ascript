@@ -1124,6 +1124,33 @@ mod tests {
             .is_empty());
     }
 
+    /// Phase 0 regression: cross-file go-to-definition must keep resolving through
+    /// the LSP unification refactor (providers/model swap). A hermetic temp-dir
+    /// fixture (real files on disk) builds the index and asserts a use of an
+    /// imported `helper()` in `main.as` resolves to its decl in `lib.as`.
+    #[test]
+    fn definition_resolves_across_files_after_phase0() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.as");
+        let main = dir.path().join("main.as");
+        fs::write(&lib, "export fn helper() { return 1 }\n").unwrap();
+        fs::write(&main, "import { helper } from \"./lib\"\nlet x = helper()\n").unwrap();
+        let idx = WorkspaceIndex::build_from_files(&[
+            (lib.clone(), fs::read_to_string(&lib).unwrap()),
+            (main.clone(), fs::read_to_string(&main).unwrap()),
+        ]);
+        let text = fs::read_to_string(&main).unwrap();
+        // The USE of `helper` in `helper()` (not the import clause).
+        let off = text.rfind("helper").unwrap();
+        let (def_path, span) = idx
+            .definition_at(&canon(&main), off)
+            .expect("cross-file helper() should resolve to lib.as");
+        assert_eq!(def_path, canon(&lib));
+        let lib_text = fs::read_to_string(&lib).unwrap();
+        assert_eq!(&lib_text[span.start..span.end], "helper");
+    }
+
     #[test]
     fn exported_fn_arity_reads_target_signature() {
         let idx = fixture();
