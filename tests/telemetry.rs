@@ -381,3 +381,84 @@ await telemetry.flush()
     assert!(req.body.contains(r#""level":"error""#), "error level: {}", req.body);
     assert!(req.body.contains("kaboom"), "message: {}", req.body);
 }
+
+// ---- F4: PostHog exporter — capture / identify ----
+
+const INIT_POSTHOG: &str = r#"
+import * as telemetry from "std/telemetry"
+telemetry.init({
+  service: "t",
+  exporters: [ telemetry.posthog({ apiKey: "phc_test" }) ],
+})
+"#;
+
+#[tokio::test]
+async fn posthog_capture_batches_to_endpoint() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT_POSTHOG}
+telemetry.capture("signup_completed", {{ distinctId: "u1", properties: {{ plan: "pro" }} }})
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let req = caps.iter().find(|r| r.signal == "events").expect("events request");
+    assert_eq!(req.exporter, "posthog");
+    assert!(req.url.ends_with("/batch/"), "url: {}", req.url);
+    let body = &req.body;
+    assert!(body.contains(r#""api_key":"phc_test""#), "api_key: {body}");
+    assert!(body.contains(r#""event":"signup_completed""#), "event: {body}");
+    assert!(body.contains(r#""distinct_id":"u1""#), "distinct_id: {body}");
+    assert!(body.contains(r#""plan":"pro""#), "props: {body}");
+}
+
+#[tokio::test]
+async fn posthog_identify_sets_person_props() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT_POSTHOG}
+telemetry.identify("u1", {{ email: "a@b.com", plan: "pro" }})
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let body = &caps.iter().find(|r| r.signal == "events").unwrap().body;
+    assert!(body.contains(r#""event":"$identify""#), "$identify: {body}");
+    assert!(body.contains(r#""$set""#), "$set: {body}");
+    assert!(body.contains(r#""email":"a@b.com""#), "person prop: {body}");
+}
+
+#[tokio::test]
+async fn capture_is_noop_without_posthog_or_mirror() {
+    // OTLP-only init, mirroring off: capture has nowhere to go → no events request.
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+telemetry.capture("evt", {{ distinctId: "u1" }})
+await telemetry.flush()
+"#
+    ))
+    .await;
+    assert!(
+        caps.iter().all(|r| r.signal != "events"),
+        "no events request expected: {:?}",
+        caps
+    );
+}
+
+#[tokio::test]
+async fn mirror_events_to_otlp_emits_log_records() {
+    let (_out, caps) = run(r#"
+import * as telemetry from "std/telemetry"
+telemetry.init({
+  service: "t",
+  mirrorEventsToOtlp: true,
+  exporters: [ telemetry.otlp({ endpoint: "http://localhost:4318" }) ],
+})
+telemetry.capture("signup", { distinctId: "u1", properties: { plan: "pro" } })
+await telemetry.flush()
+"#)
+    .await;
+    let req = caps.iter().find(|r| r.signal == "logs").expect("logs request");
+    assert!(req.url.ends_with("/v1/logs"), "url: {}", req.url);
+    assert!(req.body.contains("resourceLogs"), "{}", req.body);
+    assert!(req.body.contains(r#""stringValue":"signup""#), "event body: {}", req.body);
+    assert!(req.body.contains("distinct.id"), "distinct id attr: {}", req.body);
+}

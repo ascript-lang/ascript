@@ -1372,14 +1372,18 @@ impl Interp {
         }
     }
 
-    /// Enqueue an analytics event for the next flush. No-op if uninitialized.
+    /// Enqueue an analytics event for the next flush. No-op if uninitialized OR if
+    /// there is no destination for events (no PostHog exporter AND mirroring to
+    /// OTLP off) — per spec §4.2 a `capture` with nowhere to go is a no-op.
     #[cfg(feature = "telemetry")]
     pub(crate) fn telemetry_enqueue_event(
         &self,
         ev: crate::stdlib::telemetry::model::AnalyticsEvent,
     ) {
         if let Some(state) = self.telemetry.borrow_mut().as_mut() {
-            state.events.push(ev);
+            if state.exporters.posthog.is_some() || state.mirror_events_to_otlp {
+                state.events.push(ev);
+            }
         }
     }
 
