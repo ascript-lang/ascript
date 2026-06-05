@@ -1542,6 +1542,21 @@ impl Interp {
         Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
     }
 
+    /// Project a `shape:` argument (a `Value::Class` or a `std/schema` tagged
+    /// Object) into a JSON Schema (`serde_json::Value`) for SP11 structured output.
+    /// A class's nested `Type::Named` fields resolve through the class's `def_env`
+    /// (the same environment `validate_into` uses), so nested-class / `array<Class>` /
+    /// `map<K,Class>` fields project to their full nested schema.
+    #[cfg(feature = "ai")]
+    pub(crate) fn project_shape_json(&self, shape: &Value) -> serde_json::Value {
+        match shape {
+            Value::Class(c) => {
+                crate::stdlib::ai::json_schema::class_to_json_schema_env(c, &c.def_env)
+            }
+            other => crate::stdlib::ai::json_schema::schema_value_to_json_schema(other),
+        }
+    }
+
     /// Remove and return the resource for `id` (used by `close`/`kill`/EOF, and to
     /// own a resource across an `.await` without holding the table borrow — pair
     /// with `return_resource`). Used unconditionally by std/time timers, plus the

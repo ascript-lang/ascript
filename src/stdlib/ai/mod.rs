@@ -150,9 +150,39 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
         return Ok(crate::interp::make_pair(Value::Nil, err));
     }
 
-    let chat_req = request::build_chat_request(&opts, span)?;
+    let mut chat_req = request::build_chat_request(&opts, span)?;
     let gen_opts = request::parse_gen_opts(&opts);
-    let chat_options = build_chat_options(&gen_opts);
+    let mut chat_options = build_chat_options(&gen_opts);
+
+    // Structured output (`shape:` a class or std/schema). Project to JSON Schema,
+    // set the provider's structured-output config AND embed the schema in the system
+    // prompt (the always-available fallback, spec §7.2), then decode the result text
+    // via `validate_into`/`parse_value`, fusing decode + shape into ONE Tier-1 pair.
+    let shape = request::get_field(&opts, "shape");
+    let shape_type = match &shape {
+        Value::Class(_) => Some(shape.clone()),
+        other if crate::stdlib::schema::schema_kind(other).is_some() => Some(shape.clone()),
+        Value::Nil => None,
+        other => {
+            return Err(AsError::at(
+                format!(
+                    "ai.generate: 'shape' must be a class or a std/schema, got {}",
+                    crate::interp::type_name(other)
+                ),
+                span,
+            )
+            .into())
+        }
+    };
+    if let Some(st) = &shape_type {
+        let schema_json = interp.project_shape_json(st);
+        let sys = structured_system_prompt(&chat_req, &schema_json);
+        chat_req = chat_req.with_system(sys);
+        chat_options = chat_options.with_response_format(genai::chat::JsonSpec::new(
+            "ascript_structured_output",
+            schema_json,
+        ));
+    }
 
     // Take the genai client OUT (clone the Arc-backed handle) before the await.
     let client = interp.ai_state().client();
@@ -167,16 +197,44 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
         }
     };
 
-    match result {
-        Ok(resp) => {
-            let neutral = response::neutral_from_genai(resp);
-            let out = response::out_object(&neutral, Vec::new());
-            Ok(crate::interp::make_pair(out, Value::Nil))
+    let resp = match result {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Ok(crate::interp::make_pair(
+                Value::Nil,
+                response::error_to_value(&e),
+            ))
         }
-        Err(e) => Ok(crate::interp::make_pair(
-            Value::Nil,
-            response::error_to_value(&e),
-        )),
+    };
+    let neutral = response::neutral_from_genai(resp);
+
+    // No shape → the plain `out` object.
+    let Some(st) = shape_type else {
+        let out = response::out_object(&neutral, Vec::new());
+        return Ok(crate::interp::make_pair(out, Value::Nil));
+    };
+
+    // shape: → parse the model's text as JSON, then validate-into the shape, fusing a
+    // decode failure and a shape mismatch into ONE Tier-1 [value, err] pair.
+    let parsed_pair = crate::stdlib::json::call("parse", &[Value::Str(neutral.text.clone().into())], span)?;
+    interp.typed_decode(parsed_pair, &st, false, "", span).await
+}
+
+/// Build a system prompt instructing the model to reply with ONLY JSON matching the
+/// schema. Preserves any caller-supplied system text. This is the documented
+/// always-available fallback (spec §7.2) on top of the provider structured-output
+/// config, so even providers without native structured mode return parseable JSON.
+fn structured_system_prompt(req: &genai::chat::ChatRequest, schema_json: &serde_json::Value) -> String {
+    let existing = req.system.clone().unwrap_or_default();
+    let schema_str = serde_json::to_string(schema_json).unwrap_or_else(|_| "{}".to_string());
+    let instruction = format!(
+        "Reply with ONLY a single JSON value (no markdown, no prose) that conforms to this JSON Schema:\n{}",
+        schema_str
+    );
+    if existing.is_empty() {
+        instruction
+    } else {
+        format!("{}\n\n{}", existing, instruction)
     }
 }
 

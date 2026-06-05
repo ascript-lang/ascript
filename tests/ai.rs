@@ -333,6 +333,74 @@ fn stream_openai_text_only() {
     assert_eq!(out, "Back\npressure\n flows.\n");
 }
 
+// ===========================================================================
+// Phase D — structured output (class + std/schema) + JSON-Schema projector.
+// ===========================================================================
+
+#[test]
+fn structured_output_class_instance() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        class Recipe { name: string  ingredients: array<string>  steps: array<string> }
+        let [recipe, err] = await ai.generate({ model: "openai:gpt-4.1", prompt: "lasagna", shape: Recipe })
+        if (err != nil) { print("ERR " + err.message); return }
+        print(recipe.name)
+        print(recipe.ingredients[0])
+        print(len(recipe.steps))
+        "#,
+        vec![ai_mock::Fixture::json(&fixture("openai/recipe.json"))],
+    );
+    assert_eq!(out, "Lasagna\npasta\n2\n");
+}
+
+#[test]
+fn structured_output_schema_object() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        import * as schema from "std/schema"
+        let s = schema.object({ sentiment: schema.oneOf(["pos","neg","neu"]), score: schema.number() })
+        let [obj, err] = await ai.generate({ model: "openai:gpt-4.1", prompt: "rate", shape: s })
+        if (err != nil) { print("ERR " + err.message); return }
+        print(obj.sentiment)
+        print(obj.score)
+        "#,
+        vec![ai_mock::Fixture::json(&fixture("openai/sentiment.json"))],
+    );
+    assert_eq!(out, "pos\n0.9\n");
+}
+
+#[test]
+fn structured_output_shape_violation_is_fused_tier1() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        class Recipe { name: string  ingredients: array<string>  steps: array<string> }
+        let [recipe, err] = await ai.generate({ model: "openai:gpt-4.1", prompt: "x", shape: Recipe })
+        if (err != nil) { print("tier1 err"); return }
+        print("unexpected ok")
+        "#,
+        vec![ai_mock::Fixture::json(&fixture("openai/recipe_bad.json"))],
+    );
+    assert_eq!(out, "tier1 err\n");
+}
+
+#[test]
+fn structured_output_non_json_is_tier1() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        class Recipe { name: string  ingredients: array<string>  steps: array<string> }
+        let [recipe, err] = await ai.generate({ model: "openai:gpt-4.1", prompt: "x", shape: Recipe })
+        if (err != nil) { print("tier1 err"); return }
+        print("unexpected ok")
+        "#,
+        vec![ai_mock::Fixture::json(&fixture("openai/not_json.json"))],
+    );
+    assert_eq!(out, "tier1 err\n");
+}
+
 #[test]
 fn stream_connection_error_is_tier1_on_next() {
     // genai sends the streaming request lazily, so a provider 5xx surfaces on the
