@@ -55,6 +55,9 @@ struct Pass<'a> {
     /// Functions (by decl-range start) currently under return inference — a self
     /// call resolves to `Any` (recursion guard, no fixpoint loop).
     inferring: std::collections::HashSet<usize>,
+    /// When > 0, `emit` is suppressed (we're synthesizing inside return inference,
+    /// not the real diagnosing walk — the real walk reports those nodes).
+    suppress_emit: u32,
 }
 
 impl<'a> Pass<'a> {
@@ -67,6 +70,7 @@ impl<'a> Pass<'a> {
             fn_returns: HashMap::new(),
             expected_return: Vec::new(),
             inferring: std::collections::HashSet::new(),
+            suppress_emit: 0,
         }
     }
 
@@ -82,6 +86,9 @@ impl<'a> Pass<'a> {
     // ----------------------------------------------------------------- emit ----
 
     fn emit(&mut self, code: &str, range: ByteSpan, message: String) {
+        if self.suppress_emit > 0 {
+            return; // synthesizing during return inference — the real walk reports.
+        }
         if code == "type-mismatch" && self.legacy_spans.contains(&range.start) {
             return; // de-dup against the legacy rule at this span
         }
@@ -97,9 +104,13 @@ impl<'a> Pass<'a> {
     // --------------------------------------------------------- statement walk --
 
     fn walk_stmts(&mut self, node: &ResolvedNode, env: &mut Env) {
+        // Open a block-level narrowing scope so an early-return guard's negation can
+        // refine bindings for the statements that follow it (§4 form 1/4).
+        env.push_narrowing();
         for stmt in node.children() {
             self.walk_stmt(stmt, env);
         }
+        env.pop_narrowing();
     }
 
     fn walk_stmt(&mut self, stmt: &ResolvedNode, env: &mut Env) {
@@ -135,10 +146,30 @@ impl<'a> Pass<'a> {
         }
     }
 
-    /// Walk a block in a child environment seeded from `env` (block scoping).
+    /// Walk a block in a child environment seeded from `env`'s CURRENT view (base +
+    /// active narrowing), plus extra `refinements` (e.g. an `if`-condition narrowing
+    /// applied to the then/else branch).
     fn walk_child_block(&mut self, block: &ResolvedNode, env: &Env) {
+        self.walk_child_block_with(block, env, &[]);
+    }
+
+    fn walk_child_block_with(
+        &mut self,
+        block: &ResolvedNode,
+        env: &Env,
+        refinements: &[(BindingKey, CheckTy)],
+    ) {
         let mut inner = Env::new();
-        copy_env(env, &mut inner);
+        // Seed with the parent's CURRENT (possibly-narrowed) view of each binding.
+        for (k, _) in env.iter_base() {
+            if let Some(ty) = env.lookup(k) {
+                inner.define(k.clone(), ty);
+            }
+        }
+        // Apply branch refinements on top.
+        for (k, ty) in refinements {
+            inner.define(k.clone(), ty.clone());
+        }
         self.walk_stmts(block, &mut inner);
     }
 
@@ -181,11 +212,154 @@ impl<'a> Pass<'a> {
         if let Some(c) = &cond {
             self.synth(c, env);
         }
-        for block in stmt.children().filter(|c| c.kind() == SyntaxKind::Block) {
-            self.walk_child_block(block, env);
+        // Compute nil-guard narrowing for the then / else branches.
+        let (then_refs, else_refs) = cond
+            .as_ref()
+            .map(|c| self.condition_narrowing(c, env))
+            .unwrap_or_default();
+
+        let blocks: Vec<ResolvedNode> = stmt
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::Block)
+            .cloned()
+            .collect();
+        let else_if: Vec<ResolvedNode> = stmt
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::IfStmt)
+            .cloned()
+            .collect();
+
+        // then-block: narrowed by then_refs.
+        if let Some(then_block) = blocks.first() {
+            self.walk_child_block_with(then_block, env, &then_refs);
         }
-        for c in stmt.children().filter(|c| c.kind() == SyntaxKind::IfStmt) {
-            self.walk_if(c, env);
+        // else-block: narrowed by else_refs.
+        if let Some(else_block) = blocks.get(1) {
+            self.walk_child_block_with(else_block, env, &else_refs);
+        }
+        // `else if` chain: walk with else_refs in scope (the else side of THIS cond).
+        for c in &else_if {
+            // Seed a child env carrying else_refs so the chained condition sees them.
+            let mut chained = Env::new();
+            for (k, _) in env.iter_base() {
+                if let Some(ty) = env.lookup(k) {
+                    chained.define(k.clone(), ty);
+                }
+            }
+            for (k, ty) in &else_refs {
+                chained.define(k.clone(), ty.clone());
+            }
+            self.walk_if(c, &mut chained);
+        }
+
+        // Early-return flow merge (§4 form 1/4): if the THEN branch always exits,
+        // the negation (else_refs) holds for the rest of THIS block. Symmetric for a
+        // sole else that always exits (then_refs hold).
+        let then_exits = blocks.first().map(block_always_returns).unwrap_or(false);
+        let has_else = blocks.len() >= 2 || !else_if.is_empty();
+        if then_exits && !has_else {
+            for (k, ty) in else_refs {
+                env.narrow(k, ty);
+            }
+        }
+    }
+
+    /// Compute the (then, else) nil-guard refinements for an `if` condition (§4
+    /// form 1). Recognizes `x != nil` / `x == nil` (either operand order), bare
+    /// truthiness `x` (narrows away `Nil` only — AScript `0`/`""` are truthy), and
+    /// `!x`. Keys off the resolved binding (`BindingKey`), never the textual name.
+    /// Returns refinements only for a binding whose current type is `T?`.
+    #[allow(clippy::type_complexity)]
+    fn condition_narrowing(
+        &self,
+        cond: &ResolvedNode,
+        env: &Env,
+    ) -> (Vec<(BindingKey, CheckTy)>, Vec<(BindingKey, CheckTy)>) {
+        use SyntaxKind::*;
+        match cond.kind() {
+            ParenExpr => first_expr_child(cond)
+                .map(|c| self.condition_narrowing(&c, env))
+                .unwrap_or_default(),
+            BinaryExpr => {
+                let op = binary_op(cond);
+                if !matches!(op, Some(EqEq | BangEq)) {
+                    return Default::default();
+                }
+                let operands: Vec<ResolvedNode> = cond
+                    .children()
+                    .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+                    .cloned()
+                    .collect();
+                // Find the `nil` literal operand and the OTHER (name) operand.
+                let (name_node, has_nil) = match (operands.first(), operands.get(1)) {
+                    (Some(a), Some(b)) if is_nil_literal(b) => (Some(a), true),
+                    (Some(a), Some(b)) if is_nil_literal(a) => (Some(b), true),
+                    _ => (None, false),
+                };
+                if !has_nil {
+                    return Default::default();
+                }
+                let Some(name_node) = name_node else {
+                    return Default::default();
+                };
+                let Some(key) = self.narrowable_key(name_node, env) else {
+                    return Default::default();
+                };
+                let cur = env.lookup(&key).unwrap_or(CheckTy::Any);
+                let non_nil = cur.without_nil();
+                let nil_only = cur.only_nil();
+                // `x == nil`: then = nil, else = non-nil. `x != nil`: swapped.
+                if op == Some(EqEq) {
+                    (vec![(key.clone(), nil_only)], vec![(key, non_nil)])
+                } else {
+                    (vec![(key.clone(), non_nil)], vec![(key, nil_only)])
+                }
+            }
+            NameRef => {
+                // truthiness: then narrows away Nil ONLY (not Bool(false)/0/"").
+                let Some(key) = self.narrowable_key(cond, env) else {
+                    return Default::default();
+                };
+                let cur = env.lookup(&key).unwrap_or(CheckTy::Any);
+                (vec![(key, cur.without_nil())], Vec::new())
+            }
+            UnaryExpr => {
+                // `!x`: the ELSE branch (x falsy → here x truthy) narrows away Nil.
+                let is_bang = cond
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .any(|t| t.kind() == Bang);
+                if !is_bang {
+                    return Default::default();
+                }
+                let Some(inner) = first_expr_child(cond) else {
+                    return Default::default();
+                };
+                if inner.kind() != NameRef {
+                    return Default::default();
+                }
+                let Some(key) = self.narrowable_key(&inner, env) else {
+                    return Default::default();
+                };
+                let cur = env.lookup(&key).unwrap_or(CheckTy::Any);
+                (Vec::new(), vec![(key, cur.without_nil())])
+            }
+            _ => Default::default(),
+        }
+    }
+
+    /// The `BindingKey` of a `NameRef` whose CURRENT type is a provable `T?` (so
+    /// narrowing it is meaningful). `None` for non-names or non-optional bindings.
+    fn narrowable_key(&self, name_node: &ResolvedNode, env: &Env) -> Option<BindingKey> {
+        if name_node.kind() != SyntaxKind::NameRef {
+            return None;
+        }
+        let key = self.key_for_use(&name_node.text_range())?;
+        let cur = env.lookup(&key)?;
+        if cur.is_provable_optional() {
+            Some(key)
+        } else {
+            None
         }
     }
 
@@ -236,13 +410,6 @@ impl<'a> Pass<'a> {
             return;
         };
         for param in list.children().filter(|c| c.kind() == SyntaxKind::Param) {
-            let Some(name_tok) = param
-                .children_with_tokens()
-                .filter_map(|el| el.into_token())
-                .find(|t| t.kind() == SyntaxKind::Ident)
-            else {
-                continue;
-            };
             let is_rest = param
                 .children_with_tokens()
                 .filter_map(|el| el.into_token())
@@ -256,7 +423,20 @@ impl<'a> Pass<'a> {
                     .map(|t| CheckTy::from_type_node(t, self.table))
                     .unwrap_or(CheckTy::Any)
             };
-            if let Some(key) = self.key_for_use(&name_tok.text_range()) {
+            // A param is a DECLARATION (its name token is not a `uses` entry); key it
+            // by the resolver binding recorded at this Param node's range — that
+            // binding's slot is exactly what a use of the param resolves to.
+            if let Some(b) = self
+                .resolved
+                .bindings
+                .iter()
+                .find(|b| b.decl_range == param.text_range())
+            {
+                let key = if b.is_global {
+                    BindingKey::Global(b.name.clone())
+                } else {
+                    BindingKey::Local(b.slot)
+                };
                 env.define(key, ty);
             }
         }
@@ -417,7 +597,9 @@ impl<'a> Pass<'a> {
         match op {
             Some(Plus) => {
                 // `+` is overloaded (string concat OR numeric add): only a provable
-                // string/number result is synthesizable; never a type-error.
+                // string/number result is synthesizable; never a type-error. A `T?`
+                // operand still panics on nil, so flag possibly-nil.
+                self.flag_possibly_nil_operands(&operands, &[&lt, &rt]);
                 if is_string(&lt) || is_string(&rt) {
                     CheckTy::String
                 } else if is_number(&lt) && is_number(&rt) {
@@ -428,6 +610,7 @@ impl<'a> Pass<'a> {
             }
             Some(Minus | Star | Slash | Percent | StarStar) => {
                 self.flag_non_numeric(&operands, &[&lt, &rt]);
+                self.flag_possibly_nil_operands(&operands, &[&lt, &rt]);
                 CheckTy::Number
             }
             Some(EqEq | BangEq | Lt | Le | Gt | Ge | InstanceofKw) => CheckTy::Bool,
@@ -450,6 +633,24 @@ impl<'a> Pass<'a> {
                     ty.display(self.table)
                 );
                 self.emit("type-error", code_range(node), msg);
+            }
+        }
+    }
+
+    /// Emit `possibly-nil` for any arithmetic operand whose type is PROVABLY a `T?`
+    /// (a union containing `Nil`) — a `nil` here is a runtime panic. Heavily gated:
+    /// only a provable optional (never `Any`, never a narrowed binding).
+    fn flag_possibly_nil_operands(&mut self, operands: &[ResolvedNode], types: &[&CheckTy]) {
+        for (node, ty) in operands.iter().zip(types.iter()) {
+            if ty.is_provable_optional() {
+                self.emit(
+                    "possibly-nil",
+                    code_range(node),
+                    format!(
+                        "value is `{}` and may be nil here; guard it (`if x != nil`, `x ?? default`)",
+                        ty.display(self.table)
+                    ),
+                );
             }
         }
     }
@@ -596,7 +797,24 @@ impl<'a> Pass<'a> {
         let recv = expr
             .children()
             .find(|c| crate::check::rules::is_expr_kind(c.kind()));
-        let recv_ty = recv.map(|r| self.synth(r, env)).unwrap_or(CheckTy::Any);
+        let recv_ty = recv
+            .as_ref()
+            .map(|r| self.synth(r, env))
+            .unwrap_or(CheckTy::Any);
+        // A plain `.` on a PROVABLY `T?` receiver panics on nil → possibly-nil. A
+        // `?.` (OptMemberExpr) tolerates nil, so it never fires.
+        if expr.kind() == SyntaxKind::MemberExpr && recv_ty.is_provable_optional() {
+            if let Some(r) = &recv {
+                self.emit(
+                    "possibly-nil",
+                    code_range(r),
+                    format!(
+                        "value is `{}` and may be nil here; guard it before accessing a member",
+                        recv_ty.display(self.table)
+                    ),
+                );
+            }
+        }
         let field = member_name(expr);
         match (&recv_ty, field) {
             (CheckTy::Class(cid), Some(f)) => self.table.field_type(*cid, &f).unwrap_or(CheckTy::Any),
@@ -720,21 +938,136 @@ impl<'a> Pass<'a> {
         inferred
     }
 
-    /// Infer a function's return type (T3: join of return synths + Nil if it can
-    /// fall off the end). T2: `Any`.
+    /// Infer a function's return type: the `join` of all its `return` expression
+    /// synths, plus `Nil` if it can fall off the end (no return value reached on
+    /// some path). Synthesis runs with emission SUPPRESSED (the real walk reports).
     fn infer_return(&mut self, fn_decl: &ResolvedNode) -> CheckTy {
-        let _ = fn_decl;
-        CheckTy::Any
+        let Some(body) = fn_decl.children().find(|c| c.kind() == SyntaxKind::Block) else {
+            return CheckTy::Any;
+        };
+        let mut env = Env::new();
+        self.bind_params(fn_decl, &mut env);
+
+        let mut returns: Vec<ResolvedNode> = Vec::new();
+        collect_returns(body, &mut returns);
+
+        self.suppress_emit += 1;
+        let mut acc = CheckTy::Never;
+        let mut saw_value_return = false;
+        for ret in &returns {
+            match first_expr_child(ret) {
+                Some(e) => {
+                    let t = self.synth(&e, &mut env);
+                    acc = acc.join(&t.widen(), self.table);
+                    saw_value_return = true;
+                }
+                None => {
+                    // `return` with no value → Nil.
+                    acc = acc.join(&CheckTy::Nil, self.table);
+                }
+            }
+        }
+        self.suppress_emit -= 1;
+
+        // Can it fall off the end? If the body doesn't end in a terminator on every
+        // path, a `nil` is implicitly returned. Conservatively: add Nil unless the
+        // body's last statement is a return/panic-like terminator.
+        if !block_always_returns(body) {
+            acc = acc.join(&CheckTy::Nil, self.table);
+        }
+        if !saw_value_return && matches!(acc, CheckTy::Nil | CheckTy::Never) {
+            // a pure side-effect fn — its return is `nil`, but treat as Any to stay
+            // maximally silent at call sites (a no-value fn rarely flows into a slot).
+            return CheckTy::Any;
+        }
+        acc.widen()
     }
 }
 
 // ============================================================ free helpers ====
 
-/// Shallow-copy base bindings of `from` into `to` (block scoping).
-fn copy_env(from: &Env, to: &mut Env) {
-    for (k, v) in from.iter_base() {
-        to.define(k.clone(), v.clone());
+/// Collect every `ReturnStmt` in `node`'s subtree that belongs to THIS function
+/// (not descending into a nested `FnDecl`/`MethodDecl`/`ArrowExpr` body, whose
+/// returns are the inner function's).
+fn collect_returns(node: &ResolvedNode, out: &mut Vec<ResolvedNode>) {
+    use SyntaxKind::*;
+    for child in node.children() {
+        match child.kind() {
+            ReturnStmt => out.push(child.clone()),
+            // do not descend into a nested function — its returns aren't ours.
+            FnDecl | MethodDecl | ArrowExpr => {}
+            _ => collect_returns(child, out),
+        }
     }
+}
+
+/// Does this `Block` always reach a terminating statement (a `return`, or a panic
+/// via a bare `panic(...)` call) on its straight-line tail? Conservative: only the
+/// LAST statement being a `return`/`break`/`continue`, or an `if/else` where both
+/// branches always return, counts. Anything else → may fall off the end.
+fn block_always_returns(block: &ResolvedNode) -> bool {
+    let last = block
+        .children()
+        .filter(|c| is_stmt_kind(c.kind()))
+        .last();
+    match last {
+        Some(s) => stmt_always_returns(s),
+        None => false,
+    }
+}
+
+fn stmt_always_returns(stmt: &ResolvedNode) -> bool {
+    use SyntaxKind::*;
+    match stmt.kind() {
+        ReturnStmt => true,
+        Block => block_always_returns(stmt),
+        IfStmt => {
+            // both a then-block AND an else-block (or else-if chain) must always return.
+            let blocks: Vec<ResolvedNode> = stmt
+                .children()
+                .filter(|c| c.kind() == Block)
+                .cloned()
+                .collect();
+            let else_if: Vec<ResolvedNode> = stmt
+                .children()
+                .filter(|c| c.kind() == IfStmt)
+                .cloned()
+                .collect();
+            if blocks.is_empty() {
+                return false;
+            }
+            // Must have an else (a second block) or an else-if that always returns.
+            let has_else = blocks.len() >= 2 || !else_if.is_empty();
+            if !has_else {
+                return false;
+            }
+            blocks.iter().all(block_always_returns)
+                && else_if.iter().all(stmt_always_returns)
+        }
+        _ => false,
+    }
+}
+
+/// Is `kind` a statement-kind node (used to find a block's tail statement)?
+fn is_stmt_kind(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        kind,
+        LetStmt
+            | ReturnStmt
+            | ExprStmt
+            | IfStmt
+            | WhileStmt
+            | ForStmt
+            | Block
+            | BreakStmt
+            | ContinueStmt
+            | FnDecl
+            | ClassDecl
+            | EnumDecl
+            | ImportStmt
+            | ExportStmt
+    )
 }
 
 /// First expression-kind child of a node.
@@ -742,6 +1075,15 @@ fn first_expr_child(node: &ResolvedNode) -> Option<ResolvedNode> {
     node.children()
         .find(|c| crate::check::rules::is_expr_kind(c.kind()))
         .cloned()
+}
+
+/// Is `node` the `nil` literal?
+fn is_nil_literal(node: &ResolvedNode) -> bool {
+    node.kind() == SyntaxKind::Literal
+        && node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == SyntaxKind::NilKw)
 }
 
 /// The `CheckTy::Literal` of a `Literal` node.
@@ -979,5 +1321,73 @@ mod tests {
     fn return_against_declared_type() {
         let src = "fn f(): number { return \"x\" }\n";
         assert!(has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    // ----- T3.1 local return inference -----
+
+    #[test]
+    fn inferred_return_flows_to_slot() {
+        // id returns number (inferred); y: number; z: string = y → type-mismatch.
+        let src = "fn id(x: number) { return x }\nlet y = id(1)\nlet z: string = y\n";
+        assert!(has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn recursive_fn_no_false_positive() {
+        // a recursive fn under inference resolves self-calls to Any → no FP.
+        let src = "fn f(n: number) {\n  if (n <= 0) { return 0 }\n  return f(n - 1)\n}\nlet z: string = f(3)\n";
+        // inferred return = join(0:number, Any) = Any → silent (no mismatch).
+        assert!(!has(src, "type-mismatch"), "{:?}", analyze(src).diagnostics);
+    }
+
+    // ----- T3.2 nil-guard narrowing + possibly-nil -----
+
+    #[test]
+    fn possibly_nil_deref_without_guard() {
+        let src = "fn f(x: number?) { return x + 1 }\n";
+        assert!(has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn nil_guard_then_branch_narrows() {
+        let src = "fn f(x: number?) {\n  if (x != nil) { return x + 1 }\n  return 0\n}\n";
+        assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn early_return_eq_nil_narrows_tail() {
+        let src = "fn f(x: number?) {\n  if (x == nil) { return 0 }\n  return x + 1\n}\n";
+        assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn coalesce_narrows() {
+        let src = "fn f(x: number?) {\n  let y = x ?? 0\n  return y + 1\n}\n";
+        assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn truthiness_narrows_nil() {
+        let src = "fn f(x: number?) {\n  if (x) { return x + 1 }\n  return 0\n}\n";
+        assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn possibly_nil_member_without_guard() {
+        let src = "class P { n: number }\nfn f(p: P?) { return p.n }\n";
+        assert!(has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn opt_member_does_not_fire_possibly_nil() {
+        let src = "class P { n: number }\nfn f(p: P?) { return p?.n }\n";
+        assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn any_receiver_no_possibly_nil() {
+        // an unannotated (Any) param → no possibly-nil.
+        let src = "fn f(x) { return x + 1 }\n";
+        assert!(!has(src, "possibly-nil"));
     }
 }
