@@ -119,6 +119,13 @@ pub fn server_capabilities() -> ServerCapabilities {
             retrigger_characters: Some(vec![",".to_string()]),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
+        // Phase 2: inferred-type + parameter-name inlay hints (with lazy resolve).
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions {
+                resolve_provider: Some(true),
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            },
+        ))),
         // Phase 2: semantic-token highlighting (full document + range), with the
         // provider's legend.
         semantic_tokens_provider: Some(
@@ -336,6 +343,26 @@ impl LanguageServer for Backend {
         };
         let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
         Ok(crate::lsp::providers::signature::signature_help(model, offset))
+    }
+
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::inlay::inlay_hints(model, range)))
+    }
+
+    async fn inlay_hint_resolve(
+        &self,
+        hint: InlayHint,
+    ) -> tower_lsp::jsonrpc::Result<InlayHint> {
+        Ok(crate::lsp::providers::inlay::resolve(hint))
     }
 
     async fn semantic_tokens_full(
@@ -745,6 +772,15 @@ mod tests {
         let triggers = sig.trigger_characters.expect("trigger chars");
         assert!(triggers.contains(&"(".to_string()));
         assert!(triggers.contains(&",".to_string()));
+    }
+
+    #[test]
+    fn capabilities_advertise_inlay_hints() {
+        let caps = server_capabilities();
+        assert!(
+            caps.inlay_hint_provider.is_some(),
+            "expected an inlay-hint provider"
+        );
     }
 
     #[test]
