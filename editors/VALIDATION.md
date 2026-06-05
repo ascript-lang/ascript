@@ -154,8 +154,13 @@ Open `/tmp/ascript-uxtest/main.as`. Verify:
       (via the server's formatter engine).
 - [ ] **Code actions** (row 18) — the lightbulb offers quick fixes / Fix All / Organize Imports
       (e.g. remove an unused import).
-- [ ] **CodeLens** (row 19) — "Run | Run Test" lenses appear above `main`/`test(...)`; reference
-      counts above declarations. Clicking a lens invokes `ascript.run`/`ascript.runTest` (row 20).
+- [ ] **CodeLens** (row 19) — "▶ Run | ▶ Run test" lenses appear above `main`/`test(...)`;
+      reference counts above declarations. Clicking **▶ Run** invokes `ascript.run`, which opens
+      the integrated "AScript" terminal and runs `ascript run <file>`; clicking **▶ Run test**
+      invokes `ascript.runTest`, running `ascript test <file>` in that terminal (row 20). The CLI
+      has no per-test name filter, so **▶ Run test** runs ALL of the file's `test(...)`
+      registrations regardless of which lens was clicked. The same two commands are also available
+      from the palette (**AScript: Run File** / **AScript: Run Tests**), acting on the active editor.
 - [ ] **Folding** (row 21) — blocks/decls fold; a `//region`/`//endregion` pair folds.
 - [ ] **Selection range** (row 22) — Expand Selection grows by CST ancestry.
 - [ ] **Document links** (row 23) — `Ctrl/Cmd`-click the `"./main"` specifier opens the target file.
@@ -269,11 +274,14 @@ gaps:
 
 ### Known documented placeholders (finalize before publishing — Phase-5 dependency)
 
-- **Zed / Neovim grammar repo URL + commit** — `editors/zed/extension.toml` and
+- **Zed / Neovim grammar repo URL + commit SHA** — `editors/zed/extension.toml` and
   `editors/nvim/lua/ascript/treesitter.lua` point at the not-yet-published standalone
   `tree-sitter-ascript` repo (the Zed `[grammars.ascript]` `commit` is a `TODO(phase5)` zero-SHA
-  placeholder). Pin these once Phase 5 publishes the grammar.
-- **Full query set** — the Zed/Neovim `*.scm` query files beyond `highlights.scm` are interim
-  copies/stubs; replace with the published `queries/` set from the promoted grammar.
-- **VS Code icon** — `editors/vscode/icons/ascript.png` is a placeholder (see `icons/README.md`);
-  add real 128×128 artwork before publishing to the Marketplace.
+  placeholder). This **repo URL + commit SHA** is the **only** remaining Phase-5 dependency: pin
+  both once Phase 5 publishes the grammar. The bundled `*.scm` query files are **not** a
+  dependency — they are byte-identical full copies of the complete Phase-5 query set (verified),
+  not interim stubs.
+- **VS Code icon** — the extension ships without an icon and uses VS Code's default file icon
+  (`vsce package` succeeds with none present). To add Marketplace artwork later, drop a 128×128
+  `editors/vscode/icons/ascript.png` and restore the two `package.json` references (see
+  `editors/vscode/icons/README.md`). Not required to ship.
