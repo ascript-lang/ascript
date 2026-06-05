@@ -97,6 +97,8 @@ pub fn server_capabilities() -> ServerCapabilities {
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         // Phase 3: structural folding (blocks/decls/literals/match + //region).
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        // Phase 3: smart-expand selection via CST ancestry.
+        selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
         code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
@@ -588,6 +590,28 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         Ok(Some(crate::lsp::providers::folding::folding_ranges(model)))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<SelectionRange>>> {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(params.positions.len());
+        for pos in &params.positions {
+            let offset = crate::lsp::providers::docs::byte_offset_at(model, *pos);
+            match crate::lsp::providers::folding::selection_range_at(model, offset) {
+                Some(sr) => out.push(sr),
+                None => out.push(SelectionRange {
+                    range: Range::new(*pos, *pos),
+                    parent: None,
+                }),
+            }
+        }
+        Ok(Some(out))
     }
 
     async fn references(

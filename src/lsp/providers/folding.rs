@@ -87,6 +87,73 @@ fn region_folds(model: &SemanticModel) -> Vec<FoldingRange> {
     out
 }
 
+use tower_lsp::lsp_types::SelectionRange;
+
+/// The selection-range chain at byte `offset`: the innermost CST node containing
+/// the offset, then each ancestor outward, as a linked `SelectionRange`. The LSP
+/// client expands the selection up this chain.
+pub fn selection_range_at(model: &SemanticModel, offset: usize) -> Option<SelectionRange> {
+    // Innermost node whose range contains the offset.
+    let innermost = model
+        .tree
+        .descendants()
+        .filter(|n| {
+            let r = n.text_range();
+            let (s, e): (usize, usize) = (r.start().into(), r.end().into());
+            offset >= s && offset < e
+        })
+        .min_by_key(|n| {
+            let r = n.text_range();
+            let (s, e): (usize, usize) = (r.start().into(), r.end().into());
+            e - s
+        })?;
+    // Collect innermost + ancestors (cstree's `ancestors()` is self-inclusive, so
+    // `dedup_by_key` collapses the duplicated innermost), then fold from the
+    // OUTERMOST in so each `SelectionRange.parent` is the next-larger node.
+    let mut nodes: Vec<_> = std::iter::once(innermost.clone())
+        .chain(innermost.ancestors().cloned())
+        .collect();
+    nodes.dedup_by_key(|n| n.text_range());
+    let mut chain: Option<SelectionRange> = None;
+    for node in nodes.into_iter().rev() {
+        let range = crate::lsp::convert::byte_span_to_range(
+            &model.text,
+            &model.line_index,
+            crate::check::ByteSpan::from(node.text_range()),
+        );
+        chain = Some(SelectionRange {
+            range,
+            parent: chain.map(Box::new),
+        });
+    }
+    chain
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    #[test]
+    fn selection_expands_outward() {
+        let src = "fn f() {\n  return 1 + 2\n}\n";
+        let m = SemanticModel::build(src.to_string(), None, &LintConfig::default());
+        let off = src.find("1 + 2").unwrap(); // on the `1`
+        let sel = selection_range_at(&m, off).expect("selection");
+        // The chain must be nested: each parent's range is wider than the child's.
+        let inner = sel.range;
+        let parent = sel.parent.as_ref().expect("has a parent").range;
+        let inner_w = inner.end.character.saturating_sub(inner.start.character)
+            + (inner.end.line - inner.start.line) * 1000;
+        let parent_w = parent.end.character.saturating_sub(parent.start.character)
+            + (parent.end.line - parent.start.line) * 1000;
+        assert!(
+            parent_w >= inner_w,
+            "parent should be no smaller: {inner:?} {parent:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod folding_tests {
     use super::*;
