@@ -1,0 +1,94 @@
+name: editors
+
+on:
+  push:
+    paths:
+      - "editors/**"
+      - ".github/workflows/editors.yml"
+  pull_request:
+    paths:
+      - "editors/**"
+      - ".github/workflows/editors.yml"
+
+jobs:
+  vscode:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm run check-types
+      - run: npm run lint
+      - run: npm run compile
+      - run: npx vsce package --allow-missing-repository --no-dependencies -o ascript.vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ascript-vsix
+          path: editors/vscode/ascript.vsix
+
+  zed:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/zed
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - run: cargo build --release --target wasm32-wasip2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ascript-zed-wasm
+          path: editors/zed/target/wasm32-wasip2/release/zed_ascript.wasm
+
+  nvim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+      - name: filetype detection smoke test
+        run: |
+          : > /tmp/probe.as
+          nvim --headless -u editors/nvim/tests/minimal_init.lua \
+            -c 'lua assert(require("ascript"))' \
+            -c 'edit /tmp/probe.as' \
+            -c 'lua assert(vim.bo.filetype == "ascript", vim.bo.filetype)' \
+            -c 'qa'
+      - name: package plugin tarball
+        run: |
+          tar -czf ascript-nvim.tar.gz -C editors nvim
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ascript-nvim
+          path: ascript-nvim.tar.gz
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: validate JSON manifests
+        run: |
+          for f in editors/vscode/package.json \
+                   editors/vscode/language-configuration.json \
+                   editors/vscode/syntaxes/ascript.tmLanguage.json; do
+            jq empty "$f" && echo "$f OK"
+          done
+      - name: validate TOML manifests
+        run: |
+          python3 - <<'PY'
+          import tomllib
+          for f in ["editors/zed/extension.toml",
+                    "editors/zed/Cargo.toml",
+                    "editors/zed/languages/ascript/config.toml"]:
+              tomllib.load(open(f, "rb"))
+              print(f, "OK")
+          PY
