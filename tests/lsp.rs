@@ -221,6 +221,14 @@ fn lsp_protocol_end_to_end() {
         !caps["documentSymbolProvider"].is_null(),
         "missing documentSymbolProvider: {resp}"
     );
+    assert!(
+        !caps["documentFormattingProvider"].is_null(),
+        "missing documentFormattingProvider: {resp}"
+    );
+    assert!(
+        !caps["documentRangeFormattingProvider"].is_null(),
+        "missing documentRangeFormattingProvider: {resp}"
+    );
 
     // 2. initialized notification.
     client.notify("initialized", json!({}));
