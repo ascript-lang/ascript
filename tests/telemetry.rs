@@ -207,3 +207,105 @@ await gather([a, b])
     assert_eq!(b_child.trace_id, b.trace_id);
     assert_ne!(a.trace_id, b.trace_id, "A and B are distinct traces");
 }
+
+// ---- F2: OTLP exporter — span / metric / log HTTP payloads (capture seam) ----
+
+#[tokio::test]
+async fn otlp_span_export_shape() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+let s = telemetry.startSpan("handle-request", {{ attributes: {{ route: "/users" }} }})
+s.setStatus("ok")
+s.end()
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let req = caps.iter().find(|r| r.signal == "traces").expect("a traces request");
+    assert_eq!(req.exporter, "otlp");
+    assert!(req.url.ends_with("/v1/traces"), "url: {}", req.url);
+    let body = &req.body;
+    // OTLP ResourceSpans shape: resource.attributes carries service.name.
+    assert!(body.contains("resourceSpans"), "{body}");
+    assert!(body.contains("service.name"), "{body}");
+    assert!(body.contains("\"name\":\"handle-request\""), "{body}");
+    // hex trace/span ids (16/8 hex chars), NOT base64 (no '=' / '+').
+    let trace = field_after(body, "traceId");
+    assert_eq!(trace.len(), 32, "16-byte hex traceId: {trace}");
+    assert!(trace.chars().all(|c| c.is_ascii_hexdigit()), "hex: {trace}");
+    let span = field_after(body, "spanId");
+    assert_eq!(span.len(), 16, "8-byte hex spanId: {span}");
+    // *UnixNano are DECIMAL STRINGS.
+    assert!(body.contains("\"startTimeUnixNano\":\""), "ns string: {body}");
+    assert!(body.contains("\"code\":1"), "ok status: {body}");
+    assert!(body.contains("\"route\""), "attr: {body}");
+}
+
+#[tokio::test]
+async fn otlp_counter_is_cumulative_sum() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+let reqs = telemetry.counter("http.requests", {{ unit: "1" }})
+reqs.add(1, {{ route: "/x" }})
+reqs.add(1, {{ route: "/x" }})
+reqs.add(5, {{ route: "/y" }})
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let req = caps.iter().find(|r| r.signal == "metrics").expect("metrics request");
+    assert!(req.url.ends_with("/v1/metrics"), "url: {}", req.url);
+    let body = &req.body;
+    assert!(body.contains("resourceMetrics"), "{body}");
+    assert!(body.contains("\"name\":\"http.requests\""), "{body}");
+    assert!(body.contains("\"sum\""), "sum metric: {body}");
+    assert!(body.contains("\"aggregationTemporality\":2"), "cumulative: {body}");
+    // /x accumulated to 2, /y to 5.
+    assert!(body.contains("\"asDouble\":2.0") || body.contains("\"asDouble\":2"), "/x=2: {body}");
+    assert!(body.contains("\"asDouble\":5.0") || body.contains("\"asDouble\":5"), "/y=5: {body}");
+}
+
+#[tokio::test]
+async fn otlp_histogram_and_gauge() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+let lat = telemetry.histogram("http.latency", {{ unit: "ms" }})
+lat.record(12.5)
+lat.record(7.5)
+let inflight = telemetry.gauge("http.inflight")
+inflight.set(7)
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let body = &caps.iter().find(|r| r.signal == "metrics").unwrap().body;
+    assert!(body.contains("\"histogram\""), "histogram: {body}");
+    assert!(body.contains("\"count\":\"2\""), "2 samples: {body}");
+    assert!(body.contains("\"gauge\""), "gauge: {body}");
+}
+
+#[tokio::test]
+async fn idempotent_instrument_registration() {
+    // Re-fetching the same counter name returns the same instrument: one add of 1
+    // via each handle accumulates to 2 on ONE data point.
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+telemetry.counter("hits").add(1)
+telemetry.counter("hits").add(1)
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let body = &caps.iter().find(|r| r.signal == "metrics").unwrap().body;
+    assert_eq!(body.matches("\"name\":\"hits\"").count(), 1, "one instrument: {body}");
+    assert!(body.contains("\"asDouble\":2.0") || body.contains("\"asDouble\":2"), "sum=2: {body}");
+}
+
+/// The first `"key":"<value>"` after the needle.
+fn field_after(body: &str, key: &str) -> String {
+    let needle = format!("\"{}\":\"", key);
+    let i = body.find(&needle).unwrap_or_else(|| panic!("{key} not in {body}"));
+    let after = &body[i + needle.len()..];
+    let end = after.find('"').unwrap();
+    after[..end].to_string()
+}

@@ -1070,6 +1070,54 @@ impl Interp {
         }
     }
 
+    /// The SP12 exporter send seam. In CAPTURE mode (tests/REPL/embedders) it
+    /// records the request into the capture sink (read via `telemetry_capture()`)
+    /// and performs NO network I/O — so unit tests assert the exact OTLP/Sentry/
+    /// PostHog wire payloads with no socket and no secret. In LIVE mode it POSTs
+    /// via the pooled reqwest client shared with `std/net/http`. A live failure is
+    /// returned as `Err(message)` (the caller logs once + drops it — a telemetry
+    /// failure never aborts the user's program, spec §5).
+    ///
+    /// No `RefCell`/`resources` borrow is held across the `.await` (the request is
+    /// an owned value).
+    #[cfg(feature = "telemetry")]
+    pub(crate) async fn telemetry_send(
+        &self,
+        req: crate::stdlib::telemetry::model::CapturedRequest,
+    ) -> Result<(), String> {
+        if matches!(self.output, OutputSink::Capture(_)) {
+            self.telemetry_capture.borrow_mut().push(req);
+            return Ok(());
+        }
+        // Live: POST via the shared pooled client. Build the request fully before
+        // awaiting; hold no borrow across the send.
+        let client = crate::stdlib::net_http::shared_client();
+        let mut rb = client
+            .post(&req.url)
+            .header("content-type", "application/json")
+            .body(req.body);
+        for (k, v) in &req.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        match rb.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "telemetry {} export to {} failed: HTTP {}",
+                        req.exporter, req.url, status
+                    ))
+                }
+            }
+            Err(e) => Err(format!(
+                "telemetry {} export to {} failed: {}",
+                req.exporter, req.url, e
+            )),
+        }
+    }
+
     /// Set THIS task's current telemetry span context (returns the previous value
     /// so the caller can restore it — `telemetry.span` does save → set → await →
     /// restore around its callback). No-op (returns None) if the task-local is not
