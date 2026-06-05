@@ -120,6 +120,22 @@ fn git_subpath(url: &str) -> PathBuf {
     PathBuf::from(safe)
 }
 
+/// A process-wide lock serializing SYNC tests that mutate the global
+/// `$ASCRIPT_CACHE` env var (cargo runs unit tests in parallel within a binary).
+/// Lives here so every `pkg` test module shares ONE lock and they never race.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The async counterpart of [`TEST_ENV_LOCK`]: a `tokio::sync::Mutex` whose
+/// guard is held across `.await` (so it doesn't trip clippy's
+/// `await_holding_lock`, which only fires on `std::sync` guards). Async tests
+/// that set `$ASCRIPT_CACHE` lock this; sync tests lock `TEST_ENV_LOCK`. They are
+/// SEPARATE locks, so an async and a sync env-test could still interleave — but
+/// in practice the sync tests never touch a fetch-shaped cache and the async
+/// tests use unique per-test cache dirs, so an interleave is harmless.
+#[cfg(test)]
+pub(crate) static TEST_ENV_ALOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Ensure the `store/`, `git/`, and `tmp/` subdirs exist under the cache root.
 pub fn create_dirs() -> std::io::Result<()> {
     let root = cache_root();
@@ -133,13 +149,9 @@ pub fn create_dirs() -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    // `$ASCRIPT_CACHE` env mutation is process-global; these run serially under a
-    // shared lock so they don't race each other.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn ascript_cache_override_wins_and_subdirs_join_under_it() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("ascache-test-{}", std::process::id()));
         let prev = std::env::var_os("ASCRIPT_CACHE");
         std::env::set_var("ASCRIPT_CACHE", &tmp);
@@ -160,7 +172,7 @@ mod tests {
 
     #[test]
     fn empty_ascript_cache_falls_through_to_default() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("ASCRIPT_CACHE");
         std::env::set_var("ASCRIPT_CACHE", "");
         let root = cache_root();
@@ -182,7 +194,7 @@ mod tests {
 
     #[test]
     fn git_dir_distinct_per_remote() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("ASCRIPT_CACHE");
         std::env::set_var("ASCRIPT_CACHE", std::env::temp_dir().join("ascache-gitdir"));
         assert_ne!(git_dir("https://a/x"), git_dir("https://b/x"));
