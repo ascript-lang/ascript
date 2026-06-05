@@ -24,6 +24,13 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("inflate", bi("compress.inflate")),
         ("zipCreate", bi("compress.zipCreate")),
         ("zipExtract", bi("compress.zipExtract")),
+        // SP5 §5: zstd + brotli codecs and tar archives.
+        ("zstdCompress", bi("compress.zstdCompress")),
+        ("zstdDecompress", bi("compress.zstdDecompress")),
+        ("brotliCompress", bi("compress.brotliCompress")),
+        ("brotliDecompress", bi("compress.brotliDecompress")),
+        ("tarCreate", bi("compress.tarCreate")),
+        ("tarExtract", bi("compress.tarExtract")),
     ]
 }
 
@@ -112,8 +119,190 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 Err(msg) => Ok(err_pair(msg)),
             }
         }
+        // ── zstd ──────────────────────────────────────────────────────────────
+        "zstdCompress" => {
+            let src = source_bytes(&arg(args, 0), span, &ctx("zstdCompress"))?;
+            // Optional level (default crate default = 3). zstd accepts 1..=22.
+            let level = opt_level(args.get(1), span, "zstdCompress")?.unwrap_or(0) as i32;
+            match zstd::encode_all(&src[..], level) {
+                Ok(out) => Ok(bytes_val(out)),
+                Err(e) => Err(AsError::at(format!("zstdCompress failed: {}", e), span).into()),
+            }
+        }
+        "zstdDecompress" => {
+            let src = want_bytes(&arg(args, 0), span, &ctx("zstdDecompress"))?;
+            let raw = src.borrow().clone();
+            match zstd::decode_all(&raw[..]) {
+                Ok(out) => Ok(make_pair(bytes_val(out), Value::Nil)),
+                Err(e) => Ok(err_pair(format!("zstdDecompress failed: {}", e))),
+            }
+        }
+        // ── brotli ────────────────────────────────────────────────────────────
+        "brotliCompress" => {
+            let src = source_bytes(&arg(args, 0), span, &ctx("brotliCompress"))?;
+            // Optional quality 0..=11 (default 11 — brotli's max).
+            let quality = opt_level(args.get(1), span, "brotliCompress")?.unwrap_or(11) as u32;
+            let mut out = Vec::new();
+            {
+                let mut w = brotli::CompressorWriter::new(&mut out, 4096, quality, 22);
+                if let Err(e) = w.write_all(&src).and_then(|_| w.flush()) {
+                    return Err(AsError::at(format!("brotliCompress failed: {}", e), span).into());
+                }
+            }
+            Ok(bytes_val(out))
+        }
+        "brotliDecompress" => {
+            let src = want_bytes(&arg(args, 0), span, &ctx("brotliDecompress"))?;
+            let raw = src.borrow().clone();
+            let mut out = Vec::new();
+            let mut dec = brotli::Decompressor::new(&raw[..], 4096);
+            match dec.read_to_end(&mut out) {
+                Ok(_) => Ok(make_pair(bytes_val(out), Value::Nil)),
+                Err(e) => Ok(err_pair(format!("brotliDecompress failed: {}", e))),
+            }
+        }
+        // ── tar ───────────────────────────────────────────────────────────────
+        "tarCreate" => {
+            let entries = want_array(&arg(args, 0), span, &ctx("tarCreate"))?;
+            let entries = entries.borrow().clone();
+            match build_tar(&entries, span) {
+                Ok(bytes) => Ok(make_pair(bytes_val(bytes), Value::Nil)),
+                Err(ZipBuildError::Type(c)) => Err(c),
+                Err(ZipBuildError::Tier1(msg)) => Ok(err_pair(msg)),
+            }
+        }
+        "tarExtract" => {
+            let src = want_bytes(&arg(args, 0), span, &ctx("tarExtract"))?;
+            let raw = src.borrow().clone();
+            match extract_tar(&raw) {
+                Ok(arr) => Ok(make_pair(
+                    Value::Array(crate::value::ArrayCell::new(arr)),
+                    Value::Nil,
+                )),
+                Err(msg) => Ok(err_pair(msg)),
+            }
+        }
         _ => Err(AsError::at(format!("std/compress has no function '{}'", func), span).into()),
     }
+}
+
+/// Optional integer level/quality 2nd arg. `None` → use the codec default. A
+/// non-number (other than absent/nil) is a Tier-2 arg-type misuse.
+fn opt_level(v: Option<&Value>, span: Span, ctx: &str) -> Result<Option<i64>, Control> {
+    match v {
+        None | Some(Value::Nil) => Ok(None),
+        Some(Value::Number(n)) => Ok(Some(*n as i64)),
+        Some(other) => Err(AsError::at(
+            format!(
+                "compress.{} level must be a number, got {}",
+                ctx,
+                crate::interp::type_name(other)
+            ),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// Pull `(name, data)` out of a `{name, data}` entry object — the SAME entry
+/// shape used by zip — returning a Tier-2 type error on a malformed entry.
+fn entry_name_data(entry: &Value, ctx: &str, span: Span) -> Result<(String, Vec<u8>), ZipBuildError> {
+    let obj = match entry {
+        Value::Object(o) => o.clone(),
+        _ => {
+            return Err(ZipBuildError::Type(
+                AsError::at(
+                    format!(
+                        "compress.{} entry must be an object, got {}",
+                        ctx,
+                        crate::interp::type_name(entry)
+                    ),
+                    span,
+                )
+                .into(),
+            ))
+        }
+    };
+    let obj = obj.borrow();
+    let name = match obj.get("name") {
+        Some(Value::Str(s)) => s.to_string(),
+        other => {
+            return Err(ZipBuildError::Type(
+                AsError::at(
+                    format!(
+                        "compress.{} entry.name must be a string, got {}",
+                        ctx,
+                        crate::interp::type_name(other.unwrap_or(&Value::Nil))
+                    ),
+                    span,
+                )
+                .into(),
+            ))
+        }
+    };
+    let data = match obj.get("data") {
+        Some(Value::Bytes(b)) => b.borrow().clone(),
+        Some(Value::Str(s)) => s.as_bytes().to_vec(),
+        other => {
+            return Err(ZipBuildError::Type(
+                AsError::at(
+                    format!(
+                        "compress.{} entry.data must be bytes or a string, got {}",
+                        ctx,
+                        crate::interp::type_name(other.unwrap_or(&Value::Nil))
+                    ),
+                    span,
+                )
+                .into(),
+            ))
+        }
+    };
+    Ok((name, data))
+}
+
+/// Build a tar archive from `{name, data}` entries (same shape as zip).
+fn build_tar(entries: &[Value], span: Span) -> Result<Vec<u8>, ZipBuildError> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for entry in entries {
+        let (name, data) = entry_name_data(entry, "tarCreate", span)?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, &name, &data[..])
+            .map_err(|e| ZipBuildError::Tier1(format!("tarCreate failed: {}", e)))?;
+    }
+    builder
+        .into_inner()
+        .map_err(|e| ZipBuildError::Tier1(format!("tarCreate failed: {}", e)))
+}
+
+/// Extract a tar archive into an array of `{name, data}` objects (same shape as
+/// zipExtract).
+fn extract_tar(raw: &[u8]) -> Result<Vec<Value>, String> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(raw));
+    let mut out = Vec::new();
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("tarExtract failed: {}", e))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("tarExtract failed: {}", e))?;
+        let name = entry
+            .path()
+            .map_err(|e| format!("tarExtract failed: {}", e))?
+            .to_string_lossy()
+            .into_owned();
+        let mut data = Vec::new();
+        entry
+            .read_to_end(&mut data)
+            .map_err(|e| format!("tarExtract failed: {}", e))?;
+        let mut obj = indexmap::IndexMap::new();
+        obj.insert("name".to_string(), Value::Str(name.into()));
+        obj.insert("data".to_string(), bytes_val(data));
+        out.push(Value::Object(crate::value::ObjectCell::new(obj)));
+    }
+    Ok(out)
 }
 
 /// `zipCreate` can fail either with a Tier-2 type error (a malformed entry) or a
@@ -351,6 +540,124 @@ mod tests {
     #[should_panic(expected = "expects bytes or a string")]
     fn gzip_number_is_tier2_panic() {
         call("gzip", &[Value::Number(42.0)], sp()).unwrap();
+    }
+
+    // ── SP5 §5: zstd / brotli / tar ───────────────────────────────────────────
+
+    #[test]
+    fn zstd_roundtrip_string_and_binary() {
+        let zc = call("zstdCompress", &[s("hello zstd")], sp()).unwrap();
+        let back = ok_value(call("zstdDecompress", std::slice::from_ref(&zc), sp()).unwrap());
+        assert_eq!(as_bytes(&back), b"hello zstd".to_vec());
+        let bin = vec![0u8, 1, 255, 127, 0, 200];
+        let zc2 = call("zstdCompress", &[b(bin.clone())], sp()).unwrap();
+        let back2 = ok_value(call("zstdDecompress", std::slice::from_ref(&zc2), sp()).unwrap());
+        assert_eq!(as_bytes(&back2), bin);
+    }
+
+    #[test]
+    fn zstd_actually_compresses_repetitive() {
+        let original = "ABCD".repeat(1000);
+        let zc = call("zstdCompress", &[s(&original)], sp()).unwrap();
+        assert!(as_bytes(&zc).len() < original.len(), "zstd should shrink");
+        let back = ok_value(call("zstdDecompress", std::slice::from_ref(&zc), sp()).unwrap());
+        assert_eq!(as_bytes(&back), original.as_bytes());
+    }
+
+    #[test]
+    fn zstd_level_arg_roundtrips() {
+        let zc = call("zstdCompress", &[s("level test data"), Value::Number(19.0)], sp()).unwrap();
+        let back = ok_value(call("zstdDecompress", std::slice::from_ref(&zc), sp()).unwrap());
+        assert_eq!(as_bytes(&back), b"level test data".to_vec());
+    }
+
+    #[test]
+    fn zstd_garbage_is_tier1_err() {
+        let r = call("zstdDecompress", &[b(vec![1, 2, 3, 4, 5])], sp()).unwrap();
+        assert!(is_tier1_err(&r), "expected Tier-1 err, got {:?}", r);
+    }
+
+    #[test]
+    #[should_panic(expected = "expects bytes")]
+    fn zstd_decompress_string_is_tier2_panic() {
+        call("zstdDecompress", &[s("notbytes")], sp()).unwrap();
+    }
+
+    #[test]
+    fn brotli_roundtrip_string_and_binary() {
+        let bc = call("brotliCompress", &[s("hello brotli")], sp()).unwrap();
+        let back = ok_value(call("brotliDecompress", std::slice::from_ref(&bc), sp()).unwrap());
+        assert_eq!(as_bytes(&back), b"hello brotli".to_vec());
+        let bin = vec![9u8, 8, 7, 255, 0, 1];
+        let bc2 = call("brotliCompress", &[b(bin.clone())], sp()).unwrap();
+        let back2 = ok_value(call("brotliDecompress", std::slice::from_ref(&bc2), sp()).unwrap());
+        assert_eq!(as_bytes(&back2), bin);
+    }
+
+    #[test]
+    fn brotli_actually_compresses_repetitive() {
+        let original = "WXYZ".repeat(1000);
+        let bc = call("brotliCompress", &[s(&original)], sp()).unwrap();
+        assert!(as_bytes(&bc).len() < original.len(), "brotli should shrink");
+        let back = ok_value(call("brotliDecompress", std::slice::from_ref(&bc), sp()).unwrap());
+        assert_eq!(as_bytes(&back), original.as_bytes());
+    }
+
+    #[test]
+    fn brotli_garbage_is_tier1_err() {
+        let r = call("brotliDecompress", &[b(vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF])], sp()).unwrap();
+        assert!(is_tier1_err(&r), "expected Tier-1 err, got {:?}", r);
+    }
+
+    #[test]
+    #[should_panic(expected = "expects bytes")]
+    fn brotli_decompress_string_is_tier2_panic() {
+        call("brotliDecompress", &[s("notbytes")], sp()).unwrap();
+    }
+
+    #[test]
+    fn tar_create_extract_roundtrip() {
+        let mut e1 = indexmap::IndexMap::new();
+        e1.insert("name".to_string(), s("a.txt"));
+        e1.insert("data".to_string(), s("hello tar"));
+        let mut e2 = indexmap::IndexMap::new();
+        e2.insert("name".to_string(), s("b.bin"));
+        e2.insert("data".to_string(), b(vec![0x00, 0xFF, 0x10, 0x42]));
+        let entries = Value::Array(crate::value::ArrayCell::new(vec![
+            Value::Object(crate::value::ObjectCell::new(e1)),
+            Value::Object(crate::value::ObjectCell::new(e2)),
+        ]));
+        let tarred = ok_value(call("tarCreate", &[entries], sp()).unwrap());
+        let extracted = ok_value(call("tarExtract", &[tarred], sp()).unwrap());
+        let arr = match &extracted {
+            Value::Array(a) => a.borrow(),
+            _ => panic!("expected array"),
+        };
+        assert_eq!(arr.len(), 2);
+        let get = |v: &Value, k: &str| -> Value {
+            match v {
+                Value::Object(o) => o.borrow().get(k).cloned().unwrap(),
+                _ => panic!("expected object"),
+            }
+        };
+        assert_eq!(get(&arr[0], "name"), s("a.txt"));
+        assert_eq!(as_bytes(&get(&arr[0], "data")), b"hello tar".to_vec());
+        assert_eq!(get(&arr[1], "name"), s("b.bin"));
+        assert_eq!(as_bytes(&get(&arr[1], "data")), vec![0x00, 0xFF, 0x10, 0x42]);
+    }
+
+    #[test]
+    fn tar_extract_garbage_is_tier1_err() {
+        // A short non-tar buffer → extraction error.
+        let r = call("tarExtract", &[b(vec![1, 2, 3, 4, 5, 6, 7, 8])], sp()).unwrap();
+        assert!(is_tier1_err(&r), "expected Tier-1 err, got {:?}", r);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be an object")]
+    fn tar_create_bad_entry_is_tier2_panic() {
+        let entries = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
+        call("tarCreate", &[entries], sp()).unwrap();
     }
 
     #[tokio::test]

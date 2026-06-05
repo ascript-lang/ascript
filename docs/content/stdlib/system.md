@@ -843,6 +843,42 @@ for (let e in entries) {
 }
 ```
 
+### compress.zstdCompress / compress.zstdDecompress
+
+zstd (Zstandard) compression. `zstdCompress(src[, level])` accepts a string or
+bytes and returns bytes; `level` is optional (1–22, default 3). `zstdDecompress`
+takes bytes and is Tier-1.
+
+```ascript
+import { zstdCompress, zstdDecompress } from "std/compress"
+let packed = zstdCompress("hello", 19)
+let [raw, err] = zstdDecompress(packed)
+```
+
+### compress.brotliCompress / compress.brotliDecompress
+
+brotli compression. `brotliCompress(src[, quality])` (quality 0–11, default 11);
+`brotliDecompress` is Tier-1.
+
+```ascript
+import { brotliCompress, brotliDecompress } from "std/compress"
+let packed = brotliCompress("hello")
+let [raw, err] = brotliDecompress(packed)
+```
+
+### compress.tarCreate / compress.tarExtract
+
+tar archives, using the **same `{name, data}` entry shape as zip**. `tarCreate`
+takes an array of entries (`data` is bytes or a string) → `[bytes, err]`;
+`tarExtract` takes bytes → `[array<{name, data}>, err]`. A malformed entry shape
+is a Tier-2 panic; an I/O failure is Tier-1.
+
+```ascript
+import { tarCreate, tarExtract } from "std/compress"
+let [archive, e1] = tarCreate([{ name: "a.txt", data: "hello" }])
+let [entries, e2] = tarExtract(archive)
+```
+
 ## std/sqlite
 
 Embedded SQLite access, backed by a bundled SQLite (no system library required). `open` is the only module-level function; everything else is a method on a connection or statement handle.

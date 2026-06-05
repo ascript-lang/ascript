@@ -55,6 +55,9 @@ crc32fast = { version = "1", optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh64"], optional = true }
 flate2 = { version = "1", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+zstd = { version = "0.13", optional = true }
+brotli = { version = "7", optional = true }
+tar = { version = "0.4", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "cookies", "gzip", "brotli", "deflate", "zstd", "socks", "http2"], optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
@@ -95,7 +98,7 @@ intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
 # (process, std/process) adds tokio's process + io-util plumbing for subprocesses.
 sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "dep:hostname", "tokio/process", "tokio/io-util", "tokio/io-std"]
 crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex", "dep:crc32fast", "dep:xxhash-rust"]
-compress = ["dep:flate2", "dep:zip"]
+compress = ["dep:flate2", "dep:zip", "dep:zstd", "dep:brotli", "dep:tar"]
 sql = ["dep:rusqlite"]
 # M14 networking. Task 1 (std/net/tcp) needs only tokio's net + io-util; later
 # tasks (http/ws) ADD dep:reqwest/dep:hyper/etc. to this feature.
