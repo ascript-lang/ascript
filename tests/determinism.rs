@@ -88,6 +88,21 @@ async fn default_mode_inert_for_non_seamed_program() {
     );
 }
 
+/// SP9 §2.7 symmetry: under `--no-default-features` the `workflow` feature is
+/// compiled out, so `import "std/workflow"` is an unknown-module error on BOTH
+/// engines. (When the feature IS on, `tests/workflow.rs` exercises the real module.)
+#[cfg(not(feature = "workflow"))]
+#[tokio::test]
+async fn workflow_module_absent_without_feature() {
+    let src = "import { run } from \"std/workflow\"\n";
+    let err = ascript::run_source(src).await.expect_err("must error");
+    assert!(
+        err.message.contains("std/workflow") || err.message.contains("unknown"),
+        "expected an unknown-module error, got: {}",
+        err.message
+    );
+}
+
 /// uuid.v4 + crypto.randomBytes are reproducible under deterministic mode.
 /// (`std/uuid` is `data`-gated, `std/crypto` is `crypto`-gated; under
 /// `--no-default-features` they are compiled out, so this test is gated too.)

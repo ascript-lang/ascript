@@ -33,6 +33,7 @@ const NAV = [
     ['stdlib/time', 'Time & locale'],
     ['stdlib/net', 'Networking & HTTP'],
     ['stdlib/log', 'Logging'],
+    ['stdlib/workflow', 'Workflows (durable execution)'],
     ['stdlib/telemetry', 'Telemetry & observability'],
     ['stdlib/ai', 'AI (LLM client)'],
     ['stdlib/tui', 'Terminal UI'],

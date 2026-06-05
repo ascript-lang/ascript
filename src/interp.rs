@@ -828,6 +828,30 @@ impl Interp {
             .replace(crate::det::DeterminismContext::record(seed, start_ms))
     }
 
+    /// Install an explicit determinism context (Record or Replay), returning the
+    /// previous one. Used by `workflow.resume` to prime a Replay context with the
+    /// recorded event stream.
+    #[cfg(feature = "workflow")]
+    pub(crate) fn install_determinism(
+        &self,
+        ctx: crate::det::DeterminismContext,
+    ) -> Option<crate::det::DeterminismContext> {
+        self.determinism.borrow_mut().replace(ctx)
+    }
+
+    /// Remove and return the current determinism context (end of a workflow), so the
+    /// caller can read the recorded `events` to persist + restore the previous one.
+    #[cfg(feature = "workflow")]
+    pub(crate) fn take_determinism(&self) -> Option<crate::det::DeterminismContext> {
+        self.determinism.borrow_mut().take()
+    }
+
+    /// Restore a previously-saved determinism context (or clear it when `None`).
+    #[cfg(feature = "workflow")]
+    pub(crate) fn restore_determinism(&self, prev: Option<crate::det::DeterminismContext>) {
+        *self.determinism.borrow_mut() = prev;
+    }
+
     /// True iff deterministic mode is active. A cheap `is_some` check on the seam
     /// fast paths (the default `None` path is byte-identical to pre-SP9).
     pub(crate) fn is_deterministic(&self) -> bool {
@@ -2909,6 +2933,23 @@ impl Interp {
                         sargs.push(recv);
                         sargs.extend(values);
                         return Ok((self.call_schema(name, &sargs, expr.span).await?, false));
+                    }
+                    // SP9 §2: the SAME call-site hook for a workflow `ctx.<method>()`
+                    // (`ctx.call`/`now`/`random`/`uuid`/`sleep`). Receiver first,
+                    // then args, into `call_workflow_ctx`. Call-position only (a bare
+                    // `ctx.now` member read falls through, like schema).
+                    #[cfg(feature = "workflow")]
+                    if crate::stdlib::workflow::is_ctx_value(&recv)
+                        && crate::stdlib::workflow::is_ctx_method(name)
+                    {
+                        let values = self.eval_call_args(args, env).await?;
+                        let mut wargs = Vec::with_capacity(values.len() + 1);
+                        wargs.push(recv);
+                        wargs.extend(values);
+                        return Ok((
+                            self.call_workflow_ctx(name, &wargs, expr.span).await?,
+                            false,
+                        ));
                     }
                     // Fallback — byte-for-byte with the prior
                     // `eval_chain(callee) → eval_args → call_value` path: read

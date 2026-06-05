@@ -3139,6 +3139,19 @@ impl Vm {
             fiber.push(v);
             return Ok(());
         }
+        // (1a) SP9 §2: workflow `ctx.<method>()` hook (same predicate + shape as the
+        // schema hook, same routing to the shared `Interp`).
+        #[cfg(feature = "workflow")]
+        if crate::stdlib::workflow::is_ctx_value(&recv)
+            && crate::stdlib::workflow::is_ctx_method(name)
+        {
+            let mut wargs = Vec::with_capacity(args.len() + 1);
+            wargs.push(recv);
+            wargs.extend(args);
+            let v = self.interp.call_workflow_ctx(name, &wargs, span).await?;
+            fiber.push(v);
+            return Ok(());
+        }
         // (1b) STATIC method call `C.name(args)` (SP1 §3): the receiver is a VM
         // class whose `name` resolves (up the chain) to a compiled STATIC closure.
         // Dispatch with NO receiver, with full generator/async/sync handling

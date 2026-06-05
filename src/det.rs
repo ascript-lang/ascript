@@ -99,6 +99,15 @@ impl VirtualClock {
             self.monotonic_ms += delta_ms;
         }
     }
+
+    /// Set the wall clock to an absolute `wake` ms-epoch (replay of a recorded
+    /// durable timer fast-forwards the clock to the recorded wake time).
+    pub fn set_now(&mut self, wake: f64) {
+        if wake > self.now_ms {
+            self.monotonic_ms += wake - self.now_ms;
+        }
+        self.now_ms = wake;
+    }
 }
 
 /// A deterministic xorshift64* PRNG — the SAME algorithm as the thread-local one in

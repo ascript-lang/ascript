@@ -21,6 +21,7 @@ pub mod unknown_enum_variant;
 pub mod unreachable;
 pub mod unresolved_import;
 pub mod unused;
+pub mod workflow_determinism;
 
 pub type Rule = fn(&ResolvedNode, &ResolveResult, &str) -> Vec<AsDiagnostic>;
 
@@ -43,6 +44,7 @@ pub static ALL: &[Rule] = &[
     duplicate_member::check,
     super_misuse::check,
     field_default_type::check,
+    workflow_determinism::check,
 ];
 
 /// The `CallExpr` directly dropped by an `ExprStmt` (result unused). `None` if the

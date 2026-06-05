@@ -41,6 +41,8 @@ pub mod io;
 pub mod json;
 #[cfg(feature = "log")]
 pub mod log;
+#[cfg(feature = "workflow")]
+pub mod workflow;
 pub mod lru;
 pub mod map;
 pub mod math;
@@ -137,6 +139,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/json" => json::exports(),
         #[cfg(feature = "log")]
         "std/log" => log::exports(),
+        #[cfg(feature = "workflow")]
+        "std/workflow" => workflow::exports(),
         #[cfg(feature = "telemetry")]
         "std/telemetry" => telemetry::exports(),
         #[cfg(feature = "data")]
@@ -231,6 +235,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/intl",
     "std/json",
     "std/log",
+    "std/workflow",
     "std/telemetry",
     "std/encoding",
     "std/crypto",
@@ -397,6 +402,8 @@ impl Interp {
             "json" => json::call(func, args, span),
             #[cfg(feature = "log")]
             "log" => self.call_log(func, args, span).await,
+            #[cfg(feature = "workflow")]
+            "workflow" => self.call_workflow(func, args, span).await,
             #[cfg(feature = "telemetry")]
             "telemetry" => self.call_telemetry(func, args, span).await,
             #[cfg(feature = "data")]
