@@ -16,6 +16,15 @@ pub fn byte_to_char(src: &str, byte: usize) -> usize {
     src[..b].chars().count()
 }
 
+/// Convert a char offset to a byte offset into `src`. Clamps an out-of-range
+/// char offset to the end of `src` so the result is always a valid byte index.
+pub fn char_to_byte(src: &str, char_off: usize) -> usize {
+    src.char_indices()
+        .nth(char_off)
+        .map(|(b, _)| b)
+        .unwrap_or(src.len())
+}
+
 /// Convert a byte-offset `ByteSpan` to an LSP `Range`.
 pub fn byte_span_to_range(src: &str, index: &LineIndex, span: ByteSpan) -> Range {
     Range {
@@ -36,6 +45,16 @@ mod tests {
         assert_eq!(byte_to_char(src, 3), 2);
         assert_eq!(byte_to_char(src, 2), 1);
         assert_eq!(byte_to_char(src, 999), 5);
+    }
+
+    #[test]
+    fn char_to_byte_handles_multibyte() {
+        // "héllo": char 2 is 'l', which begins at byte 3 (é is 2 bytes).
+        let src = "héllo";
+        assert_eq!(char_to_byte(src, 0), 0);
+        assert_eq!(char_to_byte(src, 2), 3);
+        // Out-of-range clamps to the byte length.
+        assert_eq!(char_to_byte(src, 999), src.len());
     }
 
     #[test]

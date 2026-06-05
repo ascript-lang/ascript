@@ -209,11 +209,11 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let store = self.documents.lock().await;
-        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
-        Ok(analysis::hover(text, offset))
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::hover::hover(model, offset))
     }
 
     async fn completion(
