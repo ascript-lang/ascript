@@ -121,6 +121,12 @@ mod tests {
             "providers/highlight.rs",
             "providers/signature.rs",
             "providers/inlay.rs",
+            // Phase 3: the navigation + structure-depth providers must also be in
+            // scope so they can never re-introduce a legacy front-end import.
+            "providers/navigation.rs",
+            "providers/folding.rs",
+            "providers/hierarchy.rs",
+            "providers/symbols.rs",
         ] {
             let want = std::path::Path::new(&lsp_dir).join(required);
             assert!(
