@@ -6,5 +6,6 @@ pub mod docs;
 pub mod formatting;
 pub mod hover;
 pub mod navigation;
+pub mod semantic_tokens;
 pub mod symbols;
 pub mod token_spans;
