@@ -7,9 +7,12 @@
 //! BEST-EFFORT and ZERO-FALSE-POSITIVE on the corpus (the existing checker bar): the
 //! *runtime* replay-mismatch detector (`ctx.call`) is the authoritative guarantee.
 //! To stay zero-FP this rule is deliberately narrow:
-//! - it only inspects the workflow function when it is passed INLINE as an arrow or
-//!   `fn` expression to `run`/`resume` (a named function passed by reference is not
-//!   followed — that is the documented best-effort limit);
+//! - it only inspects the workflow function when it is passed INLINE as an arrow
+//!   expression to `run`/`resume` (a named function passed by reference is not
+//!   followed — that is the documented best-effort limit). AScript has NO `fn`
+//!   *expression* form — `fn`/`fn name` is statement-only on both engines, so an
+//!   inline `fn(ctx, input){…}` argument is a SYNTAX error, not an un-flagged
+//!   workflow; the only inline function literal is the arrow, which this rule walks;
 //! - a flagged call must be a DIRECT module member call (`time.now()`), not anything
 //!   wrapped in an `activity(...)` (those are the correct, recorded form), and not a
 //!   `ctx.*` method.
@@ -210,6 +213,31 @@ await run((ctx, input) => {
     fn time_now_outside_any_workflow_not_flagged() {
         let src = "import { now } from \"std/time\"\nlet t = time.now()\n";
         assert!(!has(src, "workflow-determinism"));
+    }
+
+    /// AScript has no `fn` *expression* form: `fn`/`fn name` is statement-only on
+    /// both engines, so an inline `fn(ctx, input){…}` argument never parses as a
+    /// workflow body — it is a SYNTAX error. This pins that reality (the rule's
+    /// docstring no longer claims `fn`-expression coverage). The arrow form is the
+    /// only inline function literal, and it IS walked (see
+    /// `flags_direct_time_now_in_inline_workflow`).
+    #[test]
+    fn fn_form_workflow_body_is_a_syntax_error_not_an_unflagged_workflow() {
+        let src = r#"
+import { run } from "std/workflow"
+import { now } from "std/time"
+await run(fn(ctx, input) {
+  let t = time.now()
+  return t
+}, 0, { log: "x" })
+"#;
+        let diags = analyze(src).diagnostics;
+        // The fn-expression argument does not parse, so this surfaces as a syntax
+        // error — it can never be a silently un-inspected workflow body.
+        assert!(
+            diags.iter().any(|d| d.code == "syntax-error"),
+            "expected a syntax error for the fn-expression form, got {diags:?}"
+        );
     }
 }
 
