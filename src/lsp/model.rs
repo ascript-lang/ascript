@@ -151,6 +151,67 @@ impl SemanticModel {
     }
 }
 
+use tower_lsp::lsp_types::TextDocumentContentChangeEvent;
+
+/// Apply LSP incremental content changes to `text` in order, returning the new
+/// text. A change with `range == None` replaces the whole document. Ranges are
+/// UTF-16 line/char positions resolved against the CURRENT text before each edit.
+pub fn apply_changes(text: &str, changes: &[TextDocumentContentChangeEvent]) -> String {
+    let mut out = text.to_string();
+    for change in changes {
+        match change.range {
+            None => out = change.text.clone(),
+            Some(range) => {
+                let index = LineIndex::new(&out);
+                let start = char_offset(&out, index.offset(range.start));
+                let end = char_offset(&out, index.offset(range.end));
+                out.replace_range(start..end, &change.text);
+            }
+        }
+    }
+    out
+}
+
+/// Byte offset of char offset `chars` in `s`.
+fn char_offset(s: &str, chars: usize) -> usize {
+    s.char_indices().nth(chars).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use tower_lsp::lsp_types::{Position, Range};
+
+    #[test]
+    fn incremental_edits_equal_full_reparse() {
+        // Start, then apply a ranged insert, and assert the text equals what a
+        // client would have sent as a full document.
+        let start = "let x = 1\nprint(x)\n";
+        let change = TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 8), Position::new(0, 9))), // the "1"
+            range_length: None,
+            text: "42".to_string(),
+        };
+        let got = apply_changes(start, &[change]);
+        assert_eq!(got, "let x = 42\nprint(x)\n");
+        // And a model built from the incremental result equals one built from the
+        // equivalent full text (diagnostics identical).
+        let inc = SemanticModel::build(got.clone(), Some(2), &LintConfig::default());
+        let full = SemanticModel::build("let x = 42\nprint(x)\n".to_string(), Some(2), &LintConfig::default());
+        assert_eq!(inc.diagnostics, full.diagnostics);
+    }
+
+    #[test]
+    fn full_replace_change_replaces() {
+        let change = TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: "new".to_string(),
+        };
+        assert_eq!(apply_changes("old", &[change]), "new");
+    }
+}
+
 #[cfg(test)]
 mod diag_tests {
     use super::*;

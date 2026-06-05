@@ -76,7 +76,9 @@ impl Backend {
 /// later tasks add completion/hover/definition/documentSymbol providers.
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::INCREMENTAL,
+        )),
         document_symbol_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
@@ -170,16 +172,17 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // Full-document sync: the last content change holds the entire new text.
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.reindex_uri(&params.text_document.uri, &change.text);
-            self.analyze_and_publish(
-                params.text_document.uri,
-                change.text,
-                Some(params.text_document.version),
-            )
-            .await;
-        }
+        // Incremental sync: apply the ranged content changes against the cached
+        // text, then rebuild the model from the resulting full text.
+        let uri = params.text_document.uri;
+        let version = Some(params.text_document.version);
+        let new_text = {
+            let store = self.documents.lock().await;
+            let base = store.get(&uri).map(|m| m.text.clone()).unwrap_or_default();
+            crate::lsp::model::apply_changes(&base, &params.content_changes)
+        };
+        self.reindex_uri(&uri, &new_text);
+        self.analyze_and_publish(uri, new_text, version).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -464,13 +467,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_advertise_full_sync() {
+    fn capabilities_advertise_incremental_sync() {
         let caps = server_capabilities();
         match caps.text_document_sync {
             Some(TextDocumentSyncCapability::Kind(kind)) => {
-                assert_eq!(kind, TextDocumentSyncKind::FULL);
+                assert_eq!(kind, TextDocumentSyncKind::INCREMENTAL);
             }
-            other => panic!("expected FULL text document sync, got {:?}", other),
+            other => panic!("expected INCREMENTAL text document sync, got {:?}", other),
         }
     }
 
