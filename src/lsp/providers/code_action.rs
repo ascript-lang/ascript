@@ -141,6 +141,31 @@ pub fn code_actions(
     out
 }
 
+/// Fill a source action's `WorkspaceEdit` lazily. The action's `data` carries the
+/// target `Url` (set by the cheap pass). `quickfix` actions already carry their
+/// edit and pass through unchanged.
+pub fn resolve_code_action(model: &SemanticModel, mut action: CodeAction) -> CodeAction {
+    if action.edit.is_some() {
+        return action;
+    }
+    let Some(data) = &action.data else {
+        return action;
+    };
+    let Ok(uri) = serde_json::from_value::<Url>(data.clone()) else {
+        return action;
+    };
+    action.edit = match action.kind.as_ref() {
+        Some(k) if *k == CodeActionKind::SOURCE_FIX_ALL => {
+            fix_all_action(model, &uri).and_then(|a| a.edit)
+        }
+        Some(k) if *k == CodeActionKind::SOURCE_ORGANIZE_IMPORTS => {
+            organize_imports_action(model, &uri).edit
+        }
+        _ => None,
+    };
+    action
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +213,21 @@ mod tests {
         let uri = Url::parse("file:///main.as").unwrap();
         let ca = organize_imports_action(&m, &uri);
         assert_eq!(ca.kind, Some(CodeActionKind::SOURCE_ORGANIZE_IMPORTS));
+    }
+
+    #[test]
+    fn resolve_fills_edit_for_fix_all() {
+        let src = "import { a, b } from \"std/math\"\nprint(a(1))\n";
+        let m = model(src);
+        let uri = Url::parse("file:///main.as").unwrap();
+        // A bare fixAll action with no edit (the cheap pass), tagged with the URI.
+        let bare = CodeAction {
+            title: "Fix all auto-fixable problems".to_string(),
+            kind: Some(CodeActionKind::SOURCE_FIX_ALL),
+            data: Some(serde_json::to_value(&uri).unwrap()),
+            ..CodeAction::default()
+        };
+        let resolved = resolve_code_action(&m, bare);
+        assert!(resolved.edit.is_some(), "resolve fills the edit");
     }
 }

@@ -96,7 +96,7 @@ pub fn server_capabilities() -> ServerCapabilities {
                 CodeActionKind::SOURCE_FIX_ALL,
                 CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
             ]),
-            resolve_provider: Some(false),
+            resolve_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
         execute_command_provider: Some(ExecuteCommandOptions {
@@ -307,6 +307,25 @@ impl LanguageServer for Backend {
             &params.context,
         );
         Ok(Some(actions))
+    }
+
+    async fn code_action_resolve(
+        &self,
+        action: CodeAction,
+    ) -> tower_lsp::jsonrpc::Result<CodeAction> {
+        // The target URI rides in `action.data`.
+        let uri = action
+            .data
+            .as_ref()
+            .and_then(|d| serde_json::from_value::<Url>(d.clone()).ok());
+        let Some(uri) = uri else { return Ok(action) };
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(action);
+        };
+        Ok(crate::lsp::providers::code_action::resolve_code_action(
+            model, action,
+        ))
     }
 
     async fn execute_command(
