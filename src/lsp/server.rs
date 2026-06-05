@@ -186,6 +186,9 @@ pub fn server_capabilities() -> ServerCapabilities {
         // Phase 4: documentColor / colorPresentation swatches (color.rgb/bgRgb,
         // [r,g,b] tui arrays, gated hex/functional color strings).
         color_provider: Some(ColorProviderCapability::Simple(true)),
+        // Phase 4: linkedEditingRange — live rename of a local identifier's same-file
+        // occurrences (globals refused).
+        linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
         // Phase 2: signature help while typing a call's arguments. Triggered on `(`
         // (open the call) and `,` (advance the active parameter / retrigger).
         signature_help_provider: Some(SignatureHelpOptions {
@@ -433,6 +436,21 @@ impl LanguageServer for Backend {
         };
         let rgba = crate::lsp::providers::color::Rgba::from_lsp(params.color);
         Ok(crate::lsp::providers::color::color_presentations(model, rgba, params.range))
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<LinkedEditingRanges>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::rename::linked_editing_ranges(model, offset)
+            .map(|ranges| LinkedEditingRanges { ranges, word_pattern: None }))
     }
 
     async fn signature_help(
@@ -1267,6 +1285,15 @@ mod tests {
         assert!(
             caps.color_provider.is_some(),
             "expected a documentColor provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_linked_editing_range() {
+        let caps = server_capabilities();
+        assert!(
+            caps.linked_editing_range_provider.is_some(),
+            "expected a linkedEditingRange provider"
         );
     }
 
