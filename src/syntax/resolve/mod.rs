@@ -856,6 +856,14 @@ impl Resolver {
     }
 
     fn resolve_expr(&mut self, node: &ResolvedNode) {
+        // SP9 §1: the resolver walks the CST recursively, so a deeply nested SOURCE
+        // expression (`((((…))))`) recurses here too. Grow the native stack at this
+        // funnel so resolution reaches the bottom (and then the compiler's
+        // EXPR_NEST_LIMIT cap) rather than SIGABRTing. Synchronous, inert until low.
+        crate::vm::stack::grow(|| self.resolve_expr_inner(node))
+    }
+
+    fn resolve_expr_inner(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
         match node.kind() {
             NameRef => {

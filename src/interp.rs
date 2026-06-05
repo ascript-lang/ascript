@@ -490,6 +490,18 @@ const INFLIGHT_YIELD_CAP: u64 = 256;
 /// the debug worst case, so a 512 MB worker stack gives > 2× headroom. Truly
 /// unbounded recursion stays the SP9 architectural non-goal (needs an
 /// explicit-stack VM); SP3 turns the crash into a deterministic, catchable error.
+///
+/// **SP9 §1 coordination (robust recursion):** SP9 inserts `stacker::maybe_grow`
+/// guards at the native re-entry funnels (VM `call_value`/method dispatch, generator
+/// `resume_vm`, both parsers, the resolver, `compile_expr`, and the tree-walker
+/// `eval_expr`/`run_body` — see `src/vm/stack.rs`). Those guards grow the native
+/// stack on demand so the narrow native-re-entry paths (deep `map`/reduce callbacks,
+/// nested generator composition, deeply nested expressions) REACH this logical cap
+/// cleanly instead of SIGABRTing the native stack first — even off the enlarged
+/// worker thread. This cap stays the product default and the safety backstop (it
+/// also bounds heap-`frames` growth, which `stacker` does not); SP9 chose the
+/// "always-on stacker, cap stays the ceiling" option (spec §1.6), so the value is
+/// unchanged and both engines still trip at the SAME `MAX_CALL_DEPTH`.
 pub const MAX_CALL_DEPTH: u32 = 3000;
 
 /// The maximum EXPRESSION-NESTING depth (SP3 §B / O1) — a SEPARATE limit from
@@ -2248,8 +2260,30 @@ impl Interp {
         }
     }
 
-    #[async_recursion(?Send)]
+    /// SP9 §1: native re-entry guard for the tree-walker expression evaluator. A
+    /// deeply nested SOURCE expression (`((((…))))`) recurses `eval_expr→eval_expr`
+    /// without passing through `run_body`, so the per-call `run_body` stack guard
+    /// does NOT cover it. Grow the native stack here too — but only at a coarse
+    /// checkpoint (every `STACK_CHECK_INTERVAL` nesting levels), so the cheap probe
+    /// runs once per checkpoint instead of once per expression (avoids a `Box::pin`
+    /// on every `eval_expr` call — the tree-walker hot path). The interval × the
+    /// largest per-`eval_expr` frame stays well under `RED_ZONE`, so the guard still
+    /// re-grows before any segment overflows. Inert until the stack runs low.
     pub async fn eval_expr(&self, expr: &Expr, env: &Environment) -> Result<Value, Control> {
+        // A coarse checkpoint: only the levels that are a multiple of the interval
+        // pay the (boxed) grow wrapper; all others go straight to the inner
+        // evaluator. `expr_depth` is the live nesting counter incremented in
+        // `eval_expr_inner` below.
+        const STACK_CHECK_INTERVAL: u32 = 16;
+        if self.expr_depth.get().is_multiple_of(STACK_CHECK_INTERVAL) {
+            crate::vm::stack::grow_future(self.eval_expr_inner(expr, env)).await
+        } else {
+            self.eval_expr_inner(expr, env).await
+        }
+    }
+
+    #[async_recursion(?Send)]
+    async fn eval_expr_inner(&self, expr: &Expr, env: &Environment) -> Result<Value, Control> {
         // SP3 §B / O1: bound EXPRESSION nesting (deeply nested `((((…))))`, long
         // binary chains) on its OWN counter — NOT `call_depth`. Counting expr
         // nesting against the per-call counter would double-count each logical call
@@ -3325,7 +3359,12 @@ impl Interp {
             }
             call_env.define(&p.name, dv, true).map_err(AsError::new)?;
         }
-        let result = match self.exec(body, call_env).await {
+        // SP9 §1: `run_body` is the single native re-entry funnel every script call
+        // passes through (`#[async_recursion]`, the actual native-stack deepener).
+        // Grow the native stack per poll so deep recursion (functions / methods /
+        // HOF callbacks) reaches the logical `MAX_CALL_DEPTH` cap cleanly instead of
+        // SIGABRTing the native stack first — matching the VM's re-entry guards.
+        let result = match crate::vm::stack::grow_future(self.exec(body, call_env)).await {
             Ok(Flow::Return(v)) => v,
             Ok(Flow::Normal) => Value::Nil,
             Ok(Flow::Break) => return Err(AsError::at("'break' outside of a loop", span).into()),

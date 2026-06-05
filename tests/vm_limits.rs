@@ -351,7 +351,10 @@ async fn assert_deep_succeeds_three_way(src: &str, expected: &str) {
 
 #[tokio::test]
 async fn deep_hof_callback_recursion_no_sigabrt_three_way() {
-    assert_deep_succeeds_three_way(&deep_hof_src(1500), "0\n").await;
+    // 1000 levels: each level is TWO logical calls (`rec` + the `map` arrow
+    // callback), so ~2000 logical units — over the native test-thread budget,
+    // under the 3000 cap.
+    assert_deep_succeeds_three_way(&deep_hof_src(1000), "0\n").await;
 }
 
 #[tokio::test]
@@ -443,3 +446,4 @@ async fn margin_guard_treewalker_over_limit_clean_panic_no_overflow() {
         Ok(out) => panic!("expected a clean recursion panic, but the run succeeded: {out:?}"),
     }
 }
+

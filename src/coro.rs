@@ -253,9 +253,11 @@ impl GeneratorHandle {
             .expect("VM dropped while a generator is still live (wiring bug)");
         // `Vm::run` may re-enter `resume` (a `for await` inside a generator body
         // drives a sub-generator via `Op::IterNext`), forming the async cycle
-        // run → resume → resume_vm → run. Box this edge so the recursive future has
-        // a finite size (the same indirection `#[async_recursion]` injects).
-        let outcome = Box::pin(vm.run(&mut fiber)).await;
+        // run → resume → resume_vm → run. SP9 §1: this is the native re-entry funnel
+        // for nested generator composition (a generator whose body drives another) —
+        // `grow_future` boxes the edge AND grows the native stack per poll so deep
+        // composition reaches the logical cap cleanly instead of SIGABRTing.
+        let outcome = crate::vm::stack::grow_future(vm.run(&mut fiber)).await;
         match outcome {
             Ok(crate::vm::RunOutcome::Yielded(v)) => {
                 // Still suspended: put the fiber back for the next resume.

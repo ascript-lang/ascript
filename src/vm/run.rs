@@ -2845,7 +2845,11 @@ impl Vm {
                 // cannot `yield` (yield is only valid inside a generator, which is
                 // driven differently), so `Done(v)` is the only outcome; a `yield`
                 // here would be a compiler bug.
-                match self.run(&mut fiber).await? {
+                // SP9 §1: this is a native re-entry funnel for higher-order stdlib
+                // callbacks (`array.map`/`reduce`/comparators) — a deep `map`-of-`map`
+                // nests Rust frames here. Grow the native stack per poll so the
+                // re-entry reaches the logical cap cleanly instead of SIGABRTing.
+                match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
                     RunOutcome::Done(v) => Ok(v),
                     RunOutcome::Yielded(_) => {
                         unreachable!("a closure called via Vm::call_value cannot yield")
@@ -3843,7 +3847,9 @@ impl Vm {
         // decrement, so the guard owns this unit). Matches one tree-walker
         // `run_body`.
         let _depth = self.interp.enter_call_depth_scoped(span)?;
-        match self.run(&mut fiber).await? {
+        // SP9 §1: native re-entry funnel for non-IC method dispatch — grow the
+        // native stack per poll (see `call_value`).
+        match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
             RunOutcome::Done(v) => Ok(v),
             RunOutcome::Yielded(_) => {
                 unreachable!("a non-generator method cannot yield")
@@ -3915,7 +3921,9 @@ impl Vm {
                 fiber.stack[slot] = v;
             }
         }
-        match self.run(&mut fiber).await? {
+        // SP9 §1: native re-entry funnel for static-method dispatch — grow the
+        // native stack per poll (see `call_value`).
+        match crate::vm::stack::grow_future(self.run(&mut fiber)).await? {
             RunOutcome::Done(v) => Ok(v),
             RunOutcome::Yielded(_) => unreachable!("a non-generator static cannot yield"),
         }

@@ -935,7 +935,14 @@ impl<'a> Parser<'a> {
     }
 
     fn expr(&mut self) -> Result<Expr, AsError> {
-        self.assignment()
+        // SP9 §1: the recursive-descent parser re-enters `expr` for every bracketed
+        // sub-expression (`(`/`[`/`{`/template `${`), so a deeply nested SOURCE
+        // expression (`((((…))))`) is native Rust recursion HERE — before compile or
+        // eval. Grow the native stack at this funnel so parsing reaches the AST (and
+        // then the compile/eval `EXPR_NEST_LIMIT` cap) rather than SIGABRTing first.
+        // Synchronous, so the cheap probe-and-grow `grow` suffices; inert until the
+        // stack runs low.
+        crate::vm::stack::grow(|| self.assignment())
     }
 
     fn assignment(&mut self) -> Result<Expr, AsError> {

@@ -241,6 +241,16 @@ fn expr_stmt(p: &mut Parser) {
 
 /// Like `expr` but returns the CompletedMarker so callers can wrap it (assignment).
 fn expr_returning(p: &mut Parser) -> CompletedMarker {
+    // SP9 §1: the CST parser re-enters `expr_returning` for every bracketed
+    // sub-expression (`(`/`[`/`{`/template `${`), so a deeply nested SOURCE
+    // expression (`((((…))))`) is native Rust recursion HERE — before compile/eval.
+    // Grow the native stack at this funnel so parsing reaches the CST (and then the
+    // compiler's `EXPR_NEST_LIMIT` cap) rather than SIGABRTing first. Synchronous,
+    // so the cheap probe-and-grow `grow` suffices; inert until the stack runs low.
+    crate::vm::stack::grow(|| expr_returning_inner(p))
+}
+
+fn expr_returning_inner(p: &mut Parser) -> CompletedMarker {
     let cm = lhs(p);
     let mut lhs_cm = cm;
     loop {
