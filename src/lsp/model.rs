@@ -52,3 +52,77 @@ mod tests {
         assert_eq!(m.diagnostics, direct);
     }
 }
+
+use std::collections::HashMap;
+use std::path::Path;
+use tower_lsp::lsp_types::Url;
+
+/// The per-document model cache. Keyed by `Url`; holds at most one model per open
+/// document. Rebuilds on insert (full or post-incremental text).
+#[derive(Default)]
+pub struct DocumentStore {
+    models: HashMap<Url, SemanticModel>,
+}
+
+impl DocumentStore {
+    pub fn new() -> Self {
+        DocumentStore { models: HashMap::new() }
+    }
+
+    /// Build and store the model for `uri` at `text`/`version`. The lint config is
+    /// discovered from the document's filesystem path (nearest `ascript.toml`); a
+    /// non-file URL uses the default config.
+    pub fn set(&mut self, uri: Url, text: String, version: Option<i32>) {
+        let config = config_for_uri(&uri);
+        let model = SemanticModel::build(text, version, &config);
+        self.models.insert(uri, model);
+    }
+
+    pub fn get(&self, uri: &Url) -> Option<&SemanticModel> {
+        self.models.get(uri)
+    }
+
+    pub fn remove(&mut self, uri: &Url) {
+        self.models.remove(uri);
+    }
+}
+
+/// Discover the lint config for a document URL (nearest `ascript.toml [lint]`).
+fn config_for_uri(uri: &Url) -> LintConfig {
+    if let Ok(path) = uri.to_file_path() {
+        return config_for_path(&path);
+    }
+    LintConfig::default()
+}
+
+/// Discover the lint config for a filesystem path.
+pub fn config_for_path(path: &Path) -> LintConfig {
+    crate::check::config_toml::config_for_file(path).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    #[test]
+    fn set_get_remove_roundtrip() {
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        store.set(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        assert!(store.get(&uri).is_some());
+        assert_eq!(store.get(&uri).unwrap().version, Some(1));
+        store.remove(&uri);
+        assert!(store.get(&uri).is_none());
+    }
+
+    #[test]
+    fn set_rebuilds_on_new_version() {
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        store.set(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        store.set(uri.clone(), "let = bad\n".to_string(), Some(2));
+        let m = store.get(&uri).unwrap();
+        assert_eq!(m.version, Some(2));
+        assert!(!m.diagnostics.is_empty(), "v2 has a syntax error");
+    }
+}
