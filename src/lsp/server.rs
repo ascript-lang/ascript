@@ -112,6 +112,13 @@ pub fn server_capabilities() -> ServerCapabilities {
         })),
         // Phase 2: read/write occurrence highlighting of the symbol under the cursor.
         document_highlight_provider: Some(OneOf::Left(true)),
+        // Phase 2: signature help while typing a call's arguments. Triggered on `(`
+        // (open the call) and `,` (advance the active parameter / retrigger).
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: Some(vec![",".to_string()]),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
         // Phase 2: semantic-token highlighting (full document + range), with the
         // provider's legend.
         semantic_tokens_provider: Some(
@@ -315,6 +322,20 @@ impl LanguageServer for Backend {
         };
         let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
         Ok(crate::lsp::providers::highlight::document_highlights(model, offset))
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::signature::signature_help(model, offset))
     }
 
     async fn semantic_tokens_full(
@@ -713,6 +734,17 @@ mod tests {
             ),
             "expected a document-highlight provider"
         );
+    }
+
+    #[test]
+    fn capabilities_advertise_signature_help() {
+        let caps = server_capabilities();
+        let sig = caps
+            .signature_help_provider
+            .expect("signature-help provider");
+        let triggers = sig.trigger_characters.expect("trigger chars");
+        assert!(triggers.contains(&"(".to_string()));
+        assert!(triggers.contains(&",".to_string()));
     }
 
     #[test]
