@@ -69,6 +69,14 @@ impl Backend {
         }
     }
 
+    /// True if `gen` is no longer the current generation for `uri` (a newer edit has
+    /// landed). A handler that captured `gen` at entry should bail when this is true,
+    /// because its result was computed against now-stale text.
+    async fn superseded(&self, uri: &Url, gen: u64) -> bool {
+        let store = self.documents.lock().await;
+        store.current_gen(uri).map(|g| g != gen).unwrap_or(true)
+    }
+
     /// Incrementally re-index the file behind `uri` (if it maps to a path).
     fn reindex_uri(&self, uri: &Url, text: &str) {
         if let Some(path) = url_to_canon(uri) {
@@ -526,12 +534,21 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(None);
+        let (gen, result) = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+            (model.generation, crate::lsp::providers::hover::hover(model, offset))
         };
-        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
-        Ok(crate::lsp::providers::hover::hover(model, offset))
+        // Supersession: a hover computed against now-stale text is dropped. (Only the
+        // noisy while-typing requests — completion/hover — are guarded; user-initiated
+        // navigation/symbol requests rarely race, so they stay unguarded.)
+        if self.superseded(&uri, gen).await {
+            return Ok(None);
+        }
+        Ok(result)
     }
 
     async fn completion(
@@ -540,13 +557,23 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(None);
+        let (gen, items) = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            // The completion provider scans raw chars, so it takes a CHAR offset.
+            let offset = model.line_index.offset(position);
+            (
+                model.generation,
+                crate::lsp::providers::completion::completions(model, offset),
+            )
         };
-        // The completion provider scans raw chars, so it takes a CHAR offset.
-        let offset = model.line_index.offset(position);
-        let items = crate::lsp::providers::completion::completions(model, offset);
+        // If a newer edit landed while we computed, the result is obsolete; drop it
+        // (the client re-requests against the fresh document).
+        if self.superseded(&uri, gen).await {
+            return Ok(None);
+        }
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -1867,5 +1894,19 @@ mod tests {
             caps.document_range_formatting_provider.is_some(),
             "range formatting advertised"
         );
+    }
+
+    #[test]
+    fn stale_generation_is_superseded() {
+        // Drive the store directly (no live Client) to prove the supersession guard
+        // logic: a handler holding an older generation must treat itself as stale.
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let g1 = store.set_versioned(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        let g2 = store.set_versioned(uri.clone(), "let x = 2\n".to_string(), Some(2));
+        assert_ne!(g1, g2);
+        assert_eq!(store.current_gen(&uri), Some(g2));
+        // A handler holding g1 must treat itself as superseded.
+        assert!(store.current_gen(&uri) != Some(g1));
     }
 }
