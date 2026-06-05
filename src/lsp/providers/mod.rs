@@ -7,3 +7,4 @@ pub mod formatting;
 pub mod hover;
 pub mod navigation;
 pub mod symbols;
+pub mod token_spans;
