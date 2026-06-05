@@ -292,6 +292,115 @@ fn generate_missing_credential_is_tier1() {
 }
 
 // ===========================================================================
+// Phase E — tools (the in-interpreter sequential tool-use loop).
+// ===========================================================================
+
+#[test]
+fn tool_loop_single_step_then_final() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        import * as schema from "std/schema"
+        let weather = ai.tool({
+            description: "Get current weather for a city",
+            input: schema.object({ city: schema.string() }),
+            execute: (args) => { return [{ tempC: 18, sky: "clear", city: args.city }, nil] },
+        })
+        let [out, err] = await ai.generate({
+            model: "openai:gpt-4.1",
+            prompt: "What should I wear in Lisbon?",
+            tools: { weather: weather },
+            maxSteps: 5,
+        })
+        if (err != nil) { print("ERR " + err.message); return }
+        print(out.text)
+        print(len(out.steps))
+        print(out.steps[0].tool)
+        print(out.steps[0].arguments.city)
+        "#,
+        vec![
+            ai_mock::Fixture::json(&fixture("openai/tool_turn1.json")),
+            ai_mock::Fixture::json(&fixture("openai/tool_turn2.json")),
+        ],
+    );
+    assert_eq!(
+        out,
+        "Wear a light jacket; it's 18C and clear in Lisbon.\n1\nweather\nLisbon\n"
+    );
+}
+
+#[test]
+fn tool_loop_async_execute() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        import * as schema from "std/schema"
+        let weather = ai.tool({
+            description: "weather",
+            input: schema.object({ city: schema.string() }),
+            execute: async (args) => { return [{ tempC: 18 }, nil] },
+        })
+        let [out, err] = await ai.generate({ model: "openai:gpt-4.1", prompt: "x", tools: { weather: weather } })
+        if (err != nil) { print("ERR " + err.message); return }
+        print(out.text)
+        "#,
+        vec![
+            ai_mock::Fixture::json(&fixture("openai/tool_turn1.json")),
+            ai_mock::Fixture::json(&fixture("openai/tool_turn2.json")),
+        ],
+    );
+    assert_eq!(out, "Wear a light jacket; it's 18C and clear in Lisbon.\n");
+}
+
+#[test]
+fn tool_execute_error_is_fed_back_not_aborted() {
+    // The tool returns [nil, err]; the loop feeds it back and still reaches turn 2.
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        import * as schema from "std/schema"
+        let weather = ai.tool({
+            description: "weather",
+            input: schema.object({ city: schema.string() }),
+            execute: (args) => { return [nil, { message: "service down" }] },
+        })
+        let [out, err] = await ai.generate({ model: "openai:gpt-4.1", prompt: "x", tools: { weather: weather } })
+        if (err != nil) { print("ERR " + err.message); return }
+        print(out.text)
+        print(out.steps[0].error)
+        "#,
+        vec![
+            ai_mock::Fixture::json(&fixture("openai/tool_turn1.json")),
+            ai_mock::Fixture::json(&fixture("openai/tool_turn2.json")),
+        ],
+    );
+    assert_eq!(
+        out,
+        "Wear a light jacket; it's 18C and clear in Lisbon.\nservice down\n"
+    );
+}
+
+#[test]
+fn tool_malformed_definition_is_tier2_panic() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    let res = local.block_on(&rt, async {
+        ascript::run_source(
+            r#"
+            import * as ai from "std/ai"
+            ai.tool({ description: "x", execute: (a) => { return [nil, nil] } })
+            "#,
+        )
+        .await
+    });
+    let err = res.expect_err("missing 'input' must be a Tier-2 panic");
+    assert!(err.message.contains("input"), "got: {}", err.message);
+}
+
+// ===========================================================================
 // Phase C — streaming (generators + for await).
 // ===========================================================================
 

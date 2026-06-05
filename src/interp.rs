@@ -1542,6 +1542,19 @@ impl Interp {
         Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
     }
 
+    /// Drive a value to completion if it is a `Value::Future` (an `async fn`
+    /// return), else return it unchanged. SP11's tool loop uses this to await an
+    /// `async fn` tool `execute` (mirrors the `await` operator's semantics:
+    /// `await` on a non-future is identity). A panic in the spawned task
+    /// re-surfaces here.
+    #[cfg(feature = "ai")]
+    pub(crate) async fn await_if_future(&self, v: Value) -> Result<Value, Control> {
+        match v {
+            Value::Future(f) => f.get().await,
+            other => Ok(other),
+        }
+    }
+
     /// Project a `shape:` argument (a `Value::Class` or a `std/schema` tagged
     /// Object) into a JSON Schema (`serde_json::Value`) for SP11 structured output.
     /// A class's nested `Type::Named` fields resolve through the class's `def_env`

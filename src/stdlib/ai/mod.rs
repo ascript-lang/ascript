@@ -73,7 +73,8 @@ pub(crate) async fn dispatch(
         "provider" => request::make_provider(interp, args, span),
         "generate" => generate(interp, args, span).await,
         "stream" => stream::stream(interp, args, span).await,
-        "embed" | "embedMany" | "tool" => {
+        "tool" => tools::make_tool(interp, args, span),
+        "embed" | "embedMany" => {
             Err(AsError::at(format!("std/ai: '{}' is not yet implemented", func), span).into())
         }
         other => Err(AsError::at(format!("std/ai has no function '{}'", other), span).into()),
@@ -184,10 +185,44 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
         ));
     }
 
+    // Tools: resolve the `tools:` map (an unknown/malformed tool → Tier-2 panic) and,
+    // if any, set them on the request + run the in-interpreter tool-use loop.
+    let resolved_tools = tools::resolve_tools(interp, &request::get_field(&opts, "tools"), span)?;
+    let max_steps = match request::get_field(&opts, "maxSteps") {
+        Value::Number(n) if n >= 1.0 => n as u32,
+        _ => 5,
+    };
+
     // Take the genai client OUT (clone the Arc-backed handle) before the await.
     let client = interp.ai_state().client();
-    let spec = resolved.to_service_target_or_iden();
 
+    if !resolved_tools.is_empty() {
+        let genai_tools: Vec<genai::chat::Tool> =
+            resolved_tools.iter().map(|t| t.tool.clone()).collect();
+        let chat_req = chat_req.with_tools(genai_tools);
+        let spec = resolved.to_service_target_or_iden();
+        let loop_result = tools::run_tool_loop(
+            interp,
+            tools::ToolLoop {
+                client: &client,
+                target: spec,
+                chat_req,
+                chat_options: &chat_options,
+                tools: &resolved_tools,
+                max_steps,
+            },
+            span,
+        )
+        .await?;
+        return Ok(match loop_result {
+            Ok((neutral, steps)) => {
+                crate::interp::make_pair(response::out_object(&neutral, steps), Value::Nil)
+            }
+            Err(err) => crate::interp::make_pair(Value::Nil, err),
+        });
+    }
+
+    let spec = resolved.to_service_target_or_iden();
     let result = match spec {
         request::ServiceTargetOrIden::Target(t) => {
             client.exec_chat(t, chat_req, Some(&chat_options)).await
