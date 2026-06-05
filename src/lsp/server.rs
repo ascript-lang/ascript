@@ -341,8 +341,36 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _params: InitializedParams) {
-        // Warm the cross-file index: walk each root for `*.as` and index them.
+        // Warm the cross-file index over ALL workspace roots (multi-root), wrapped
+        // in a best-effort work-done progress report.
         let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+        let token = NumberOrString::String("ascript-index".to_string());
+        // Create + Begin (spawned: the create is a server→client request whose
+        // response we do not need; a client without progress support ignores it).
+        {
+            let client = self.client.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                let _ = client
+                    .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                        token: token.clone(),
+                    })
+                    .await;
+                client
+                    .send_notification::<notification::Progress>(ProgressParams {
+                        token,
+                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                            WorkDoneProgressBegin {
+                                title: "Indexing AScript workspace".to_string(),
+                                cancellable: Some(false),
+                                message: None,
+                                percentage: None,
+                            },
+                        )),
+                    })
+                    .await;
+            });
+        }
         let mut files: Vec<(PathBuf, String)> = Vec::new();
         for root in &roots {
             for path in workspace::discover_as_files(root) {
@@ -356,6 +384,15 @@ impl LanguageServer for Backend {
                 idx.reindex_file(path, text);
             }
         }
+        // End the progress with the indexed-file count.
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                    message: Some(format!("{} files indexed", files.len())),
+                })),
+            })
+            .await;
         // Dynamically register a file watcher for `*.as` + `ascript.toml` so the
         // client sends `workspace/didChangeWatchedFiles` (best-effort — a client
         // without dynamic-registration support simply ignores it).
@@ -1376,6 +1413,34 @@ impl LanguageServer for Backend {
         }
     }
 
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        if let Ok(mut roots) = self.roots.write() {
+            for added in &params.event.added {
+                if let Ok(p) = added.uri.to_file_path() {
+                    if !roots.contains(&p) {
+                        roots.push(p);
+                    }
+                }
+            }
+            for removed in &params.event.removed {
+                if let Ok(p) = removed.uri.to_file_path() {
+                    roots.retain(|r| r != &p);
+                }
+            }
+        }
+        // Re-warm the index over the (new) root set.
+        let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+        if let Ok(mut idx) = self.index.write() {
+            for root in &roots {
+                for path in workspace::discover_as_files(root) {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        idx.reindex_file(&path, &text);
+                    }
+                }
+            }
+        }
+    }
+
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
         Ok(())
     }
@@ -1636,6 +1701,28 @@ mod tests {
             .commands
             .iter()
             .any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND));
+    }
+
+    #[test]
+    fn index_covers_multiple_roots() {
+        // Two distinct roots, each with a `.as` file: discover + reindex composes
+        // across roots so the index holds entries from BOTH (multi-root).
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let a = root_a.path().join("alpha.as");
+        let b = root_b.path().join("beta.as");
+        std::fs::write(&a, "export fn alpha() {}\n").unwrap();
+        std::fs::write(&b, "export fn beta() {}\n").unwrap();
+        let mut idx = WorkspaceIndex::new();
+        for root in [root_a.path(), root_b.path()] {
+            for path in workspace::discover_as_files(root) {
+                let text = std::fs::read_to_string(&path).unwrap();
+                idx.reindex_file(&path, &text);
+            }
+        }
+        let names: Vec<&str> = idx.defs_by_name.keys().map(String::as_str).collect();
+        assert!(names.contains(&"alpha"), "alpha from root A: {names:?}");
+        assert!(names.contains(&"beta"), "beta from root B: {names:?}");
     }
 
     #[test]
