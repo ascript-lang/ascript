@@ -125,6 +125,23 @@ let [people, _] = csv.parse("name,age\nAda,36", { header: true })
 // people == [{ name: "Ada", age: "36" }]
 ```
 
+#### Typed parse: `csv.parse(text, Class|schema, options?)`
+
+Pass a class (or a [std/schema](schema) value) as the 2nd argument to validate **each
+row** and get an array of typed instances. CSV cells are always strings, so typed rows
+are validated **with coercion** — a `number` field accepts the cell `"36"` → `36`. Use
+`{ header: true }` so rows are keyed objects matching the class fields. Validation is
+fail-fast across rows: the first bad row's error carries a `row[N]` path prefix.
+
+```ascript
+class Row { name: string  age: number }
+let [rows, err] = csv.parse("name,age\nAda,36\nGrace,37", Row, { header: true })
+// rows[0].age == 36 (a Number); err == nil
+
+let [bad, e] = csv.parse("name,age\nAda,notnum", Row, { header: true })
+// bad == nil; e != nil  (row[0].age failed)
+```
+
 ### csv.stringify
 
 Serializes an array of rows to CSV text.
@@ -166,6 +183,15 @@ let [bad, e] = toml.parse("= bad")
 // e   == { message: "invalid TOML: ..." }
 ```
 
+Like `json.parse`, a 2nd `Class | schema` argument validates the whole decoded
+document and fuses a parse failure and a shape mismatch into one `[value, err]`:
+
+```ascript
+class Config { host: string  port: number }
+let [cfg, err] = toml.parse("host = \"localhost\"\nport = 8080", Config)
+// cfg.host == "localhost"; cfg.port == 8080; err == nil
+```
+
 ### toml.stringify
 
 Serializes an AScript value to TOML text.
@@ -202,6 +228,15 @@ Parses a YAML string into an AScript value.
 let [doc, err] = yaml.parse("name: Ada\nage: 36\ntags:\n  - a\n  - b")
 // doc == { name: "Ada", age: 36, tags: ["a", "b"] }
 // err == nil
+```
+
+A 2nd `Class | schema` argument validates the decoded document, exactly like
+`json.parse` / `toml.parse`:
+
+```ascript
+class Config { host: string  port: number }
+let [cfg, err] = yaml.parse("host: example.com\nport: 443", Config)
+// cfg.host == "example.com"; cfg.port == 443; err == nil
 ```
 
 ### yaml.stringify
