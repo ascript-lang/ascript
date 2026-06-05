@@ -198,10 +198,10 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
         let store = self.documents.lock().await;
-        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let symbols = analysis::document_symbols(text);
+        let symbols = crate::lsp::providers::symbols::document_symbols(model);
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
