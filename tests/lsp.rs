@@ -282,6 +282,15 @@ fn lsp_protocol_end_to_end() {
         !caps["diagnosticProvider"].is_null(),
         "missing diagnosticProvider: {resp}"
     );
+    // Phase 4: workspace file-operations (willRenameFiles) + multi-root folders.
+    assert!(
+        !caps["workspace"]["fileOperations"]["willRename"].is_null(),
+        "missing workspace.fileOperations.willRename: {resp}"
+    );
+    assert_eq!(
+        caps["workspace"]["workspaceFolders"]["supported"], true,
+        "multi-root workspace folders supported: {resp}"
+    );
     // Phase 4: executeCommand carries run/runTest.
     {
         let cmds = caps["executeCommandProvider"]["commands"]

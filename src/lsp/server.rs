@@ -222,6 +222,19 @@ pub fn server_capabilities() -> ServerCapabilities {
                 work_done_progress_options: WorkDoneProgressOptions::default(),
             },
         ))),
+        // Phase 4: multi-root workspace folders + file-operations (willRenameFiles /
+        // didRenameFiles import rewrite, restricted to `*.as` files).
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
+            file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                will_rename: Some(as_file_rename_filter()),
+                did_rename: Some(as_file_rename_filter()),
+                ..WorkspaceFileOperationsServerCapabilities::default()
+            }),
+        }),
         // Phase 2: semantic-token highlighting (full document + range), with the
         // provider's legend.
         semantic_tokens_provider: Some(
@@ -233,6 +246,21 @@ pub fn server_capabilities() -> ServerCapabilities {
             }),
         ),
         ..ServerCapabilities::default()
+    }
+}
+
+/// A `FileOperationRegistrationOptions` matching `file://**/*.as` (the scheme +
+/// glob both `willRenameFiles` and `didRenameFiles` register on).
+fn as_file_rename_filter() -> FileOperationRegistrationOptions {
+    FileOperationRegistrationOptions {
+        filters: vec![FileOperationFilter {
+            scheme: Some("file".to_string()),
+            pattern: FileOperationPattern {
+                glob: "**/*.as".to_string(),
+                matches: Some(FileOperationPatternKind::File),
+                options: None,
+            },
+        }],
     }
 }
 
@@ -1197,6 +1225,62 @@ impl LanguageServer for Backend {
         }))
     }
 
+    async fn will_rename_files(
+        &self,
+        params: RenameFilesParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<WorkspaceEdit>> {
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for f in &params.files {
+            let (Some(old), Some(new)) = (
+                Url::parse(&f.old_uri).ok().and_then(|u| u.to_file_path().ok()),
+                Url::parse(&f.new_uri).ok().and_then(|u| u.to_file_path().ok()),
+            ) else {
+                continue;
+            };
+            for (importer, range, new_spec) in idx.import_rewrite_edits(&old, &new) {
+                let Some(uri) = canon_to_url(&importer) else {
+                    continue;
+                };
+                let Some(text) = idx_text(&idx, &workspace::canon(&importer)) else {
+                    continue;
+                };
+                changes.entry(uri).or_default().push(TextEdit {
+                    range: workspace::byte_span_to_range(&text, range),
+                    new_text: new_spec,
+                });
+            }
+        }
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
+    }
+
+    async fn did_rename_files(&self, params: RenameFilesParams) {
+        // Re-key the index: drop the old path, index the new one off disk.
+        for f in &params.files {
+            let (Some(old), Some(new)) = (
+                Url::parse(&f.old_uri).ok().and_then(|u| u.to_file_path().ok()),
+                Url::parse(&f.new_uri).ok().and_then(|u| u.to_file_path().ok()),
+            ) else {
+                continue;
+            };
+            if let Ok(mut idx) = self.index.write() {
+                idx.files.remove(&workspace::canon(&old));
+                if let Ok(text) = std::fs::read_to_string(&new) {
+                    idx.reindex_file(&new, &text);
+                }
+            }
+        }
+    }
+
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
         Ok(())
     }
@@ -1457,6 +1541,21 @@ mod tests {
             .commands
             .iter()
             .any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND));
+    }
+
+    #[test]
+    fn capabilities_advertise_file_operations_and_multiroot() {
+        let caps = server_capabilities();
+        let ws = caps.workspace.expect("workspace capabilities");
+        let folders = ws.workspace_folders.expect("workspace folders");
+        assert_eq!(folders.supported, Some(true));
+        let ops = ws.file_operations.expect("file operations");
+        let will = ops.will_rename.expect("willRename registered");
+        assert!(will
+            .filters
+            .iter()
+            .any(|f| f.pattern.glob == "**/*.as"));
+        assert!(ops.did_rename.is_some(), "didRename registered");
     }
 
     #[test]
