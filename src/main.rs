@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 mod lint_config_toml;
+#[cfg(feature = "pkg")]
+mod pkg;
 
 #[derive(Parser)]
 #[command(name = "ascript", about = "The AScript interpreter")]
