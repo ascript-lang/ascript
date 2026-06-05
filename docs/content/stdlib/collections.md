@@ -1058,6 +1058,12 @@ Return a pseudo-random number in the half-open range `[0, 1)`. The generator is 
 math.random()   // e.g. 0.7421…
 ```
 
+> **Deterministic mode (SP9).** Inside a `std/workflow` run (or under deterministic mode),
+> `math.random`/`randomInt`/`shuffle`/`sample`, `uuid.v4`, and `crypto.randomBytes` draw from a
+> per-`Interp` **seeded** PRNG that is recorded and replayed, so two same-seed runs are
+> byte-identical. Outside deterministic mode the generator is the normal time-seeded one (no
+> behavior change). See [Workflows](?p=stdlib/workflow).
+
 ### math.sin
 
 Sine of an angle in radians.

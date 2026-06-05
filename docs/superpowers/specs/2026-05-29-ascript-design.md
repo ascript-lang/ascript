@@ -373,9 +373,15 @@ diagnostic + stack trace, and exit non-zero. Panics include:
   deeply nested expression) is capped at a fixed logical depth (`MAX_CALL_DEPTH`);
   over it the runtime raises `maximum recursion depth exceeded` **before** the
   native stack overflows — a clean, deterministic panic, NOT a process abort, and
-  identical on both engines (the bytecode VM and the tree-walker oracle). This is a
-  graceful guard, not unlimited recursion: truly unbounded recursion needs an
-  explicit-stack VM and remains an architectural non-goal (see §7's non-goals).
+  identical on both engines (the bytecode VM and the tree-walker oracle). **SP9 §1**
+  makes the narrow native re-entry paths (deep HOF callbacks, nested generator
+  composition, deeply nested expressions) *reach* this cap cleanly — `stacker`
+  grows the native stack on demand at those funnels, so the cap (not the native
+  stack) is what fires. "Robust recursion / durable execution / determinism seams"
+  are realized on the model-2a engine by SP9 (see
+  `specs/2026-06-04-sp9-recursion-durability-determinism-design.md` and the
+  reclassified async-generators ADR); the one model-2b residual is
+  arbitrary-concurrent-task-interleaving determinism (§7's non-goals).
 
 Panics are **not catchable** in normal code — this keeps the value-based model
 honest. A single host/REPL boundary, `recover(fn)`, runs `fn` and converts a panic
