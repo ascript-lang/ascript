@@ -7,6 +7,7 @@
 //! legacy `analysis::completions`.
 
 use crate::lsp::model::SemanticModel;
+use crate::syntax::resolve::types::BindingKind;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
 
 /// The AScript keywords offered as completions (KEYWORD kind). Mirrors the lexer's
@@ -79,6 +80,31 @@ fn baseline_completions() -> Vec<CompletionItem> {
     out
 }
 
+/// In-scope user bindings as completion items. Phase 1 v1 offers EVERY binding in
+/// the resolved set (de-duplicated by name, last decl wins) — precise per-cursor
+/// scope filtering by frame is a Phase-2 refinement; over-offering a sibling-scope
+/// name is a benign, non-misleading suggestion. The binding KIND maps to an icon.
+fn binding_completions(model: &SemanticModel) -> Vec<CompletionItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for b in &model.resolved.bindings {
+        if !seen.insert(b.name.clone()) {
+            continue;
+        }
+        let kind = match b.kind {
+            BindingKind::Fn => CompletionItemKind::FUNCTION,
+            BindingKind::Class => CompletionItemKind::CLASS,
+            BindingKind::Enum => CompletionItemKind::ENUM,
+            BindingKind::Const => CompletionItemKind::CONSTANT,
+            BindingKind::Param => CompletionItemKind::VARIABLE,
+            BindingKind::Import => CompletionItemKind::MODULE,
+            _ => CompletionItemKind::VARIABLE,
+        };
+        out.push(item(&b.name, kind));
+    }
+    out
+}
+
 /// Completions at char `offset` in the model's text. Pure and robust: never panics,
 /// and always returns at least the baseline (keywords + builtins) even on partial or
 /// syntactically broken input (completion is requested mid-edit).
@@ -115,7 +141,9 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
         }
     }
 
-    baseline_completions()
+    let mut base = baseline_completions();
+    base.extend(binding_completions(model));
+    base
 }
 
 /// Whether `offset` sits inside the still-open string of a `from "..."` / `from '...'`
@@ -320,6 +348,22 @@ mod tests {
             .find(|i| i.label == "yield")
             .expect("yield keyword in baseline");
         assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn baseline_includes_in_scope_bindings() {
+        // A top-level `let` and a fn name are in scope at the cursor and should be
+        // offered alongside keywords/builtins.
+        let src = "let total = 1\nfn helper() {}\nt\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let off = src.rfind('t').unwrap() + 1; // just after the `t` on the last line
+        let items = completions(&model, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"total"), "missing local binding: {labels:?}");
+        assert!(labels.contains(&"helper"), "missing fn binding: {labels:?}");
+        // Keywords + builtins still present (subset preserved).
+        assert!(labels.contains(&"let"), "keyword missing: {labels:?}");
+        assert!(labels.contains(&"print"), "builtin missing: {labels:?}");
     }
 
     #[test]
