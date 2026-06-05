@@ -9,7 +9,8 @@
 use crate::lsp::model::SemanticModel;
 use crate::syntax::resolve::types::BindingKind;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, InsertTextFormat, Position, Range, TextEdit,
+    CompletionItem, CompletionItemKind, Documentation, InsertTextFormat, MarkupContent, MarkupKind,
+    Position, Range, TextEdit,
 };
 
 /// The AScript keywords offered as completions (KEYWORD kind). Mirrors the lexer's
@@ -238,6 +239,35 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
     base
 }
 
+/// Fill `detail`/`documentation` for an item that the cheap pass left bare. v1
+/// resolves builtins/keywords from the shared docs table; bindings are left as-is
+/// (their kind icon already conveys the essential info).
+///
+/// API adaptation vs the plan: `docs::keyword_doc` takes a `SyntaxKind`, not a
+/// `&str`, so a keyword label is lexed to its leading token kind before lookup;
+/// `docs::builtin_doc` takes the `&str` label directly.
+pub fn resolve_completion(_model: &SemanticModel, item: &mut CompletionItem) {
+    if item.documentation.is_some() {
+        return;
+    }
+    let doc = crate::lsp::providers::docs::builtin_doc(&item.label)
+        .map(str::to_string)
+        .or_else(|| keyword_doc_for_label(&item.label).map(str::to_string));
+    if let Some(doc) = doc {
+        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: doc,
+        }));
+    }
+}
+
+/// The keyword doc for a label string, by lexing it to its leading token kind and
+/// consulting the shared `docs::keyword_doc(SyntaxKind)` table.
+fn keyword_doc_for_label(label: &str) -> Option<&'static str> {
+    let kind = crate::syntax::lex(label).first().map(|t| t.kind)?;
+    crate::lsp::providers::docs::keyword_doc(kind)
+}
+
 /// Whether `offset` sits inside the still-open string of a `from "..."` / `from '...'`
 /// on the current line. Scans backward from the cursor within the current line for an
 /// opening quote with no closing quote before the cursor, then checks the text before
@@ -440,6 +470,29 @@ mod tests {
             .find(|i| i.label == "yield")
             .expect("yield keyword in baseline");
         assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn resolve_fills_detail_for_builtin() {
+        let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
+        let mut print_item = item("print", CompletionItemKind::FUNCTION);
+        assert!(print_item.documentation.is_none());
+        resolve_completion(&model, &mut print_item);
+        assert!(
+            print_item.documentation.is_some() || print_item.detail.is_some(),
+            "resolve should add detail/docs for a builtin"
+        );
+    }
+
+    #[test]
+    fn resolve_fills_detail_for_keyword() {
+        let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
+        let mut let_item = item("let", CompletionItemKind::KEYWORD);
+        resolve_completion(&model, &mut let_item);
+        assert!(
+            let_item.documentation.is_some(),
+            "resolve should add docs for a keyword"
+        );
     }
 
     #[test]

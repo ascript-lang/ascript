@@ -84,6 +84,7 @@ pub fn server_capabilities() -> ServerCapabilities {
         completion_provider: Some(CompletionOptions {
             // `.` for member-access completions; `"` / `'` for import-path strings.
             trigger_characters: Some(vec![".".to_string(), "\"".to_string(), "'".to_string()]),
+            resolve_provider: Some(true),
             ..CompletionOptions::default()
         }),
         definition_provider: Some(OneOf::Left(true)),
@@ -232,6 +233,22 @@ impl LanguageServer for Backend {
         let offset = model.line_index.offset(position);
         let items = crate::lsp::providers::completion::completions(model, offset);
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn completion_resolve(
+        &self,
+        mut item: CompletionItem,
+    ) -> tower_lsp::jsonrpc::Result<CompletionItem> {
+        // Resolve uses the docs table only (no document context needed); a
+        // synthetic empty model is sufficient because `resolve_completion`
+        // ignores the model for builtins/keywords.
+        let model = crate::lsp::model::SemanticModel::build(
+            String::new(),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        crate::lsp::providers::completion::resolve_completion(&model, &mut item);
+        Ok(item)
     }
 
     async fn formatting(
