@@ -218,6 +218,25 @@ impl<'a> Pass<'a> {
             (None, Some(init_expr)) => self.synth(init_expr, env).widen(),
             (None, None) => CheckTy::Any,
         };
+        // LSP hover/inlay collection mode: record the inferred type of an
+        // un-annotated `let`/`const` binding on its NAME-token range, so the inlay
+        // provider can surface an inferred-type hint there (a binding site is not a
+        // `NameRef` use, so it is not otherwise covered by `synth_nameref`). Only
+        // for a concrete (non-`Any`) type, and never for an annotated binding (the
+        // annotation is already visible in the source). Hover-mode-only: the normal
+        // diagnosing pass leaves `hover == None`, so this is behavior-preserving and
+        // emits no diagnostics.
+        if self.hover.is_some() && ann.is_none() && bound_ty != CheckTy::Any {
+            if let Some(name_range) = decl_name_range(stmt) {
+                let display = bound_ty.display(self.table);
+                if let Some(h) = self.hover.as_mut() {
+                    h.push(HoverType {
+                        range: name_range,
+                        ty: display,
+                    });
+                }
+            }
+        }
         if let Some(k) = key {
             env.define(k, bound_ty);
         }
@@ -1219,6 +1238,16 @@ fn first_expr_child(node: &ResolvedNode) -> Option<ResolvedNode> {
     node.children()
         .find(|c| crate::check::rules::is_expr_kind(c.kind()))
         .cloned()
+}
+
+/// The byte span of a `let`/`const` binding's NAME token: the first `Ident` token
+/// directly under the `LetStmt` (after the `let`/`const` keyword). Used by the LSP
+/// hover/inlay collection mode to anchor an inferred-type hint at the binding name.
+fn decl_name_range(stmt: &ResolvedNode) -> Option<ByteSpan> {
+    stmt.children_with_tokens()
+        .filter_map(|el| el.into_token().cloned())
+        .find(|t| t.kind() == SyntaxKind::Ident)
+        .map(|t| ByteSpan::from(t.text_range()))
 }
 
 /// Is `kind` a match-pattern node kind?

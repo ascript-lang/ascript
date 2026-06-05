@@ -6,6 +6,7 @@ pub mod docs;
 pub mod formatting;
 pub mod highlight;
 pub mod hover;
+pub mod inlay;
 pub mod navigation;
 pub mod semantic_tokens;
 pub mod signature;
