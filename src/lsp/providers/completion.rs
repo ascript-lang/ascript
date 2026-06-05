@@ -139,6 +139,35 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
                 }
             }
         }
+
+        // Context 3: member access on a class/enum NAME — offer its static surface
+        // (enum variants, or the class's declared fields + methods) from the SP10
+        // table. This only runs when the alias is NOT a namespace import.
+        let table = crate::check::infer::table::Table::build(&model.tree, &model.resolved);
+        if let Some(eid) = table.enum_id(&alias) {
+            if let Some(info) = table.enum_info(eid) {
+                return info
+                    .variants
+                    .iter()
+                    .map(|v| item(v, CompletionItemKind::ENUM_MEMBER))
+                    .collect();
+            }
+        }
+        if let Some(cid) = table.class_id(&alias) {
+            if let Some(info) = table.class(cid) {
+                let mut out: Vec<CompletionItem> = info
+                    .fields
+                    .keys()
+                    .map(|f| item(f, CompletionItemKind::FIELD))
+                    .collect();
+                out.extend(
+                    info.methods
+                        .keys()
+                        .map(|m| item(m, CompletionItemKind::METHOD)),
+                );
+                return out;
+            }
+        }
     }
 
     let mut base = baseline_completions();
@@ -348,6 +377,23 @@ mod tests {
             .find(|i| i.label == "yield")
             .expect("yield keyword in baseline");
         assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn member_access_offers_enum_variants_and_class_members() {
+        let src = "enum Color { Red, Green }\nclass Point { x: number\n  fn dist() { return 0 } }\nColor.\nPoint.\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+
+        let color_off = src.find("Color.\n").unwrap() + "Color.".len();
+        let cl = completions(&model, color_off);
+        let cls: Vec<&str> = cl.iter().map(|i| i.label.as_str()).collect();
+        assert!(cls.contains(&"Red") && cls.contains(&"Green"), "enum variants: {cls:?}");
+
+        let point_off = src.find("Point.\n").unwrap() + "Point.".len();
+        let pl = completions(&model, point_off);
+        let pls: Vec<&str> = pl.iter().map(|i| i.label.as_str()).collect();
+        assert!(pls.contains(&"x"), "class field: {pls:?}");
+        assert!(pls.contains(&"dist"), "class method: {pls:?}");
     }
 
     #[test]
