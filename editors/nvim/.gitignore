@@ -1,0 +1,8 @@
+# Neovim / test artifacts
+*.swp
+*.swo
+.netrwhist
+# nvim-treesitter installs the compiled parser here at runtime
+parser/
+# generated helptags
+doc/tags

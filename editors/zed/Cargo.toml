@@ -1,0 +1,18 @@
+# Standalone crate: NOT a member of the ascript repo workspace, so a repo-root
+# `cargo build` does not absorb this WASM extension (mirrors the grammar crate).
+[workspace]
+
+[package]
+name = "zed_ascript"
+version = "0.6.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/ascript.rs"
+
+[dependencies]
+# Verify against current Zed docs: target wasm32-wasip2 with zed_extension_api 0.6.
+zed_extension_api = "0.6"

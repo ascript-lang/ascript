@@ -1,0 +1,211 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "AScript",
+  "scopeName": "source.ascript",
+  "fileTypes": [
+    "as"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#constants"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#functions"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.ascript",
+          "begin": "//",
+          "end": "$"
+        },
+        {
+          "name": "comment.block.ascript",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.ascript",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.ascript",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.template.ascript",
+          "begin": "`",
+          "end": "`",
+          "patterns": [
+            {
+              "name": "constant.character.escape.ascript",
+              "match": "\\\\."
+            },
+            {
+              "name": "meta.template.expression.ascript",
+              "begin": "\\$\\{",
+              "end": "\\}",
+              "beginCaptures": {
+                "0": {
+                  "name": "punctuation.definition.template-expression.begin.ascript"
+                }
+              },
+              "endCaptures": {
+                "0": {
+                  "name": "punctuation.definition.template-expression.end.ascript"
+                }
+              },
+              "patterns": [
+                {
+                  "include": "$self"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.ascript",
+          "match": "\\b(0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\\d[\\d_]*(\\.[\\d_]+)?([eE][+-]?\\d+)?)\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.ascript",
+          "match": "\\b(if|else|for|while|loop|match|return|break|continue|in|step|yield|await|recover|throw|try)\\b"
+        },
+        {
+          "name": "keyword.control.import.ascript",
+          "match": "\\b(import|export|from|as)\\b"
+        },
+        {
+          "name": "storage.modifier.ascript",
+          "match": "\\b(static|async)\\b"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(let|const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.ascript"
+            },
+            "2": {
+              "name": "variable.other.ascript"
+            }
+          }
+        },
+        {
+          "match": "\\b(fn)\\b\\s*\\*?\\s*([A-Za-z_][A-Za-z0-9_]*)?",
+          "captures": {
+            "1": {
+              "name": "storage.type.function.ascript"
+            },
+            "2": {
+              "name": "entity.name.function.ascript"
+            }
+          }
+        },
+        {
+          "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.class.ascript"
+            },
+            "2": {
+              "name": "entity.name.type.class.ascript"
+            }
+          }
+        },
+        {
+          "match": "\\b(enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.enum.ascript"
+            },
+            "2": {
+              "name": "entity.name.type.enum.ascript"
+            }
+          }
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.ascript",
+          "match": "\\b(number|string|bool|nil|any|bytes|array|map|future)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.ascript",
+          "match": "\\b(true|false)\\b"
+        },
+        {
+          "name": "constant.language.nil.ascript",
+          "match": "\\b(nil)\\b"
+        },
+        {
+          "name": "variable.language.self.ascript",
+          "match": "\\b(self|super)\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "entity.name.function.call.ascript",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.ascript",
+          "match": "(\\+|\\-|\\*|/|%|==|!=|<=|>=|<|>|&&|\\|\\||!|\\?|=|\\.\\.=|\\.\\.\\.|\\.\\.)"
+        }
+      ]
+    }
+  }
+}
