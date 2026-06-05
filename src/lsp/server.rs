@@ -110,6 +110,16 @@ pub fn server_capabilities() -> ServerCapabilities {
             prepare_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
+        // Phase 2: semantic-token highlighting (full document + range), with the
+        // provider's legend.
+        semantic_tokens_provider: Some(
+            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                legend: crate::lsp::providers::semantic_tokens::legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: Some(true),
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            }),
+        ),
         ..ServerCapabilities::default()
     }
 }
@@ -289,6 +299,33 @@ impl LanguageServer for Backend {
             model,
             params.range,
         )))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let tokens = crate::lsp::providers::semantic_tokens::semantic_tokens_full(model);
+        Ok(Some(SemanticTokensResult::Tokens(tokens)))
+    }
+
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensRangeResult>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let tokens = crate::lsp::providers::semantic_tokens::semantic_tokens_range(model, range);
+        Ok(Some(SemanticTokensRangeResult::Tokens(tokens)))
     }
 
     async fn code_action(
@@ -638,6 +675,15 @@ mod tests {
             ),
             "expected a definition provider, got {:?}",
             caps.definition_provider
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_semantic_tokens() {
+        let caps = server_capabilities();
+        assert!(
+            caps.semantic_tokens_provider.is_some(),
+            "expected a semantic-tokens provider"
         );
     }
 
