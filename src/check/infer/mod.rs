@@ -27,3 +27,22 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, src: &str) -> Vec<As
     let table = table::Table::build(tree, resolved);
     pass::run(tree, resolved, src, &table)
 }
+
+/// The inferred/declared type (rendered `CheckTy`) of the name use whose byte span
+/// contains `byte_offset`, if any. Runs the CST front-end + the SP10 inference pass
+/// in hover-collection mode (NO interpreter). Used by the LSP hover hook.
+///
+/// When several recorded spans contain the offset, the NARROWEST (innermost) wins,
+/// so a precise reference is preferred over an enclosing one.
+pub fn hover_type_at(src: &str, byte_offset: usize) -> Option<String> {
+    use crate::syntax::{resolve, tree_builder};
+    let tree = tree_builder::build_tree(crate::syntax::parser::parse(src));
+    let resolved = resolve::resolve(&tree);
+    let table = table::Table::build(&tree, &resolved);
+    let hovers = pass::collect_hover_types(&tree, &resolved, src, &table);
+    hovers
+        .into_iter()
+        .filter(|h| byte_offset >= h.range.start && byte_offset < h.range.end)
+        .min_by_key(|h| h.range.end - h.range.start)
+        .map(|h| h.ty)
+}

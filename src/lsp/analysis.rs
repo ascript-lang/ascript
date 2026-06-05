@@ -113,6 +113,15 @@ fn byte_to_char(src: &str, byte: usize) -> usize {
     src[..b].chars().count()
 }
 
+/// Convert a CHAR offset to a BYTE offset into `src` (the legacy lexer's spans are
+/// char-based; the CST front-end the SP10 hover types use is byte-based).
+fn char_to_byte(src: &str, char_off: usize) -> usize {
+    src.char_indices()
+        .nth(char_off)
+        .map(|(b, _)| b)
+        .unwrap_or(src.len())
+}
+
 /// Convert a char-offset `Span` into an LSP `Range` via the `LineIndex`.
 fn span_range(span: Span, index: &LineIndex) -> Range {
     Range {
@@ -344,7 +353,20 @@ pub fn hover(text: &str, offset: usize) -> Option<Hover> {
     let range = span_range(token.span, &index);
 
     let doc = match &token.tok {
-        Tok::Ident(name) => ident_doc(name, text),
+        Tok::Ident(name) => {
+            // Append the SP10 inferred/declared type when the identifier resolves to
+            // a binding with a known `CheckTy` (a `let n: number`, an inferred
+            // `let y = id(1)`, …). Falls back to the keyword/builtin/decl doc.
+            let byte = char_to_byte(text, token.span.start);
+            let ty = crate::check::infer::hover_type_at(text, byte);
+            let base = ident_doc(name, text);
+            match (base, ty) {
+                (Some(b), Some(t)) => Some(format!("{b}\n\n*type:* `{t}`")),
+                (Some(b), None) => Some(b),
+                (None, Some(t)) => Some(format!("`{name}`\n\n*type:* `{t}`")),
+                (None, None) => None,
+            }
+        }
         other => keyword_doc(other).map(str::to_string),
     }?;
 
@@ -1296,6 +1318,45 @@ export fn bar() {}
     fn hover_on_unknown_ident_is_none() {
         let src = "zzz";
         assert!(hover(src, 0).is_none());
+    }
+
+    // ---- SP10 hover types ----
+
+    #[test]
+    fn hover_shows_annotated_type() {
+        // hovering the USE of `n` in `print(n)` shows `number`.
+        let src = "let n: number = 1\nprint(n)\n";
+        let off = src.rfind('n').unwrap(); // the use in print(n)
+        let h = hover(src, off).expect("hover on n");
+        assert!(markup(&h).contains("number"), "got: {}", markup(&h));
+    }
+
+    #[test]
+    fn hover_shows_inferred_return_type() {
+        // hovering `y` (= id(1), id returns number) shows `number`.
+        let src = "fn id(x: number) { return x }\nlet y = id(1)\nprint(y)\n";
+        let off = src.rfind('y').unwrap();
+        let h = hover(src, off).expect("hover on y");
+        assert!(markup(&h).contains("number"), "got: {}", markup(&h));
+    }
+
+    #[test]
+    fn hover_shows_any_for_unannotated() {
+        let src = "fn g(p) { return p }\n";
+        let off = src.rfind('p').unwrap(); // the use in `return p`
+        let h = hover(src, off).expect("hover on p");
+        assert!(markup(&h).contains("any"), "got: {}", markup(&h));
+    }
+
+    #[test]
+    fn hover_type_at_helper_direct() {
+        // direct unit of the infer helper: an annotated optional renders `number?`.
+        let src = "fn f(x: number?) { return x }\n";
+        let off = src.rfind('x').unwrap();
+        assert_eq!(
+            crate::check::infer::hover_type_at(src, off).as_deref(),
+            Some("number?")
+        );
     }
 
     // ---- completions ----

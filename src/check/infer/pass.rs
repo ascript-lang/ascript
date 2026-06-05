@@ -26,6 +26,27 @@ use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::ResolveResult;
 use std::collections::HashMap;
 
+/// A collected hover type: the byte span of a name use and its rendered `CheckTy`.
+pub struct HoverType {
+    pub range: ByteSpan,
+    pub ty: String,
+}
+
+/// Drive the inference pass purely to COLLECT hover types (no diagnostics emitted):
+/// every `NameRef` use's synthesized/declared type, rendered via `CheckTy::display`.
+/// Used by the LSP hover hook (no interpreter).
+pub fn collect_hover_types(
+    tree: &ResolvedNode,
+    resolved: &ResolveResult,
+    src: &str,
+    table: &Table,
+) -> Vec<HoverType> {
+    let mut pass = Pass::new(resolved, src, table);
+    pass.hover = Some(Vec::new());
+    pass.run(tree);
+    pass.hover.take().unwrap_or_default()
+}
+
 /// Drive the inference pass over the whole file.
 pub fn run(
     tree: &ResolvedNode,
@@ -58,6 +79,9 @@ struct Pass<'a> {
     /// When > 0, `emit` is suppressed (we're synthesizing inside return inference,
     /// not the real diagnosing walk — the real walk reports those nodes).
     suppress_emit: u32,
+    /// When `Some`, every `NameRef` synth records its (range, displayed type) here
+    /// (the LSP hover collection mode). `None` for the normal diagnosing pass.
+    hover: Option<Vec<HoverType>>,
 }
 
 impl<'a> Pass<'a> {
@@ -71,6 +95,7 @@ impl<'a> Pass<'a> {
             expected_return: Vec::new(),
             inferring: std::collections::HashSet::new(),
             suppress_emit: 0,
+            hover: None,
         }
     }
 
@@ -608,7 +633,20 @@ impl<'a> Pass<'a> {
         let Some(key) = self.key_for_use(&expr.text_range()) else {
             return CheckTy::Any;
         };
-        env.lookup(&key).unwrap_or(CheckTy::Any)
+        let looked_up = env.lookup(&key);
+        let ty = looked_up.clone().unwrap_or(CheckTy::Any);
+        // Record a hover type ONLY for a name that resolves to a TRACKED binding (so a
+        // bare undefined/builtin name yields no spurious `any` hover).
+        if self.hover.is_some() && looked_up.is_some() {
+            let display = ty.display(self.table);
+            if let Some(h) = self.hover.as_mut() {
+                h.push(HoverType {
+                    range: code_range(expr),
+                    ty: display,
+                });
+            }
+        }
+        ty
     }
 
     fn synth_binary(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {
