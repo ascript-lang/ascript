@@ -1521,6 +1521,20 @@ impl Interp {
         }))
     }
 
+    /// Mint a `Value::Native` handle carrying only plain readable `fields` and NO
+    /// backing OS resource (no `resources` table entry). Used by SP11 std/ai's
+    /// provider/model/tool handles, which are pure config data — there is nothing to
+    /// reclaim on drop, so they need no `ResourceState`. The id is still unique.
+    #[cfg(feature = "ai")]
+    pub(crate) fn make_native_data(
+        &self,
+        kind: crate::value::NativeKind,
+        fields: indexmap::IndexMap<String, Value>,
+    ) -> Value {
+        let id = self.next_id();
+        Value::Native(std::rc::Rc::new(crate::value::NativeObject { id, kind, fields }))
+    }
+
     /// Remove and return the resource for `id` (used by `close`/`kill`/EOF, and to
     /// own a resource across an `.await` without holding the table borrow — pair
     /// with `return_resource`). Used unconditionally by std/time timers, plus the
@@ -3070,6 +3084,13 @@ impl Interp {
         {
             if matches!(m.receiver.kind, crate::value::NativeKind::Terminal) {
                 return self.call_terminal_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "ai")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(m.receiver.kind, AiProvider | AiModel | AiStream | AiTextStream | AiTool) {
+                return crate::stdlib::ai::call_method(self, &m, args, span).await;
             }
         }
         {

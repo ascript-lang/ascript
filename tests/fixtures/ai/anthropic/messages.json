@@ -1,0 +1,9 @@
+{
+  "id": "msg_test",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-4-5",
+  "content": [ { "type": "text", "text": "CAP: consistency, availability, partition tolerance — pick two." } ],
+  "stop_reason": "end_turn",
+  "usage": { "input_tokens": 14, "output_tokens": 16 }
+}

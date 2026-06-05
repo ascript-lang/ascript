@@ -78,7 +78,7 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp"],
 # SP11 std/ai: multi-provider LLM client. Wraps the genai crate (OpenAI +
 # OpenAI-compat swarm + native Anthropic/Gemini + Bedrock SigV4 + Vertex). Optional,
 # off-by-default `ai` feature (network + heavy provider deps → opt-in like telemetry).
-genai = { version = "0.6", optional = true }
+genai = { version = "0.6", optional = true, features = ["bedrock-sigv4"] }
 
 [build-dependencies]
 cc = "1"

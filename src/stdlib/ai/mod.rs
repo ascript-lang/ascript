@@ -41,6 +41,12 @@ mod tools;
 pub mod json_schema;
 
 pub use request::AiClient;
+/// Test-only fixture-replay seam: see [`request::set_test_endpoint`]. Re-exported
+/// publicly so the integration tests (which can only see the crate's public API) can
+/// point the genai client at a loopback mock server. Production never calls it.
+pub use request::set_test_endpoint;
+
+use genai::chat::ChatOptions;
 
 /// The `(name, Value)` bindings `import * as ai from "std/ai"` brings in.
 pub fn exports() -> Vec<(&'static str, Value)> {
@@ -59,16 +65,135 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 pub(crate) async fn dispatch(
     interp: &Interp,
     func: &str,
-    _args: &[Value],
+    args: &[Value],
     span: Span,
 ) -> Result<Value, Control> {
-    // Touch the per-Interp AI client state so the genai `Client` is materialized
-    // lazily on first use (Phases B–F populate the cache here before any await).
-    interp.ai_state().ensure_initialized();
     match func {
-        "provider" | "generate" | "stream" | "embed" | "embedMany" | "tool" => {
+        "provider" => request::make_provider(interp, args, span),
+        "generate" => generate(interp, args, span).await,
+        "stream" | "embed" | "embedMany" | "tool" => {
             Err(AsError::at(format!("std/ai: '{}' is not yet implemented", func), span).into())
         }
         other => Err(AsError::at(format!("std/ai has no function '{}'", other), span).into()),
     }
+}
+
+/// Dispatch a method call on an `ai*` native handle (provider/model/stream/tool).
+/// Phase B handles `provider.model(id)`; later phases add stream/tool methods.
+pub(crate) async fn call_method(
+    interp: &Interp,
+    m: &crate::value::NativeMethod,
+    args: Vec<Value>,
+    span: Span,
+) -> Result<Value, Control> {
+    use crate::value::NativeKind;
+    match m.receiver.kind {
+        NativeKind::AiProvider => match m.method.as_str() {
+            "model" => {
+                let id = match args.first() {
+                    Some(Value::Str(s)) => s.to_string(),
+                    _ => {
+                        return Err(AsError::at(
+                            "provider.model(id): 'id' must be a string",
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                Ok(request::make_model_from_provider(interp, &m.receiver, &id))
+            }
+            other => Err(AsError::at(
+                format!("ai provider has no method '{}'", other),
+                span,
+            )
+            .into()),
+        },
+        NativeKind::AiStream | NativeKind::AiTextStream => {
+            stream::call_stream_method(interp, m, args, span).await
+        }
+        other => Err(AsError::at(
+            format!("ai {} has no callable method", other.type_name()),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// `ai.generate(opts)` — non-streaming text generation → Tier-1 `[out, err]`.
+///
+/// `opts` must be an object with a `model` plus a `prompt` or `messages`. Builds the
+/// genai request, clones the genai `Client` OUT of `Interp.ai` BEFORE the await
+/// (take-out-across-await — no `RefCell` borrow across the genai future), runs
+/// `exec_chat`, and maps the result (or a missing-credential / provider error) into
+/// a single Tier-1 pair.
+async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
+    let opts = match args.first() {
+        Some(v @ Value::Object(_)) | Some(v @ Value::Instance(_)) => v.clone(),
+        _ => {
+            return Err(AsError::at(
+                "ai.generate(opts): expected an options object with a 'model'",
+                span,
+            )
+            .into())
+        }
+    };
+    let model_arg = request::get_field(&opts, "model");
+    if matches!(model_arg, Value::Nil) {
+        return Err(AsError::at("ai.generate: 'model' is required", span).into());
+    }
+    let resolved = request::resolve_model(&model_arg, span)?;
+
+    // Missing credential → Tier-1 `[nil, err]` (expected operational failure).
+    if let Some(err) = request::credential_missing_error(&resolved) {
+        return Ok(crate::interp::make_pair(Value::Nil, err));
+    }
+
+    let chat_req = request::build_chat_request(&opts, span)?;
+    let gen_opts = request::parse_gen_opts(&opts);
+    let chat_options = build_chat_options(&gen_opts);
+
+    // Take the genai client OUT (clone the Arc-backed handle) before the await.
+    let client = interp.ai_state().client();
+    let spec = resolved.to_service_target_or_iden();
+
+    let result = match spec {
+        request::ServiceTargetOrIden::Target(t) => {
+            client.exec_chat(t, chat_req, Some(&chat_options)).await
+        }
+        request::ServiceTargetOrIden::Iden(iden) => {
+            client.exec_chat(iden, chat_req, Some(&chat_options)).await
+        }
+    };
+
+    match result {
+        Ok(resp) => {
+            let neutral = response::neutral_from_genai(resp);
+            let out = response::out_object(&neutral, Vec::new());
+            Ok(crate::interp::make_pair(out, Value::Nil))
+        }
+        Err(e) => Ok(crate::interp::make_pair(
+            Value::Nil,
+            response::error_to_value(&e),
+        )),
+    }
+}
+
+/// Build genai `ChatOptions` from the parsed [`request::GenOpts`]. Always captures
+/// usage + the raw body (the `out.raw` escape hatch) + tool calls.
+fn build_chat_options(g: &request::GenOpts) -> ChatOptions {
+    let mut o = ChatOptions::default()
+        .with_capture_usage(true)
+        .with_capture_content(true)
+        .with_capture_tool_calls(true)
+        .with_capture_raw_body(true);
+    if let Some(mt) = g.max_tokens {
+        o = o.with_max_tokens(mt);
+    }
+    if let Some(t) = g.temperature {
+        o = o.with_temperature(t);
+    }
+    if let Some(p) = g.top_p {
+        o = o.with_top_p(p);
+    }
+    o
 }
