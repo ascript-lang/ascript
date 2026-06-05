@@ -43,6 +43,36 @@ vim.filetype.add({ extension = { as = "ascript" } })
 require("lspconfig").ascript.setup({})
 ```
 
+## Formatting
+
+The **recommended** path is LSP formatting, which works out of the box once the server is
+attached:
+
+```lua
+:lua vim.lsp.buf.format()
+```
+
+or enable format-on-save:
+
+```lua
+require("ascript").setup({ format_on_save = true })
+```
+
+### conform.nvim (optional)
+
+> **Note on `ascript fmt`:** the CLI formats files **in place** and has **no stdin mode**
+> (`ascript fmt -` is not supported and errors out). The conform recipe below therefore uses
+> conform's **tempfile** strategy (`stdin = false`, `$FILENAME`): conform writes the buffer to a
+> temp file, runs `ascript fmt` on it (which rewrites it in place), and reads the result back.
+> Do **not** configure a `stdin = true` / `ascript fmt -` recipe — it will silently fail.
+
+```lua
+require("conform").setup({
+  formatters = { ascript_fmt = require("ascript.format").conform_formatter },
+  formatters_by_ft = { ascript = { "ascript_fmt" } },
+})
+```
+
 ## Upstreaming
 
 The `ascript` server definition is also submitted upstream to

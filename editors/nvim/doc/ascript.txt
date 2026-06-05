@@ -39,4 +39,8 @@ conform.nvim:
     })
 <
 
+Note: `ascript fmt` formats files in place and has no stdin mode, so the
+conform recipe uses the tempfile strategy (`stdin = false`). Do not configure
+an `ascript fmt -` / `stdin = true` recipe — it will fail.
+
  vim:tw=78:ts=8:ft=help:norl:
