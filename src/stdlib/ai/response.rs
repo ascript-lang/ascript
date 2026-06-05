@@ -168,6 +168,19 @@ fn describe_error(err: &genai::Error) -> (String, Option<u16>) {
             format!("HTTP {} from provider: {}", status.as_u16(), short_body(body)),
             Some(status.as_u16()),
         ),
+        // A streaming HTTP failure: genai boxes the underlying `HttpError` inside
+        // `WebStream { error: BoxError }`. Downcast to recover the status/body.
+        genai::Error::WebStream { cause, error, .. } => {
+            if let Some(genai::Error::HttpError { status, body, .. }) =
+                error.downcast_ref::<genai::Error>()
+            {
+                return (
+                    format!("HTTP {} from provider: {}", status.as_u16(), short_body(body)),
+                    Some(status.as_u16()),
+                );
+            }
+            (cause.clone(), None)
+        }
         other => (other.to_string(), None),
     }
 }

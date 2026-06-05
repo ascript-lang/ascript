@@ -41,6 +41,7 @@ mod tools;
 pub mod json_schema;
 
 pub use request::AiClient;
+pub use stream::AiStreamState;
 /// Test-only fixture-replay seam: see [`request::set_test_endpoint`]. Re-exported
 /// publicly so the integration tests (which can only see the crate's public API) can
 /// point the genai client at a loopback mock server. Production never calls it.
@@ -71,7 +72,8 @@ pub(crate) async fn dispatch(
     match func {
         "provider" => request::make_provider(interp, args, span),
         "generate" => generate(interp, args, span).await,
-        "stream" | "embed" | "embedMany" | "tool" => {
+        "stream" => stream::stream(interp, args, span).await,
+        "embed" | "embedMany" | "tool" => {
             Err(AsError::at(format!("std/ai: '{}' is not yet implemented", func), span).into())
         }
         other => Err(AsError::at(format!("std/ai has no function '{}'", other), span).into()),
@@ -180,7 +182,7 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
 
 /// Build genai `ChatOptions` from the parsed [`request::GenOpts`]. Always captures
 /// usage + the raw body (the `out.raw` escape hatch) + tool calls.
-fn build_chat_options(g: &request::GenOpts) -> ChatOptions {
+pub(crate) fn build_chat_options(g: &request::GenOpts) -> ChatOptions {
     let mut o = ChatOptions::default()
         .with_capture_usage(true)
         .with_capture_content(true)

@@ -321,6 +321,13 @@ pub(crate) enum ResourceState {
     // export, then the resource is removed. Boxed to keep the enum compact.
     #[cfg(feature = "telemetry")]
     TelemetrySpan(Box<crate::stdlib::telemetry::model::OpenSpan>),
+    // SP11 std/ai: a live streaming chat (`ai.stream`). Holds the genai
+    // `ChatStream` (a `Stream` of events) plus the running terminal aggregate
+    // (`stream.result()`). `next()`/`textOnly()` poll one event per call via the
+    // take-out-across-await pattern; `result()` returns the aggregate. Boxed to keep
+    // the `ResourceState` enum compact. Feature `ai`.
+    #[cfg(feature = "ai")]
+    AiStream(Box<crate::stdlib::ai::AiStreamState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -4531,15 +4538,20 @@ pub(crate) fn native_stream_method(kind: crate::value::NativeKind) -> Option<&'s
     {
         use crate::value::NativeKind::*;
         match kind {
-            WsConnection => Some("recv"),
-            SseStream => Some("next"),
-            _ => None,
+            WsConnection => return Some("recv"),
+            SseStream => return Some("next"),
+            _ => {}
         }
     }
-    #[cfg(not(feature = "net"))]
+    #[cfg(feature = "ai")]
     {
-        None
+        use crate::value::NativeKind::*;
+        if matches!(kind, AiStream | AiTextStream) {
+            return Some("next");
+        }
     }
+    let _ = kind;
+    None
 }
 
 /// Human-readable type name for diagnostics.

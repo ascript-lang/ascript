@@ -290,3 +290,63 @@ fn generate_missing_credential_is_tier1() {
     let out = out.expect("missing credential is Tier-1, not a panic");
     assert_eq!(out, "no credential for provider 'openai'\n");
 }
+
+// ===========================================================================
+// Phase C — streaming (generators + for await).
+// ===========================================================================
+
+#[test]
+fn stream_openai_typed_chunks_and_result() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        let [s, err] = await ai.stream({ model: "openai:gpt-4.1", prompt: "Explain backpressure." })
+        if (err != nil) { print("ERR " + err.message); return }
+        let acc = ""
+        for await (chunk in s) {
+            if (chunk.type == "text") { acc = acc + chunk.text }
+            if (chunk.type == "finish") { print("FINISH " + chunk.finishReason) }
+        }
+        print(acc)
+        let final = s.result()
+        print(final.text)
+        print(final.usage.totalTokens)
+        "#,
+        vec![ai_mock::Fixture::sse(&fixture("openai/stream.sse"))],
+    );
+    assert_eq!(out, "FINISH stop\nBackpressure flows.\nBackpressure flows.\n6\n");
+}
+
+#[test]
+fn stream_openai_text_only() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        let [s, err] = await ai.stream({ model: "openai:gpt-4.1", prompt: "go" })
+        if (err != nil) { print("ERR " + err.message); return }
+        for await (piece in s.textOnly()) {
+            print(piece)
+        }
+        "#,
+        vec![ai_mock::Fixture::sse(&fixture("openai/stream.sse"))],
+    );
+    assert_eq!(out, "Back\npressure\n flows.\n");
+}
+
+#[test]
+fn stream_connection_error_is_tier1_on_next() {
+    // genai sends the streaming request lazily, so a provider 5xx surfaces on the
+    // first `next()` poll as a Tier-1 `[nil, err]` (not on the ai.stream open).
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        let [s, err] = await ai.stream({ model: "openai:gpt-4.1", prompt: "boom" })
+        if (err != nil) { print("open status=" + type(err.status)); return }
+        let [chunk, e2] = await s.next()
+        if (e2 != nil) { print("next status=" + type(e2.status)); return }
+        print("unexpected ok")
+        "#,
+        vec![ai_mock::Fixture::json_status(500, r#"{"error":{"message":"server error"}}"#)],
+    );
+    assert_eq!(out, "next status=number\n");
+}
