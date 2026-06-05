@@ -28,9 +28,7 @@ pub fn document_symbols(model: &SemanticModel) -> Vec<DocumentSymbol> {
         } else {
             child
         };
-        if let Some(sym) = symbol_for(model, decl) {
-            out.push(sym);
-        }
+        symbols_for(model, decl, &mut out);
     }
     out
 }
@@ -56,18 +54,32 @@ fn name_range(model: &SemanticModel, node: &ResolvedNode) -> Range {
     crate::lsp::convert::byte_span_to_range(&model.text, &model.line_index, ByteSpan::from(tr))
 }
 
-/// Build a top-level symbol for a declaration node, or `None` if it binds nothing.
+/// Append the top-level symbol(s) a declaration node introduces. A `let`/`const`
+/// that destructures (`let [a, b] = …` / `let {x, y} = …`) emits ONE symbol per
+/// bound name; every other declaration emits at most one.
 #[allow(deprecated)]
-fn symbol_for(model: &SemanticModel, node: &ResolvedNode) -> Option<DocumentSymbol> {
+fn symbols_for(model: &SemanticModel, node: &ResolvedNode, out: &mut Vec<DocumentSymbol>) {
+    // Destructuring let/const: one VARIABLE/CONSTANT per bound name.
+    if node.kind() == SyntaxKind::LetStmt {
+        if let Some(pat) = node.children().find(|c| {
+            matches!(c.kind(), SyntaxKind::ArrayBindPat | SyntaxKind::ObjectBindPat)
+        }) {
+            let kind = let_kind(node);
+            push_pattern_symbols(model, &pat, kind, out);
+            return;
+        }
+    }
     let (kind, children) = match node.kind() {
         SyntaxKind::FnDecl => (SymbolKind::FUNCTION, None),
         SyntaxKind::ClassDecl => (SymbolKind::CLASS, Some(class_children(model, node))),
         SyntaxKind::EnumDecl => (SymbolKind::ENUM, Some(enum_children(model, node))),
         SyntaxKind::LetStmt => (let_kind(node), None),
-        _ => return None,
+        _ => return,
     };
-    let name = crate::syntax::resolve::ident_text(node)?;
-    Some(DocumentSymbol {
+    let Some(name) = crate::syntax::resolve::ident_text(node) else {
+        return;
+    };
+    out.push(DocumentSymbol {
         name,
         detail: None,
         kind,
@@ -76,7 +88,61 @@ fn symbol_for(model: &SemanticModel, node: &ResolvedNode) -> Option<DocumentSymb
         range: full_range(model, node),
         selection_range: name_range(model, node),
         children,
-    })
+    });
+}
+
+/// Emit one symbol per name bound by an `ArrayBindPat`/`ObjectBindPat`: each
+/// `BindEntry`'s LOCAL name (the last `Ident` — `key as local`) and a `RestBind`'s
+/// name. Mirrors the resolver's `declare_pattern_names`. The selection range is the
+/// bound NAME token; the full range is the entry node.
+#[allow(deprecated)]
+fn push_pattern_symbols(
+    model: &SemanticModel,
+    pat: &ResolvedNode,
+    kind: SymbolKind,
+    out: &mut Vec<DocumentSymbol>,
+) {
+    for entry in pat.children() {
+        let (name_tok, full) = match entry.kind() {
+            SyntaxKind::BindEntry => {
+                // `key` or `key as local` — the LAST IDENT is the local name.
+                let tok = entry
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token().cloned())
+                    .filter(|t| t.kind() == SyntaxKind::Ident)
+                    .last();
+                (tok, entry.text_range())
+            }
+            SyntaxKind::RestBind => {
+                let tok = entry
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token().cloned())
+                    .find(|t| t.kind() == SyntaxKind::Ident);
+                (tok, entry.text_range())
+            }
+            _ => continue,
+        };
+        let Some(tok) = name_tok else { continue };
+        let selection = crate::lsp::convert::byte_span_to_range(
+            &model.text,
+            &model.line_index,
+            ByteSpan::from(tok.text_range()),
+        );
+        out.push(DocumentSymbol {
+            name: tok.text().to_string(),
+            detail: None,
+            kind,
+            tags: None,
+            deprecated: None,
+            range: crate::lsp::convert::byte_span_to_range(
+                &model.text,
+                &model.line_index,
+                ByteSpan::from(full),
+            ),
+            selection_range: selection,
+            children: None,
+        });
+    }
 }
 
 /// `VARIABLE` for a `let`, `CONSTANT` for a `const` (detected by a `ConstKw`
@@ -163,6 +229,28 @@ mod tests {
         assert!(names.contains(&"C"), "{names:?}");
         assert!(names.contains(&"E"), "{names:?}");
         assert!(names.contains(&"v"), "{names:?}");
+    }
+
+    #[test]
+    fn destructuring_lists_each_name() {
+        // Array + object destructuring must emit one symbol per bound name (the
+        // first-Ident-only path produced ZERO symbols before the fix).
+        let arr = document_symbols(&model("let [a, b] = pair\n"));
+        let anames: Vec<&str> = arr.iter().map(|s| s.name.as_str()).collect();
+        assert!(anames.contains(&"a"), "{anames:?}");
+        assert!(anames.contains(&"b"), "{anames:?}");
+        assert!(arr.iter().all(|s| s.kind == SymbolKind::VARIABLE));
+
+        let obj = document_symbols(&model("let {x, y} = obj\n"));
+        let onames: Vec<&str> = obj.iter().map(|s| s.name.as_str()).collect();
+        assert!(onames.contains(&"x"), "{onames:?}");
+        assert!(onames.contains(&"y"), "{onames:?}");
+
+        // A `const` destructure yields CONSTANT symbols.
+        let c = document_symbols(&model("const [m, n] = pair\n"));
+        assert!(c.iter().all(|s| s.kind == SymbolKind::CONSTANT), "{c:?}");
+        let cnames: Vec<&str> = c.iter().map(|s| s.name.as_str()).collect();
+        assert!(cnames.contains(&"m") && cnames.contains(&"n"), "{cnames:?}");
     }
 
     #[test]
