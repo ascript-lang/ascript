@@ -254,6 +254,45 @@ let [text, err] = yaml.stringify({ x: 1 })
 // err  == nil
 ```
 
+## std/msgpack
+
+MessagePack binary serialization (compact, schemaless). Provided by the `binary`
+Cargo feature (default-on). Two functions:
+
+- `msgpack.encode(value) -> bytes` — serialize any data value to MessagePack bytes.
+  This is a total data mapping; it is a Tier-2 panic only on a genuinely
+  unrepresentable handle (a function/native handle, etc.), never on data.
+- `msgpack.decode(bytes) -> [value, err]` — Tier-1; malformed input → err channel.
+- `msgpack.decode(bytes, Class|schema) -> [value, err]` — typed decode, fusing a
+  decode failure and a shape mismatch into one pair (like `json.parse(text, Class)`).
+
+The value mapping: numbers (integer-valued in range → integer, else float),
+strings, bools, nil, **bytes → binary**, arrays, and maps. A decoded map becomes
+an `Object` if every key is a string, otherwise a `Map`.
+
+```ascript
+import * as msgpack from "std/msgpack"
+let bytes = msgpack.encode({ name: "Ada", nums: [1, 2, 3], ok: true })
+let [val, err] = msgpack.decode(bytes)
+// val.name == "Ada"; val.nums[1] == 2; err == nil
+```
+
+## std/cbor
+
+CBOR (RFC 8949) binary serialization. Same `binary` feature, same API and value
+mapping as `std/msgpack`:
+
+- `cbor.encode(value) -> bytes`
+- `cbor.decode(bytes) -> [value, err]`
+- `cbor.decode(bytes, Class|schema) -> [value, err]`
+
+```ascript
+import * as cbor from "std/cbor"
+class Point { x: number  y: number }
+let [pt, err] = cbor.decode(cbor.encode({ x: 3, y: 4 }), Point)
+// pt.x == 3; pt.y == 4; err == nil
+```
+
 ## std/encoding
 
 Binary and text encoding helpers: base64, hex, URL percent-encoding, and UTF-8 conversion between strings and byte arrays. The `*Encode` functions return a value directly (no error pair); the `*Decode` functions are fallible and return a `[value, err]` pair. Functions that consume raw bytes accept either a `bytes` value or a string (encoded as UTF-8).

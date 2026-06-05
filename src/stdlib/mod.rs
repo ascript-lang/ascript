@@ -8,6 +8,8 @@ pub mod array;
 pub mod assert_mod;
 pub mod bench;
 pub mod bytes;
+#[cfg(feature = "binary")]
+pub mod cbor;
 pub mod cli;
 pub mod color;
 #[cfg(feature = "compress")]
@@ -38,6 +40,8 @@ pub mod json;
 pub mod log;
 pub mod map;
 pub mod math;
+#[cfg(feature = "binary")]
+pub mod msgpack;
 #[cfg(feature = "net")]
 pub mod net_host;
 #[cfg(feature = "net")]
@@ -159,6 +163,10 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/toml" => toml::exports(),
         #[cfg(feature = "data")]
         "std/yaml" => yaml::exports(),
+        #[cfg(feature = "binary")]
+        "std/msgpack" => msgpack::exports(),
+        #[cfg(feature = "binary")]
+        "std/cbor" => cbor::exports(),
         #[cfg(feature = "tui")]
         "std/tui" => tui::exports(),
         _ => return None,
@@ -218,6 +226,8 @@ pub const STD_MODULES: &[&str] = &[
     "std/csv",
     "std/toml",
     "std/yaml",
+    "std/msgpack",
+    "std/cbor",
     "std/tui",
 ];
 
@@ -275,6 +285,24 @@ impl Interp {
                     };
                     let type_arg = type_arg.clone();
                     return self.typed_decode(parsed, &type_arg, strict, "", span).await;
+                }
+            }
+        }
+        // Typed decode for the binary formats (msgpack/cbor): a 2nd Class|schema
+        // arg validates the decoded value, reusing the shared typed_decode helper.
+        #[cfg(feature = "binary")]
+        if func == "decode" && matches!(module, "msgpack" | "cbor") {
+            if let Some(type_arg) = args.get(1) {
+                let is_class = matches!(type_arg, Value::Class(_));
+                let is_schema = schema::schema_kind(type_arg).is_some();
+                if is_class || is_schema {
+                    let parsed = match module {
+                        "msgpack" => msgpack::call(func, &args[..1], span)?,
+                        "cbor" => cbor::call(func, &args[..1], span)?,
+                        _ => unreachable!(),
+                    };
+                    let type_arg = type_arg.clone();
+                    return self.typed_decode(parsed, &type_arg, false, "", span).await;
                 }
             }
         }
@@ -375,6 +403,10 @@ impl Interp {
             "toml" => toml::call(func, args, span),
             #[cfg(feature = "data")]
             "yaml" => yaml::call(func, args, span),
+            #[cfg(feature = "binary")]
+            "msgpack" => msgpack::call(func, args, span),
+            #[cfg(feature = "binary")]
+            "cbor" => cbor::call(func, args, span),
             #[cfg(feature = "tui")]
             "tui" => self.call_tui(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),

@@ -1,0 +1,8 @@
+# exit: none
+msgpack encoded 32 bytes
+msgpack: Ada 2
+cbor encoded 31 bytes
+cbor: Ada 3
+typed: (3, 4)
+malformed cbor rejected: invalid CBOR: Syntax(0)
+binary_serialization: all assertions passed

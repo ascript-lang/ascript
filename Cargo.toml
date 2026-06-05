@@ -68,6 +68,8 @@ crossterm = { version = "0.28", optional = true }
 hostname = { version = "0.4", optional = true }
 tower-lsp = { version = "0.20", optional = true }
 sysinfo = { version = "0.31", optional = true }
+rmpv = { version = "1", optional = true }
+ciborium = { version = "0.2", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -77,8 +79,12 @@ ungrammar = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:serde_yaml", "dep:percent-encoding", "dep:url"]
+# SP5 §4: std/msgpack + std/cbor binary serialization via the rmpv / ciborium
+# dynamic-value models (no serde derive — bridged by hand like json). Typed decode
+# reuses validate_into/parse_value, so it depends on `data`. Default-on.
+binary = ["dep:rmpv", "dep:ciborium", "data"]
 # std/log: leveled structured logging. Reuses json's total `to_json_lossy`
 # serializer (behind `data`), so it pulls in `data`. Default-on; cfg's out
 # cleanly under --no-default-features.
