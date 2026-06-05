@@ -88,6 +88,9 @@ pub fn server_capabilities() -> ServerCapabilities {
             ..CompletionOptions::default()
         }),
         definition_provider: Some(OneOf::Left(true)),
+        // Phase 3: declaration ≈ definition for AScript (no separate forward
+        // declaration concept).
+        declaration_provider: Some(DeclarationCapability::Simple(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
         code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
@@ -492,6 +495,40 @@ impl LanguageServer for Backend {
             uri,
             range,
         })))
+    }
+
+    async fn goto_declaration(
+        &self,
+        params: request::GotoDeclarationParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<request::GotoDeclarationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        // Cross-file via the workspace index first (mirrors `goto_definition`).
+        if let Some(path) = url_to_canon(&uri) {
+            let xfile = self.index.read().ok().and_then(|idx| {
+                idx.definition_at(&path, offset).map(|(def_path, span)| {
+                    let target_text = idx_text(&idx, &def_path).unwrap_or_default();
+                    (def_path, workspace::byte_span_to_range(&target_text, span))
+                })
+            });
+            if let Some((def_path, range)) = xfile {
+                if let Some(def_uri) = canon_to_url(&def_path) {
+                    return Ok(Some(request::GotoDeclarationResponse::Scalar(Location {
+                        uri: def_uri,
+                        range,
+                    })));
+                }
+            }
+        }
+        Ok(
+            crate::lsp::providers::navigation::declaration_in_file(model, offset)
+                .map(|range| request::GotoDeclarationResponse::Scalar(Location { uri, range })),
+        )
     }
 
     async fn references(

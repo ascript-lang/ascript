@@ -242,6 +242,29 @@ fn name_ref_at(model: &SemanticModel, offset: usize) -> Option<&ResolvedNode> {
     })
 }
 
+/// `textDocument/declaration` — for AScript this is identical to `definition`
+/// (no separate declaration concept). Resolves the name at `offset` to its decl
+/// range in this file. Cross-file declarations are served by the workspace index
+/// in the server handler (same path `definition` uses).
+pub fn declaration_in_file(model: &SemanticModel, offset: usize) -> Option<Range> {
+    definition_in_file(model, offset)
+}
+
+#[cfg(test)]
+mod declaration_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    #[test]
+    fn declaration_resolves_like_definition() {
+        let src = "fn f() {\n  let y = 1\n  return y\n}\n";
+        let model = SemanticModel::build(src.to_string(), None, &LintConfig::default());
+        let use_off = src.rfind('y').unwrap();
+        let r = declaration_in_file(&model, use_off).expect("decl");
+        assert_eq!(r.start.line, 1); // the `let y` line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
