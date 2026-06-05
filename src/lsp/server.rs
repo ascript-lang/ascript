@@ -1113,6 +1113,34 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_advertise_phase3_navigation() {
+        let caps = server_capabilities();
+        assert!(caps.declaration_provider.is_some());
+        assert!(caps.type_definition_provider.is_some());
+        assert!(caps.implementation_provider.is_some());
+        assert!(caps.folding_range_provider.is_some());
+        assert!(caps.selection_range_provider.is_some());
+        assert!(caps.document_link_provider.is_some());
+        assert!(caps.call_hierarchy_provider.is_some());
+        // `lsp-types` 0.94 has no `type_hierarchy_provider` field — it is advertised
+        // through `experimental.typeHierarchyProvider`.
+        assert_eq!(
+            caps.experimental
+                .as_ref()
+                .and_then(|e| e.get("typeHierarchyProvider")),
+            Some(&serde_json::Value::Bool(true)),
+        );
+        // workspaceSymbol advertises lazy resolve.
+        assert!(matches!(
+            caps.workspace_symbol_provider,
+            Some(OneOf::Right(WorkspaceSymbolOptions {
+                resolve_provider: Some(true),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
     fn capabilities_advertise_incremental_sync() {
         let caps = server_capabilities();
         match caps.text_document_sync {
