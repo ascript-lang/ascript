@@ -251,7 +251,7 @@ fn type_name_at(model: &SemanticModel, offset: usize) -> Option<String> {
                 SyntaxKind::NameRef | SyntaxKind::ClassDecl | SyntaxKind::EnumDecl
             )
     })?;
-    crate::syntax::resolve::ident_text(&node)
+    crate::syntax::resolve::ident_text(node)
 }
 
 /// The byte span of the name `Ident` of the `kind` decl named `name`.
