@@ -305,6 +305,124 @@ fn decl_name_range(model: &SemanticModel, name: &str) -> Option<Range> {
     ))
 }
 
+use crate::check::infer::table::Table;
+
+/// `textDocument/implementation` — when the cursor is on a class name, every
+/// subclass decl's name range; when on an enum name, every variant's name range.
+/// In-file only (subclasses across files are a documented follow-up). Returns an
+/// empty vec when the cursor is not on a class/enum name.
+pub fn implementations_in_file(model: &SemanticModel, offset: usize) -> Vec<Range> {
+    let Some(name) = name_at_offset(model, offset) else {
+        return Vec::new();
+    };
+    let table = Table::build(&model.tree, &model.resolved);
+    if let Some(class_id) = table.class_id(&name) {
+        // Every class whose ancestry includes this class (excluding itself).
+        let mut out = Vec::new();
+        for node in model
+            .tree
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::ClassDecl)
+        {
+            let Some(other) = crate::syntax::resolve::ident_text(node) else {
+                continue;
+            };
+            let Some(other_id) = table.class_id(&other) else {
+                continue;
+            };
+            if other_id != class_id && table.is_subclass(other_id, class_id) {
+                if let Some(r) = decl_name_range(model, &other) {
+                    out.push(r);
+                }
+            }
+        }
+        return out;
+    }
+    if table.enum_id(&name).is_some() {
+        // The cursor is an enum name: return each variant's name range.
+        return enum_variant_ranges(model, &name);
+    }
+    Vec::new()
+}
+
+/// The identifier text at `offset` (a `NameRef` token or a decl's name `Ident`).
+fn name_at_offset(model: &SemanticModel, offset: usize) -> Option<String> {
+    let node = model.tree.descendants().find(|n| {
+        let r = n.text_range();
+        let (s, e): (usize, usize) = (r.start().into(), r.end().into());
+        offset >= s
+            && offset < e
+            && matches!(
+                n.kind(),
+                SyntaxKind::NameRef | SyntaxKind::ClassDecl | SyntaxKind::EnumDecl
+            )
+    })?;
+    crate::syntax::resolve::ident_text(node)
+}
+
+/// Each variant's name range in the enum named `enum_name`.
+fn enum_variant_ranges(model: &SemanticModel, enum_name: &str) -> Vec<Range> {
+    let Some(decl) = model.tree.descendants().find(|n| {
+        n.kind() == SyntaxKind::EnumDecl
+            && crate::syntax::resolve::ident_text(n).as_deref() == Some(enum_name)
+    }) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for v in decl
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::EnumVariant)
+    {
+        if let Some(ident) = v
+            .children_with_tokens()
+            .filter_map(|el| el.into_token().cloned())
+            .find(|t| t.kind() == SyntaxKind::Ident)
+        {
+            out.push(crate::lsp::convert::byte_span_to_range(
+                &model.text,
+                &model.line_index,
+                ByteSpan::from(ident.text_range()),
+            ));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod impl_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    fn model(src: &str) -> SemanticModel {
+        SemanticModel::build(src.to_string(), None, &LintConfig::default())
+    }
+
+    #[test]
+    fn class_implementations_are_subclasses() {
+        let src = "class Animal {}\nclass Dog extends Animal {}\nclass Cat extends Animal {}\n";
+        let m = model(src);
+        let off = src.find("Animal").unwrap() + 1; // on the `Animal` class name
+        let impls = implementations_in_file(&m, off);
+        assert_eq!(impls.len(), 2, "Dog + Cat: {impls:?}");
+    }
+
+    #[test]
+    fn enum_implementations_are_variants() {
+        let src = "enum Color { Red, Green, Blue }\nprint(1)\n";
+        let m = model(src);
+        let off = src.find("Color").unwrap() + 1;
+        let impls = implementations_in_file(&m, off);
+        assert_eq!(impls.len(), 3, "{impls:?}");
+    }
+
+    #[test]
+    fn non_type_offset_yields_empty() {
+        let m = model("let x = 1\nprint(x)\n");
+        let off = m.text.rfind('x').unwrap();
+        assert!(implementations_in_file(&m, off).is_empty());
+    }
+}
+
 #[cfg(test)]
 mod type_def_tests {
     use super::*;

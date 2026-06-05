@@ -93,6 +93,8 @@ pub fn server_capabilities() -> ServerCapabilities {
         declaration_provider: Some(DeclarationCapability::Simple(true)),
         // Phase 3: jump to the inferred type's class/enum decl (in-file).
         type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+        // Phase 3: subclasses of a class / variants of an enum (in-file).
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
         code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
@@ -548,6 +550,31 @@ impl LanguageServer for Backend {
             crate::lsp::providers::navigation::type_definition_in_file(model, offset)
                 .map(|range| request::GotoTypeDefinitionResponse::Scalar(Location { uri, range })),
         )
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: request::GotoImplementationParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<request::GotoImplementationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        let locs: Vec<Location> =
+            crate::lsp::providers::navigation::implementations_in_file(model, offset)
+                .into_iter()
+                .map(|range| Location {
+                    uri: uri.clone(),
+                    range,
+                })
+                .collect();
+        if locs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(request::GotoImplementationResponse::Array(locs)))
     }
 
     async fn references(
