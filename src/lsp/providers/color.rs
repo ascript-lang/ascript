@@ -663,3 +663,54 @@ mod presentation_tests {
         assert_eq!(te.new_text, "0, 128, 255");
     }
 }
+
+#[cfg(test)]
+mod corpus_gate {
+    use super::*;
+    use crate::check::LintConfig;
+
+    /// Zero-false-positive gate (spec §7.2): over the WHOLE `examples/**` corpus
+    /// (which includes the `p.label == "#100"` case in `typed_fields.as`),
+    /// `document_colors` with default settings must NEVER produce a swatch landing
+    /// on a `"#..."` / `'#...'` label string — a string color is recognized only in
+    /// a registered color-sink, of which there are none today.
+    #[test]
+    fn corpus_no_false_positive_color_swatches() {
+        let mut roots = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")];
+        roots.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/advanced"));
+        let mut seen_hash_100 = false;
+        for dir in roots {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("as") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if src.contains("\"#100\"") {
+                    seen_hash_100 = true;
+                }
+                let model = SemanticModel::build(src.clone(), None, &LintConfig::default());
+                for c in document_colors(&model, false) {
+                    let span = range_to_byte_span(&model, c.range);
+                    let end = span.end.min(src.len());
+                    let text = &src[span.start.min(end)..end];
+                    assert!(
+                        !text.starts_with("\"#") && !text.starts_with("'#"),
+                        "false-positive color swatch on label {text:?} in {path:?}"
+                    );
+                }
+            }
+        }
+        // Guard the guard: the `#100` case is actually present in the corpus, so the
+        // assertion above is meaningfully exercising the spec false-positive case.
+        assert!(
+            seen_hash_100,
+            "expected the `\"#100\"` label case to be present in examples/**"
+        );
+    }
+}
