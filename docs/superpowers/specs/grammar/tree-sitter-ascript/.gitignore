@@ -5,3 +5,5 @@ build/
 package-lock.json
 # Rust binding build dir
 target/
+# Standalone grammar crate lock (a tree-sitter grammar is a library crate)
+Cargo.lock
