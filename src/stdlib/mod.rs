@@ -55,8 +55,12 @@ pub mod net_ws;
 pub mod object;
 #[cfg(feature = "sys")]
 pub mod os;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "sys")]
 pub mod process;
+#[cfg(feature = "redis")]
+pub mod redis;
 #[cfg(feature = "data")]
 pub mod regex;
 pub mod schema;
@@ -153,6 +157,10 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/regex" => regex::exports(),
         #[cfg(feature = "sql")]
         "std/sqlite" => sqlite::exports(),
+        #[cfg(feature = "postgres")]
+        "std/postgres" => postgres::exports(),
+        #[cfg(feature = "redis")]
+        "std/redis" => redis::exports(),
         #[cfg(feature = "data")]
         "std/url" => url::exports(),
         #[cfg(feature = "data")]
@@ -221,6 +229,8 @@ pub const STD_MODULES: &[&str] = &[
     "std/net/ws",
     "std/regex",
     "std/sqlite",
+    "std/postgres",
+    "std/redis",
     "std/url",
     "std/uuid",
     "std/csv",
@@ -393,6 +403,10 @@ impl Interp {
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "sql")]
             "sqlite" => self.call_sqlite_open(func, args, span),
+            #[cfg(feature = "postgres")]
+            "postgres" => self.call_postgres(func, args, span).await,
+            #[cfg(feature = "redis")]
+            "redis" => self.call_redis(func, args, span).await,
             #[cfg(feature = "data")]
             "url" => url::call(func, args, span),
             #[cfg(feature = "data")]

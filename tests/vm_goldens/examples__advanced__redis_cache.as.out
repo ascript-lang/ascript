@@ -1,0 +1,2 @@
+# exit: none
+redis_cache: ASCRIPT_TEST_REDIS_URL not set — skipping live demo (ok)

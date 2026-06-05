@@ -28,6 +28,7 @@ const NAV = [
     ['stdlib/collections', 'Core & collections'],
     ['stdlib/data', 'Data & serialization'],
     ['stdlib/system', 'System & files'],
+    ['stdlib/db', 'Databases (Postgres & Redis)'],
     ['stdlib/time', 'Time & locale'],
     ['stdlib/net', 'Networking & HTTP'],
     ['stdlib/log', 'Logging'],
