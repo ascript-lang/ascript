@@ -1,0 +1,7 @@
+# Node / node-gyp build artifacts (the committed src/parser.c is the source of truth)
+node_modules/
+build/
+*.node
+package-lock.json
+# Rust binding build dir
+target/

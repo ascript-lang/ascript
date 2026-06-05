@@ -1,0 +1,42 @@
+{
+  "name": "tree-sitter-ascript",
+  "version": "0.1.0",
+  "description": "AScript grammar for tree-sitter",
+  "repository": "https://github.com/mahmoud/ascript",
+  "license": "MIT",
+  "keywords": ["parser", "lexer", "tree-sitter", "ascript"],
+  "main": "bindings/node",
+  "types": "bindings/node",
+  "files": ["grammar.js", "binding.gyp", "bindings/node/*", "queries/*", "src/**"],
+  "dependencies": {
+    "node-addon-api": "^7.1.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "tree-sitter-cli": "^0.22.0"
+  },
+  "peerDependencies": {
+    "tree-sitter": "^0.21.0"
+  },
+  "peerDependenciesMeta": {
+    "tree-sitter": { "optional": true }
+  },
+  "scripts": {
+    "install": "node-gyp-build",
+    "generate": "tree-sitter generate --abi 14",
+    "parse": "tree-sitter parse",
+    "test": "tree-sitter parse examples/*.as"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.ascript",
+      "file-types": ["as"],
+      "highlights": "queries/highlights.scm",
+      "injections": "queries/injections.scm",
+      "locals": "queries/locals.scm",
+      "folds": "queries/folds.scm",
+      "indents": "queries/indents.scm",
+      "tags": "queries/tags.scm"
+    }
+  ]
+}
