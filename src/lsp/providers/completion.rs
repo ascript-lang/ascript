@@ -1,10 +1,16 @@
-//! `textDocument/completion` over the model.
+//! `textDocument/completion` (and `completionItem/resolve`) over the cached
+//! [`SemanticModel`].
 //!
-//! Phase 0 keeps completion's CURRENT behavior (baseline keywords + builtins,
-//! import-path string context, and namespace-member access) but reads from the
-//! cached [`SemanticModel`]'s text instead of re-lexing/parsing. The full,
-//! resolver-aware rewrite is Phase 1; the logic here is byte-identical to the
-//! legacy `analysis::completions`.
+//! Scope-aware completion driven by the resolver result rather than raw lexing:
+//! keywords + builtins, in-scope user bindings, member access on a class / enum /
+//! module namespace (offering its members or exports), import-path string context,
+//! curated control-flow snippets, and auto-import items that add the matching
+//! `import … from "std/…"` edit for a known stdlib export. `resolve_completion`
+//! lazily fills in detail/documentation for builtins and keywords.
+//!
+//! In-scope bindings are taken from the resolved set (de-duplicated by name); the
+//! list is not yet frame-precise, so a sibling-scope name may be over-offered — a
+//! documented Phase-2 refinement.
 
 use crate::lsp::model::SemanticModel;
 use crate::syntax::resolve::types::BindingKind;
