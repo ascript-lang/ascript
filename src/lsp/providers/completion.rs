@@ -8,7 +8,7 @@
 
 use crate::lsp::model::SemanticModel;
 use crate::syntax::resolve::types::BindingKind;
-use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind};
+use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat};
 
 /// The AScript keywords offered as completions (KEYWORD kind). Mirrors the lexer's
 /// keyword table plus `match`.
@@ -105,6 +105,29 @@ fn binding_completions(model: &SemanticModel) -> Vec<CompletionItem> {
     out
 }
 
+/// Curated control-flow snippets. Each is a SNIPPET-format item with `${n:…}`
+/// tab-stops and a `$0` final cursor.
+fn snippet_completions() -> Vec<CompletionItem> {
+    const SNIPPETS: &[(&str, &str)] = &[
+        ("fn", "fn ${1:name}(${2:params}) {\n  $0\n}"),
+        ("if", "if (${1:cond}) {\n  $0\n}"),
+        ("for", "for (${1:item} of ${2:iter}) {\n  $0\n}"),
+        ("while", "while (${1:cond}) {\n  $0\n}"),
+        ("match", "match ${1:subject} {\n  ${2:pattern} => $0,\n}"),
+        ("class", "class ${1:Name} {\n  $0\n}"),
+    ];
+    SNIPPETS
+        .iter()
+        .map(|(label, body)| CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::SNIPPET),
+            insert_text: Some(body.to_string()),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..CompletionItem::default()
+        })
+        .collect()
+}
+
 /// Completions at char `offset` in the model's text. Pure and robust: never panics,
 /// and always returns at least the baseline (keywords + builtins) even on partial or
 /// syntactically broken input (completion is requested mid-edit).
@@ -172,6 +195,7 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
 
     let mut base = baseline_completions();
     base.extend(binding_completions(model));
+    base.extend(snippet_completions());
     base
 }
 
@@ -377,6 +401,22 @@ mod tests {
             .find(|i| i.label == "yield")
             .expect("yield keyword in baseline");
         assert_eq!(y.kind, Some(CompletionItemKind::KEYWORD));
+    }
+
+    #[test]
+    fn baseline_includes_snippets() {
+        let model = SemanticModel::build("x\n".to_string(), None, &crate::check::LintConfig::default());
+        let items = completions(&model, 1);
+        let fn_snip = items
+            .iter()
+            .find(|i| i.label == "fn" && i.insert_text_format == Some(InsertTextFormat::SNIPPET))
+            .expect("fn snippet present");
+        assert!(
+            fn_snip.insert_text.as_deref().unwrap_or("").contains("$0")
+                || fn_snip.insert_text.as_deref().unwrap_or("").contains("${1"),
+            "snippet has a tab-stop: {:?}",
+            fn_snip.insert_text
+        );
     }
 
     #[test]
