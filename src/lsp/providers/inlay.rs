@@ -88,6 +88,16 @@ fn param_name_hints(model: &SemanticModel) -> Vec<InlayHint> {
         let Some(arg_list) = call.children().find(|c| c.kind() == SyntaxKind::ArgList) else {
             continue;
         };
+        // A spread arg (`f(...xs, 3)`) breaks the positional-index→param mapping (the
+        // spread expands to an unknown count), so the trailing args would be labeled
+        // with the WRONG param name. Suppress param-name hints for the whole call —
+        // matching the checker's `call-arity`/`contract` spread bail-out.
+        if arg_list
+            .children()
+            .any(|c| c.kind() == SyntaxKind::SpreadElem)
+        {
+            continue;
+        }
         // Positional argument expressions, in order.
         let args: Vec<&ResolvedNode> = arg_list
             .children()
@@ -224,6 +234,33 @@ mod tests {
             .collect();
         assert!(names.contains(&"a:".to_string()), "{names:?}");
         assert!(names.contains(&"b:".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn no_param_hints_when_call_has_a_spread_arg() {
+        // `f(...xs, 3)`: the spread arg shifts the positional index, so `3` would be
+        // mislabeled `a:` instead of `c:`. Param-name hints are suppressed for any
+        // call whose arg list contains a spread.
+        let src = "fn f(a, b, c) { return a }\nlet xs = [1, 2]\nf(...xs, 3)\n";
+        let m = model(src);
+        let hints = inlay_hints(&m, full_range(&m));
+        let names: Vec<String> = hints
+            .iter()
+            .filter(|h| h.kind == Some(InlayHintKind::PARAMETER))
+            .filter_map(|h| match &h.label {
+                InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.is_empty(),
+            "spread call must emit NO param-name hints, got {names:?}"
+        );
+        // The inferred-type hint on the `let xs` is unaffected.
+        assert!(
+            hints.iter().any(|h| h.kind == Some(InlayHintKind::TYPE)),
+            "type hint on `let xs` still expected"
+        );
     }
 
     #[test]
