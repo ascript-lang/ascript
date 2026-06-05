@@ -1,0 +1,16 @@
+id = "ascript"
+name = "AScript"
+description = "AScript language support for Zed: tree-sitter highlighting and the ascript language server."
+version = "0.6.0"
+schema_version = 1
+authors = ["AScript contributors"]
+repository = "https://github.com/ascript-lang/ascript"
+
+[language_servers.ascript]
+name = "AScript Language Server"
+languages = ["AScript"]
+
+[grammars.ascript]
+# Promoted standalone grammar from LSP Phase 5. Pin to a published commit.
+repository = "https://github.com/ascript-lang/tree-sitter-ascript"
+commit = "0000000000000000000000000000000000000000" # TODO(phase5): pin to the published grammar commit
