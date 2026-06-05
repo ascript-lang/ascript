@@ -263,6 +263,31 @@ fn lsp_protocol_end_to_end() {
         !caps["colorProvider"].is_null(),
         "missing colorProvider: {resp}"
     );
+    // Phase 4: codeLens (resolve advertised).
+    assert!(
+        !caps["codeLensProvider"].is_null(),
+        "missing codeLensProvider: {resp}"
+    );
+    assert_eq!(
+        caps["codeLensProvider"]["resolveProvider"], true,
+        "codeLens resolve advertised: {resp}"
+    );
+    // Phase 4: linkedEditingRange.
+    assert!(
+        !caps["linkedEditingRangeProvider"].is_null(),
+        "missing linkedEditingRangeProvider: {resp}"
+    );
+    // Phase 4: executeCommand carries run/runTest.
+    {
+        let cmds = caps["executeCommandProvider"]["commands"]
+            .as_array()
+            .expect("executeCommand commands");
+        let cmd_strs: Vec<&str> = cmds.iter().filter_map(|c| c.as_str()).collect();
+        assert!(
+            cmd_strs.contains(&"ascript.run") && cmd_strs.contains(&"ascript.runTest"),
+            "executeCommand commands: {cmd_strs:?}"
+        );
+    }
     // signatureHelp trigger chars `(` and `,`.
     let sig_triggers = caps["signatureHelpProvider"]["triggerCharacters"]
         .as_array()

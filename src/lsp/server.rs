@@ -157,8 +157,19 @@ pub fn server_capabilities() -> ServerCapabilities {
             resolve_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
+        // Phase 4: codeLens (run-test/run-main + reference counts) resolved lazily.
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(true),
+        }),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec![crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string()],
+            commands: vec![
+                crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string(),
+                // Phase 4: codeLens run/runTest commands (acknowledged, not executed
+                // by the server — the static-only invariant: the editor extension
+                // binds these to a terminal task).
+                "ascript.run".to_string(),
+                "ascript.runTest".to_string(),
+            ],
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         // Phase 3: call hierarchy (prepare/incoming/outgoing) over the workspace
@@ -551,6 +562,77 @@ impl LanguageServer for Backend {
         ))
     }
 
+    async fn code_lens(
+        &self,
+        params: CodeLensParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CodeLens>>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::lens::code_lenses(
+            model,
+            uri.as_str(),
+        )))
+    }
+
+    async fn code_lens_resolve(
+        &self,
+        mut lens: CodeLens,
+    ) -> tower_lsp::jsonrpc::Result<CodeLens> {
+        // A refs lens carries `{ kind:"refs", uri, name }`; fill its title.
+        let Some(data) = lens.data.clone() else {
+            return Ok(lens);
+        };
+        let (Some(uri_s), Some(name)) = (
+            data.get("uri").and_then(|v| v.as_str()).map(str::to_string),
+            data.get("name").and_then(|v| v.as_str()).map(str::to_string),
+        ) else {
+            return Ok(lens);
+        };
+        let Ok(uri) = Url::parse(&uri_s) else {
+            return Ok(lens);
+        };
+        // Same-file count from the cached model + cross-file from the index.
+        let same_file = {
+            let store = self.documents.lock().await;
+            store
+                .get(&uri)
+                .map(|m| crate::lsp::providers::lens::resolve_same_file_ref_count(m, &name))
+                .unwrap_or(0)
+        };
+        let mut count = same_file;
+        if let Some(path) = url_to_canon(&uri) {
+            if let Ok(idx) = self.index.read() {
+                // Cross-file references: every use of this name in an importer of
+                // the def's file (the same-file count is authoritative; this adds
+                // the importers' uses, anchored on the def's name range).
+                if let Some(file) = idx.files.get(&path) {
+                    if let Some(def) = file
+                        .defs
+                        .iter()
+                        .find(|d| d.name == name)
+                        .map(|d| d.name_range)
+                    {
+                        let cross = idx
+                            .references_at(&path, def.start, false)
+                            .into_iter()
+                            .filter(|(p, _)| *p != path)
+                            .count();
+                        count += cross;
+                    }
+                }
+            }
+        }
+        lens.command = Some(Command {
+            title: format!("{count} reference(s)"),
+            command: String::new(),
+            arguments: None,
+        });
+        Ok(lens)
+    }
+
     async fn execute_command(
         &self,
         params: ExecuteCommandParams,
@@ -571,6 +653,16 @@ impl LanguageServer for Backend {
                     }
                 }
             }
+        } else if params.command == "ascript.run" || params.command == "ascript.runTest" {
+            // Static-only invariant: the server NEVER runs the interpreter. It only
+            // acknowledges the intent; the editor extension binds these commands to
+            // a terminal task that invokes `ascript run`/`ascript test` (Phase 6).
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("execute {}: {:?}", params.command, params.arguments),
+                )
+                .await;
         }
         Ok(None)
     }
@@ -1286,6 +1378,23 @@ mod tests {
             caps.color_provider.is_some(),
             "expected a documentColor provider"
         );
+    }
+
+    #[test]
+    fn capabilities_advertise_code_lens_and_run_commands() {
+        let caps = server_capabilities();
+        let lens = caps.code_lens_provider.expect("code-lens provider");
+        assert_eq!(lens.resolve_provider, Some(true));
+        let exec = caps
+            .execute_command_provider
+            .expect("execute-command provider");
+        assert!(exec.commands.iter().any(|c| c == "ascript.run"));
+        assert!(exec.commands.iter().any(|c| c == "ascript.runTest"));
+        // The Phase 1 fix-all command is still present (extended, not overwritten).
+        assert!(exec
+            .commands
+            .iter()
+            .any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND));
     }
 
     #[test]
