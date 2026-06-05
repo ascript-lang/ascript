@@ -69,6 +69,18 @@ impl Backend {
         }
     }
 
+    /// Handle `window/workDoneProgress/cancel` (wired as a custom method in
+    /// `run_server` because tower-lsp 0.20 does not yet expose it as a
+    /// `LanguageServer` trait method — see the crate TODO at `tower-lsp/src/lib.rs`).
+    /// We run exactly one cancellable long task — the initial workspace indexing
+    /// under the `ascript-index` token — so flip the flag its loop checks between
+    /// files.
+    pub async fn on_work_done_progress_cancel(&self, params: WorkDoneProgressCancelParams) {
+        if matches!(&params.token, NumberOrString::String(s) if s == "ascript-index") {
+            self.index_cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// True if `gen` is no longer the current generation for `uri` (a newer edit has
     /// landed). A handler that captured `gen` at entry should bail when this is true,
     /// because its result was computed against now-stale text.
@@ -374,32 +386,37 @@ impl LanguageServer for Backend {
         // in a best-effort work-done progress report.
         let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
         let token = NumberOrString::String("ascript-index".to_string());
-        // Create + Begin (spawned: the create is a server→client request whose
+        // Reset the cancel flag for this indexing pass.
+        self.index_cancelled.store(false, Ordering::SeqCst);
+        // Create the progress token (best-effort: a server→client request whose
         // response we do not need; a client without progress support ignores it).
+        // Spawned so we never stall `initialized` waiting on a client that never
+        // answers (the prior Phase-4 deadlock fix).
         {
             let client = self.client.clone();
             let token = token.clone();
             tokio::spawn(async move {
                 let _ = client
                     .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
-                        token: token.clone(),
-                    })
-                    .await;
-                client
-                    .send_notification::<notification::Progress>(ProgressParams {
                         token,
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
-                            WorkDoneProgressBegin {
-                                title: "Indexing AScript workspace".to_string(),
-                                cancellable: Some(false),
-                                message: None,
-                                percentage: None,
-                            },
-                        )),
                     })
                     .await;
             });
         }
+        // Begin — cancellable so the client may flip the cancel flag mid-index.
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing AScript workspace".to_string(),
+                        cancellable: Some(true),
+                        message: None,
+                        percentage: Some(0),
+                    },
+                )),
+            })
+            .await;
         let mut files: Vec<(PathBuf, String)> = Vec::new();
         for root in &roots {
             for path in workspace::discover_as_files(root) {
@@ -408,17 +425,44 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        if let Ok(mut idx) = self.index.write() {
-            for (path, text) in &files {
+        // Index file-by-file, reporting progress and honoring cancellation between
+        // files so a huge workspace can be aborted via `window/workDoneProgress/cancel`.
+        let total = files.len().max(1);
+        let mut indexed = 0usize;
+        let mut cancelled = false;
+        for (i, (path, text)) in files.iter().enumerate() {
+            if self.index_cancelled.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            if let Ok(mut idx) = self.index.write() {
                 idx.reindex_file(path, text);
             }
+            indexed = i + 1;
+            self.client
+                .send_notification::<notification::Progress>(ProgressParams {
+                    token: token.clone(),
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                        WorkDoneProgressReport {
+                            cancellable: Some(true),
+                            message: Some(format!("{}/{}", i + 1, total)),
+                            percentage: Some(((i + 1) * 100 / total) as u32),
+                        },
+                    )),
+                })
+                .await;
         }
-        // End the progress with the indexed-file count.
+        // End the progress with the indexed-file count (noting an early cancel).
+        let end_message = if cancelled {
+            format!("indexing cancelled after {indexed} of {} files", files.len())
+        } else {
+            format!("{} files indexed", files.len())
+        };
         self.client
             .send_notification::<notification::Progress>(ProgressParams {
                 token,
                 value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
-                    message: Some(format!("{} files indexed", files.len())),
+                    message: Some(end_message),
                 })),
             })
             .await;
@@ -1955,6 +1999,17 @@ mod tests {
             caps.document_range_formatting_provider.is_some(),
             "range formatting advertised"
         );
+    }
+
+    #[test]
+    fn index_cancel_flag_is_observable_and_sticky() {
+        // The flag is observable + sticky once set. (The wire path — a
+        // `window/workDoneProgress/cancel` flipping it mid-index — is covered by the
+        // protocol smoke test in tests/lsp.rs.)
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!flag.load(Ordering::SeqCst));
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]

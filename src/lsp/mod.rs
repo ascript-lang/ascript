@@ -30,6 +30,15 @@ use tower_lsp::{LspService, Server};
 pub async fn run_server() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(Backend::new);
+    // `window/workDoneProgress/cancel` is registered as a custom method: tower-lsp
+    // 0.20 does not yet expose it as a `LanguageServer` trait method (a documented
+    // crate TODO), so we route it to `Backend::on_work_done_progress_cancel`, which
+    // flips the cancel flag the initial-indexing loop honors between files.
+    let (service, socket) = LspService::build(Backend::new)
+        .custom_method(
+            "window/workDoneProgress/cancel",
+            Backend::on_work_done_progress_cancel,
+        )
+        .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }
