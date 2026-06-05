@@ -349,6 +349,42 @@ fn lsp_protocol_end_to_end() {
         "hover response missing result: {hover_resp}"
     );
 
+    // 5b. completion on the symbols doc -> the rewritten scope-aware provider
+    // offers in-scope bindings (`greet`, `Point`) AND control-flow snippets.
+    client.request(
+        5,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": sym_uri },
+            "position": { "line": 5, "character": 0 }
+        }),
+    );
+    let comp_resp = client.read_response(5, overall);
+    let comp_items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let comp_labels: Vec<&str> = comp_items
+        .iter()
+        .filter_map(|i| i["label"].as_str())
+        .collect();
+    assert!(
+        comp_labels.contains(&"greet") && comp_labels.contains(&"Point"),
+        "completion should offer in-scope bindings: {comp_labels:?}"
+    );
+    assert!(
+        comp_labels.contains(&"print") && comp_labels.contains(&"let"),
+        "completion should preserve builtins + keywords: {comp_labels:?}"
+    );
+    // A snippet item (`match`) carries insertTextFormat == Snippet (2).
+    let snippet = comp_items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("match") && i["insertTextFormat"].as_i64() == Some(2))
+        .expect("a snippet completion item");
+    assert!(
+        snippet["insertText"].as_str().is_some_and(|t| t.contains("$")),
+        "snippet has a tab-stop: {snippet}"
+    );
+
     // 6. shutdown -> result; exit -> clean exit.
     client.request_no_params(4, "shutdown");
     let shutdown_resp = client.read_response(4, overall);
