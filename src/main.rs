@@ -92,6 +92,35 @@ enum Command {
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
     Lsp,
+    /// Add a dependency to ascript.toml + lock (git/url/path spec).
+    #[cfg(feature = "pkg")]
+    Add {
+        /// e.g. `github.com/owner/repo@v1.0.0`, `https://host/pkg-1.2.0.tar.gz`,
+        /// or `../local-path`.
+        spec: String,
+    },
+    /// Remove a dependency from ascript.toml + re-lock.
+    #[cfg(feature = "pkg")]
+    Remove { name: String },
+    /// Resolve + fetch dependencies and write/verify ascript.lock.
+    #[cfg(feature = "pkg")]
+    Install {
+        /// Install EXACTLY from ascript.lock (no network); fail on drift.
+        #[arg(long = "locked")]
+        locked: bool,
+    },
+    /// Raise pins + re-lock (optionally a single dependency).
+    #[cfg(feature = "pkg")]
+    Update { name: Option<String> },
+    /// (Re)generate ascript.lock from the manifest.
+    #[cfg(feature = "pkg")]
+    Lock,
+    /// Print the resolved dependency graph.
+    #[cfg(feature = "pkg")]
+    Tree,
+    /// Re-hash the cache store against the lock integrity (fail-closed).
+    #[cfg(feature = "pkg")]
+    Verify,
 }
 
 // SP3 §B: run the whole program on a worker thread with an enlarged
@@ -185,6 +214,9 @@ async fn real_main() -> ExitCode {
             file,
             args,
         } => {
+            // `--locked` only affects dependency resolution, which is `pkg`-gated.
+            #[cfg(not(feature = "pkg"))]
+            let _ = locked;
             let path = std::path::Path::new(&file);
             // A `.aso` file is compiled bytecode → run it on the VM (no compile step).
             // A `.as` file is compiled to bytecode and run on the VM as well (this is
@@ -208,7 +240,7 @@ async fn real_main() -> ExitCode {
                 None
             } else {
                 match pkg::commands::ensure_lock(path, locked) {
-                    Ok(outcome) => outcome.map(|o| o.map),
+                    Ok(map) => map,
                     Err(e) => {
                         eprintln!("error: {e}");
                         return ExitCode::from(1);
@@ -455,7 +487,7 @@ async fn real_main() -> ExitCode {
                 let packages = match files.first() {
                     Some(first) => {
                         match pkg::commands::ensure_lock(std::path::Path::new(first), locked) {
-                            Ok(outcome) => outcome.map(|o| o.map),
+                            Ok(map) => map,
                             Err(e) => {
                                 eprintln!("error: {e}");
                                 return ExitCode::from(1);
@@ -493,6 +525,35 @@ async fn real_main() -> ExitCode {
         Command::Lsp => {
             ascript::lsp::run_server().await;
             ExitCode::SUCCESS
+        }
+        #[cfg(feature = "pkg")]
+        Command::Add { spec } => pkg_command_exit(pkg::commands::cmd_add(&spec)),
+        #[cfg(feature = "pkg")]
+        Command::Remove { name } => pkg_command_exit(pkg::commands::cmd_remove(&name)),
+        #[cfg(feature = "pkg")]
+        Command::Install { locked } => pkg_command_exit(pkg::commands::cmd_install(locked)),
+        #[cfg(feature = "pkg")]
+        Command::Update { name } => {
+            pkg_command_exit(pkg::commands::cmd_update(name.as_deref()))
+        }
+        #[cfg(feature = "pkg")]
+        Command::Lock => pkg_command_exit(pkg::commands::cmd_lock()),
+        #[cfg(feature = "pkg")]
+        Command::Tree => pkg_command_exit(pkg::commands::cmd_tree()),
+        #[cfg(feature = "pkg")]
+        Command::Verify => pkg_command_exit(pkg::commands::cmd_verify()),
+    }
+}
+
+/// Map a package-command `Result<(), String>` to an exit code (clear error to
+/// stderr on failure).
+#[cfg(feature = "pkg")]
+fn pkg_command_exit(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
         }
     }
 }

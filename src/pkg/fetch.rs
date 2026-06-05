@@ -73,32 +73,29 @@ pub async fn fetch(src: &DepSource, manifest_dir: &Path) -> Result<Fetched, Stri
 /// is read straight from disk with no runtime. Used by `commands.rs`'s resolver.
 pub fn fetch_blocking(src: &DepSource, manifest_dir: &Path) -> Result<Fetched, String> {
     match src {
+        // path/git are synchronous (filesystem / `git` subprocess) — run inline.
         DepSource::Path { path } => fetch_path(path, manifest_dir),
         DepSource::Git { url, pin } => fetch_git(url, pin),
-        DepSource::Url { url } if url.starts_with("file://") => {
-            // No network → no runtime needed; reuse the async arm's body via a
-            // minimal blocking runtime would also work, but the file:// path is
-            // pure sync IO, so run it on a tiny dedicated runtime for uniformity.
-            block_on_url(url)
-        }
-        DepSource::Url { url } => block_on_url(url),
+        // url awaits a reqwest download (or a sync file:// read): drive the async
+        // `fetch` on a throwaway current-thread runtime on a FRESH thread, so it
+        // never nests inside the caller's runtime.
+        DepSource::Url { .. } => block_on(src, manifest_dir),
         DepSource::Registry { req } => Err(format!(
             "bare-version dependency '{req}' requires a registry, which is not available yet"
         )),
     }
 }
 
-/// Block on the async url fetch using a fresh current-thread runtime on a NEW
+/// Block on the async [`fetch`] using a fresh current-thread runtime on a NEW
 /// thread, so it is safe even when the caller is already inside a tokio runtime.
-fn block_on_url(url: &str) -> Result<Fetched, String> {
-    let url = url.to_string();
+fn block_on(src: &DepSource, manifest_dir: &Path) -> Result<Fetched, String> {
     std::thread::scope(|s| {
         s.spawn(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| format!("cannot build fetch runtime: {e}"))?;
-            rt.block_on(fetch_url(&url))
+            rt.block_on(fetch(src, manifest_dir))
         })
         .join()
         .map_err(|_| "url fetch thread panicked".to_string())?

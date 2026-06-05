@@ -5,7 +5,9 @@
 //! under `ascript run` (VM) and `ascript run --tree-walker` (the oracle). These
 //! spawn the built binary like `tests/cli.rs`.
 
-use std::path::{Path, PathBuf};
+#[cfg(feature = "pkg")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn bin() -> &'static str {
@@ -13,6 +15,7 @@ fn bin() -> &'static str {
 }
 
 /// A unique scratch dir under the system tempdir.
+#[cfg(feature = "pkg")]
 fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
         "pkg-it-{}-{}-{}",
@@ -27,6 +30,7 @@ fn scratch(tag: &str) -> PathBuf {
     d
 }
 
+#[cfg(feature = "pkg")]
 fn write(dir: &Path, rel: &str, contents: &str) {
     let p = dir.join(rel);
     if let Some(parent) = p.parent() {
@@ -35,6 +39,7 @@ fn write(dir: &Path, rel: &str, contents: &str) {
     std::fs::write(p, contents).unwrap();
 }
 
+#[cfg(feature = "pkg")]
 fn git_available() -> bool {
     Command::new("git")
         .arg("--version")
@@ -44,6 +49,7 @@ fn git_available() -> bool {
 }
 
 /// `git` in `dir` with deterministic identity; panics on failure.
+#[cfg(feature = "pkg")]
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -62,7 +68,19 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
+/// Run a package subcommand in `project` with an isolated cache.
+#[cfg(feature = "pkg")]
+fn pkg_cmd(project: &Path, cache: &Path, args: &[&str]) -> Output {
+    Command::new(bin())
+        .args(args)
+        .current_dir(project)
+        .env("ASCRIPT_CACHE", cache)
+        .output()
+        .expect("spawn ascript")
+}
+
 /// Run `ascript run [--tree-walker] [--locked] <file>` with an isolated cache.
+#[cfg(feature = "pkg")]
 fn run_in(file: &Path, cache: &Path, tree_walker: bool, locked: bool) -> Output {
     let mut cmd = Command::new(bin());
     cmd.arg("run");
@@ -223,6 +241,144 @@ fn git_dep_fetch_lock_run_byte_identical_then_locked() {
         String::from_utf8_lossy(&locked.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&locked.stdout), "hi from git\n");
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&app);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// `add ../lib` (path) → manifest + lock updated; `remove lib` → dropped + re-locked.
+#[cfg(feature = "pkg")]
+#[test]
+fn cmd_add_remove_path_dep() {
+    let root = scratch("addrm");
+    // A path-dep target package.
+    let lib = root.join("lib");
+    write(&lib, "ascript.toml", "[package]\nname=\"lib\"\nversion=\"1.0.0\"\nentry=\"main.as\"\n");
+    write(&lib, "main.as", "export fn v() { return 1 }\n");
+    // The consumer project.
+    let app = root.join("app");
+    write(&app, "ascript.toml", "[package]\nname=\"app\"\nversion=\"0.1.0\"\n");
+    let cache = scratch("addrm-cache");
+
+    // add ../lib
+    let out = pkg_cmd(&app, &cache, &["add", "../lib"]);
+    assert!(out.status.success(), "add failed: {}", String::from_utf8_lossy(&out.stderr));
+    let manifest = std::fs::read_to_string(app.join("ascript.toml")).unwrap();
+    assert!(manifest.contains("lib = { path = \"../lib\" }"), "{manifest}");
+    let lock = std::fs::read_to_string(app.join("ascript.lock")).unwrap();
+    assert!(lock.contains("name = \"lib\""), "{lock}");
+    assert!(lock.contains("source = \"path+../lib\""), "{lock}");
+
+    // remove lib
+    let out = pkg_cmd(&app, &cache, &["remove", "lib"]);
+    assert!(out.status.success(), "remove failed: {}", String::from_utf8_lossy(&out.stderr));
+    let manifest = std::fs::read_to_string(app.join("ascript.toml")).unwrap();
+    assert!(!manifest.contains("lib ="), "dep removed:\n{manifest}");
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// `install`, `tree`, `verify` end-to-end against a local file:// git dep, and
+/// `verify` fails non-zero on a tampered store tree. Hermetic; skips if no git.
+#[cfg(feature = "pkg")]
+#[test]
+fn cmd_install_tree_verify_and_tamper() {
+    if !git_available() {
+        eprintln!("SKIP cmd_install_tree_verify_and_tamper: `git` not found");
+        return;
+    }
+    // A tagged git source package.
+    let repo = scratch("itv-repo");
+    write(&repo, "ascript.toml", "[package]\nname=\"dep\"\nversion=\"1.0.0\"\nentry=\"main.as\"\n");
+    write(&repo, "main.as", "export fn v() { return 1 }\n");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "v1"]);
+    git(&repo, &["tag", "v1.0.0"]);
+    let url = format!("file://{}", repo.display());
+
+    let app = scratch("itv-app");
+    write(
+        &app,
+        "ascript.toml",
+        &format!("[package]\nname=\"app\"\nversion=\"0.1.0\"\n\n[dependencies]\ndep = {{ git = \"{url}\", tag = \"v1.0.0\" }}\n"),
+    );
+    let cache = scratch("itv-cache");
+
+    // install → resolves + fetches + writes lock.
+    let out = pkg_cmd(&app, &cache, &["install"]);
+    assert!(out.status.success(), "install failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(app.join("ascript.lock").is_file());
+
+    // tree → prints the resolved graph.
+    let out = pkg_cmd(&app, &cache, &["tree"]);
+    assert!(out.status.success());
+    let tree = String::from_utf8_lossy(&out.stdout);
+    assert!(tree.contains("dep") && tree.contains("v1.0.0") && tree.contains("git+"), "{tree}");
+
+    // verify → passes on a clean store.
+    let out = pkg_cmd(&app, &cache, &["verify"]);
+    assert!(out.status.success(), "verify should pass clean: {}", String::from_utf8_lossy(&out.stderr));
+
+    // install --locked → offline, deterministic.
+    let out = pkg_cmd(&app, &cache, &["install", "--locked"]);
+    assert!(out.status.success(), "locked install failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Tamper a store tree → verify must FAIL non-zero.
+    let store = cache.join("store");
+    let mut tampered = false;
+    for entry in std::fs::read_dir(&store).unwrap() {
+        let dir = entry.unwrap().path();
+        let target = dir.join("main.as");
+        if target.is_file() {
+            std::fs::write(&target, "export fn v() { return 999 }\n").unwrap();
+            tampered = true;
+        }
+    }
+    assert!(tampered, "expected a store entry to tamper");
+    let out = pkg_cmd(&app, &cache, &["verify"]);
+    assert!(!out.status.success(), "verify must fail on a tampered store");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("integrity mismatch"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&app);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// `add <file://repo>@v1.0.0` records a git+tag entry with rev+integrity in lock.
+#[cfg(feature = "pkg")]
+#[test]
+fn cmd_add_git_at_tag() {
+    if !git_available() {
+        eprintln!("SKIP cmd_add_git_at_tag: `git` not found");
+        return;
+    }
+    let repo = scratch("addgit-repo");
+    write(&repo, "ascript.toml", "[package]\nname=\"g\"\nversion=\"1.0.0\"\nentry=\"main.as\"\n");
+    write(&repo, "main.as", "export fn v() { return 1 }\n");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "v1"]);
+    git(&repo, &["tag", "v1.0.0"]);
+    let url = format!("file://{}", repo.display());
+
+    let app = scratch("addgit-app");
+    write(&app, "ascript.toml", "[package]\nname=\"app\"\nversion=\"0.1.0\"\n");
+    let cache = scratch("addgit-cache");
+
+    let spec = format!("{url}@v1.0.0");
+    let out = pkg_cmd(&app, &cache, &["add", &spec]);
+    assert!(out.status.success(), "add git failed: {}", String::from_utf8_lossy(&out.stderr));
+    let manifest = std::fs::read_to_string(app.join("ascript.toml")).unwrap();
+    assert!(manifest.contains("git =") && manifest.contains("tag = \"v1.0.0\""), "{manifest}");
+    let lock = std::fs::read_to_string(app.join("ascript.lock")).unwrap();
+    assert!(lock.contains("rev = ") && lock.contains("integrity = \"asum1-"), "{lock}");
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&app);

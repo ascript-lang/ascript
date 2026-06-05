@@ -42,14 +42,6 @@ pub struct LockEntry {
 }
 
 impl Lockfile {
-    /// An empty lockfile at the current version.
-    pub fn empty() -> Lockfile {
-        Lockfile {
-            version: LOCK_VERSION,
-            packages: Vec::new(),
-        }
-    }
-
     /// Serialize to canonical TOML: `version = N` then `[[package]]` blocks
     /// sorted by name, fields in a fixed order, optional fields omitted when
     /// absent. Byte-stable (write→read→write is identical).
@@ -259,7 +251,10 @@ mod tests {
 
     #[test]
     fn empty_round_trips() {
-        let lock = Lockfile::empty();
+        let lock = Lockfile {
+            version: LOCK_VERSION,
+            packages: Vec::new(),
+        };
         let s = lock.to_toml();
         let parsed = Lockfile::parse("ascript.lock", &s).unwrap();
         assert_eq!(lock, parsed);
