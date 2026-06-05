@@ -644,11 +644,23 @@ impl LanguageServer for Backend {
             .read()
             .map(|s| s.detect_hex_strings_everywhere)
             .unwrap_or(false);
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(Vec::new());
+        // Large-file degradation: color swatches go quiet above HUGE_FILE_BYTES,
+        // logged once. Normal + Large still scan.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(Vec::new());
+            };
+            if matches!(model.size_class(), crate::lsp::model::SizeClass::Huge) {
+                Some(format!("ascript: {uri} is huge — document colors disabled"))
+            } else {
+                return Ok(crate::lsp::providers::color::document_colors(model, everywhere));
+            }
         };
-        Ok(crate::lsp::providers::color::document_colors(model, everywhere))
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Vec::new())
     }
 
     async fn color_presentation(
@@ -699,11 +711,28 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
         let range = params.range;
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(None);
+        // Large-file degradation: inlay hints are skipped above LARGE_FILE_BYTES
+        // (Large + Huge), returning an empty set. A one-line note is logged for the
+        // huge case so the degradation is observable, never silent — and never a hang.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            match model.size_class() {
+                crate::lsp::model::SizeClass::Normal => {
+                    return Ok(Some(crate::lsp::providers::inlay::inlay_hints(model, range)));
+                }
+                crate::lsp::model::SizeClass::Large => None,
+                crate::lsp::model::SizeClass::Huge => {
+                    Some(format!("ascript: {uri} is huge — inlay hints disabled"))
+                }
+            }
         };
-        Ok(Some(crate::lsp::providers::inlay::inlay_hints(model, range)))
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Some(Vec::new()))
     }
 
     async fn inlay_hint_resolve(
@@ -718,12 +747,31 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(None);
+        // Large-file degradation: above LARGE_FILE_BYTES the FULL token set is not
+        // served (a capable client falls back to ranged `semanticTokens/range`
+        // requests, which stay served and are inherently bounded). Logged, never a
+        // hang. The log note rides outside the store lock.
+        let note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            match model.size_class() {
+                crate::lsp::model::SizeClass::Normal => {
+                    let tokens =
+                        crate::lsp::providers::semantic_tokens::semantic_tokens_full(model);
+                    return Ok(Some(SemanticTokensResult::Tokens(tokens)));
+                }
+                crate::lsp::model::SizeClass::Large => {
+                    format!("ascript: {uri} is large — semantic tokens served range-only")
+                }
+                crate::lsp::model::SizeClass::Huge => {
+                    format!("ascript: {uri} is huge — semantic tokens disabled")
+                }
+            }
         };
-        let tokens = crate::lsp::providers::semantic_tokens::semantic_tokens_full(model);
-        Ok(Some(SemanticTokensResult::Tokens(tokens)))
+        self.client.log_message(MessageType::INFO, note).await;
+        Ok(None)
     }
 
     async fn semantic_tokens_range(
@@ -1217,11 +1265,24 @@ impl LanguageServer for Backend {
         &self,
         params: FoldingRangeParams,
     ) -> tower_lsp::jsonrpc::Result<Option<Vec<FoldingRange>>> {
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&params.text_document.uri) else {
-            return Ok(None);
+        let uri = params.text_document.uri;
+        // Large-file degradation: folding ranges go quiet above HUGE_FILE_BYTES
+        // (returning empty), logged once. Normal + Large still fold.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            if matches!(model.size_class(), crate::lsp::model::SizeClass::Huge) {
+                Some(format!("ascript: {uri} is huge — folding ranges disabled"))
+            } else {
+                return Ok(Some(crate::lsp::providers::folding::folding_ranges(model)));
+            }
         };
-        Ok(Some(crate::lsp::providers::folding::folding_ranges(model)))
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Some(Vec::new()))
     }
 
     async fn selection_range(
@@ -1894,6 +1955,24 @@ mod tests {
             caps.document_range_formatting_provider.is_some(),
             "range formatting advertised"
         );
+    }
+
+    #[test]
+    fn size_class_gates_expensive_providers() {
+        use crate::lsp::model::{SemanticModel, SizeClass};
+        use crate::lsp::perf::LARGE_FILE_BYTES;
+        let big = SemanticModel::build(
+            "a".repeat(LARGE_FILE_BYTES),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        assert!(matches!(big.size_class(), SizeClass::Large | SizeClass::Huge));
+        let small = SemanticModel::build(
+            "let x = 1\n".to_string(),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        assert_eq!(small.size_class(), SizeClass::Normal);
     }
 
     #[test]
