@@ -10,8 +10,10 @@
 
 use crate::lsp::model::SemanticModel;
 use crate::lsp::providers::token_spans::{positioned_tokens, TokenSpan};
+use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::BindingKind;
+use std::collections::HashMap;
 use tower_lsp::lsp_types::{SemanticTokenModifier, SemanticTokenType, SemanticTokensLegend};
 
 /// The semantic token TYPES we emit, in legend-index order. A token's wire
@@ -51,11 +53,9 @@ const TYPE_KEYWORD: u32 = 0;
 const TYPE_FUNCTION: u32 = 1;
 const TYPE_PARAMETER: u32 = 2;
 const TYPE_VARIABLE: u32 = 3;
-#[allow(dead_code)]
 const TYPE_PROPERTY: u32 = 4;
 const TYPE_CLASS: u32 = 5;
 const TYPE_ENUM: u32 = 6;
-#[allow(dead_code)]
 const TYPE_ENUM_MEMBER: u32 = 7;
 const TYPE_STRING: u32 = 8;
 const TYPE_NUMBER: u32 = 9;
@@ -78,16 +78,23 @@ pub struct ClassifiedToken {
 /// source order. Tokens we don't surface (punctuation/operators) are dropped.
 pub fn classify(model: &SemanticModel) -> Vec<ClassifiedToken> {
     let toks = positioned_tokens(model);
+    // Member-access NAME spans (`obj.field`'s `field`) → PROPERTY, or ENUM_MEMBER
+    // when the receiver resolves to an enum. Built once per pass off the CST.
+    let members = member_name_spans(model);
     let mut out = Vec::new();
     for t in &toks {
-        if let Some(c) = classify_one(model, t) {
+        if let Some(c) = classify_one(model, t, &members) {
             out.push(c);
         }
     }
     out
 }
 
-fn classify_one(model: &SemanticModel, t: &TokenSpan) -> Option<ClassifiedToken> {
+fn classify_one(
+    model: &SemanticModel,
+    t: &TokenSpan,
+    members: &HashMap<(usize, usize), u32>,
+) -> Option<ClassifiedToken> {
     let (token_type, modifiers) = match t.kind {
         SyntaxKind::LineComment | SyntaxKind::BlockComment => (TYPE_COMMENT, 0),
         // Other trivia (whitespace / newline) is not surfaced.
@@ -98,6 +105,11 @@ fn classify_one(model: &SemanticModel, t: &TokenSpan) -> Option<ClassifiedToken>
         | SyntaxKind::TemplateStart
         | SyntaxKind::TemplateMiddle
         | SyntaxKind::TemplateEnd => (TYPE_STRING, 0),
+        // A member-access NAME (`obj.field`) is a PROPERTY/ENUM_MEMBER, not a
+        // resolver use — check it BEFORE the resolver-based ident classification.
+        SyntaxKind::Ident if members.contains_key(&(t.start, t.end())) => {
+            (members[&(t.start, t.end())], 0)
+        }
         SyntaxKind::Ident => classify_ident(model, t)?,
         k if is_keyword_kind(k) => (TYPE_KEYWORD, 0),
         _ => return None, // punctuation / operators: not surfaced
@@ -108,6 +120,51 @@ fn classify_one(model: &SemanticModel, t: &TokenSpan) -> Option<ClassifiedToken>
         token_type,
         modifiers,
     })
+}
+
+/// Byte spans of every member-access NAME token (`obj.field`'s `field`, including
+/// `obj?.field`), mapped to its token type: ENUM_MEMBER when the receiver is a
+/// bare `NameRef` resolving to an enum NAME (via the SP10 `Table`), else PROPERTY.
+/// The member name is the trailing direct `Ident` TOKEN child of a
+/// `MemberExpr`/`OptMemberExpr`.
+fn member_name_spans(model: &SemanticModel) -> HashMap<(usize, usize), u32> {
+    let table = crate::check::infer::table::Table::build(&model.tree, &model.resolved);
+    let mut out = HashMap::new();
+    for node in model.tree.descendants().filter(|n| {
+        matches!(n.kind(), SyntaxKind::MemberExpr | SyntaxKind::OptMemberExpr)
+    }) {
+        // The member NAME is the last direct `Ident` token child (the receiver is a
+        // child NODE, the `.`/`?.` is an operator token).
+        let Some(span) = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == SyntaxKind::Ident)
+            .map(|t| t.text_range())
+            .last()
+        else {
+            continue;
+        };
+        let key = (usize::from(span.start()), usize::from(span.end()));
+        let ty = if receiver_is_enum(node, &table) {
+            TYPE_ENUM_MEMBER
+        } else {
+            TYPE_PROPERTY
+        };
+        out.insert(key, ty);
+    }
+    out
+}
+
+/// True when a `MemberExpr`/`OptMemberExpr`'s receiver is a bare `NameRef` whose
+/// name is a known enum (`Color.Red`). A non-NameRef receiver (`a.b.c`, a call) is
+/// not an enum access.
+fn receiver_is_enum(member: &ResolvedNode, table: &crate::check::infer::table::Table) -> bool {
+    let Some(recv) = member.children().find(|c| c.kind() == SyntaxKind::NameRef) else {
+        return false;
+    };
+    crate::syntax::resolve::ident_text(recv)
+        .map(|name| table.enum_id(&name).is_some())
+        .unwrap_or(false)
 }
 
 /// Refine an `Ident` token using the resolver. The token's byte span is its
@@ -311,6 +368,34 @@ mod tests {
         let kinds: Vec<u32> = cs.iter().map(|c| c.token_type).collect();
         assert!(kinds.contains(&TYPE_FUNCTION), "{kinds:?}");
         assert!(kinds.contains(&TYPE_PARAMETER), "{kinds:?}");
+    }
+
+    #[test]
+    fn member_access_name_classifies_as_property() {
+        let src = "let obj = { field: 1 }\nlet v = obj.field\n";
+        let m = model(src);
+        let cs = classify(&m);
+        // The `field` in `obj.field` (the member-access NAME) → PROPERTY.
+        let member_off = src.rfind("field").unwrap();
+        let tok = cs
+            .iter()
+            .find(|c| c.start == member_off)
+            .unwrap_or_else(|| panic!("no token at member name; got {cs:?}"));
+        assert_eq!(tok.token_type, TYPE_PROPERTY, "obj.field → PROPERTY");
+    }
+
+    #[test]
+    fn enum_variant_member_classifies_as_enum_member() {
+        let src = "enum Color { Red, Green }\nlet c = Color.Red\n";
+        let m = model(src);
+        let cs = classify(&m);
+        // The `Red` in `Color.Red` (receiver resolves to an enum) → ENUM_MEMBER.
+        let red_off = src.rfind("Red").unwrap();
+        let tok = cs
+            .iter()
+            .find(|c| c.start == red_off)
+            .unwrap_or_else(|| panic!("no token at Color.Red member; got {cs:?}"));
+        assert_eq!(tok.token_type, TYPE_ENUM_MEMBER, "Color.Red → ENUM_MEMBER");
     }
 }
 
