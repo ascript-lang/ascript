@@ -28,6 +28,13 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 use std::sync::LazyLock;
 static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
+/// The real monotonic clock in ms since process start. Shared with the SP9 §3
+/// determinism seam in `call_time`, which passes this as the `None`-mode fallback
+/// for `time.monotonic` so the default path stays byte-identical to the arm below.
+pub(crate) fn real_monotonic_ms() -> f64 {
+    START.elapsed().as_secs_f64() * 1000.0
+}
+
 /// Synchronous time functions. `sleep` is handled async in `call_time` (mod.rs)
 /// and must NOT be dispatched here.
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {

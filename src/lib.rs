@@ -2,6 +2,7 @@ pub mod ast;
 pub mod check;
 pub mod compile;
 pub mod coro;
+pub mod det;
 pub mod diagnostics;
 pub mod env;
 pub mod error;
@@ -178,6 +179,36 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         // exit(n) — return the captured output plus the exit code.
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// SP9 §3 test/embedder seam: run `src` on the tree-walker in DETERMINISTIC mode
+/// with the given `seed` (the eventual `--deterministic --seed N` CLI flag maps to
+/// this path). The clock/RNG seams route through a fresh
+/// [`crate::det::DeterminismContext`] in Record mode, so two runs with the same seed
+/// produce byte-identical output (the determinism oracle, spec §3.5). `#[doc(hidden)]`
+/// — not a stable public API.
+#[doc(hidden)]
+pub async fn run_source_deterministic(src: &str, seed: u64) -> Result<String, AsError> {
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let tokens = lexer::lex(src).map_err(|e| e.with_source(src_info.clone()))?;
+    let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    interp.enter_deterministic(seed);
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(interp.exec(&program, &env)))
+        .await;
+    local.await;
+    match result {
+        Ok(_) | Err(crate::interp::Control::Propagate(_)) => Ok(interp.output()),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Exit(_)) => Ok(interp.output()),
     }
 }
 
