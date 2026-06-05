@@ -27,16 +27,7 @@ use tower_lsp::lsp_types::Range;
 /// server then asks the workspace index, which handles cross-file + module
 /// globals) or when no name sits under the cursor.
 pub fn definition_in_file(model: &SemanticModel, offset: usize) -> Option<Range> {
-    // Find the NameRef whose byte range contains the offset (the innermost — a
-    // NameRef has no NameRef descendants, so the first match is precise).
-    let nameref = name_ref_at(model, offset)?;
-    let res = model.resolved.uses.get(&nameref.text_range())?;
-    let use_range = nameref.text_range();
-    let binding = match res {
-        Resolution::Local(slot) => binding_for_local(model, use_range, *slot)?,
-        Resolution::Upvalue(idx) => binding_for_upvalue(model, use_range, *idx)?,
-        Resolution::Global(_) | Resolution::Unresolved => return None,
-    };
+    let binding = binding_for_offset(model, offset)?;
     let decl_range = binding.decl_range;
     // `decl_range` is the whole declaration statement (e.g. the full `let y = 1`).
     // Narrow it to the binding's NAME token so the jump lands on the identifier,
@@ -47,6 +38,68 @@ pub fn definition_in_file(model: &SemanticModel, offset: usize) -> Option<Range>
         &model.line_index,
         ByteSpan::from(target),
     ))
+}
+
+/// The frame-aware binding the `NameRef` at `offset` resolves to (`Local`/
+/// `Upvalue`). `None` for globals/unresolved or when no name sits under the cursor.
+fn binding_for_offset(model: &SemanticModel, offset: usize) -> Option<&Binding> {
+    let nameref = name_ref_at(model, offset)?;
+    binding_for_node(model, nameref)
+}
+
+/// The frame-aware binding a specific `NameRef` node resolves to (`Local`/
+/// `Upvalue`). `None` for globals/unresolved. This is the SHARED scope-precise
+/// resolution reused by document-highlight to match occurrences by BINDING
+/// IDENTITY rather than name text.
+pub(crate) fn binding_for_node<'m>(
+    model: &'m SemanticModel,
+    nameref: &ResolvedNode,
+) -> Option<&'m Binding> {
+    let use_range = nameref.text_range();
+    let res = model.resolved.uses.get(&use_range)?;
+    match res {
+        Resolution::Local(slot) => binding_for_local(model, use_range, *slot),
+        Resolution::Upvalue(idx) => binding_for_upvalue(model, use_range, *idx),
+        Resolution::Global(_) | Resolution::Unresolved => None,
+    }
+}
+
+/// A binding's IDENTITY for occurrence matching: a frame-precise local/upvalue is
+/// identified by its declaration range; a module-scope global is identified by its
+/// name (globals have no per-frame slot). Two uses share a binding iff their
+/// `BindingId`s are equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BindingId {
+    Local(TextRange),
+    Global(String),
+}
+
+/// The binding IDENTITY the `NameRef` at `offset` resolves to. A `Local`/`Upvalue`
+/// resolves frame-precisely to its decl range; a `Global` resolves to its name.
+/// `None` for unresolved or when no name sits under the cursor.
+pub(crate) fn binding_id_for(model: &SemanticModel, offset: usize) -> Option<BindingId> {
+    let nameref = name_ref_at(model, offset)?;
+    binding_id_for_node(model, nameref)
+}
+
+/// The binding IDENTITY a specific `NameRef` use resolves to. Used by
+/// document-highlight to test whether a candidate use refers to the SAME binding as
+/// the cursor.
+pub(crate) fn binding_id_for_node(
+    model: &SemanticModel,
+    nameref: &ResolvedNode,
+) -> Option<BindingId> {
+    let use_range = nameref.text_range();
+    match model.resolved.uses.get(&use_range)? {
+        Resolution::Local(slot) => {
+            binding_for_local(model, use_range, *slot).map(|b| BindingId::Local(b.decl_range))
+        }
+        Resolution::Upvalue(idx) => {
+            binding_for_upvalue(model, use_range, *idx).map(|b| BindingId::Local(b.decl_range))
+        }
+        Resolution::Global(name) => Some(BindingId::Global(name.clone())),
+        Resolution::Unresolved => None,
+    }
 }
 
 /// The binding a `Local(slot)` use resolves to: the binding with `slot` whose
