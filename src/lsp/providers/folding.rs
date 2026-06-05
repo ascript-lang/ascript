@@ -129,6 +129,114 @@ pub fn selection_range_at(model: &SemanticModel, offset: usize) -> Option<Select
     chain
 }
 
+use tower_lsp::lsp_types::{DocumentLink, Url};
+
+/// A recognized import-specifier link: the `Range` of the `"<path>"` string token
+/// plus an optional resolved target file path. `std/*` and unresolved/bare imports
+/// yield a link with `target = None` (the span is still highlighted).
+pub struct ImportLink {
+    pub range: tower_lsp::lsp_types::Range,
+    /// The resolved relative-import target file path, if any (`std/*` → None).
+    pub target: Option<std::path::PathBuf>,
+}
+
+/// Every `import` specifier in the file, with its string-token range and resolved
+/// relative target (resolved against `importer_dir`, mirroring the runtime rule:
+/// join, append `.as` if no extension). `std/*` and bare specifiers → `None`.
+pub fn import_links(
+    model: &SemanticModel,
+    importer_dir: Option<&std::path::Path>,
+) -> Vec<ImportLink> {
+    let mut out = Vec::new();
+    for import in model
+        .tree
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::ImportStmt)
+    {
+        let Some(str_tok) = import
+            .children_with_tokens()
+            .filter_map(|el| el.into_token().cloned())
+            .find(|t| t.kind() == SyntaxKind::Str)
+        else {
+            continue;
+        };
+        let r = str_tok.text_range();
+        let range = crate::lsp::convert::byte_span_to_range(
+            &model.text,
+            &model.line_index,
+            crate::check::ByteSpan::from(r),
+        );
+        let spec = strip_quotes(str_tok.text());
+        let target = match importer_dir {
+            Some(dir) if spec.starts_with("./") || spec.starts_with("../") => {
+                let mut p = dir.join(spec);
+                if p.extension().is_none() {
+                    p.set_extension("as");
+                }
+                Some(p)
+            }
+            _ => None, // std/* or bare or no importer dir
+        };
+        out.push(ImportLink { range, target });
+    }
+    out
+}
+
+/// Strip the surrounding quotes from a string literal token (mirrors
+/// `src/check/rules/unresolved_import.rs::strip_quotes`).
+fn strip_quotes(s: &str) -> &str {
+    let mut chars = s.chars();
+    chars.next();
+    chars.next_back();
+    chars.as_str()
+}
+
+/// Build LSP `DocumentLink`s from the recognized import links.
+pub fn document_links(
+    model: &SemanticModel,
+    importer_dir: Option<&std::path::Path>,
+) -> Vec<DocumentLink> {
+    import_links(model, importer_dir)
+        .into_iter()
+        .map(|link| DocumentLink {
+            range: link.range,
+            target: link.target.and_then(|p| Url::from_file_path(p).ok()),
+            tooltip: None,
+            data: None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    fn model(src: &str) -> SemanticModel {
+        SemanticModel::build(src.to_string(), None, &LintConfig::default())
+    }
+
+    #[test]
+    fn relative_import_resolves_to_file() {
+        let m = model("import { helper } from \"./lib\"\nprint(1)\n");
+        let dir = std::path::Path::new("/ws");
+        let links = import_links(&m, Some(dir));
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].target.as_deref(),
+            Some(std::path::Path::new("/ws/lib.as"))
+        );
+    }
+
+    #[test]
+    fn std_import_has_no_target() {
+        let m = model("import { abs } from \"std/math\"\nprint(1)\n");
+        let links = import_links(&m, Some(std::path::Path::new("/ws")));
+        assert_eq!(links.len(), 1);
+        assert!(links[0].target.is_none());
+    }
+}
+
 #[cfg(test)]
 mod selection_tests {
     use super::*;

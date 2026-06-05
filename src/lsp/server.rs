@@ -99,6 +99,11 @@ pub fn server_capabilities() -> ServerCapabilities {
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         // Phase 3: smart-expand selection via CST ancestry.
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        // Phase 3: clickable import specifiers (relative → target file).
+        document_link_provider: Some(DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
         code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
@@ -612,6 +617,25 @@ impl LanguageServer for Backend {
             }
         }
         Ok(Some(out))
+    }
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<DocumentLink>>> {
+        let uri = params.text_document.uri;
+        let dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::folding::document_links(
+            model,
+            dir.as_deref(),
+        )))
     }
 
     async fn references(
