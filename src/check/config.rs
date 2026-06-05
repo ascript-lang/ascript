@@ -44,6 +44,10 @@ pub const RULE_CODES: &[&str] = &[
     "duplicate-member",
     "super-misuse",
     "field-default-type",
+    // SP10 — the advisory gradual type checker (all default Warning).
+    "type-mismatch",
+    "type-error",
+    "possibly-nil",
 ];
 
 /// Per-code severity overrides plus global warning promotion.
