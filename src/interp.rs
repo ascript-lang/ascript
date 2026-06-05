@@ -374,6 +374,50 @@ pub enum LogFormat {
     Json,
 }
 
+/// A single resolved third-party package: its loadable root directory and the
+/// absolute entry module to bind for a bare `import "<name>"` (SP6 §6).
+///
+/// This is a DEPENDENCY-FREE plain-`std` type living in the interpreter core so a
+/// bare-specifier import resolves identically on both engines. The CLI's `pkg`
+/// feature (manifest/lock/MVS/fetch) builds the [`PackageMap`] and installs it via
+/// [`Interp::set_package_resolver`]; the core never grows a network/git/toml
+/// dependency. Under `--no-default-features` (no `pkg`) the map is simply always
+/// empty, so a bare specifier yields the clean "unknown package" error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPkg {
+    /// The package's root directory (a content-addressed `store/<hash>/` dir for a
+    /// git/url dep, or the local dir for a path dep). Package-internal `./`
+    /// imports resolve within this root via the existing file-module loader.
+    pub root: PathBuf,
+    /// The absolute entry module bound for a bare `import "<name>"` (no subpath).
+    pub entry: PathBuf,
+}
+
+/// The CLI-injected resolved dependency set: package key → resolved package. The
+/// key is the first path segment (`http` for `import "http/router"`) or the
+/// `@scope/name` pair for a scoped package.
+pub type PackageMap = HashMap<String, ResolvedPkg>;
+
+/// The three-way classification of an `import` specifier, shared BYTE-IDENTICALLY
+/// by both engines (the tree-walker `Stmt::Import` arm and the VM `Op::Import`
+/// exec) via [`Interp::classify_specifier`] (SP6 §6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecifierKind {
+    /// `std/*` — a built-in stdlib module (unchanged; never touches the FS).
+    Std,
+    /// A relative/absolute file module (`./m`, `../m`, `/abs/m`) — unchanged; the
+    /// resolved path is joined against the importer's dir by the existing loader.
+    Relative(PathBuf),
+    /// A bare package specifier whose first segment resolved in the package map.
+    /// `target` is the absolute file the existing loader should load: the
+    /// package's `entry` (no subpath) or `root.join(subpath)` with a default
+    /// `.as` extension.
+    Package { key: String, target: PathBuf },
+    /// A bare package specifier whose first segment is NOT in the resolved set →
+    /// a Tier-2 "unknown package" error (identical message on both engines).
+    UnknownPackage(String),
+}
+
 /// All mutable interpreter state lives behind interior mutability (`RefCell`/
 /// `Cell`) so the `eval`/`exec`/`call_*` methods take `&self`, not `&mut self`.
 /// This lets multiple concurrent eval futures (M17 Phase 2+) share one
@@ -478,12 +522,44 @@ pub struct Interp {
     /// value out / drop the borrow before returning, like the `resources`
     /// discipline).
     determinism: RefCell<Option<crate::det::DeterminismContext>>,
+    /// SP6 §6: the CLI-injected resolved third-party package set. `None` until
+    /// [`Interp::set_package_resolver`] installs it (the REPL / tests / a project
+    /// with no deps leave it `None` → every bare specifier is "unknown package").
+    /// A DEPENDENCY-FREE plain map (no network/git/toml types), so the core
+    /// compiles under `--no-default-features` with the map simply always absent.
+    /// Read through a short-lived borrow that is dropped BEFORE the loader
+    /// `.await` (the resolved target is cloned out first — never hold this borrow
+    /// across an await; `await_holding_refcell_ref` stays satisfied).
+    package_resolver: RefCell<Option<PackageMap>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
 /// after spawning so the executor can reap finished/cancelled tasks. Keeps a
 /// no-await loop of un-awaited async calls bounded instead of growing to N.
 const INFLIGHT_YIELD_CAP: u64 = 256;
+
+/// Split a bare import specifier into `(package_key, subpath)` (SP6 §6). The key
+/// is the first path segment, or the `@scope/name` pair for a scoped package; the
+/// subpath is everything after it (empty if none). E.g.
+/// `"http"` → `("http", "")`, `"http/router"` → `("http", "router")`,
+/// `"@acme/schema"` → `("@acme/schema", "")`,
+/// `"@acme/schema/sub"` → `("@acme/schema", "sub")`.
+pub(crate) fn split_package_key(source: &str) -> (String, String) {
+    if let Some(rest) = source.strip_prefix('@') {
+        // Scoped: the key is the first TWO segments (`@scope/name`).
+        let mut parts = rest.splitn(3, '/');
+        let scope = parts.next().unwrap_or("");
+        let name = parts.next().unwrap_or("");
+        let subpath = parts.next().unwrap_or("");
+        let key = format!("@{scope}/{name}");
+        (key, subpath.to_string())
+    } else {
+        match source.split_once('/') {
+            Some((first, rest)) => (first.to_string(), rest.to_string()),
+            None => (source.to_string(), String::new()),
+        }
+    }
+}
 
 /// The real wall clock in ms since the Unix epoch (the value `time.now`/`date.now`
 /// return when NOT in deterministic mode). Shared so the determinism seam and the
@@ -725,6 +801,7 @@ impl Interp {
             ai: RefCell::new(crate::stdlib::ai::AiClient::default()),
             cli_args: RefCell::new(Vec::new()),
             determinism: RefCell::new(None),
+            package_resolver: RefCell::new(None),
         }
     }
 
@@ -1944,6 +2021,65 @@ impl Interp {
             p.set_extension("as");
         }
         p
+    }
+
+    /// Install the CLI-resolved third-party package set (SP6 §6). Called once,
+    /// before running, by `ascript run`/`test`. A subsequent bare specifier
+    /// (`import "http"`) resolves through this map on BOTH engines. Replaces any
+    /// previously-installed map (the REPL re-installs per session).
+    pub fn set_package_resolver(&self, map: PackageMap) {
+        *self.package_resolver.borrow_mut() = Some(map);
+    }
+
+    /// Classify an `import` specifier three ways, SHARED byte-identically by both
+    /// engines (SP6 §6). The split, in order:
+    ///
+    /// 1. `std/…`              → [`SpecifierKind::Std`] (unchanged).
+    /// 2. `./`, `../`, absolute → [`SpecifierKind::Relative`] (unchanged; the
+    ///    path is the importer-relative file the existing loader will join).
+    /// 3. otherwise → a BARE PACKAGE specifier: split off the first segment (or
+    ///    `@scope/name` for a scoped package) as the key; look it up in the
+    ///    resolved map. Hit with no subpath → the package `entry`; hit with a
+    ///    subpath → `root.join(subpath)` (default `.as`); miss →
+    ///    [`SpecifierKind::UnknownPackage`].
+    ///
+    /// This holds the `package_resolver` borrow ONLY for the synchronous lookup
+    /// and clones the resolved [`ResolvedPkg`] out — the returned `target` is owned
+    /// so the caller never holds the borrow across the loader `.await`.
+    pub(crate) fn classify_specifier(&self, source: &str) -> SpecifierKind {
+        if source.starts_with("std/") {
+            return SpecifierKind::Std;
+        }
+        if source.starts_with("./")
+            || source.starts_with("../")
+            || Path::new(source).is_absolute()
+        {
+            return SpecifierKind::Relative(self.resolve_import(source));
+        }
+
+        // Bare package specifier. Compute the package key + the remaining subpath.
+        let (key, subpath) = split_package_key(source);
+
+        let resolved = self
+            .package_resolver
+            .borrow()
+            .as_ref()
+            .and_then(|m| m.get(&key).cloned());
+        match resolved {
+            None => SpecifierKind::UnknownPackage(key),
+            Some(pkg) => {
+                let target = if subpath.is_empty() {
+                    pkg.entry
+                } else {
+                    let mut p = pkg.root.join(&subpath);
+                    if p.extension().is_none() {
+                        p.set_extension("as");
+                    }
+                    p
+                };
+                SpecifierKind::Package { key, target }
+            }
+        }
     }
 
     /// Resolve a `std/*` module to its `ModuleEntry` for the bytecode VM. This is
@@ -8440,5 +8576,101 @@ let n = nil
 print(n?.m())
 "#;
         assert_eq!(run(src).await, "7\nnil\n");
+    }
+
+    // ---- SP6 package resolver plumbing (D1) ---------------------------------
+
+    #[test]
+    fn split_package_key_unscoped() {
+        assert_eq!(split_package_key("http"), ("http".into(), "".into()));
+        assert_eq!(
+            split_package_key("http/router"),
+            ("http".into(), "router".into())
+        );
+        assert_eq!(
+            split_package_key("http/a/b"),
+            ("http".into(), "a/b".into())
+        );
+    }
+
+    #[test]
+    fn split_package_key_scoped() {
+        assert_eq!(
+            split_package_key("@acme/schema"),
+            ("@acme/schema".into(), "".into())
+        );
+        assert_eq!(
+            split_package_key("@acme/schema/sub"),
+            ("@acme/schema".into(), "sub".into())
+        );
+        assert_eq!(
+            split_package_key("@acme/schema/a/b"),
+            ("@acme/schema".into(), "a/b".into())
+        );
+    }
+
+    #[test]
+    fn classify_std_and_relative_unchanged() {
+        let interp = Interp::new();
+        assert_eq!(interp.classify_specifier("std/math"), SpecifierKind::Std);
+        // Relative paths resolve against module_dir (default ".") + default ".as".
+        match interp.classify_specifier("./util") {
+            SpecifierKind::Relative(p) => assert!(p.to_string_lossy().ends_with("util.as")),
+            other => panic!("expected Relative, got {other:?}"),
+        }
+        match interp.classify_specifier("../sib/mod") {
+            SpecifierKind::Relative(p) => assert!(p.to_string_lossy().ends_with("mod.as")),
+            other => panic!("expected Relative, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_bare_unknown_without_resolver() {
+        let interp = Interp::new();
+        // No resolver installed → every bare specifier is UnknownPackage.
+        assert_eq!(
+            interp.classify_specifier("http"),
+            SpecifierKind::UnknownPackage("http".into())
+        );
+        assert_eq!(
+            interp.classify_specifier("@scope/x/sub"),
+            SpecifierKind::UnknownPackage("@scope/x".into())
+        );
+    }
+
+    #[test]
+    fn classify_bare_package_entry_and_subpath() {
+        let interp = Interp::new();
+        let mut map = PackageMap::new();
+        map.insert(
+            "lib".into(),
+            ResolvedPkg {
+                root: PathBuf::from("/store/abc"),
+                entry: PathBuf::from("/store/abc/src/main.as"),
+            },
+        );
+        interp.set_package_resolver(map);
+
+        // No subpath → the entry module.
+        match interp.classify_specifier("lib") {
+            SpecifierKind::Package { key, target } => {
+                assert_eq!(key, "lib");
+                assert_eq!(target, PathBuf::from("/store/abc/src/main.as"));
+            }
+            other => panic!("expected Package, got {other:?}"),
+        }
+        // Subpath → root.join(subpath) + default .as.
+        match interp.classify_specifier("lib/util") {
+            SpecifierKind::Package { key, target } => {
+                assert_eq!(key, "lib");
+                assert_eq!(target, PathBuf::from("/store/abc/util.as"));
+            }
+            other => panic!("expected Package, got {other:?}"),
+        }
+        // A miss on an unknown key stays UnknownPackage even with a resolver.
+        assert_eq!(
+            interp.classify_specifier("other"),
+            SpecifierKind::UnknownPackage("other".into())
+        );
     }
 }
