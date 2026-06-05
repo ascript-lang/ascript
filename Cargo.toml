@@ -75,6 +75,10 @@ rmpv = { version = "1", optional = true }
 ciborium = { version = "0.2", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"], optional = true }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"], optional = true }
+# SP11 std/ai: multi-provider LLM client. Wraps the genai crate (OpenAI +
+# OpenAI-compat swarm + native Anthropic/Gemini + Bedrock SigV4 + Vertex). Optional,
+# off-by-default `ai` feature (network + heavy provider deps → opt-in like telemetry).
+genai = { version = "0.6", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -133,6 +137,14 @@ sysinfo = ["dep:sysinfo"]
 # SP11-facing Interp::telemetry_* soft hook keeps always-present signatures so
 # std/ai builds with telemetry absent.
 telemetry = ["data", "net"]
+# SP11 std/ai: multi-provider LLM client wrapping the genai crate. Depends on
+# `data` (json serialization for raw escape-hatch + structured output) and `net`
+# (the pooled reqwest client we inject into genai). NOT in `default` (network +
+# heavy provider deps → opt-in, like telemetry/http3). cfg's out cleanly under
+# --no-default-features; the std/ai import is still accepted by the checker via
+# the un-gated STD_MODULES list. Emits OTel GenAI spans through SP12's soft hook
+# with NO Cargo dependency on telemetry (works whether telemetry is on or off).
+ai = ["data", "net", "dep:genai"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"

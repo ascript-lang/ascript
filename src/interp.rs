@@ -453,6 +453,14 @@ pub struct Interp {
     /// Empty unless set by [`Interp::set_cli_args`] (i.e. the REPL and test
     /// runner always see `[]`, which is correct).
     cli_args: RefCell<Vec<Rc<str>>>,
+    /// SP11 std/ai state: the lazily-built genai `Client` (one per `Interp`, with
+    /// our pooled reqwest client injected) and an optional fixture-replay seam used
+    /// by tests to serve recorded JSON/SSE bodies with no socket/secret. `None`
+    /// until the first `ai.*` call materializes it. State lives behind this
+    /// `RefCell` so the `&self` `call_ai` path can take the client OUT across each
+    /// `.await` (take-out-across-await), never holding a borrow over a genai await.
+    #[cfg(feature = "ai")]
+    ai: RefCell<crate::stdlib::ai::AiClient>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -673,6 +681,8 @@ impl Interp {
             telemetry: RefCell::new(None),
             #[cfg(feature = "telemetry")]
             telemetry_capture: RefCell::new(Vec::new()),
+            #[cfg(feature = "ai")]
+            ai: RefCell::new(crate::stdlib::ai::AiClient::default()),
             cli_args: RefCell::new(Vec::new()),
         }
     }
@@ -1437,6 +1447,29 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         crate::stdlib::telemetry::dispatch(self, func, args, span).await
+    }
+
+    /// `std/ai` dispatch (SP11). Delegates to the ai module, which owns the genai
+    /// request/response mapping; the `Interp` owns the genai `Client` lifetime
+    /// (`self.ai`) + resource handles. Borrow discipline: the genai client is taken
+    /// OUT of `self.ai` across each `.await` (take-out-across-await) so no `RefCell`
+    /// borrow is ever held over a genai future.
+    #[cfg(feature = "ai")]
+    pub(crate) async fn call_ai(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        crate::stdlib::ai::dispatch(self, func, args, span).await
+    }
+
+    /// Mutable borrow of the per-`Interp` AI client state. SP11 take-out-across-await
+    /// helper: callers clone out the genai `Client` (cheap `Arc` inside) before any
+    /// `.await`, never holding this borrow across one.
+    #[cfg(feature = "ai")]
+    pub(crate) fn ai_state(&self) -> std::cell::RefMut<'_, crate::stdlib::ai::AiClient> {
+        self.ai.borrow_mut()
     }
 
     /// Is the captured output buffer empty? (REPL flush check.) Always true under
