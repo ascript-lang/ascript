@@ -2,6 +2,7 @@
 //! config/suppression, and the LSP-facing entry point.
 pub mod analyze;
 pub mod config;
+pub mod config_toml;
 pub mod diagnostic;
 pub mod fix;
 pub mod infer;

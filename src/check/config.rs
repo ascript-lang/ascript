@@ -5,7 +5,7 @@
 //! `--deny`/`--warn`/`--allow <rule>` (repeatable). `deny_warnings` additionally
 //! promotes all surviving warnings for exit-code purposes
 //! (`ascript check --deny-warnings`). The `ascript.toml` `[lint]` table
-//! (discovered + parsed in the CLI binary's `lint_config_toml` module) also
+//! (discovered + parsed in the `check::config_toml` module) also
 //! seeds this same `LintConfig`; the CLI flags are overlaid on top, so the net
 //! precedence is: inline `// ascript-ignore[code]` suppression (runs first, in
 //! `analyze.rs`, and config cannot resurrect a diagnostic the source suppressed),
