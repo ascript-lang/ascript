@@ -202,6 +202,62 @@ fn is_keyword_kind(k: SyntaxKind) -> bool {
     )
 }
 
+use tower_lsp::lsp_types::{Range, SemanticToken, SemanticTokens};
+
+/// `semanticTokens/full`: every classified token, delta-encoded.
+pub fn semantic_tokens_full(model: &SemanticModel) -> SemanticTokens {
+    encode(model, &classify(model))
+}
+
+/// `semanticTokens/range`: only tokens whose byte span overlaps `range`.
+pub fn semantic_tokens_range(model: &SemanticModel, range: Range) -> SemanticTokens {
+    let start =
+        crate::lsp::convert::char_to_byte(&model.text, model.line_index.offset(range.start));
+    let end = crate::lsp::convert::char_to_byte(&model.text, model.line_index.offset(range.end));
+    let filtered: Vec<ClassifiedToken> = classify(model)
+        .into_iter()
+        .filter(|c| c.start < end && (c.start + c.len) > start)
+        .collect();
+    encode(model, &filtered)
+}
+
+/// Delta-encode classified tokens. Each token becomes 5 ints relative to the
+/// PREVIOUS token's line/char (LSP semantic-tokens wire format). A multi-line
+/// token (block comment) is emitted as a single token at its start position;
+/// clients handle the run via `length` (acceptable for v1 — matches the design's
+/// "deltas deferred" note).
+fn encode(model: &SemanticModel, tokens: &[ClassifiedToken]) -> SemanticTokens {
+    let mut data = Vec::with_capacity(tokens.len());
+    let mut prev_line = 0u32;
+    let mut prev_char = 0u32;
+    for c in tokens {
+        let pos = model
+            .line_index
+            .position(crate::lsp::convert::byte_to_char(&model.text, c.start));
+        let length = (crate::lsp::convert::byte_to_char(&model.text, c.start + c.len)
+            - crate::lsp::convert::byte_to_char(&model.text, c.start)) as u32;
+        let delta_line = pos.line - prev_line;
+        let delta_start = if pos.line == prev_line {
+            pos.character - prev_char
+        } else {
+            pos.character
+        };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length,
+            token_type: c.token_type,
+            token_modifiers_bitset: c.modifiers,
+        });
+        prev_line = pos.line;
+        prev_char = pos.character;
+    }
+    SemanticTokens {
+        result_id: None,
+        data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +311,57 @@ mod tests {
         let kinds: Vec<u32> = cs.iter().map(|c| c.token_type).collect();
         assert!(kinds.contains(&TYPE_FUNCTION), "{kinds:?}");
         assert!(kinds.contains(&TYPE_PARAMETER), "{kinds:?}");
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    fn model(src: &str) -> SemanticModel {
+        SemanticModel::build(src.to_string(), None, &LintConfig::default())
+    }
+
+    #[test]
+    fn full_encodes_first_token_absolute() {
+        let st = semantic_tokens_full(&model("let x = 1\n"));
+        assert!(!st.data.is_empty());
+        // First token (`let`) is at line 0 char 0 → deltas are absolute (0,0).
+        assert_eq!(st.data[0].delta_line, 0);
+        assert_eq!(st.data[0].delta_start, 0);
+        assert_eq!(st.data[0].length, 3); // "let"
+        assert_eq!(st.data[0].token_type, TYPE_KEYWORD);
+    }
+
+    #[test]
+    fn full_deltas_are_monotonic_within_a_line() {
+        // Second token on the same line uses a positive delta_start, delta_line 0.
+        let st = semantic_tokens_full(&model("let x = 1\n"));
+        // `x` follows `let ` → delta_line 0, delta_start = 4 (chars from `let` start).
+        let x = st
+            .data
+            .iter()
+            .find(|t| t.token_type == TYPE_VARIABLE)
+            .unwrap();
+        assert_eq!(x.delta_line, 0);
+        assert_eq!(x.delta_start, 4);
+    }
+
+    #[test]
+    fn range_filters_to_overlapping_tokens() {
+        let src = "let a = 1\nlet b = 2\n";
+        let m = model(src);
+        // A range covering only line 1 must exclude line-0 tokens.
+        let st = semantic_tokens_range(
+            &m,
+            Range::new(
+                tower_lsp::lsp_types::Position::new(1, 0),
+                tower_lsp::lsp_types::Position::new(1, 9),
+            ),
+        );
+        // First emitted token is on line 1 (delta_line == 1 from the (0,0) baseline).
+        assert!(!st.data.is_empty());
+        assert_eq!(st.data[0].delta_line, 1);
     }
 }
