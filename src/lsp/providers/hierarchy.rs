@@ -28,13 +28,60 @@ pub fn prepare_call(idx: &WorkspaceIndex, path: &Path, offset: usize) -> Option<
 
 /// Incoming calls: every reference to the anchor across the workspace, grouped by
 /// the file they occur in. Reuses `references_at` (which already follows import
-/// edges), excluding the declaration itself.
+/// edges, excluding the declaration itself) and then FILTERS to actual call sites
+/// — a reference that merely uses the callable as a value (`let g = helper`) is
+/// dropped; only references that are the CALLEE `NameRef` of a `CallExpr` survive.
 pub fn incoming_calls(
     idx: &WorkspaceIndex,
     anchor: &CallAnchor,
 ) -> Vec<(PathBuf, crate::check::diagnostic::ByteSpan)> {
     let off = anchor.name_range.start;
     idx.references_at(&anchor.path, off, false)
+        .into_iter()
+        .filter(|(path, span)| is_call_site(idx, path, *span))
+        .collect()
+}
+
+/// True iff the reference at `span` in `path` is the CALLEE of a `CallExpr` (vs. a
+/// bare value use). Re-parses the file's cached index text (the established pattern
+/// from `file_module_arity`/`exported_fn_arity`) and locates the `NameRef` whose
+/// range matches `span`; it is a call site iff its parent is a `CallExpr` and it is
+/// that `CallExpr`'s first `NameRef` child (the callee position).
+fn is_call_site(
+    idx: &WorkspaceIndex,
+    path: &Path,
+    span: crate::check::diagnostic::ByteSpan,
+) -> bool {
+    use crate::syntax::kind::SyntaxKind;
+    let canon = crate::lsp::workspace::canon(path);
+    let Some(file) = idx.files.get(&canon) else {
+        return false;
+    };
+    let parsed = crate::syntax::parser::parse(&file.text);
+    if !parsed.errors.is_empty() || !parsed.lex_errors.is_empty() {
+        return false;
+    }
+    let tree = crate::syntax::tree_builder::build_tree(parsed);
+    // The NameRef whose range is exactly the reference span.
+    let Some(name_ref) = tree.descendants().find(|n| {
+        n.kind() == SyntaxKind::NameRef
+            && crate::check::diagnostic::ByteSpan::from(n.text_range()) == span
+    }) else {
+        return false;
+    };
+    let Some(parent) = name_ref.parent() else {
+        return false;
+    };
+    if parent.kind() != SyntaxKind::CallExpr {
+        return false;
+    }
+    // It is the callee iff it is the CallExpr's first NameRef child (the callee
+    // position — mirrors `file_module_arity`'s `children().find(NameRef)`).
+    let callee_range = parent
+        .children()
+        .find(|c| c.kind() == SyntaxKind::NameRef)
+        .map(|c| c.text_range());
+    callee_range == Some(name_ref.text_range())
 }
 
 #[cfg(test)]
@@ -84,6 +131,38 @@ mod call_tests {
         assert!(
             !incoming.is_empty(),
             "should find the call in main: {incoming:?}"
+        );
+    }
+
+    #[test]
+    fn incoming_excludes_value_use_references() {
+        // `helper` is BOTH called (`helper()`) AND used as a value (`let g = helper`).
+        // Only the call site is an incoming call; the value-use reference must NOT
+        // appear.
+        let src = "fn helper() { return 1 }\nfn main() {\n  let g = helper\n  return helper()\n}\n";
+        let (dir, idx) = index(&[("a.as", src)]);
+        let p = crate::lsp::workspace::canon(&dir.path().join("a.as"));
+        let text = &idx.files[&p].text;
+        let decl_off = text.find("fn helper").unwrap() + 3;
+        let anchor = prepare_call(&idx, &p, decl_off).expect("anchor on decl");
+        let incoming = incoming_calls(&idx, &anchor);
+        assert_eq!(
+            incoming.len(),
+            1,
+            "exactly the one call site, not the value use: {incoming:?}"
+        );
+        // The single ref is the CALL-site `helper`, not the `let g = helper` one:
+        // its span lands in the `return helper()` region, AFTER the value use.
+        let (_, span) = &incoming[0];
+        let value_use_off = text.find("= helper").unwrap();
+        let call_off = text.rfind("helper").unwrap();
+        assert!(
+            span.start > value_use_off && span.start <= call_off,
+            "ref is the call-site occurrence, not the value use: {span:?}"
+        );
+        assert!(
+            text[span.start..span.end].contains("helper"),
+            "span covers the `helper` identifier: {span:?}"
         );
     }
 }
