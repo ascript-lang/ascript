@@ -7,7 +7,7 @@
   "keywords": ["parser", "lexer", "tree-sitter", "ascript"],
   "main": "bindings/node",
   "types": "bindings/node",
-  "files": ["grammar.js", "binding.gyp", "bindings/node/*", "queries/*", "src/**"],
+  "files": ["grammar.js", "binding.gyp", "bindings/node/*", "queries/*", "src/**", "README.md"],
   "dependencies": {
     "node-addon-api": "^7.1.0",
     "node-gyp-build": "^4.8.0"
