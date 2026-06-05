@@ -108,6 +108,19 @@ mod tests {
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         collect_rs(std::path::Path::new(&lsp_dir), &mut files);
         assert!(!files.is_empty(), "expected to find .rs files under src/lsp");
+        // Phase 1: the three new editing-essentials providers MUST be in scope of
+        // this scan so they can never re-introduce a legacy front-end import.
+        for required in [
+            "providers/formatting.rs",
+            "providers/completion.rs",
+            "providers/code_action.rs",
+        ] {
+            let want = std::path::Path::new(&lsp_dir).join(required);
+            assert!(
+                files.iter().any(|f| f == &want),
+                "guard scan must cover {required}"
+            );
+        }
         for path in files {
             let src = std::fs::read_to_string(&path).unwrap_or_default();
             for b in &banned {
