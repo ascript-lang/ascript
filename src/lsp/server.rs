@@ -24,6 +24,10 @@ use tower_lsp::{Client, LanguageServer};
 /// keystrokes (typing ~10 chars/sec → all fold into one rebuild).
 const DEBOUNCE_MS: u64 = 40;
 
+/// A pending (debounced) edit for a URL: the latest folded text, its document
+/// version, and the monotone edit sequence number that stamps it.
+type PendingEdit = (String, Option<i32>, u64);
+
 /// Client-configurable settings (subset). Updated by `didChangeConfiguration`.
 #[derive(Debug, Clone, Default)]
 pub struct LspSettings {
@@ -47,7 +51,7 @@ pub struct Backend {
     /// Coalescing: the latest pending text + version + edit sequence number per URL.
     /// A debounced rebuild only proceeds if its captured sequence is still the latest
     /// for the URL (a newer edit landing supersedes it).
-    pending: Mutex<HashMap<Url, (String, Option<i32>, u64)>>,
+    pending: Mutex<HashMap<Url, PendingEdit>>,
     /// Monotone edit sequence, bumped on every `did_change`.
     edit_seq: AtomicU64,
     /// Set by `window/workDoneProgress/cancel` for the indexing token; checked
