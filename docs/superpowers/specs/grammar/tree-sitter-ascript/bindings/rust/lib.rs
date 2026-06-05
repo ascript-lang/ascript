@@ -28,8 +28,11 @@ pub const INDENTS_QUERY: &str = include_str!("../../queries/indents.scm");
 
 /// The text-objects query for this grammar.
 pub const TEXTOBJECTS_QUERY: &str = include_str!("../../queries/textobjects.scm");
-// NOTE: TAGS/BRACKETS query constants are
-// added by their creating tasks (Phase 5 Tasks 9–10) so this crate always compiles —
+
+/// The symbol-tagging query (nav / ctags-style indexing) for this grammar.
+pub const TAGS_QUERY: &str = include_str!("../../queries/tags.scm");
+// NOTE: the BRACKETS query constant is
+// added by its creating task (Phase 5 Task 10) so this crate always compiles —
 // `include_str!` requires the target file to exist.
 
 #[cfg(test)]
