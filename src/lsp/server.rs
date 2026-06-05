@@ -1,12 +1,14 @@
 //! tower-lsp `LanguageServer` implementation: a thin async adapter over the pure
-//! `analysis` layer plus a document store.
+//! `analysis` layer plus a cached `SemanticModel` document store.
 //!
 //! The backend is `Send + Sync` because it holds only `Send + Sync` types: the
-//! `Client`, and a `tokio::sync::Mutex<HashMap<Url, String>>` of document text. No
-//! interpreter state (`Rc`/`RefCell`/`Value`) is ever held, so this compiles on the
-//! `current_thread` tokio runtime AND satisfies tower-lsp's `Send + Sync` bounds.
+//! `Client`, and a `tokio::sync::Mutex<DocumentStore>` of per-document semantic
+//! models. No interpreter state (`Rc`/`RefCell`/`Value`) is ever held, so this
+//! compiles on the `current_thread` tokio runtime AND satisfies tower-lsp's
+//! `Send + Sync` bounds.
 
 use crate::lsp::analysis;
+use crate::lsp::model::DocumentStore;
 use crate::lsp::workspace::{self, WorkspaceIndex};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -17,7 +19,7 @@ use tower_lsp::{Client, LanguageServer};
 
 pub struct Backend {
     client: Client,
-    documents: Mutex<HashMap<Url, String>>,
+    documents: Mutex<DocumentStore>,
     /// The cross-file symbol index (SP4 §4). `RwLock` (not the interpreter's
     /// `RefCell`) keeps the backend `Send + Sync`; it holds only owned
     /// `String`/`PathBuf`/range data, never a `Value`.
@@ -31,7 +33,7 @@ impl Backend {
     pub fn new(client: Client) -> Self {
         Backend {
             client,
-            documents: Mutex::new(HashMap::new()),
+            documents: Mutex::new(DocumentStore::new()),
             index: RwLock::new(WorkspaceIndex::new()),
             roots: RwLock::new(Vec::new()),
         }
@@ -46,11 +48,18 @@ impl Backend {
         }
     }
 
-    /// Store the document text and publish its diagnostics. Merges the path-less
-    /// `analysis::diagnostics` with the index-backed file-module call-arity
-    /// (D-arity), which the single-file analysis cannot compute.
+    /// Build/cache the document's `SemanticModel` and publish its diagnostics.
+    /// Merges the model's config-aware single-file diagnostics with the
+    /// index-backed file-module call-arity (D-arity), which the single-file
+    /// analysis cannot compute.
     async fn analyze_and_publish(&self, uri: Url, text: String, version: Option<i32>) {
-        let mut diags = analysis::diagnostics(&text);
+        let mut diags;
+        {
+            let mut store = self.documents.lock().await;
+            store.set(uri.clone(), text.clone(), version);
+            diags = store.get(&uri).map(|m| m.lsp_diagnostics()).unwrap_or_default();
+        }
+        // Index-backed cross-file arity (cannot be computed single-file).
         if let Some(path) = url_to_canon(&uri) {
             if let Ok(idx) = self.index.read() {
                 for d in idx.file_module_arity(&path, &text) {
@@ -58,7 +67,6 @@ impl Backend {
                 }
             }
         }
-        self.documents.lock().await.insert(uri.clone(), text);
         self.client.publish_diagnostics(uri, diags, version).await;
     }
 }
@@ -186,8 +194,8 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> tower_lsp::jsonrpc::Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let symbols = analysis::document_symbols(text);
@@ -197,8 +205,8 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -211,8 +219,8 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -226,8 +234,8 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -270,8 +278,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_decl = params.context.include_declaration;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -332,8 +340,8 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri;
         let position = params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -359,8 +367,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
