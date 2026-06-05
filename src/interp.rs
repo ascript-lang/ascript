@@ -1086,7 +1086,17 @@ impl Interp {
         req: crate::stdlib::telemetry::model::CapturedRequest,
     ) -> Result<(), String> {
         if matches!(self.output, OutputSink::Capture(_)) {
-            self.telemetry_capture.borrow_mut().push(req);
+            self.telemetry_capture.borrow_mut().push(req.clone());
+            // Test seam: a test may force the capture send to "fail" to exercise
+            // the error model (a flush failure is logged once + dropped, never
+            // panics). Off by default; set per-thread via
+            // `crate::telemetry_test_force_send_error`.
+            if crate::stdlib::telemetry::test_force_send_error() {
+                return Err(format!(
+                    "telemetry {} export to {} failed: forced (test)",
+                    req.exporter, req.url
+                ));
+            }
             return Ok(());
         }
         // Live: POST via the shared pooled client. Build the request fully before
@@ -1383,6 +1393,35 @@ impl Interp {
         if let Some(state) = self.telemetry.borrow_mut().as_mut() {
             if state.exporters.posthog.is_some() || state.mirror_events_to_otlp {
                 state.events.push(ev);
+            }
+        }
+    }
+
+    /// Flush the telemetry pipeline at process exit (spec §2: an automatic flush
+    /// on the existing shutdown path). A no-op if telemetry was never initialized
+    /// or the feature is off. A flush failure is logged once to stderr and dropped
+    /// — telemetry must never affect the program's exit. Buffered signals are
+    /// cleared either way.
+    pub async fn telemetry_flush_on_exit(&self) {
+        #[cfg(feature = "telemetry")]
+        {
+            if !self.telemetry_active() {
+                return;
+            }
+            if let Some(mut state) = self.telemetry_take_state() {
+                let outcome =
+                    crate::stdlib::telemetry::flush_state_public(self, &mut state).await;
+                state.spans.clear();
+                state.events.clear();
+                self.telemetry_return_state(state);
+                if let Err(msg) = outcome {
+                    // Live builds warn once; capture builds (tests) stay quiet.
+                    if matches!(self.output, OutputSink::Live) {
+                        use std::io::Write;
+                        let mut e = std::io::stderr().lock();
+                        let _ = writeln!(e, "telemetry: flush-on-exit failed: {}", msg);
+                    }
+                }
             }
         }
     }

@@ -27,6 +27,14 @@ use crate::interp::Interp;
 pub use crate::interp::TestSummary;
 #[cfg(feature = "telemetry")]
 pub use crate::stdlib::telemetry::model::CapturedRequest;
+/// Test seam: force the SP12 telemetry capture-mode send to "fail" (per-thread),
+/// to exercise the error model (a flush failure is logged once + dropped, never
+/// aborts the program). `#[doc(hidden)]` — not a public API.
+#[doc(hidden)]
+#[cfg(feature = "telemetry")]
+pub fn telemetry_test_force_send_error(on: bool) {
+    crate::stdlib::telemetry::set_test_force_send_error(on);
+}
 use std::path::Path;
 use std::rc::Rc;
 
@@ -351,6 +359,8 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
     let result = local
         .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
         .await;
+    // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
+    local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await; // drain spawned tasks
                  // End-of-program cycle collection (V13-T3): reclaim any leftover
                  // reference cycles for a clean shutdown. The fiber's stack has been
@@ -420,6 +430,8 @@ pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, 
     let result = local
         .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
         .await;
+    // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
+    local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await; // drain spawned tasks (structured join)
                  // End-of-program cycle collection (V13-T3): see `run_aso_file`.
     crate::gc::collect();

@@ -76,6 +76,24 @@ pub fn is_known_func(func: &str) -> bool {
     )
 }
 
+thread_local! {
+    /// Test seam: when set, the capture-mode send seam returns an error so tests
+    /// can exercise the error model (flush failure → logged once + dropped, never
+    /// a program abort). Per-thread, so concurrent `#[tokio::test]`s (each on its
+    /// own current-thread runtime) don't interfere. Always `false` outside tests.
+    static FORCE_SEND_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set the per-thread force-send-error test seam (see [`FORCE_SEND_ERROR`]).
+pub fn set_test_force_send_error(on: bool) {
+    FORCE_SEND_ERROR.with(|c| c.set(on));
+}
+
+/// Read the force-send-error test seam.
+pub(crate) fn test_force_send_error() -> bool {
+    FORCE_SEND_ERROR.with(|c| c.get())
+}
+
 /// A Tier-1 success acknowledgement `[true, nil]` (from `init`/`flush`).
 fn tier1_ok() -> Value {
     crate::interp::make_pair(Value::Bool(true), Value::Nil)
@@ -184,7 +202,7 @@ pub async fn dispatch(
         "otlp" => build_otlp_descriptor(args, span),
         "sentry" => build_sentry_descriptor(args, span),
         "posthog" => build_posthog_descriptor(args, span),
-        "init" => init(interp, args, span),
+        "init" => init(interp, args, span).await,
         "shutdown" => shutdown(interp).await,
         "flush" => flush(interp).await,
         "startSpan" => start_span(interp, args, span),
@@ -239,7 +257,7 @@ fn build_posthog_descriptor(args: &[Value], span: Span) -> Result<Value, Control
 /// missing/unparseable required exporter config is a Tier-1 `[nil, err]`; a wrong
 /// argument *type* (init not an object, unknown exporter kind, unsupported OTLP
 /// protocol) is a Tier-2 panic.
-fn init(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
+async fn init(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
     let cfg = super::arg(args, 0);
     let cfg_obj = match &cfg {
         Value::Object(_) => cfg.clone(),
@@ -294,8 +312,12 @@ fn init(interp: &Interp, args: &[Value], span: Span) -> Result<Value, Control> {
         instruments: IndexMap::new(),
         events: Vec::new(),
     };
-    // Re-init replaces the pipeline; the previous one (if any) was flushed by the
-    // explicit `flush`/`shutdown` discipline at the call site / process exit.
+    // Re-init REPLACES the pipeline, flushing the previous one first (spec §2) so
+    // its buffered signals are not lost. A flush failure here is swallowed (the
+    // old pipeline is being discarded regardless).
+    if interp.telemetry_active() {
+        let _ = flush(interp).await;
+    }
     interp.telemetry_install(state);
     Ok(tier1_ok())
 }
@@ -343,13 +365,26 @@ async fn flush(interp: &Interp) -> Result<Value, Control> {
     state.spans.clear();
     state.events.clear();
     interp.telemetry_return_state(state);
-    outcome
+    // Surface as a Tier-1 `[ok, err]` — never a panic (spec §5). A failed flush is
+    // observability noise the program may inspect, not a fatal error.
+    match outcome {
+        Ok(()) => Ok(tier1_ok()),
+        Err(msg) => Ok(tier1_err(&msg)),
+    }
 }
 
-/// Export every buffered signal through each configured exporter. Returns a
-/// Tier-1 `[ok, err]`: `ok` on full success, else `[nil, err]` carrying the first
-/// failure (already logged + dropped — the program continues either way).
-async fn flush_state(interp: &Interp, state: &mut TelemetryState) -> Result<Value, Control> {
+/// Export every buffered signal through each configured exporter. Returns the
+/// FIRST exporter failure (already non-fatal — the caller turns it into a Tier-1
+/// pair or logs+drops it on the exit path). Used by `flush`, re-`init`, and
+/// flush-on-exit.
+pub(crate) async fn flush_state_public(
+    interp: &Interp,
+    state: &mut TelemetryState,
+) -> Result<(), String> {
+    flush_state(interp, state).await
+}
+
+async fn flush_state(interp: &Interp, state: &mut TelemetryState) -> Result<(), String> {
     let mut first_err: Option<String> = None;
     // OTLP: spans + metrics + (mirrored) event logs.
     if state.exporters.otlp.is_some() {
@@ -368,8 +403,8 @@ async fn flush_state(interp: &Interp, state: &mut TelemetryState) -> Result<Valu
         }
     }
     match first_err {
-        None => Ok(tier1_ok()),
-        Some(msg) => Ok(tier1_err(&msg)),
+        None => Ok(()),
+        Some(msg) => Err(msg),
     }
 }
 

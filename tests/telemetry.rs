@@ -7,6 +7,7 @@
 #![cfg(feature = "telemetry")]
 
 use ascript::run_source_with_interp;
+use ascript::value::Value;
 use std::rc::Rc;
 
 /// Run `.as` source on the tree-walker, returning (stdout, captured requests).
@@ -461,4 +462,143 @@ await telemetry.flush()
     assert!(req.body.contains("resourceLogs"), "{}", req.body);
     assert!(req.body.contains(r#""stringValue":"signup""#), "event body: {}", req.body);
     assert!(req.body.contains("distinct.id"), "distinct id attr: {}", req.body);
+}
+
+// ---- F5: error model, flush-on-exit, re-init/shutdown, the SP11 hook ----
+
+#[tokio::test]
+async fn flush_failure_is_tier1_not_a_panic() {
+    // A forced send failure surfaces as [nil, err] from flush; the program
+    // continues (prints "after"). Telemetry failure never aborts the program.
+    ascript::telemetry_test_force_send_error(true);
+    let (out, _interp) = run_i(&format!(
+        r#"{INIT}
+telemetry.startSpan("s").end()
+let [ok, err] = await telemetry.flush()
+print(ok)
+print(err != nil)
+print("after")
+"#
+    ))
+    .await;
+    ascript::telemetry_test_force_send_error(false);
+    assert_eq!(out, "nil\ntrue\nafter\n");
+}
+
+#[tokio::test]
+async fn init_non_object_is_tier2_panic() {
+    let r = run_source_with_interp(r#"
+import * as telemetry from "std/telemetry"
+telemetry.init(42)
+"#)
+    .await;
+    assert!(r.is_err(), "init(42) should be a Tier-2 panic");
+}
+
+#[tokio::test]
+async fn unknown_exporter_kind_is_tier2_panic() {
+    let r = run_source_with_interp(r#"
+import * as telemetry from "std/telemetry"
+telemetry.init({ service: "t", exporters: [ { foo: 1 } ] })
+"#)
+    .await;
+    assert!(r.is_err(), "a non-descriptor exporter should be a Tier-2 panic");
+}
+
+#[tokio::test]
+async fn setstatus_bogus_is_tier2_panic() {
+    let r = run_source_with_interp(&format!(
+        r#"{INIT}
+let s = telemetry.startSpan("s")
+s.setStatus("bogus")
+"#
+    ))
+    .await;
+    assert!(r.is_err(), "setStatus(\"bogus\") should be a Tier-2 panic");
+}
+
+#[tokio::test]
+async fn reinit_replaces_pipeline_flushing_old() {
+    // The first pipeline buffers a span; re-init flushes it (one traces request)
+    // then installs the new pipeline.
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+telemetry.startSpan("old").end()
+telemetry.init({{ service: "t2", exporters: [ telemetry.otlp({{ endpoint: "http://localhost:4318" }}) ] }})
+telemetry.startSpan("new").end()
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let traces: Vec<_> = caps.iter().filter(|r| r.signal == "traces").collect();
+    // One flush from re-init (carrying "old") + one explicit flush (carrying "new").
+    assert_eq!(traces.len(), 2, "re-init flush + explicit flush: {:?}", caps);
+    assert!(traces[0].body.contains("\"name\":\"old\""), "first flush has old span");
+    assert!(traces[1].body.contains("\"name\":\"new\""), "second flush has new span");
+}
+
+#[tokio::test]
+async fn shutdown_returns_to_noop() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT}
+telemetry.startSpan("before").end()
+await telemetry.shutdown()
+telemetry.startSpan("after").end()   // no-op (pipeline torn down)
+await telemetry.flush()              // no-op
+"#
+    ))
+    .await;
+    let traces: Vec<_> = caps.iter().filter(|r| r.signal == "traces").collect();
+    // shutdown flushed "before"; nothing after.
+    assert_eq!(traces.len(), 1, "only shutdown's flush: {:?}", caps);
+    assert!(traces[0].body.contains("\"name\":\"before\""));
+    assert!(!traces[0].body.contains("\"name\":\"after\""));
+}
+
+#[tokio::test]
+async fn flush_on_exit_emits_unflushed_spans() {
+    // A program that creates spans but never calls flush(): the exit-path flush
+    // exports them (the SP11 GenAI-span use case — spans recorded by the library,
+    // flushed automatically at process end).
+    let (_out, interp) = run_i(&format!(
+        r#"{INIT}
+telemetry.startSpan("auto").end()
+"#
+    ))
+    .await;
+    // No flush yet: the span is buffered, nothing captured.
+    assert!(interp.telemetry_capture().is_empty());
+    interp.telemetry_flush_on_exit().await;
+    let traces: Vec<_> = interp.telemetry_capture().into_iter().filter(|r| r.signal == "traces").collect();
+    assert_eq!(traces.len(), 1, "flush-on-exit exports the buffered span");
+    assert!(traces[0].body.contains("\"name\":\"auto\""));
+}
+
+#[tokio::test]
+async fn sp11_soft_hook_contract() {
+    // The EXACT surface std/ai (SP11) will call: telemetry_span_start → _set →
+    // _event → _end produces a captured OTLP span with the attributes; with
+    // telemetry uninitialized the hook is inert.
+    let (_out, interp) = run_i(INIT).await;
+    assert!(interp.telemetry_active());
+    let id = interp
+        .telemetry_span_start(
+            "chat openai:gpt-4.1",
+            vec![("gen_ai.system".into(), Value::Str("openai".into()))],
+        )
+        .expect("active → Some span id");
+    interp.telemetry_span_set(id, "gen_ai.request.model", Value::Str("gpt-4.1".into()));
+    interp.telemetry_span_event(id, "first-token", vec![]);
+    interp.telemetry_span_end(id, ascript::interp::SpanStatus::Ok);
+    interp.telemetry_flush_on_exit().await;
+    let body = &interp.telemetry_capture().into_iter().find(|r| r.signal == "traces").unwrap().body;
+    assert!(body.contains("chat openai:gpt-4.1"), "span name: {body}");
+    assert!(body.contains("gen_ai.system"), "attr: {body}");
+    assert!(body.contains("gen_ai.request.model"), "set attr: {body}");
+    assert!(body.contains("\"code\":1"), "ok status: {body}");
+
+    // Uninitialized interp: hook inert.
+    let fresh = ascript::interp::Interp::new();
+    assert!(!fresh.telemetry_active());
+    assert!(fresh.telemetry_span_start("x", vec![]).is_none());
 }
