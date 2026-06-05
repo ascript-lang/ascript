@@ -2488,11 +2488,23 @@ impl Interp {
                 Ok(flow)
             }
             Stmt::Import { names, source } => {
-                let entry = if source.starts_with("std/") {
-                    self.load_std_module(source)?
-                } else {
-                    let resolved = self.resolve_import(source);
-                    self.load_module(&resolved).await?
+                // SP6 §6: the SHARED three-way classifier drives both engines.
+                // `Std` → the static registry; `Relative`/`Package` → the SAME
+                // existing file-module loader (a package's resolved target is just
+                // a file under a different root); `UnknownPackage` → a Tier-2
+                // error with the message identical on both engines. The resolved
+                // `target` is owned (cloned out of the resolver borrow), so the
+                // borrow is never held across the loader `.await`.
+                let entry = match self.classify_specifier(source) {
+                    SpecifierKind::Std => self.load_std_module(source)?,
+                    SpecifierKind::Relative(resolved) => self.load_module(&resolved).await?,
+                    SpecifierKind::Package { target, .. } => self.load_module(&target).await?,
+                    SpecifierKind::UnknownPackage(key) => {
+                        return Err(AsError::new(format!(
+                            "unknown package '{key}' — add it with 'ascript add'"
+                        ))
+                        .into());
+                    }
                 };
                 match names {
                     crate::ast::ImportNames::Named(names) => {

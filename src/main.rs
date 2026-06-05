@@ -184,12 +184,41 @@ async fn real_main() -> ExitCode {
             let is_aso = path.extension().and_then(|e| e.to_str()) == Some("aso");
             let use_tree_walker =
                 tree_walker || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
+            // SP6: build the resolved package map (path deps for now; the full
+            // MVS resolve + fetch + lock lands in Phase E) from the entry file's
+            // nearest `ascript.toml` and inject it onto the interpreter so a bare
+            // `import "pkg"` resolves identically on both engines. `.aso` runs
+            // skip this (a compiled module's imports were resolved at compile
+            // time / load against its own dir). Under `--no-default-features` the
+            // `pkg` feature is off → no map → bare specifier is "unknown package".
+            #[cfg(feature = "pkg")]
+            let packages = match pkg::build_path_dep_map(path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(1);
+                }
+            };
             let result = if is_aso {
                 ascript::run_aso_file(path, &args).await
             } else if use_tree_walker {
-                ascript::run_file(path, &args).await
+                #[cfg(feature = "pkg")]
+                {
+                    ascript::run_file_with_packages(path, &args, packages).await
+                }
+                #[cfg(not(feature = "pkg"))]
+                {
+                    ascript::run_file(path, &args).await
+                }
             } else {
-                ascript::run_file_on_vm(path, &args).await
+                #[cfg(feature = "pkg")]
+                {
+                    ascript::run_file_on_vm_with_packages(path, &args, packages).await
+                }
+                #[cfg(not(feature = "pkg"))]
+                {
+                    ascript::run_file_on_vm(path, &args).await
+                }
             };
             match result {
                 // Output already streamed live (OutputSink::Live).
