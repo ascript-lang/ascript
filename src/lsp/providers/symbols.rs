@@ -65,7 +65,7 @@ fn symbols_for(model: &SemanticModel, node: &ResolvedNode, out: &mut Vec<Documen
             matches!(c.kind(), SyntaxKind::ArrayBindPat | SyntaxKind::ObjectBindPat)
         }) {
             let kind = let_kind(node);
-            push_pattern_symbols(model, &pat, kind, out);
+            push_pattern_symbols(model, pat, kind, out);
             return;
         }
     }
