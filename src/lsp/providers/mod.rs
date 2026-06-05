@@ -3,6 +3,7 @@
 pub mod code_action;
 pub mod completion;
 pub mod docs;
+pub mod folding;
 pub mod formatting;
 pub mod highlight;
 pub mod hover;

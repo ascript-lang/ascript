@@ -95,6 +95,8 @@ pub fn server_capabilities() -> ServerCapabilities {
         type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
         // Phase 3: subclasses of a class / variants of an enum (in-file).
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+        // Phase 3: structural folding (blocks/decls/literals/match + //region).
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
         code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
@@ -575,6 +577,17 @@ impl LanguageServer for Backend {
             return Ok(None);
         }
         Ok(Some(request::GotoImplementationResponse::Array(locs)))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<FoldingRange>>> {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::folding::folding_ranges(model)))
     }
 
     async fn references(
