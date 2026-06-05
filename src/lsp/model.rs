@@ -121,20 +121,40 @@ use tower_lsp::lsp_types::Url;
 #[derive(Default)]
 pub struct DocumentStore {
     models: HashMap<Url, SemanticModel>,
+    /// Monotone generation counter, bumped on every `set_versioned`. The stored
+    /// model carries the generation it was built at, so a handler that captured a
+    /// generation can detect that a newer edit superseded it.
+    next_gen: u64,
 }
 
 impl DocumentStore {
     pub fn new() -> Self {
-        DocumentStore { models: HashMap::new() }
+        DocumentStore { models: HashMap::new(), next_gen: 0 }
     }
 
-    /// Build and store the model for `uri` at `text`/`version`. The lint config is
-    /// discovered from the document's filesystem path (nearest `ascript.toml`); a
-    /// non-file URL uses the default config.
-    pub fn set(&mut self, uri: Url, text: String, version: Option<i32>) {
+    /// Build + store the model for `uri`, stamping it with a fresh monotone
+    /// generation, which is returned so the caller can later detect supersession.
+    /// The lint config is discovered from the document's filesystem path (nearest
+    /// `ascript.toml`); a non-file URL uses the default config.
+    pub fn set_versioned(&mut self, uri: Url, text: String, version: Option<i32>) -> u64 {
+        self.next_gen += 1;
+        let gen = self.next_gen;
         let config = config_for_uri(&uri);
-        let model = SemanticModel::build(text, version, &config);
+        let mut model = SemanticModel::build(text, version, &config);
+        model.generation = gen;
         self.models.insert(uri, model);
+        gen
+    }
+
+    /// Build and store the model for `uri` at `text`/`version`, discarding the
+    /// generation (back-compat shim for callers that do not track supersession).
+    pub fn set(&mut self, uri: Url, text: String, version: Option<i32>) {
+        let _ = self.set_versioned(uri, text, version);
+    }
+
+    /// The generation currently stored for `uri` (`None` if not open).
+    pub fn current_gen(&self, uri: &Url) -> Option<u64> {
+        self.models.get(uri).map(|m| m.generation)
     }
 
     pub fn get(&self, uri: &Url) -> Option<&SemanticModel> {
@@ -188,6 +208,33 @@ mod store_tests {
         let m = store.get(&uri).unwrap();
         assert_eq!(m.version, Some(2));
         assert!(!m.diagnostics.is_empty(), "v2 has a syntax error");
+    }
+}
+
+#[cfg(test)]
+mod gen_tests {
+    use super::*;
+
+    #[test]
+    fn set_bumps_generation_monotonically() {
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let g1 = store.set_versioned(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        let g2 = store.set_versioned(uri.clone(), "let x = 2\n".to_string(), Some(2));
+        assert!(g2 > g1, "generation must increase per edit: {g1} -> {g2}");
+        assert_eq!(store.current_gen(&uri), Some(g2));
+        // The stored model carries its generation.
+        assert_eq!(store.get(&uri).unwrap().generation, g2);
+    }
+
+    #[test]
+    fn stale_generation_is_detectable() {
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let g1 = store.set_versioned(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        let _g2 = store.set_versioned(uri.clone(), "let x = 2\n".to_string(), Some(2));
+        // A handler holding g1 sees it is no longer current.
+        assert!(store.current_gen(&uri) != Some(g1), "g1 should be stale");
     }
 }
 
