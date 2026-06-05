@@ -77,6 +77,10 @@ pub fn analyze_with_config(src: &str, config: &LintConfig) -> Analysis {
     for rule in crate::check::rules::ALL {
         diagnostics.extend(rule(&tree, &resolved, src));
     }
+    // SP10: the advisory gradual type checker (a single stateful pass with the same
+    // signature as a Rule). It runs no code and emits `type-mismatch`/`type-error`/
+    // `possibly-nil` diagnostics through this same machinery.
+    diagnostics.extend(crate::check::infer::check(&tree, &resolved, src));
 
     // Apply inline `ascript-ignore` suppressions before sorting.
     let supp = suppressions(src);

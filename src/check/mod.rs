@@ -4,6 +4,7 @@ pub mod analyze;
 pub mod config;
 pub mod diagnostic;
 pub mod fix;
+pub mod infer;
 pub mod render;
 pub mod rules;
 pub mod std_arity;

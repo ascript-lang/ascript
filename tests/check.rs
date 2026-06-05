@@ -578,4 +578,34 @@ mod corpus {
             offenders.join("\n")
         );
     }
+
+    // SP10 corpus zero-new-diagnostic differential (the SP10 analogue of the VM
+    // three-way differential). The whole corpus must produce ZERO
+    // `type-mismatch`/`type-error`/`possibly-nil` diagnostics — any new one is a bug
+    // in `assignable`/`synth`/narrowing (relax the GUARD, never this assertion).
+    //
+    // The test runs in WHICHEVER feature config `cargo test` is invoked with, so it
+    // gates BOTH `cargo test` (default) and `cargo test --no-default-features`.
+    #[test]
+    fn type_checker_emits_no_type_diagnostics_on_the_corpus() {
+        let type_codes = ["type-mismatch", "type-error", "possibly-nil"];
+        let mut offenders = Vec::new();
+        for path in corpus() {
+            let src = fs::read_to_string(&path).unwrap();
+            let hits: Vec<_> = ascript::check::analyze(&src)
+                .diagnostics
+                .into_iter()
+                .filter(|d| type_codes.contains(&d.code.as_str()))
+                .map(|d| format!("{}@{}: {}", d.code, d.range.start, d.message))
+                .collect();
+            if !hits.is_empty() {
+                offenders.push(format!("{}:\n  {}", path.display(), hits.join("\n  ")));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "SP10 type checker emitted type-* diagnostics on the untyped corpus (fix the root cause in assignable/synth/narrowing — default to Unknown/silent — NEVER relax this gate):\n{}",
+            offenders.join("\n")
+        );
+    }
 }
