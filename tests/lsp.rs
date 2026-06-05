@@ -229,6 +229,18 @@ fn lsp_protocol_end_to_end() {
         !caps["documentRangeFormattingProvider"].is_null(),
         "missing documentRangeFormattingProvider: {resp}"
     );
+    assert!(
+        !caps["codeActionProvider"].is_null(),
+        "missing codeActionProvider: {resp}"
+    );
+    assert!(
+        !caps["executeCommandProvider"].is_null(),
+        "missing executeCommandProvider: {resp}"
+    );
+    assert_eq!(
+        caps["completionProvider"]["resolveProvider"], true,
+        "completion resolve advertised: {resp}"
+    );
 
     // 2. initialized notification.
     client.notify("initialized", json!({}));

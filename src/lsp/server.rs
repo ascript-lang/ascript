@@ -90,6 +90,19 @@ pub fn server_capabilities() -> ServerCapabilities {
         definition_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![
+                CodeActionKind::QUICKFIX,
+                CodeActionKind::SOURCE_FIX_ALL,
+                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            ]),
+            resolve_provider: Some(false),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: vec![crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string()],
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
         // SP4 §4: cross-file navigation providers backed by the workspace index.
         workspace_symbol_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
@@ -276,6 +289,48 @@ impl LanguageServer for Backend {
             model,
             params.range,
         )))
+    }
+
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let actions = crate::lsp::providers::code_action::code_actions(
+            model,
+            &uri,
+            params.range,
+            &params.context,
+        );
+        Ok(Some(actions))
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<serde_json::Value>> {
+        if params.command == crate::lsp::providers::code_action::FIX_ALL_COMMAND {
+            // The first argument is the target document URI.
+            if let Some(arg) = params.arguments.first() {
+                if let Ok(uri) = serde_json::from_value::<Url>(arg.clone()) {
+                    let edit = {
+                        let store = self.documents.lock().await;
+                        store.get(&uri).and_then(|m| {
+                            crate::lsp::providers::code_action::fix_all_action(m, &uri)
+                                .and_then(|a| a.edit)
+                        })
+                    };
+                    if let Some(edit) = edit {
+                        let _ = self.client.apply_edit(edit).await;
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn goto_definition(
