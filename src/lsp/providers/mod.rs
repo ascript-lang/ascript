@@ -4,6 +4,7 @@ pub mod code_action;
 pub mod completion;
 pub mod docs;
 pub mod formatting;
+pub mod highlight;
 pub mod hover;
 pub mod navigation;
 pub mod semantic_tokens;
