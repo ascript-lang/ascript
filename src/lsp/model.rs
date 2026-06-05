@@ -18,6 +18,10 @@ pub struct SemanticModel {
     pub diagnostics: Vec<AsDiagnostic>,
     pub tokens: Vec<LexToken>,
     pub line_index: LineIndex,
+    /// The monotone generation this model was built at, stamped by
+    /// `DocumentStore::set_versioned` (0 for a model built directly via `build`).
+    /// Handlers capture it at entry to detect supersession by a newer edit.
+    pub generation: u64,
 }
 
 impl SemanticModel {
@@ -29,7 +33,16 @@ impl SemanticModel {
         let diagnostics = crate::check::analyze::analyze_with_config(&text, config).diagnostics;
         let tokens: Vec<LexToken> = crate::syntax::lex(&text);
         let line_index = LineIndex::new(&text);
-        SemanticModel { text, version, tree, resolved, diagnostics, tokens, line_index }
+        SemanticModel {
+            text,
+            version,
+            tree,
+            resolved,
+            diagnostics,
+            tokens,
+            line_index,
+            generation: 0,
+        }
     }
 }
 
@@ -50,6 +63,52 @@ mod tests {
         let m = SemanticModel::build(src.to_string(), None, &LintConfig::default());
         let direct = crate::check::analyze::analyze_with_config(src, &LintConfig::default()).diagnostics;
         assert_eq!(m.diagnostics, direct);
+    }
+}
+
+use crate::lsp::perf::{HUGE_FILE_BYTES, LARGE_FILE_BYTES};
+
+/// How expensive providers should treat a document, by source size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeClass {
+    /// Normal: every provider runs at full fidelity.
+    Normal,
+    /// Large: semantic-tokens FULL degrades to range-only; inlay hints skipped.
+    Large,
+    /// Huge: only diagnostics + navigation; token/inlay/folding/color return empty.
+    Huge,
+}
+
+impl SemanticModel {
+    /// The document's size class (drives provider degradation).
+    pub fn size_class(&self) -> SizeClass {
+        match self.text.len() {
+            n if n >= HUGE_FILE_BYTES => SizeClass::Huge,
+            n if n >= LARGE_FILE_BYTES => SizeClass::Large,
+            _ => SizeClass::Normal,
+        }
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn small_file_is_normal() {
+        let m = SemanticModel::build("let x = 1\n".to_string(), None, &LintConfig::default());
+        assert_eq!(m.size_class(), SizeClass::Normal);
+    }
+
+    #[test]
+    fn threshold_classifies_large_and_huge() {
+        let large = "a".repeat(LARGE_FILE_BYTES);
+        let m = SemanticModel::build(large, None, &LintConfig::default());
+        assert_eq!(m.size_class(), SizeClass::Large);
+
+        let huge = "a".repeat(HUGE_FILE_BYTES);
+        let m = SemanticModel::build(huge, None, &LintConfig::default());
+        assert_eq!(m.size_class(), SizeClass::Huge);
     }
 }
 
