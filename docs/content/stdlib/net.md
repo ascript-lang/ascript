@@ -491,6 +491,30 @@ server.post("/users", userSchema, req => {
 })
 ```
 
+#### Typed query + path-param schemas
+
+The schema slot also accepts an **options object** `{ params, query, body }` (each
+field a schema, any may be omitted) to validate the path params and query string —
+not just the body. Path params and query values arrive as **strings** over HTTP, so
+`params`/`query` are validated with **coercion on** (a `schema.number()` accepts
+`"7"` → `7`); `body` is JSON-origin and validated without coercion (as above).
+
+```ascript
+server.get("/users/:id", {
+  params: schema.object({ id: schema.number() }),       // "7" -> 7
+  query:  schema.object({ verbose: schema.bool() }),    // "true" -> true
+}, req => {
+  // req.params.id is a Number; req.query.verbose is a Bool.
+  return { status: 200, body: `user ${req.params.id}` }
+})
+```
+
+Validation runs in the order **params → query → body**. On the first failure the
+server returns **400** with `{error: "validation failed", where, path, message}`,
+where `where` is `"params"`, `"query"`, or `"body"`; the handler is not called. On
+success the **coerced** values replace the raw strings in `req.params` / `req.query`.
+A bare schema 3rd arg stays body-only (unchanged back-compat).
+
 ### The request object
 
 Handlers and middleware receive a request object:

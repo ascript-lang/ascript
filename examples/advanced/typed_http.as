@@ -13,6 +13,7 @@ import { create } from "std/http/server"
 import { get } from "std/net/http"
 import * as json from "std/json"
 import * as task from "std/task"
+import * as schema from "std/schema"
 
 const HOST = "127.0.0.1"
 
@@ -40,6 +41,17 @@ server.route("GET", "/users/bad", (req) => {
   return jsonResponse(200, { id: "not-a-number", name: "Bug" })
 })
 
+// Typed path-param + query schemas (SP5 §2). Path params and query values arrive
+// as STRINGS over HTTP; declaring a schema with coercion turns them into the right
+// types BEFORE the handler runs. A bad value yields a 400 (the handler never runs).
+server.get("/double/:n", { params: schema.object({ n: schema.number() }) }, (req) => {
+  // req.params.n is a real number here, so arithmetic works.
+  return jsonResponse(200, { doubled: req.params.n * 2 })
+})
+server.get("/search", { query: schema.object({ page: schema.number() }) }, (req) => {
+  return jsonResponse(200, { page: req.query.page })
+})
+
 // Decode + validate a JSON user. `await resp.json(User)?` unwraps to a checked
 // User instance, or propagates the fused [nil, err] on a failure.
 async fn loadUser(base, path) {
@@ -54,7 +66,7 @@ async fn loadUser(base, path) {
 // server answers one request per connection (connection: close), so maxRequests
 // counts the two connections the client opens, then the loop drains and returns.
 async fn runServer() {
-  await server.serve({ maxRequests: 2 })
+  await server.serve({ maxRequests: 4 })
 }
 
 async fn main() {
@@ -81,6 +93,20 @@ async fn main() {
   assert(err2 != nil, "bad shape -> err")
   assert(err2.message != nil, "err has a message")
   print(`rejected bad payload: ${err2.message}`)
+
+  // 3. Typed path param: "/double/21" coerces n="21" → 21, handler returns 42.
+  let [dResp, dErr] = await get(`${base}/double/21`)
+  assert(dErr == nil, "double request ok")
+  let [dBody, _dbe] = await dResp.json()
+  assert(dBody.doubled == 42, `param coerced + doubled: ${dBody.doubled}`)
+  print(`typed param: doubled=${dBody.doubled}`)
+
+  // 4. Typed query: "?page=3" coerces to a number.
+  let [qResp, qErr] = await get(`${base}/search?page=3`)
+  assert(qErr == nil, "query request ok")
+  let [qBody, _qbe] = await qResp.json()
+  assert(qBody.page == 3, `query coerced to number: ${qBody.page}`)
+  print(`typed query: page=${qBody.page}`)
 
   // Let the server finish its accept loop and drain.
   await serving
