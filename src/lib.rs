@@ -25,6 +25,8 @@ pub mod vm;
 use crate::error::{AsError, SourceInfo};
 use crate::interp::Interp;
 pub use crate::interp::TestSummary;
+#[cfg(feature = "telemetry")]
+pub use crate::stdlib::telemetry::model::CapturedRequest;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -166,6 +168,33 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         // exit(n) — return the captured output plus the exit code.
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// Run `src` on the tree-walker and return the captured output PLUS the owning
+/// `Rc<Interp>`, so a test can read interpreter-side state after the program
+/// finishes (used by the SP12 `std/telemetry` capture-mode tests, which assert on
+/// `interp.telemetry_capture()`). `#[doc(hidden)]` test seam — not a public API.
+#[doc(hidden)]
+#[cfg(feature = "telemetry")]
+pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), AsError> {
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let tokens = lexer::lex(src).map_err(|e| e.with_source(src_info.clone()))?;
+    let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    let result = local.run_until(interp.exec(&program, &env)).await;
+    local.await;
+    match result {
+        Ok(_) => Ok((interp.output(), interp)),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), interp)),
+        Err(crate::interp::Control::Exit(_)) => Ok((interp.output(), interp)),
     }
 }
 

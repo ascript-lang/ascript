@@ -73,6 +73,8 @@ pub mod stream;
 pub mod string;
 pub mod sync;
 pub mod task_mod;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 pub mod template;
 pub mod time;
 pub mod time_timers;
@@ -131,6 +133,8 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/json" => json::exports(),
         #[cfg(feature = "log")]
         "std/log" => log::exports(),
+        #[cfg(feature = "telemetry")]
+        "std/telemetry" => telemetry::exports(),
         #[cfg(feature = "data")]
         "std/encoding" => encoding::exports(),
         #[cfg(feature = "crypto")]
@@ -222,6 +226,7 @@ pub const STD_MODULES: &[&str] = &[
     "std/intl",
     "std/json",
     "std/log",
+    "std/telemetry",
     "std/encoding",
     "std/crypto",
     "std/compress",
@@ -376,6 +381,8 @@ impl Interp {
             "json" => json::call(func, args, span),
             #[cfg(feature = "log")]
             "log" => self.call_log(func, args, span).await,
+            #[cfg(feature = "telemetry")]
+            "telemetry" => self.call_telemetry(func, args, span).await,
             #[cfg(feature = "data")]
             "encoding" => encoding::call(func, args, span),
             #[cfg(feature = "crypto")]
