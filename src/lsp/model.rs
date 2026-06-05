@@ -165,6 +165,12 @@ pub fn apply_changes(text: &str, changes: &[TextDocumentContentChangeEvent]) -> 
                 let index = LineIndex::new(&out);
                 let start = char_offset(&out, index.offset(range.start));
                 let end = char_offset(&out, index.offset(range.end));
+                // A protocol-violating client may send an inverted range (end before
+                // start); `replace_range` would panic, so skip such a change and leave
+                // the text unchanged rather than crash the server.
+                if start > end {
+                    continue;
+                }
                 out.replace_range(start..end, &change.text);
             }
         }
@@ -199,6 +205,22 @@ mod sync_tests {
         let inc = SemanticModel::build(got.clone(), Some(2), &LintConfig::default());
         let full = SemanticModel::build("let x = 42\nprint(x)\n".to_string(), Some(2), &LintConfig::default());
         assert_eq!(inc.diagnostics, full.diagnostics);
+    }
+
+    #[test]
+    fn inverted_range_is_skipped_not_panicked() {
+        // A protocol-violating client sends a range whose end PRECEDES its start.
+        // `replace_range(start..end)` would panic; the guard must skip the change,
+        // leaving the document unchanged.
+        let start = "let x = 1\n";
+        let change = TextDocumentContentChangeEvent {
+            // end (0,2) is before start (0,8) → inverted.
+            range: Some(Range::new(Position::new(0, 8), Position::new(0, 2))),
+            range_length: None,
+            text: "BOOM".to_string(),
+        };
+        let got = apply_changes(start, &[change]);
+        assert_eq!(got, start, "inverted-range change is skipped, text unchanged");
     }
 
     #[test]
