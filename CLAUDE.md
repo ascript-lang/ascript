@@ -210,6 +210,32 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > the CST `tree_builder`+`resolve`, powering cross-file go-to-def / workspace symbols /
 > find-references / rename (refuses on collision or a parse error in a touched file) + index-backed
 > file-module `call-arity` merged into the LSP diagnostics path.
+>
+> **SP10 — advisory static gradual type checker (`src/check/infer/`, feature-INDEPENDENT, static-only,
+> NEVER runs code).** A single stateful inference pass wired into `analyze_with_config` after the
+> `rules::ALL` loop (same `Rule` signature: `infer::check(&tree, &resolved, src) -> Vec<AsDiagnostic>`).
+> Emits three default-Warning codes — **`type-mismatch`** (a value provably the wrong type for an
+> ANNOTATED slot: let/const init, param at an in-file call, return, class-field default — the
+> SUPERSET that **subsumes** `contract-mismatch`+`field-default-type`), **`type-error`** (arithmetic/
+> negation on a provably non-number), and **`possibly-nil`** (a provable `T?` deref without a guard).
+> Files: `ty.rs` (the `CheckTy` lattice over `ast::Type` + `Any`/`Never`/`Literal`/`EnumVariant`;
+> `from_type_node`; `normalize` with width-cap 8/depth-cap 8; `join`/`meet`; **`Compat3 { Yes, No,
+> Unknown }` — ONLY `No` ever emits**, everything uncertain is `Unknown`/silent — the gradual escape
+> that keeps the untyped corpus at ZERO false positives), `table.rs` (class/enum symbol table built
+> from `ClassDecl`/`EnumDecl`, 2-pass for forward refs, `is_subclass`/`nearest_common_ancestor`),
+> `env.rs` (`BindingKey`-keyed inferred-type env + a pushed/popped narrowing overlay), `pass.rs`
+> (bidirectional `synth`/`check_against`; in-file return inference — join of return synths +Nil if it
+> can fall off the end, recursion-guarded, cross-module=`Any`; nil-guard/`match`/`instanceof`
+> narrowing + early-return flow merge). An `async fn` CALL synths `future<R>`; a generator call →
+> `Any`. **THE TWO INVARIANTS:** (1) the whole corpus (`examples/**`) emits **0** `type-*` diagnostics
+> in BOTH feature configs (`tests/check.rs::corpus::type_checker_emits_no_type_diagnostics_on_the_corpus`
+> — a new corpus `type-*` is a bug in `assignable`/`synth`/narrowing; fix the root cause / default to
+> `Unknown`, NEVER relax the gate); (2) SP10 runs no code, so `vm_differential` stays UNCHANGED 353/0.
+> Legacy `contract-mismatch`/`field-default-type` stay in `rules::ALL` one release (the pass span-dedups
+> its own `type-mismatch` against them); prefer `type-mismatch`. LSP: `infer::hover_type_at(src,
+> byte_off)` powers hover types (no interpreter); `type-*` surface in the editor via the shared
+> `analyze` path. NON-goals (deferred): whole-program/cross-module inference, new surface syntax,
+> strict mode, stdlib signature stubs, alias/closure/custom-guard narrowing.
 
 ## Commands
 

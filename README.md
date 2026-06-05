@@ -104,7 +104,11 @@ legacy tree-walker is retained as a differential oracle and a debugging escape h
 
 `ascript check` statically checks `.as` files (syntax errors + lints) and reports
 **all** diagnostics with an exit code suited to CI: `0` clean, `1` on a lint failure,
-`2` on a usage error (e.g. an unknown rule).
+`2` on a usage error (e.g. an unknown rule). It includes an **advisory gradual type
+checker** (`type-mismatch` / `type-error` / `possibly-nil`, all default-Warning)
+that predicts likely runtime contract violations — annotation mismatches, provably
+ill-typed operations, and unguarded `T?` dereferences — while staying silent on
+idiomatic untyped code (only *provably* wrong code is flagged).
 
 Per-rule severity is configurable via repeatable CLI flags and/or an `ascript.toml`:
 

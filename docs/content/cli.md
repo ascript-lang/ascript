@@ -134,6 +134,13 @@ Statically check `.as` files — syntax errors plus a set of lints (unused bindi
 unawaited futures, ignored results, and more) — without running them. It shares its analysis core
 with the language server, so the diagnostics you see here match those in your editor.
 
+It also runs an **advisory gradual type checker** that emits `type-mismatch`, `type-error`, and
+`possibly-nil` (all default-Warning) by predicting a likely runtime [contract](language/type-contracts)
+violation ahead of time — annotation mismatches, provably ill-typed operations, and unguarded `T?`
+dereferences. It is gradual: idiomatic untyped code stays silent, only *provably* wrong code is
+flagged. See [Type contracts → Static type checking](language/type-contracts) for the full surface
+and the narrowing rules.
+
 ```text
 ascript check src/main.as src/util.as
 ascript check src/*.as --deny unused-binding --allow shadowing --deny-warnings

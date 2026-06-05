@@ -115,3 +115,101 @@ area(Circle())   // ok — Circle is a Shape
 > [!NOTE] Because contracts run at the boundary, they double as living, machine-checked
 > documentation: the annotation can never silently drift out of sync with the code's actual
 > behaviour, the way a comment can.
+
+## Static type checking (advisory)
+
+`ascript check` (and your editor, via the language server) layers an **advisory, gradual type
+checker** over the same annotations. It is **static and advisory only** — it runs no code, never
+changes runtime behaviour, and never gates execution. A program with type warnings still runs and
+still produces identical output on both engines. Its job is to *predict* a likely runtime contract
+violation before you run the program.
+
+It is **gradual**: anything it cannot prove stays silent. An unannotated parameter, an `any`-typed
+value, a value flowing through `any`, an `import`ed/stdlib result, or any expression whose type the
+checker can't determine is treated as `any` and never produces a warning. Idiomatic untyped AScript
+stays completely quiet — only *provably* wrong code is flagged.
+
+It emits three diagnostics, all default-**Warning** and all configurable like every other lint
+(`// ascript-ignore[type-mismatch]`, `--deny`/`--warn`/`--allow`, the `ascript.toml [lint]` table):
+
+- **`type-mismatch`** — a value provably the wrong type for an **annotated slot**: a typed `let`/
+  `const` initializer, a typed parameter at a call, a typed `return`, or a typed class-field default.
+
+  ```ascript
+  let count: number = "ten"          // type-mismatch: expected `number`, found `string`
+  fn area(r: number): number { return r * r }
+  let label = "5"
+  area(label)                        // type-mismatch: argument 1 expects `number`, found `string`
+  ```
+
+- **`type-error`** — an operation provably ill-typed *regardless* of a declared slot: arithmetic on
+  a provably non-numeric (and non-`string`-for-`+`) operand.
+
+  ```ascript
+  let name: string = "ada"
+  let n = name - 1                   // type-error: arithmetic operand is `string`, not a number
+  ```
+
+- **`possibly-nil`** — a `T?` value dereferenced (member access, arithmetic, …) without a guard. It
+  fires **only** when the receiver is provably `T?` *and* no narrowing applies, so it is shippable
+  enabled-by-default.
+
+  ```ascript
+  fn inc(x: number?): number {
+    return x + 1                     // possibly-nil: x is `number?` and may be nil here
+  }
+  ```
+
+### Narrowing
+
+The checker is **flow-sensitive**: a guard *narrows* a binding's type for the branch it dominates,
+so a guarded `T?` deref is silent. The recognized forms are:
+
+```ascript
+fn ok(x: number?): number {
+  if (x != nil) { return x + 1 }     // then-branch: x is `number` — silent
+  return 0
+}
+
+fn ok2(x: number?): number {
+  if (x == nil) { return 0 }         // early return …
+  return x + 1                       // … so the tail sees x as `number` — silent
+}
+
+fn ok3(x: number?): number {
+  let y = x ?? 0                     // ?? narrows the left operand to non-nil
+  return y + 1
+}
+
+fn ok4(x: number?): number {
+  if (x) { return x + 1 }            // truthiness narrows away nil only
+  return 0
+}
+```
+
+`match` arms narrow the subject to each arm's pattern, and (with the `instanceof` operator) an
+`if (x instanceof Dog)` narrows `x` to `Dog` in the then-branch. Narrowing keys off the resolved
+binding, not the name, so it never leaks across an aliasing `let` or a closure boundary.
+
+### Local inference
+
+Bindings without an annotation are **inferred** from their initializer, and a same-file function's
+return type is inferred from its `return`s — so a downstream typed slot can still be checked without
+you annotating everything:
+
+```ascript
+fn id(x: number) { return x }        // inferred return: number
+let y = id(1)                        // y : number (inferred)
+let z: string = y                    // type-mismatch: expected `string`, found `number`
+```
+
+Inference is **intra-procedural and in-file**: parameters default to `any`, and a cross-module
+callee's result is `any` (the checker draws the same module line SP4 drew for arity — in-file yes,
+cross-module no).
+
+> [!NOTE] **Deprecation.** The older `contract-mismatch` (literal-argument-only) and
+> `field-default-type` (literal-field-default-only) lints are **subsumed** by `type-mismatch`, which
+> checks *any* synthesizable expression, not just literals. Both legacy codes still fire on their
+> exact old cases for one release (so an existing `ascript.toml` naming them keeps working) and the
+> new pass suppresses its own duplicate `type-mismatch` at the same span; prefer `type-mismatch`
+> going forward. In a later release the legacy rules become accepted-but-no-op config aliases.
