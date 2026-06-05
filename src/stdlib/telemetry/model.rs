@@ -30,6 +30,22 @@ pub struct CapturedRequest {
     pub body: String,
 }
 
+/// A flattened, hex-id view of a buffered span for tests (read via
+/// `Interp::telemetry_spans_debug`). Lets F1 assert tracing semantics (name,
+/// parenting, status, attrs, events) WITHOUT depending on the F2 OTLP wire
+/// shaping.
+#[derive(Clone, Debug)]
+pub struct SpanSnapshot {
+    pub name: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_id: Option<String>,
+    pub status_code: u8,
+    pub status_message: Option<String>,
+    pub attributes: Vec<(String, String)>,
+    pub events: Vec<String>,
+}
+
 /// One finished span, exporter-agnostic. Exporters shape it into OTLP / Sentry
 /// JSON on flush.
 #[derive(Clone, Debug)]
@@ -44,6 +60,26 @@ pub struct SpanRecord {
     pub attributes: Vec<(String, Value)>,
     pub events: Vec<SpanEvent>,
     pub status: SpanStatusRecord,
+}
+
+impl SpanRecord {
+    /// A flattened, hex-id [`SpanSnapshot`] for tests.
+    pub fn snapshot(&self) -> SpanSnapshot {
+        SpanSnapshot {
+            name: self.name.clone(),
+            trace_id: hex(&self.trace_id),
+            span_id: hex(&self.span_id),
+            parent_id: self.parent_id.map(|p| hex(&p)),
+            status_code: self.status.code.otlp_code(),
+            status_message: self.status.message.clone(),
+            attributes: self
+                .attributes
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect(),
+            events: self.events.iter().map(|e| e.name.clone()).collect(),
+        }
+    }
 }
 
 /// An in-progress span, held in `ResourceState::TelemetrySpan` between

@@ -51,6 +51,67 @@ impl From<AsError> for Control {
     }
 }
 
+#[cfg(feature = "telemetry")]
+tokio::task_local! {
+    /// SP12: the CURRENT telemetry span context for THIS async task. A tokio
+    /// task-local (NOT a shared cell) so concurrent `spawn_local` tasks each have
+    /// their OWN current span — a span started in one task can never leak as the
+    /// parent of an unrelated concurrent task (spec §9.3, the subtle correctness
+    /// point). It survives `.await` within a task and is isolated across tasks.
+    ///
+    /// Seeded at each entry point and re-seeded at every async-fn/method spawn
+    /// site (capturing the spawning task's current), so the captured lineage flows
+    /// into the spawned body. `telemetry.span` mutates this cell around its
+    /// callback (save → set → await → restore); `startSpan`/`telemetry_open_span`
+    /// read it to choose a parent.
+    pub(crate) static TELEMETRY_CURRENT: std::cell::Cell<Option<crate::stdlib::telemetry::model::SpanCtx>>;
+}
+
+/// SP12: run `fut` within a fresh [`TELEMETRY_CURRENT`] scope seeded with
+/// `parent` (the spawning task's current span, captured at spawn time). Used at
+/// the async-fn/method spawn sites and the entry points so every task has the
+/// task-local in scope.
+#[cfg(feature = "telemetry")]
+pub(crate) async fn telemetry_scope<F, T>(
+    parent: Option<crate::stdlib::telemetry::model::SpanCtx>,
+    fut: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    TELEMETRY_CURRENT
+        .scope(std::cell::Cell::new(parent), fut)
+        .await
+}
+
+/// Root-scope variant for the entry points (`run_file*`, `run_source*`, repl,
+/// `run_tests`) that aren't feature-gated. With the `telemetry` feature ON it
+/// establishes the root [`TELEMETRY_CURRENT`] scope (no parent); with it OFF it
+/// is the identity, so non-telemetry builds pay nothing.
+pub async fn telemetry_root_scope<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    #[cfg(feature = "telemetry")]
+    {
+        telemetry_scope(None, fut).await
+    }
+    #[cfg(not(feature = "telemetry"))]
+    {
+        fut.await
+    }
+}
+
+/// Capture the current task's telemetry span context (for propagation into a
+/// spawned task). `None` if telemetry is off or no span is current.
+#[cfg(feature = "telemetry")]
+pub(crate) fn telemetry_capture_current() -> Option<crate::stdlib::telemetry::model::SpanCtx> {
+    TELEMETRY_CURRENT
+        .try_with(|c| c.get())
+        .ok()
+        .flatten()
+}
+
 /// A span outcome, used by the SP12 `std/telemetry` soft hook (the contract
 /// `std/ai` calls). Defined in this CORE module — **not** behind the `telemetry`
 /// feature — so `std/ai` can name it whether or not the `telemetry` feature is
@@ -387,13 +448,6 @@ pub struct Interp {
     /// opening a socket. Tests read it via [`Interp::telemetry_capture`].
     #[cfg(feature = "telemetry")]
     telemetry_capture: RefCell<Vec<crate::stdlib::telemetry::model::CapturedRequest>>,
-    /// SP12 std/telemetry current-span stack (span resource ids), pushed by
-    /// `telemetry.span` for the duration of its callback so a span created inside
-    /// parents to it. Saved/restored across `spawn_local` task boundaries so a
-    /// span started in one task never leaks as the parent of an unrelated
-    /// concurrent task (spec §9.3). A `RefCell`, never held across an `.await`.
-    #[cfg(feature = "telemetry")]
-    telemetry_span_stack: RefCell<Vec<crate::stdlib::telemetry::model::SpanCtx>>,
     /// The script's own CLI arguments (`ascript run file.as <args...>`).
     /// Excludes the binary name and the script path — only the trailing args.
     /// Empty unless set by [`Interp::set_cli_args`] (i.e. the REPL and test
@@ -619,8 +673,6 @@ impl Interp {
             telemetry: RefCell::new(None),
             #[cfg(feature = "telemetry")]
             telemetry_capture: RefCell::new(Vec::new()),
-            #[cfg(feature = "telemetry")]
-            telemetry_span_stack: RefCell::new(Vec::new()),
             cli_args: RefCell::new(Vec::new()),
         }
     }
@@ -946,6 +998,18 @@ impl Interp {
         self.telemetry_capture.borrow().clone()
     }
 
+    /// Flattened snapshots of the currently-buffered (not-yet-flushed) spans
+    /// (test hook). Lets the F1 tracing tests assert span semantics — name,
+    /// parenting, status, attributes, events — without the F2 OTLP wire shaping.
+    #[cfg(feature = "telemetry")]
+    pub fn telemetry_spans_debug(&self) -> Vec<crate::stdlib::telemetry::model::SpanSnapshot> {
+        self.telemetry
+            .borrow()
+            .as_ref()
+            .map(|s| s.spans.iter().map(|sp| sp.snapshot()).collect())
+            .unwrap_or_default()
+    }
+
     /// Start a span through the telemetry pipeline (used by `std/ai`'s GenAI-span
     /// emission). Returns an opaque span id (the span resource id), or `None` when
     /// telemetry is absent/off so callers never branch on a feature. The span
@@ -1006,34 +1070,26 @@ impl Interp {
         }
     }
 
-    /// Record a captured exporter HTTP request (test/capture mode). In `Live`
-    /// mode this is unused (the exporters POST for real); under `Capture` the
-    /// request is buffered for `telemetry_capture()`.
-    ///
-    /// Push a scoped span onto the current-span stack (for `telemetry.span`).
+    /// Set THIS task's current telemetry span context (returns the previous value
+    /// so the caller can restore it — `telemetry.span` does save → set → await →
+    /// restore around its callback). No-op (returns None) if the task-local is not
+    /// in scope (telemetry off, or code running outside a telemetry scope).
     #[cfg(feature = "telemetry")]
-    pub(crate) fn telemetry_push_current(
+    pub(crate) fn telemetry_set_current(
         &self,
-        ctx: crate::stdlib::telemetry::model::SpanCtx,
-    ) {
-        self.telemetry_span_stack.borrow_mut().push(ctx);
+        ctx: Option<crate::stdlib::telemetry::model::SpanCtx>,
+    ) -> Option<crate::stdlib::telemetry::model::SpanCtx> {
+        TELEMETRY_CURRENT
+            .try_with(|c| c.replace(ctx))
+            .ok()
+            .flatten()
     }
 
-    /// Pop the top scoped span (asserting it is `id`, tolerating mismatch).
-    #[cfg(feature = "telemetry")]
-    pub(crate) fn telemetry_pop_current(&self, id: u64) {
-        let mut st = self.telemetry_span_stack.borrow_mut();
-        // Pop the entry for `id` (normally the top); be defensive against an
-        // out-of-order pop by removing the matching entry wherever it is.
-        if let Some(pos) = st.iter().rposition(|c| c.resource_id == id) {
-            st.remove(pos);
-        }
-    }
-
-    /// The current scoped span context (top of the stack), if any.
+    /// The current task's telemetry span context, if any (task-local; isolated
+    /// across concurrent `spawn_local` tasks).
     #[cfg(feature = "telemetry")]
     pub(crate) fn telemetry_current(&self) -> Option<crate::stdlib::telemetry::model::SpanCtx> {
-        self.telemetry_span_stack.borrow().last().copied()
+        crate::interp::telemetry_capture_current()
     }
 
     /// Open a new span: mint ids (root → new trace; else parent to the current
@@ -3156,10 +3212,21 @@ impl Interp {
             // Track this task's lifetime for backpressure; the guard moves into the
             // task and decrements on completion OR cancel-on-drop.
             let guard = self.inflight_guard();
+            // SP12: capture THIS task's current telemetry span so the spawned body
+            // inherits the correct parent lineage (per-task isolation, spec §9.3).
+            #[cfg(feature = "telemetry")]
+            let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
+                #[cfg(feature = "telemetry")]
+                let r = crate::interp::telemetry_scope(
+                    telem_parent,
+                    vm.run_function_body(func, args, call_env, span, what),
+                )
+                .await;
+                #[cfg(not(feature = "telemetry"))]
                 let r = vm.run_function_body(func, args, call_env, span, what).await;
                 cell.resolve(r);
             });
@@ -3481,10 +3548,19 @@ impl Interp {
             // Resolve the cell, not a handle clone, so cancel-on-drop works.
             let cell = fut.cell();
             let guard = self.inflight_guard();
+            #[cfg(feature = "telemetry")]
+            let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
                 // Owned `method`/`call_env`/`name` keep the `BodySpec` borrow inside
                 // `run_method_body`'s frame, so nothing escapes the `'static` task.
+                #[cfg(feature = "telemetry")]
+                let r = crate::interp::telemetry_scope(
+                    telem_parent,
+                    vm.run_method_body(method, args, call_env, span, name),
+                )
+                .await;
+                #[cfg(not(feature = "telemetry"))]
                 let r = vm.run_method_body(method, args, call_env, span, name).await;
                 cell.resolve(r);
             });
@@ -3532,8 +3608,17 @@ impl Interp {
             let fut = crate::task::SharedFuture::new();
             let cell = fut.cell();
             let guard = self.inflight_guard();
+            #[cfg(feature = "telemetry")]
+            let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
+                #[cfg(feature = "telemetry")]
+                let r = crate::interp::telemetry_scope(
+                    telem_parent,
+                    vm.run_method_body(m, args, call_env, span, what),
+                )
+                .await;
+                #[cfg(not(feature = "telemetry"))]
                 let r = vm.run_method_body(m, args, call_env, span, what).await;
                 cell.resolve(r);
             });

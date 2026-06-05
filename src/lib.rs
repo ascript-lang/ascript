@@ -103,7 +103,7 @@ pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result: Result<TestSummary, AsError> = local
-        .run_until(async {
+        .run_until(crate::interp::telemetry_root_scope(async {
             for file in files {
                 match interp.load_module(Path::new(file)).await {
                     Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
@@ -126,7 +126,7 @@ pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
                 Err(crate::interp::Control::Panic(e)) => Err(e),
                 Err(crate::interp::Control::Propagate(_)) => Ok(TestSummary::default()),
             }
-        })
+        }))
         .await;
     local.await; // drain spawned tasks — no-op until Phase 2
     result
@@ -154,7 +154,9 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
     // (`let len = 5`) and import names that collide with builtins.
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(interp.exec(&program, &env)).await;
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(interp.exec(&program, &env)))
+        .await;
     local.await; // drain spawned tasks — no-op until Phase 2
     match result {
         Ok(crate::interp::Flow::Break) => Err(AsError::new("'break' outside of a loop")),
@@ -188,7 +190,10 @@ pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), A
     interp.install_self();
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(interp.exec(&program, &env)).await;
+    // Establish the root telemetry-span scope so top-level `telemetry.span` /
+    // `startSpan` parenting works (per-task isolation; spec §9.3).
+    let root = crate::interp::telemetry_root_scope(interp.exec(&program, &env));
+    let result = local.run_until(root).await;
     local.await;
     match result {
         Ok(_) => Ok((interp.output(), interp)),
@@ -343,7 +348,9 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .await;
     local.await; // drain spawned tasks
                  // End-of-program cycle collection (V13-T3): reclaim any leftover
                  // reference cycles for a clean shutdown. The fiber's stack has been
@@ -410,7 +417,9 @@ pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, 
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .await;
     local.await; // drain spawned tasks (structured join)
                  // End-of-program cycle collection (V13-T3): see `run_aso_file`.
     crate::gc::collect();

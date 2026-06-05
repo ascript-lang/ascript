@@ -415,13 +415,17 @@ async fn scoped_span(interp: &Interp, args: &[Value], span: Span) -> Result<Valu
             _ => None,
         })
         .expect("freshly opened span is present");
-    interp.telemetry_push_current(SpanCtx {
+    // Set THIS task's current span around the callback (save → set → restore), so
+    // a span created inside the callback (or in the spawned async-fn body, which
+    // captures this task's current at spawn time) parents to it. Per-task
+    // task-local isolation means concurrent scoped spans never cross-parent.
+    let prev = interp.telemetry_set_current(Some(SpanCtx {
         resource_id: id,
         trace_id,
         span_id,
-    });
+    }));
     let result = run_scoped_cb(interp, cb, span).await;
-    interp.telemetry_pop_current(id);
+    interp.telemetry_set_current(prev);
     // Determine status from the callback outcome.
     match &result {
         Ok(pair) => {
@@ -714,16 +718,22 @@ telemetry.init({ service: "hook-test", exporters: [ telemetry.otlp({ endpoint: "
     }
 
     #[tokio::test]
-    async fn current_span_stack_push_pop() {
+    async fn current_span_task_local_set_restore() {
         let interp = active_interp().await;
-        assert!(interp.telemetry_current().is_none());
-        interp.telemetry_push_current(SpanCtx {
-            resource_id: 7,
-            trace_id: [1u8; 16],
-            span_id: [2u8; 8],
-        });
-        assert_eq!(interp.telemetry_current().map(|c| c.resource_id), Some(7));
-        interp.telemetry_pop_current(7);
-        assert!(interp.telemetry_current().is_none());
+        // The task-local current is per-task: set/restore round-trips inside a
+        // telemetry scope (mirrors `telemetry.span`'s save → set → restore).
+        crate::interp::telemetry_root_scope(async {
+            assert!(interp.telemetry_current().is_none());
+            let prev = interp.telemetry_set_current(Some(SpanCtx {
+                resource_id: 7,
+                trace_id: [1u8; 16],
+                span_id: [2u8; 8],
+            }));
+            assert!(prev.is_none());
+            assert_eq!(interp.telemetry_current().map(|c| c.resource_id), Some(7));
+            interp.telemetry_set_current(prev);
+            assert!(interp.telemetry_current().is_none());
+        })
+        .await;
     }
 }
