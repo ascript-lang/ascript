@@ -258,6 +258,11 @@ fn lsp_protocol_end_to_end() {
         !caps["inlayHintProvider"].is_null(),
         "missing inlayHintProvider: {resp}"
     );
+    // Phase 4: documentColor / colorPresentation.
+    assert!(
+        !caps["colorProvider"].is_null(),
+        "missing colorProvider: {resp}"
+    );
     // signatureHelp trigger chars `(` and `,`.
     let sig_triggers = caps["signatureHelpProvider"]["triggerCharacters"]
         .as_array()

@@ -17,6 +17,14 @@ use tokio::sync::Mutex;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+/// Client-configurable settings (subset). Updated by `didChangeConfiguration`.
+#[derive(Debug, Clone, Default)]
+pub struct LspSettings {
+    /// `ascript.color.detectHexStringsEverywhere` — broaden hex-string color
+    /// detection past the color-sink gate. Default `false`.
+    pub detect_hex_strings_everywhere: bool,
+}
+
 pub struct Backend {
     client: Client,
     documents: Mutex<DocumentStore>,
@@ -27,6 +35,8 @@ pub struct Backend {
     /// Workspace root folders captured in `initialize`, walked for `*.as` files
     /// when the index is first built.
     roots: RwLock<Vec<PathBuf>>,
+    /// Client-configurable settings (`didChangeConfiguration`).
+    settings: RwLock<LspSettings>,
 }
 
 impl Backend {
@@ -36,6 +46,7 @@ impl Backend {
             documents: Mutex::new(DocumentStore::new()),
             index: RwLock::new(WorkspaceIndex::new()),
             roots: RwLock::new(Vec::new()),
+            settings: RwLock::new(LspSettings::default()),
         }
     }
 
@@ -172,6 +183,9 @@ pub fn server_capabilities() -> ServerCapabilities {
         })),
         // Phase 2: read/write occurrence highlighting of the symbol under the cursor.
         document_highlight_provider: Some(OneOf::Left(true)),
+        // Phase 4: documentColor / colorPresentation swatches (color.rgb/bgRgb,
+        // [r,g,b] tui arrays, gated hex/functional color strings).
+        color_provider: Some(ColorProviderCapability::Simple(true)),
         // Phase 2: signature help while typing a call's arguments. Triggered on `(`
         // (open the call) and `,` (advance the active parameter / retrigger).
         signature_help_provider: Some(SignatureHelpOptions {
@@ -389,6 +403,36 @@ impl LanguageServer for Backend {
         };
         let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
         Ok(crate::lsp::providers::highlight::document_highlights(model, offset))
+    }
+
+    async fn document_color(
+        &self,
+        params: DocumentColorParams,
+    ) -> tower_lsp::jsonrpc::Result<Vec<ColorInformation>> {
+        let uri = params.text_document.uri;
+        let everywhere = self
+            .settings
+            .read()
+            .map(|s| s.detect_hex_strings_everywhere)
+            .unwrap_or(false);
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        Ok(crate::lsp::providers::color::document_colors(model, everywhere))
+    }
+
+    async fn color_presentation(
+        &self,
+        params: ColorPresentationParams,
+    ) -> tower_lsp::jsonrpc::Result<Vec<ColorPresentation>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let rgba = crate::lsp::providers::color::Rgba::from_lsp(params.color);
+        Ok(crate::lsp::providers::color::color_presentations(model, rgba, params.range))
     }
 
     async fn signature_help(
@@ -1214,6 +1258,15 @@ mod tests {
                 Some(OneOf::Left(true)) | Some(OneOf::Right(_))
             ),
             "expected a document-highlight provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_color_provider() {
+        let caps = server_capabilities();
+        assert!(
+            caps.color_provider.is_some(),
+            "expected a documentColor provider"
         );
     }
 
