@@ -1,0 +1,8 @@
+# exit: none
+toml: localhost:8080
+yaml: example.com:443
+toml mismatch rejected: type contract violated at config.port: expected number, got string
+csv row: Ada 36
+csv row: Grace 37
+csv bad cell rejected: expected number, got string
+typed_config: all assertions passed

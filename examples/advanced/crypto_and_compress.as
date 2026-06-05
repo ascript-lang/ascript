@@ -79,6 +79,33 @@ fn main() {
   assert(restored == original)
   print(`round-trip matches  = ${restored == original}`)
 
+  print("\n=== zstd + brotli codecs ===")
+  // zstd and brotli accept a string or bytes and return bytes; the matching
+  // *Decompress is Tier-1 ([bytes, err]). An optional 2nd arg tunes the level.
+  let zc = compress.zstdCompress(original, 19)
+  let [zback, zcErr] = compress.zstdDecompress(zc)
+  if (zcErr != nil) { print(`zstd failed: ${zcErr.message}`); return }
+  assert(encoding.utf8Decode(zback)[0] == original)
+  print(`zstd  ${len(original)} -> ${len(zc)} bytes (round-trip ok)`)
+
+  let bc = compress.brotliCompress(original)
+  let [bback, bcErr] = compress.brotliDecompress(bc)
+  if (bcErr != nil) { print(`brotli failed: ${bcErr.message}`); return }
+  assert(encoding.utf8Decode(bback)[0] == original)
+  print(`brotli ${len(original)} -> ${len(bc)} bytes (round-trip ok)`)
+
+  print("\n=== tar archive ===")
+  // tarCreate/tarExtract use the SAME {name, data} entry shape as zip.
+  let [tarBytes, tcErr] = compress.tarCreate([
+    { name: "hello.txt", data: "hello from tar" },
+    { name: "raw.bin", data: encoding.hexEncode("ff00") },
+  ])
+  if (tcErr != nil) { print(`tarCreate failed: ${tcErr.message}`); return }
+  print(`tar archive bytes   = ${len(tarBytes)}`)
+  let [tarEntries, teErr] = compress.tarExtract(tarBytes)
+  if (teErr != nil) { print(`tarExtract failed: ${teErr.message}`); return }
+  print(`extracted ${len(tarEntries)} tar entr(ies)`)
+
   print("\n=== zip archive ===")
   // Build an in-memory zip from two named entries, then read it back.
   let [zipBytes, zErr] = compress.zipCreate([

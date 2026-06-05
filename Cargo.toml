@@ -55,6 +55,9 @@ crc32fast = { version = "1", optional = true }
 xxhash-rust = { version = "0.8", features = ["xxh64"], optional = true }
 flate2 = { version = "1", optional = true }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+zstd = { version = "0.13", optional = true }
+brotli = { version = "7", optional = true }
+tar = { version = "0.4", optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "cookies", "gzip", "brotli", "deflate", "zstd", "socks", "http2"], optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
@@ -68,6 +71,10 @@ crossterm = { version = "0.28", optional = true }
 hostname = { version = "0.4", optional = true }
 tower-lsp = { version = "0.20", optional = true }
 sysinfo = { version = "0.31", optional = true }
+rmpv = { version = "1", optional = true }
+ciborium = { version = "0.2", optional = true }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"], optional = true }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp"], optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -77,8 +84,12 @@ ungrammar = "1"
 tree-sitter = "0.25"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis"]
 data = ["dep:serde", "dep:serde_json", "dep:regex", "dep:base64", "dep:hex", "dep:uuid", "dep:csv", "dep:serde_yaml", "dep:percent-encoding", "dep:url"]
+# SP5 §4: std/msgpack + std/cbor binary serialization via the rmpv / ciborium
+# dynamic-value models (no serde derive — bridged by hand like json). Typed decode
+# reuses validate_into/parse_value, so it depends on `data`. Default-on.
+binary = ["dep:rmpv", "dep:ciborium", "data"]
 # std/log: leveled structured logging. Reuses json's total `to_json_lossy`
 # serializer (behind `data`), so it pulls in `data`. Default-on; cfg's out
 # cleanly under --no-default-features.
@@ -89,8 +100,13 @@ intl = ["dep:icu", "dep:fixed_decimal", "dep:chrono"]
 # (process, std/process) adds tokio's process + io-util plumbing for subprocesses.
 sys = ["dep:dotenvy", "dep:walkdir", "dep:ignore", "dep:regex", "dep:hostname", "tokio/process", "tokio/io-util", "tokio/io-std"]
 crypto = ["dep:sha2", "dep:md-5", "dep:hmac", "dep:argon2", "dep:bcrypt", "dep:rand", "dep:hex", "dep:crc32fast", "dep:xxhash-rust"]
-compress = ["dep:flate2", "dep:zip"]
+compress = ["dep:flate2", "dep:zip", "dep:zstd", "dep:brotli", "dep:tar"]
 sql = ["dep:rusqlite"]
+# SP5 §6: async network DB clients over the !Send current-thread runtime. The
+# driver futures are spawned via spawn_local; connections are native resources with
+# deterministic Drop (abort the driver task on close). Default-on (batteries).
+postgres = ["dep:tokio-postgres", "tokio/net"]
+redis = ["dep:redis", "tokio/net"]
 # M14 networking. Task 1 (std/net/tcp) needs only tokio's net + io-util; later
 # tasks (http/ws) ADD dep:reqwest/dep:hyper/etc. to this feature.
 net = ["dep:reqwest", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "dep:http", "dep:tokio-util", "dep:tokio-tungstenite", "dep:base64", "tokio/net", "tokio/io-util"]

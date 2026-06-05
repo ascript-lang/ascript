@@ -8,6 +8,8 @@ pub mod array;
 pub mod assert_mod;
 pub mod bench;
 pub mod bytes;
+#[cfg(feature = "binary")]
+pub mod cbor;
 pub mod cli;
 pub mod color;
 #[cfg(feature = "compress")]
@@ -15,6 +17,7 @@ pub mod compress;
 pub mod convert;
 #[cfg(feature = "crypto")]
 pub mod crypto;
+pub mod events;
 #[cfg(feature = "data")]
 pub mod csv;
 #[cfg(feature = "datetime")]
@@ -36,8 +39,11 @@ pub mod io;
 pub mod json;
 #[cfg(feature = "log")]
 pub mod log;
+pub mod lru;
 pub mod map;
 pub mod math;
+#[cfg(feature = "binary")]
+pub mod msgpack;
 #[cfg(feature = "net")]
 pub mod net_host;
 #[cfg(feature = "net")]
@@ -51,8 +57,12 @@ pub mod net_ws;
 pub mod object;
 #[cfg(feature = "sys")]
 pub mod os;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "sys")]
 pub mod process;
+#[cfg(feature = "redis")]
+pub mod redis;
 #[cfg(feature = "data")]
 pub mod regex;
 pub mod schema;
@@ -63,6 +73,7 @@ pub mod stream;
 pub mod string;
 pub mod sync;
 pub mod task_mod;
+pub mod template;
 pub mod time;
 pub mod time_timers;
 #[cfg(feature = "data")]
@@ -103,6 +114,9 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/map" => map::exports(),
         "std/schema" => schema::exports(),
         "std/set" => set::exports(),
+        "std/lru" => lru::exports(),
+        "std/events" => events::exports(),
+        "std/template" => template::exports(),
         "std/bytes" => bytes::exports(),
         "std/convert" => convert::exports(),
         "std/task" => task_mod::exports(),
@@ -149,6 +163,10 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/regex" => regex::exports(),
         #[cfg(feature = "sql")]
         "std/sqlite" => sqlite::exports(),
+        #[cfg(feature = "postgres")]
+        "std/postgres" => postgres::exports(),
+        #[cfg(feature = "redis")]
+        "std/redis" => redis::exports(),
         #[cfg(feature = "data")]
         "std/url" => url::exports(),
         #[cfg(feature = "data")]
@@ -159,6 +177,10 @@ pub fn std_module_exports(path: &str) -> Option<Vec<(String, Value)>> {
         "std/toml" => toml::exports(),
         #[cfg(feature = "data")]
         "std/yaml" => yaml::exports(),
+        #[cfg(feature = "binary")]
+        "std/msgpack" => msgpack::exports(),
+        #[cfg(feature = "binary")]
+        "std/cbor" => cbor::exports(),
         #[cfg(feature = "tui")]
         "std/tui" => tui::exports(),
         _ => return None,
@@ -187,6 +209,9 @@ pub const STD_MODULES: &[&str] = &[
     "std/map",
     "std/schema",
     "std/set",
+    "std/lru",
+    "std/events",
+    "std/template",
     "std/bytes",
     "std/convert",
     "std/task",
@@ -213,11 +238,15 @@ pub const STD_MODULES: &[&str] = &[
     "std/net/ws",
     "std/regex",
     "std/sqlite",
+    "std/postgres",
+    "std/redis",
     "std/url",
     "std/uuid",
     "std/csv",
     "std/toml",
     "std/yaml",
+    "std/msgpack",
+    "std/cbor",
     "std/tui",
 ];
 
@@ -253,58 +282,67 @@ impl Interp {
         //     (a raw object is not a valid 2nd arg but also not a schema).
         //
         // With no 2nd arg this falls through to the normal 1-arg parse below.
+        // Typed parse for the whole-document text formats (json/toml/yaml): when a
+        // 2nd arg is a `Value::Class` or a tagged-Object schema, run the module's
+        // plain 1-arg `parse` to get the decoded value, then validate-into / parse
+        // it, FUSING a decode failure and a shape mismatch into one Tier-1 pair.
+        // The csv block below is row-oriented and handled separately.
         #[cfg(feature = "data")]
-        if module == "json" && func == "parse" {
-            if let Some(Value::Class(c)) = args.get(1) {
-                // `json.parse(text, Class, strict?)` — optional trailing bool.
-                let strict = matches!(args.get(2), Some(Value::Bool(true)));
-                let parsed = json::call(func, &args[..1], span)?; // [val, err]
-                if let Value::Array(a) = &parsed {
-                    let (val, err) = {
-                        let b = a.borrow();
-                        (b[0].clone(), b[1].clone())
+        if func == "parse" && matches!(module, "json" | "toml" | "yaml") {
+            if let Some(type_arg) = args.get(1) {
+                let is_class = matches!(type_arg, Value::Class(_));
+                let is_schema = schema::schema_kind(type_arg).is_some();
+                if is_class || is_schema {
+                    // `json.parse(text, Class, strict?)` — optional trailing bool.
+                    let strict = matches!(args.get(2), Some(Value::Bool(true)));
+                    // Module-specific 1-arg decode → [val, err].
+                    let parsed = match module {
+                        "json" => json::call(func, &args[..1], span)?,
+                        "toml" => toml::call(func, &args[..1], span)?,
+                        "yaml" => yaml::call(func, &args[..1], span)?,
+                        _ => unreachable!(),
                     };
-                    if err != Value::Nil {
-                        return Ok(parsed); // parse error stays in the err channel
-                    }
-                    return match self.validate_into(c, &val, strict, "", span).await {
-                        Ok(inst) => Ok(crate::interp::make_pair(inst, Value::Nil)),
-                        Err(e) => Ok(crate::interp::make_pair(
-                            Value::Nil,
-                            crate::interp::make_error(Value::Str(e.message.into())),
-                        )),
-                    };
+                    let type_arg = type_arg.clone();
+                    return self.typed_decode(parsed, &type_arg, strict, "", span).await;
                 }
             }
-            // Schema path: 2nd arg is a tagged-Object schema (has __kind).
-            if let Some(second) = args.get(1) {
-                if schema::schema_kind(second).is_some() {
-                    let schema_val = second.clone();
-                    // Step 1: parse JSON text (1-arg call).
-                    let parsed = json::call(func, &args[..1], span)?; // [val, err]
-                    if let Value::Array(a) = &parsed {
-                        let (val, err) = {
-                            let b = a.borrow();
-                            (b[0].clone(), b[1].clone())
-                        };
-                        // JSON parse failure → fuse as-is into Tier-1 err channel.
-                        if err != Value::Nil {
-                            return Ok(parsed);
-                        }
-                        // Step 2: validate the decoded value against the schema.
-                        return match self.parse_value(&schema_val, &val, "", false, span).await {
-                            Ok(v) => Ok(crate::interp::make_pair(v, Value::Nil)),
-                            Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
-                                Ok(crate::interp::make_pair(Value::Nil, e))
-                            }
-                            // Tier-2 programmer error (malformed schema) → panic.
-                            Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
-                                Err(crate::error::AsError::at(msg, span).into())
-                            }
-                            // A panic/propagate from a refine fn — re-raise unchanged.
-                            Err(crate::stdlib::schema::ParseFail::Control(c)) => Err(c),
-                        };
+        }
+        // Typed decode for the binary formats (msgpack/cbor): a 2nd Class|schema
+        // arg validates the decoded value, reusing the shared typed_decode helper.
+        #[cfg(feature = "binary")]
+        if func == "decode" && matches!(module, "msgpack" | "cbor") {
+            if let Some(type_arg) = args.get(1) {
+                let is_class = matches!(type_arg, Value::Class(_));
+                let is_schema = schema::schema_kind(type_arg).is_some();
+                if is_class || is_schema {
+                    let parsed = match module {
+                        "msgpack" => msgpack::call(func, &args[..1], span)?,
+                        "cbor" => cbor::call(func, &args[..1], span)?,
+                        _ => unreachable!(),
+                    };
+                    let type_arg = type_arg.clone();
+                    return self.typed_decode(parsed, &type_arg, false, "", span).await;
+                }
+            }
+        }
+        // Typed parse for csv (row-oriented): validate EACH decoded row against the
+        // Class/schema, fail-fast on the first bad row with a `row[N]` path prefix.
+        #[cfg(feature = "data")]
+        if module == "csv" && func == "parse" {
+            if let Some(type_arg) = args.get(1) {
+                let is_class = matches!(type_arg, Value::Class(_));
+                let is_schema = schema::schema_kind(type_arg).is_some();
+                if is_class || is_schema {
+                    // Decode rows with the original args MINUS the type arg, so any
+                    // trailing `{header: true}` options object is still honored.
+                    // csv.parse(text, Type, options?) → forward [text, options?].
+                    let mut decode_args: Vec<Value> = vec![args[0].clone()];
+                    if let Some(opts) = args.get(2) {
+                        decode_args.push(opts.clone());
                     }
+                    let parsed = csv::call(func, &decode_args, span)?; // [rows, err]
+                    let type_arg = type_arg.clone();
+                    return self.typed_decode_rows(parsed, &type_arg, span).await;
                 }
             }
         }
@@ -321,6 +359,9 @@ impl Interp {
             "map" => map::call(func, args, span),
             "schema" => self.call_schema(func, args, span).await,
             "set" => set::call(func, args, span),
+            "lru" => self.call_lru_new(func, args, span),
+            "events" => self.call_events_new(func, args, span),
+            "template" => template::call(func, args, span),
             "bytes" => bytes::call(func, args, span),
             "convert" => convert::call(func, args, span),
             "task" => self.call_task(func, args, span).await,
@@ -374,6 +415,10 @@ impl Interp {
             "regex" => regex::call(func, args, span),
             #[cfg(feature = "sql")]
             "sqlite" => self.call_sqlite_open(func, args, span),
+            #[cfg(feature = "postgres")]
+            "postgres" => self.call_postgres(func, args, span).await,
+            #[cfg(feature = "redis")]
+            "redis" => self.call_redis(func, args, span).await,
             #[cfg(feature = "data")]
             "url" => url::call(func, args, span),
             #[cfg(feature = "data")]
@@ -384,10 +429,156 @@ impl Interp {
             "toml" => toml::call(func, args, span),
             #[cfg(feature = "data")]
             "yaml" => yaml::call(func, args, span),
+            #[cfg(feature = "binary")]
+            "msgpack" => msgpack::call(func, args, span),
+            #[cfg(feature = "binary")]
+            "cbor" => cbor::call(func, args, span),
             #[cfg(feature = "tui")]
             "tui" => self.call_tui(func, args, span),
             _ => Err(AsError::at(format!("unknown stdlib module '{}'", module), span).into()),
         }
+    }
+
+    /// Shared typed-decode core (SP5 §3/§4): given a `[value, err]` decode pair
+    /// (the result of a module's plain 1-arg `parse`) and a 2nd `Class | schema`
+    /// argument, validate the decoded value and return a single Tier-1
+    /// `[value, err]` pair that FUSES a decode failure and a shape mismatch.
+    ///
+    /// - decode error (`err != nil`) → returned as-is (stays in the err channel).
+    /// - `Value::Class` → `validate_into` (defaults/nested coercion; no `init`).
+    /// - tagged-Object schema → `parse_value` (coerce=false).
+    /// - A malformed schema → Tier-2 panic; a refine-fn `Control` → re-raised.
+    ///
+    /// Used by json/toml/yaml/msgpack/cbor whole-document typed parse.
+    #[cfg(feature = "data")]
+    pub(crate) async fn typed_decode(
+        &self,
+        parsed: Value,
+        type_arg: &Value,
+        strict: bool,
+        path: &str,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // `parsed` is a [val, err] pair from the module's 1-arg parse.
+        let (val, err) = match &parsed {
+            Value::Array(a) if a.borrow().len() == 2 => {
+                let b = a.borrow();
+                (b[0].clone(), b[1].clone())
+            }
+            // Defensive: a non-pair decode result is treated as the raw value.
+            other => (other.clone(), Value::Nil),
+        };
+        if err != Value::Nil {
+            return Ok(parsed); // decode error stays in the err channel
+        }
+        match type_arg {
+            Value::Class(c) => match self.validate_into(c, &val, strict, path, span).await {
+                Ok(inst) => Ok(crate::interp::make_pair(inst, Value::Nil)),
+                Err(e) => Ok(crate::interp::make_pair(
+                    Value::Nil,
+                    crate::interp::make_error(Value::Str(e.message.into())),
+                )),
+            },
+            _ => match self.parse_value(type_arg, &val, path, false, span).await {
+                Ok(v) => Ok(crate::interp::make_pair(v, Value::Nil)),
+                Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
+                    Ok(crate::interp::make_pair(Value::Nil, e))
+                }
+                Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
+                    Err(crate::error::AsError::at(msg, span).into())
+                }
+                Err(crate::stdlib::schema::ParseFail::Control(c)) => Err(c),
+            },
+        }
+    }
+
+    /// Row-oriented typed decode for `csv.parse(text, Class|schema, options?)`:
+    /// validate EACH decoded row against the Class/schema, fail-fast on the first
+    /// bad row, threading a `row[N]` path prefix into the error. Returns
+    /// `[array<Instance|value>, err]`.
+    #[cfg(feature = "data")]
+    pub(crate) async fn typed_decode_rows(
+        &self,
+        parsed: Value,
+        type_arg: &Value,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let (rows_val, err) = match &parsed {
+            Value::Array(a) if a.borrow().len() == 2 => {
+                let b = a.borrow();
+                (b[0].clone(), b[1].clone())
+            }
+            other => (other.clone(), Value::Nil),
+        };
+        if err != Value::Nil {
+            return Ok(parsed); // decode error stays in the err channel
+        }
+        let rows: Vec<Value> = match &rows_val {
+            Value::Array(a) => a.borrow().clone(),
+            _ => {
+                return Ok(crate::interp::make_pair(
+                    Value::Nil,
+                    crate::interp::make_error(Value::Str(
+                        "csv.parse typed: expected an array of rows".into(),
+                    )),
+                ))
+            }
+        };
+        // CSV cells are inherently strings, so typed CSV rows are validated with
+        // COERCION on (a `number` field accepts the cell "36" → 36). For a Class,
+        // derive its object schema (the same `fromClass` mapping) and coerce-parse
+        // the row, then validate_into the coerced object to build the Instance. For
+        // a tagged schema, coerce-parse directly.
+        let class_schema: Option<Value> = match type_arg {
+            Value::Class(_) => {
+                Some(self.call_schema("fromClass", std::slice::from_ref(type_arg), span).await?)
+            }
+            _ => None,
+        };
+        let mut out: Vec<Value> = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            let path = format!("row[{}]", i);
+            match type_arg {
+                Value::Class(c) => {
+                    // Step 1: coerce the row against the class-derived schema.
+                    let schema = class_schema.as_ref().expect("class schema present");
+                    let coerced = match self.parse_value(schema, row, &path, true, span).await {
+                        Ok(v) => v,
+                        Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
+                            return Ok(crate::interp::make_pair(Value::Nil, e));
+                        }
+                        Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
+                            return Err(crate::error::AsError::at(msg, span).into());
+                        }
+                        Err(crate::stdlib::schema::ParseFail::Control(ctl)) => return Err(ctl),
+                    };
+                    // Step 2: validate the coerced object into a class Instance.
+                    match self.validate_into(c, &coerced, false, &path, span).await {
+                        Ok(inst) => out.push(inst),
+                        Err(e) => {
+                            return Ok(crate::interp::make_pair(
+                                Value::Nil,
+                                crate::interp::make_error(Value::Str(e.message.into())),
+                            ))
+                        }
+                    }
+                }
+                _ => match self.parse_value(type_arg, row, &path, true, span).await {
+                    Ok(v) => out.push(v),
+                    Err(crate::stdlib::schema::ParseFail::Mismatch(e)) => {
+                        return Ok(crate::interp::make_pair(Value::Nil, e));
+                    }
+                    Err(crate::stdlib::schema::ParseFail::InvalidSchema(msg)) => {
+                        return Err(crate::error::AsError::at(msg, span).into());
+                    }
+                    Err(crate::stdlib::schema::ParseFail::Control(ctl)) => return Err(ctl),
+                },
+            }
+        }
+        Ok(crate::interp::make_pair(
+            Value::Array(crate::value::ArrayCell::new(out)),
+            Value::Nil,
+        ))
     }
 
     /// `std/time` dispatch. `sleep` is async (the first async stdlib fn) and is

@@ -220,6 +220,27 @@ pub(crate) enum ResourceState {
     // stages), driven by `Interp::pull_next`. Always present (core). Boxed to keep
     // the enum compact (a StreamState carries a Vec of stages + a source).
     Stream(Box<crate::stdlib::stream::StreamState>),
+    // SP5 §6 std/postgres: a tokio-postgres async connection. Holds the `Client`
+    // plus the `AbortHandle` of the spawned driver task (the `Connection` future
+    // that drives the protocol). Dropping/closing the resource aborts the driver
+    // task — deterministic teardown, matching the cancel-on-drop discipline. The
+    // Client's query/execute take `&self`, but we still take_resource it out across
+    // the await to avoid holding a `resources` borrow.
+    #[cfg(feature = "postgres")]
+    PostgresConnection {
+        client: tokio_postgres::Client,
+        conn_task: tokio::task::AbortHandle,
+    },
+    // SP5 §6 std/redis: a multiplexed async connection. Its command methods take
+    // `&mut self`; taken out across the await per the borrow discipline. Boxed to
+    // keep the enum compact (MultiplexedConnection is sizeable).
+    #[cfg(feature = "redis")]
+    RedisConnection(Box<redis::aio::MultiplexedConnection>),
+    // SP5 §7 std/lru: a bounded LRU cache (core, not feature-gated). Boxed to keep
+    // the enum compact (the IndexMap can grow).
+    Lru(Box<crate::stdlib::lru::LruState>),
+    // SP5 §7 std/events: an event-emitter's per-event listener lists (core).
+    Events(Box<crate::stdlib::events::EventsState>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -2400,6 +2421,18 @@ impl Interp {
                 return self.call_process_method(&m, args, span).await;
             }
         }
+        #[cfg(feature = "postgres")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::PostgresConnection) {
+                return self.call_postgres_method(&m, args, span).await;
+            }
+        }
+        #[cfg(feature = "redis")]
+        {
+            if matches!(m.receiver.kind, crate::value::NativeKind::RedisConnection) {
+                return self.call_redis_method(&m, args, span).await;
+            }
+        }
         #[cfg(feature = "net")]
         {
             use crate::value::NativeKind::*;
@@ -2450,6 +2483,12 @@ impl Interp {
             }
             if matches!(m.receiver.kind, RateLimiter) {
                 return self.call_rate_limiter_method(&m, args, span).await;
+            }
+            if matches!(m.receiver.kind, Lru) {
+                return self.call_lru_method(&m, &args, span);
+            }
+            if matches!(m.receiver.kind, Events) {
+                return self.call_events_method(&m, args, span).await;
             }
         }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())

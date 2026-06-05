@@ -414,6 +414,18 @@ pub enum NativeKind {
     // std/stream: a lazy pull-based stream (a source + a chain of combinator
     // stages). Driven by terminals via `Interp::pull_next`. Not feature-gated.
     Stream,
+    // SP5 §6 std/postgres: an async Postgres connection (feature `postgres`).
+    // Methods: query/queryOne/exec/begin/commit/rollback/close.
+    PostgresConnection,
+    // SP5 §6 std/redis: an async Redis connection (feature `redis`).
+    // Methods: command/get/set/del/incr/expire/exists/close.
+    RedisConnection,
+    // SP5 §7 std/lru: a bounded LRU cache (core). Methods: get/set/has/delete/
+    // clear/len/keys.
+    Lru,
+    // SP5 §7 std/events: an event-emitter (core). Methods: on/once/off/emit/
+    // listenerCount.
+    Events,
 }
 
 impl NativeKind {
@@ -443,6 +455,10 @@ impl NativeKind {
             NativeKind::RateLimiter => "rateLimiter",
             NativeKind::UdpSocket => "udpSocket",
             NativeKind::Stream => "stream",
+            NativeKind::PostgresConnection => "postgresConnection",
+            NativeKind::RedisConnection => "redisConnection",
+            NativeKind::Lru => "lru",
+            NativeKind::Events => "emitter",
         }
     }
 }
