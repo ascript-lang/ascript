@@ -12,10 +12,17 @@ use crate::lsp::model::DocumentStore;
 use crate::lsp::workspace::{self, WorkspaceIndex};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
+
+/// The debounce window: edits arriving within this of the previous edit coalesce
+/// into one rebuild. Short enough to feel instant, long enough to absorb a burst of
+/// keystrokes (typing ~10 chars/sec → all fold into one rebuild).
+const DEBOUNCE_MS: u64 = 40;
 
 /// Client-configurable settings (subset). Updated by `didChangeConfiguration`.
 #[derive(Debug, Clone, Default)]
@@ -37,6 +44,15 @@ pub struct Backend {
     roots: RwLock<Vec<PathBuf>>,
     /// Client-configurable settings (`didChangeConfiguration`).
     settings: RwLock<LspSettings>,
+    /// Coalescing: the latest pending text + version + edit sequence number per URL.
+    /// A debounced rebuild only proceeds if its captured sequence is still the latest
+    /// for the URL (a newer edit landing supersedes it).
+    pending: Mutex<HashMap<Url, (String, Option<i32>, u64)>>,
+    /// Monotone edit sequence, bumped on every `did_change`.
+    edit_seq: AtomicU64,
+    /// Set by `window/workDoneProgress/cancel` for the indexing token; checked
+    /// between files so a huge workspace's initial indexing can be aborted.
+    index_cancelled: AtomicBool,
 }
 
 impl Backend {
@@ -47,6 +63,9 @@ impl Backend {
             index: RwLock::new(WorkspaceIndex::new()),
             roots: RwLock::new(Vec::new()),
             settings: RwLock::new(LspSettings::default()),
+            pending: Mutex::new(HashMap::new()),
+            edit_seq: AtomicU64::new(0),
+            index_cancelled: AtomicBool::new(false),
         }
     }
 
@@ -98,7 +117,9 @@ impl Backend {
         let mut diags;
         {
             let mut store = self.documents.lock().await;
-            store.set(uri.clone(), text.clone(), version);
+            // `set_versioned` bumps the document generation so a concurrently-running
+            // completion/hover handler can detect it was superseded (Task 5).
+            store.set_versioned(uri.clone(), text.clone(), version);
             diags = store.get(&uri).map(|m| m.lsp_diagnostics()).unwrap_or_default();
         }
         // Index-backed cross-file arity (cannot be computed single-file).
@@ -433,17 +454,53 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // Incremental sync: apply the ranged content changes against the cached
-        // text, then rebuild the model from the resulting full text.
-        let uri = params.text_document.uri;
+        // Incremental sync with debounce/coalesce: a burst of keystrokes within the
+        // debounce window folds into a SINGLE rebuild + publish, and only the latest
+        // folded text is analyzed (older edits are folded forward, never analyzed).
+        let uri = params.text_document.uri.clone();
         let version = Some(params.text_document.version);
-        let new_text = {
-            let store = self.documents.lock().await;
-            let base = store.get(&uri).map(|m| m.text.clone()).unwrap_or_default();
-            crate::lsp::model::apply_changes(&base, &params.content_changes)
+
+        // Fold the ranged edits onto the latest known text (pending wins over the
+        // cached model so consecutive bursts stack correctly).
+        let base = {
+            let pending = self.pending.lock().await;
+            if let Some((t, _, _)) = pending.get(&uri) {
+                t.clone()
+            } else {
+                let store = self.documents.lock().await;
+                store.get(&uri).map(|m| m.text.clone()).unwrap_or_default()
+            }
         };
-        self.reindex_uri(&uri, &new_text);
-        self.analyze_and_publish(uri, new_text, version).await;
+        let new_text = crate::lsp::model::apply_changes(&base, &params.content_changes);
+
+        // Stamp this edit and record it as the latest pending text for the URI.
+        let seq = self.edit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(uri.clone(), (new_text.clone(), version, seq));
+        }
+
+        // Debounce: wait the window, then rebuild ONLY if no newer edit landed. The
+        // sleep defers THIS uri's rebuild without blocking other requests (tower-lsp
+        // dispatches each notification as its own task on the LocalSet).
+        tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+        let still_latest = {
+            let pending = self.pending.lock().await;
+            pending.get(&uri).map(|(_, _, s)| *s) == Some(seq)
+        };
+        if !still_latest {
+            return; // a newer edit superseded us; it will rebuild.
+        }
+
+        let (text, ver) = {
+            let mut pending = self.pending.lock().await;
+            match pending.remove(&uri) {
+                Some((t, v, _)) => (t, v),
+                None => return,
+            }
+        };
+        self.reindex_uri(&uri, &text);
+        self.analyze_and_publish(uri, text, ver).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {

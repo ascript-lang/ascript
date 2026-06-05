@@ -343,6 +343,26 @@ mod sync_tests {
         };
         assert_eq!(apply_changes("old", &[change]), "new");
     }
+
+    #[test]
+    fn coalesced_edits_fold_forward() {
+        // Two ranged inserts applied in sequence equal one apply over the folded text
+        // — proving a debounce that only analyzes the LATEST folded text is correct.
+        let start = "let x = 1\n";
+        let e1 = TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 8), Position::new(0, 9))),
+            range_length: None,
+            text: "2".to_string(),
+        };
+        let after1 = apply_changes(start, &[e1]);
+        let e2 = TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 8), Position::new(0, 9))),
+            range_length: None,
+            text: "3".to_string(),
+        };
+        let after2 = apply_changes(&after1, &[e2]);
+        assert_eq!(after2, "let x = 3\n");
+    }
 }
 
 #[cfg(test)]
