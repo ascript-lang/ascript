@@ -15,6 +15,13 @@ path = "src/main.rs"
 rust_decimal = { version = "1", features = ["maths"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 async-recursion = "1"
+# Probe-and-grow native stack (SP9 §1): `stacker::maybe_grow` allocates a fresh
+# heap-backed stack segment at the native re-entry points (VM/generator/compiler/
+# tree-walker) when the remaining native stack falls below the red zone, so deep
+# recursion reaches the `MAX_CALL_DEPTH` logical cap cleanly instead of SIGABRTing
+# the native stack first. CORE/unconditional (must build under
+# --no-default-features); the only `unsafe` is the crate's own (sanctioned).
+stacker = "0.1"
 indexmap = "2"
 # Cyclic GC (Bacon–Rajan trial-deletion over refcounted `Cc<T>`). CORE runtime,
 # NOT feature-gated: the GC must be present in --no-default-features too. V13-T1

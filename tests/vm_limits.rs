@@ -271,6 +271,150 @@ fn cli_under_limit_recursion_succeeds_both_engines() {
     }
 }
 
+// =============================================================================
+// §C (SP9 §1) — robust unbounded recursion: deep NATIVE re-entry no longer
+// SIGABRTs. These programs nest native Rust frames at the four re-entry points
+// (`call_value` for HOF callbacks, generator `resume_vm`, method dispatch,
+// `compile_expr`/`eval_expr` for nested expressions) to a depth that overflows
+// the DEFAULT test-thread stack (~8 MB) BEFORE SP9 — exit 134 / SIGABRT — yet is
+// comfortably UNDER the `MAX_CALL_DEPTH` logical cap (3000). After SP9's
+// `stacker::maybe_grow` guard at each re-entry point, they succeed BYTE-IDENTICALLY
+// on BOTH engines, run directly on the test thread (NOT the enlarged worker stack),
+// proving the guard — not the worker stack — is what prevents the native overflow.
+//
+// Depth rationale: at ~82 KB / logical native frame (SP3 §B6) the default test
+// thread holds ~95 re-entry frames before overflow, so a depth of 1500 (well over
+// that, well under the 3000 cap) is a faithful "used-to-SIGABRT, now-succeeds"
+// reproducer. The programs are written to terminate quickly once the stack grows.
+
+/// A recursion whose every level re-enters `Vm::call_value`'s `Value::Closure`
+/// arm through an `array.map` HOF callback (`src/vm/run.rs` `call_value` :2848).
+/// Each level is a fresh large native frame (map native + call_value + run).
+fn deep_hof_src(n: usize) -> String {
+    format!(
+        "import {{ map }} from \"std/array\"\nfn rec(n) {{\n  if (n <= 0) {{ return 0 }}\n  return map([n], (x) => rec(x - 1))[0]\n}}\nprint(rec({n}))\n"
+    )
+}
+
+/// A recursion through deep GENERATOR composition: a generator whose body drives
+/// (resumes) a nested generator, nesting `coro::resume_vm` native frames.
+fn deep_generator_src(n: usize) -> String {
+    format!(
+        "fn* g(n) {{\n  if (n <= 0) {{\n    yield 0\n  }} else {{\n    let inner = g(n - 1)\n    let r = inner.next()\n    while (r != nil) {{\n      yield r\n      r = inner.next()\n    }}\n  }}\n}}\nlet total = 0\nlet gen = g({n})\nlet v = gen.next()\nwhile (v != nil) {{\n  total = total + v\n  v = gen.next()\n}}\nprint(total)\n"
+    )
+}
+
+/// A recursion through non-IC METHOD dispatch (`invoke_compiled_method` /
+/// `vm_construct` re-entry into `Vm::run`).
+fn deep_method_src(n: usize) -> String {
+    format!(
+        "class R {{\n  fn rec(n) {{\n    if (n <= 0) {{ return 0 }}\n    let inner = R()\n    return inner.rec(n - 1)\n  }}\n}}\nprint(R().rec({n}))\n"
+    )
+}
+
+/// A deeply nested SOURCE expression: `((((…1…))))`. Exercises the synchronous
+/// compiler `compile_expr` (`src/compile/mod.rs:984`) and the tree-walker
+/// `eval_expr` (`src/interp.rs:2252`). Depth is in PAREN nesting, not calls;
+/// 2500 is over the native test-thread budget but under the 3000 cap.
+fn deep_paren_src(n: usize) -> String {
+    let mut s = String::with_capacity(n * 2 + 16);
+    s.push_str("print(");
+    for _ in 0..n {
+        s.push('(');
+    }
+    s.push('1');
+    for _ in 0..n {
+        s.push(')');
+    }
+    s.push_str(")\n");
+    s
+}
+
+/// Assert a program runs to SUCCESS with byte-identical stdout + exit on all
+/// three engines (tree-walker, specialized VM, generic VM), DIRECTLY on the test
+/// thread (no enlarged worker stack). Before SP9 these SIGABRT (the test harness
+/// would die); after SP9 they succeed. `expected` is the exact stdout.
+async fn assert_deep_succeeds_three_way(src: &str, expected: &str) {
+    let tw = ascript::run_source(src).await.expect("tree-walker: deep recursion must succeed (SP9)");
+    assert_eq!(tw, expected, "tree-walker stdout mismatch");
+    let (vm, code) = ascript::vm_run_source(src)
+        .await
+        .expect("specialized VM: deep recursion must succeed (SP9)");
+    assert_eq!(vm, expected, "specialized VM stdout mismatch");
+    assert_eq!(code, None, "specialized VM exit");
+    let (gen, gcode) = ascript::vm_run_source_generic(src)
+        .await
+        .expect("generic VM: deep recursion must succeed (SP9)");
+    assert_eq!(gen, expected, "generic VM stdout mismatch");
+    assert_eq!(gcode, None, "generic VM exit");
+}
+
+#[tokio::test]
+async fn deep_hof_callback_recursion_no_sigabrt_three_way() {
+    assert_deep_succeeds_three_way(&deep_hof_src(1500), "0\n").await;
+}
+
+#[tokio::test]
+async fn deep_generator_composition_no_sigabrt_three_way() {
+    assert_deep_succeeds_three_way(&deep_generator_src(1500), "0\n").await;
+}
+
+#[tokio::test]
+async fn deep_method_dispatch_recursion_no_sigabrt_three_way() {
+    assert_deep_succeeds_three_way(&deep_method_src(1500), "0\n").await;
+}
+
+#[tokio::test]
+async fn deep_nested_expression_no_sigabrt_three_way() {
+    assert_deep_succeeds_three_way(&deep_paren_src(2500), "1\n").await;
+}
+
+/// Boundary parity (SP3, re-verified under SP9): the logical cap is still THE
+/// ceiling on both engines — `f(MAX-1)` succeeds and `f(MAX+slack)` fails with the
+/// clean `maximum recursion depth exceeded` panic, identically on all three
+/// engines, run on the enlarged worker stack (as the binary does) so the native
+/// stack is never the limiting factor.
+#[test]
+fn recursion_cap_is_the_ceiling_both_engines_under_sp9() {
+    // Just under the cap → success on the worker stack (3000 deep needs the big
+    // stack on the tree-walker even with stacker, since stacker only grows at
+    // re-entry funnels — plain script recursion uses the heap frames + the worker
+    // stack exactly as SP3 established).
+    let under = rec_src(2900);
+    let over = rec_src(8000);
+    let (tw_under, vm_under, gen_under) = ascript::run_on_worker_stack(move || async move {
+        let tw = ascript::run_source_exit(&under).await.map(|(o, _)| o).map_err(|e| e.message);
+        let vm = ascript::vm_run_source(&under).await.map(|(o, _)| o).map_err(|e| e.message);
+        let gen = ascript::vm_run_source_generic(&under).await.map(|(o, _)| o).map_err(|e| e.message);
+        (tw, vm, gen)
+    });
+    assert_eq!(tw_under, Ok("2900\n".to_string()), "tree-walker under cap");
+    assert_eq!(vm_under, Ok("2900\n".to_string()), "specialized VM under cap");
+    assert_eq!(gen_under, Ok("2900\n".to_string()), "generic VM under cap");
+
+    let (tw_over, vm_over, gen_over) = ascript::run_on_worker_stack(move || async move {
+        let tw = ascript::run_source_exit(&over).await.map(|(o, _)| o).map_err(|e| e.message);
+        let vm = ascript::vm_run_source(&over).await.map(|(o, _)| o).map_err(|e| e.message);
+        let gen = ascript::vm_run_source_generic(&over).await.map(|(o, _)| o).map_err(|e| e.message);
+        (tw, vm, gen)
+    });
+    assert_eq!(
+        tw_over,
+        Err("maximum recursion depth exceeded".to_string()),
+        "tree-walker over cap → clean panic"
+    );
+    assert_eq!(
+        vm_over,
+        Err("maximum recursion depth exceeded".to_string()),
+        "specialized VM over cap → clean panic"
+    );
+    assert_eq!(
+        gen_over,
+        Err("maximum recursion depth exceeded".to_string()),
+        "generic VM over cap → clean panic"
+    );
+}
+
 /// SP3 §B7 margin guard: the tree-walker has the LARGEST per-frame native budget
 /// of either engine. The depth guard fires AT `MAX_CALL_DEPTH` logical units; at
 /// that moment the tree-walker's native stack holds ~`MAX_CALL_DEPTH`
