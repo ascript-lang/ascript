@@ -24,7 +24,6 @@
     "url": "https://github.com/ascript-lang/ascript",
     "directory": "editors/vscode"
   },
-  "icon": "icons/ascript.png",
   "main": "./dist/extension.js",
   "activationEvents": [
     "onLanguage:ascript",
@@ -41,11 +40,7 @@
         "extensions": [
           ".as"
         ],
-        "configuration": "./language-configuration.json",
-        "icon": {
-          "light": "./icons/ascript.png",
-          "dark": "./icons/ascript.png"
-        }
+        "configuration": "./language-configuration.json"
       }
     ],
     "grammars": [
@@ -89,6 +84,14 @@
       {
         "command": "ascript.showServerVersion",
         "title": "AScript: Show Language Server Version"
+      },
+      {
+        "command": "ascript.run",
+        "title": "AScript: Run File"
+      },
+      {
+        "command": "ascript.runTest",
+        "title": "AScript: Run Tests"
       }
     ]
   },
