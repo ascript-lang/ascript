@@ -681,7 +681,7 @@ pub mod symbols;
 
 - [ ] **Step 2: Write the failing test**
 
-Create `src/lsp/providers/symbols.rs`. Walk the CST top-level declarations (mirror the kinds in `src/lsp/workspace.rs`'s `index_tree`, which already classifies `FnDecl`/`ClassDecl`/`EnumDecl`/`LetDecl`/`ImportStmt`). Use `crate::syntax::resolve::ident_text` for names and `code_range`-style byte spans from `text_range()`.
+Create `src/lsp/providers/symbols.rs`. Walk the CST top-level declarations (mirror the kinds in `src/lsp/workspace.rs`'s `index_tree`, which already classifies `FnDecl`/`ClassDecl`/`EnumDecl`/`LetStmt`/`ImportStmt`). Use `crate::syntax::resolve::ident_text` for names and `code_range`-style byte spans from `text_range()`.
 
 ```rust
 //! `textDocument/documentSymbol` over the CST.
@@ -709,7 +709,7 @@ fn symbol_for(model: &SemanticModel, node: &crate::syntax::cst::ResolvedNode) ->
         SyntaxKind::FnDecl => (SymbolKind::FUNCTION, ()),
         SyntaxKind::ClassDecl => (SymbolKind::CLASS, ()),
         SyntaxKind::EnumDecl => (SymbolKind::ENUM, ()),
-        SyntaxKind::LetDecl => (SymbolKind::VARIABLE, ()),
+        SyntaxKind::LetStmt => (SymbolKind::VARIABLE, ()),
         _ => return None,
     };
     let name = crate::syntax::resolve::ident_text(node)?;
