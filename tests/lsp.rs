@@ -277,6 +277,11 @@ fn lsp_protocol_end_to_end() {
         !caps["linkedEditingRangeProvider"].is_null(),
         "missing linkedEditingRangeProvider: {resp}"
     );
+    // Phase 4: pull diagnostics.
+    assert!(
+        !caps["diagnosticProvider"].is_null(),
+        "missing diagnosticProvider: {resp}"
+    );
     // Phase 4: executeCommand carries run/runTest.
     {
         let cmds = caps["executeCommandProvider"]["commands"]

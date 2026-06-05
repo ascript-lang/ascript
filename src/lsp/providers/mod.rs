@@ -3,6 +3,7 @@
 pub mod code_action;
 pub mod color;
 pub mod completion;
+pub mod diagnostic;
 pub mod docs;
 pub mod folding;
 pub mod formatting;

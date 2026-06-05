@@ -200,6 +200,14 @@ pub fn server_capabilities() -> ServerCapabilities {
         // Phase 4: linkedEditingRange — live rename of a local identifier's same-file
         // occurrences (globals refused).
         linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
+        // Phase 4: pull diagnostics (textDocument/diagnostic + workspace/diagnostic),
+        // returning the same diagnostics as the push path.
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+            identifier: Some("ascript".to_string()),
+            inter_file_dependencies: true,
+            workspace_diagnostics: true,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         // Phase 2: signature help while typing a call's arguments. Triggered on `(`
         // (open the call) and `,` (advance the active parameter / retrigger).
         signature_help_provider: Some(SignatureHelpOptions {
@@ -631,6 +639,60 @@ impl LanguageServer for Backend {
             arguments: None,
         });
         Ok(lens)
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> tower_lsp::jsonrpc::Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        match store.get(&uri) {
+            Some(model) => Ok(crate::lsp::providers::diagnostic::document_report(model)),
+            None => Ok(DocumentDiagnosticReportResult::Report(
+                DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport::default()),
+            )),
+        }
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> tower_lsp::jsonrpc::Result<WorkspaceDiagnosticReportResult> {
+        // Project-wide: every indexed file → a workspace full report. Build a model
+        // per file off its cached text (config-aware via the per-path lint config),
+        // returning the SAME diagnostics the push/document-pull paths compute.
+        let files: Vec<(PathBuf, String)> = {
+            match self.index.read().ok() {
+                Some(idx) => idx
+                    .files
+                    .iter()
+                    .map(|(p, f)| (p.clone(), f.text.clone()))
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        let mut items: Vec<WorkspaceDocumentDiagnosticReport> = Vec::with_capacity(files.len());
+        for (path, text) in files {
+            let Some(uri) = canon_to_url(&path) else {
+                continue;
+            };
+            let config = crate::lsp::model::config_for_path(&path);
+            let model = crate::lsp::model::SemanticModel::build(text, None, &config);
+            items.push(WorkspaceDocumentDiagnosticReport::Full(
+                WorkspaceFullDocumentDiagnosticReport {
+                    uri,
+                    version: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: model.lsp_diagnostics(),
+                    },
+                },
+            ));
+        }
+        Ok(WorkspaceDiagnosticReportResult::Report(
+            WorkspaceDiagnosticReport { items },
+        ))
     }
 
     async fn execute_command(
@@ -1395,6 +1457,18 @@ mod tests {
             .commands
             .iter()
             .any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND));
+    }
+
+    #[test]
+    fn capabilities_advertise_pull_diagnostics() {
+        let caps = server_capabilities();
+        match caps.diagnostic_provider {
+            Some(DiagnosticServerCapabilities::Options(opts)) => {
+                assert!(opts.workspace_diagnostics, "workspace diagnostics on");
+                assert!(opts.inter_file_dependencies, "inter-file deps on");
+            }
+            other => panic!("expected DiagnosticOptions, got {other:?}"),
+        }
     }
 
     #[test]
