@@ -34,6 +34,7 @@ const NAV = [
     ['stdlib/net', 'Networking & HTTP'],
     ['stdlib/log', 'Logging'],
     ['stdlib/telemetry', 'Telemetry & observability'],
+    ['stdlib/ai', 'AI (LLM client)'],
     ['stdlib/tui', 'Terminal UI'],
   ]},
   { title: 'Resources', items: [

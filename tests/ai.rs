@@ -292,6 +292,56 @@ fn generate_missing_credential_is_tier1() {
 }
 
 // ===========================================================================
+// Phase F — embeddings.
+// ===========================================================================
+
+#[test]
+fn embed_single() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        let [emb, err] = await ai.embed({ model: "openai:text-embedding-3-small", value: "sunny day" })
+        if (err != nil) { print("ERR " + err.message); return }
+        print(len(emb.embedding))
+        print(emb.embedding[0] > 0.09 && emb.embedding[0] < 0.11)
+        print(emb.usage.inputTokens)
+        "#,
+        vec![ai_mock::Fixture::json(&fixture("openai/embed.json"))],
+    );
+    assert_eq!(out, "3\ntrue\n3\n");
+}
+
+#[test]
+fn embed_many() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        let [embs, err] = await ai.embedMany({ model: "openai:text-embedding-3-small", values: ["a", "b"] })
+        if (err != nil) { print("ERR " + err.message); return }
+        print(len(embs.embeddings))
+        print(len(embs.embeddings[0]))
+        print(embs.usage.inputTokens)
+        "#,
+        vec![ai_mock::Fixture::json(&fixture("openai/embed_many.json"))],
+    );
+    assert_eq!(out, "2\n2\n4\n");
+}
+
+#[test]
+fn embed_error_is_tier1() {
+    let out = run_with_fixtures(
+        r#"
+        import * as ai from "std/ai"
+        let [emb, err] = await ai.embed({ model: "openai:text-embedding-3-small", value: "x" })
+        if (err != nil) { print("status=" + type(err.status)); return }
+        print("unexpected ok")
+        "#,
+        vec![ai_mock::Fixture::json_status(429, r#"{"error":{"message":"rate limited"}}"#)],
+    );
+    assert_eq!(out, "status=number\n");
+}
+
+// ===========================================================================
 // Phase E — tools (the in-interpreter sequential tool-use loop).
 // ===========================================================================
 
@@ -526,4 +576,217 @@ fn stream_connection_error_is_tier1_on_next() {
         vec![ai_mock::Fixture::json_status(500, r#"{"error":{"message":"server error"}}"#)],
     );
     assert_eq!(out, "next status=number\n");
+}
+
+// ===========================================================================
+// Phase F — telemetry GenAI spans (opt-in, through the SP12 soft hook).
+// Gated on BOTH `ai` and `telemetry`: asserts a `chat <model>` span with the
+// gen_ai.* attributes is captured when telemetry is initialized, through the
+// runtime hook (no AI-specific exporter, no network).
+// ===========================================================================
+#[cfg(feature = "telemetry")]
+mod telemetry_spans {
+    use super::*;
+
+    /// Like `run_with_fixtures` but returns the owning interp so the test can read
+    /// `telemetry_spans_debug()`.
+    fn run_with_fixtures_i(
+        src: &str,
+        fixtures: Vec<ai_mock::Fixture>,
+    ) -> std::rc::Rc<ascript::interp::Interp> {
+        let server = ai_mock::MockServer::start(fixtures);
+        let base = server.base_url();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let interp = local.block_on(&rt, async {
+            ascript::stdlib::ai::set_test_endpoint(Some(base));
+            let (_out, interp) = ascript::run_source_with_interp(src)
+                .await
+                .expect("program runs");
+            ascript::stdlib::ai::set_test_endpoint(None);
+            interp
+        });
+        server.stop();
+        interp
+    }
+
+    const INIT: &str = r#"
+import * as telemetry from "std/telemetry"
+import * as ai from "std/ai"
+telemetry.init({ service: "t", exporters: [ telemetry.otlp({ endpoint: "http://localhost:4318" }) ] })
+"#;
+
+    #[test]
+    fn generate_emits_genai_span() {
+        let interp = run_with_fixtures_i(
+            &format!(
+                r#"{INIT}
+let [r, err] = await ai.generate({{ model: "openai:gpt-4.1", prompt: "hi", temperature: 0.2, maxTokens: 100 }})
+print(r.text)
+"#
+            ),
+            vec![ai_mock::Fixture::json(&fixture("openai/chat.json"))],
+        );
+        let spans = interp.telemetry_spans_debug();
+        let chat = spans
+            .iter()
+            .find(|s| s.name.starts_with("chat "))
+            .expect("a `chat <model>` span");
+        assert_eq!(chat.name, "chat openai:gpt-4.1");
+        let has = |k: &str| chat.attributes.iter().any(|(ak, _)| ak == k);
+        assert!(has("gen_ai.operation.name"), "{:?}", chat.attributes);
+        assert!(has("gen_ai.provider.name"));
+        assert!(has("gen_ai.request.model"));
+        assert!(has("gen_ai.request.temperature"));
+        assert!(has("gen_ai.request.max_tokens"));
+        assert!(has("gen_ai.response.finish_reasons"));
+        assert!(has("gen_ai.usage.input_tokens"));
+        assert!(has("gen_ai.usage.output_tokens"));
+        // PII-safe default: no prompt/response CONTENT recorded.
+        assert!(!has("gen_ai.prompt"), "content must be off by default");
+        assert_eq!(chat.status_code, 1, "ok");
+    }
+
+    #[test]
+    fn per_call_disabled_emits_no_span() {
+        let interp = run_with_fixtures_i(
+            &format!(
+                r#"{INIT}
+let [r, err] = await ai.generate({{ model: "openai:gpt-4.1", prompt: "hi", telemetry: {{ enabled: false }} }})
+print(r.text)
+"#
+            ),
+            vec![ai_mock::Fixture::json(&fixture("openai/chat.json"))],
+        );
+        let spans = interp.telemetry_spans_debug();
+        assert!(
+            !spans.iter().any(|s| s.name.starts_with("chat ")),
+            "per-call telemetry:{{enabled:false}} suppresses the span"
+        );
+    }
+
+    #[test]
+    fn record_inputs_opt_in_records_prompt() {
+        let interp = run_with_fixtures_i(
+            &format!(
+                r#"{INIT}
+let [r, err] = await ai.generate({{ model: "openai:gpt-4.1", prompt: "secret", telemetry: {{ recordInputs: true }} }})
+print(r.text)
+"#
+            ),
+            vec![ai_mock::Fixture::json(&fixture("openai/chat.json"))],
+        );
+        let spans = interp.telemetry_spans_debug();
+        let chat = spans.iter().find(|s| s.name.starts_with("chat ")).unwrap();
+        assert!(
+            chat.attributes.iter().any(|(k, _)| k == "gen_ai.prompt"),
+            "recordInputs:true records the prompt"
+        );
+    }
+}
+
+// ===========================================================================
+// Env-gated LIVE suite — hits real providers. Skipped (early return) unless
+// `ASCRIPT_AI_LIVE=1` AND the provider key is set, so the default `cargo test`
+// never opens a socket or needs a secret. NOT `#[ignore]` (it always "passes" by
+// early-returning when the env is absent).
+// ===========================================================================
+
+fn live_enabled() -> bool {
+    std::env::var("ASCRIPT_AI_LIVE").as_deref() == Ok("1")
+}
+
+/// Run a live `.as` program (no fixture seam) on a current-thread runtime.
+fn run_live(src: &str) -> Result<String, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .block_on(&rt, async { ascript::run_source(src).await })
+        .map_err(|e| e.message)
+}
+
+#[test]
+fn live_openai_generate() {
+    if !live_enabled() || std::env::var("OPENAI_API_KEY").is_err() {
+        return; // skipped without ASCRIPT_AI_LIVE=1 + OPENAI_API_KEY
+    }
+    let out = run_live(
+        r#"
+        import * as ai from "std/ai"
+        let [r, err] = await ai.generate({ model: "openai:gpt-4.1-mini", prompt: "Reply with the single word: pong", maxTokens: 10 })
+        if (err != nil) { print("ERR " + err.message) } else { print(len(r.text) > 0) }
+        "#,
+    )
+    .expect("live openai run");
+    assert!(out.contains("true") || out.contains("ERR"), "got: {}", out);
+}
+
+#[test]
+fn live_anthropic_generate() {
+    if !live_enabled() || std::env::var("ANTHROPIC_API_KEY").is_err() {
+        return;
+    }
+    let out = run_live(
+        r#"
+        import * as ai from "std/ai"
+        let [r, err] = await ai.generate({ model: "anthropic:claude-haiku-4.5", prompt: "Reply: pong", maxTokens: 10 })
+        if (err != nil) { print("ERR " + err.message) } else { print(len(r.text) > 0) }
+        "#,
+    )
+    .expect("live anthropic run");
+    assert!(out.contains("true") || out.contains("ERR"), "got: {}", out);
+}
+
+#[test]
+fn live_gemini_generate() {
+    if !live_enabled() || std::env::var("GEMINI_API_KEY").is_err() {
+        return;
+    }
+    let out = run_live(
+        r#"
+        import * as ai from "std/ai"
+        let [r, err] = await ai.generate({ model: "google:gemini-2.5-flash", prompt: "Reply: pong" })
+        if (err != nil) { print("ERR " + err.message) } else { print(len(r.text) > 0) }
+        "#,
+    )
+    .expect("live gemini run");
+    assert!(out.contains("true") || out.contains("ERR"), "got: {}", out);
+}
+
+#[test]
+fn live_bedrock_generate() {
+    if !live_enabled() || std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+        return;
+    }
+    let out = run_live(
+        r#"
+        import * as ai from "std/ai"
+        let [r, err] = await ai.generate({ model: "bedrock:anthropic.claude-3-5-haiku-20241022-v1:0", prompt: "Reply: pong", maxTokens: 10 })
+        if (err != nil) { print("ERR " + err.message) } else { print(len(r.text) > 0) }
+        "#,
+    )
+    .expect("live bedrock run");
+    assert!(out.contains("true") || out.contains("ERR"), "got: {}", out);
+}
+
+#[test]
+fn live_vertex_generate() {
+    if !live_enabled() || std::env::var("GOOGLE_APPLICATION_CREDENTIALS").is_err() {
+        return;
+    }
+    let out = run_live(
+        r#"
+        import * as ai from "std/ai"
+        let [r, err] = await ai.generate({ model: "vertex:gemini-2.5-flash", prompt: "Reply: pong" })
+        if (err != nil) { print("ERR " + err.message) } else { print(len(r.text) > 0) }
+        "#,
+    )
+    .expect("live vertex run");
+    assert!(out.contains("true") || out.contains("ERR"), "got: {}", out);
 }

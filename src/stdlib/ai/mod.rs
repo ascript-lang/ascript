@@ -36,6 +36,7 @@ use crate::value::Value;
 mod request;
 mod response;
 mod stream;
+mod telemetry;
 mod tools;
 
 pub mod json_schema;
@@ -74,9 +75,8 @@ pub(crate) async fn dispatch(
         "generate" => generate(interp, args, span).await,
         "stream" => stream::stream(interp, args, span).await,
         "tool" => tools::make_tool(interp, args, span),
-        "embed" | "embedMany" => {
-            Err(AsError::at(format!("std/ai: '{}' is not yet implemented", func), span).into())
-        }
+        "embed" => embed(interp, args, false, span).await,
+        "embedMany" => embed(interp, args, true, span).await,
         other => Err(AsError::at(format!("std/ai has no function '{}'", other), span).into()),
     }
 }
@@ -196,6 +196,10 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
     // Take the genai client OUT (clone the Arc-backed handle) before the await.
     let client = interp.ai_state().client();
 
+    // GenAI-convention OTel span (opt-in: only when telemetry is initialized).
+    let model_label = format!("{}:{}", resolved.provider_tag, resolved.model);
+    let span_id = telemetry::open_chat_span(interp, &opts, &resolved, &model_label, &gen_opts);
+
     if !resolved_tools.is_empty() {
         let genai_tools: Vec<genai::chat::Tool> =
             resolved_tools.iter().map(|t| t.tool.clone()).collect();
@@ -216,9 +220,13 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
         .await?;
         return Ok(match loop_result {
             Ok((neutral, steps)) => {
+                telemetry::close_chat_span(interp, span_id, Some(&neutral), false);
                 crate::interp::make_pair(response::out_object(&neutral, steps), Value::Nil)
             }
-            Err(err) => crate::interp::make_pair(Value::Nil, err),
+            Err(err) => {
+                telemetry::close_chat_span(interp, span_id, None, true);
+                crate::interp::make_pair(Value::Nil, err)
+            }
         });
     }
 
@@ -235,13 +243,15 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
     let resp = match result {
         Ok(resp) => resp,
         Err(e) => {
+            telemetry::close_chat_span(interp, span_id, None, true);
             return Ok(crate::interp::make_pair(
                 Value::Nil,
                 response::error_to_value(&e),
-            ))
+            ));
         }
     };
     let neutral = response::neutral_from_genai(resp);
+    telemetry::close_chat_span(interp, span_id, Some(&neutral), false);
 
     // No shape → the plain `out` object.
     let Some(st) = shape_type else {
@@ -253,6 +263,90 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
     // decode failure and a shape mismatch into ONE Tier-1 [value, err] pair.
     let parsed_pair = crate::stdlib::json::call("parse", &[Value::Str(neutral.text.clone().into())], span)?;
     interp.typed_decode(parsed_pair, &st, false, "", span).await
+}
+
+/// `ai.embed({model, value})` / `ai.embedMany({model, values})` → Tier-1 pair.
+/// Single: `[{embedding:[..], usage:{inputTokens}}, err]`. Many:
+/// `[{embeddings:[[..],..], usage:{inputTokens}}, err]`.
+async fn embed(
+    interp: &Interp,
+    args: &[Value],
+    many: bool,
+    span: Span,
+) -> Result<Value, Control> {
+    let opts = match args.first() {
+        Some(v @ Value::Object(_)) | Some(v @ Value::Instance(_)) => v.clone(),
+        _ => {
+            return Err(AsError::at(
+                "ai.embed(opts): expected an options object with a 'model'",
+                span,
+            )
+            .into())
+        }
+    };
+    let model_arg = request::get_field(&opts, "model");
+    if matches!(model_arg, Value::Nil) {
+        return Err(AsError::at("ai.embed: 'model' is required", span).into());
+    }
+    let resolved = request::resolve_model(&model_arg, span)?;
+    if let Some(err) = request::credential_missing_error(&resolved) {
+        return Ok(crate::interp::make_pair(Value::Nil, err));
+    }
+
+    let inputs: Vec<String> = if many {
+        match request::get_field(&opts, "values") {
+            Value::Array(a) => a
+                .borrow()
+                .iter()
+                .map(|v| match v {
+                    Value::Str(s) => Ok(s.to_string()),
+                    other => Err(AsError::at(
+                        format!(
+                            "ai.embedMany: 'values' must be an array of strings, got a {}",
+                            crate::interp::type_name(other)
+                        ),
+                        span,
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(AsError::at("ai.embedMany: 'values' must be an array of strings", span)
+                    .into())
+            }
+        }
+    } else {
+        match request::get_field(&opts, "value") {
+            Value::Str(s) => vec![s.to_string()],
+            _ => return Err(AsError::at("ai.embed: 'value' must be a string", span).into()),
+        }
+    };
+
+    let model_label = format!("{}:{}", resolved.provider_tag, resolved.model);
+    let span_id = telemetry::open_embed_span(interp, &opts, &resolved, &model_label);
+
+    let client = interp.ai_state().client();
+    let spec = resolved.to_service_target_or_iden();
+    let result = match spec {
+        request::ServiceTargetOrIden::Target(t) => client.embed_batch(t, inputs, None).await,
+        request::ServiceTargetOrIden::Iden(iden) => client.embed_batch(iden, inputs, None).await,
+    };
+    match result {
+        Ok(resp) => {
+            let input_tokens = resp.usage.prompt_tokens.map(|n| n as i64);
+            telemetry::close_embed_span(interp, span_id, input_tokens, false);
+            Ok(crate::interp::make_pair(
+                response::embed_object(&resp, many),
+                Value::Nil,
+            ))
+        }
+        Err(e) => {
+            telemetry::close_embed_span(interp, span_id, None, true);
+            Ok(crate::interp::make_pair(
+                Value::Nil,
+                response::error_to_value(&e),
+            ))
+        }
+    }
 }
 
 /// Build a system prompt instructing the model to reply with ONLY JSON matching the

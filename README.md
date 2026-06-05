@@ -164,6 +164,7 @@ ascript run hello.as
 | Concurrency | `std/task` (`spawn` · `gather` · `race` · `timeout` · `retry` over `future<T>`) · `std/sync` (FIFO channels · counting semaphore · token-bucket rate limiter) |
 | Logging | `std/log` (`debug` · `info` · `warn` · `error`; human/json, structured fields) |
 | Observability | `std/telemetry` (tracing spans · metrics: counter/histogram/gauge · analytics: `capture`/`identify`; hand-rolled OTLP HTTP/JSON · Sentry · PostHog exporters; opt-in `telemetry` feature, no-op until `init`) |
+| AI / LLM | `std/ai` (unified multi-provider client wrapping `genai`: OpenAI · OpenAI-compat swarm · Anthropic · Gemini · Bedrock SigV4 · Vertex ADC · Azure; `"provider:model"` + env creds · `generate` (Tier-1) · `stream` (generators/`for await`) · class/`std/schema` structured output + JSON-Schema projector · in-interpreter tool loop · `embed`/`embedMany`; OTel GenAI spans via the telemetry hook; opt-in `ai` feature) |
 | Terminal UI | `std/tui` |
 | Lazy streams | `std/stream` (lazy pull engine: `range` · `from` sources; `map` · `filter` · `take` · `drop` · `flatMap` · `enumerate` · `zip` combinators; `collect` · `reduce` · `count` · `find` · `first` · `forEach` terminals) |
 | Test assertions | `std/assert` (deep `eq`/`ne`, `isTrue`/`isFalse`/`isNil`/`notNil`, `gt`/`gte`/`lt`/`lte`, `contains`, `approxEq`, `throws`, `snapshot`) |

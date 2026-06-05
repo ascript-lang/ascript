@@ -141,6 +141,49 @@ fn opt_num(v: Option<i64>) -> Value {
     }
 }
 
+/// Build the embeddings `out` object. Single: `{embedding:[..], usage}`.
+/// Many: `{embeddings:[[..],..], usage}`. `usage` carries `inputTokens`.
+pub(crate) fn embed_object(resp: &genai::embed::EmbedResponse, many: bool) -> Value {
+    let mut m = indexmap::IndexMap::new();
+    if many {
+        let arrs: Vec<Value> = resp
+            .embeddings
+            .iter()
+            .map(|e| vector_value(&e.vector))
+            .collect();
+        m.insert(
+            "embeddings".to_string(),
+            Value::Array(crate::value::ArrayCell::new(arrs)),
+        );
+    } else {
+        let v = resp
+            .embeddings
+            .first()
+            .map(|e| vector_value(&e.vector))
+            .unwrap_or_else(|| Value::Array(crate::value::ArrayCell::new(Vec::new())));
+        m.insert("embedding".to_string(), v);
+    }
+    let mut usage = indexmap::IndexMap::new();
+    usage.insert(
+        "inputTokens".to_string(),
+        match resp.usage.prompt_tokens {
+            Some(n) => Value::Number(n as f64),
+            None => Value::Nil,
+        },
+    );
+    m.insert(
+        "usage".to_string(),
+        Value::Object(crate::value::ObjectCell::new(usage)),
+    );
+    Value::Object(crate::value::ObjectCell::new(m))
+}
+
+fn vector_value(v: &[f32]) -> Value {
+    Value::Array(crate::value::ArrayCell::new(
+        v.iter().map(|f| Value::Number(*f as f64)).collect(),
+    ))
+}
+
 /// Map a genai `Error` to the AScript Tier-1 `err` object `{message, status?}`.
 pub(crate) fn error_to_value(err: &genai::Error) -> Value {
     let mut map = indexmap::IndexMap::new();
