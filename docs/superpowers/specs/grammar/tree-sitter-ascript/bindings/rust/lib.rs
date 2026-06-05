@@ -16,8 +16,11 @@ pub const HIGHLIGHTS_QUERY: &str = include_str!("../../queries/highlights.scm");
 
 /// The language-injection query for this grammar.
 pub const INJECTIONS_QUERY: &str = include_str!("../../queries/injections.scm");
-// NOTE: LOCALS/FOLDS/INDENTS/TEXTOBJECTS/TAGS/BRACKETS query constants are
-// added by their creating tasks (Phase 5 Tasks 5–10) so this crate always compiles —
+
+/// The local-variable (scopes/definitions/references) query for this grammar.
+pub const LOCALS_QUERY: &str = include_str!("../../queries/locals.scm");
+// NOTE: FOLDS/INDENTS/TEXTOBJECTS/TAGS/BRACKETS query constants are
+// added by their creating tasks (Phase 5 Tasks 6–10) so this crate always compiles —
 // `include_str!` requires the target file to exist.
 
 #[cfg(test)]
