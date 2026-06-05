@@ -13,8 +13,11 @@ pub const LANGUAGE: LanguageFn = unsafe { LanguageFn::from_raw(tree_sitter_ascri
 
 /// The syntax-highlighting query for this grammar.
 pub const HIGHLIGHTS_QUERY: &str = include_str!("../../queries/highlights.scm");
-// NOTE: INJECTIONS/LOCALS/FOLDS/INDENTS/TEXTOBJECTS/TAGS/BRACKETS query constants are
-// added by their creating tasks (Phase 5 Tasks 4–10) so this crate always compiles —
+
+/// The language-injection query for this grammar.
+pub const INJECTIONS_QUERY: &str = include_str!("../../queries/injections.scm");
+// NOTE: LOCALS/FOLDS/INDENTS/TEXTOBJECTS/TAGS/BRACKETS query constants are
+// added by their creating tasks (Phase 5 Tasks 5–10) so this crate always compiles —
 // `include_str!` requires the target file to exist.
 
 #[cfg(test)]
