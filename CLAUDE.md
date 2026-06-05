@@ -236,6 +236,39 @@ The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md
 > byte_off)` powers hover types (no interpreter); `type-*` surface in the editor via the shared
 > `analyze` path. NON-goals (deferred): whole-program/cross-module inference, new surface syntax,
 > strict mode, stdlib signature stubs, alias/closure/custom-guard narrowing.
+>
+> **SP6 — package manager / dependency story (decentralized-first).** A default-on
+> `pkg` Cargo feature (`pkg = ["net","compress","dep:sha2","dep:base64"]`) gating an
+> ENTIRELY CLI-side module set `src/pkg/{manifest,cache,hash,fetch,lock,resolve,commands}.rs`
+> (mirrors `src/lint_config_toml.rs` keeping TOML/IO out of the core). `ascript.toml`
+> gains `[package]` + `[dependencies]` (value SHAPE selects the source kind:
+> `{git,tag|rev}` / `{url}` / `{path}` / a bare-version STRING → reserved-future
+> registry "needs a registry" error). Resolution is Go-style **MVS** (max-of-mins over
+> git-tag versions; rev/url/path are non-versioned leaves; same-name conflict names both
+> requirers; cycle detection; bare-version → registry error) over a `DepFetcher` trait
+> (pure unit-tested; the real `OnlineFetcher`/`LockedFetcher` wrap `fetch.rs`). Fetch:
+> path in-place, git via the `git` CLI subprocess (bare clone + `git archive | tar -x` —
+> NO hooks/submodule scripts, D8), url via reqwest+extract; staged into a content-addressed
+> `store/<asum1>/` (cache root = `$ASCRIPT_CACHE` → XDG/per-OS, no `dirs` crate). `asum1`
+> = sha256 over a NORMALIZED tree (`*.as`+`ascript.toml`, sorted, length-prefixed,
+> base64url; excludes `.aso`/`.git`). `ascript.lock` (own `version=1`, sorted, kind-prefixed
+> `source`, path deps omit integrity) is written by `run`/`test`/`install`; `--locked` is
+> offline + integrity-RE-HASHED (fail-closed). **THE ONE CORE CHANGE (byte-identical
+> both engines):** a dependency-free `PackageMap = HashMap<String, ResolvedPkg{root,entry}>`
+> + `Interp.package_resolver: RefCell<Option<PackageMap>>` + `set_package_resolver`, and a
+> SHARED `classify_specifier(source) -> SpecifierKind{Std | Relative(p) | Package{key,target}
+> | UnknownPackage(key)}` (`split_package_key`: first segment or `@scope/name`; remainder =
+> subpath). Wired into BOTH the tree-walker `Stmt::Import` AND VM `Op::Import`: Std/Relative
+> UNCHANGED, Package → the SAME existing file loader with the absolute store target (so
+> package-internal `./` imports resolve within the store), UnknownPackage → identical
+> `unknown package '<k>' — add it with 'ascript add'` Tier-2 error. The resolver borrow is
+> cloned-out, NEVER held across the loader `.await`. Under `--no-default-features` (no `pkg`)
+> the map is always empty → bare specifier = clean "unknown package"; the core grows NO
+> net/git/toml dependency. CLI: `add`/`remove`/`install`/`update`/`lock`/`tree`/`verify`
+> (all `#[cfg(feature="pkg")]`). Hermetic tests only (`tests/pkg.rs` + fixtures): path deps +
+> local `file://` git repos in a tempdir (skip if `git` absent) + `file://` url tarballs — NO
+> network. `vm_differential` UNCHANGED 353/0 (SP6 doesn't touch non-package programs). SP6
+> touches NEITHER `.aso` NOR `ASO_FORMAT_VERSION` (the lockfile `version` is its own counter).
 
 ## Commands
 

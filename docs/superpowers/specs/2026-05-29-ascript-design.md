@@ -35,7 +35,12 @@ Design priorities, in strict order:
   CLAUDE.md architecture, `src/lib.rs` `vm_run_source`). JIT remains a non-goal.
 - No multithreading in user code (single-threaded event loop; see §7).
 - No macro system, operator overloading, or metaprogramming.
-- No package manager / registry (deferred to a future spec).
+- ~~No package manager / registry (deferred to a future spec).~~ **Shipped in
+  SP6** (`docs/superpowers/specs/2026-06-04-sp6-package-manager-design.md`):
+  decentralized-first git/URL/path dependencies via Go-style MVS, content-addressed
+  cache + fail-closed `asum1` lockfile integrity, bare-specifier imports on both
+  engines, `add`/`install`/`update`/`lock`/`tree`/`verify` commands. A central
+  registry remains a future, purely-additive source kind.
 - No audio or graphics/windowing in v1 — these imply a main-thread windowing event
   loop that conflicts with the single-threaded Tokio model (§7), plus heavy
   platform/GPU dependencies. Deferred to a future **"AScript Media"** spec / optional
@@ -796,7 +801,10 @@ print(p.y)                // 0
 - Namespace import: `import * as util from "./util"`.
 - **No default exports** (keeps resolution trivial and unambiguous).
 - One file = one module. Paths are resolved relative to the importing file;
-  `std/*` paths resolve to built-in modules.
+  `std/*` paths resolve to built-in modules; a **bare specifier** (`import "http"`,
+  no `./`/`../`/`std/` prefix) resolves through the SP6 package manager's
+  dependency set (first path segment = package, remainder = subpath module). An
+  unresolved bare specifier is a clean *"unknown package"* error.
 - Each module is **evaluated once** and cached; circular imports resolve to the
   partially-initialized module (a load-order error if a binding is used before init).
 

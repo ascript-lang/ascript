@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 mod lint_config_toml;
+#[cfg(feature = "pkg")]
+mod pkg;
 
 #[derive(Parser)]
 #[command(name = "ascript", about = "The AScript interpreter")]
@@ -20,6 +22,11 @@ enum Command {
         /// takes precedence over the env var. Ignored for `.aso` (always VM).
         #[arg(long = "tree-walker")]
         tree_walker: bool,
+        /// Offline-deterministic: resolve dependencies EXACTLY from `ascript.lock`
+        /// (no network), failing on any drift, missing lock, or integrity
+        /// mismatch. For CI / sandboxes.
+        #[arg(long = "locked")]
+        locked: bool,
         file: String,
         /// Trailing arguments forwarded to the script as `env.args()`.
         /// Hyphen-prefixed values (e.g. `--flag`) are also captured.
@@ -75,10 +82,45 @@ enum Command {
         fix_dry_run: bool,
     },
     /// Run .as test files
-    Test { files: Vec<String> },
+    Test {
+        files: Vec<String>,
+        /// Offline-deterministic: resolve dependencies EXACTLY from `ascript.lock`
+        /// (no network), failing on drift / missing lock / integrity mismatch.
+        #[arg(long = "locked")]
+        locked: bool,
+    },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
     Lsp,
+    /// Add a dependency to ascript.toml + lock (git/url/path spec).
+    #[cfg(feature = "pkg")]
+    Add {
+        /// e.g. `github.com/owner/repo@v1.0.0`, `https://host/pkg-1.2.0.tar.gz`,
+        /// or `../local-path`.
+        spec: String,
+    },
+    /// Remove a dependency from ascript.toml + re-lock.
+    #[cfg(feature = "pkg")]
+    Remove { name: String },
+    /// Resolve + fetch dependencies and write/verify ascript.lock.
+    #[cfg(feature = "pkg")]
+    Install {
+        /// Install EXACTLY from ascript.lock (no network); fail on drift.
+        #[arg(long = "locked")]
+        locked: bool,
+    },
+    /// Raise pins + re-lock (optionally a single dependency).
+    #[cfg(feature = "pkg")]
+    Update { name: Option<String> },
+    /// (Re)generate ascript.lock from the manifest.
+    #[cfg(feature = "pkg")]
+    Lock,
+    /// Print the resolved dependency graph.
+    #[cfg(feature = "pkg")]
+    Tree,
+    /// Re-hash the cache store against the lock integrity (fail-closed).
+    #[cfg(feature = "pkg")]
+    Verify,
 }
 
 // SP3 §B: run the whole program on a worker thread with an enlarged
@@ -168,9 +210,13 @@ async fn real_main() -> ExitCode {
     match cli.command {
         Command::Run {
             tree_walker,
+            locked,
             file,
             args,
         } => {
+            // `--locked` only affects dependency resolution, which is `pkg`-gated.
+            #[cfg(not(feature = "pkg"))]
+            let _ = locked;
             let path = std::path::Path::new(&file);
             // A `.aso` file is compiled bytecode → run it on the VM (no compile step).
             // A `.as` file is compiled to bytecode and run on the VM as well (this is
@@ -182,12 +228,45 @@ async fn real_main() -> ExitCode {
             let is_aso = path.extension().and_then(|e| e.to_str()) == Some("aso");
             let use_tree_walker =
                 tree_walker || std::env::var("ASCRIPT_ENGINE").as_deref() == Ok("tree-walker");
+            // SP6: ensure the lock is satisfied (MVS resolve + fetch-on-miss, or
+            // `--locked` offline against ascript.lock), assemble the resolved
+            // package map, and inject it so a bare `import "pkg"` resolves
+            // identically on both engines. `.aso` runs skip this (a compiled
+            // module's imports were resolved against its own dir). Under
+            // `--no-default-features` the `pkg` feature is off → no map → bare
+            // specifier is "unknown package".
+            #[cfg(feature = "pkg")]
+            let packages = if is_aso {
+                None
+            } else {
+                match pkg::commands::ensure_lock(path, locked) {
+                    Ok(map) => map,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(1);
+                    }
+                }
+            };
             let result = if is_aso {
                 ascript::run_aso_file(path, &args).await
             } else if use_tree_walker {
-                ascript::run_file(path, &args).await
+                #[cfg(feature = "pkg")]
+                {
+                    ascript::run_file_with_packages(path, &args, packages).await
+                }
+                #[cfg(not(feature = "pkg"))]
+                {
+                    ascript::run_file(path, &args).await
+                }
             } else {
-                ascript::run_file_on_vm(path, &args).await
+                #[cfg(feature = "pkg")]
+                {
+                    ascript::run_file_on_vm_with_packages(path, &args, packages).await
+                }
+                #[cfg(not(feature = "pkg"))]
+                {
+                    ascript::run_file_on_vm(path, &args).await
+                }
             };
             match result {
                 // Output already streamed live (OutputSink::Live).
@@ -399,7 +478,32 @@ async fn real_main() -> ExitCode {
                 ExitCode::SUCCESS
             }
         }
-        Command::Test { files } => match ascript::run_tests(&files).await {
+        Command::Test { files, locked } => {
+            // SP6: ensure the lock is satisfied for the test files' nearest
+            // manifest (resolve+fetch-on-miss, or `--locked` offline) and inject
+            // the resolved package map so a bare `import "pkg"` in a test works.
+            #[cfg(feature = "pkg")]
+            let test_result = {
+                let packages = match files.first() {
+                    Some(first) => {
+                        match pkg::commands::ensure_lock(std::path::Path::new(first), locked) {
+                            Ok(map) => map,
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                return ExitCode::from(1);
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                ascript::run_tests_with_packages(&files, packages).await
+            };
+            #[cfg(not(feature = "pkg"))]
+            let test_result = {
+                let _ = locked;
+                ascript::run_tests(&files).await
+            };
+            match test_result {
             Ok(summary) => {
                 for (name, message) in &summary.failures {
                     println!("FAIL {}: {}", name, message);
@@ -415,11 +519,41 @@ async fn real_main() -> ExitCode {
                 ascript::diagnostics::report(&e);
                 ExitCode::from(1)
             }
-        },
+            }
+        }
         #[cfg(feature = "lsp")]
         Command::Lsp => {
             ascript::lsp::run_server().await;
             ExitCode::SUCCESS
+        }
+        #[cfg(feature = "pkg")]
+        Command::Add { spec } => pkg_command_exit(pkg::commands::cmd_add(&spec)),
+        #[cfg(feature = "pkg")]
+        Command::Remove { name } => pkg_command_exit(pkg::commands::cmd_remove(&name)),
+        #[cfg(feature = "pkg")]
+        Command::Install { locked } => pkg_command_exit(pkg::commands::cmd_install(locked)),
+        #[cfg(feature = "pkg")]
+        Command::Update { name } => {
+            pkg_command_exit(pkg::commands::cmd_update(name.as_deref()))
+        }
+        #[cfg(feature = "pkg")]
+        Command::Lock => pkg_command_exit(pkg::commands::cmd_lock()),
+        #[cfg(feature = "pkg")]
+        Command::Tree => pkg_command_exit(pkg::commands::cmd_tree()),
+        #[cfg(feature = "pkg")]
+        Command::Verify => pkg_command_exit(pkg::commands::cmd_verify()),
+    }
+}
+
+/// Map a package-command `Result<(), String>` to an exit code (clear error to
+/// stderr on failure).
+#[cfg(feature = "pkg")]
+fn pkg_command_exit(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
         }
     }
 }

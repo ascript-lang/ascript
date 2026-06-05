@@ -1,0 +1,4 @@
+[package]
+name = "@scope/x"
+version = "2.0.0"
+entry = "src/main.as"

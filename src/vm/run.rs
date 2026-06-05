@@ -1868,21 +1868,52 @@ impl Vm {
                     // name, returns its value (or None if absent), plus an ordered list
                     // of export names for the namespace form. For std we wrap the
                     // `ModuleEntry`; for a file module we use its IndexMap directly.
-                    let exports: ModuleExports = if source.starts_with("std/") {
-                        let entry = self.interp.import_std(&source)?;
-                        // Materialize the std module's exports into an ordered map
-                        // so both import forms share one code path. The std export
-                        // set is unordered (a HashSet); order is irrelevant for the
-                        // named form and matches the tree-walker's unordered
-                        // namespace object for the namespace form.
-                        let mut m = indexmap::IndexMap::new();
-                        for name in entry.exports.borrow().iter() {
-                            m.insert(name.clone(), entry.env.get(name).unwrap_or(Value::Nil));
-                        }
-                        Rc::new(RefCell::new(m))
-                    } else {
-                        self.load_file_module(&source, fault_ip, fiber).await?
-                    };
+                    //
+                    // SP6 §6: the SHARED `classify_specifier` drives the split (the
+                    // SAME helper the tree-walker's `Stmt::Import` uses, so the two
+                    // engines route identically). `Std` → the static registry;
+                    // `Relative`/`Package` → the SAME `load_file_module` (a
+                    // package's resolved `target` is an absolute path, so
+                    // `module_dir.join(target)` yields `target` unchanged and
+                    // package-internal `./` imports still resolve within the store
+                    // root); `UnknownPackage` → a Tier-2 error, message identical
+                    // to the tree-walker. The owned `target` string is taken out of
+                    // the resolver borrow before this `.await`.
+                    let exports: ModuleExports =
+                        match self.interp.classify_specifier(&source) {
+                            crate::interp::SpecifierKind::Std => {
+                                let entry = self.interp.import_std(&source)?;
+                                // Materialize the std module's exports into an ordered
+                                // map so both import forms share one code path. The std
+                                // export set is unordered (a HashSet); order is
+                                // irrelevant for the named form and matches the
+                                // tree-walker's unordered namespace object.
+                                let mut m = indexmap::IndexMap::new();
+                                for name in entry.exports.borrow().iter() {
+                                    m.insert(
+                                        name.clone(),
+                                        entry.env.get(name).unwrap_or(Value::Nil),
+                                    );
+                                }
+                                Rc::new(RefCell::new(m))
+                            }
+                            crate::interp::SpecifierKind::Relative(_) => {
+                                self.load_file_module(&source, fault_ip, fiber).await?
+                            }
+                            crate::interp::SpecifierKind::Package { target, .. } => {
+                                let target = target.to_string_lossy().into_owned();
+                                self.load_file_module(&target, fault_ip, fiber).await?
+                            }
+                            crate::interp::SpecifierKind::UnknownPackage(key) => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "unknown package '{key}' — add it with 'ascript add'"
+                                    ),
+                                ));
+                            }
+                        };
 
                     match desc {
                         crate::vm::chunk::ImportDesc::Named { source, names } => {

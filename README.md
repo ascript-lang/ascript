@@ -76,7 +76,26 @@ ascript check file.as      # static check (syntax + lints)
 ascript check --fix *.as   # apply safe autofixes (unused-import removal)
 ascript test file.as       # run test(name, fn) cases
 ascript lsp                # language server over stdio (cross-file nav + rename)
+
+ascript add ../util        # add a dependency (git/url/path) → ascript.toml + lock
+ascript install            # resolve + fetch deps + write ascript.lock
+ascript install --locked   # CI: install EXACTLY from the lock (no network)
+ascript update [name]      # re-resolve + rewrite the lock
+ascript tree               # print the resolved dependency graph
+ascript verify             # re-hash the cache against the lock integrity
 ```
+
+### Packages & dependencies
+
+Declare third-party code in `ascript.toml` (`[package]` + `[dependencies]`) and
+resolve it reproducibly from **git / URL / local path** via Go-style Minimal
+Version Selection — no central registry to operate. Dependencies are cached
+content-addressed (`$ASCRIPT_CACHE` / XDG), locked with fail-closed `asum1-`
+integrity in `ascript.lock`, and loaded through a **bare specifier**
+(`import "http"`) on both engines. There are **no install scripts** — packages
+are pure `.as` source, the hashed contract. `ascript run`/`test` implicitly
+ensure the lock (`--locked` for hermetic CI). See the
+[packages guide](docs/content/packages.md).
 
 ### Runtime & performance
 
