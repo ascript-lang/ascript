@@ -372,6 +372,15 @@ fn default_client() -> reqwest::Client {
     })
 }
 
+/// The pooled, process-wide default `reqwest::Client`, shared with SP12
+/// `std/telemetry`'s hand-rolled OTLP/Sentry/PostHog exporters so they reuse the
+/// same connection pool (no second client, no new crate). Cloning is cheap
+/// (an `Arc` internally).
+#[cfg(feature = "telemetry")]
+pub(crate) fn shared_client() -> reqwest::Client {
+    default_client()
+}
+
 /// Keys whose presence forces a per-request `ClientBuilder` (the cached default
 /// client cannot express any of these). If none are present we reuse the pooled
 /// default client (fast path).

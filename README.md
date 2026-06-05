@@ -163,6 +163,7 @@ ascript run hello.as
 | Networking | `std/net` (DNS: `lookup` · `lookupOne`) · `std/net/tcp` · `std/net/udp` (datagram sockets) · `std/net/http` · `std/http/server` (verb methods: `get`/`post`/`put`/`patch`/`delete`/`head`/`options`; schema-validated typed routes) · `std/net/ws` |
 | Concurrency | `std/task` (`spawn` · `gather` · `race` · `timeout` · `retry` over `future<T>`) · `std/sync` (FIFO channels · counting semaphore · token-bucket rate limiter) |
 | Logging | `std/log` (`debug` · `info` · `warn` · `error`; human/json, structured fields) |
+| Observability | `std/telemetry` (tracing spans · metrics: counter/histogram/gauge · analytics: `capture`/`identify`; hand-rolled OTLP HTTP/JSON · Sentry · PostHog exporters; opt-in `telemetry` feature, no-op until `init`) |
 | Terminal UI | `std/tui` |
 | Lazy streams | `std/stream` (lazy pull engine: `range` · `from` sources; `map` · `filter` · `take` · `drop` · `flatMap` · `enumerate` · `zip` combinators; `collect` · `reduce` · `count` · `find` · `first` · `forEach` terminals) |
 | Test assertions | `std/assert` (deep `eq`/`ne`, `isTrue`/`isFalse`/`isNil`/`notNil`, `gt`/`gte`/`lt`/`lte`, `contains`, `approxEq`, `throws`, `snapshot`) |

@@ -1,0 +1,5 @@
+# exit: none
+init ok: true
+compute = 10
+compute err is nil: true
+telemetry ok

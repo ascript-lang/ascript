@@ -51,6 +51,81 @@ impl From<AsError> for Control {
     }
 }
 
+#[cfg(feature = "telemetry")]
+tokio::task_local! {
+    /// SP12: the CURRENT telemetry span context for THIS async task. A tokio
+    /// task-local (NOT a shared cell) so concurrent `spawn_local` tasks each have
+    /// their OWN current span — a span started in one task can never leak as the
+    /// parent of an unrelated concurrent task (spec §9.3, the subtle correctness
+    /// point). It survives `.await` within a task and is isolated across tasks.
+    ///
+    /// Seeded at each entry point and re-seeded at every async-fn/method spawn
+    /// site (capturing the spawning task's current), so the captured lineage flows
+    /// into the spawned body. `telemetry.span` mutates this cell around its
+    /// callback (save → set → await → restore); `startSpan`/`telemetry_open_span`
+    /// read it to choose a parent.
+    pub(crate) static TELEMETRY_CURRENT: std::cell::Cell<Option<crate::stdlib::telemetry::model::SpanCtx>>;
+}
+
+/// SP12: run `fut` within a fresh [`TELEMETRY_CURRENT`] scope seeded with
+/// `parent` (the spawning task's current span, captured at spawn time). Used at
+/// the async-fn/method spawn sites and the entry points so every task has the
+/// task-local in scope.
+#[cfg(feature = "telemetry")]
+pub(crate) async fn telemetry_scope<F, T>(
+    parent: Option<crate::stdlib::telemetry::model::SpanCtx>,
+    fut: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    TELEMETRY_CURRENT
+        .scope(std::cell::Cell::new(parent), fut)
+        .await
+}
+
+/// Root-scope variant for the entry points (`run_file*`, `run_source*`, repl,
+/// `run_tests`) that aren't feature-gated. With the `telemetry` feature ON it
+/// establishes the root [`TELEMETRY_CURRENT`] scope (no parent); with it OFF it
+/// is the identity, so non-telemetry builds pay nothing.
+pub async fn telemetry_root_scope<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    #[cfg(feature = "telemetry")]
+    {
+        telemetry_scope(None, fut).await
+    }
+    #[cfg(not(feature = "telemetry"))]
+    {
+        fut.await
+    }
+}
+
+/// Capture the current task's telemetry span context (for propagation into a
+/// spawned task). `None` if telemetry is off or no span is current.
+#[cfg(feature = "telemetry")]
+pub(crate) fn telemetry_capture_current() -> Option<crate::stdlib::telemetry::model::SpanCtx> {
+    TELEMETRY_CURRENT
+        .try_with(|c| c.get())
+        .ok()
+        .flatten()
+}
+
+/// A span outcome, used by the SP12 `std/telemetry` soft hook (the contract
+/// `std/ai` calls). Defined in this CORE module — **not** behind the `telemetry`
+/// feature — so `std/ai` can name it whether or not the `telemetry` feature is
+/// compiled in (the hook methods on [`Interp`] keep always-present signatures and
+/// bridge to the telemetry pipeline only when the feature is on). Maps 1:1 onto
+/// OTLP status codes (`Unset`/`Ok`/`Error`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpanStatus {
+    #[default]
+    Unset,
+    Ok,
+    Error,
+}
+
 /// A fresh global environment with the built-in functions installed.
 /// The bare (unqualified) builtin names installed in every program's global env.
 /// Shared with the checker (`undefined-variable`) so they cannot drift.
@@ -241,6 +316,11 @@ pub(crate) enum ResourceState {
     Lru(Box<crate::stdlib::lru::LruState>),
     // SP5 §7 std/events: an event-emitter's per-event listener lists (core).
     Events(Box<crate::stdlib::events::EventsState>),
+    // SP12 std/telemetry: an in-progress span (ids, name, start ns, attrs, events,
+    // status). On `end()` it is finalized into a `SpanRecord` and buffered for
+    // export, then the resource is removed. Boxed to keep the enum compact.
+    #[cfg(feature = "telemetry")]
+    TelemetrySpan(Box<crate::stdlib::telemetry::model::OpenSpan>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -356,6 +436,18 @@ pub struct Interp {
     /// std/log capture buffer (used under `OutputSink::Capture`, i.e. tests).
     #[cfg(feature = "log")]
     log_capture: RefCell<String>,
+    /// SP12 std/telemetry pipeline. `None` = uninitialized = every telemetry call
+    /// is a no-op (the "safe to leave in production" promise). Set by
+    /// `telemetry.init`, cleared by `telemetry.shutdown`. State lives behind this
+    /// `RefCell` so the `&self` `call_telemetry` path can mutate buffered signals
+    /// through short-lived borrows (never held across an `.await`).
+    #[cfg(feature = "telemetry")]
+    telemetry: RefCell<Option<crate::stdlib::telemetry::model::TelemetryState>>,
+    /// SP12 std/telemetry capture sink: the outbound HTTP requests the exporters
+    /// WOULD have sent, recorded under `OutputSink::Capture` (tests) instead of
+    /// opening a socket. Tests read it via [`Interp::telemetry_capture`].
+    #[cfg(feature = "telemetry")]
+    telemetry_capture: RefCell<Vec<crate::stdlib::telemetry::model::CapturedRequest>>,
     /// The script's own CLI arguments (`ascript run file.as <args...>`).
     /// Excludes the binary name and the script path — only the trailing args.
     /// Empty unless set by [`Interp::set_cli_args`] (i.e. the REPL and test
@@ -577,6 +669,10 @@ impl Interp {
             log_format: Cell::new(LogFormat::Human),
             #[cfg(feature = "log")]
             log_capture: RefCell::new(String::new()),
+            #[cfg(feature = "telemetry")]
+            telemetry: RefCell::new(None),
+            #[cfg(feature = "telemetry")]
+            telemetry_capture: RefCell::new(Vec::new()),
             cli_args: RefCell::new(Vec::new()),
         }
     }
@@ -868,6 +964,479 @@ impl Interp {
             }
             other => Err(AsError::at(format!("std/log has no function '{}'", other), span).into()),
         }
+    }
+
+    // ---- SP12 std/telemetry: state access + the SP11-facing soft hook ----
+    //
+    // The hook methods (`telemetry_active`/`telemetry_span_start`/…) have
+    // ALWAYS-PRESENT signatures; only their bodies are `#[cfg(feature =
+    // "telemetry")]`-bridged. With the feature OFF they are inert (`false` /
+    // `None` / no-op), so `std/ai` (SP11) calls them with NO `cfg` of its own and
+    // NO telemetry import — `std/ai` builds with telemetry absent and
+    // `std/telemetry` builds with ai absent. Tracing is OPT-IN: active only once
+    // `telemetry.init` has run (`telemetry_active()`).
+
+    /// True iff telemetry is initialized AND has at least one configured exporter
+    /// (i.e. emitting is meaningful). The SP11 GenAI-span hook checks this so it
+    /// emits nothing when telemetry is uninitialized.
+    pub fn telemetry_active(&self) -> bool {
+        #[cfg(feature = "telemetry")]
+        {
+            self.telemetry.borrow().is_some()
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            false
+        }
+    }
+
+    /// Snapshot of the captured exporter HTTP requests (test hook). Empty under
+    /// `Live`. Only present with the `telemetry` feature (the returned type lives
+    /// behind the feature); SP12 capture-mode tests are likewise feature-gated.
+    #[cfg(feature = "telemetry")]
+    pub fn telemetry_capture(&self) -> Vec<crate::stdlib::telemetry::model::CapturedRequest> {
+        self.telemetry_capture.borrow().clone()
+    }
+
+    /// Flattened snapshots of the currently-buffered (not-yet-flushed) spans
+    /// (test hook). Lets the F1 tracing tests assert span semantics — name,
+    /// parenting, status, attributes, events — without the F2 OTLP wire shaping.
+    #[cfg(feature = "telemetry")]
+    pub fn telemetry_spans_debug(&self) -> Vec<crate::stdlib::telemetry::model::SpanSnapshot> {
+        self.telemetry
+            .borrow()
+            .as_ref()
+            .map(|s| s.spans.iter().map(|sp| sp.snapshot()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Start a span through the telemetry pipeline (used by `std/ai`'s GenAI-span
+    /// emission). Returns an opaque span id (the span resource id), or `None` when
+    /// telemetry is absent/off so callers never branch on a feature. The span
+    /// parents to the current scoped span if one is active, else is a trace root.
+    pub fn telemetry_span_start(
+        &self,
+        name: &str,
+        attrs: Vec<(String, Value)>,
+    ) -> Option<u64> {
+        #[cfg(feature = "telemetry")]
+        {
+            if !self.telemetry_active() {
+                return None;
+            }
+            Some(self.telemetry_open_span(name, attrs))
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            let _ = (name, attrs);
+            None
+        }
+    }
+
+    /// Set an attribute on an open span (no-op if the id is unknown / feature off).
+    pub fn telemetry_span_set(&self, id: u64, key: &str, val: Value) {
+        #[cfg(feature = "telemetry")]
+        {
+            self.telemetry_span_set_attr(id, key, val);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            let _ = (id, key, val);
+        }
+    }
+
+    /// Add a timestamped event to an open span (no-op if unknown / feature off).
+    pub fn telemetry_span_event(&self, id: u64, name: &str, attrs: Vec<(String, Value)>) {
+        #[cfg(feature = "telemetry")]
+        {
+            self.telemetry_span_add_event(id, name, attrs);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            let _ = (id, name, attrs);
+        }
+    }
+
+    /// End an open span with a status, buffering it for export (no-op if unknown /
+    /// feature off).
+    pub fn telemetry_span_end(&self, id: u64, status: SpanStatus) {
+        #[cfg(feature = "telemetry")]
+        {
+            self.telemetry_finish_span(id, status);
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            let _ = (id, status);
+        }
+    }
+
+    /// The SP12 exporter send seam. In CAPTURE mode (tests/REPL/embedders) it
+    /// records the request into the capture sink (read via `telemetry_capture()`)
+    /// and performs NO network I/O — so unit tests assert the exact OTLP/Sentry/
+    /// PostHog wire payloads with no socket and no secret. In LIVE mode it POSTs
+    /// via the pooled reqwest client shared with `std/net/http`. A live failure is
+    /// returned as `Err(message)` (the caller logs once + drops it — a telemetry
+    /// failure never aborts the user's program, spec §5).
+    ///
+    /// No `RefCell`/`resources` borrow is held across the `.await` (the request is
+    /// an owned value).
+    #[cfg(feature = "telemetry")]
+    pub(crate) async fn telemetry_send(
+        &self,
+        req: crate::stdlib::telemetry::model::CapturedRequest,
+    ) -> Result<(), String> {
+        if matches!(self.output, OutputSink::Capture(_)) {
+            self.telemetry_capture.borrow_mut().push(req.clone());
+            // Test seam: a test may force the capture send to "fail" to exercise
+            // the error model (a flush failure is logged once + dropped, never
+            // panics). Off by default; set per-thread via
+            // `crate::telemetry_test_force_send_error`.
+            if crate::stdlib::telemetry::test_force_send_error() {
+                return Err(format!(
+                    "telemetry {} export to {} failed: forced (test)",
+                    req.exporter, req.url
+                ));
+            }
+            return Ok(());
+        }
+        // Live: POST via the shared pooled client. Build the request fully before
+        // awaiting; hold no borrow across the send.
+        let client = crate::stdlib::net_http::shared_client();
+        let mut rb = client
+            .post(&req.url)
+            .header("content-type", "application/json")
+            .body(req.body);
+        for (k, v) in &req.headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
+        match rb.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "telemetry {} export to {} failed: HTTP {}",
+                        req.exporter, req.url, status
+                    ))
+                }
+            }
+            Err(e) => Err(format!(
+                "telemetry {} export to {} failed: {}",
+                req.exporter, req.url, e
+            )),
+        }
+    }
+
+    /// Set THIS task's current telemetry span context (returns the previous value
+    /// so the caller can restore it — `telemetry.span` does save → set → await →
+    /// restore around its callback). No-op (returns None) if the task-local is not
+    /// in scope (telemetry off, or code running outside a telemetry scope).
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_set_current(
+        &self,
+        ctx: Option<crate::stdlib::telemetry::model::SpanCtx>,
+    ) -> Option<crate::stdlib::telemetry::model::SpanCtx> {
+        TELEMETRY_CURRENT
+            .try_with(|c| c.replace(ctx))
+            .ok()
+            .flatten()
+    }
+
+    /// The current task's telemetry span context, if any (task-local; isolated
+    /// across concurrent `spawn_local` tasks).
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_current(&self) -> Option<crate::stdlib::telemetry::model::SpanCtx> {
+        crate::interp::telemetry_capture_current()
+    }
+
+    /// Open a new span: mint ids (root → new trace; else parent to the current
+    /// scoped span), register it as a `TelemetrySpan` resource, and return its id.
+    /// Caller must have confirmed telemetry is active.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_open_span(&self, name: &str, attrs: Vec<(String, Value)>) -> u64 {
+        use crate::stdlib::telemetry::model::{
+            new_span_id, new_trace_id, now_unix_nanos, OpenSpan, SpanStatusRecord,
+        };
+        let (trace_id, parent_id) = match self.telemetry_current() {
+            Some(ctx) => (ctx.trace_id, Some(ctx.span_id)),
+            None => (new_trace_id(), None),
+        };
+        let open = OpenSpan {
+            trace_id,
+            span_id: new_span_id(),
+            parent_id,
+            name: name.to_string(),
+            start_unix_nano: now_unix_nanos(),
+            attributes: attrs,
+            events: Vec::new(),
+            status: SpanStatusRecord::default(),
+        };
+        let handle = self.register_resource(
+            crate::value::NativeKind::TelemetrySpan,
+            indexmap::IndexMap::new(),
+            ResourceState::TelemetrySpan(Box::new(open)),
+        );
+        match handle {
+            Value::Native(n) => n.id,
+            _ => unreachable!("register_resource yields a Native handle"),
+        }
+    }
+
+    /// Set an attribute on an open span (last-write-wins by key). No-op if the id
+    /// is not a live span (already ended).
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_span_set_attr(&self, id: u64, key: &str, val: Value) {
+        self.with_resource_mut(id, |r| {
+            if let Some(ResourceState::TelemetrySpan(s)) = r {
+                if let Some(slot) = s.attributes.iter_mut().find(|(k, _)| k == key) {
+                    slot.1 = val;
+                } else {
+                    s.attributes.push((key.to_string(), val));
+                }
+            }
+        });
+    }
+
+    /// Add a timestamped event to an open span. No-op if the span has ended.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_span_add_event(&self, id: u64, name: &str, attrs: Vec<(String, Value)>) {
+        use crate::stdlib::telemetry::model::{now_unix_nanos, SpanEvent};
+        self.with_resource_mut(id, |r| {
+            if let Some(ResourceState::TelemetrySpan(s)) = r {
+                s.events.push(SpanEvent {
+                    name: name.to_string(),
+                    time_unix_nano: now_unix_nanos(),
+                    attributes: attrs,
+                });
+            }
+        });
+    }
+
+    /// Set an open span's status (and optional message). No-op if ended.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_span_set_status(
+        &self,
+        id: u64,
+        code: crate::stdlib::telemetry::model::SpanStatusCode,
+        message: Option<String>,
+    ) {
+        self.with_resource_mut(id, |r| {
+            if let Some(ResourceState::TelemetrySpan(s)) = r {
+                s.status.code = code;
+                if message.is_some() {
+                    s.status.message = message;
+                }
+            }
+        });
+    }
+
+    /// End an open span: freeze it into a `SpanRecord` and buffer it for export.
+    /// No-op if the span has already ended (id absent) — calling a method after
+    /// `end()` is documented as a no-op, not a panic.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_finish_span(&self, id: u64, status: SpanStatus) {
+        use crate::stdlib::telemetry::model::{now_unix_nanos, SpanStatusCode};
+        // Take the open span out of the table (removes it; a second end is a no-op).
+        let open = match self.take_resource(id) {
+            Some(ResourceState::TelemetrySpan(s)) => *s,
+            // Not a span (or already ended): put any other state back and bail.
+            Some(other) => {
+                self.return_resource(id, other);
+                return;
+            }
+            None => return,
+        };
+        let mut record = open.finish(now_unix_nanos());
+        // The hook's explicit status wins over a status set via setStatus only
+        // when it is not Unset (so `span.setStatus("error")` then `end()` keeps
+        // error; the scoped helper passes Ok/Error explicitly).
+        match status {
+            SpanStatus::Ok => record.status.code = SpanStatusCode::Ok,
+            SpanStatus::Error => record.status.code = SpanStatusCode::Error,
+            SpanStatus::Unset => {}
+        }
+        if let Some(st) = self.telemetry.borrow_mut().as_mut() {
+            st.spans.push(record);
+        }
+    }
+
+    /// Take the configured telemetry pipeline out of the cell (for an async flush
+    /// across an `.await` without holding the `RefCell` borrow). Pair with
+    /// [`Interp::telemetry_return_state`].
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_take_state(
+        &self,
+    ) -> Option<crate::stdlib::telemetry::model::TelemetryState> {
+        self.telemetry.borrow_mut().take()
+    }
+
+    /// Put the telemetry pipeline back after an async flush. If a re-`init` ran
+    /// during the flush (installing a new pipeline) the new one wins and the old
+    /// is dropped.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_return_state(
+        &self,
+        state: crate::stdlib::telemetry::model::TelemetryState,
+    ) {
+        let mut slot = self.telemetry.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(state);
+        }
+    }
+
+    /// Install a freshly-built telemetry pipeline (replacing any existing one,
+    /// which the caller has already flushed). Set by `telemetry.init`.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_install(
+        &self,
+        state: crate::stdlib::telemetry::model::TelemetryState,
+    ) {
+        *self.telemetry.borrow_mut() = Some(state);
+    }
+
+    /// Register (idempotently by name) a metric instrument and return its
+    /// resource id (here just a monotonic id from the resource counter). Telemetry
+    /// is known active by the caller.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_register_instrument(
+        &self,
+        name: &str,
+        kind: crate::stdlib::telemetry::model::MetricKind,
+        unit: Option<String>,
+        description: Option<String>,
+    ) -> u64 {
+        let mut slot = self.telemetry.borrow_mut();
+        let Some(state) = slot.as_mut() else {
+            return u64::MAX;
+        };
+        // Idempotent: an existing instrument with the same name returns its id.
+        if let Some(id) = state
+            .instruments
+            .iter()
+            .find(|(_, inst)| inst.name == name)
+            .map(|(id, _)| *id)
+        {
+            return id;
+        }
+        let id = self.next_id();
+        state.instruments.insert(
+            id,
+            crate::stdlib::telemetry::model::MetricInstrument {
+                name: name.to_string(),
+                kind,
+                unit,
+                description,
+                points: indexmap::IndexMap::new(),
+                start_unix_nano: crate::stdlib::telemetry::model::now_unix_nanos(),
+            },
+        );
+        id
+    }
+
+    /// Apply a metric sample (`add`/`record`/`set`) to the instrument's point for
+    /// the given attribute set (cumulative temporality). No-op if unknown.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_record_metric(
+        &self,
+        id: u64,
+        method: &str,
+        amount: f64,
+        attrs: Vec<(String, Value)>,
+    ) {
+        use crate::stdlib::telemetry::model::{attr_key, MetricKind, MetricPoint};
+        let key = attr_key(&attrs);
+        let mut slot = self.telemetry.borrow_mut();
+        let Some(state) = slot.as_mut() else {
+            return;
+        };
+        let Some(inst) = state.instruments.get_mut(&id) else {
+            return;
+        };
+        let entry = inst
+            .points
+            .entry(key)
+            .or_insert_with(|| (attrs, MetricPoint::default()));
+        let point = &mut entry.1;
+        let _ = method; // the kind determines the aggregation, not the method name
+        match inst.kind {
+            MetricKind::Counter => {
+                point.value += amount;
+                point.count += 1;
+            }
+            MetricKind::Gauge => {
+                point.value = amount;
+                point.count = 1;
+            }
+            MetricKind::Histogram => {
+                if point.count == 0 {
+                    point.min = amount;
+                    point.max = amount;
+                } else {
+                    point.min = point.min.min(amount);
+                    point.max = point.max.max(amount);
+                }
+                point.value += amount;
+                point.count += 1;
+            }
+        }
+    }
+
+    /// Enqueue an analytics event for the next flush. No-op if uninitialized OR if
+    /// there is no destination for events (no PostHog exporter AND mirroring to
+    /// OTLP off) — per spec §4.2 a `capture` with nowhere to go is a no-op.
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn telemetry_enqueue_event(
+        &self,
+        ev: crate::stdlib::telemetry::model::AnalyticsEvent,
+    ) {
+        if let Some(state) = self.telemetry.borrow_mut().as_mut() {
+            if state.exporters.posthog.is_some() || state.mirror_events_to_otlp {
+                state.events.push(ev);
+            }
+        }
+    }
+
+    /// Flush the telemetry pipeline at process exit (spec §2: an automatic flush
+    /// on the existing shutdown path). A no-op if telemetry was never initialized
+    /// or the feature is off. A flush failure is logged once to stderr and dropped
+    /// — telemetry must never affect the program's exit. Buffered signals are
+    /// cleared either way.
+    pub async fn telemetry_flush_on_exit(&self) {
+        #[cfg(feature = "telemetry")]
+        {
+            if !self.telemetry_active() {
+                return;
+            }
+            if let Some(mut state) = self.telemetry_take_state() {
+                let outcome =
+                    crate::stdlib::telemetry::flush_state_public(self, &mut state).await;
+                state.spans.clear();
+                state.events.clear();
+                self.telemetry_return_state(state);
+                if let Err(msg) = outcome {
+                    // Live builds warn once; capture builds (tests) stay quiet.
+                    if matches!(self.output, OutputSink::Live) {
+                        use std::io::Write;
+                        let mut e = std::io::stderr().lock();
+                        let _ = writeln!(e, "telemetry: flush-on-exit failed: {}", msg);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `std/telemetry` dispatch (mirrors `call_log`). Delegates to the telemetry
+    /// module, which owns the wire shaping; the `Interp` owns the state cells,
+    /// resource handles, and the send seam.
+    #[cfg(feature = "telemetry")]
+    pub(crate) async fn call_telemetry(
+        &self,
+        func: &str,
+        args: &[Value],
+        span: Span,
+    ) -> Result<Value, Control> {
+        crate::stdlib::telemetry::dispatch(self, func, args, span).await
     }
 
     /// Is the captured output buffer empty? (REPL flush check.) Always true under
@@ -2491,6 +3060,23 @@ impl Interp {
                 return self.call_events_method(&m, args, span).await;
             }
         }
+        #[cfg(feature = "telemetry")]
+        {
+            use crate::value::NativeKind::*;
+            if matches!(
+                m.receiver.kind,
+                TelemetrySpan | TelemetryInstrument | TelemetryNoop
+            ) {
+                return crate::stdlib::telemetry::call_method(
+                    self,
+                    &m.receiver,
+                    &m.method,
+                    args,
+                    span,
+                )
+                .await;
+            }
+        }
         Err(AsError::at(format!("native handle has no method '{}'", m.method), span).into())
     }
 
@@ -2717,10 +3303,21 @@ impl Interp {
             // Track this task's lifetime for backpressure; the guard moves into the
             // task and decrements on completion OR cancel-on-drop.
             let guard = self.inflight_guard();
+            // SP12: capture THIS task's current telemetry span so the spawned body
+            // inherits the correct parent lineage (per-task isolation, spec §9.3).
+            #[cfg(feature = "telemetry")]
+            let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
                 // The owned `func`/`call_env`/`what` live in `run_function_body`'s
                 // frame, so the `BodySpec` borrow never escapes this `'static` task.
+                #[cfg(feature = "telemetry")]
+                let r = crate::interp::telemetry_scope(
+                    telem_parent,
+                    vm.run_function_body(func, args, call_env, span, what),
+                )
+                .await;
+                #[cfg(not(feature = "telemetry"))]
                 let r = vm.run_function_body(func, args, call_env, span, what).await;
                 cell.resolve(r);
             });
@@ -3042,10 +3639,19 @@ impl Interp {
             // Resolve the cell, not a handle clone, so cancel-on-drop works.
             let cell = fut.cell();
             let guard = self.inflight_guard();
+            #[cfg(feature = "telemetry")]
+            let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
                 // Owned `method`/`call_env`/`name` keep the `BodySpec` borrow inside
                 // `run_method_body`'s frame, so nothing escapes the `'static` task.
+                #[cfg(feature = "telemetry")]
+                let r = crate::interp::telemetry_scope(
+                    telem_parent,
+                    vm.run_method_body(method, args, call_env, span, name),
+                )
+                .await;
+                #[cfg(not(feature = "telemetry"))]
                 let r = vm.run_method_body(method, args, call_env, span, name).await;
                 cell.resolve(r);
             });
@@ -3093,8 +3699,17 @@ impl Interp {
             let fut = crate::task::SharedFuture::new();
             let cell = fut.cell();
             let guard = self.inflight_guard();
+            #[cfg(feature = "telemetry")]
+            let telem_parent = crate::interp::telemetry_capture_current();
             let handle = tokio::task::spawn_local(async move {
                 let _g = guard;
+                #[cfg(feature = "telemetry")]
+                let r = crate::interp::telemetry_scope(
+                    telem_parent,
+                    vm.run_method_body(m, args, call_env, span, what),
+                )
+                .await;
+                #[cfg(not(feature = "telemetry"))]
                 let r = vm.run_method_body(m, args, call_env, span, what).await;
                 cell.resolve(r);
             });
@@ -4295,6 +4910,24 @@ mod tests {
     use super::*;
     use crate::lexer::lex;
     use crate::parser::parse;
+
+    /// SP12 soft hook: with NO `telemetry.init` (and regardless of the feature),
+    /// the SP11-facing `Interp::telemetry_*` hook is inert — `telemetry_active()`
+    /// is false and `telemetry_span_start` returns `None`. This is the exact
+    /// surface `std/ai` calls; it must compile and be inert in EVERY feature
+    /// config (this test runs in both default and `--no-default-features`).
+    #[test]
+    fn telemetry_soft_hook_inert_without_init() {
+        let interp = Interp::new();
+        assert!(!interp.telemetry_active());
+        assert!(interp
+            .telemetry_span_start("op", vec![("k".into(), Value::Number(1.0))])
+            .is_none());
+        // Setter/event/end on an arbitrary id are safe no-ops when inactive.
+        interp.telemetry_span_set(0, "k", Value::Nil);
+        interp.telemetry_span_event(0, "e", vec![]);
+        interp.telemetry_span_end(0, SpanStatus::Ok);
+    }
 
     /// Extract the panic's AsError from a Control (test helper).
     fn panic_of(c: Control) -> AsError {

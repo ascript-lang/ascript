@@ -224,7 +224,7 @@ async fn eval_line_vm(vm: &Rc<Vm>, line: &str) -> bool {
     // returns (structured concurrency).
     let local = tokio::task::LocalSet::new();
     let should_exit = local
-        .run_until(async {
+        .run_until(crate::interp::telemetry_root_scope(async {
             match vm.run(&mut fiber).await {
                 // The trailing-expression value (or `Nil` for a statement line) — the
                 // compiler emitted `RETURN <value>`. Print it unless it is `Nil`,
@@ -252,7 +252,7 @@ async fn eval_line_vm(vm: &Rc<Vm>, line: &str) -> bool {
                 // exit() — end the REPL loop cleanly.
                 Err(Control::Exit(_)) => true,
             }
-        })
+        }))
         .await;
     local.await; // drain spawned tasks (structured join)
     should_exit
@@ -395,7 +395,7 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) -> bool {
     // returns (no-op until Phase 2).
     let local = tokio::task::LocalSet::new();
     let should_exit = local
-        .run_until(async {
+        .run_until(crate::interp::telemetry_root_scope(async {
             match interp.exec(&program, env).await {
                 Err(Control::Panic(e)) => {
                     flush_output(interp);
@@ -433,7 +433,7 @@ async fn eval_line(interp: &Interp, env: &Environment, line: &str) -> bool {
                 flush_output(interp);
             }
             false
-        })
+        }))
         .await;
     local.await;
     should_exit

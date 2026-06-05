@@ -25,6 +25,16 @@ pub mod vm;
 use crate::error::{AsError, SourceInfo};
 use crate::interp::Interp;
 pub use crate::interp::TestSummary;
+#[cfg(feature = "telemetry")]
+pub use crate::stdlib::telemetry::model::CapturedRequest;
+/// Test seam: force the SP12 telemetry capture-mode send to "fail" (per-thread),
+/// to exercise the error model (a flush failure is logged once + dropped, never
+/// aborts the program). `#[doc(hidden)]` — not a public API.
+#[doc(hidden)]
+#[cfg(feature = "telemetry")]
+pub fn telemetry_test_force_send_error(on: bool) {
+    crate::stdlib::telemetry::set_test_force_send_error(on);
+}
 use std::path::Path;
 use std::rc::Rc;
 
@@ -101,7 +111,7 @@ pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
     interp.install_self();
     let local = tokio::task::LocalSet::new();
     let result: Result<TestSummary, AsError> = local
-        .run_until(async {
+        .run_until(crate::interp::telemetry_root_scope(async {
             for file in files {
                 match interp.load_module(Path::new(file)).await {
                     Ok(_) | Err(crate::interp::Control::Propagate(_)) => {}
@@ -124,7 +134,7 @@ pub async fn run_tests(files: &[String]) -> Result<TestSummary, AsError> {
                 Err(crate::interp::Control::Panic(e)) => Err(e),
                 Err(crate::interp::Control::Propagate(_)) => Ok(TestSummary::default()),
             }
-        })
+        }))
         .await;
     local.await; // drain spawned tasks — no-op until Phase 2
     result
@@ -152,7 +162,9 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
     // (`let len = 5`) and import names that collide with builtins.
     let env = crate::interp::global_env().child();
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(interp.exec(&program, &env)).await;
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(interp.exec(&program, &env)))
+        .await;
     local.await; // drain spawned tasks — no-op until Phase 2
     match result {
         Ok(crate::interp::Flow::Break) => Err(AsError::new("'break' outside of a loop")),
@@ -166,6 +178,36 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
         Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), None)),
         // exit(n) — return the captured output plus the exit code.
         Err(crate::interp::Control::Exit(code)) => Ok((interp.output(), Some(code))),
+    }
+}
+
+/// Run `src` on the tree-walker and return the captured output PLUS the owning
+/// `Rc<Interp>`, so a test can read interpreter-side state after the program
+/// finishes (used by the SP12 `std/telemetry` capture-mode tests, which assert on
+/// `interp.telemetry_capture()`). `#[doc(hidden)]` test seam — not a public API.
+#[doc(hidden)]
+#[cfg(feature = "telemetry")]
+pub async fn run_source_with_interp(src: &str) -> Result<(String, Rc<Interp>), AsError> {
+    let src_info = Rc::new(SourceInfo {
+        path: "<input>".to_string(),
+        text: src.to_string(),
+    });
+    let tokens = lexer::lex(src).map_err(|e| e.with_source(src_info.clone()))?;
+    let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
+    let interp = Rc::new(Interp::new());
+    interp.install_self();
+    let env = crate::interp::global_env().child();
+    let local = tokio::task::LocalSet::new();
+    // Establish the root telemetry-span scope so top-level `telemetry.span` /
+    // `startSpan` parenting works (per-task isolation; spec §9.3).
+    let root = crate::interp::telemetry_root_scope(interp.exec(&program, &env));
+    let result = local.run_until(root).await;
+    local.await;
+    match result {
+        Ok(_) => Ok((interp.output(), interp)),
+        Err(crate::interp::Control::Panic(e)) => Err(e.with_source(src_info)),
+        Err(crate::interp::Control::Propagate(_)) => Ok((interp.output(), interp)),
+        Err(crate::interp::Control::Exit(_)) => Ok((interp.output(), interp)),
     }
 }
 
@@ -314,7 +356,11 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .await;
+    // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
+    local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await; // drain spawned tasks
                  // End-of-program cycle collection (V13-T3): reclaim any leftover
                  // reference cycles for a clean shutdown. The fiber's stack has been
@@ -381,7 +427,11 @@ pub async fn run_file_on_vm(path: &Path, script_args: &[String]) -> Result<i32, 
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 
     let local = tokio::task::LocalSet::new();
-    let result = local.run_until(vm.run(&mut fiber)).await;
+    let result = local
+        .run_until(crate::interp::telemetry_root_scope(vm.run(&mut fiber)))
+        .await;
+    // SP12: flush any buffered telemetry on the existing shutdown path (spec §2).
+    local.run_until(interp.telemetry_flush_on_exit()).await;
     local.await; // drain spawned tasks (structured join)
                  // End-of-program cycle collection (V13-T3): see `run_aso_file`.
     crate::gc::collect();

@@ -123,6 +123,16 @@ tui = ["dep:crossterm"]
 # Rc/RefCell runtime. tower-lsp bundles lsp-types + tower + JSON-RPC over stdio.
 lsp = ["dep:tower-lsp", "tokio/io-std"]
 sysinfo = ["dep:sysinfo"]
+# SP12 std/telemetry: vendor-neutral observability facade (tracing spans, metrics,
+# analytics events) with three HAND-ROLLED HTTP exporters (OTLP http/json, Sentry
+# envelopes, PostHog capture) over the pooled reqwest client in net_http.rs — NO
+# opentelemetry/sentry/posthog crate (they assume a Send multi-thread runtime; the
+# interp is !Send current-thread). Depends on `data` (json::to_json_lossy total
+# serializer) + `net` (the shared reqwest client). NOT in `default` (network + new
+# surface → opt-in, like http3). cfg's out cleanly under --no-default-features; the
+# SP11-facing Interp::telemetry_* soft hook keeps always-present signatures so
+# std/ai builds with telemetry absent.
+telemetry = ["data", "net"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"

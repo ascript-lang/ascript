@@ -426,6 +426,18 @@ pub enum NativeKind {
     // SP5 §7 std/events: an event-emitter (core). Methods: on/once/off/emit/
     // listenerCount.
     Events,
+    // SP12 std/telemetry: a tracing span handle. Methods: setAttribute/addEvent/
+    // setStatus/end. Inert (no-op) before telemetry.init. Feature `telemetry`.
+    #[cfg(feature = "telemetry")]
+    TelemetrySpan,
+    // SP12 std/telemetry: a metric instrument handle (counter/histogram/gauge).
+    // Methods: add (counter), record (histogram), set (gauge). Feature `telemetry`.
+    #[cfg(feature = "telemetry")]
+    TelemetryInstrument,
+    // SP12 std/telemetry: an INERT handle returned when telemetry is not
+    // initialized — every method is a no-op. Feature `telemetry`.
+    #[cfg(feature = "telemetry")]
+    TelemetryNoop,
 }
 
 impl NativeKind {
@@ -459,6 +471,12 @@ impl NativeKind {
             NativeKind::RedisConnection => "redisConnection",
             NativeKind::Lru => "lru",
             NativeKind::Events => "emitter",
+            #[cfg(feature = "telemetry")]
+            NativeKind::TelemetrySpan => "span",
+            #[cfg(feature = "telemetry")]
+            NativeKind::TelemetryInstrument => "instrument",
+            #[cfg(feature = "telemetry")]
+            NativeKind::TelemetryNoop => "telemetryNoop",
         }
     }
 }
