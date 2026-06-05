@@ -539,6 +539,99 @@ impl WorkspaceIndex {
             true
         }
     }
+
+    /// Compute the import-specifier rewrites needed when `old_path` is renamed to
+    /// `new_path`: for every file that imports `old_path`, the byte range of its
+    /// `from "<spec>"` string token's INNER text (between the quotes) + the NEW
+    /// importer-relative specifier. Returns `(importer_path, specifier_range,
+    /// new_specifier)`. The new specifier is the importer-relative path to
+    /// `new_path` WITHOUT the `.as` extension and WITH a leading `./` (mirroring
+    /// the forms `resolve_specifier` accepts).
+    pub fn import_rewrite_edits(
+        &self,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> Vec<(PathBuf, ByteSpan, String)> {
+        let old = canonicalize(old_path);
+        let mut out = Vec::new();
+        let Some(importers) = self.importers.get(&old) else {
+            return out;
+        };
+        for imp in importers {
+            let Some(file) = self.files.get(imp) else {
+                continue;
+            };
+            let importer_dir = imp.parent().map(Path::to_path_buf).unwrap_or_default();
+            let new_spec = relative_specifier(&importer_dir, new_path);
+            // Re-parse the importer to find the import statement whose resolved
+            // target is `old`, and the byte range of its `from "<spec>"` STRING.
+            let parsed = crate::syntax::parser::parse(&file.text);
+            if !parsed.errors.is_empty() || !parsed.lex_errors.is_empty() {
+                continue;
+            }
+            let tree = crate::syntax::tree_builder::build_tree(parsed);
+            for import in tree
+                .descendants()
+                .filter(|n| n.kind() == SyntaxKind::ImportStmt)
+            {
+                let Some(spec) = import_specifier(import) else {
+                    continue;
+                };
+                if resolve_specifier(&spec, &importer_dir).as_deref() != Some(old.as_path()) {
+                    continue;
+                }
+                // The string TOKEN range, INNER (between the quotes).
+                if let Some(tok) = import
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .find(|t| t.kind() == SyntaxKind::Str)
+                {
+                    let r = ByteSpan::from(tok.text_range());
+                    let inner = ByteSpan {
+                        start: r.start + 1,
+                        end: r.end - 1,
+                    };
+                    out.push((imp.clone(), inner, new_spec.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The importer-relative specifier for `target` (a leading `./`/`../`, no `.as`).
+fn relative_specifier(importer_dir: &Path, target: &Path) -> String {
+    let target = canonicalize(target);
+    let target_noext = {
+        let mut t = target.clone();
+        if t.extension().and_then(|e| e.to_str()) == Some("as") {
+            t.set_extension("");
+        }
+        t
+    };
+    let rel = pathdiff_lexical(importer_dir, &target_noext);
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.starts_with("./") || s.starts_with("../") {
+        s
+    } else {
+        format!("./{s}")
+    }
+}
+
+/// A lexical relative path from `base` to `target` (no fs access), enough for
+/// sibling/`../` import rewrites.
+fn pathdiff_lexical(base: &Path, target: &Path) -> PathBuf {
+    let base: Vec<_> = base.components().collect();
+    let targ: Vec<_> = target.components().collect();
+    let common = base.iter().zip(&targ).take_while(|(a, b)| a == b).count();
+    let mut out = PathBuf::new();
+    for _ in common..base.len() {
+        out.push("..");
+    }
+    for c in &targ[common..] {
+        out.push(c.as_os_str());
+    }
+    out
 }
 
 /// Find the byte offset of the def NAMED `name` in `def_path` (its name-range
@@ -875,6 +968,27 @@ mod tests {
         assert_send_sync::<WorkspaceIndex>();
         assert_send_sync::<FileIndex>();
         assert_send_sync::<SymbolDef>();
+    }
+
+    #[test]
+    fn import_rewrite_on_move_points_at_new_path() {
+        // a.as is imported by b.as via "./a"; moving a.as → lib/a.as rewrites b's
+        // specifier to "./lib/a".
+        let a = (PathBuf::from("/ws/a.as"), "export fn f() {}\n".to_string());
+        let b = (
+            PathBuf::from("/ws/b.as"),
+            "import { f } from \"./a\"\nf()\n".to_string(),
+        );
+        let idx = WorkspaceIndex::build_from_files(&[a, b]);
+        let edits =
+            idx.import_rewrite_edits(&PathBuf::from("/ws/a.as"), &PathBuf::from("/ws/lib/a.as"));
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        let (importer, range, new_spec) = &edits[0];
+        assert_eq!(importer, &PathBuf::from("/ws/b.as"));
+        assert_eq!(new_spec, "./lib/a");
+        // The range is the inner specifier (between the quotes).
+        let b_text = "import { f } from \"./a\"\nf()\n";
+        assert_eq!(&b_text[range.start..range.end], "./a");
     }
 
     fn fixture() -> WorkspaceIndex {
