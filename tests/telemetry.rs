@@ -309,3 +309,75 @@ fn field_after(body: &str, key: &str) -> String {
     let end = after.find('"').unwrap();
     after[..end].to_string()
 }
+
+// ---- F3: Sentry exporter — DSN parse, transaction + error envelopes ----
+
+const INIT_SENTRY: &str = r#"
+import * as telemetry from "std/telemetry"
+let [ok, err] = telemetry.init({
+  service: "t",
+  exporters: [ telemetry.sentry({ dsn: "https://pub123@o9.ingest.sentry.io/42" }) ],
+})
+"#;
+
+#[tokio::test]
+async fn sentry_init_malformed_dsn_is_tier1() {
+    let (out, _caps) = run(r#"
+import * as telemetry from "std/telemetry"
+let [ok, err] = telemetry.init({
+  service: "t",
+  exporters: [ telemetry.sentry({ dsn: "not-a-dsn" }) ],
+})
+print(ok)
+print(err != nil)
+"#)
+    .await;
+    assert_eq!(out, "nil\ntrue\n");
+}
+
+#[tokio::test]
+async fn sentry_transaction_envelope() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT_SENTRY}
+await telemetry.span("outer", async () => {{
+  let inner = telemetry.startSpan("inner")
+  inner.end()
+}})
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let req = caps.iter().find(|r| r.signal == "envelope").expect("envelope request");
+    assert_eq!(req.exporter, "sentry");
+    // DSN → envelope URL + auth header.
+    assert_eq!(req.url, "https://o9.ingest.sentry.io/api/42/envelope/");
+    assert!(
+        req.headers.iter().any(|(k, v)| k == "X-Sentry-Auth" && v.contains("sentry_key=pub123")),
+        "auth header: {:?}",
+        req.headers
+    );
+    // Newline-delimited envelope: header line, item-header line, payload line.
+    let lines: Vec<&str> = req.body.lines().collect();
+    assert!(lines.len() >= 3, "envelope lines: {:?}", lines);
+    assert!(req.body.contains(r#""type":"transaction""#), "transaction item: {}", req.body);
+    assert!(req.body.contains(r#""transaction":"outer""#), "tx name: {}", req.body);
+    // The inner span is embedded as a child span.
+    assert!(req.body.contains(r#""op":"inner""#), "child span: {}", req.body);
+}
+
+#[tokio::test]
+async fn sentry_error_status_adds_error_event() {
+    let (_out, caps) = run(&format!(
+        r#"{INIT_SENTRY}
+await telemetry.span("boom", async () => {{ assert(false, "kaboom") }})
+await telemetry.flush()
+"#
+    ))
+    .await;
+    let req = caps.iter().find(|r| r.signal == "envelope").expect("envelope request");
+    // Both a transaction AND an error event item.
+    assert!(req.body.contains(r#""type":"transaction""#), "tx: {}", req.body);
+    assert!(req.body.contains(r#""type":"event""#), "error event: {}", req.body);
+    assert!(req.body.contains(r#""level":"error""#), "error level: {}", req.body);
+    assert!(req.body.contains("kaboom"), "message: {}", req.body);
+}
