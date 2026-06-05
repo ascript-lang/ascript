@@ -21,7 +21,7 @@
   "let" "const" "fn" "return"
   "if" "else" "while" "for" "of" "in" "match"
   "async" "await"
-  "class" "extends" "super" "self"
+  "class" "extends"
   "enum"
   "import" "export" "from" "as"
 ] @keyword
