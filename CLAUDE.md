@@ -574,7 +574,10 @@ yaml/uuid/bytes), `datetime`, `intl`, `sys` (fs/process/env), `crypto`, `compres
 
 ### Tree-sitter grammar
 `build.rs` compiles a vendored Tree-sitter parser from
-`docs/superpowers/specs/grammar/tree-sitter-ascript/src/parser.c` via the `cc` crate.
+`tree-sitter-ascript/src/parser.c` via the `cc` crate. The grammar lives at the repo-root
+`tree-sitter-ascript/` directory (the conventional tree-sitter layout — grammar at root — so it
+can be split out to a standalone published repo); it is a self-contained npm+cargo artifact with
+its own empty `[workspace]` so `cargo build` does not absorb it.
 `tests/treesitter_conformance.rs` asserts BOTH the grammar and the hand-written parser accept every
 `examples/*.as` file with no errors. `tests/frontend_conformance.rs` is a differential parser
 guardrail. If you change syntax, update both parsers and keep the examples passing.

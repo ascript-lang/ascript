@@ -135,7 +135,7 @@ fn treesitter_parses_static_methods() {
 fn query_files() -> Vec<PathBuf> {
     // Resolve relative to the crate manifest so the test is cwd-independent.
     let query_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("docs/superpowers/specs/grammar/tree-sitter-ascript/queries");
+        .join("tree-sitter-ascript/queries");
     let mut files = Vec::new();
     let entries = fs::read_dir(&query_dir)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", query_dir.display()));
