@@ -39,6 +39,10 @@ const NAV = [
     ['stdlib/ai', 'AI (LLM client)'],
     ['stdlib/tui', 'Terminal UI'],
   ]},
+  { title: 'Tooling', items: [
+    ['tooling/editor-setup', 'Editor setup'],
+    ['tooling/lsp-capabilities', 'LSP capabilities'],
+  ]},
   { title: 'Resources', items: [
     ['examples', 'Examples'],
   ]},

@@ -1,10 +1,10 @@
-//! `ascript.toml` `[lint]` config discovery + parsing for the `ascript check` CLI.
+//! `ascript.toml` `[lint]` config discovery + parsing for `ascript check` and the LSP.
 //!
-//! This lives in the CLI binary (NOT `src/check/`, which stays toml-free and
-//! feature-independent). It uses the `toml` crate (a non-optional dependency, so
-//! it is available under `--no-default-features` too) to parse a `[lint]` table
-//! into severity overrides that seed a [`ascript::check::LintConfig`]. CLI flags
-//! are then overlaid on top, so the net precedence is:
+//! This lives in `src/check/` so both the CLI and the LSP discover the same
+//! `ascript.toml [lint]` config. It uses the `toml` crate (a non-optional
+//! dependency, so it is available under `--no-default-features` too) to parse a
+//! `[lint]` table into severity overrides that seed a [`crate::check::LintConfig`].
+//! CLI flags are then overlaid on top, so the net precedence is:
 //!
 //!   inline `// ascript-ignore[code]` (suppression, in `analyze.rs`)
 //!     > CLI `--deny`/`--warn`/`--allow`/`--deny-warnings`
@@ -16,7 +16,7 @@
 //! marker style; the first `ascript.toml` found wins. Discovery is per-file so a
 //! file is governed by the config nearest to it.
 
-use ascript::check::LintConfig;
+use crate::check::LintConfig;
 use std::path::{Path, PathBuf};
 
 /// A parsed `[lint]` table from an `ascript.toml`.
@@ -119,7 +119,7 @@ pub fn apply(path: &Path, lint: &TomlLint, config: &mut LintConfig) -> Result<()
             if !LintConfig::is_known_code(code) {
                 return Err(format!(
                     "ascript.toml: {name}: unknown lint rule '{code}' in `lint.{kind}` (known rules: {})",
-                    ascript::check::RULE_CODES.join(", ")
+                    crate::check::RULE_CODES.join(", ")
                 ));
             }
             match kind {
@@ -204,9 +204,26 @@ mod tests {
         };
         apply(Path::new("ascript.toml"), &lint, &mut cfg).unwrap();
         assert_eq!(
-            cfg.effective("unused-binding", ascript::check::Severity::Warning),
+            cfg.effective("unused-binding", crate::check::Severity::Warning),
             None
         );
         assert!(cfg.deny_warnings);
+    }
+}
+
+#[cfg(test)]
+mod relocation_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn discover_finds_nearest_ascript_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("ascript.toml");
+        let mut f = std::fs::File::create(&toml).unwrap();
+        writeln!(f, "[lint]\nunused-binding = \"allow\"").unwrap();
+        let src = dir.path().join("main.as");
+        std::fs::File::create(&src).unwrap();
+        assert_eq!(discover(&src).as_deref(), Some(toml.as_path()));
     }
 }

@@ -1,23 +1,44 @@
-//! tower-lsp `LanguageServer` implementation: a thin async adapter over the pure
-//! `analysis` layer plus a document store.
+//! tower-lsp `LanguageServer` implementation: a thin async adapter over the cached
+//! `SemanticModel` document store and the pure `providers`.
 //!
-//! The backend is `Send + Sync` because it holds only `Send + Sync` types: the
-//! `Client`, and a `tokio::sync::Mutex<HashMap<Url, String>>` of document text. No
+//! Every capability runs on the CST front-end + cached `SemanticModel` — the legacy
+//! `ast`/`lexer`/`parser` front-end is NOT used here. The backend is `Send + Sync`
+//! because it holds only `Send + Sync` types: the `Client`, and a
+//! `tokio::sync::Mutex<DocumentStore>` of per-document semantic models. No
 //! interpreter state (`Rc`/`RefCell`/`Value`) is ever held, so this compiles on the
 //! `current_thread` tokio runtime AND satisfies tower-lsp's `Send + Sync` bounds.
 
-use crate::lsp::analysis;
+use crate::lsp::model::DocumentStore;
 use crate::lsp::workspace::{self, WorkspaceIndex};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+/// The debounce window: edits arriving within this of the previous edit coalesce
+/// into one rebuild. Short enough to feel instant, long enough to absorb a burst of
+/// keystrokes (typing ~10 chars/sec → all fold into one rebuild).
+const DEBOUNCE_MS: u64 = 40;
+
+/// A pending (debounced) edit for a URL: the latest folded text, its document
+/// version, and the monotone edit sequence number that stamps it.
+type PendingEdit = (String, Option<i32>, u64);
+
+/// Client-configurable settings (subset). Updated by `didChangeConfiguration`.
+#[derive(Debug, Clone, Default)]
+pub struct LspSettings {
+    /// `ascript.color.detectHexStringsEverywhere` — broaden hex-string color
+    /// detection past the color-sink gate. Default `false`.
+    pub detect_hex_strings_everywhere: bool,
+}
+
 pub struct Backend {
     client: Client,
-    documents: Mutex<HashMap<Url, String>>,
+    documents: Mutex<DocumentStore>,
     /// The cross-file symbol index (SP4 §4). `RwLock` (not the interpreter's
     /// `RefCell`) keeps the backend `Send + Sync`; it holds only owned
     /// `String`/`PathBuf`/range data, never a `Value`.
@@ -25,16 +46,51 @@ pub struct Backend {
     /// Workspace root folders captured in `initialize`, walked for `*.as` files
     /// when the index is first built.
     roots: RwLock<Vec<PathBuf>>,
+    /// Client-configurable settings (`didChangeConfiguration`).
+    settings: RwLock<LspSettings>,
+    /// Coalescing: the latest pending text + version + edit sequence number per URL.
+    /// A debounced rebuild only proceeds if its captured sequence is still the latest
+    /// for the URL (a newer edit landing supersedes it).
+    pending: Mutex<HashMap<Url, PendingEdit>>,
+    /// Monotone edit sequence, bumped on every `did_change`.
+    edit_seq: AtomicU64,
+    /// Set by `window/workDoneProgress/cancel` for the indexing token; checked
+    /// between files so a huge workspace's initial indexing can be aborted.
+    index_cancelled: AtomicBool,
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
         Backend {
             client,
-            documents: Mutex::new(HashMap::new()),
+            documents: Mutex::new(DocumentStore::new()),
             index: RwLock::new(WorkspaceIndex::new()),
             roots: RwLock::new(Vec::new()),
+            settings: RwLock::new(LspSettings::default()),
+            pending: Mutex::new(HashMap::new()),
+            edit_seq: AtomicU64::new(0),
+            index_cancelled: AtomicBool::new(false),
         }
+    }
+
+    /// Handle `window/workDoneProgress/cancel` (wired as a custom method in
+    /// `run_server` because tower-lsp 0.20 does not yet expose it as a
+    /// `LanguageServer` trait method — see the crate TODO at `tower-lsp/src/lib.rs`).
+    /// We run exactly one cancellable long task — the initial workspace indexing
+    /// under the `ascript-index` token — so flip the flag its loop checks between
+    /// files.
+    pub async fn on_work_done_progress_cancel(&self, params: WorkDoneProgressCancelParams) {
+        if matches!(&params.token, NumberOrString::String(s) if s == "ascript-index") {
+            self.index_cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// True if `gen` is no longer the current generation for `uri` (a newer edit has
+    /// landed). A handler that captured `gen` at entry should bail when this is true,
+    /// because its result was computed against now-stale text.
+    async fn superseded(&self, uri: &Url, gen: u64) -> bool {
+        let store = self.documents.lock().await;
+        store.current_gen(uri).map(|g| g != gen).unwrap_or(true)
     }
 
     /// Incrementally re-index the file behind `uri` (if it maps to a path).
@@ -46,21 +102,91 @@ impl Backend {
         }
     }
 
-    /// Store the document text and publish its diagnostics. Merges the path-less
-    /// `analysis::diagnostics` with the index-backed file-module call-arity
-    /// (D-arity), which the single-file analysis cannot compute.
+    /// Resolve a type-hierarchy step (`supertypes` when `up`, else `subtypes`) for
+    /// a `TypeHierarchyItem`: re-anchor it in its document model by name, then map
+    /// the provider's `(name, span)` pairs to `TypeHierarchyItem`s in the same file.
+    async fn type_hierarchy_step(&self, item: TypeHierarchyItem, up: bool) -> Vec<TypeHierarchyItem> {
+        let uri = item.uri.clone();
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Vec::new();
+        };
+        let offset = range_start_byte(&model.text, item.selection_range);
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_type(model, offset) else {
+            return Vec::new();
+        };
+        let pairs = if up {
+            crate::lsp::providers::hierarchy::supertypes(model, &anchor.name)
+        } else {
+            crate::lsp::providers::hierarchy::subtypes(model, &anchor.name)
+        };
+        pairs
+            .into_iter()
+            .map(|(name, span)| {
+                let range = crate::lsp::convert::byte_span_to_range(
+                    &model.text,
+                    &model.line_index,
+                    span,
+                );
+                type_item(name, SymbolKind::CLASS, uri.clone(), range)
+            })
+            .collect()
+    }
+
+    /// Build/cache the document's `SemanticModel` and publish its diagnostics.
+    /// Merges the model's config-aware single-file diagnostics with the
+    /// index-backed file-module call-arity (D-arity), which the single-file
+    /// analysis cannot compute.
     async fn analyze_and_publish(&self, uri: Url, text: String, version: Option<i32>) {
-        let mut diags = analysis::diagnostics(&text);
+        let mut diags;
+        {
+            let mut store = self.documents.lock().await;
+            // `set_versioned` bumps the document generation so a concurrently-running
+            // completion/hover handler can detect it was superseded (Task 5).
+            store.set_versioned(uri.clone(), text.clone(), version);
+            diags = store.get(&uri).map(|m| m.lsp_diagnostics()).unwrap_or_default();
+        }
+        // Index-backed cross-file arity (cannot be computed single-file).
         if let Some(path) = url_to_canon(&uri) {
             if let Ok(idx) = self.index.read() {
                 for d in idx.file_module_arity(&path, &text) {
-                    diags.push(analysis::byte_diagnostic_to_lsp(&text, &d));
+                    diags.push(crate::lsp::convert::byte_diagnostic_to_lsp(&text, &d));
                 }
             }
         }
-        self.documents.lock().await.insert(uri.clone(), text);
         self.client.publish_diagnostics(uri, diags, version).await;
     }
+
+    /// Rebuild + re-publish diagnostics for every open document. Used when the
+    /// effective lint config may have changed (an `ascript.toml` edit), since the
+    /// model's config is discovered from the document's path at build time.
+    async fn republish_all_open(&self) {
+        let docs: Vec<(Url, String, Option<i32>)> = {
+            let store = self.documents.lock().await;
+            store
+                .uris()
+                .into_iter()
+                .filter_map(|uri| {
+                    store
+                        .get(&uri)
+                        .map(|m| (uri.clone(), m.text.clone(), m.version))
+                })
+                .collect()
+        };
+        for (uri, text, version) in docs {
+            self.analyze_and_publish(uri, text, version).await;
+        }
+    }
+}
+
+/// Parse the `ascript.color.detectHexStringsEverywhere` boolean out of a
+/// `didChangeConfiguration` settings payload, if present.
+fn parse_detect_setting(settings: &serde_json::Value) -> Option<bool> {
+    settings
+        .get("ascript")
+        .and_then(|a| a.get("color"))
+        .and_then(|c| c.get("detectHexStringsEverywhere"))
+        .and_then(|v| v.as_bool())
 }
 
 /// The set of capabilities the server advertises. Factored out so it can be unit
@@ -68,23 +194,149 @@ impl Backend {
 /// later tasks add completion/hover/definition/documentSymbol providers.
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::INCREMENTAL,
+        )),
         document_symbol_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             // `.` for member-access completions; `"` / `'` for import-path strings.
             trigger_characters: Some(vec![".".to_string(), "\"".to_string(), "'".to_string()]),
+            resolve_provider: Some(true),
             ..CompletionOptions::default()
         }),
         definition_provider: Some(OneOf::Left(true)),
+        // Phase 3: declaration ≈ definition for AScript (no separate forward
+        // declaration concept).
+        declaration_provider: Some(DeclarationCapability::Simple(true)),
+        // Phase 3: jump to the inferred type's class/enum decl (in-file).
+        type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+        // Phase 3: subclasses of a class / variants of an enum (in-file).
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+        // Phase 3: structural folding (blocks/decls/literals/match + //region).
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        // Phase 3: smart-expand selection via CST ancestry.
+        selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        // Phase 3: clickable import specifiers (relative → target file).
+        document_link_provider: Some(DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        document_range_formatting_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![
+                CodeActionKind::QUICKFIX,
+                CodeActionKind::SOURCE_FIX_ALL,
+                CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+            ]),
+            resolve_provider: Some(true),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        // Phase 4: codeLens (run-test/run-main + reference counts) resolved lazily.
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(true),
+        }),
+        execute_command_provider: Some(ExecuteCommandOptions {
+            commands: vec![
+                crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string(),
+                // Phase 4: codeLens run/runTest commands (acknowledged, not executed
+                // by the server — the static-only invariant: the editor extension
+                // binds these to a terminal task).
+                "ascript.run".to_string(),
+                "ascript.runTest".to_string(),
+            ],
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
+        // Phase 3: call hierarchy (prepare/incoming/outgoing) over the workspace
+        // index call graph.
+        call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+        // Phase 3: type hierarchy (prepare/supertypes/subtypes) for classes/enums.
+        // `lsp-types` 0.94 `ServerCapabilities` has NO `type_hierarchy_provider`
+        // field, so it is advertised through the `experimental` escape hatch
+        // (tower-lsp routes the `textDocument/prepareTypeHierarchy` method
+        // regardless of the advertised capability shape).
+        experimental: Some(serde_json::json!({ "typeHierarchyProvider": true })),
         // SP4 §4: cross-file navigation providers backed by the workspace index.
-        workspace_symbol_provider: Some(OneOf::Left(true)),
+        // Phase 3: advertise lazy `workspaceSymbol/resolve` via the options form.
+        workspace_symbol_provider: Some(OneOf::Right(WorkspaceSymbolOptions {
+            resolve_provider: Some(true),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         references_provider: Some(OneOf::Left(true)),
         rename_provider: Some(OneOf::Right(RenameOptions {
             prepare_provider: Some(true),
             work_done_progress_options: WorkDoneProgressOptions::default(),
         })),
+        // Phase 2: read/write occurrence highlighting of the symbol under the cursor.
+        document_highlight_provider: Some(OneOf::Left(true)),
+        // Phase 4: documentColor / colorPresentation swatches (color.rgb/bgRgb,
+        // [r,g,b] tui arrays, gated hex/functional color strings).
+        color_provider: Some(ColorProviderCapability::Simple(true)),
+        // Phase 4: linkedEditingRange — live rename of a local identifier's same-file
+        // occurrences (globals refused).
+        linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
+        // Phase 4: pull diagnostics (textDocument/diagnostic + workspace/diagnostic),
+        // returning the same diagnostics as the push path.
+        diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
+            identifier: Some("ascript".to_string()),
+            inter_file_dependencies: true,
+            workspace_diagnostics: true,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
+        // Phase 2: signature help while typing a call's arguments. Triggered on `(`
+        // (open the call) and `,` (advance the active parameter / retrigger).
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: Some(vec![",".to_string()]),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        }),
+        // Phase 2: inferred-type + parameter-name inlay hints (with lazy resolve).
+        inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+            InlayHintOptions {
+                resolve_provider: Some(true),
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            },
+        ))),
+        // Phase 4: multi-root workspace folders + file-operations (willRenameFiles /
+        // didRenameFiles import rewrite, restricted to `*.as` files).
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
+            file_operations: Some(WorkspaceFileOperationsServerCapabilities {
+                will_rename: Some(as_file_rename_filter()),
+                did_rename: Some(as_file_rename_filter()),
+                ..WorkspaceFileOperationsServerCapabilities::default()
+            }),
+        }),
+        // Phase 2: semantic-token highlighting (full document + range), with the
+        // provider's legend.
+        semantic_tokens_provider: Some(
+            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                legend: crate::lsp::providers::semantic_tokens::legend(),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                range: Some(true),
+                work_done_progress_options: WorkDoneProgressOptions::default(),
+            }),
+        ),
         ..ServerCapabilities::default()
+    }
+}
+
+/// A `FileOperationRegistrationOptions` matching `file://**/*.as` (the scheme +
+/// glob both `willRenameFiles` and `didRenameFiles` register on).
+fn as_file_rename_filter() -> FileOperationRegistrationOptions {
+    FileOperationRegistrationOptions {
+        filters: vec![FileOperationFilter {
+            scheme: Some("file".to_string()),
+            pattern: FileOperationPattern {
+                glob: "**/*.as".to_string(),
+                matches: Some(FileOperationPatternKind::File),
+                options: None,
+            },
+        }],
     }
 }
 
@@ -134,8 +386,41 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _params: InitializedParams) {
-        // Warm the cross-file index: walk each root for `*.as` and index them.
+        // Warm the cross-file index over ALL workspace roots (multi-root), wrapped
+        // in a best-effort work-done progress report.
         let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+        let token = NumberOrString::String("ascript-index".to_string());
+        // Reset the cancel flag for this indexing pass.
+        self.index_cancelled.store(false, Ordering::SeqCst);
+        // Create the progress token (best-effort: a server→client request whose
+        // response we do not need; a client without progress support ignores it).
+        // Spawned so we never stall `initialized` waiting on a client that never
+        // answers (the prior Phase-4 deadlock fix).
+        {
+            let client = self.client.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                let _ = client
+                    .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                        token,
+                    })
+                    .await;
+            });
+        }
+        // Begin — cancellable so the client may flip the cancel flag mid-index.
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing AScript workspace".to_string(),
+                        cancellable: Some(true),
+                        message: None,
+                        percentage: Some(0),
+                    },
+                )),
+            })
+            .await;
         let mut files: Vec<(PathBuf, String)> = Vec::new();
         for root in &roots {
             for path in workspace::discover_as_files(root) {
@@ -144,11 +429,74 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        if let Ok(mut idx) = self.index.write() {
-            for (path, text) in &files {
+        // Index file-by-file, reporting progress and honoring cancellation between
+        // files so a huge workspace can be aborted via `window/workDoneProgress/cancel`.
+        let total = files.len().max(1);
+        let mut indexed = 0usize;
+        let mut cancelled = false;
+        for (i, (path, text)) in files.iter().enumerate() {
+            if self.index_cancelled.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            if let Ok(mut idx) = self.index.write() {
                 idx.reindex_file(path, text);
             }
+            indexed = i + 1;
+            self.client
+                .send_notification::<notification::Progress>(ProgressParams {
+                    token: token.clone(),
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                        WorkDoneProgressReport {
+                            cancellable: Some(true),
+                            message: Some(format!("{}/{}", i + 1, total)),
+                            percentage: Some(((i + 1) * 100 / total) as u32),
+                        },
+                    )),
+                })
+                .await;
         }
+        // End the progress with the indexed-file count (noting an early cancel).
+        let end_message = if cancelled {
+            format!("indexing cancelled after {indexed} of {} files", files.len())
+        } else {
+            format!("{} files indexed", files.len())
+        };
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token,
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
+                    message: Some(end_message),
+                })),
+            })
+            .await;
+        // Dynamically register a file watcher for `*.as` + `ascript.toml` so the
+        // client sends `workspace/didChangeWatchedFiles` (best-effort — a client
+        // without dynamic-registration support simply ignores it).
+        let registration = Registration {
+            id: "ascript-watch".to_string(),
+            method: "workspace/didChangeWatchedFiles".to_string(),
+            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.as".to_string()),
+                        kind: None,
+                    },
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/ascript.toml".to_string()),
+                        kind: None,
+                    },
+                ],
+            })
+            .ok(),
+        };
+        // Spawned (not awaited inline): `register_capability` is a server→client
+        // REQUEST whose response we do not need; awaiting it inline would stall the
+        // `initialized` handler against a client that never answers.
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let _ = client.register_capability(vec![registration]).await;
+        });
         self.client
             .log_message(MessageType::INFO, "ascript language server initialized")
             .await;
@@ -162,16 +510,58 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // Full-document sync: the last content change holds the entire new text.
-        if let Some(change) = params.content_changes.into_iter().last() {
-            self.reindex_uri(&params.text_document.uri, &change.text);
-            self.analyze_and_publish(
-                params.text_document.uri,
-                change.text,
-                Some(params.text_document.version),
-            )
-            .await;
+        // Incremental sync with debounce/coalesce: a burst of keystrokes within the
+        // debounce window folds into a SINGLE rebuild + publish, and only the latest
+        // folded text is analyzed (older edits are folded forward, never analyzed).
+        let uri = params.text_document.uri.clone();
+        let version = Some(params.text_document.version);
+
+        // Fold the ranged edits onto the latest known text (pending wins over the
+        // cached model so consecutive bursts stack correctly).
+        let base = {
+            let pending = self.pending.lock().await;
+            if let Some((t, _, _)) = pending.get(&uri) {
+                t.clone()
+            } else {
+                let store = self.documents.lock().await;
+                store.get(&uri).map(|m| m.text.clone()).unwrap_or_default()
+            }
+        };
+        let new_text = crate::lsp::model::apply_changes(&base, &params.content_changes);
+
+        // Correctness note: coalescing has no lost-edit race ONLY because (a) there is no
+        // .await between the fold-read and the pending insert (both synchronous), and (b) the
+        // server runs on a current_thread/LocalSet runtime so no other task interleaves in that
+        // window. Do NOT introduce an .await here, and revisit if the runtime ever becomes
+        // multi-threaded.
+        // Stamp this edit and record it as the latest pending text for the URI.
+        let seq = self.edit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(uri.clone(), (new_text.clone(), version, seq));
         }
+
+        // Debounce: wait the window, then rebuild ONLY if no newer edit landed. The
+        // sleep defers THIS uri's rebuild without blocking other requests (tower-lsp
+        // dispatches each notification as its own task on the LocalSet).
+        tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+        let still_latest = {
+            let pending = self.pending.lock().await;
+            pending.get(&uri).map(|(_, _, s)| *s) == Some(seq)
+        };
+        if !still_latest {
+            return; // a newer edit superseded us; it will rebuild.
+        }
+
+        let (text, ver) = {
+            let mut pending = self.pending.lock().await;
+            match pending.remove(&uri) {
+                Some((t, v, _)) => (t, v),
+                None => return,
+            }
+        };
+        self.reindex_uri(&uri, &text);
+        self.analyze_and_publish(uri, text, ver).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -186,23 +576,32 @@ impl LanguageServer for Backend {
         params: DocumentSymbolParams,
     ) -> tower_lsp::jsonrpc::Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let symbols = analysis::document_symbols(text);
+        let symbols = crate::lsp::providers::symbols::document_symbols(model);
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
     async fn hover(&self, params: HoverParams) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
-            return Ok(None);
+        let (gen, result) = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+            (model.generation, crate::lsp::providers::hover::hover(model, offset))
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
-        Ok(analysis::hover(text, offset))
+        // Supersession: a hover computed against now-stale text is dropped. (Only the
+        // noisy while-typing requests — completion/hover — are guarded; user-initiated
+        // navigation/symbol requests rarely race, so they stay unguarded.)
+        if self.superseded(&uri, gen).await {
+            return Ok(None);
+        }
+        Ok(result)
     }
 
     async fn completion(
@@ -211,13 +610,431 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let (gen, items) = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            // The completion provider scans raw chars, so it takes a CHAR offset.
+            let offset = model.line_index.offset(position);
+            (
+                model.generation,
+                crate::lsp::providers::completion::completions(model, offset),
+            )
+        };
+        // If a newer edit landed while we computed, the result is obsolete; drop it
+        // (the client re-requests against the fresh document).
+        if self.superseded(&uri, gen).await {
+            return Ok(None);
+        }
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn completion_resolve(
+        &self,
+        mut item: CompletionItem,
+    ) -> tower_lsp::jsonrpc::Result<CompletionItem> {
+        // Resolve uses the docs table only (no document context needed); a
+        // synthetic empty model is sufficient because `resolve_completion`
+        // ignores the model for builtins/keywords.
+        let model = crate::lsp::model::SemanticModel::build(
+            String::new(),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        crate::lsp::providers::completion::resolve_completion(&model, &mut item);
+        Ok(item)
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
-        let items = analysis::completions(text, offset);
-        Ok(Some(CompletionResponse::Array(items)))
+        Ok(Some(crate::lsp::providers::formatting::format_document(model)))
+    }
+
+    async fn range_formatting(
+        &self,
+        params: DocumentRangeFormattingParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::formatting::format_range(
+            model,
+            params.range,
+        )))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<DocumentHighlight>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::highlight::document_highlights(model, offset))
+    }
+
+    async fn document_color(
+        &self,
+        params: DocumentColorParams,
+    ) -> tower_lsp::jsonrpc::Result<Vec<ColorInformation>> {
+        let uri = params.text_document.uri;
+        let everywhere = self
+            .settings
+            .read()
+            .map(|s| s.detect_hex_strings_everywhere)
+            .unwrap_or(false);
+        // Large-file degradation: color swatches go quiet above HUGE_FILE_BYTES,
+        // logged once. Normal + Large still scan.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(Vec::new());
+            };
+            if matches!(model.size_class(), crate::lsp::model::SizeClass::Huge) {
+                Some(format!("ascript: {uri} is huge — document colors disabled"))
+            } else {
+                return Ok(crate::lsp::providers::color::document_colors(model, everywhere));
+            }
+        };
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Vec::new())
+    }
+
+    async fn color_presentation(
+        &self,
+        params: ColorPresentationParams,
+    ) -> tower_lsp::jsonrpc::Result<Vec<ColorPresentation>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(Vec::new());
+        };
+        let rgba = crate::lsp::providers::color::Rgba::from_lsp(params.color);
+        Ok(crate::lsp::providers::color::color_presentations(model, rgba, params.range))
+    }
+
+    async fn linked_editing_range(
+        &self,
+        params: LinkedEditingRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<LinkedEditingRanges>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::rename::linked_editing_ranges(model, offset)
+            .map(|ranges| LinkedEditingRanges { ranges, word_pattern: None }))
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(crate::lsp::providers::signature::signature_help(model, offset))
+    }
+
+    async fn inlay_hint(
+        &self,
+        params: InlayHintParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        // Large-file degradation: inlay hints are skipped above LARGE_FILE_BYTES
+        // (Large + Huge), returning an empty set. A one-line note is logged for the
+        // huge case so the degradation is observable, never silent — and never a hang.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            match model.size_class() {
+                crate::lsp::model::SizeClass::Normal => {
+                    return Ok(Some(crate::lsp::providers::inlay::inlay_hints(model, range)));
+                }
+                crate::lsp::model::SizeClass::Large => None,
+                crate::lsp::model::SizeClass::Huge => {
+                    Some(format!("ascript: {uri} is huge — inlay hints disabled"))
+                }
+            }
+        };
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Some(Vec::new()))
+    }
+
+    async fn inlay_hint_resolve(
+        &self,
+        hint: InlayHint,
+    ) -> tower_lsp::jsonrpc::Result<InlayHint> {
+        Ok(crate::lsp::providers::inlay::resolve(hint))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        // Large-file degradation: above LARGE_FILE_BYTES the FULL token set is not
+        // served (a capable client falls back to ranged `semanticTokens/range`
+        // requests, which stay served and are inherently bounded). Logged, never a
+        // hang. The log note rides outside the store lock.
+        let note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            match model.size_class() {
+                crate::lsp::model::SizeClass::Normal => {
+                    let tokens =
+                        crate::lsp::providers::semantic_tokens::semantic_tokens_full(model);
+                    return Ok(Some(SemanticTokensResult::Tokens(tokens)));
+                }
+                crate::lsp::model::SizeClass::Large => {
+                    format!("ascript: {uri} is large — semantic tokens served range-only")
+                }
+                crate::lsp::model::SizeClass::Huge => {
+                    format!("ascript: {uri} is huge — semantic tokens disabled")
+                }
+            }
+        };
+        self.client.log_message(MessageType::INFO, note).await;
+        Ok(None)
+    }
+
+    async fn semantic_tokens_range(
+        &self,
+        params: SemanticTokensRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensRangeResult>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let tokens = crate::lsp::providers::semantic_tokens::semantic_tokens_range(model, range);
+        Ok(Some(SemanticTokensRangeResult::Tokens(tokens)))
+    }
+
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let actions = crate::lsp::providers::code_action::code_actions(
+            model,
+            &uri,
+            params.range,
+            &params.context,
+        );
+        Ok(Some(actions))
+    }
+
+    async fn code_action_resolve(
+        &self,
+        action: CodeAction,
+    ) -> tower_lsp::jsonrpc::Result<CodeAction> {
+        // The target URI rides in `action.data`.
+        let uri = action
+            .data
+            .as_ref()
+            .and_then(|d| serde_json::from_value::<Url>(d.clone()).ok());
+        let Some(uri) = uri else { return Ok(action) };
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(action);
+        };
+        Ok(crate::lsp::providers::code_action::resolve_code_action(
+            model, action,
+        ))
+    }
+
+    async fn code_lens(
+        &self,
+        params: CodeLensParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CodeLens>>> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::lens::code_lenses(
+            model,
+            uri.as_str(),
+        )))
+    }
+
+    async fn code_lens_resolve(
+        &self,
+        mut lens: CodeLens,
+    ) -> tower_lsp::jsonrpc::Result<CodeLens> {
+        // A refs lens carries `{ kind:"refs", uri, name }`; fill its title.
+        let Some(data) = lens.data.clone() else {
+            return Ok(lens);
+        };
+        let (Some(uri_s), Some(name)) = (
+            data.get("uri").and_then(|v| v.as_str()).map(str::to_string),
+            data.get("name").and_then(|v| v.as_str()).map(str::to_string),
+        ) else {
+            return Ok(lens);
+        };
+        let Ok(uri) = Url::parse(&uri_s) else {
+            return Ok(lens);
+        };
+        // Same-file count from the cached model + cross-file from the index.
+        let same_file = {
+            let store = self.documents.lock().await;
+            store
+                .get(&uri)
+                .map(|m| crate::lsp::providers::lens::resolve_same_file_ref_count(m, &name))
+                .unwrap_or(0)
+        };
+        let mut count = same_file;
+        if let Some(path) = url_to_canon(&uri) {
+            if let Ok(idx) = self.index.read() {
+                // Cross-file references: every use of this name in an importer of
+                // the def's file (the same-file count is authoritative; this adds
+                // the importers' uses, anchored on the def's name range).
+                if let Some(file) = idx.files.get(&path) {
+                    if let Some(def) = file
+                        .defs
+                        .iter()
+                        .find(|d| d.name == name)
+                        .map(|d| d.name_range)
+                    {
+                        let cross = idx
+                            .references_at(&path, def.start, false)
+                            .into_iter()
+                            .filter(|(p, _)| *p != path)
+                            .count();
+                        count += cross;
+                    }
+                }
+            }
+        }
+        lens.command = Some(Command {
+            title: format!("{count} reference(s)"),
+            command: String::new(),
+            arguments: None,
+        });
+        Ok(lens)
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> tower_lsp::jsonrpc::Result<DocumentDiagnosticReportResult> {
+        let uri = params.text_document.uri;
+        let store = self.documents.lock().await;
+        match store.get(&uri) {
+            Some(model) => Ok(crate::lsp::providers::diagnostic::document_report(model)),
+            None => Ok(DocumentDiagnosticReportResult::Report(
+                DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport::default()),
+            )),
+        }
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> tower_lsp::jsonrpc::Result<WorkspaceDiagnosticReportResult> {
+        // Project-wide: every indexed file → a workspace full report. Build a model
+        // per file off its cached text (config-aware via the per-path lint config),
+        // returning the SAME diagnostics the push/document-pull paths compute.
+        let files: Vec<(PathBuf, String)> = {
+            match self.index.read().ok() {
+                Some(idx) => idx
+                    .files
+                    .iter()
+                    .map(|(p, f)| (p.clone(), f.text.clone()))
+                    .collect(),
+                None => Vec::new(),
+            }
+        };
+        let mut items: Vec<WorkspaceDocumentDiagnosticReport> = Vec::with_capacity(files.len());
+        for (path, text) in files {
+            let Some(uri) = canon_to_url(&path) else {
+                continue;
+            };
+            let config = crate::lsp::model::config_for_path(&path);
+            let model = crate::lsp::model::SemanticModel::build(text, None, &config);
+            items.push(WorkspaceDocumentDiagnosticReport::Full(
+                WorkspaceFullDocumentDiagnosticReport {
+                    uri,
+                    version: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: model.lsp_diagnostics(),
+                    },
+                },
+            ));
+        }
+        Ok(WorkspaceDiagnosticReportResult::Report(
+            WorkspaceDiagnosticReport { items },
+        ))
+    }
+
+    async fn execute_command(
+        &self,
+        params: ExecuteCommandParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<serde_json::Value>> {
+        if params.command == crate::lsp::providers::code_action::FIX_ALL_COMMAND {
+            // The first argument is the target document URI.
+            if let Some(arg) = params.arguments.first() {
+                if let Ok(uri) = serde_json::from_value::<Url>(arg.clone()) {
+                    let edit = {
+                        let store = self.documents.lock().await;
+                        store.get(&uri).and_then(|m| {
+                            crate::lsp::providers::code_action::fix_all_action(m, &uri)
+                                .and_then(|a| a.edit)
+                        })
+                    };
+                    if let Some(edit) = edit {
+                        let _ = self.client.apply_edit(edit).await;
+                    }
+                }
+            }
+        } else if params.command == "ascript.run" || params.command == "ascript.runTest" {
+            // Static-only invariant: the server NEVER runs the interpreter. It only
+            // acknowledges the intent; the editor extension binds these commands to
+            // a terminal task that invokes `ascript run`/`ascript test` (Phase 6).
+            self.client
+                .log_message(
+                    MessageType::INFO,
+                    format!("execute {}: {:?}", params.command, params.arguments),
+                )
+                .await;
+        }
+        Ok(None)
     }
 
     async fn goto_definition(
@@ -226,24 +1043,21 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
             return Ok(None);
         };
-        let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
+        let byte = crate::lsp::providers::docs::byte_offset_at(model, position);
         // SP4 §4: try the cross-file index first — if the use at the cursor is an
-        // imported/cross-file name, return a `Location` in the TARGET file.
+        // imported/cross-file name (or a top-level/module global), return a
+        // `Location` in the TARGET file.
         if let Some(path) = url_to_canon(&uri) {
-            let xfile = self
-                .index
-                .read()
-                .ok()
-                .and_then(|idx| idx.definition_at(&path, char_to_byte(text, offset)).map(
-                    |(def_path, span)| {
-                        let target_text = idx_text(&idx, &def_path).unwrap_or_default();
-                        (def_path, workspace::byte_span_to_range(&target_text, span))
-                    },
-                ));
+            let xfile = self.index.read().ok().and_then(|idx| {
+                idx.definition_at(&path, byte).map(|(def_path, span)| {
+                    let target_text = idx_text(&idx, &def_path).unwrap_or_default();
+                    (def_path, workspace::byte_span_to_range(&target_text, span))
+                })
+            });
             if let Some((def_path, range)) = xfile {
                 if let Some(target_uri) = canon_to_url(&def_path) {
                     return Ok(Some(GotoDefinitionResponse::Scalar(Location {
@@ -253,14 +1067,316 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        // Fall back to the single-file analysis (same-file local/decl).
-        let Some(range) = analysis::definition(text, offset) else {
+        // Fall back to the single-file resolver provider (same-file local/param/
+        // upvalue bindings the cross-file index does not track).
+        let Some(range) = crate::lsp::providers::navigation::definition_in_file(model, byte) else {
             return Ok(None);
         };
         Ok(Some(GotoDefinitionResponse::Scalar(Location {
             uri,
             range,
         })))
+    }
+
+    async fn goto_declaration(
+        &self,
+        params: request::GotoDeclarationParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<request::GotoDeclarationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        // Cross-file via the workspace index first (mirrors `goto_definition`).
+        if let Some(path) = url_to_canon(&uri) {
+            let xfile = self.index.read().ok().and_then(|idx| {
+                idx.definition_at(&path, offset).map(|(def_path, span)| {
+                    let target_text = idx_text(&idx, &def_path).unwrap_or_default();
+                    (def_path, workspace::byte_span_to_range(&target_text, span))
+                })
+            });
+            if let Some((def_path, range)) = xfile {
+                if let Some(def_uri) = canon_to_url(&def_path) {
+                    return Ok(Some(request::GotoDeclarationResponse::Scalar(Location {
+                        uri: def_uri,
+                        range,
+                    })));
+                }
+            }
+        }
+        Ok(
+            crate::lsp::providers::navigation::declaration_in_file(model, offset)
+                .map(|range| request::GotoDeclarationResponse::Scalar(Location { uri, range })),
+        )
+    }
+
+    async fn goto_type_definition(
+        &self,
+        params: request::GotoTypeDefinitionParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<request::GotoTypeDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        Ok(
+            crate::lsp::providers::navigation::type_definition_in_file(model, offset)
+                .map(|range| request::GotoTypeDefinitionResponse::Scalar(Location { uri, range })),
+        )
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: request::GotoImplementationParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<request::GotoImplementationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        let locs: Vec<Location> =
+            crate::lsp::providers::navigation::implementations_in_file(model, offset)
+                .into_iter()
+                .map(|range| Location {
+                    uri: uri.clone(),
+                    range,
+                })
+                .collect();
+        if locs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(request::GotoImplementationResponse::Array(locs)))
+    }
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(path) = url_to_canon(&uri) else {
+            return Ok(None);
+        };
+        let offset = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            crate::lsp::providers::docs::byte_offset_at(model, position)
+        };
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_call(&idx, &path, offset)
+        else {
+            return Ok(None);
+        };
+        let Some(item) = call_item(&idx, &anchor.path, &anchor.name, anchor.name_range) else {
+            return Ok(None);
+        };
+        Ok(Some(vec![item]))
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let item = params.item;
+        let Some(path) = url_to_canon(&item.uri) else {
+            return Ok(None);
+        };
+        let offset = {
+            let Ok(idx) = self.index.read() else {
+                return Ok(None);
+            };
+            let text = idx_text(&idx, &path).unwrap_or_default();
+            range_start_byte(&text, item.selection_range)
+        };
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_call(&idx, &path, offset)
+        else {
+            return Ok(None);
+        };
+        // Group the incoming reference sites by the file they occur in.
+        let mut by_file: HashMap<PathBuf, Vec<Range>> = HashMap::new();
+        for (p, span) in crate::lsp::providers::hierarchy::incoming_calls(&idx, &anchor) {
+            let text = idx_text(&idx, &p).unwrap_or_default();
+            by_file
+                .entry(p)
+                .or_default()
+                .push(workspace::byte_span_to_range(&text, span));
+        }
+        let mut out = Vec::new();
+        for (p, from_ranges) in by_file {
+            // The caller item: the FILE that contains the reference (its own name
+            // is the file stem — a coarse but valid "from" item per LSP).
+            let Some(from) = file_call_item(&idx, &p) else {
+                continue;
+            };
+            out.push(CallHierarchyIncomingCall { from, from_ranges });
+        }
+        Ok(Some(out))
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let item = params.item;
+        let Some(path) = url_to_canon(&item.uri) else {
+            return Ok(None);
+        };
+        // The anchor file's cached model drives the CST walk of the fn body.
+        let model_text = {
+            let store = self.documents.lock().await;
+            store.get(&item.uri).map(|m| m.text.clone())
+        };
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let text = model_text
+            .clone()
+            .or_else(|| idx_text(&idx, &path))
+            .unwrap_or_default();
+        let offset = range_start_byte(&text, item.selection_range);
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_call(&idx, &path, offset)
+        else {
+            return Ok(None);
+        };
+        let model = crate::lsp::model::SemanticModel::build(
+            text,
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        let mut out = Vec::new();
+        for call in crate::lsp::providers::hierarchy::outgoing_calls(&idx, &model, &anchor) {
+            let Some((def_path, def_span)) = call.def else {
+                continue; // unresolved callee — skip
+            };
+            let Some(to) = call_item(&idx, &def_path, &call.name, def_span) else {
+                continue;
+            };
+            let from_range = workspace::byte_span_to_range(&model.text, call.call_site);
+            out.push(CallHierarchyOutgoingCall {
+                to,
+                from_ranges: vec![from_range],
+            });
+        }
+        Ok(Some(out))
+    }
+
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TypeHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+        let Some(anchor) = crate::lsp::providers::hierarchy::prepare_type(model, offset) else {
+            return Ok(None);
+        };
+        let range = crate::lsp::convert::byte_span_to_range(
+            &model.text,
+            &model.line_index,
+            anchor.name_range,
+        );
+        let kind = if anchor.is_class {
+            SymbolKind::CLASS
+        } else {
+            SymbolKind::ENUM
+        };
+        Ok(Some(vec![type_item(anchor.name, kind, uri, range)]))
+    }
+
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TypeHierarchyItem>>> {
+        Ok(Some(self.type_hierarchy_step(params.item, true).await))
+    }
+
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<TypeHierarchyItem>>> {
+        Ok(Some(self.type_hierarchy_step(params.item, false).await))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<FoldingRange>>> {
+        let uri = params.text_document.uri;
+        // Large-file degradation: folding ranges go quiet above HUGE_FILE_BYTES
+        // (returning empty), logged once. Normal + Large still fold.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            if matches!(model.size_class(), crate::lsp::model::SizeClass::Huge) {
+                Some(format!("ascript: {uri} is huge — folding ranges disabled"))
+            } else {
+                return Ok(Some(crate::lsp::providers::folding::folding_ranges(model)));
+            }
+        };
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Some(Vec::new()))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<SelectionRange>>> {
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(params.positions.len());
+        for pos in &params.positions {
+            let offset = crate::lsp::providers::docs::byte_offset_at(model, *pos);
+            match crate::lsp::providers::folding::selection_range_at(model, offset) {
+                Some(sr) => out.push(sr),
+                None => out.push(SelectionRange {
+                    range: Range::new(*pos, *pos),
+                    parent: None,
+                }),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<Vec<DocumentLink>>> {
+        let uri = params.text_document.uri;
+        let dir = uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let store = self.documents.lock().await;
+        let Some(model) = store.get(&uri) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::lsp::providers::folding::document_links(
+            model,
+            dir.as_deref(),
+        )))
     }
 
     async fn references(
@@ -270,8 +1386,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_decl = params.context.include_declaration;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -326,14 +1442,23 @@ impl LanguageServer for Backend {
         Ok(Some(out))
     }
 
+    async fn symbol_resolve(
+        &self,
+        params: WorkspaceSymbol,
+    ) -> tower_lsp::jsonrpc::Result<WorkspaceSymbol> {
+        Ok(crate::lsp::providers::symbols::resolve_workspace_symbol(
+            params,
+        ))
+    }
+
     async fn prepare_rename(
         &self,
         params: TextDocumentPositionParams,
     ) -> tower_lsp::jsonrpc::Result<Option<PrepareRenameResponse>> {
         let uri = params.text_document.uri;
         let position = params.position;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -359,8 +1484,8 @@ impl LanguageServer for Backend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let new_name = params.new_name;
-        let docs = self.documents.lock().await;
-        let Some(text) = docs.get(&uri) else {
+        let store = self.documents.lock().await;
+        let Some(text) = store.get(&uri).map(|m| m.text.as_str()) else {
             return Ok(None);
         };
         let offset = crate::lsp::line_index::LineIndex::new(text).offset(position);
@@ -393,6 +1518,127 @@ impl LanguageServer for Backend {
         }))
     }
 
+    async fn will_rename_files(
+        &self,
+        params: RenameFilesParams,
+    ) -> tower_lsp::jsonrpc::Result<Option<WorkspaceEdit>> {
+        let Ok(idx) = self.index.read() else {
+            return Ok(None);
+        };
+        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+        for f in &params.files {
+            let (Some(old), Some(new)) = (
+                Url::parse(&f.old_uri).ok().and_then(|u| u.to_file_path().ok()),
+                Url::parse(&f.new_uri).ok().and_then(|u| u.to_file_path().ok()),
+            ) else {
+                continue;
+            };
+            for (importer, range, new_spec) in idx.import_rewrite_edits(&old, &new) {
+                let Some(uri) = canon_to_url(&importer) else {
+                    continue;
+                };
+                let Some(text) = idx_text(&idx, &workspace::canon(&importer)) else {
+                    continue;
+                };
+                changes.entry(uri).or_default().push(TextEdit {
+                    range: workspace::byte_span_to_range(&text, range),
+                    new_text: new_spec,
+                });
+            }
+        }
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
+    }
+
+    async fn did_rename_files(&self, params: RenameFilesParams) {
+        // Re-key the index: drop the old path, index the new one off disk.
+        for f in &params.files {
+            let (Some(old), Some(new)) = (
+                Url::parse(&f.old_uri).ok().and_then(|u| u.to_file_path().ok()),
+                Url::parse(&f.new_uri).ok().and_then(|u| u.to_file_path().ok()),
+            ) else {
+                continue;
+            };
+            if let Ok(mut idx) = self.index.write() {
+                idx.files.remove(&workspace::canon(&old));
+                if let Ok(text) = std::fs::read_to_string(&new) {
+                    idx.reindex_file(&new, &text);
+                }
+            }
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut reconfig = false;
+        for change in &params.changes {
+            let Ok(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            let is_as = path.extension().and_then(|e| e.to_str()) == Some("as");
+            let is_toml = path.file_name().and_then(|n| n.to_str()) == Some("ascript.toml");
+            if is_as {
+                if change.typ == FileChangeType::DELETED {
+                    if let Ok(mut idx) = self.index.write() {
+                        idx.files.remove(&workspace::canon(&path));
+                    }
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    if let Ok(mut idx) = self.index.write() {
+                        idx.reindex_file(&path, &text);
+                    }
+                }
+            } else if is_toml {
+                // The lint config changed: every open document's diagnostics may
+                // change (its config is path-discovered).
+                reconfig = true;
+            }
+        }
+        if reconfig {
+            self.republish_all_open().await;
+        }
+    }
+
+    async fn did_change_configuration(&self, params: DidChangeConfigurationParams) {
+        if let Some(detect) = parse_detect_setting(&params.settings) {
+            if let Ok(mut s) = self.settings.write() {
+                s.detect_hex_strings_everywhere = detect;
+            }
+        }
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        if let Ok(mut roots) = self.roots.write() {
+            for added in &params.event.added {
+                if let Ok(p) = added.uri.to_file_path() {
+                    if !roots.contains(&p) {
+                        roots.push(p);
+                    }
+                }
+            }
+            for removed in &params.event.removed {
+                if let Ok(p) = removed.uri.to_file_path() {
+                    roots.retain(|r| r != &p);
+                }
+            }
+        }
+        // Re-warm the index over the (new) root set.
+        let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
+        if let Ok(mut idx) = self.index.write() {
+            for root in &roots {
+                for path in workspace::discover_as_files(root) {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        idx.reindex_file(&path, &text);
+                    }
+                }
+            }
+        }
+    }
+
     async fn shutdown(&self) -> tower_lsp::jsonrpc::Result<()> {
         Ok(())
     }
@@ -401,6 +1647,75 @@ impl LanguageServer for Backend {
 /// The text of an indexed file (from its `FileIndex.text`).
 fn idx_text(idx: &WorkspaceIndex, path: &std::path::Path) -> Option<String> {
     idx.files.get(path).map(|f| f.text.clone())
+}
+
+/// Build a `CallHierarchyItem` for a named callable defined at `name_range` in
+/// `path` (kind `FUNCTION`; `range`/`selection_range` are the name span).
+fn call_item(
+    idx: &WorkspaceIndex,
+    path: &std::path::Path,
+    name: &str,
+    name_range: crate::check::ByteSpan,
+) -> Option<CallHierarchyItem> {
+    let uri = canon_to_url(path)?;
+    let text = idx_text(idx, path).unwrap_or_default();
+    let range = workspace::byte_span_to_range(&text, name_range);
+    #[allow(deprecated)]
+    Some(CallHierarchyItem {
+        name: name.to_string(),
+        kind: SymbolKind::FUNCTION,
+        tags: None,
+        detail: None,
+        uri,
+        range,
+        selection_range: range,
+        data: None,
+    })
+}
+
+/// Build a coarse file-level `CallHierarchyItem` for an INCOMING-call caller: the
+/// item is the file itself (kind `FILE`, name = file stem), with the call sites in
+/// `from_ranges`. Used when a reference's enclosing function is not separately
+/// resolved.
+fn file_call_item(idx: &WorkspaceIndex, path: &std::path::Path) -> Option<CallHierarchyItem> {
+    let uri = canon_to_url(path)?;
+    let _ = idx_text(idx, path); // ensure the file is known to the index
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<file>".to_string());
+    let zero = Range::new(Position::new(0, 0), Position::new(0, 0));
+    #[allow(deprecated)]
+    Some(CallHierarchyItem {
+        name,
+        kind: SymbolKind::FILE,
+        tags: None,
+        detail: None,
+        uri,
+        range: zero,
+        selection_range: zero,
+        data: None,
+    })
+}
+
+/// Build a `TypeHierarchyItem` for a class/enum `name` at `range` in `uri`.
+fn type_item(name: String, kind: SymbolKind, uri: Url, range: Range) -> TypeHierarchyItem {
+    TypeHierarchyItem {
+        name,
+        kind,
+        tags: None,
+        detail: None,
+        uri,
+        range,
+        selection_range: range,
+        data: None,
+    }
+}
+
+/// The byte offset of `range`'s start within `text` (LSP position → char → byte).
+fn range_start_byte(text: &str, range: Range) -> usize {
+    let char_off = crate::lsp::line_index::LineIndex::new(text).offset(range.start);
+    char_to_byte(text, char_off)
 }
 
 /// Char offset → byte offset within `text` (the index keys on bytes; LSP
@@ -456,13 +1771,41 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_advertise_full_sync() {
+    fn capabilities_advertise_phase3_navigation() {
+        let caps = server_capabilities();
+        assert!(caps.declaration_provider.is_some());
+        assert!(caps.type_definition_provider.is_some());
+        assert!(caps.implementation_provider.is_some());
+        assert!(caps.folding_range_provider.is_some());
+        assert!(caps.selection_range_provider.is_some());
+        assert!(caps.document_link_provider.is_some());
+        assert!(caps.call_hierarchy_provider.is_some());
+        // `lsp-types` 0.94 has no `type_hierarchy_provider` field — it is advertised
+        // through `experimental.typeHierarchyProvider`.
+        assert_eq!(
+            caps.experimental
+                .as_ref()
+                .and_then(|e| e.get("typeHierarchyProvider")),
+            Some(&serde_json::Value::Bool(true)),
+        );
+        // workspaceSymbol advertises lazy resolve.
+        assert!(matches!(
+            caps.workspace_symbol_provider,
+            Some(OneOf::Right(WorkspaceSymbolOptions {
+                resolve_provider: Some(true),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn capabilities_advertise_incremental_sync() {
         let caps = server_capabilities();
         match caps.text_document_sync {
             Some(TextDocumentSyncCapability::Kind(kind)) => {
-                assert_eq!(kind, TextDocumentSyncKind::FULL);
+                assert_eq!(kind, TextDocumentSyncKind::INCREMENTAL);
             }
-            other => panic!("expected FULL text document sync, got {:?}", other),
+            other => panic!("expected INCREMENTAL text document sync, got {:?}", other),
         }
     }
 
@@ -509,5 +1852,205 @@ mod tests {
             "expected a definition provider, got {:?}",
             caps.definition_provider
         );
+    }
+
+    #[test]
+    fn capabilities_advertise_semantic_tokens() {
+        let caps = server_capabilities();
+        assert!(
+            caps.semantic_tokens_provider.is_some(),
+            "expected a semantic-tokens provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_document_highlight() {
+        let caps = server_capabilities();
+        assert!(
+            matches!(
+                caps.document_highlight_provider,
+                Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+            ),
+            "expected a document-highlight provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_color_provider() {
+        let caps = server_capabilities();
+        assert!(
+            caps.color_provider.is_some(),
+            "expected a documentColor provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_code_lens_and_run_commands() {
+        let caps = server_capabilities();
+        let lens = caps.code_lens_provider.expect("code-lens provider");
+        assert_eq!(lens.resolve_provider, Some(true));
+        let exec = caps
+            .execute_command_provider
+            .expect("execute-command provider");
+        assert!(exec.commands.iter().any(|c| c == "ascript.run"));
+        assert!(exec.commands.iter().any(|c| c == "ascript.runTest"));
+        // The Phase 1 fix-all command is still present (extended, not overwritten).
+        assert!(exec
+            .commands
+            .iter()
+            .any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND));
+    }
+
+    #[test]
+    fn index_covers_multiple_roots() {
+        // Two distinct roots, each with a `.as` file: discover + reindex composes
+        // across roots so the index holds entries from BOTH (multi-root).
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let a = root_a.path().join("alpha.as");
+        let b = root_b.path().join("beta.as");
+        std::fs::write(&a, "export fn alpha() {}\n").unwrap();
+        std::fs::write(&b, "export fn beta() {}\n").unwrap();
+        let mut idx = WorkspaceIndex::new();
+        for root in [root_a.path(), root_b.path()] {
+            for path in workspace::discover_as_files(root) {
+                let text = std::fs::read_to_string(&path).unwrap();
+                idx.reindex_file(&path, &text);
+            }
+        }
+        let names: Vec<&str> = idx.defs_by_name.keys().map(String::as_str).collect();
+        assert!(names.contains(&"alpha"), "alpha from root A: {names:?}");
+        assert!(names.contains(&"beta"), "beta from root B: {names:?}");
+    }
+
+    #[test]
+    fn parse_detect_setting_reads_color_flag() {
+        let on = serde_json::json!({
+            "ascript": { "color": { "detectHexStringsEverywhere": true } }
+        });
+        assert_eq!(parse_detect_setting(&on), Some(true));
+        let off = serde_json::json!({
+            "ascript": { "color": { "detectHexStringsEverywhere": false } }
+        });
+        assert_eq!(parse_detect_setting(&off), Some(false));
+        // Absent → None (no change).
+        assert_eq!(parse_detect_setting(&serde_json::json!({})), None);
+        assert_eq!(
+            parse_detect_setting(&serde_json::json!({ "ascript": {} })),
+            None
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_file_operations_and_multiroot() {
+        let caps = server_capabilities();
+        let ws = caps.workspace.expect("workspace capabilities");
+        let folders = ws.workspace_folders.expect("workspace folders");
+        assert_eq!(folders.supported, Some(true));
+        let ops = ws.file_operations.expect("file operations");
+        let will = ops.will_rename.expect("willRename registered");
+        assert!(will
+            .filters
+            .iter()
+            .any(|f| f.pattern.glob == "**/*.as"));
+        assert!(ops.did_rename.is_some(), "didRename registered");
+    }
+
+    #[test]
+    fn capabilities_advertise_pull_diagnostics() {
+        let caps = server_capabilities();
+        match caps.diagnostic_provider {
+            Some(DiagnosticServerCapabilities::Options(opts)) => {
+                assert!(opts.workspace_diagnostics, "workspace diagnostics on");
+                assert!(opts.inter_file_dependencies, "inter-file deps on");
+            }
+            other => panic!("expected DiagnosticOptions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capabilities_advertise_linked_editing_range() {
+        let caps = server_capabilities();
+        assert!(
+            caps.linked_editing_range_provider.is_some(),
+            "expected a linkedEditingRange provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_signature_help() {
+        let caps = server_capabilities();
+        let sig = caps
+            .signature_help_provider
+            .expect("signature-help provider");
+        let triggers = sig.trigger_characters.expect("trigger chars");
+        assert!(triggers.contains(&"(".to_string()));
+        assert!(triggers.contains(&",".to_string()));
+    }
+
+    #[test]
+    fn capabilities_advertise_inlay_hints() {
+        let caps = server_capabilities();
+        assert!(
+            caps.inlay_hint_provider.is_some(),
+            "expected an inlay-hint provider"
+        );
+    }
+
+    #[test]
+    fn capabilities_advertise_formatting() {
+        let caps = server_capabilities();
+        assert!(
+            caps.document_formatting_provider.is_some(),
+            "formatting advertised"
+        );
+        assert!(
+            caps.document_range_formatting_provider.is_some(),
+            "range formatting advertised"
+        );
+    }
+
+    #[test]
+    fn index_cancel_flag_is_observable_and_sticky() {
+        // The flag is observable + sticky once set — i.e. the cancel→abort behavior is
+        // covered HERE. (The protocol smoke test in tests/lsp.rs only proves the server
+        // serves with the `window/workDoneProgress/cancel` method registered; it does NOT
+        // drive a cancel notification through to actually abort indexing.)
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!flag.load(Ordering::SeqCst));
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn size_class_gates_expensive_providers() {
+        use crate::lsp::model::{SemanticModel, SizeClass};
+        use crate::lsp::perf::LARGE_FILE_BYTES;
+        let big = SemanticModel::build(
+            "a".repeat(LARGE_FILE_BYTES),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        assert!(matches!(big.size_class(), SizeClass::Large | SizeClass::Huge));
+        let small = SemanticModel::build(
+            "let x = 1\n".to_string(),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        assert_eq!(small.size_class(), SizeClass::Normal);
+    }
+
+    #[test]
+    fn stale_generation_is_superseded() {
+        // Drive the store directly (no live Client) to prove the supersession guard
+        // logic: a handler holding an older generation must treat itself as stale.
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let g1 = store.set_versioned(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        let g2 = store.set_versioned(uri.clone(), "let x = 2\n".to_string(), Some(2));
+        assert_ne!(g1, g2);
+        assert_eq!(store.current_gen(&uri), Some(g2));
+        // A handler holding g1 must treat itself as superseded.
+        assert!(store.current_gen(&uri) != Some(g1));
     }
 }

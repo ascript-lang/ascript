@@ -1,0 +1,15 @@
+name = "AScript"
+grammar = "ascript"
+path_suffixes = ["as"]
+line_comments = ["// "]
+block_comment = ["/* ", " */"]
+autoclose_before = ";:.,=}])>"
+tab_size = 2
+hard_tabs = false
+
+[brackets]
+"{" = "}"
+"[" = "]"
+"(" = ")"
+"\"" = "\""
+"`" = "`"

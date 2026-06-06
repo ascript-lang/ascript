@@ -154,7 +154,14 @@ autofixes — currently **unused-import** removal — and re-evaluates the exit 
 against the post-fix analysis. The `call-arity` lint reaches across modules and to
 **constructor**, **method**, and **imported `std/*`** calls (zero false positives); the
 language server's cross-file index extends this and powers go-to-definition,
-find-references, workspace symbols, and **rename across files**.
+find-references, workspace symbols, and **rename across files**, alongside the full
+modern LSP surface (hover types, signature help, semantic tokens, inlay hints, code
+lenses, call/type hierarchy, and more). It stays responsive under rapid editing and
+degrades gracefully on very large files.
+
+See [editor setup](docs/content/tooling/editor-setup.md) for VS Code, Zed, and Neovim,
+and the [LSP capability reference](docs/content/tooling/lsp-capabilities.md) for every
+method the server answers.
 
 ### Hello, world
 

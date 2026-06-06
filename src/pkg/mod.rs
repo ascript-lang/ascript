@@ -1,8 +1,9 @@
 //! SP6 — package manager / dependency story (CLI-only, `#[cfg(feature = "pkg")]`).
 //!
 //! This module set lives entirely in the `ascript` binary behind the default-on
-//! `pkg` Cargo feature, mirroring how `src/lint_config_toml.rs` keeps TOML/IO out
-//! of the interpreter core. Nothing here is reachable from `src/interp.rs` /
+//! `pkg` Cargo feature, keeping TOML/IO out of the interpreter core (the lint
+//! config TOML lives in `ascript::check::config_toml`). Nothing here is
+//! reachable from `src/interp.rs` /
 //! `src/vm/*` / `src/value.rs`: the ONLY core change SP6 makes is the
 //! dependency-free package-resolver map (`Interp::set_package_resolver`) plus the
 //! shared `classify_specifier` helper, both of which use plain `std` types so the

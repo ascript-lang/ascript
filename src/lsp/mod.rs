@@ -7,12 +7,19 @@
 //! `vim.lsp.start` / a VS Code custom-language-client `serverOptions` need only the
 //! command `["ascript", "lsp"]` with the `.as` filetype — no extra args.
 //!
-//! The server does STATIC analysis only (lex/parse) — it never runs the
+//! The server does STATIC analysis only — it runs the CST front-end
+//! (`syntax::parse`/`tree_builder`/`resolve`) plus the checker, NEVER the
 //! interpreter — so the whole layer stays `Send + Sync` and free of the runtime's
-//! `Rc`/`RefCell` types. See `analysis` (pure) and `server` (the thin adapter).
+//! `Rc`/`RefCell` types and the legacy `ast`/`lexer`/`parser` front-end. Each
+//! capability is a pure provider over a cached `SemanticModel` (see `model` and
+//! `providers`); `server` is the thin async adapter and `convert` owns all
+//! byte↔`Position`/`Range` coordinate conversion.
 
-pub mod analysis;
+pub mod convert;
 pub mod line_index;
+pub mod model;
+pub mod perf;
+pub mod providers;
 pub mod server;
 pub mod workspace;
 
@@ -23,6 +30,15 @@ use tower_lsp::{LspService, Server};
 pub async fn run_server() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(Backend::new);
+    // `window/workDoneProgress/cancel` is registered as a custom method: tower-lsp
+    // 0.20 does not yet expose it as a `LanguageServer` trait method (a documented
+    // crate TODO), so we route it to `Backend::on_work_done_progress_cancel`, which
+    // flips the cancel flag the initial-indexing loop honors between files.
+    let (service, socket) = LspService::build(Backend::new)
+        .custom_method(
+            "window/workDoneProgress/cancel",
+            Backend::on_work_done_progress_cancel,
+        )
+        .finish();
     Server::new(stdin, stdout, socket).serve(service).await;
 }
