@@ -1,6 +1,6 @@
 [package]
 name = "ascript"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 description = "A gradually-typed, multi-paradigm, JavaScript-flavored scripting language with runtime-checked type contracts, structured concurrency, and a batteries-included standard library."
 repository = "https://github.com/ascript-lang/ascript"
