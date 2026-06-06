@@ -43,7 +43,15 @@ Command: **AScript: Restart Language Server**. Format-on-save uses
 
 Install the **AScript** extension from `editors/zed/`. It registers the tree-sitter
 grammar (highlights / injections / locals / folds / indents / textobjects / brackets)
-and launches the `ascript lsp` server. Override the binary in your Zed settings:
+and launches the `ascript lsp` server.
+
+**Preferred setup — let Zed find `ascript` itself.** Zed loads your login-shell environment,
+so if `ascript` is on your shell `PATH` (e.g. add `~/.local/bin` in your `~/.zshrc`/`~/.bashrc`)
+the extension launches it with the correct `lsp` argument automatically — no settings needed.
+
+**If you must point Zed at an absolute binary** (e.g. it still can't find it), set BOTH `path`
+**and** `arguments` — overriding `binary.path` makes Zed launch the binary directly and `arguments`
+defaults to empty, so you must pass `["lsp"]` yourself:
 
 ```jsonc
 {
@@ -52,6 +60,11 @@ and launches the `ascript lsp` server. Override the binary in your Zed settings:
   }
 }
 ```
+
+> [!WARN] Setting `binary.path` **without** `arguments: ["lsp"]` launches bare `ascript`,
+> which prints CLI help instead of speaking LSP — Zed then reports *"Server reset the
+> connection"* and you get syntax highlighting but no diagnostics/hover/navigation. The
+> `arguments: ["lsp"]` field is required with `binary.path`.
 
 > [!NOTE] Zed loads the tree-sitter grammar from the published
 > [`ascript-lang/tree-sitter-ascript`](https://github.com/ascript-lang/tree-sitter-ascript)
@@ -118,8 +131,11 @@ even though it works in your terminal.
   `~/.cargo/bin`, `~/bin`, `/usr/local/bin`, `/opt/homebrew/bin`) automatically, so a
   standard install usually just works. To be explicit, set `ascript.server.path` (VS Code).
 - **Zed** runs its extension in a WASM sandbox and can only resolve the binary via the
-  worktree `PATH` or an explicit setting — so if Zed didn't pick it up, set
-  `lsp.ascript.binary.path` to the **absolute** path (see the Zed section above).
+  worktree `PATH` or an explicit setting. Zed loads your login-shell env, so adding `~/.local/bin`
+  to your shell `PATH` is usually enough. If you must set `lsp.ascript.binary.path`, you **must
+  also** set `arguments: ["lsp"]` (overriding `binary.path` drops the extension's `lsp` argument —
+  see the Zed section above); otherwise Zed runs bare `ascript` and reports "Server reset the
+  connection".
 - Alternatively, install `ascript` to a dir already on the GUI `PATH` (e.g. `/usr/local/bin`
   or `/opt/homebrew/bin`), or launch the editor from a terminal so it inherits your shell `PATH`.
 
