@@ -22,6 +22,22 @@ and formatting.
 }
 ```
 
+## Tree-sitter highlighting
+
+`require("ascript").setup({})` registers the `ascript` parser and starts highlighting for
+`*.as` buffers automatically (via `vim.treesitter.start`). The bundled queries under
+`queries/ascript/` are picked up from the runtimepath.
+
+Both nvim-treesitter branches are supported — the plugin detects which is installed:
+
+- **master** (legacy): the parser registers into `get_parser_configs()`; install it with
+  `:TSInstall ascript`.
+- **main** (the rewrite): the parser registers on the `User TSUpdate` event with the required
+  `tier`; install it with `:TSInstall ascript` or `:lua require("nvim-treesitter").install({"ascript"})`.
+
+The parser is pinned to a published grammar commit (see `lua/ascript/treesitter.lua`); bump that
+revision when the grammar changes. Highlighting activates once the parser is installed.
+
 ## Without the plugin — a one-file snippet
 
 If you do not want a plugin, register the server directly:

@@ -63,6 +63,11 @@ jobs:
             -c 'edit /tmp/probe.as' \
             -c 'lua assert(vim.bo.filetype == "ascript", vim.bo.filetype)' \
             -c 'qa'
+      - name: tree-sitter registration test (master + main branch APIs)
+        run: |
+          nvim --headless -u editors/nvim/tests/minimal_init.lua \
+            -c 'luafile editors/nvim/tests/treesitter_spec.lua' \
+            -c 'qa'
       - name: package plugin tarball
         run: |
           tar -czf ascript-nvim.tar.gz -C editors nvim

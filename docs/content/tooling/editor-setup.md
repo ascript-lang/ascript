@@ -86,7 +86,10 @@ The `editors/nvim/` directory ships this as a small `ascript` Lua module so you 
 `require("ascript").setup()` instead of inlining the config.
 
 Tree-sitter highlighting via [`nvim-treesitter`](https://github.com/nvim-treesitter/nvim-treesitter)
-registers the `ascript` parser plus the shared queries under `queries/ascript/`.
+registers the `ascript` parser plus the shared queries under `queries/ascript/`, and starts
+highlighting automatically for `*.as` buffers. **Both** nvim-treesitter branches are supported — the
+plugin detects whether you run the legacy **master** API or the **main** rewrite and registers
+accordingly. Install the parser with `:TSInstall ascript`.
 
 > [!NOTE] The tree-sitter parser is pulled from the published
 > [`ascript-lang/tree-sitter-ascript`](https://github.com/ascript-lang/tree-sitter-ascript)
