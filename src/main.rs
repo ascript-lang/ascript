@@ -158,10 +158,8 @@ fn tally(
     for d in &analysis.diagnostics {
         match d.severity {
             ascript::check::Severity::Error => *any_error = true,
-            ascript::check::Severity::Warning => {
-                if config.deny_warnings {
-                    *deny_warnings_tripped = true;
-                }
+            ascript::check::Severity::Warning if config.deny_warnings => {
+                *deny_warnings_tripped = true;
             }
             _ => {}
         }
