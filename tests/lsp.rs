@@ -353,6 +353,47 @@ fn lsp_protocol_end_to_end() {
         "missing workspaceSymbol resolveProvider: {resp}"
     );
 
+    // Phase 7: the FULL advertised capability set. This list is the source-of-truth
+    // mirror of `server_capabilities()` in `src/lsp/server.rs` — every standard
+    // provider field it sets to `Some(..)` must appear here (type hierarchy is the one
+    // exception: it rides the `experimental` escape hatch, asserted above). If you add
+    // or remove a capability there, update this list (and the LSP capability docs).
+    for cap in [
+        "textDocumentSync",
+        "completionProvider",
+        "hoverProvider",
+        "definitionProvider",
+        "declarationProvider",
+        "typeDefinitionProvider",
+        "implementationProvider",
+        "documentSymbolProvider",
+        "referencesProvider",
+        "renameProvider",
+        "workspaceSymbolProvider",
+        "documentHighlightProvider",
+        "foldingRangeProvider",
+        "selectionRangeProvider",
+        "documentLinkProvider",
+        "signatureHelpProvider",
+        "semanticTokensProvider",
+        "inlayHintProvider",
+        "codeActionProvider",
+        "codeLensProvider",
+        "executeCommandProvider",
+        "documentFormattingProvider",
+        "documentRangeFormattingProvider",
+        "colorProvider",
+        "linkedEditingRangeProvider",
+        "diagnosticProvider",
+        "callHierarchyProvider",
+        "workspace",
+    ] {
+        assert!(
+            !caps[cap].is_null(),
+            "missing advertised capability `{cap}`: {resp}"
+        );
+    }
+
     // 2. initialized notification.
     client.notify("initialized", json!({}));
 
@@ -803,5 +844,303 @@ fn lsp_cross_file_goto_definition_and_rename() {
     let _ = client.read_response(99, overall);
     client.notify_no_params("exit");
     let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Phase 7: exercise one representative request per provider family that the main
+/// smoke test does not already hit end-to-end (documentLink, formatting, range
+/// formatting, codeAction, codeLens, documentColor, linkedEditingRange, declaration,
+/// typeDefinition, implementation, and pull diagnostics). Each must return a
+/// well-formed response (a `result` member — `null`/empty is acceptable) and none may
+/// deadlock within the overall deadline.
+#[test]
+fn lsp_full_capability_surface() {
+    let overall = Instant::now() + Duration::from_secs(30);
+    let mut client = LspClient::spawn();
+
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    // A content-rich document: an import (documentLink), a class (typeDefinition /
+    // implementation), a color literal (documentColor), and a local identifier with
+    // multiple occurrences (linkedEditingRange).
+    let uri = "ascript-test://surface.as";
+    let text = "import { rgb } from \"std/color\"\n\
+class Animal {\n  name: string\n}\n\
+class Dog {\n  name: string\n}\n\
+fn paint() {\n  let c = rgb(10, 20, 30)\n  return c\n}\n\
+let count = 1\ncount = count + 1\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text } }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Each tuple: (id, method, params). Every response must carry a `result` member.
+    let line_count = text.lines().count() as i64;
+    let whole_range = json!({
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": line_count, "character": 0 }
+    });
+    let requests: Vec<(i64, &str, Value)> = vec![
+        (
+            10,
+            "textDocument/documentLink",
+            json!({ "textDocument": { "uri": uri } }),
+        ),
+        (
+            11,
+            "textDocument/formatting",
+            json!({ "textDocument": { "uri": uri }, "options": { "tabSize": 2, "insertSpaces": true } }),
+        ),
+        (
+            12,
+            "textDocument/rangeFormatting",
+            json!({ "textDocument": { "uri": uri }, "range": whole_range,
+                    "options": { "tabSize": 2, "insertSpaces": true } }),
+        ),
+        (
+            13,
+            "textDocument/codeAction",
+            json!({ "textDocument": { "uri": uri }, "range": whole_range,
+                    "context": { "diagnostics": [] } }),
+        ),
+        (
+            14,
+            "textDocument/codeLens",
+            json!({ "textDocument": { "uri": uri } }),
+        ),
+        (
+            15,
+            "textDocument/documentColor",
+            json!({ "textDocument": { "uri": uri } }),
+        ),
+        (
+            16,
+            "textDocument/linkedEditingRange",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 11, "character": 4 } }),
+        ),
+        (
+            17,
+            "textDocument/declaration",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 8, "character": 10 } }),
+        ),
+        (
+            18,
+            "textDocument/typeDefinition",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 8, "character": 6 } }),
+        ),
+        (
+            19,
+            "textDocument/implementation",
+            json!({ "textDocument": { "uri": uri }, "position": { "line": 1, "character": 6 } }),
+        ),
+        (
+            20,
+            "textDocument/diagnostic",
+            json!({ "textDocument": { "uri": uri } }),
+        ),
+        (
+            21,
+            "textDocument/selectionRange",
+            json!({ "textDocument": { "uri": uri }, "positions": [{ "line": 8, "character": 6 }] }),
+        ),
+    ];
+
+    for (id, method, params) in requests {
+        client.request(id, method, params);
+        let r = client.read_response(id, overall);
+        assert!(
+            r.get("result").is_some() && r.get("error").is_none(),
+            "`{method}` malformed (missing result or carried an error): {r}"
+        );
+    }
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    assert!(
+        client.wait_for_exit(Duration::from_secs(10)),
+        "server did not exit cleanly"
+    );
+}
+
+/// Phase 7: a ~300 KiB file must not hang the server. The large-file degradation path
+/// (semantic tokens range-only, inlay skipped) means these may return null/empty, but
+/// they MUST return a well-formed response within the overall deadline.
+#[test]
+fn lsp_large_file_does_not_hang() {
+    let overall = Instant::now() + Duration::from_secs(30);
+    let mut client = LspClient::spawn();
+
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    // Build a >256 KiB document from repeated small function units so the parser /
+    // resolver / checker do real work (not one giant token).
+    let mut big = String::new();
+    let mut i = 0usize;
+    while big.len() < 300 * 1024 {
+        big.push_str(&format!(
+            "fn f_{i}(a, b) {{\n  let s = a + b\n  return s * 2\n}}\n"
+        ));
+        i += 1;
+    }
+    let uri = "ascript-test://big.as";
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": big } }),
+    );
+    // Diagnostics still run (always) — drain the publish.
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // semanticTokens/full: degraded to null on a large file, but well-formed + prompt.
+    client.request(
+        30,
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let st = client.read_response(30, overall);
+    assert!(
+        st.get("result").is_some() && st.get("error").is_none(),
+        "large-file semanticTokens/full hung or malformed: {st}"
+    );
+
+    // inlayHint: skipped (empty) on a large file, but well-formed + prompt.
+    client.request(
+        31,
+        "textDocument/inlayHint",
+        json!({ "textDocument": { "uri": uri },
+                "range": { "start": { "line": 0, "character": 0 },
+                           "end": { "line": 10, "character": 0 } } }),
+    );
+    let ih = client.read_response(31, overall);
+    assert!(
+        ih.get("result").is_some() && ih.get("error").is_none(),
+        "large-file inlayHint hung or malformed: {ih}"
+    );
+
+    // The range variant of semantic tokens stays served (bounded) — sanity check it
+    // still answers well-formed.
+    client.request(
+        32,
+        "textDocument/semanticTokens/range",
+        json!({ "textDocument": { "uri": uri },
+                "range": { "start": { "line": 0, "character": 0 },
+                           "end": { "line": 8, "character": 0 } } }),
+    );
+    let str_ = client.read_response(32, overall);
+    assert!(
+        str_.get("result").is_some() && str_.get("error").is_none(),
+        "large-file semanticTokens/range malformed: {str_}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    assert!(
+        client.wait_for_exit(Duration::from_secs(10)),
+        "server did not exit cleanly"
+    );
+}
+
+/// Phase 7 consistency invariant: the set of diagnostic codes the LSP publishes for a
+/// file equals the set `ascript check --json` emits for the SAME file under the SAME
+/// `ascript.toml [lint]` config. Both paths run `analyze_with_config` over the nearest
+/// config, so they must agree; this proves it end-to-end over the real binary.
+#[test]
+fn lsp_diagnostics_match_ascript_check() {
+    let dir =
+        std::env::temp_dir().join(format!("ascript_lsp_consistency_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // A config that turns an otherwise-default lint on, plus a file that trips it AND a
+    // hard syntax/semantic issue, so the code set is non-trivial.
+    std::fs::write(
+        dir.join("ascript.toml"),
+        "[lint]\nunused-binding = \"warn\"\n",
+    )
+    .unwrap();
+    let f = dir.join("m.as");
+    std::fs::write(&f, "fn main() {\n  let unused = 1\n}\n").unwrap();
+    let uri = format!("file://{}", f.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    // (a) LSP diagnostics for the file, as a set of `code` strings.
+    let overall = Instant::now() + Duration::from_secs(30);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+    let file_text = std::fs::read_to_string(&f).unwrap();
+    client.notify(
+        "textDocument/didOpen",
+        json!({ "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": file_text } }),
+    );
+    let note = client.read_notification("textDocument/publishDiagnostics", overall);
+    let mut lsp_codes: Vec<String> = note["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array")
+        .iter()
+        .filter_map(|d| d["code"].as_str().map(|s| s.to_string()))
+        .collect();
+    lsp_codes.sort();
+    lsp_codes.dedup();
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+
+    // (b) `ascript check --json` on the same file, in the same dir (so it resolves the
+    // same `ascript.toml`). Output is a JSON array of { code, ... } objects.
+    let out = Command::new(env!("CARGO_BIN_EXE_ascript"))
+        .arg("check")
+        .arg("--json")
+        .arg(&f)
+        .current_dir(&dir)
+        .output()
+        .expect("run `ascript check --json`");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("check --json output not JSON ({e}): {stdout}"));
+    let mut check_codes: Vec<String> = parsed
+        .as_array()
+        .expect("check --json is a JSON array")
+        .iter()
+        .filter_map(|d| d["code"].as_str().map(|s| s.to_string()))
+        .collect();
+    check_codes.sort();
+    check_codes.dedup();
+
+    // (c) The two code SETS must be equal (order-independent).
+    assert_eq!(
+        lsp_codes, check_codes,
+        "LSP diagnostics ({lsp_codes:?}) must match `ascript check` ({check_codes:?}) \
+         for the same source + config"
+    );
+    // Sanity: the corpus is non-trivial (the unused-binding lint did fire).
+    assert!(
+        check_codes.contains(&"unused-binding".to_string()),
+        "expected the unused-binding lint to fire: {check_codes:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

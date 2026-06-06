@@ -741,7 +741,7 @@ Two new Markdown pages under `docs/content/`, wired into the docs site NAV and l
 - Modify: `docs/assets/app.js` (add a "Tooling" NAV section)
 - Modify: `README.md` (link the two pages)
 
-- [ ] **Step 1: Write `docs/content/tooling/editor-setup.md`.**
+- [x] **Step 1: Write `docs/content/tooling/editor-setup.md`.**
 
 ```markdown
 # Editor setup
@@ -838,7 +838,7 @@ the LSP log. Diagnostics and navigation always run. (The front-end is a full-rep
 design; responsiveness comes from debouncing, not incremental green-node reuse.)
 ```
 
-- [ ] **Step 2: Write `docs/content/tooling/lsp-capabilities.md`.**
+- [x] **Step 2: Write `docs/content/tooling/lsp-capabilities.md`.**
 
 Enumerate every method the server advertises. Cross-check the real list against `server_capabilities()` in `src/lsp/server.rs` at implementation time and against the §4 capability matrix — adjust the table to exactly what is wired (do not list a method the server does not answer).
 
@@ -932,7 +932,7 @@ advisory type inferencer) — the server never runs your code.
 > from debouncing and size bounds rather than incremental green-node reuse.
 ```
 
-- [ ] **Step 3: Wire the NAV section.**
+- [x] **Step 3: Wire the NAV section.**
 
 In `docs/assets/app.js`, add a "Tooling" section to the `NAV` array (after "Standard library", before "Resources"):
 
@@ -943,7 +943,7 @@ In `docs/assets/app.js`, add a "Tooling" section to the `NAV` array (after "Stan
   ]},
 ```
 
-- [ ] **Step 4: Link from `README.md`.**
+- [x] **Step 4: Link from `README.md`.**
 
 In the README's tooling/LSP area (the `ascript lsp` row of the CLI table ~line 78 and the LSP paragraph ~line 156), add a sentence linking the new pages, e.g.:
 
@@ -953,7 +953,7 @@ and the [LSP capability reference](docs/content/tooling/lsp-capabilities.md) for
 method the server answers.
 ```
 
-- [ ] **Step 5: Verify the docs render (served, not `file://`).**
+- [x] **Step 5: Verify the docs render (served, not `file://`).**
 
 ```bash
 cd docs && python3 -m http.server 8000 &
@@ -961,7 +961,7 @@ cd docs && python3 -m http.server 8000 &
 # confirm both pages load and appear in the sidebar + cmd-K search; then stop the server.
 ```
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 git add docs/content/tooling docs/assets/app.js README.md
@@ -978,7 +978,7 @@ Extend `tests/lsp.rs` to (a) assert the **full** advertised capability set on `i
 - Modify: `tests/lsp.rs`
 - Test: the file itself.
 
-- [ ] **Step 1: Assert the full capability set.**
+- [x] **Step 1: Assert the full capability set.**
 
 In `lsp_protocol_end_to_end`, after reading the `initialize` response, extend the capability assertions to cover every provider the server now advertises. Cross-check the field names against `server_capabilities()` at write time and assert each present one is non-null:
 
@@ -999,7 +999,7 @@ for cap in [
 
 > If a capability above was NOT implemented by an earlier phase, remove it from this list to match reality — but the list MUST equal the set in `server_capabilities()`. Add a code comment pointing back to that function as the source of truth.
 
-- [ ] **Step 2: Exercise one representative request per provider.**
+- [x] **Step 2: Exercise one representative request per provider.**
 
 Add a new test `lsp_full_capability_surface` that opens a content-rich document and fires one request per provider (folding, selectionRange, documentLink, signatureHelp, semanticTokens/full, inlayHint, codeAction, documentHighlight, formatting, documentColor, callHierarchy/prepare, typeHierarchy/prepare). For each, assert the response carries a `result` member (it may be null/empty, but must be well-formed). Reuse the `LspClient` driver. Example for two of them:
 
@@ -1015,7 +1015,7 @@ let r = client.read_response(11, overall);
 assert!(r.get("result").is_some(), "formatting malformed: {r}");
 ```
 
-- [ ] **Step 3: Large-file no-hang test.**
+- [x] **Step 3: Large-file no-hang test.**
 
 Add `lsp_large_file_does_not_hang`: open a ~300 KiB document (built from repeated `fn` units), then request semanticTokens/full and inlayHint, asserting each returns within the overall 30s deadline (the `read_response` deadline already enforces this) and that the responses are well-formed (`result` present — `null`/empty is the expected degraded answer):
 
@@ -1033,7 +1033,7 @@ let r = client.read_response(20, overall);
 assert!(r.get("result").is_some(), "large-file semantic tokens hung or malformed: {r}");
 ```
 
-- [ ] **Step 4: Diagnostics ≡ `ascript check` consistency invariant.**
+- [x] **Step 4: Diagnostics ≡ `ascript check` consistency invariant.**
 
 Add `lsp_diagnostics_match_ascript_check`: in a temp dir with an `ascript.toml [lint]` and a `.as` file that trips a configurable lint, (1) capture the LSP `publishDiagnostics` codes for that file on `didOpen`, (2) run the `ascript check` binary on the same file in the same dir and parse its emitted diagnostic codes, (3) assert the two code sets are equal. Use `env!("CARGO_BIN_EXE_ascript")` for the `check` subprocess. Sketch:
 
@@ -1058,12 +1058,12 @@ let out = std::process::Command::new(env!("CARGO_BIN_EXE_ascript"))
 
 Confirm the `ascript check` CLI output includes machine-greppable codes (it does — diagnostics carry a `code`; if the human format is hard to parse, add `--format json` IF the CLI supports it, else grep the code tokens). If exact-set equality is too brittle against ordering, assert set-equality of the codes (not the order).
 
-- [ ] **Step 5: Run the protocol suite.**
+- [x] **Step 5: Run the protocol suite.**
 
 Run: `cargo test --test lsp`
 Expected: PASS (all LSP wire tests, old + new).
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 
 ```bash
 git add tests/lsp.rs
@@ -1078,7 +1078,7 @@ git commit -m "test(lsp): full-capability smoke + large-file no-hang + diagnosti
 - Modify: `README.md` (one line: note the responsiveness/large-file behavior near the LSP paragraph, if not already added in Task 8)
 - Verify: the whole suite + both clippy configs.
 
-- [ ] **Step 1: Run the full gate.**
+- [x] **Step 1: Run the full gate.**
 
 ```bash
 cargo test
@@ -1089,7 +1089,7 @@ cargo clippy --no-default-features --all-targets
 
 Expected: all green/clean. Under `--no-default-features` the `lsp` feature is OFF, so `tests/lsp.rs` compiles out (it is `#![cfg(feature = "lsp")]`) and `src/lsp/*` is gated — confirm the new `perf.rs`/`model.rs` code is inside the existing `lsp` cfg boundary so the no-default build does not try to compile it.
 
-- [ ] **Step 2: Confirm the perf budget is met.**
+- [x] **Step 2: Confirm the perf budget is met.**
 
 ```bash
 cargo test --lib lsp::perf::budget_tests -- --nocapture
@@ -1097,14 +1097,14 @@ cargo test --lib lsp::perf::budget_tests -- --nocapture
 
 Expected: `large_file_rebuild_is_under_budget` PASS, well under `REBUILD_BUDGET_MS`.
 
-- [ ] **Step 3: Confirm the docs publish.**
+- [x] **Step 3: Confirm the docs publish.**
 
 ```bash
 cd docs && python3 -m http.server 8000
 # verify #tooling/editor-setup and #tooling/lsp-capabilities load + appear in sidebar/search.
 ```
 
-- [ ] **Step 4: Commit any final doc/README tweak.**
+- [x] **Step 4: Commit any final doc/README tweak.**
 
 ```bash
 git add README.md
@@ -1115,14 +1115,14 @@ git commit -m "docs: note LSP responsiveness + large-file bounds near the toolin
 
 ## Phase 7 Done — Gate
 
-- [ ] **Full-capability smoke green:** `cargo test --test lsp` passes, asserting the entire advertised capability set on `initialize` and exercising one representative request per provider end-to-end, with no hang on a ~300 KiB file.
-- [ ] **Perf budget met:** `large_file_rebuild_is_under_budget` passes under `REBUILD_BUDGET_MS`; rapid edits coalesce into one rebuild; stale completion/hover results are superseded and dropped.
-- [ ] **Large-file bounds live:** above `LARGE_FILE_BYTES` semantic tokens are range-only and inlay is skipped; above `HUGE_FILE_BYTES` token/inlay/folding/color go quiet — each logged, diagnostics + navigation always running.
-- [ ] **Indexing progress:** `initialized` emits cancellable work-done progress; `window/workDoneProgress/cancel` aborts it.
-- [ ] **Consistency invariant:** LSP diagnostics ≡ `ascript check` codes for the same `ascript.toml` config (`lsp_diagnostics_match_ascript_check`).
-- [ ] **Docs published:** `docs/content/tooling/editor-setup.md` + `docs/content/tooling/lsp-capabilities.md` exist, are in the site NAV + search, render when served, and are linked from `README.md`.
-- [ ] **Gates clean:** `cargo test`, `cargo test --no-default-features`, `cargo clippy --all-targets`, and `cargo clippy --no-default-features --all-targets` all pass.
-- [ ] **Invariants preserved:** the LSP stays `Send + Sync`, holds no `Rc`/`RefCell`/`Value`, and imports no `crate::{ast,lexer,parser,token}` (the Phase 0 guard test still passes).
+- [x] **Full-capability smoke green:** `cargo test --test lsp` passes, asserting the entire advertised capability set on `initialize` and exercising one representative request per provider end-to-end, with no hang on a ~300 KiB file.
+- [x] **Perf budget met:** `large_file_rebuild_is_under_budget` passes under `REBUILD_BUDGET_MS`; rapid edits coalesce into one rebuild; stale completion/hover results are superseded and dropped.
+- [x] **Large-file bounds live:** above `LARGE_FILE_BYTES` semantic tokens are range-only and inlay is skipped; above `HUGE_FILE_BYTES` token/inlay/folding/color go quiet — each logged, diagnostics + navigation always running.
+- [x] **Indexing progress:** `initialized` emits cancellable work-done progress; `window/workDoneProgress/cancel` aborts it.
+- [x] **Consistency invariant:** LSP diagnostics ≡ `ascript check` codes for the same `ascript.toml` config (`lsp_diagnostics_match_ascript_check`).
+- [x] **Docs published:** `docs/content/tooling/editor-setup.md` + `docs/content/tooling/lsp-capabilities.md` exist, are in the site NAV + search, render when served, and are linked from `README.md`.
+- [x] **Gates clean:** `cargo test`, `cargo test --no-default-features`, `cargo clippy --all-targets`, and `cargo clippy --no-default-features --all-targets` all pass.
+- [x] **Invariants preserved:** the LSP stays `Send + Sync`, holds no `Rc`/`RefCell`/`Value`, and imports no `crate::{ast,lexer,parser,token}` (the Phase 0 guard test still passes).
 
 **This completes the first-class-LSP campaign.** Phases 0–4 unified the LSP onto one cached `SemanticModel` and built out the full modern + advanced capability surface; Phase 5 promoted the tree-sitter grammar; Phase 6 shipped the VS Code, Zed, and Neovim integrations; and Phase 7 made the server responsive under real editing pressure, robust on large files, cancellation-aware, and fully documented. The AScript language server is now first-class end-to-end.
 ```

@@ -18,6 +18,10 @@ pub struct SemanticModel {
     pub diagnostics: Vec<AsDiagnostic>,
     pub tokens: Vec<LexToken>,
     pub line_index: LineIndex,
+    /// The monotone generation this model was built at, stamped by
+    /// `DocumentStore::set_versioned` (0 for a model built directly via `build`).
+    /// Handlers capture it at entry to detect supersession by a newer edit.
+    pub generation: u64,
 }
 
 impl SemanticModel {
@@ -29,7 +33,16 @@ impl SemanticModel {
         let diagnostics = crate::check::analyze::analyze_with_config(&text, config).diagnostics;
         let tokens: Vec<LexToken> = crate::syntax::lex(&text);
         let line_index = LineIndex::new(&text);
-        SemanticModel { text, version, tree, resolved, diagnostics, tokens, line_index }
+        SemanticModel {
+            text,
+            version,
+            tree,
+            resolved,
+            diagnostics,
+            tokens,
+            line_index,
+            generation: 0,
+        }
     }
 }
 
@@ -53,6 +66,52 @@ mod tests {
     }
 }
 
+use crate::lsp::perf::{HUGE_FILE_BYTES, LARGE_FILE_BYTES};
+
+/// How expensive providers should treat a document, by source size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeClass {
+    /// Normal: every provider runs at full fidelity.
+    Normal,
+    /// Large: semantic-tokens FULL degrades to range-only; inlay hints skipped.
+    Large,
+    /// Huge: only diagnostics + navigation; token/inlay/folding/color return empty.
+    Huge,
+}
+
+impl SemanticModel {
+    /// The document's size class (drives provider degradation).
+    pub fn size_class(&self) -> SizeClass {
+        match self.text.len() {
+            n if n >= HUGE_FILE_BYTES => SizeClass::Huge,
+            n if n >= LARGE_FILE_BYTES => SizeClass::Large,
+            _ => SizeClass::Normal,
+        }
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn small_file_is_normal() {
+        let m = SemanticModel::build("let x = 1\n".to_string(), None, &LintConfig::default());
+        assert_eq!(m.size_class(), SizeClass::Normal);
+    }
+
+    #[test]
+    fn threshold_classifies_large_and_huge() {
+        let large = "a".repeat(LARGE_FILE_BYTES);
+        let m = SemanticModel::build(large, None, &LintConfig::default());
+        assert_eq!(m.size_class(), SizeClass::Large);
+
+        let huge = "a".repeat(HUGE_FILE_BYTES);
+        let m = SemanticModel::build(huge, None, &LintConfig::default());
+        assert_eq!(m.size_class(), SizeClass::Huge);
+    }
+}
+
 use std::collections::HashMap;
 use std::path::Path;
 use tower_lsp::lsp_types::Url;
@@ -62,20 +121,40 @@ use tower_lsp::lsp_types::Url;
 #[derive(Default)]
 pub struct DocumentStore {
     models: HashMap<Url, SemanticModel>,
+    /// Monotone generation counter, bumped on every `set_versioned`. The stored
+    /// model carries the generation it was built at, so a handler that captured a
+    /// generation can detect that a newer edit superseded it.
+    next_gen: u64,
 }
 
 impl DocumentStore {
     pub fn new() -> Self {
-        DocumentStore { models: HashMap::new() }
+        DocumentStore { models: HashMap::new(), next_gen: 0 }
     }
 
-    /// Build and store the model for `uri` at `text`/`version`. The lint config is
-    /// discovered from the document's filesystem path (nearest `ascript.toml`); a
-    /// non-file URL uses the default config.
-    pub fn set(&mut self, uri: Url, text: String, version: Option<i32>) {
+    /// Build + store the model for `uri`, stamping it with a fresh monotone
+    /// generation, which is returned so the caller can later detect supersession.
+    /// The lint config is discovered from the document's filesystem path (nearest
+    /// `ascript.toml`); a non-file URL uses the default config.
+    pub fn set_versioned(&mut self, uri: Url, text: String, version: Option<i32>) -> u64 {
+        self.next_gen += 1;
+        let gen = self.next_gen;
         let config = config_for_uri(&uri);
-        let model = SemanticModel::build(text, version, &config);
+        let mut model = SemanticModel::build(text, version, &config);
+        model.generation = gen;
         self.models.insert(uri, model);
+        gen
+    }
+
+    /// Build and store the model for `uri` at `text`/`version`, discarding the
+    /// generation (back-compat shim for callers that do not track supersession).
+    pub fn set(&mut self, uri: Url, text: String, version: Option<i32>) {
+        let _ = self.set_versioned(uri, text, version);
+    }
+
+    /// The generation currently stored for `uri` (`None` if not open).
+    pub fn current_gen(&self, uri: &Url) -> Option<u64> {
+        self.models.get(uri).map(|m| m.generation)
     }
 
     pub fn get(&self, uri: &Url) -> Option<&SemanticModel> {
@@ -129,6 +208,33 @@ mod store_tests {
         let m = store.get(&uri).unwrap();
         assert_eq!(m.version, Some(2));
         assert!(!m.diagnostics.is_empty(), "v2 has a syntax error");
+    }
+}
+
+#[cfg(test)]
+mod gen_tests {
+    use super::*;
+
+    #[test]
+    fn set_bumps_generation_monotonically() {
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let g1 = store.set_versioned(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        let g2 = store.set_versioned(uri.clone(), "let x = 2\n".to_string(), Some(2));
+        assert!(g2 > g1, "generation must increase per edit: {g1} -> {g2}");
+        assert_eq!(store.current_gen(&uri), Some(g2));
+        // The stored model carries its generation.
+        assert_eq!(store.get(&uri).unwrap().generation, g2);
+    }
+
+    #[test]
+    fn stale_generation_is_detectable() {
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let g1 = store.set_versioned(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        let _g2 = store.set_versioned(uri.clone(), "let x = 2\n".to_string(), Some(2));
+        // A handler holding g1 sees it is no longer current.
+        assert!(store.current_gen(&uri) != Some(g1), "g1 should be stale");
     }
 }
 
@@ -236,6 +342,26 @@ mod sync_tests {
             text: "new".to_string(),
         };
         assert_eq!(apply_changes("old", &[change]), "new");
+    }
+
+    #[test]
+    fn coalesced_edits_fold_forward() {
+        // Two ranged inserts applied in sequence equal one apply over the folded text
+        // — proving a debounce that only analyzes the LATEST folded text is correct.
+        let start = "let x = 1\n";
+        let e1 = TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 8), Position::new(0, 9))),
+            range_length: None,
+            text: "2".to_string(),
+        };
+        let after1 = apply_changes(start, &[e1]);
+        let e2 = TextDocumentContentChangeEvent {
+            range: Some(Range::new(Position::new(0, 8), Position::new(0, 9))),
+            range_length: None,
+            text: "3".to_string(),
+        };
+        let after2 = apply_changes(&after1, &[e2]);
+        assert_eq!(after2, "let x = 3\n");
     }
 }
 

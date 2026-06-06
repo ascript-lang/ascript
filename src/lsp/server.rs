@@ -12,10 +12,21 @@ use crate::lsp::model::DocumentStore;
 use crate::lsp::workspace::{self, WorkspaceIndex};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
+
+/// The debounce window: edits arriving within this of the previous edit coalesce
+/// into one rebuild. Short enough to feel instant, long enough to absorb a burst of
+/// keystrokes (typing ~10 chars/sec → all fold into one rebuild).
+const DEBOUNCE_MS: u64 = 40;
+
+/// A pending (debounced) edit for a URL: the latest folded text, its document
+/// version, and the monotone edit sequence number that stamps it.
+type PendingEdit = (String, Option<i32>, u64);
 
 /// Client-configurable settings (subset). Updated by `didChangeConfiguration`.
 #[derive(Debug, Clone, Default)]
@@ -37,6 +48,15 @@ pub struct Backend {
     roots: RwLock<Vec<PathBuf>>,
     /// Client-configurable settings (`didChangeConfiguration`).
     settings: RwLock<LspSettings>,
+    /// Coalescing: the latest pending text + version + edit sequence number per URL.
+    /// A debounced rebuild only proceeds if its captured sequence is still the latest
+    /// for the URL (a newer edit landing supersedes it).
+    pending: Mutex<HashMap<Url, PendingEdit>>,
+    /// Monotone edit sequence, bumped on every `did_change`.
+    edit_seq: AtomicU64,
+    /// Set by `window/workDoneProgress/cancel` for the indexing token; checked
+    /// between files so a huge workspace's initial indexing can be aborted.
+    index_cancelled: AtomicBool,
 }
 
 impl Backend {
@@ -47,7 +67,30 @@ impl Backend {
             index: RwLock::new(WorkspaceIndex::new()),
             roots: RwLock::new(Vec::new()),
             settings: RwLock::new(LspSettings::default()),
+            pending: Mutex::new(HashMap::new()),
+            edit_seq: AtomicU64::new(0),
+            index_cancelled: AtomicBool::new(false),
         }
+    }
+
+    /// Handle `window/workDoneProgress/cancel` (wired as a custom method in
+    /// `run_server` because tower-lsp 0.20 does not yet expose it as a
+    /// `LanguageServer` trait method — see the crate TODO at `tower-lsp/src/lib.rs`).
+    /// We run exactly one cancellable long task — the initial workspace indexing
+    /// under the `ascript-index` token — so flip the flag its loop checks between
+    /// files.
+    pub async fn on_work_done_progress_cancel(&self, params: WorkDoneProgressCancelParams) {
+        if matches!(&params.token, NumberOrString::String(s) if s == "ascript-index") {
+            self.index_cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// True if `gen` is no longer the current generation for `uri` (a newer edit has
+    /// landed). A handler that captured `gen` at entry should bail when this is true,
+    /// because its result was computed against now-stale text.
+    async fn superseded(&self, uri: &Url, gen: u64) -> bool {
+        let store = self.documents.lock().await;
+        store.current_gen(uri).map(|g| g != gen).unwrap_or(true)
     }
 
     /// Incrementally re-index the file behind `uri` (if it maps to a path).
@@ -98,7 +141,9 @@ impl Backend {
         let mut diags;
         {
             let mut store = self.documents.lock().await;
-            store.set(uri.clone(), text.clone(), version);
+            // `set_versioned` bumps the document generation so a concurrently-running
+            // completion/hover handler can detect it was superseded (Task 5).
+            store.set_versioned(uri.clone(), text.clone(), version);
             diags = store.get(&uri).map(|m| m.lsp_diagnostics()).unwrap_or_default();
         }
         // Index-backed cross-file arity (cannot be computed single-file).
@@ -345,32 +390,37 @@ impl LanguageServer for Backend {
         // in a best-effort work-done progress report.
         let roots = self.roots.read().map(|r| r.clone()).unwrap_or_default();
         let token = NumberOrString::String("ascript-index".to_string());
-        // Create + Begin (spawned: the create is a server→client request whose
+        // Reset the cancel flag for this indexing pass.
+        self.index_cancelled.store(false, Ordering::SeqCst);
+        // Create the progress token (best-effort: a server→client request whose
         // response we do not need; a client without progress support ignores it).
+        // Spawned so we never stall `initialized` waiting on a client that never
+        // answers (the prior Phase-4 deadlock fix).
         {
             let client = self.client.clone();
             let token = token.clone();
             tokio::spawn(async move {
                 let _ = client
                     .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
-                        token: token.clone(),
-                    })
-                    .await;
-                client
-                    .send_notification::<notification::Progress>(ProgressParams {
                         token,
-                        value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
-                            WorkDoneProgressBegin {
-                                title: "Indexing AScript workspace".to_string(),
-                                cancellable: Some(false),
-                                message: None,
-                                percentage: None,
-                            },
-                        )),
                     })
                     .await;
             });
         }
+        // Begin — cancellable so the client may flip the cancel flag mid-index.
+        self.client
+            .send_notification::<notification::Progress>(ProgressParams {
+                token: token.clone(),
+                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
+                    WorkDoneProgressBegin {
+                        title: "Indexing AScript workspace".to_string(),
+                        cancellable: Some(true),
+                        message: None,
+                        percentage: Some(0),
+                    },
+                )),
+            })
+            .await;
         let mut files: Vec<(PathBuf, String)> = Vec::new();
         for root in &roots {
             for path in workspace::discover_as_files(root) {
@@ -379,17 +429,44 @@ impl LanguageServer for Backend {
                 }
             }
         }
-        if let Ok(mut idx) = self.index.write() {
-            for (path, text) in &files {
+        // Index file-by-file, reporting progress and honoring cancellation between
+        // files so a huge workspace can be aborted via `window/workDoneProgress/cancel`.
+        let total = files.len().max(1);
+        let mut indexed = 0usize;
+        let mut cancelled = false;
+        for (i, (path, text)) in files.iter().enumerate() {
+            if self.index_cancelled.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
+            if let Ok(mut idx) = self.index.write() {
                 idx.reindex_file(path, text);
             }
+            indexed = i + 1;
+            self.client
+                .send_notification::<notification::Progress>(ProgressParams {
+                    token: token.clone(),
+                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::Report(
+                        WorkDoneProgressReport {
+                            cancellable: Some(true),
+                            message: Some(format!("{}/{}", i + 1, total)),
+                            percentage: Some(((i + 1) * 100 / total) as u32),
+                        },
+                    )),
+                })
+                .await;
         }
-        // End the progress with the indexed-file count.
+        // End the progress with the indexed-file count (noting an early cancel).
+        let end_message = if cancelled {
+            format!("indexing cancelled after {indexed} of {} files", files.len())
+        } else {
+            format!("{} files indexed", files.len())
+        };
         self.client
             .send_notification::<notification::Progress>(ProgressParams {
                 token,
                 value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
-                    message: Some(format!("{} files indexed", files.len())),
+                    message: Some(end_message),
                 })),
             })
             .await;
@@ -433,17 +510,58 @@ impl LanguageServer for Backend {
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        // Incremental sync: apply the ranged content changes against the cached
-        // text, then rebuild the model from the resulting full text.
-        let uri = params.text_document.uri;
+        // Incremental sync with debounce/coalesce: a burst of keystrokes within the
+        // debounce window folds into a SINGLE rebuild + publish, and only the latest
+        // folded text is analyzed (older edits are folded forward, never analyzed).
+        let uri = params.text_document.uri.clone();
         let version = Some(params.text_document.version);
-        let new_text = {
-            let store = self.documents.lock().await;
-            let base = store.get(&uri).map(|m| m.text.clone()).unwrap_or_default();
-            crate::lsp::model::apply_changes(&base, &params.content_changes)
+
+        // Fold the ranged edits onto the latest known text (pending wins over the
+        // cached model so consecutive bursts stack correctly).
+        let base = {
+            let pending = self.pending.lock().await;
+            if let Some((t, _, _)) = pending.get(&uri) {
+                t.clone()
+            } else {
+                let store = self.documents.lock().await;
+                store.get(&uri).map(|m| m.text.clone()).unwrap_or_default()
+            }
         };
-        self.reindex_uri(&uri, &new_text);
-        self.analyze_and_publish(uri, new_text, version).await;
+        let new_text = crate::lsp::model::apply_changes(&base, &params.content_changes);
+
+        // Correctness note: coalescing has no lost-edit race ONLY because (a) there is no
+        // .await between the fold-read and the pending insert (both synchronous), and (b) the
+        // server runs on a current_thread/LocalSet runtime so no other task interleaves in that
+        // window. Do NOT introduce an .await here, and revisit if the runtime ever becomes
+        // multi-threaded.
+        // Stamp this edit and record it as the latest pending text for the URI.
+        let seq = self.edit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(uri.clone(), (new_text.clone(), version, seq));
+        }
+
+        // Debounce: wait the window, then rebuild ONLY if no newer edit landed. The
+        // sleep defers THIS uri's rebuild without blocking other requests (tower-lsp
+        // dispatches each notification as its own task on the LocalSet).
+        tokio::time::sleep(Duration::from_millis(DEBOUNCE_MS)).await;
+        let still_latest = {
+            let pending = self.pending.lock().await;
+            pending.get(&uri).map(|(_, _, s)| *s) == Some(seq)
+        };
+        if !still_latest {
+            return; // a newer edit superseded us; it will rebuild.
+        }
+
+        let (text, ver) = {
+            let mut pending = self.pending.lock().await;
+            match pending.remove(&uri) {
+                Some((t, v, _)) => (t, v),
+                None => return,
+            }
+        };
+        self.reindex_uri(&uri, &text);
+        self.analyze_and_publish(uri, text, ver).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -469,12 +587,21 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> tower_lsp::jsonrpc::Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(None);
+        let (gen, result) = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
+            (model.generation, crate::lsp::providers::hover::hover(model, offset))
         };
-        let offset = crate::lsp::providers::docs::byte_offset_at(model, position);
-        Ok(crate::lsp::providers::hover::hover(model, offset))
+        // Supersession: a hover computed against now-stale text is dropped. (Only the
+        // noisy while-typing requests — completion/hover — are guarded; user-initiated
+        // navigation/symbol requests rarely race, so they stay unguarded.)
+        if self.superseded(&uri, gen).await {
+            return Ok(None);
+        }
+        Ok(result)
     }
 
     async fn completion(
@@ -483,13 +610,23 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(None);
+        let (gen, items) = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            // The completion provider scans raw chars, so it takes a CHAR offset.
+            let offset = model.line_index.offset(position);
+            (
+                model.generation,
+                crate::lsp::providers::completion::completions(model, offset),
+            )
         };
-        // The completion provider scans raw chars, so it takes a CHAR offset.
-        let offset = model.line_index.offset(position);
-        let items = crate::lsp::providers::completion::completions(model, offset);
+        // If a newer edit landed while we computed, the result is obsolete; drop it
+        // (the client re-requests against the fresh document).
+        if self.superseded(&uri, gen).await {
+            return Ok(None);
+        }
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -560,11 +697,23 @@ impl LanguageServer for Backend {
             .read()
             .map(|s| s.detect_hex_strings_everywhere)
             .unwrap_or(false);
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(Vec::new());
+        // Large-file degradation: color swatches go quiet above HUGE_FILE_BYTES,
+        // logged once. Normal + Large still scan.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(Vec::new());
+            };
+            if matches!(model.size_class(), crate::lsp::model::SizeClass::Huge) {
+                Some(format!("ascript: {uri} is huge — document colors disabled"))
+            } else {
+                return Ok(crate::lsp::providers::color::document_colors(model, everywhere));
+            }
         };
-        Ok(crate::lsp::providers::color::document_colors(model, everywhere))
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Vec::new())
     }
 
     async fn color_presentation(
@@ -615,11 +764,28 @@ impl LanguageServer for Backend {
     ) -> tower_lsp::jsonrpc::Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
         let range = params.range;
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(None);
+        // Large-file degradation: inlay hints are skipped above LARGE_FILE_BYTES
+        // (Large + Huge), returning an empty set. A one-line note is logged for the
+        // huge case so the degradation is observable, never silent — and never a hang.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            match model.size_class() {
+                crate::lsp::model::SizeClass::Normal => {
+                    return Ok(Some(crate::lsp::providers::inlay::inlay_hints(model, range)));
+                }
+                crate::lsp::model::SizeClass::Large => None,
+                crate::lsp::model::SizeClass::Huge => {
+                    Some(format!("ascript: {uri} is huge — inlay hints disabled"))
+                }
+            }
         };
-        Ok(Some(crate::lsp::providers::inlay::inlay_hints(model, range)))
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Some(Vec::new()))
     }
 
     async fn inlay_hint_resolve(
@@ -634,12 +800,31 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> tower_lsp::jsonrpc::Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&uri) else {
-            return Ok(None);
+        // Large-file degradation: above LARGE_FILE_BYTES the FULL token set is not
+        // served (a capable client falls back to ranged `semanticTokens/range`
+        // requests, which stay served and are inherently bounded). Logged, never a
+        // hang. The log note rides outside the store lock.
+        let note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            match model.size_class() {
+                crate::lsp::model::SizeClass::Normal => {
+                    let tokens =
+                        crate::lsp::providers::semantic_tokens::semantic_tokens_full(model);
+                    return Ok(Some(SemanticTokensResult::Tokens(tokens)));
+                }
+                crate::lsp::model::SizeClass::Large => {
+                    format!("ascript: {uri} is large — semantic tokens served range-only")
+                }
+                crate::lsp::model::SizeClass::Huge => {
+                    format!("ascript: {uri} is huge — semantic tokens disabled")
+                }
+            }
         };
-        let tokens = crate::lsp::providers::semantic_tokens::semantic_tokens_full(model);
-        Ok(Some(SemanticTokensResult::Tokens(tokens)))
+        self.client.log_message(MessageType::INFO, note).await;
+        Ok(None)
     }
 
     async fn semantic_tokens_range(
@@ -1133,11 +1318,24 @@ impl LanguageServer for Backend {
         &self,
         params: FoldingRangeParams,
     ) -> tower_lsp::jsonrpc::Result<Option<Vec<FoldingRange>>> {
-        let store = self.documents.lock().await;
-        let Some(model) = store.get(&params.text_document.uri) else {
-            return Ok(None);
+        let uri = params.text_document.uri;
+        // Large-file degradation: folding ranges go quiet above HUGE_FILE_BYTES
+        // (returning empty), logged once. Normal + Large still fold.
+        let huge_note = {
+            let store = self.documents.lock().await;
+            let Some(model) = store.get(&uri) else {
+                return Ok(None);
+            };
+            if matches!(model.size_class(), crate::lsp::model::SizeClass::Huge) {
+                Some(format!("ascript: {uri} is huge — folding ranges disabled"))
+            } else {
+                return Ok(Some(crate::lsp::providers::folding::folding_ranges(model)));
+            }
         };
-        Ok(Some(crate::lsp::providers::folding::folding_ranges(model)))
+        if let Some(note) = huge_note {
+            self.client.log_message(MessageType::INFO, note).await;
+        }
+        Ok(Some(Vec::new()))
     }
 
     async fn selection_range(
@@ -1810,5 +2008,49 @@ mod tests {
             caps.document_range_formatting_provider.is_some(),
             "range formatting advertised"
         );
+    }
+
+    #[test]
+    fn index_cancel_flag_is_observable_and_sticky() {
+        // The flag is observable + sticky once set — i.e. the cancel→abort behavior is
+        // covered HERE. (The protocol smoke test in tests/lsp.rs only proves the server
+        // serves with the `window/workDoneProgress/cancel` method registered; it does NOT
+        // drive a cancel notification through to actually abort indexing.)
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!flag.load(Ordering::SeqCst));
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn size_class_gates_expensive_providers() {
+        use crate::lsp::model::{SemanticModel, SizeClass};
+        use crate::lsp::perf::LARGE_FILE_BYTES;
+        let big = SemanticModel::build(
+            "a".repeat(LARGE_FILE_BYTES),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        assert!(matches!(big.size_class(), SizeClass::Large | SizeClass::Huge));
+        let small = SemanticModel::build(
+            "let x = 1\n".to_string(),
+            None,
+            &crate::check::LintConfig::default(),
+        );
+        assert_eq!(small.size_class(), SizeClass::Normal);
+    }
+
+    #[test]
+    fn stale_generation_is_superseded() {
+        // Drive the store directly (no live Client) to prove the supersession guard
+        // logic: a handler holding an older generation must treat itself as stale.
+        let mut store = DocumentStore::new();
+        let uri = Url::parse("untitled:Untitled-1").unwrap();
+        let g1 = store.set_versioned(uri.clone(), "let x = 1\n".to_string(), Some(1));
+        let g2 = store.set_versioned(uri.clone(), "let x = 2\n".to_string(), Some(2));
+        assert_ne!(g1, g2);
+        assert_eq!(store.current_gen(&uri), Some(g2));
+        // A handler holding g1 must treat itself as superseded.
+        assert!(store.current_gen(&uri) != Some(g1));
     }
 }

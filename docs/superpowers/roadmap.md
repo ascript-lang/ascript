@@ -170,6 +170,26 @@ goal. A fresh conversation starts here; see "Phase 2 starting point" notes at th
   JSON-RPC (bounded against hangs). 509 lib + 21 cli + 1 lsp + 2 frontend + 5 module + 2 conformance
   (540 default; 245 `--no-default`). Merged. Plan: `plans/2026-05-29-ascript-m16-lsp.md`.
 
+- ✅ **First-class LSP campaign (Phases 0–7).** Built on M16: Phase 0 unified the server onto one
+  cached `SemanticModel`/`DocumentStore` over the CST front-end (no second front-end; `Send+Sync`,
+  no `Rc`/`RefCell`/`Value`, no `crate::{ast,lexer,parser,token}` in `src/lsp/`); Phases 1–4 grew the
+  full modern + advanced capability surface (config-aware + pull diagnostics, completion + resolve +
+  auto-import + snippets, hover types, signatureHelp, the navigation family
+  definition/declaration/typeDefinition/implementation/references, rename + prepare, document +
+  workspace symbols, formatting + rangeFormatting, codeAction + resolve + executeCommand, semantic
+  tokens full+range, documentHighlight, inlayHint, foldingRange, selectionRange, documentLink,
+  call/type hierarchy, documentColor, linkedEditingRange, codeLens, multi-root + file-operations
+  import rewrite); Phase 5 promoted the tree-sitter grammar; Phase 6 shipped the VS Code, Zed, and
+  Neovim integrations (`editors/`); **Phase 7** made the server responsive (debounce/coalesce edits,
+  supersede stale completion/hover), large-file-safe (range-only semantic tokens + skipped inlay
+  above ~256 KiB, all token/inlay/folding/color quiet above ~2 MiB, diagnostics + navigation always
+  running), cancellation-aware (work-done progress around initial indexing), and fully documented
+  (`docs/content/tooling/{editor-setup,lsp-capabilities}.md`, linked from `README.md`). The protocol
+  smoke test asserts the entire advertised capability set, exercises one request per provider, proves
+  a ~300 KiB file does not hang, and pins the consistency invariant **LSP diagnostics ≡ `ascript
+  check`** (set-equal codes for the same source + config). `vm_differential` stays 353/0/1. Plans:
+  `plans/2026-06-05-lsp-phase0-unification-foundation.md` … `plans/2026-06-05-lsp-phase7-performance-polish.md`.
+
 ---
 
 ## Phase 5 — Concurrency & coroutines (post-spec extension)
