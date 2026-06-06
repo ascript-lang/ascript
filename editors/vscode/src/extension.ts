@@ -5,7 +5,7 @@ import {
   ServerOptions,
   TransportKind,
 } from "vscode-languageclient/node";
-import { resolveServerPath, checkServerVersion } from "./serverPath";
+import { resolveServerPath, checkServerVersion, validateServer } from "./serverPath";
 
 let client: LanguageClient | undefined;
 
@@ -32,6 +32,14 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
   const command = await resolveServerPath(context);
   if (!command) {
     return; // resolveServerPath already surfaced the error
+  }
+
+  // Pre-flight: a binary that can't serve LSP (e.g. built without the `lsp` feature)
+  // would otherwise spawn → exit → restart-loop silently. Fail with a clear message.
+  const validation = await validateServer(command);
+  if (!validation.ok) {
+    vscode.window.showErrorMessage(`AScript language server cannot start: ${validation.reason}`);
+    return;
   }
 
   const serverOptions: ServerOptions = {

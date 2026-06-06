@@ -1,8 +1,54 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as https from "https";
 import * as crypto from "crypto";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
+
+export interface ServerValidation {
+  ok: boolean;
+  version?: string;
+  reason?: string;
+}
+
+/** Pre-flight the resolved binary BEFORE starting the language client, so a binary
+ *  that cannot serve LSP produces a clear, actionable error instead of a silent
+ *  spawn → exit → restart loop (which manifests as the status bar "blinking" with no
+ *  diagnostics or navigation). The common cause is a build without the `lsp` Cargo
+ *  feature, whose `ascript lsp` answers `error: unrecognized subcommand 'lsp'`. */
+export async function validateServer(command: string): Promise<ServerValidation> {
+  let help: string;
+  try {
+    const { stdout } = await execFileAsync(command, ["--help"], { timeout: 5000 });
+    help = stdout;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, reason: `\`${command} --help\` failed to run: ${msg}` };
+  }
+  // The `lsp` subcommand only exists when AScript is built with the `lsp` feature
+  // (on by default). Match it as a subcommand line in `--help` output.
+  if (!/^\s*lsp\b/m.test(help)) {
+    return {
+      ok: false,
+      reason:
+        `the \`ascript\` binary at '${command}' has no \`lsp\` subcommand — it was built without ` +
+        `the \`lsp\` feature. Reinstall AScript with default features ` +
+        `(e.g. \`cargo install --path .\` or \`cargo build --release\`), then restart the server.`,
+    };
+  }
+  let version: string | undefined;
+  try {
+    const { stdout } = await execFileAsync(command, ["--version"], { timeout: 5000 });
+    version = stdout.trim().split(/\s+/).pop();
+  } catch {
+    // version is best-effort; a working --help is enough to proceed
+  }
+  return { ok: true, version };
+}
 
 /** The minimum AScript server version this extension supports. Keep in lockstep
  *  with editors/README.md and the other two integrations. */
@@ -37,10 +83,28 @@ export async function resolveServerPath(
   }
 
   vscode.window.showErrorMessage(
-    "Could not find the `ascript` language server on your PATH. " +
-      "Install AScript, set `ascript.server.path`, or enable `ascript.server.autoDownload`.",
+    "Could not find the `ascript` language server. Set `ascript.server.path` to its absolute path, " +
+      "add its directory (e.g. `~/.local/bin`) to your PATH, or enable `ascript.server.autoDownload`. " +
+      "Tip: on macOS an editor launched from the Dock/Finder may not inherit your shell's PATH.",
   );
   return undefined;
+}
+
+/** Common install locations a GUI-launched editor's PATH often omits — the classic
+ *  macOS "VS Code started from the Dock has a stripped PATH" problem. Searching these
+ *  lets the extension still find a user-installed `ascript` (e.g. in `~/.local/bin` or
+ *  `~/.cargo/bin`) without requiring an explicit `ascript.server.path`. */
+function commonBinDirs(): string[] {
+  const home = os.homedir();
+  const dirs = [
+    path.join(home, ".local", "bin"),
+    path.join(home, ".cargo", "bin"),
+    path.join(home, "bin"),
+  ];
+  if (process.platform !== "win32") {
+    dirs.push("/usr/local/bin", "/opt/homebrew/bin", "/usr/bin");
+  }
+  return dirs;
 }
 
 function isExecutable(p: string): boolean {
@@ -55,11 +119,15 @@ function isExecutable(p: string): boolean {
 /** Search each PATH entry for an executable `name` (handles `.exe` on Windows). */
 function findOnPath(name: string): string | undefined {
   const exeNames = process.platform === "win32" ? [`${name}.exe`, name] : [name];
-  const dirs = (process.env.PATH ?? "").split(path.delimiter);
+  // Search the inherited PATH first, then common user/system bin dirs the GUI PATH
+  // frequently misses (de-duplicated, order-preserving).
+  const seen = new Set<string>();
+  const dirs = [...(process.env.PATH ?? "").split(path.delimiter), ...commonBinDirs()];
   for (const dir of dirs) {
-    if (!dir) {
+    if (!dir || seen.has(dir)) {
       continue;
     }
+    seen.add(dir);
     for (const exe of exeNames) {
       const candidate = path.join(dir, exe);
       if (isExecutable(candidate)) {
