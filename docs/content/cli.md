@@ -233,9 +233,10 @@ highlight**, **folding** and **selection ranges**, **document links**, **code le
 type hierarchy**, **document color** swatches, **linked editing**, **pull diagnostics**, multi-root
 workspaces, and **rename-on-move** import rewriting. Editing stays responsive under load — rapid
 keystrokes coalesce into one rebuild, stale completion/hover results are dropped, and very large
-files degrade gracefully (semantic tokens go range-only and inlay hints are skipped above ~256 KiB;
-token/inlay/folding/color providers go quiet above ~2 MiB) while diagnostics and navigation always
-run.
+files degrade gracefully (`semanticTokens/full` goes range-only and inlay hints are skipped above
+~256 KiB; `semanticTokens/full`/inlay/folding/color providers go quiet above ~2 MiB, though
+`semanticTokens/range` is always served to keep the visible viewport colored) while diagnostics and
+navigation always run.
 
 See [editor setup](tooling/editor-setup) for VS Code, Zed, and Neovim configuration, and the
 [LSP capability reference](tooling/lsp-capabilities) for every method the server answers.

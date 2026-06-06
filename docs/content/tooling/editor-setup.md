@@ -107,8 +107,9 @@ require("conform").setup({
 
 The server coalesces rapid keystrokes into a single rebuild and supersedes stale
 completion/hover results, so editing stays responsive. Very large files degrade
-gracefully — above ~256 KiB semantic tokens are served range-only and inlay hints are
-skipped; above ~2 MiB token/inlay/folding/color providers go quiet — with a note in
-the LSP log. Diagnostics and navigation always run. Initial workspace indexing reports
+gracefully — above ~256 KiB `semanticTokens/full` is served range-only and inlay hints are
+skipped; above ~2 MiB `semanticTokens/full`/inlay/folding/color providers go quiet (but
+`semanticTokens/range` is always served, keeping the visible viewport colored) — with a
+note in the LSP log. Diagnostics and navigation always run. Initial workspace indexing reports
 cancellable work-done progress. (The front-end is a full-reparse design; responsiveness
 comes from debouncing, not incremental green-node reuse.)

@@ -97,9 +97,11 @@ advisory type inferencer) — the server never runs your code. The list mirrors
 - **Debounce/coalesce:** bursts of keystrokes fold into one rebuild.
 - **Supersession:** a completion/hover computed against now-stale text is dropped (the
   client re-requests against the fresh document).
-- **Large-file bounds:** above ~256 KiB, semantic tokens go range-only and inlay hints
-  are skipped; above ~2 MiB, token/inlay/folding/color providers go quiet. Diagnostics
-  and navigation always run. Every degradation is logged via `window/logMessage`.
+- **Large-file bounds:** above ~256 KiB, `semanticTokens/full` goes range-only and inlay
+  hints are skipped; above ~2 MiB, `semanticTokens/full`/inlay/folding/color providers go
+  quiet. `semanticTokens/range` is **always** served — it is the bounded fallback that keeps
+  the visible viewport colored at any file size. Diagnostics and navigation always run.
+  Every degradation is logged via `window/logMessage`.
 - **Indexing progress:** initial workspace indexing reports cancellable work-done
   progress.
 

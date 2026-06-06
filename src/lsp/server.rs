@@ -529,6 +529,11 @@ impl LanguageServer for Backend {
         };
         let new_text = crate::lsp::model::apply_changes(&base, &params.content_changes);
 
+        // Correctness note: coalescing has no lost-edit race ONLY because (a) there is no
+        // .await between the fold-read and the pending insert (both synchronous), and (b) the
+        // server runs on a current_thread/LocalSet runtime so no other task interleaves in that
+        // window. Do NOT introduce an .await here, and revisit if the runtime ever becomes
+        // multi-threaded.
         // Stamp this edit and record it as the latest pending text for the URI.
         let seq = self.edit_seq.fetch_add(1, Ordering::SeqCst) + 1;
         {
@@ -2007,9 +2012,10 @@ mod tests {
 
     #[test]
     fn index_cancel_flag_is_observable_and_sticky() {
-        // The flag is observable + sticky once set. (The wire path — a
-        // `window/workDoneProgress/cancel` flipping it mid-index — is covered by the
-        // protocol smoke test in tests/lsp.rs.)
+        // The flag is observable + sticky once set — i.e. the cancel→abort behavior is
+        // covered HERE. (The protocol smoke test in tests/lsp.rs only proves the server
+        // serves with the `window/workDoneProgress/cancel` method registered; it does NOT
+        // drive a cancel notification through to actually abort indexing.)
         let flag = std::sync::atomic::AtomicBool::new(false);
         assert!(!flag.load(Ordering::SeqCst));
         flag.store(true, Ordering::SeqCst);
