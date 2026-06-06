@@ -1,0 +1,36 @@
+name: Mirror grammar to tree-sitter-ascript
+
+# Auto-publishes the tree-sitter-ascript/ subtree to ascript-lang/tree-sitter-ascript
+# whenever the grammar changes on main. The monorepo is the source of truth.
+#
+# SETUP (one-time): add a repository secret GRAMMAR_SYNC_TOKEN — a fine-grained PAT with
+# "Contents: write" on ascript-lang/tree-sitter-ascript. Until it is set, this workflow
+# no-ops (use scripts/sync-grammar.sh to mirror manually). Free on public repos.
+
+on:
+  push:
+    branches: [main]
+    paths: ["tree-sitter-ascript/**"]
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Subtree split + push to the grammar repo
+        env:
+          TOKEN: ${{ secrets.GRAMMAR_SYNC_TOKEN }}
+        run: |
+          if [ -z "${TOKEN}" ]; then
+            echo "GRAMMAR_SYNC_TOKEN not set — skipping auto-mirror."
+            echo "Set the secret, or run scripts/sync-grammar.sh manually."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          SPLIT=$(git subtree split --prefix=tree-sitter-ascript)
+          git push "https://x-access-token:${TOKEN}@github.com/ascript-lang/tree-sitter-ascript.git" "${SPLIT}:main"
+          echo "Mirrored ${SPLIT} -> ascript-lang/tree-sitter-ascript@main"

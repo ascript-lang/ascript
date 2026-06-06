@@ -37,8 +37,11 @@ The package ships the following tree-sitter query files under `queries/`:
 
 ## Source of truth
 
-The canonical grammar lives in the AScript repository at
-`docs/superpowers/specs/grammar/tree-sitter-ascript/` and is the single source of truth for both this
-npm/cargo artifact and the AScript engine itself: the engine's `build.rs` compiles the same
-`src/parser.c` directly. When the grammar changes, regenerate `parser.c` with
-`tree-sitter generate --abi 14` so both consumers stay in sync.
+This repo is a **published mirror**. The canonical grammar lives in the AScript monorepo
+([`ascript-lang/ascript`](https://github.com/ascript-lang/ascript)) at the top-level
+`tree-sitter-ascript/` directory — the single source of truth for both this npm/cargo
+artifact and the AScript engine itself (the engine's `build.rs` compiles the same
+`src/parser.c` directly). Changes are made there and mirrored here via `git subtree`
+(see `scripts/sync-grammar.sh` / the `mirror-grammar` workflow in the monorepo). When the
+grammar changes, regenerate `parser.c` with `tree-sitter generate --abi 14` so both
+consumers stay in sync.

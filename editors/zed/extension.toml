@@ -11,6 +11,6 @@ name = "AScript Language Server"
 languages = ["AScript"]
 
 [grammars.ascript]
-# Promoted standalone grammar from LSP Phase 5. Pin to a published commit.
+# Standalone grammar, published from ascript-lang/ascript (the tree-sitter-ascript/ subtree).
 repository = "https://github.com/ascript-lang/tree-sitter-ascript"
-commit = "0000000000000000000000000000000000000000" # TODO(phase5): pin to the published grammar commit
+commit = "6ec3075da980a080fc8eef7e3b0375aa3cc2d004"

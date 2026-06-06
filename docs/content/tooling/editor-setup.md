@@ -53,12 +53,12 @@ and launches the `ascript lsp` server. Override the binary in your Zed settings:
 }
 ```
 
-> [!NOTE] Zed loads the tree-sitter grammar from a published repository pinned by
-> commit in `editors/zed/extension.toml`. Until the standalone `tree-sitter-ascript`
-> grammar repo is published and that commit is pinned, the LSP-driven features (every
-> capability on the [capabilities page](tooling/lsp-capabilities)) work, but local
-> tree-sitter syntax highlighting falls back to plain text. The language server's
-> semantic tokens still color your code.
+> [!NOTE] Zed loads the tree-sitter grammar from the published
+> [`ascript-lang/tree-sitter-ascript`](https://github.com/ascript-lang/tree-sitter-ascript)
+> repo, pinned by commit in `editors/zed/extension.toml`. Every LSP capability (see the
+> [capabilities page](tooling/lsp-capabilities)) — including the language server's
+> semantic-token coloring — works regardless; the tree-sitter grammar adds the local
+> syntax highlighting on top.
 
 ## Neovim
 
@@ -88,9 +88,9 @@ The `editors/nvim/` directory ships this as a small `ascript` Lua module so you 
 Tree-sitter highlighting via [`nvim-treesitter`](https://github.com/nvim-treesitter/nvim-treesitter)
 registers the `ascript` parser plus the shared queries under `queries/ascript/`.
 
-> [!NOTE] As with Zed, the tree-sitter parser is pulled from the standalone grammar
-> repository; until it is published, register the parser from a local checkout (the
-> Neovim README documents the path). LSP features are unaffected.
+> [!NOTE] The tree-sitter parser is pulled from the published
+> [`ascript-lang/tree-sitter-ascript`](https://github.com/ascript-lang/tree-sitter-ascript)
+> repo (pinned by revision in the Neovim config). LSP features work regardless of the parser.
 
 Formatting: use the LSP (`vim.lsp.buf.format()`), or a
 [`conform.nvim`](https://github.com/stevearc/conform.nvim) recipe pointing at

@@ -146,7 +146,7 @@ deny_warnings = true
 
 Precedence is inline `// ascript-ignore[code]` > CLI flag > `ascript.toml` > rule
 default; `syntax-error` is always an error. See the
-[checker design spec](docs/superpowers/specs/2026-06-02-checker-design.md) for the
+[checker design spec](superpowers/specs/2026-06-02-checker-design.md) for the
 full rule-code list and details.
 
 `ascript check --fix` (or `--fix-dry-run` to preview) applies the safe, idempotent
@@ -249,7 +249,7 @@ cargo clippy --all-targets         # lint — kept clean in both feature configs
 ```
 
 Architecture and contributor guidance live in [CLAUDE.md](CLAUDE.md); the full design spec and
-milestone history are under [`docs/superpowers/`](docs/superpowers/).
+milestone history are under [`superpowers/`](superpowers/).
 
 ## License
 

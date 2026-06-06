@@ -14,10 +14,10 @@ function M.register()
   local parser_config = parsers.get_parser_configs()
   parser_config.ascript = {
     install_info = {
-      -- TODO(phase5): pin to the published tree-sitter-ascript repo + revision.
       url = "https://github.com/ascript-lang/tree-sitter-ascript",
       files = { "src/parser.c" },
-      branch = "main",
+      -- Pinned to the published grammar commit for reproducibility; bump on grammar updates.
+      revision = "6ec3075da980a080fc8eef7e3b0375aa3cc2d004",
       generate_requires_npm = false,
       requires_generate_from_grammar = false,
     },

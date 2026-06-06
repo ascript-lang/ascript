@@ -14,8 +14,8 @@ behavior-identical to the VM, not a second dialect.
 
 The design goal is **"Lua-simple language, Go/Deno-class standard library"**: the core stays tiny
 (~10 value kinds, gradual contracts, no hidden control flow) while the stdlib is deliberately rich.
-The authoritative design is `docs/superpowers/specs/2026-05-29-ascript-design.md` — the entire spec
-(§§2–16) is implemented. `docs/superpowers/roadmap.md` is the milestone-by-milestone record.
+The authoritative design is `superpowers/specs/2026-05-29-ascript-design.md` — the entire spec
+(§§2–16) is implemented. `superpowers/roadmap.md` is the milestone-by-milestone record.
 
 ## Documentation & examples
 
@@ -593,11 +593,11 @@ guardrail. If you change syntax, update both parsers and keep the examples passi
 - Commit trailer: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 - Workflow per milestone (see roadmap): writing-plans → subagent-driven-development (a fresh
   implementer plus an *independent* reviewer that runs commands and probes edges) → holistic review →
-  merge `--no-ff`. Plans live in `docs/superpowers/plans/`.
+  merge `--no-ff`. Plans live in `superpowers/plans/`.
 - Any spec deferral must be a documented, owner-noted Cargo feature or Tier-1 error — never a silent
   drop. Current deferrals: `http3` (feature), HTTP trailers (best-effort), `icu`/crossterm subsets,
   cross-file LSP features. M17 has three **architectural** non-goals (impossible under the approach-A
-  async engine — documented in spec §7 and `docs/superpowers/specs/adr/2026-05-30-async-generators.md`,
+  async engine — documented in spec §7 and `superpowers/specs/adr/2026-05-30-async-generators.md`,
   not code TODOs): durable/serializable continuations (needs an explicit-stack VM), robust unbounded
   deep recursion (needs stackful coroutines), and deterministic/replayable task scheduling.
   **Accepted SP1 trade-offs** (post-cutover, recorded so they are not mistaken for bugs): (1) a
