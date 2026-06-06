@@ -13,15 +13,31 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+/// What the background reader thread yields for each frame it pulls off stdout.
+enum ReadItem {
+    /// A fully-framed, parsed JSON-RPC message.
+    Msg(Value),
+    /// The stream hit EOF before a full message (e.g. the child died).
+    Eof,
+}
+
 /// A minimal LSP client driving the spawned server over its stdio.
+///
+/// Reads are performed on a dedicated background thread that pushes each framed
+/// message onto an `mpsc` channel; the test thread pulls with `recv_timeout` bounded
+/// by the per-test `deadline`. This is what makes the deadline *real*: a slow or
+/// missing response fails with a clear, deterministic panic at the deadline instead
+/// of blocking indefinitely inside a `read_line`/`read_exact` (which ignore the
+/// wall-clock check that only ran *between* reads).
 struct LspClient {
     child: Child,
     // `Option` so we can close stdin (drop it) to send EOF after `exit`; tower-lsp's
     // serve loop ends on stdin EOF, which is what actually drives a clean exit.
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    rx: Receiver<ReadItem>,
 }
 
 impl LspClient {
@@ -36,11 +52,29 @@ impl LspClient {
             .expect("failed to spawn `ascript lsp`");
         let stdin = Some(child.stdin.take().expect("child stdin"));
         let stdout = BufReader::new(child.stdout.take().expect("child stdout"));
-        LspClient {
-            child,
-            stdin,
-            stdout,
-        }
+
+        // Background reader: frame messages off stdout and forward them. It exits when
+        // the stream EOFs (it sends one `Eof` then stops) or when the receiver is
+        // dropped (the `send` fails). It never blocks the test thread.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stdout = stdout;
+            loop {
+                match read_framed_message(&mut stdout) {
+                    Some(msg) => {
+                        if tx.send(ReadItem::Msg(msg)).is_err() {
+                            return; // client gone
+                        }
+                    }
+                    None => {
+                        let _ = tx.send(ReadItem::Eof);
+                        return;
+                    }
+                }
+            }
+        });
+
+        LspClient { child, stdin, rx }
     }
 
     /// Write a single `Content-Length`-framed JSON-RPC message.
@@ -77,45 +111,39 @@ impl LspClient {
         self.send(&json!({ "jsonrpc": "2.0", "method": method }));
     }
 
-    /// Read exactly one `Content-Length`-framed JSON-RPC message and parse it.
+    /// Pull the next framed message from the reader thread, honoring `deadline`.
     ///
-    /// Returns `None` if the stream hits EOF before a full message is read (e.g.
-    /// the child died — the caller can then surface stderr).
-    fn read_message(&mut self) -> Option<Value> {
-        let mut content_length: Option<usize> = None;
-        // Read header lines until the blank separator line.
+    /// Returns `None` on EOF (the child closed stdout). Panics — with a clear,
+    /// deterministic message plus the child's stderr — if no message arrives before
+    /// `deadline`, so a genuinely hung server fails cleanly instead of blocking
+    /// forever inside a blocking read.
+    fn next_message(&mut self, deadline: Instant, waiting_for: &str) -> Option<Value> {
         loop {
-            let mut line = String::new();
-            let n = self.stdout.read_line(&mut line).ok()?;
-            if n == 0 {
-                return None; // EOF
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                panic!(
+                    "timed out waiting for {waiting_for}{}",
+                    self.drain_stderr()
+                );
             }
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if trimmed.is_empty() {
-                break; // end of headers
-            }
-            if let Some(rest) = trimmed
-                .strip_prefix("Content-Length:")
-                .or_else(|| trimmed.strip_prefix("content-length:"))
-            {
-                content_length = Some(rest.trim().parse().expect("parse Content-Length"));
+            // Cap each wait so we re-check the deadline promptly even if the channel
+            // never produces; `recv_timeout` itself does the blocking wait.
+            let step = remaining.min(Duration::from_millis(250));
+            match self.rx.recv_timeout(step) {
+                Ok(ReadItem::Msg(msg)) => return Some(msg),
+                Ok(ReadItem::Eof) => return None,
+                Err(RecvTimeoutError::Timeout) => continue, // re-check deadline
+                Err(RecvTimeoutError::Disconnected) => return None, // reader gone
             }
         }
-        let len = content_length.expect("message had no Content-Length header");
-        let mut body = vec![0u8; len];
-        self.stdout.read_exact(&mut body).ok()?;
-        Some(serde_json::from_slice(&body).expect("parse JSON body"))
     }
 
     /// Read messages until one with the given `id` (a response) arrives, skipping
     /// any notifications (which have no `id`) that interleave. Bounded by `deadline`.
     fn read_response(&mut self, id: i64, deadline: Instant) -> Value {
+        let waiting = format!("response id={id}");
         loop {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for response id={id}"
-            );
-            let msg = self.read_message().unwrap_or_else(|| {
+            let msg = self.next_message(deadline, &waiting).unwrap_or_else(|| {
                 panic!(
                     "server closed stream before response id={id}{}",
                     self.drain_stderr()
@@ -130,12 +158,9 @@ impl LspClient {
 
     /// Read messages until a notification with the given `method` arrives. Bounded.
     fn read_notification(&mut self, method: &str, deadline: Instant) -> Value {
+        let waiting = format!("`{method}` notification");
         loop {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for `{method}` notification"
-            );
-            let msg = self.read_message().unwrap_or_else(|| {
+            let msg = self.next_message(deadline, &waiting).unwrap_or_else(|| {
                 panic!(
                     "server closed stream before `{method}`{}",
                     self.drain_stderr()
@@ -188,9 +213,38 @@ impl Drop for LspClient {
     }
 }
 
+/// Read exactly one `Content-Length`-framed JSON-RPC message and parse it. Runs on
+/// the background reader thread (blocking reads are fine there — the test thread is
+/// never blocked). Returns `None` if the stream hits EOF before a full message.
+fn read_framed_message(stdout: &mut BufReader<ChildStdout>) -> Option<Value> {
+    let mut content_length: Option<usize> = None;
+    // Read header lines until the blank separator line.
+    loop {
+        let mut line = String::new();
+        let n = stdout.read_line(&mut line).ok()?;
+        if n == 0 {
+            return None; // EOF
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break; // end of headers
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("Content-Length:")
+            .or_else(|| trimmed.strip_prefix("content-length:"))
+        {
+            content_length = Some(rest.trim().parse().expect("parse Content-Length"));
+        }
+    }
+    let len = content_length.expect("message had no Content-Length header");
+    let mut body = vec![0u8; len];
+    stdout.read_exact(&mut body).ok()?;
+    Some(serde_json::from_slice(&body).expect("parse JSON body"))
+}
+
 #[test]
 fn lsp_protocol_end_to_end() {
-    let overall = Instant::now() + Duration::from_secs(30);
+    let overall = Instant::now() + Duration::from_secs(90);
     let mut client = LspClient::spawn();
 
     // 1. initialize -> capabilities.
@@ -738,7 +792,7 @@ fn lsp_cross_file_goto_definition_and_rename() {
     let b_uri = format!("file://{}", b_path.display());
     let root_uri = format!("file://{}", dir.display());
 
-    let overall = Instant::now() + Duration::from_secs(30);
+    let overall = Instant::now() + Duration::from_secs(90);
     let mut client = LspClient::spawn();
 
     client.request(
@@ -855,7 +909,7 @@ fn lsp_cross_file_goto_definition_and_rename() {
 /// deadlock within the overall deadline.
 #[test]
 fn lsp_full_capability_surface() {
-    let overall = Instant::now() + Duration::from_secs(30);
+    let overall = Instant::now() + Duration::from_secs(90);
     let mut client = LspClient::spawn();
 
     client.request(
@@ -976,7 +1030,14 @@ let count = 1\ncount = count + 1\n";
 /// they MUST return a well-formed response within the overall deadline.
 #[test]
 fn lsp_large_file_does_not_hang() {
-    let overall = Instant::now() + Duration::from_secs(30);
+    // This is a NON-HANG test, not a latency test: it asserts the server eventually
+    // returns a well-formed response via the large-file degradation path. Building a
+    // ~300 KiB `SemanticModel` in a debug binary under heavy concurrent compile/clippy
+    // load can legitimately take tens of seconds, so the deadline is generous — large
+    // enough to never trip on a merely-slow (but progressing) server, while still
+    // bounded so a *true* infinite hang fails cleanly (the deadline-honoring reads turn
+    // it into a deterministic panic rather than a blocked process).
+    let overall = Instant::now() + Duration::from_secs(120);
     let mut client = LspClient::spawn();
 
     client.request(
@@ -1079,7 +1140,7 @@ fn lsp_diagnostics_match_ascript_check() {
     let root_uri = format!("file://{}", dir.display());
 
     // (a) LSP diagnostics for the file, as a set of `code` strings.
-    let overall = Instant::now() + Duration::from_secs(30);
+    let overall = Instant::now() + Duration::from_secs(90);
     let mut client = LspClient::spawn();
     client.request(
         1,
