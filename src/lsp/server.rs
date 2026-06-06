@@ -238,14 +238,13 @@ pub fn server_capabilities() -> ServerCapabilities {
             resolve_provider: Some(true),
         }),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: vec![
-                crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string(),
-                // Phase 4: codeLens run/runTest commands (acknowledged, not executed
-                // by the server — the static-only invariant: the editor extension
-                // binds these to a terminal task).
-                "ascript.run".to_string(),
-                "ascript.runTest".to_string(),
-            ],
+            // ONLY server-executed commands belong here — the LSP client auto-registers a
+            // VS Code command for each, so listing a client-owned id (e.g. `ascript.run`,
+            // which the editor extension registers itself and binds to a terminal task)
+            // collides with the extension ("command 'ascript.run' already exists") and aborts
+            // initialization. The codeLens still emits `ascript.run`/`ascript.runTest` as
+            // Command ids; the extension owns and handles them.
+            commands: vec![crate::lsp::providers::code_action::FIX_ALL_COMMAND.to_string()],
             work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         // Phase 3: call hierarchy (prepare/incoming/outgoing) over the workspace
@@ -1892,13 +1891,15 @@ mod tests {
         let exec = caps
             .execute_command_provider
             .expect("execute-command provider");
-        assert!(exec.commands.iter().any(|c| c == "ascript.run"));
-        assert!(exec.commands.iter().any(|c| c == "ascript.runTest"));
-        // The Phase 1 fix-all command is still present (extended, not overwritten).
-        assert!(exec
-            .commands
-            .iter()
-            .any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND));
+        // Only SERVER-executed commands are advertised. The client auto-registers a VS Code
+        // command per id, so client-owned codeLens commands (`ascript.run`/`ascript.runTest`,
+        // which the extension registers + binds to a terminal) MUST NOT appear here, or they
+        // collide with the extension and abort init.
+        assert!(
+            exec.commands.iter().any(|c| c == crate::lsp::providers::code_action::FIX_ALL_COMMAND)
+        );
+        assert!(!exec.commands.iter().any(|c| c == "ascript.run"));
+        assert!(!exec.commands.iter().any(|c| c == "ascript.runTest"));
     }
 
     #[test]

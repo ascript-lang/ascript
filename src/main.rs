@@ -90,7 +90,12 @@ enum Command {
     },
     /// Run the language server (LSP over stdio)
     #[cfg(feature = "lsp")]
-    Lsp,
+    Lsp {
+        /// Accepted for compatibility with LSP clients that pass `--stdio` (e.g. some
+        /// VS Code client configs). stdio is the only transport, so this is a no-op.
+        #[arg(long = "stdio")]
+        stdio: bool,
+    },
     /// Add a dependency to ascript.toml + lock (git/url/path spec).
     #[cfg(feature = "pkg")]
     Add {
@@ -520,7 +525,7 @@ async fn real_main() -> ExitCode {
             }
         }
         #[cfg(feature = "lsp")]
-        Command::Lsp => {
+        Command::Lsp { .. } => {
             ascript::lsp::run_server().await;
             ExitCode::SUCCESS
         }
