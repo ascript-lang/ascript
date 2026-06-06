@@ -16,6 +16,7 @@
     <a href="reader.html#/introduction">Docs</a>
     <a href="reader.html#/stdlib/overview">Standard library</a>
     <a href="reader.html#/examples">Examples</a>
+    <a href="https://github.com/ascript-lang/ascript" target="_blank" rel="noopener">GitHub</a>
   </nav>
   <span class="spacer"></span>
   <button class="searchbtn" data-action="search"><span>Search docs</span><kbd>⌘K</kbd></button>
@@ -27,7 +28,7 @@
   <!-- HERO -->
   <section class="hero">
     <div>
-      <span class="hero-eyebrow">Gradually typed · Rust-powered</span>
+      <span class="hero-eyebrow">Gradually typed · Rust-powered · Vibe-coded</span>
       <h1>A <em>focused</em> language with<br>serious batteries.</h1>
       <p class="lead">AScript reads like JavaScript, adds gradual types and structured
         concurrency, and ships a Go-class standard library — HTTP, WebSockets, SQLite,
@@ -37,9 +38,9 @@
         <a class="btn btn-ghost" href="reader.html#/stdlib/overview">Explore the stdlib</a>
       </div>
       <div class="hero-stats">
-        <div><span class="n">8</span><span class="l">core value kinds</span></div>
-        <div><span class="n">28</span><span class="l">std modules</span></div>
-        <div><span class="n">540</span><span class="l">tests passing</span></div>
+        <div><span class="n">16</span><span class="l">core value kinds</span></div>
+        <div><span class="n">54</span><span class="l">std modules</span></div>
+        <div><span class="n">2,565</span><span class="l">tests passing</span></div>
       </div>
     </div>
 
@@ -131,7 +132,9 @@
     <div>
       <a href="reader.html#/introduction">Documentation</a> ·
       <a href="reader.html#/cli">CLI</a> ·
-      <a href="reader.html#/examples">Examples</a>
+      <a href="reader.html#/examples">Examples</a> ·
+      <a href="https://github.com/ascript-lang/ascript" target="_blank" rel="noopener">Source (GitHub)</a> ·
+      <a href="https://github.com/ascript-lang/tree-sitter-ascript" target="_blank" rel="noopener">Tree-sitter grammar</a>
     </div>
   </div>
 </footer>
@@ -150,15 +153,20 @@
   document.getElementById('hero-code').innerHTML = highlightAScript(
 `import { get } from "std/net/http"
 
-// Fetch a user — errors are plain values, no exceptions.
-async fn loadUser(id: number): Result<object> {
-  let [resp, err] = await get(\`https://api.example.com/users/\${id}\`)
-  if (err != nil) { return Err(err.message) }
-  return await resp.json()
+// Typed fields + a default, validated at the boundary.
+class User {
+  id: number
+  name: string
+  role: string = "guest"
 }
 
-let [user, err] = await loadUser(42)
-print(err == nil ? \`hi \${user.name}\` : "lookup failed")`);
+async fn fetchUser(id: number): Result<User> {
+  let resp = await get(\`https://api.example.com/users/\${id}\`)?  // ? propagates errors
+  return await resp.json(User)                                  // parse + validate in one step
+}
+
+let user = await fetchUser(42)!   // ! unwraps, or panics (recoverably)
+print(\`\${user.name} — \${user.role}\`)`);
 </script>
 </body>
 </html>

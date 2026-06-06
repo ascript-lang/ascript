@@ -48,7 +48,7 @@ color  = "^1.2.0"                                                      # FUTURE:
 A **bare specifier** (no `./`, `../`, or `std/` prefix) resolves through the
 dependency set:
 
-```javascript
+```ascript
 import { get } from "http"          // the http package's entry module
 import { Router } from "http/router" // a SUBPATH module inside the http package
 import { Schema } from "@acme/schema" // a scoped package's entry

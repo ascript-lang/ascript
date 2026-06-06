@@ -25,7 +25,7 @@ append-only log instead of re-executing.
 
 ## API
 
-```as
+```ascript
 import { run, resume, activity } from "std/workflow"
 
 // An activity wraps a side-effecting fn. Its RESULT is recorded.

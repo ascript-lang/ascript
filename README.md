@@ -7,25 +7,33 @@
 [![CI](https://github.com/ascript-lang/ascript/actions/workflows/ci.yml/badge.svg)](https://github.com/ascript-lang/ascript/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-ascript--lang.github.io-3b82f6)](https://ascript-lang.github.io/ascript/)
+[![Vibe-coded](https://img.shields.io/badge/vibe--coded-%E2%9C%A8-ff69b4)](https://github.com/ascript-lang/ascript/commits/main)
 
 AScript is a gradually-typed, multi-paradigm scripting language with JavaScript-flavored syntax,
 runtime-checked type contracts (plus an advisory static checker), first-class structured concurrency,
 and a batteries-included standard library — all in a single Rust binary.
 
+_Vibe-coded: designed and built end-to-end with AI (Claude), human-directed._
+
 </div>
 
 ```ascript
 import { get } from "std/net/http"
-import * as json from "std/json"
 
-async fn weather(city: string): Result<object> {
-  let [resp, err] = await get(`https://api.example.com/weather?q=${city}`)
-  if (err != nil) { return Err(err.message) }
-  return await resp.json()
+// Typed fields + a default, validated at the boundary.
+class User {
+  id: number
+  name: string
+  role: string = "guest"
 }
 
-let [report, err] = await weather("Lisbon")
-print(err == nil ? `${report.tempC}°C in Lisbon` : "could not load weather")
+async fn fetchUser(id: number): Result<User> {
+  let resp = await get(`https://api.example.com/users/${id}`)?  // ? propagates errors
+  return await resp.json(User)                                  // parse + validate in one step
+}
+
+let user = await fetchUser(42)!   // ! unwraps, or panics (recoverably)
+print(`${user.name} — ${user.role}`)
 ```
 
 ## Why AScript
@@ -251,8 +259,8 @@ See the [Examples page](docs/content/examples.md) for the full catalog.
 ## Development
 
 ```bash
-cargo test                         # full suite (~540 tests, all features)
-cargo test --no-default-features   # core language only (~245 tests)
+cargo test                         # full suite (~2,565 tests, all features)
+cargo test --no-default-features   # core language only (~1,854 tests)
 cargo clippy --all-targets         # lint — kept clean in both feature configs
 ```
 
