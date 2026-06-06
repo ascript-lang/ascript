@@ -3,7 +3,7 @@
 AScript ships a first-class language server (`ascript lsp`, stdio JSON-RPC) plus a
 tree-sitter grammar and a canonical formatter (`ascript fmt`). This page gets each
 supported editor talking to them. For the full list of methods the server answers,
-see [LSP capabilities](tooling/lsp-capabilities).
+see [LSP capabilities](lsp-capabilities).
 
 All three editors discover the server on your `PATH` as `ascript`. Build it once:
 
@@ -56,7 +56,7 @@ and launches the `ascript lsp` server. Override the binary in your Zed settings:
 > [!NOTE] Zed loads the tree-sitter grammar from the published
 > [`ascript-lang/tree-sitter-ascript`](https://github.com/ascript-lang/tree-sitter-ascript)
 > repo, pinned by commit in `editors/zed/extension.toml`. Every LSP capability (see the
-> [capabilities page](tooling/lsp-capabilities)) — including the language server's
+> [capabilities page](lsp-capabilities)) — including the language server's
 > semantic-token coloring — works regardless; the tree-sitter grammar adds the local
 > syntax highlighting on top.
 

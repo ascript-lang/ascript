@@ -86,16 +86,28 @@ The standard library is split into Cargo features, all enabled by `default`:
 
 | Feature | Modules it enables |
 |---|---|
-| `data` | json, csv, toml, yaml, encoding, regex, uuid, bytes |
+| `data` | json, csv, toml, yaml, encoding, regex, uuid, url |
+| `binary` | msgpack, cbor (depends on `data`) |
 | `datetime` | date |
 | `intl` | intl |
-| `sys` | fs, env, process |
+| `sys` | fs, io, env, os, process |
+| `sysinfo` | live system metrics (`std/os`) |
 | `crypto` | crypto |
 | `compress` | compress |
 | `sql` | sqlite |
-| `net` | net/tcp, net/http, http/server, net/ws |
+| `postgres` | postgres |
+| `redis` | redis |
+| `net` | net (DNS), net/tcp, net/udp, net/http, http/server, net/ws |
+| `log` | log (structured leveled logging) |
+| `workflow` | workflow (durable execution; depends on `data`) |
 | `tui` | tui |
 | `lsp` | the `ascript lsp` language server |
+| `pkg` | the `ascript add`/`install` package manager (depends on `net` + `compress`) |
+| `telemetry` | telemetry (OTLP traces/metrics, Sentry, PostHog) |
+| `ai` | the LLM client (`std/ai`) |
+
+Only one feature is **opt-in** (not in `default`): `http3` (see the note below) — reqwest's HTTP/3
+backend is still unstable, so it would otherwise break a plain `cargo build`.
 
 Building with a subset (for a smaller binary or fewer dependencies) cleanly omits the rest:
 
@@ -106,9 +118,17 @@ cargo build --no-default-features --features "data,sys,net"
 > [!NOTE] `std/math`, `std/string`, `std/array`, `std/object`, `std/map`, `std/convert`, and
 > `std/time` are always available — they have no feature gate.
 
+> [!NOTE] `http3` is an opt-in feature (not in `default`) that additionally requires
+> `RUSTFLAGS="--cfg reqwest_unstable"` because reqwest's HTTP/3 backend is still unstable.
+
 ## Where to go next
 
 - [Syntax & control flow](language/syntax) — the whole grammar in one page.
 - [Errors & results](language/errors) — the `[value, err]` convention and the `?` operator.
 - [Standard library overview](stdlib/overview) — how imports and error tiers work.
 - [Examples](examples) — complete, runnable programs for every domain.
+- [Pattern matching](language/classes-enums) — `match`, range patterns, guards, object/array destructuring.
+- [Generators & async](language/modules-async) — `fn*`, `async fn*`, `yield`, and `for await`.
+- [Concurrency](stdlib/async) — the cooperative event loop, `std/task` `spawn`/`gather`/`race`/`timeout`.
+- [Static checker](cli) — `ascript check` with advisory gradual types (`type-mismatch`, `possibly-nil`).
+- [Packages](packages) — `ascript add` / `ascript install` and the decentralized dependency model.

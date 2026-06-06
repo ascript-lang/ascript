@@ -9,30 +9,44 @@
 
 ## 1. Vision & Design Priorities
 
-AScript is a small, dynamically-typed scripting language with **JavaScript-flavored
-syntax**, a **batteries-included standard library**, and **optional runtime-checked
-type annotations**, executed by a **tree-walking interpreter written in Rust**.
+AScript is a gradually-typed, multi-paradigm scripting language with **JavaScript-flavored
+syntax**, a **batteries-included standard library**, and **runtime-checked type contracts**
+(plus an advisory static checker), compiled to bytecode and executed by a **virtual machine
+written in Rust** — with the original **tree-walking interpreter retained as a byte-identical
+reference oracle** and `--tree-walker` debug engine.
 
-The guiding model is **"Lua-simple language, Go/Deno-class standard library"**:
+> **Original v1 framing (2026-05-29), kept for the record:** "a small, dynamically-typed
+> scripting language … executed by a tree-walking interpreter." The language has since grown a
+> bytecode VM (now the default) and a coherent gradual type discipline; the characterization
+> above reflects the current reality.
 
-- The *language core* stays as simple as Lua — a tree-walking interpreter, ~8 value
-  kinds, gradual contracts, no hidden control flow.
+The guiding model is **a focused core with a Go-class standard library**:
+
+- The *language core* stays approachable — a small set of value kinds (~16), gradual type
+  contracts, no hidden control flow — but it is genuinely multi-paradigm: object-oriented
+  (classes, inheritance, `instanceof`), functional (closures, pattern matching, generators,
+  destructuring, ranges, lazy streams), and concurrent (`async`/`await`, structured
+  concurrency, channels, durable workflows).
 - The *standard library and tooling* are deliberately rich, because Rust's crate
   ecosystem makes high-quality batteries cheap to include.
 
 Design priorities, in strict order:
 
-1. **Simplicity** — a beginner can hold the whole language in their head.
+1. **Simplicity** — the core stays small and predictable; no hidden control flow.
 2. **Safety** — errors are explicit; mistakes fail loudly, not silently.
 3. **Familiarity** — anyone who knows JavaScript can read AScript immediately.
 4. **Performance** — adequate for scripting; never at the expense of the above.
 
 ### Non-goals (v1)
 
-- No static type inference or compile-time type checking (types are runtime contracts).
-- No bytecode VM or JIT (tree-walker only). **Superseded 2026-06-04:** a bytecode VM is now
-  the **default** engine and the tree-walker is the byte-identical reference oracle (`--tree-walker`;
-  CLAUDE.md architecture, `src/lib.rs` `vm_run_source`). JIT remains a non-goal.
+- No *blocking* compile-time type checking — types are enforced as runtime contracts.
+  **Refined (SP10):** an **advisory** static gradual type checker now ships (`ascript check`
+  emits `type-mismatch`/`type-error`/`possibly-nil`, LSP hover types), but it is non-blocking
+  and never erases types. Whole-program type *inference* remains a non-goal.
+- No JIT. **Note (2026-06-04):** the original "no bytecode VM" non-goal was superseded — a
+  bytecode VM is now the **default** engine and the tree-walker is the byte-identical reference
+  oracle (`--tree-walker`; CLAUDE.md architecture, `src/lib.rs` `vm_run_source`). JIT itself
+  remains a non-goal.
 - No multithreading in user code (single-threaded event loop; see §7).
 - No macro system, operator overloading, or metaprogramming.
 - ~~No package manager / registry (deferred to a future spec).~~ **Shipped in

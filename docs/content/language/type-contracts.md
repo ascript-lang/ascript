@@ -52,6 +52,7 @@ scale("3")   // panic: type contract violated: expected number, got string ("3")
 | `T1 \| T2` | a union — satisfied if either side matches |
 | `ClassName` | an instance of that class or any subclass |
 | `EnumName` | any variant of that enum |
+| `future<T>` | a `future` value (the result of calling an `async fn`) |
 | `T?` | `T` **or** nil — the nullable suffix, sugar for `T \| nil` |
 
 ## The nullable suffix `T?`

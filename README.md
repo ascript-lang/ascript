@@ -2,15 +2,15 @@
 
 # AScript
 
-**A Lua-simple language with a Go/Deno-class standard library.**
+**A multi-paradigm scripting language with gradual types, structured concurrency, and a Go-class standard library.**
 
 [![CI](https://github.com/ascript-lang/ascript/actions/workflows/ci.yml/badge.svg)](https://github.com/ascript-lang/ascript/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-ascript--lang.github.io-3b82f6)](https://ascript-lang.github.io/ascript/)
 
-AScript is a small, dynamically-typed scripting language with JavaScript-flavored syntax, optional
-runtime-checked type contracts, and a batteries-included standard library — all in a single Rust
-binary.
+AScript is a gradually-typed, multi-paradigm scripting language with JavaScript-flavored syntax,
+runtime-checked type contracts (plus an advisory static checker), first-class structured concurrency,
+and a batteries-included standard library — all in a single Rust binary.
 
 </div>
 
@@ -30,12 +30,16 @@ print(err == nil ? `${report.tempC}°C in Lisbon` : "could not load weather")
 
 ## Why AScript
 
-The guiding model is **"Lua-simple language, Go/Deno-class standard library."** The core stays tiny —
-~10 value kinds, gradual contracts, no hidden control flow — and runs on a register-light **bytecode
-VM** with inline caches and a cycle-collecting GC. The library does the heavy lifting, because Rust's
-crate ecosystem makes high-quality batteries cheap.
+The guiding model is **a focused core with a Go-class standard library.** The core stays
+approachable — a small set of value kinds, gradual type contracts, no hidden control flow — but it is
+genuinely multi-paradigm: object-oriented (classes, inheritance, `instanceof`), functional (closures,
+pattern matching, generators, destructuring, ranges, lazy streams), and concurrent (`async`/`await`,
+structured concurrency, channels, durable workflows). It runs on a register-light **bytecode VM** with
+inline caches and a cycle-collecting GC. The library does the heavy lifting, because Rust's crate
+ecosystem makes high-quality batteries cheap.
 
-Design priorities, in strict order: **simplicity → safety → familiarity → performance**.
+Design priorities, in strict order: **simplicity → safety → familiarity → performance**. "Simplicity"
+here means a core you can hold in your head and no hidden control flow — not a feature-poor language.
 
 - **Familiar syntax** — braces, `fn`, arrows, template strings, `for…of`. If you read JavaScript, you read AScript.
 - **Gradual type contracts** — optional annotations, checked at runtime as contracts, never erased. Includes the nullable suffix `T?` (≡ `T | nil`) and typed class fields (required, optional, defaulted) checked on assignment.

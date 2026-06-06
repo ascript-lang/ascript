@@ -112,6 +112,8 @@ include:
 - An explicit `assert(cond, msg)` failure.
 - A `!` [force-unwrap](#the--force-unwrap-operator) on a failed result pair (recoverable via `recover`).
 - A `ClassName.from(obj)` [shape mismatch](classes-enums) (recoverable, carries a field path).
+- Spreading the wrong container kind — e.g. `[...5]` or `{...5}` — is a runtime panic (spreading
+  into an array requires an array; spreading into an object requires an object).
 - Misusing a builtin (e.g. `len` on a number).
 - Exceeding the **recursion-depth limit** — `maximum recursion depth exceeded` (recoverable via
   `recover`). Deep non-terminating recursion (and deeply nested expressions) hit a fixed logical-depth
@@ -174,4 +176,15 @@ exit(1)
 exit()
 ```
 
-`exit` is a global builtin — no import needed. Call it only after all output has been flushed (or at the very end of the program); because `print` output is buffered and flushed at normal program exit, an `exit` call in the middle of output may cause in-flight `print` calls to be dropped. For scripts that need to signal failure to the shell, `exit(1)` at the end is the conventional idiom.
+`exit` is a global builtin — no import needed.
+
+Under the CLI `ascript run` command, `print` streams **live to stdout** — output appears immediately
+and is retained even if the program later panics. Calling `exit` at any point is therefore safe: all
+previously printed output has already been written.
+
+In capture mode (the REPL and `ascript test`), output goes to an internal buffer that is flushed at
+the end of the run. In that context, `exit` bypasses normal cleanup and in-flight buffered output
+may be dropped — but this is rarely a concern in practice, since test assertions are checked before
+any `exit` is reached.
+
+For scripts that need to signal failure to the shell, `exit(1)` at the end is the conventional idiom.

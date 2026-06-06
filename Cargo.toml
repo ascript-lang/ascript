@@ -2,7 +2,7 @@
 name = "ascript"
 version = "0.1.0"
 edition = "2021"
-description = "A small, dynamically-typed, JavaScript-flavored scripting language with runtime-checked type contracts and a batteries-included standard library."
+description = "A gradually-typed, multi-paradigm, JavaScript-flavored scripting language with runtime-checked type contracts, structured concurrency, and a batteries-included standard library."
 repository = "https://github.com/ascript-lang/ascript"
 license = "MIT"
 readme = "README.md"
@@ -100,7 +100,7 @@ tree-sitter = "0.25"
 tempfile = "3"
 
 [features]
-default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg"]
+default = ["data", "datetime", "intl", "sys", "crypto", "compress", "sql", "net", "tui", "lsp", "log", "sysinfo", "binary", "postgres", "redis", "workflow", "pkg", "telemetry", "ai"]
 # SP6 package manager / dependency story. Decentralized-first (git/url/path deps;
 # bare-version requirements need a future registry). CLI-only and feature-gated,
 # exactly like `src/lint_config_toml.rs` keeps TOML/IO out of the interpreter

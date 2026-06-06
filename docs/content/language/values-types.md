@@ -23,6 +23,8 @@ AScript has a small, fixed set of value kinds. `type(v)` returns the kind name a
 | Class | `class` | `class Name { … }` | `<class Name>` |
 | Instance | `instance` | `Name(args)` | `<Name instance>` |
 | Enum | `enum` | `enum Name { … }` | `<enum Name>` |
+| Future | `future` | *(calling an `async fn`)* | `<future>` |
+| Generator | `generator` | *(calling a `fn*` or `async fn*`)* | `<generator>` |
 
 ## Numbers
 
@@ -69,7 +71,7 @@ xs == xs              // true  — same reference
 ## Value vs reference semantics
 
 `nil`, `bool`, `number`, and `string` are value-semantic (copied on assignment). `array`, `object`,
-`map`, `bytes`, and class instances are heap values shared **by reference** — assignment copies the
+`map`, `set`, `bytes`, and class instances are heap values shared **by reference** — assignment copies the
 handle, not the contents.
 
 ```ascript

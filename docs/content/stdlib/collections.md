@@ -1062,7 +1062,7 @@ math.random()   // e.g. 0.7421…
 > `math.random`/`randomInt`/`shuffle`/`sample`, `uuid.v4`, and `crypto.randomBytes` draw from a
 > per-`Interp` **seeded** PRNG that is recorded and replayed, so two same-seed runs are
 > byte-identical. Outside deterministic mode the generator is the normal time-seeded one (no
-> behavior change). See [Workflows](?p=stdlib/workflow).
+> behavior change). See [Workflows](workflow).
 
 ### math.sin
 

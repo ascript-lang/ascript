@@ -2,7 +2,7 @@
 
 # Data & serialization
 
-AScript ships a family of data-handling modules for the formats you reach for every day: JSON, CSV, TOML, and YAML serialization; base64/hex/URL/UTF-8 encoding; regular expressions; UUID generation; and URL manipulation. All eight modules — `std/json`, `std/csv`, `std/toml`, `std/yaml`, `std/encoding`, `std/regex`, `std/uuid`, and `std/url` — are provided by the `data` Cargo feature, which is enabled by default. If you build AScript with a custom feature set, include `data` to keep these modules available.
+AScript ships a family of data-handling modules for the formats you reach for every day: JSON, CSV, TOML, and YAML serialization; MessagePack and CBOR binary serialization; exact decimal arithmetic; base64/hex/URL/UTF-8 encoding; regular expressions; UUID generation; and URL manipulation. All eleven modules — `std/json`, `std/csv`, `std/toml`, `std/yaml`, `std/msgpack`, `std/cbor`, `std/decimal`, `std/encoding`, `std/regex`, `std/uuid`, and `std/url` — are provided by the `data` Cargo feature, which is enabled by default. If you build AScript with a custom feature set, include `data` to keep these modules available.
 
 > [!TIER1] Fallible functions return a two-element `[value, err]` pair — `err` is `nil` on success. Destructure: `let [v, e] = json.parse(s)`.
 

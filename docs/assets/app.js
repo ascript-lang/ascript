@@ -27,17 +27,23 @@ const NAV = [
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
     ['stdlib/collections', 'Core & collections'],
-    ['stdlib/utilities', 'Utilities (LRU, events, templates)'],
     ['stdlib/data', 'Data & serialization'],
+    ['stdlib/schema', 'Validation & schemas'],
     ['stdlib/system', 'System & files'],
-    ['stdlib/db', 'Databases (Postgres & Redis)'],
+    ['stdlib/db', 'Databases (SQLite, Postgres & Redis)'],
     ['stdlib/time', 'Time & locale'],
     ['stdlib/net', 'Networking & HTTP'],
-    ['stdlib/log', 'Logging'],
+    ['stdlib/async', 'Async & concurrency'],
+    ['stdlib/stream', 'Lazy streams'],
+    ['stdlib/utilities', 'Utilities (LRU, events, templates)'],
     ['stdlib/workflow', 'Workflows (durable execution)'],
     ['stdlib/telemetry', 'Telemetry & observability'],
     ['stdlib/ai', 'AI (LLM client)'],
+    ['stdlib/log', 'Logging'],
+    ['stdlib/cli', 'CLI & terminal'],
     ['stdlib/tui', 'Terminal UI'],
+    ['stdlib/assert', 'Test assertions'],
+    ['stdlib/bench', 'Benchmarking'],
   ]},
   { title: 'Tooling', items: [
     ['tooling/editor-setup', 'Editor setup'],
@@ -53,8 +59,30 @@ const PAGE_ORDER = [];
 NAV.forEach(s => s.items.forEach(([slug, title]) => { PAGE_TITLES[slug] = title; PAGE_ORDER.push(slug); }));
 
 // ======================= Markdown renderer ===============================
+// Directory (content-root-relative, trailing '/') of the page being rendered,
+// so in-content relative links (`type-contracts`, `../stdlib/data`) resolve
+// against it. Set by loadPage before each renderMarkdown call.
+let RENDER_DIR = '';
+
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Resolve an in-content markdown link (possibly relative, with `../` and/or a
+// trailing `#anchor`) to a hash-router href, relative to RENDER_DIR. A leading
+// `/` means content-root-absolute.
+function resolveDocHref(u) {
+  const h = u.indexOf('#');
+  const path = h === -1 ? u : u.slice(0, h);
+  const anchor = h === -1 ? '' : u.slice(h); // keeps the leading '#'
+  const base = path.startsWith('/') ? '' : RENDER_DIR;
+  const out = [];
+  for (const p of (base + path.replace(/^\//, '')).split('/')) {
+    if (p === '' || p === '.') continue;
+    if (p === '..') out.pop();
+    else out.push(p);
+  }
+  return `#/${out.join('/')}${anchor}`;
 }
 
 function renderInline(s) {
@@ -65,7 +93,7 @@ function renderInline(s) {
   // links [text](url)
   s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t, u) => {
     const internal = !/^https?:|^#|^mailto:/.test(u);
-    const href = internal ? `#/${u.replace(/^\.?\//, '')}` : u;
+    const href = internal ? resolveDocHref(u) : u;
     const ext = /^https?:/.test(u) ? ' target="_blank" rel="noopener"' : '';
     return `<a href="${href}"${ext}>${t}</a>`;
   });
@@ -332,6 +360,7 @@ async function loadPage(slug) {
     const res = await fetch(`content/${slug}.md`, { cache: 'no-cache' });
     if (!res.ok) throw new Error(res.status);
     const md = await res.text();
+    RENDER_DIR = slug.includes('/') ? slug.slice(0, slug.lastIndexOf('/') + 1) : '';
     const { html, headings } = renderMarkdown(md);
     content.innerHTML = `<div class="content-inner prose">${html}${pageNavHtml(slug)}</div>`;
     currentSlug = slug;

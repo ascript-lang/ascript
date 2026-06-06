@@ -2,8 +2,8 @@
 
 # Standard library overview
 
-AScript's standard library is deliberately rich — the philosophy is *"Lua-simple language, Go/Deno-class
-standard library."* Each `std/*` module is implemented in native Rust over AScript's
+AScript's standard library is deliberately rich — a **Go-class standard library** wrapped around a
+focused language core. Each `std/*` module is implemented in native Rust over AScript's
 [value model](../language/values-types), so the batteries are fast and dependency-light.
 
 ## Importing modules
@@ -65,17 +65,22 @@ json, crypto, …) need no `await`.
 
 | Page | Modules |
 |---|---|
-| [Core & collections](collections) | `string` · `array` · `object` · `map` · `math` · `convert` · `bytes` |
+| [Core & collections](collections) | `string` · `array` · `object` · `map` · `set` · `math` · `decimal` · `convert` · `bytes` |
 | [Data & serialization](data) | `json` · `csv` · `toml` · `yaml` · `msgpack` · `cbor` · `encoding` · `regex` · `uuid` · `url` |
 | [Validation & schema](schema) | `schema` (composable validators, constraints, refine, coerce, fromClass) |
-| [System & files](system) | `fs` · `env` · `io` · `process` · `crypto` · `compress` · `sqlite` |
+| [System & files](system) | `fs` · `env` · `os` · `io` · `process` · `crypto` · `compress` |
+| [Databases](db) | `sqlite` · `postgres` · `redis` |
 | [CLI & terminal](cli) | `cli` · `color` |
 | [Time & locale](time) | `time` (+ `interval`/`debounce`/`throttle`) · `date` · `intl` |
-| [Networking & HTTP](net) | `net/tcp` · `net/http` · `http/server` · `net/ws` |
+| [Networking & HTTP](net) | `net` (DNS) · `net/tcp` · `net/udp` · `net/http` · `http/server` · `net/ws` |
 | [Async & concurrency](async) | `task` (+ `retry`) · `sync` (channels · semaphore · rateLimiter) |
+| [Lazy streams](stream) | `stream` (lazy pull engine: sources, combinators, terminals) |
+| [Utilities](utilities) | `lru` · `events` · `template` |
+| [Durable workflows](workflow) | `workflow` (event-sourced replay: `run` · `resume` · `activity` · `ctx`) |
+| [AI](ai) | `ai` (multi-provider LLM: generate · stream · embed · tool) |
+| [Telemetry](telemetry) | `telemetry` (OTLP traces/metrics · Sentry · PostHog) |
 | [Logging](log) | `log` |
 | [Terminal UI](tui) | `tui` |
-| [Lazy streams](stream) | `stream` (lazy pull engine: sources, combinators, terminals) |
 | [Test assertions](assert) | `assert` (deep eq, comparisons, contains, approxEq, throws, snapshot) |
 | [Benchmarking](bench) | `bench` (measure · compare) |
 

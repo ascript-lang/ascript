@@ -370,6 +370,19 @@ match n {
 }
 ```
 
+A `step` makes the pattern a **strided membership** test: `start..end step k` matches a subject `x`
+when `x` is in range *and* `(x − start)` is a whole multiple of `k` (the anchor is `start`):
+
+```ascript
+fn classify(n: number): string {
+  return match n {
+    1..=10 step 2 => "odd in 1..10",   // matches 1, 3, 5, 7, 9
+    1..=10        => "even in 1..10",  // catches the rest in range
+    _             => "out of range",
+  }
+}
+```
+
 #### Array patterns
 
 `[p0, p1, …]` matches an array with exactly that many elements (unless a trailing rest is

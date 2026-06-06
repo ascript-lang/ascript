@@ -2,7 +2,7 @@
 
 # System & files
 
-These modules give AScript programs access to the host system: the filesystem, the process environment, subprocesses, host OS facts, live system metrics, cryptography, compression, and an embedded SQLite database. Each module is imported by its path, for example `import { read, write } from "std/fs"`.
+These modules give AScript programs access to the host system: the filesystem, the process environment, subprocesses, host OS facts, live system metrics, cryptography, and compression. Each module is imported by its path, for example `import { read, write } from "std/fs"`.
 
 Most of these modules are gated behind Cargo features, all of which are **on by default**:
 
@@ -13,7 +13,6 @@ Most of these modules are gated behind Cargo features, all of which are **on by 
 | `std/os` (live metrics: memory, swap, cpuUsage, loadAvg, disks, uptime, networkInterfaces, localIp) | `sysinfo` |
 | `std/crypto` | `crypto` |
 | `std/compress` | `compress` |
-| `std/sqlite` | `sql` |
 
 > [!TIER1]
 > Fallible I/O follows the **Tier-1** convention: the function returns a `[value, err]` pair. On success `err` is `nil`; on failure `value` is `nil` and `err` is an error object with a `message` field. Always destructure and check, e.g. `let [text, err] = read(path)`.
@@ -877,66 +876,4 @@ is a Tier-2 panic; an I/O failure is Tier-1.
 import { tarCreate, tarExtract } from "std/compress"
 let [archive, e1] = tarCreate([{ name: "a.txt", data: "hello" }])
 let [entries, e2] = tarExtract(archive)
-```
-
-## std/sqlite
-
-Embedded SQLite access, backed by a bundled SQLite (no system library required). `open` is the only module-level function; everything else is a method on a connection or statement handle.
-
-Values map between AScript and SQLite as follows: `Number` → integer (if integral) or real, `Str` → text, `Bool` → integer `0`/`1`, `Nil` → null, `Bytes` → blob. Reading back: integer/real → `Number`, text → `Str`, blob → `Bytes`, null → `Nil`.
-
-**Parameter binding.** Pass parameters as the optional second argument:
-
-- A **positional array** binds `?` placeholders in order: `conn.exec("INSERT INTO t VALUES (?, ?)", [1, "alice"])`.
-- A **named object** binds `:name` placeholders by key (the leading `:` in the key is optional): `conn.exec("INSERT INTO t VALUES (:id, :name)", { id: 1, name: "alice" })`.
-
-> [!TIER2]
-> Using a connection or statement handle after `close()` (or after its connection is closed) is a use-after-close Tier-2 panic.
-
-### sqlite.open
-
-Opens (or creates) a database file and returns a connection handle.
-
-- **path** `string` — the database file path. Use `":memory:"` for an in-memory database.
-- **Returns** `[connection, err]` — a connection handle.
-
-```ascript
-import { open } from "std/sqlite"
-let [conn, err] = open(":memory:")
-print(err)
-print(type(conn))
-```
-
-### Connection methods
-
-- **conn.exec(sql, params?)** — execute a statement that returns no rows. Returns `[changes, err]`, where `changes` is the number of rows affected.
-- **conn.query(sql, params?)** — run a query. Returns `[rows, err]`, where `rows` is an array of objects keyed by column name.
-- **conn.prepare(sql)** — prepare a statement for repeated execution. Returns `[statement, err]`; the SQL is validated immediately.
-- **conn.begin()** / **conn.commit()** / **conn.rollback()** — explicit transaction control (plain `BEGIN`/`COMMIT`/`ROLLBACK`). Each returns `[nil, err]`.
-- **conn.close()** — close the connection and release its resources. Returns `nil`.
-
-### Statement methods
-
-A prepared statement re-resolves its owning connection on each call, so it stays valid until the connection is closed.
-
-- **stmt.run(params?)** — execute the prepared statement. Returns `[changes, err]`.
-- **stmt.all(params?)** — run the prepared query. Returns `[rows, err]` (array of objects keyed by column).
-
-A complete create-table → insert → query flow:
-
-```ascript
-import { open } from "std/sqlite"
-let [conn, _] = open(":memory:")
-
-conn.exec("CREATE TABLE users (id INTEGER, name TEXT)")
-
-let [ins, perr] = conn.prepare("INSERT INTO users VALUES (?, ?)")
-ins.run([1, "alice"])
-ins.run([2, "bob"])
-
-let [rows, err] = conn.query("SELECT id, name FROM users WHERE id = :id", { id: 2 })
-print(err)
-print(rows[0].name)
-
-conn.close()
 ```

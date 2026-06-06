@@ -134,6 +134,7 @@ step                     range stride (contextual keyword) — a..b step k
 &&                      logical and
 ||                      logical or
 ??                      nil-coalescing
+? :                     ternary conditional (right-associative)
 =  += -= *= /=          assignment
 ```
 
