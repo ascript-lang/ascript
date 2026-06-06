@@ -582,6 +582,20 @@ its own empty `[workspace]` so `cargo build` does not absorb it.
 `examples/*.as` file with no errors. `tests/frontend_conformance.rs` is a differential parser
 guardrail. If you change syntax, update both parsers and keep the examples passing.
 
+**Publishing the grammar (do this WHENEVER you change `tree-sitter-ascript/**`).** The monorepo
+`tree-sitter-ascript/` dir is the source of truth; the standalone repo
+`ascript-lang/tree-sitter-ascript` is a `git subtree` mirror that editors (Zed/Neovim) + npm/cargo
+consume. After regenerating `parser.c` (`cd tree-sitter-ascript && tree-sitter generate --abi 14`)
+and confirming `cargo test --test treesitter_conformance` is green, run the sync script and re-pin:
+```bash
+./scripts/sync-grammar.sh        # subtree-splits + pushes tree-sitter-ascript/ to the mirror; prints the new SHA
+```
+Then update the printed SHA in `editors/zed/extension.toml` (`commit = "…"`) and
+`editors/nvim/lua/ascript/treesitter.lua` (`revision = "…"`), and commit. CI
+(`.github/workflows/mirror-grammar.yml`) also auto-mirrors on push once the `GRAMMAR_SYNC_TOKEN`
+secret is set, but the editor-pin bump is always manual. Treat a grammar change as INCOMPLETE until
+the mirror is pushed and the two pins are updated. See `CONTRIBUTING.md` for the token setup.
+
 ## Tests
 - Unit tests live inline (`#[test]` / `#[tokio::test]`) in `src/*.rs`.
 - Integration tests in `tests/`: `cli.rs`, `modules.rs`, `lsp.rs`, `treesitter_conformance.rs`,

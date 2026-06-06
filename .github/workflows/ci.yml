@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build · test · clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The full default feature set: rusqlite is `bundled` and reqwest/tungstenite
+      # use rustls, so no system libs (sqlite/openssl) are required. DB-backed tests
+      # (postgres/redis) self-skip with no live server.
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Test (default features)
+        run: cargo test
+
+      - name: Test (core, --no-default-features)
+        run: cargo test --no-default-features
+
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (--no-default-features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings

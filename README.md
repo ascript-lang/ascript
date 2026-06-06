@@ -4,6 +4,10 @@
 
 **A Lua-simple language with a Go/Deno-class standard library.**
 
+[![CI](https://github.com/ascript-lang/ascript/actions/workflows/ci.yml/badge.svg)](https://github.com/ascript-lang/ascript/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-ascript--lang.github.io-3b82f6)](https://ascript-lang.github.io/ascript/)
+
 AScript is a small, dynamically-typed scripting language with JavaScript-flavored syntax, optional
 runtime-checked type contracts, and a batteries-included standard library — all in a single Rust
 binary.
