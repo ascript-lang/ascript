@@ -2,6 +2,10 @@
 name = "ascript"
 version = "0.1.0"
 edition = "2021"
+description = "A small, dynamically-typed, JavaScript-flavored scripting language with runtime-checked type contracts and a batteries-included standard library."
+repository = "https://github.com/ascript-lang/ascript"
+license = "MIT"
+readme = "README.md"
 
 [lib]
 name = "ascript"

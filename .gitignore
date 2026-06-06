@@ -1,2 +1,26 @@
+# Rust build output
 /target
+# Compiled AScript bytecode artifacts
+*.aso
+
+# Parallel-development worktrees
 /.worktrees
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*~
+
+# Editor-extension build outputs (editors/* also carry their own .gitignore)
+node_modules/
+dist/
+*.vsix
+*.wasm
+*.node
+
+# Local tooling / session state — never publish
+/.claude/
+/.remember/
+/goal.md

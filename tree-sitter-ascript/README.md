@@ -1,7 +1,7 @@
 # tree-sitter-ascript
 
 A [tree-sitter](https://tree-sitter.github.io/tree-sitter/) grammar for
-[AScript](https://github.com/mahmoud/ascript) — a small, dynamically-typed, JavaScript-flavored
+[AScript](https://github.com/ascript-lang/ascript) — a small, dynamically-typed, JavaScript-flavored
 scripting language (`.as` files) with optional runtime-checked type contracts and a
 batteries-included standard library. This package provides incremental parsing plus a full set of
 editor query files (syntax highlighting, code folding, indentation, and more) for any editor or tool

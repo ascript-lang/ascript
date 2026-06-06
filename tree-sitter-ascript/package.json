@@ -2,12 +2,12 @@
   "name": "tree-sitter-ascript",
   "version": "0.1.0",
   "description": "AScript grammar for tree-sitter",
-  "repository": "https://github.com/mahmoud/ascript",
+  "repository": "https://github.com/ascript-lang/tree-sitter-ascript",
   "license": "MIT",
   "keywords": ["parser", "lexer", "tree-sitter", "ascript"],
   "main": "bindings/node",
   "types": "bindings/node",
-  "files": ["grammar.js", "binding.gyp", "bindings/node/*", "queries/*", "src/**", "README.md"],
+  "files": ["grammar.js", "binding.gyp", "bindings/node/*", "queries/*", "src/**", "README.md", "LICENSE"],
   "dependencies": {
     "node-addon-api": "^7.1.0",
     "node-gyp-build": "^4.8.0"

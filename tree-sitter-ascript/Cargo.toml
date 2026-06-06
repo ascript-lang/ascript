@@ -7,12 +7,12 @@ license = "MIT"
 readme = "README.md"
 keywords = ["incremental", "parsing", "tree-sitter", "ascript"]
 categories = ["parser-implementations", "text-editors"]
-repository = "https://github.com/mahmoud/ascript"
+repository = "https://github.com/ascript-lang/tree-sitter-ascript"
 edition = "2021"
 autoexamples = false
 
 build = "bindings/rust/build.rs"
-include = ["bindings/rust/*", "grammar.js", "queries/*", "src/*", "README.md"]
+include = ["bindings/rust/*", "grammar.js", "queries/*", "src/*", "README.md", "LICENSE"]
 
 # Standalone crate: NOT a member of the ascript repo workspace.
 [workspace]
