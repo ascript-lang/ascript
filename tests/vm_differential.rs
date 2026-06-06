@@ -843,6 +843,16 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/sse_client.as",
         SkipReason::Nondeterministic,
     ),
+    // `ws_client.as` connects to `ws://127.0.0.1:8788` (the `ws_server.as` peer).
+    // Its output is environment-dependent on TWO axes: (1) whether anything is
+    // listening on that port — with the server up it completes an echo round-trip,
+    // with it down it prints a connection-refused line; and (2) the OS errno text
+    // in that line is platform-specific (`os error 61` on macOS, `111` on Linux).
+    // A two-run stdout-equality oracle matches on a single machine (both runs hit
+    // the same errno) but a golden frozen on one OS cannot reproduce on another —
+    // it is not a VM divergence (the live two-run + three-way gates still prove
+    // byte-identity on whatever platform runs them). Same class as `sse_client.as`.
+    ("examples/advanced/ws_client.as", SkipReason::Nondeterministic),
     // SP11 std/ai examples: their output is environment-dependent — with no provider
     // key they print Tier-1 "no credential" messages, but the OpenAI-compatible local
     // line ("local model unavailable: <reqwest error>") depends on whether a local

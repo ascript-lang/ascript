@@ -1,3 +1,0 @@
-# exit: none
-could not connect to ws://127.0.0.1:8788 — net/ws.connect to ws://127.0.0.1:8788 failed: IO error: Connection refused (os error 61)
-(start examples/advanced/ws_server.as first)
