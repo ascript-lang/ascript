@@ -187,7 +187,9 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 .codecard-bar .dots i:nth-child(2){ background: #f0a92b; }
 .codecard-bar .dots i:nth-child(3){ background: #9bbf6a; }
 .codecard-bar .name { font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin-left: 6px; }
-.codecard pre { margin: 0; padding: 20px 22px; }
+.codecard pre { margin: 0; padding: 20px 22px; overflow-x: auto; white-space: pre; }
+.codecard pre::-webkit-scrollbar { height: 8px; }
+.codecard pre::-webkit-scrollbar-thumb { background: var(--ink-700); border-radius: 8px; }
 
 /* =========================== sections (landing) =========================== */
 .section { padding: 70px 0; }

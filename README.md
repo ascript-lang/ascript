@@ -20,7 +20,7 @@ _Vibe-coded: designed and built end-to-end with AI (Claude), human-directed._
 ```ascript
 import { get } from "std/net/http"
 
-// Typed fields + a default, validated at the boundary.
+// Typed fields + a default, validated on input.
 class User {
   id: number
   name: string
@@ -28,11 +28,13 @@ class User {
 }
 
 async fn fetchUser(id: number): Result<User> {
-  let resp = await get(`https://api.example.com/users/${id}`)?  // ? propagates errors
-  return await resp.json(User)                                  // parse + validate in one step
+  // ? propagates errors; .json(User) validates
+  let resp = await get(`https://api.example.com/users/${id}`)?
+  return await resp.json(User)
 }
 
-let user = await fetchUser(42)!   // ! unwraps, or panics (recoverably)
+// ! unwraps the [value, err] pair (or panics, recoverably)
+let user = await fetchUser(42)!
 print(`${user.name} — ${user.role}`)
 ```
 

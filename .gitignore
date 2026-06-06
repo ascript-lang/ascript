@@ -24,3 +24,9 @@ dist/
 /.claude/
 /.remember/
 /goal.md
+
+# Browser-automation (Playwright MCP) artifacts — verification screenshots, never publish
+.playwright-mcp/
+/page-*.png
+/page-*.jpeg
+/hero-*.png
