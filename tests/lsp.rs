@@ -345,15 +345,21 @@ fn lsp_protocol_end_to_end() {
         caps["workspace"]["workspaceFolders"]["supported"], true,
         "multi-root workspace folders supported: {resp}"
     );
-    // Phase 4: executeCommand carries run/runTest.
+    // executeCommandProvider lists ONLY server-executed commands (ascript.fixAll). The
+    // client-owned codeLens commands (ascript.run/runTest) MUST NOT appear here, or the
+    // client's auto-registration collides with the editor extension ("command already exists").
     {
         let cmds = caps["executeCommandProvider"]["commands"]
             .as_array()
             .expect("executeCommand commands");
         let cmd_strs: Vec<&str> = cmds.iter().filter_map(|c| c.as_str()).collect();
         assert!(
-            cmd_strs.contains(&"ascript.run") && cmd_strs.contains(&"ascript.runTest"),
-            "executeCommand commands: {cmd_strs:?}"
+            cmd_strs.contains(&"ascript.fixAll"),
+            "executeCommand should advertise ascript.fixAll: {cmd_strs:?}"
+        );
+        assert!(
+            !cmd_strs.contains(&"ascript.run") && !cmd_strs.contains(&"ascript.runTest"),
+            "executeCommand must NOT advertise client-owned run commands: {cmd_strs:?}"
         );
     }
     // signatureHelp trigger chars `(` and `,`.
