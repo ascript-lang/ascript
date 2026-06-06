@@ -68,6 +68,11 @@ jobs:
           nvim --headless -u editors/nvim/tests/minimal_init.lua \
             -c 'luafile editors/nvim/tests/treesitter_spec.lua' \
             -c 'qa'
+      - name: server binary resolver test (GUI-PATH fallback)
+        run: |
+          nvim --headless -u editors/nvim/tests/minimal_init.lua \
+            -c 'luafile editors/nvim/tests/lspconfig_spec.lua' \
+            -c 'qa'
       - name: package plugin tarball
         run: |
           tar -czf ascript-nvim.tar.gz -C editors nvim

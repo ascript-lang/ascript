@@ -42,9 +42,13 @@ impl AScriptExtension {
         let path = worktree
             .which("ascript")
             .ok_or_else(|| {
+                // A GUI-launched Zed may not inherit your shell PATH, so a binary in
+                // ~/.local/bin can be invisible to `which`. The extension runs in a WASM
+                // sandbox and cannot probe arbitrary paths, so point at the explicit setting.
                 format!(
-                    "could not find `ascript` on PATH. Install AScript (>= {MIN_SERVER_VERSION}) \
-                     or set its binary path in the language server settings."
+                    "could not find `ascript` on PATH. Install AScript (>= {MIN_SERVER_VERSION}), \
+                     or set `lsp.ascript.binary.path` to its absolute path in your Zed settings. \
+                     (A GUI-launched editor may not see your shell PATH; an absolute path avoids this.)"
                 )
             })?;
         self.cached_path = Some(path.clone());

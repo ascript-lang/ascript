@@ -55,7 +55,7 @@ and launches the `ascript lsp` server. Override the binary in your Zed settings:
 
 > [!NOTE] Zed loads the tree-sitter grammar from the published
 > [`ascript-lang/tree-sitter-ascript`](https://github.com/ascript-lang/tree-sitter-ascript)
-> repo, pinned by commit in `editors/zed/extension.toml`. Every LSP capability (see the
+> repo, pinned by `rev` in `editors/zed/extension.toml`. Every LSP capability (see the
 > [capabilities page](lsp-capabilities)) — including the language server's
 > semantic-token coloring — works regardless; the tree-sitter grammar adds the local
 > syntax highlighting on top.
@@ -105,6 +105,23 @@ require("conform").setup({
   formatters_by_ft = { ascript = { "ascript_fmt" } },
 })
 ```
+
+## Troubleshooting: the editor can't find `ascript`
+
+If you get **syntax coloring but no diagnostics, hover, or go-to-definition** (and maybe a
+"could not find `ascript`" error), the editor's process can't locate the binary. The usual
+cause is a **GUI-launched editor on macOS**: an app started from the Dock/Finder does *not*
+inherit your shell's `PATH`, so a binary in `~/.local/bin` (or `~/.cargo/bin`) is invisible —
+even though it works in your terminal.
+
+- **VS Code** and **Neovim** now also search the common install dirs (`~/.local/bin`,
+  `~/.cargo/bin`, `~/bin`, `/usr/local/bin`, `/opt/homebrew/bin`) automatically, so a
+  standard install usually just works. To be explicit, set `ascript.server.path` (VS Code).
+- **Zed** runs its extension in a WASM sandbox and can only resolve the binary via the
+  worktree `PATH` or an explicit setting — so if Zed didn't pick it up, set
+  `lsp.ascript.binary.path` to the **absolute** path (see the Zed section above).
+- Alternatively, install `ascript` to a dir already on the GUI `PATH` (e.g. `/usr/local/bin`
+  or `/opt/homebrew/bin`), or launch the editor from a terminal so it inherits your shell `PATH`.
 
 ## Performance notes
 
