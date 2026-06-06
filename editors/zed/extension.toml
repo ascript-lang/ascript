@@ -13,4 +13,4 @@ languages = ["AScript"]
 [grammars.ascript]
 # Standalone grammar, published from ascript-lang/ascript (the tree-sitter-ascript/ subtree).
 repository = "https://github.com/ascript-lang/tree-sitter-ascript"
-commit = "6ec3075da980a080fc8eef7e3b0375aa3cc2d004"
+commit = "a075a12ad120e21fc6df6b5e6b7f4ff40fd99c74"

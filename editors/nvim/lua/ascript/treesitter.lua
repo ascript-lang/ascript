@@ -17,7 +17,7 @@ function M.register()
       url = "https://github.com/ascript-lang/tree-sitter-ascript",
       files = { "src/parser.c" },
       -- Pinned to the published grammar commit for reproducibility; bump on grammar updates.
-      revision = "6ec3075da980a080fc8eef7e3b0375aa3cc2d004",
+      revision = "a075a12ad120e21fc6df6b5e6b7f4ff40fd99c74",
       generate_requires_npm = false,
       requires_generate_from_grammar = false,
     },
