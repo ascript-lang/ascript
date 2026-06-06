@@ -28,7 +28,10 @@ durable workflows) — while the stdlib is deliberately rich. The authoritative 
   site must be **served**, not opened from `file://` (`cd docs && python3 -m http.server`). The Markdown
   is also readable straight from the repo.
 - The stdlib reference pages mirror the source modules; if you change a `std/*` API, update the matching
-  `docs/content/stdlib/*.md` page. The language-guide pages are
+  `docs/content/stdlib/*.md` page. **Adding a NEW page** means adding its slug to the `NAV` array in
+  `docs/assets/app.js` — the sidebar AND the cmd-K search both derive from `NAV`, so a page with no entry
+  is unreachable (no link, no search hit). In-content links are resolved relative to the current page's
+  directory (`](workflow)`, `](../language/syntax)`), not absolute-from-root. The language-guide pages are
   `docs/content/language/{syntax,values-types,classes-enums,type-contracts,errors,modules-async}.md`
   (note: `match`/generators/concurrency live inside those pages, not separate files).
 - **`README.md`** is the repo front door (install, CLI, stdlib table, links into `docs/`).

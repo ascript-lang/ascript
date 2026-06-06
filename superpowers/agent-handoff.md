@@ -6,8 +6,9 @@ This file carries the context that was stored in the original machine's agent
 
 ## What this project is
 
-**AScript** — a Lua-simple, JS-flavored scripting language with a Rust tree-walking
-interpreter and a batteries-included standard library. Built ground-up, milestone by
+**AScript** — a gradually-typed, multi-paradigm, JS-flavored scripting language with a Rust
+bytecode VM (the tree-walker is retained as a byte-identical differential oracle) and a
+batteries-included standard library. Built ground-up, milestone by
 milestone: production-quality, fully unit- and example-tested, spec-compliant, nothing
 deferred within a phase (deferrals must be justified + assigned an owning milestone).
 
