@@ -14,5 +14,5 @@ crate-type = ["cdylib"]
 path = "src/ascript.rs"
 
 [dependencies]
-# Verify against current Zed docs: target wasm32-wasip2 with zed_extension_api 0.6.
-zed_extension_api = "0.6"
+# Target wasm32-wasip2 with the current zed_extension_api (0.7). Bump as Zed's API advances.
+zed_extension_api = "0.7"

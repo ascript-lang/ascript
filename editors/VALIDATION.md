@@ -274,13 +274,12 @@ gaps:
 
 ### Known documented placeholders (finalize before publishing — Phase-5 dependency)
 
-- **Zed / Neovim grammar repo URL + commit SHA** — `editors/zed/extension.toml` and
-  `editors/nvim/lua/ascript/treesitter.lua` point at the not-yet-published standalone
-  `tree-sitter-ascript` repo (the Zed `[grammars.ascript]` `commit` is a `TODO(phase5)` zero-SHA
-  placeholder). This **repo URL + commit SHA** is the **only** remaining Phase-5 dependency: pin
-  both once Phase 5 publishes the grammar. The bundled `*.scm` query files are **not** a
-  dependency — they are byte-identical full copies of the complete Phase-5 query set (verified),
-  not interim stubs.
+- **Zed / Neovim grammar repo URL + commit SHA** — RESOLVED. The standalone
+  `ascript-lang/tree-sitter-ascript` grammar is published and `editors/zed/extension.toml`
+  (`[grammars.ascript].commit`) and `editors/nvim/lua/ascript/treesitter.lua` (`GRAMMAR_REV`) are
+  both pinned to the published commit (currently `a075a12`). Re-pin both whenever the grammar
+  changes — `scripts/sync-grammar.sh` mirrors the subtree and prints the new SHA. The bundled
+  `*.scm` query files are full copies of the complete query set (verified), not interim stubs.
 - **VS Code icon** — the extension ships without an icon and uses VS Code's default file icon
   (`vsce package` succeeds with none present). To add Marketplace artwork later, drop a 128×128
   `editors/vscode/icons/ascript.png` and restore the two `package.json` references (see
