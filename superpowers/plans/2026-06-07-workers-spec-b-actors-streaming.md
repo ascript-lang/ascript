@@ -376,9 +376,9 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `tests/cli.rs` (or `tests/workers_stateful.rs`), no `src/repl.rs` change expected.
 
-- [ ] **Step 1: Failing/confirming REPL test.** Add a REPL integration test piping a multi-line `worker class` and a `worker fn*` definition into `ascript repl` and then using them across lines (e.g. define `worker class Counter {...}` on lines 1-4, then `let c = await Counter.spawn()` then `print(await c.inc())` on later lines). Assert the brace-delimited definitions buffer correctly via the existing `is_incomplete` token-depth logic and that the session `Vm`/`Interp` persists the `worker class` definition across lines. Run → **expect PASS** (if it fails, the `worker` token confuses depth counting — fix `is_incomplete` to treat `worker` as a non-delimiter, but brace counting should already handle it).
+- [x] **Step 1: Failing/confirming REPL test.** Add a REPL integration test piping a multi-line `worker class` and a `worker fn*` definition into `ascript repl` and then using them across lines (e.g. define `worker class Counter {...}` on lines 1-4, then `let c = await Counter.spawn()` then `print(await c.inc())` on later lines). Assert the brace-delimited definitions buffer correctly via the existing `is_incomplete` token-depth logic and that the session `Vm`/`Interp` persists the `worker class` definition across lines. Run → **expect PASS** (if it fails, the `worker` token confuses depth counting — fix `is_incomplete` to treat `worker` as a non-delimiter, but brace counting should already handle it).
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
   ```bash
   git commit -am "test(repl): worker class / worker fn* multi-line entry + cross-line persistence regression
 

@@ -551,6 +551,53 @@ fn repl_accepts_multiline_worker_fn_and_calls_it() {
     assert!(out.contains("36"), "expected 36; stdout: {out:?}  stderr: {err:?}");
 }
 
+/// Regression (Spec B Task 10): a `worker class` defined across multiple buffered REPL
+/// lines (brace-delimited — the `worker` keyword is contextual, so `is_incomplete` only
+/// sees `{`/`}` tokens and buffers correctly) must persist in the session and be usable
+/// on subsequent REPL inputs: `spawn`, method calls, and `close` all round-trip through
+/// the same session-accumulated `worker_source`.  Guards against the actor dispatch not
+/// seeing the class definition when it recompiles the source slice in a fresh isolate.
+#[test]
+fn repl_accepts_multiline_worker_class_and_calls_method() {
+    // Lines 1–4 buffer as one input (open `{`…`}`); subsequent lines are separate inputs.
+    let input = concat!(
+        "worker class Counter {\n",
+        "  n: number = 0\n",
+        "  fn inc(): number { self.n = self.n + 1; return self.n }\n",
+        "}\n",
+        "let c = await Counter.spawn()\n",
+        "print(await c.inc())\n",
+        "print(await c.inc())\n",
+        "c.close()\n",
+    );
+    let (out, err) = run_repl_session(input, false);
+    assert!(
+        out.contains("1\n2"),
+        "expected incremented counter; stdout: {out:?}  stderr: {err:?}"
+    );
+}
+
+/// Regression (Spec B Task 10): a `worker fn*` streaming generator defined across multiple
+/// buffered REPL lines must persist in the session scope and stream values via `for await`
+/// on a subsequent REPL input.  Mirrors the `worker fn` regression from Plan A Task 13 but
+/// exercises the streaming path.
+#[test]
+fn repl_accepts_multiline_worker_gen_and_streams_it() {
+    // Lines 1–3 buffer as one input (open `{`…`}`); lines 4–5 are separate inputs.
+    let input = concat!(
+        "worker fn* count(n) {\n",
+        "  for (i in 1..=n) { yield i * 10 }\n",
+        "}\n",
+        "let g = count(3)\n",
+        "for await (x in g) { print(x) }\n",
+    );
+    let (out, err) = run_repl_session(input, false);
+    assert!(
+        out.contains("10") && out.contains("20") && out.contains("30"),
+        "expected 10/20/30 from stream; stdout: {out:?}  stderr: {err:?}"
+    );
+}
+
 #[test]
 fn repl_tree_walker_flag_still_works() {
     let (out, _) = run_repl_session("let x = 21\nx * 2\n", true);
