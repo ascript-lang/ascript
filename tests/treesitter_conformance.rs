@@ -192,6 +192,9 @@ fn parse_has_error(src: &str) -> bool {
 fn treesitter_parses_worker_decls() {
     for src in [
         "worker fn f() { return 1 }",
+        // Canonical modifier order is `worker async fn` (worker BEFORE async),
+        // matching both Rust front-ends, the formatter, and `method_definition`.
+        "worker async fn f() { return 1 }",
         "class C { static worker fn h(x) { return x } }",
         "class C { worker fn m(x) { return x } }",
     ] {

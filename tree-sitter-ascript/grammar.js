@@ -200,8 +200,8 @@ module.exports = grammar({
     rest_element: $ => seq('...', field('name', $.identifier)),
 
     function_declaration: $ => seq(
-      optional('async'),
       optional($.worker_keyword),
+      optional('async'),
       'fn',
       optional('*'),  // `fn*` / `async fn*` — a generator (§7, M17)
       field('name', $.identifier),
