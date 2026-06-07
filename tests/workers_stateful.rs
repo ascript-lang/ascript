@@ -214,3 +214,160 @@ await main()
 "#;
     assert_both_engines("leak", src, "true\n");
 }
+
+// ---------------------------------------------------------------------------
+// Task 6 — `worker fn*` STREAMING generators (dedicated isolate, demand-driven
+// pull, bounded buffer, bidirectional next(v), close/drop teardown).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stream_records_yields_ordered_sequence() {
+    // A `worker fn*` runs its producer body in a dedicated isolate and streams its
+    // ordered sequence back, consumed transparently via `for await`. Each yielded
+    // value crosses the boundary via structured-clone encode/decode.
+    let src = r#"
+worker fn* records(n) { for (i in 1..=n) { yield i * 10 } }
+async fn main() {
+  for await (r in records(3)) { print(r) }
+}
+await main()
+"#;
+    assert_both_engines("stream_records", src, "10\n20\n30\n");
+}
+
+#[test]
+fn stream_yields_structured_values() {
+    // Yielded OBJECTS cross the boundary intact (structured clone), proving the
+    // serializer round-trips non-scalar yields.
+    let src = r#"
+worker fn* recs(n) { for (i in 1..=n) { yield { id: i, label: `rec-${i}` } } }
+async fn main() {
+  for await (r in recs(2)) { print(`${r.id}:${r.label}`) }
+}
+await main()
+"#;
+    assert_both_engines("stream_structured", src, "1:rec-1\n2:rec-2\n");
+}
+
+#[test]
+fn stream_backpressure_strict_pull() {
+    // STRICT PULL (prefetch=1): the producer advances at most one step per demand
+    // credit, so an INFINITE producer consumed only a few times terminates cleanly.
+    // If the producer ran ahead of demand unbounded, this would hang forever — so a
+    // clean, bounded result IS the backpressure assertion.
+    let src = r#"
+worker fn* naturals() { let i = 0; while (true) { i = i + 1; yield i } }
+async fn main() {
+  let g = naturals()
+  print(await g.next())   // 1
+  print(await g.next())   // 2
+  print(await g.next())   // 3
+  g.close()
+}
+await main()
+print("done")
+"#;
+    assert_both_engines("stream_backpressure", src, "1\n2\n3\ndone\n");
+}
+
+#[test]
+fn stream_bidirectional_next_value() {
+    // A value passed to `.next(v)` is injected back across the boundary as the result
+    // of the producer's suspended `yield` expression — bidirectional round-trip.
+    let src = r#"
+worker fn* echo() { let a = yield 1; let b = yield a + 100; yield b + 1000 }
+async fn main() {
+  let g = echo()
+  print(await g.next())    // 1   (first next ignores its input)
+  print(await g.next(5))   // 105 (a = 5)
+  print(await g.next(7))   // 1007 (b = 7)
+}
+await main()
+"#;
+    assert_both_engines("stream_bidi", src, "1\n105\n1007\n");
+}
+
+#[test]
+fn stream_close_then_next_is_done() {
+    // `close()` tears the isolate down; a subsequent `.next()` is the done sentinel
+    // (nil). The process exits cleanly afterward (no zombie producer thread).
+    let src = r#"
+worker fn* records(n) { for (i in 1..=n) { yield i } }
+async fn main() {
+  let g = records(5)
+  print(await g.next())   // 1
+  print(await g.next())   // 2
+  g.close()
+  print(await g.next())   // nil (done after close)
+}
+await main()
+print("done")
+"#;
+    assert_both_engines("stream_close", src, "1\n2\nnil\ndone\n");
+}
+
+#[test]
+fn stream_drop_without_close_tears_down() {
+    // Dropping the generator (going out of scope, never `close`d, partially consumed)
+    // reclaims the producer isolate via last-drop teardown — the process still exits
+    // cleanly (the trailing "done" prints, proving no exit-drain hang on a zombie).
+    let src = r#"
+worker fn* naturals() { let i = 0; while (true) { i = i + 1; yield i } }
+async fn main() {
+  let g = naturals()
+  print(await g.next())   // 1
+  // g goes out of scope here without close() — last-drop tears the isolate down.
+}
+await main()
+print("done")
+"#;
+    assert_both_engines("stream_drop", src, "1\ndone\n");
+}
+
+#[test]
+fn stream_producer_panic_is_recoverable() {
+    // An uncaught Tier-2 panic inside the producer body surfaces as a RECOVERABLE
+    // panic on the consumer (catchable by `recover`), after earlier yields succeed.
+    let src = r#"
+worker fn* flaky() { yield 1; panic("boom"); yield 2 }
+async fn main() {
+  let g = flaky()
+  print(await g.next())                         // 1
+  let r = recover(() => await g.next())
+  print(r[1] != nil)                            // true: producer panic caught
+}
+await main()
+"#;
+    assert_both_engines("stream_panic", src, "1\ntrue\n");
+}
+
+#[test]
+fn stream_non_sendable_yield_panics() {
+    // A non-sendable yielded value (a function) cannot cross the boundary — it is a
+    // recoverable sendability panic with a field path on the consumer.
+    let src = r#"
+worker fn* bad() { yield (() => 1) }
+async fn main() {
+  let g = bad()
+  let r = recover(() => await g.next())
+  print(r[1] != nil)   // true: sendability error caught
+}
+await main()
+"#;
+    assert_both_engines("stream_nonsendable_yield", src, "true\n");
+}
+
+#[test]
+fn stream_non_sendable_arg_panics() {
+    // A non-sendable CALL arg to a `worker fn*` is a recoverable sendability panic at
+    // the call site (before any value streams).
+    let src = r#"
+worker fn* take(f) { yield 1 }
+async fn main() {
+  let r = recover(() => take(() => 1))
+  print(r[1] != nil)   // true: sendability error caught
+}
+await main()
+"#;
+    assert_both_engines("stream_nonsendable_arg", src, "true\n");
+}

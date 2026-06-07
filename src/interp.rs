@@ -2028,6 +2028,59 @@ impl Interp {
         Ok(Value::Future(fut))
     }
 
+    /// Workers Spec B §Task 6: build a streaming-generator handle for a `worker fn*`.
+    /// Spawns a DEDICATED isolate running the generator body, ships the code slice +
+    /// call args, and returns a `Value::Generator` backed by a cross-thread
+    /// [`crate::coro::GenImpl::Worker`] demand-driven driver. `for await` / `.next(v)` /
+    /// `.close()` then work transparently — each consumer step is one demand credit
+    /// across the boundary (strict pull = backpressure).
+    ///
+    /// Shared by BOTH engines (the tree-walker `call_function` and the VM `Op::Call`
+    /// hooks call this), so streaming behavior is byte-identical.
+    ///
+    /// SPAWN IS SYNCHRONOUS here (unlike `spawn_actor`'s `future<handle>`): a generator
+    /// call returns a `Value::Generator` immediately, matching local generators — the
+    /// isolate is spawned + the producer built (its `Init` ack awaited) before returning,
+    /// so a build failure surfaces eagerly at the call, exactly like a local generator's
+    /// eager arg binding.
+    ///
+    /// `!Send` integrity: the isolate builds its OWN `Interp`/`Vm` and runs its OWN
+    /// generator; only `Send` bytes (slice + encoded args) cross. The driver stays here.
+    pub(crate) async fn spawn_worker_stream(
+        &self,
+        entry_name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // Sendability gate on the call args (field-path panic on failure).
+        for a in &args {
+            crate::worker::serialize::check_sendable(a)
+                .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+        }
+        // Build the `worker fn*` code slice (entry + transitive top-level deps) from the
+        // program source — the SINGLE path shared by both engines.
+        let slice = crate::worker::build_code_slice_from_source(self, entry_name, None)?;
+        // Encode the call args as one array (preserving cross-arg sharing).
+        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let encoded = crate::worker::serialize::encode(&args_array)
+            .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+
+        // Spawn the dedicated isolate + build the producer (awaits the Init ack).
+        let driver = crate::worker::stream::StreamDriver::spawn(
+            entry_name.to_string(),
+            slice.entry_aso.to_vec(),
+            encoded,
+        )
+        .await
+        .map_err(|msg| Control::Panic(AsError::at(msg, span)))?;
+
+        let handle = crate::coro::GeneratorHandle::new_worker(
+            Box::new(driver),
+            std::rc::Rc::downgrade(&self.rc()),
+        );
+        Ok(Value::Generator(Rc::new(handle)))
+    }
+
     /// Run `f` with a shared borrow of the resource for `id` (handle methods that
     /// only inspect state, e.g. `conn.query` re-resolving a statement). The closure
     /// must NOT `.await` — the borrow is held for its duration.
@@ -2603,13 +2656,13 @@ impl Interp {
                 span,
                 ..
             } => {
-                // Spec A: `worker async fn` and `worker fn*` are not valid combinations.
-                // Workers already return an awaitable future — adding `async` or generator
-                // semantics is unsupported in Spec A and must be a clean error, not a silent
-                // drop of the modifier.
-                if *is_worker && (*is_async || *is_generator) {
+                // `worker async fn` is not a valid combination (a worker already returns
+                // an awaitable future, so `async` is redundant). `worker fn*` IS valid
+                // (Spec B Task 6: a streaming generator running in a dedicated isolate) —
+                // its is_worker/is_generator flags route the CALL to the streaming driver.
+                if *is_worker && *is_async {
                     return Err(Control::Panic(AsError::at(
-                        "worker functions cannot be async or generators (workers already return an awaitable future; worker fn* is out of Spec A scope)".to_string(),
+                        "worker functions cannot be async (a worker already returns an awaitable future; combine worker with fn* for a streaming generator, not async)".to_string(),
                         *span,
                     )));
                 }
@@ -3983,6 +4036,22 @@ impl Interp {
         // the future is `'static`. The body's `yield` finds this generator via the
         // current-generator stack that `resume` maintains while polling. Both sync
         // and async generators take this path (the body may itself `await`).
+        // A `worker fn*` (Spec B Task 6) is a STREAMING generator: its body runs in a
+        // DEDICATED isolate and is consumed via a cross-thread demand-driven driver.
+        // This precedes the local-generator branch (a `worker fn*` has BOTH flags) and
+        // the `worker fn` branch (a streaming worker is not a request/response worker).
+        // Inline-nesting (a `worker fn*` called from inside an isolate) is NOT special-
+        // cased — it spawns a nested dedicated isolate (a generator inside a worker is a
+        // rare composition; correctness over the extra thread).
+        if func.is_worker && func.is_generator {
+            let entry_name = func.name.clone().ok_or_else(|| {
+                Control::Panic(AsError::at(
+                    "worker fn* must be a named top-level function".to_string(),
+                    span,
+                ))
+            })?;
+            return self.spawn_worker_stream(&entry_name, args, span).await;
+        }
         if func.is_generator {
             let vm = self.rc();
             let func = func.clone();

@@ -79,6 +79,32 @@ enum GenImpl {
         /// the `None` done sentinel.
         done: Cell<bool>,
     },
+    /// Cross-thread streaming generator (`worker fn*`, Spec B Task 6). The producer
+    /// body runs in a DEDICATED isolate; THIS side is a demand-driven driver. Each
+    /// `resume(input)` ENCODES `input` (the value the producer's `yield` expression
+    /// returns — bidirectional), sends one demand credit over the
+    /// [`crate::worker::stream::StreamDriver`]'s channel, awaits the next serialized
+    /// yield, and DECODES it against the consumer's `Interp`. A bounded prefetch
+    /// buffer (default 1 = strict pull) gives backpressure (the producer runs at most
+    /// one step ahead of demand). Transparent behind `Value::Generator`, so
+    /// `for await`/`.next(v)`/`.close()` work unchanged.
+    Worker {
+        /// The cross-thread driver, moved OUT across the `.await` (take-out-then-
+        /// await-then-return, like `Vm`'s `fiber`) so no `RefCell` borrow rides the
+        /// await. `None` while resuming (taken out) or once done/closed (dropped =
+        /// isolate teardown).
+        driver: RefCell<Option<Box<crate::worker::stream::StreamDriver>>>,
+        /// The consumer's interp, to encode the injected `next(v)` and decode each
+        /// yielded value (the boundary is `Send` bytes; the `Value`s are rebuilt on
+        /// THIS thread against THIS interp).
+        interp: Weak<crate::interp::Interp>,
+        /// First `resume` ignores `input` (local-generator first-`next` semantics),
+        /// matching `Body`/`Vm`.
+        started: Cell<bool>,
+        /// Once the producer is done / errored / closed: further resumes are the
+        /// `None` done sentinel.
+        done: Cell<bool>,
+    },
 }
 
 /// The runtime handle behind `Value::Generator`. Wraps either engine (tree-walker
@@ -118,20 +144,47 @@ impl GeneratorHandle {
         }
     }
 
+    /// Build a streaming-worker handle (`worker fn*`, Spec B Task 6) around an
+    /// already-`Init`'d cross-thread [`StreamDriver`](crate::worker::stream::StreamDriver).
+    /// The producer body runs in the driver's dedicated isolate; this side is the
+    /// demand-driven consumer. `interp` is a weak ref to the consumer's interp (upgraded
+    /// to encode/decode the boundary `Value`s on each resume). No body runs until the
+    /// first [`resume`](Self::resume).
+    pub fn new_worker(
+        driver: Box<crate::worker::stream::StreamDriver>,
+        interp: Weak<crate::interp::Interp>,
+    ) -> Self {
+        GeneratorHandle {
+            inner: GenImpl::Worker {
+                driver: RefCell::new(Some(driver)),
+                interp,
+                started: Cell::new(false),
+                done: Cell::new(false),
+            },
+        }
+    }
+
     /// Producer side, called from inside a TREE-WALKER body via the `yield`
     /// expression. Parks the value in `out` and suspends the body future until the
     /// consumer's next `resume` deposits a value in `inp`, which becomes `yield`'s
     /// result.
     ///
     /// # Panics
-    /// If called on a VM-backed handle (a VM `yield` is the `Op::Yield` opcode, not
-    /// this method — a wiring bug if it ever reaches here).
+    /// If called on a non-tree-walker handle (a VM `yield` is the `Op::Yield` opcode; a
+    /// worker producer yields in ITS OWN isolate, not via this handle — a wiring bug if
+    /// it ever reaches here).
     pub async fn yield_(&self, v: Value) -> Value {
         let (out, inp) = match &self.inner {
             GenImpl::Body { out, inp, .. } => (out, inp),
             GenImpl::Vm { .. } => {
                 unreachable!(
                     "GeneratorHandle::yield_ called on a VM-backed generator (use Op::Yield)"
+                )
+            }
+            GenImpl::Worker { .. } => {
+                unreachable!(
+                    "GeneratorHandle::yield_ called on a worker generator (the producer \
+                     yields in its own isolate, not via the caller-side handle)"
                 )
             }
         };
@@ -151,6 +204,7 @@ impl GeneratorHandle {
         match &self.inner {
             GenImpl::Body { .. } => self.resume_body(input).await,
             GenImpl::Vm { .. } => self.resume_vm(input).await,
+            GenImpl::Worker { .. } => self.resume_worker(input).await,
         }
     }
 
@@ -163,7 +217,7 @@ impl GeneratorHandle {
                 inp,
                 started,
             } => (body, out, inp, started),
-            GenImpl::Vm { .. } => unreachable!("resume_body on a VM generator"),
+            _ => unreachable!("resume_body on a non-tree-walker generator"),
         };
         if started.get() {
             *inp.borrow_mut() = Some(input);
@@ -223,7 +277,7 @@ impl GeneratorHandle {
                 started,
                 done,
             } => (fiber, vm, started, done),
-            GenImpl::Body { .. } => unreachable!("resume_vm on a tree-walker generator"),
+            _ => unreachable!("resume_vm on a non-VM generator"),
         };
         if done.get() {
             return Ok(None);
@@ -280,15 +334,94 @@ impl GeneratorHandle {
         }
     }
 
+    /// The streaming-worker resume path (`worker fn*`, Spec B Task 6): send one demand
+    /// credit across the isolate boundary and await the next serialized yield.
+    ///
+    /// ENCODE/DECODE happen on THIS (consumer) thread against the consumer's interp:
+    /// `input` (the `.next(v)` value) is encoded into `Send` bytes for the producer's
+    /// suspended `yield`; the yielded value comes back as bytes and is decoded here.
+    ///
+    /// AWAIT DISCIPLINE: the `Box<StreamDriver>` is MOVED OUT of its
+    /// `RefCell<Option<..>>` before `driver.resume(..).await` and put back after (the
+    /// take-out-then-await-then-return pattern), so no `RefCell` borrow rides the await
+    /// (`clippy::await_holding_refcell_ref` stays clean). The `interp` weak is upgraded
+    /// (outside any borrow) for the encode/decode.
+    async fn resume_worker(&self, input: Value) -> Result<Option<Value>, Control> {
+        let (driver_cell, interp_weak, started, done) = match &self.inner {
+            GenImpl::Worker {
+                driver,
+                interp,
+                started,
+                done,
+            } => (driver, interp, started, done),
+            _ => unreachable!("resume_worker on a non-worker generator"),
+        };
+        if done.get() {
+            return Ok(None);
+        }
+        // The consumer's interp drives encode/decode. It outlives any live generator
+        // (the handle is reachable only while a program runs), so a failed upgrade is a
+        // wiring bug.
+        let interp = interp_weak
+            .upgrade()
+            .expect("interp dropped while a streaming generator is still live (wiring bug)");
+
+        // Encode the injected value on FIRST resume too, but the producer ignores it
+        // (first-`next` semantics) — we pass nil's encoding then to keep the protocol
+        // uniform. Encode against the consumer's serializer (sendability gate applies).
+        let to_inject = if started.get() { input } else { Value::Nil };
+        if !started.get() {
+            started.set(true);
+        }
+        let encoded_input = crate::worker::serialize::encode(&to_inject)
+            .map_err(|e| Control::Panic(crate::error::AsError::new(e.message())))?;
+
+        // Take the driver OUT (no borrow held across the await). `None` here means a
+        // re-entrant resume of a generator already running — surface as done.
+        let driver = match driver_cell.borrow_mut().take() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let outcome = driver.resume(encoded_input).await;
+        match outcome {
+            Ok(Some(bytes)) => {
+                // Still producing: put the driver back for the next demand credit.
+                *driver_cell.borrow_mut() = Some(driver);
+                let v = crate::worker::serialize::decode(&bytes, &interp)
+                    .map_err(|e| Control::Panic(crate::error::AsError::new(e.message())))?;
+                Ok(Some(v))
+            }
+            Ok(None) => {
+                // The producer finished: iteration ends. Drop the driver (= isolate
+                // teardown) by leaving it taken out, and mark done.
+                done.set(true);
+                Ok(None)
+            }
+            Err(msg) => {
+                // A producer panic / sendability failure: surface to the consumer. The
+                // generator is done (driver stays taken out = torn down).
+                done.set(true);
+                Err(Control::Panic(crate::error::AsError::new(msg)))
+            }
+        }
+    }
+
     /// Close the generator: no more values are produced; a subsequent `resume`
     /// returns `Ok(None)`. Used by `gen.close()`. For the tree-walker that drops
-    /// the body future; for the VM that drops the Fiber and marks it done.
+    /// the body future; for the VM that drops the Fiber and marks it done; for a
+    /// streaming worker that drops the driver (closing the channel + joining the
+    /// isolate thread — clean teardown, no zombie).
     pub fn close(&self) {
         match &self.inner {
             GenImpl::Body { body, .. } => *body.borrow_mut() = None,
             GenImpl::Vm { fiber, done, .. } => {
                 done.set(true);
                 *fiber.borrow_mut() = None;
+            }
+            GenImpl::Worker { driver, done, .. } => {
+                done.set(true);
+                *driver.borrow_mut() = None; // drop = IsolateHandle Drop = teardown
             }
         }
     }

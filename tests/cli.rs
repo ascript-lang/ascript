@@ -2492,7 +2492,7 @@ fn worker_async_fn_is_rejected_on_both_engines() {
     // `worker async fn` must fail on BOTH engines with the expected message.
     // The parser accepts both flags (permissive parsing); the semantic layer rejects.
     let src = "worker async fn g() { return 2 }\nprint(await g())\n";
-    let expected = "worker functions cannot be async or generators";
+    let expected = "worker functions cannot be async";
 
     let (ok_vm, out_vm) = run_worker_program_raw(src, false);
     assert!(
@@ -2516,28 +2516,22 @@ fn worker_async_fn_is_rejected_on_both_engines() {
 }
 
 #[test]
-fn worker_generator_fn_is_rejected_on_both_engines() {
-    // `worker fn*` must fail on BOTH engines with the expected message.
-    let src = "worker fn* h() { yield 1 }\nprint(await h())\n";
-    let expected = "worker functions cannot be async or generators";
+fn worker_generator_fn_streams_on_both_engines() {
+    // Spec B Task 6: `worker fn*` is a VALID streaming generator running in a
+    // dedicated isolate. It yields its ordered sequence transparently via `for await`,
+    // byte-identically on BOTH engines.
+    let src = "worker fn* records(n) { for (i in 1..=n) { yield i * 10 } }\n\
+               async fn main() { for await (r in records(3)) { print(r) } }\n\
+               await main()\n";
 
     let (ok_vm, out_vm) = run_worker_program_raw(src, false);
-    assert!(
-        !ok_vm,
-        "VM must reject `worker fn*` but it succeeded; output: {out_vm}"
-    );
-    assert!(
-        out_vm.contains(expected),
-        "VM error must contain expected message; output: {out_vm}"
-    );
+    assert!(ok_vm, "VM must stream `worker fn*`; output: {out_vm}");
+    assert_eq!(out_vm, "10\n20\n30\n", "VM streamed sequence");
 
     let (ok_tw, out_tw) = run_worker_program_raw(src, true);
     assert!(
-        !ok_tw,
-        "tree-walker must reject `worker fn*` but it succeeded; output: {out_tw}"
+        ok_tw,
+        "tree-walker must stream `worker fn*`; output: {out_tw}"
     );
-    assert!(
-        out_tw.contains(expected),
-        "tree-walker error must contain expected message; output: {out_tw}"
-    );
+    assert_eq!(out_tw, "10\n20\n30\n", "tree-walker streamed sequence");
 }

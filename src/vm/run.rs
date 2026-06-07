@@ -1070,6 +1070,40 @@ impl Vm {
                         // at the call (the tree-walker also binds args eagerly when
                         // building the generator). AWAIT DISCIPLINE: no await here;
                         // the fiber is built synchronously and handed to the handle.
+                        // A `worker fn*` (Spec B Task 6) is a STREAMING generator: its
+                        // body runs in a DEDICATED isolate, consumed via a cross-thread
+                        // demand-driven driver. Must precede the plain-generator arm (a
+                        // `worker fn*` has BOTH flags) and the `worker fn` arm. Same
+                        // `Interp::spawn_worker_stream` as the tree-walker → byte-
+                        // identical. AWAIT DISCIPLINE: pop the args synchronously, then
+                        // `.await` the spawn with no fiber borrow held.
+                        Value::Closure(callee)
+                            if callee.proto.is_worker && callee.proto.is_generator =>
+                        {
+                            let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let entry_name = callee
+                                .proto
+                                .chunk
+                                .name
+                                .clone()
+                                .ok_or_else(|| {
+                                    Control::Panic(crate::error::AsError::at(
+                                        "worker fn* must be a named top-level function"
+                                            .to_string(),
+                                        call_span,
+                                    ))
+                                })?;
+                            let mut args = vec![Value::Nil; argc];
+                            for slot in args.iter_mut().rev() {
+                                *slot = fiber.pop();
+                            }
+                            fiber.pop(); // the callee value at callee_idx
+                            let gen = self
+                                .interp
+                                .spawn_worker_stream(&entry_name, args, call_span)
+                                .await?;
+                            fiber.push(gen);
+                        }
                         Value::Closure(callee) if callee.proto.is_generator => {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
@@ -2965,11 +2999,40 @@ impl Vm {
                 // test harness or a fresh isolate that loaded the slice directly —
                 // fall through to the plain inline path (which is correct there).
                 if closure.proto.is_worker
+                    && !closure.proto.is_generator
                     && !crate::worker::pool::in_isolate()
                     && (self.interp.worker_source().is_some()
                         || self.interp.worker_aso_bytes().is_some())
                 {
                     return self.dispatch_worker_closure(&closure, args, span);
+                }
+                // A GENERATOR closure (`fn*` / `async fn*` / `worker fn*`) is NOT run to
+                // completion here — it builds a NOT-STARTED VM fiber wrapped in a
+                // `GeneratorHandle`, returning a `Value::Generator` (the consumer drives
+                // it via `resume`). This mirrors the `Op::Call` generator arm and is the
+                // path taken when a `worker fn*` runs ON ITS DEDICATED ISOLATE: the
+                // isolate's `build_producer` calls `call_value(entry, ..)` and expects a
+                // LOCAL generator back (the cross-thread streaming is the CALLER-side
+                // driver, not the isolate's). Without this, the body would run inline and
+                // hit "a closure cannot yield".
+                if closure.proto.is_generator {
+                    let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
+                    let bound =
+                        crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                    let mut gfiber = Fiber::new(closure);
+                    gfiber.frame_mut().ret_span = span;
+                    gfiber.frame_mut().argc = bound.supplied;
+                    let cells = gfiber.frame().cells.clone();
+                    for (slot, v) in bound.values.into_iter().enumerate() {
+                        if let Some(cell) = &cells[slot] {
+                            *cell.borrow_mut() = v;
+                        } else {
+                            gfiber.stack[slot] = v;
+                        }
+                    }
+                    let handle =
+                        crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
+                    return Ok(Value::Generator(Rc::new(handle)));
                 }
                 // `what` mirrors the tree-walker's
                 // `func.name.as_deref().unwrap_or("function")` so an arity/contract

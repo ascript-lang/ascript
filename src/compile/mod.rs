@@ -2533,13 +2533,15 @@ impl Compiler {
             }
         }
 
-        // Spec A: `worker async fn` and `worker fn*` are not valid combinations.
-        // Workers already return an awaitable future — adding `async` or generator
-        // semantics is unsupported in Spec A and must be a clean error, not a silent
-        // drop of the modifier.
-        if is_worker && (is_async || is_generator) {
+        // `worker async fn` is not a valid combination: a worker already returns an
+        // awaitable future, so `async` is redundant and unsupported — a clean error,
+        // not a silent drop of the modifier. `worker fn*` IS valid (Spec B Task 6: a
+        // streaming generator running in a dedicated isolate); it is compiled like any
+        // generator (its `is_worker`/`is_generator` flags route the CALL to the
+        // streaming-worker driver at runtime).
+        if is_worker && is_async {
             return Err(CompileError::new(
-                "worker functions cannot be async or generators (workers already return an awaitable future; worker fn* is out of Spec A scope)",
+                "worker functions cannot be async (a worker already returns an awaitable future; combine worker with fn* for a streaming generator, not async)",
                 span,
             ));
         }
@@ -5879,20 +5881,27 @@ mod tests {
 
     #[test]
     fn worker_async_fn_is_a_compile_error() {
-        // Spec A: `worker async fn` and `worker fn*` are rejected at compile time
-        // (they were accepted by the parser — permissive parsing, semantic rejection).
+        // `worker async fn` is rejected at compile time (accepted by the parser —
+        // permissive parsing, semantic rejection).
         let err_async =
             compile_source("worker async fn g() { return 2 }\n").expect_err("must be a compile error");
         assert!(
-            err_async.message.contains("worker functions cannot be async or generators"),
+            err_async.message.contains("worker functions cannot be async"),
             "unexpected message: {}", err_async.message
         );
-        let err_gen =
-            compile_source("worker fn* h() { yield 1 }\n").expect_err("must be a compile error");
-        assert!(
-            err_gen.message.contains("worker functions cannot be async or generators"),
-            "unexpected message: {}", err_gen.message
-        );
+    }
+
+    #[test]
+    fn worker_generator_compiles_with_both_flags() {
+        // Spec B Task 6: `worker fn*` is now VALID — a streaming generator. The proto
+        // carries BOTH is_worker and is_generator; the runtime CALL routes it to the
+        // dedicated-isolate streaming driver.
+        let chunk =
+            compile_source("worker fn* h() { yield 1 }\n").expect("worker fn* compiles");
+        let proto = chunk.protos.first().expect("one nested proto");
+        assert!(proto.is_worker, "expected is_worker = true on worker fn*");
+        assert!(proto.is_generator, "expected is_generator = true on worker fn*");
+        assert!(!proto.is_async, "worker fn* is not async");
     }
 
     #[test]

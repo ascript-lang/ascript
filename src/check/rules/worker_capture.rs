@@ -48,28 +48,25 @@ pub fn check(tree: &ResolvedNode, res: &ResolveResult, _src: &str) -> Vec<AsDiag
             continue;
         }
 
-        // Spec A: `worker async fn` / `async worker fn` and `worker fn*` are
-        // not valid modifier combinations.  Workers already return an awaitable
-        // future; `async` is redundant and unsupported.  `fn*` (generator
-        // workers) are out of Spec A scope.  Flag the declaration directly.
+        // `worker async fn` / `async worker fn` is not a valid modifier combination:
+        // a worker already returns an awaitable future, so `async` is redundant.
+        // `worker fn*` (a streaming generator) IS valid (Spec B Task 6) and still
+        // runs in a dedicated isolate, so its body must satisfy the same capture
+        // rules — we do NOT skip the capture checks for it.
         {
             let has_async = node
                 .children_with_tokens()
                 .filter_map(|el| el.into_token())
                 .any(|t| t.kind() == AsyncKw);
-            let has_star = node
-                .children_with_tokens()
-                .filter_map(|el| el.into_token())
-                .any(|t| t.kind() == Star);
-            if has_async || has_star {
+            if has_async {
                 out.push(AsDiagnostic {
                     range: code_range(node),
                     severity: Severity::Error,
                     code: "worker-capture".to_string(),
-                    message: "worker functions cannot be async or generators (workers already return an awaitable future; worker fn* is out of Spec A scope)".to_string(),
+                    message: "worker functions cannot be async (a worker already returns an awaitable future; combine worker with fn* for a streaming generator, not async)".to_string(),
                     fix: None,
                 });
-                // Skip capture checks for invalid combos — the fn won't run anyway.
+                // Skip capture checks for the invalid combo — the fn won't run anyway.
                 continue;
             }
         }
