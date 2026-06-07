@@ -802,7 +802,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Test: `tests/cli.rs` (integration), `src/worker/pool.rs` `#[cfg(test)]` (lazy proof)
 - Modify: `src/worker/dispatch.rs` / `pool.rs` / `isolate.rs` as needed to make the tests pass
 
-- [ ] **Step 1: Write the failing tests** — add to `tests/cli.rs`:
+- [x] **Step 1: Write the failing tests** — add to `tests/cli.rs`:
 
 ```rust
 #[test]
@@ -867,21 +867,21 @@ fn pool_not_initialized_until_first_dispatch() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failures**
+- [x] **Step 2: Run to verify failures**
   Run: `cargo test --test cli worker_panic_is_recoverable worker_result_pair oversubscription nested_worker sendability_violation` and `cargo test --lib pool_not_initialized`
   Expected: FAIL (cancel/panic/queue/inline paths incomplete).
 
-- [ ] **Step 3: Implement panic propagation.** In the isolate run loop, catch an uncaught `Control::Panic(e)` from the entry run and send `WorkerReply::Panic(e.message)` (carry worker-side span context in the message string). In `dispatch_worker`'s bridge task, convert `WorkerReply::Panic(msg)` into a **recoverable** `Control::Panic(AsError::new(msg))` resolved into the future's cell, so `recover` catches it. A `[value, err]` pair returns via `WorkerReply::Ok` (ordinary encoded data) — no special-casing.
+- [x] **Step 3: Implement panic propagation.** In the isolate run loop, catch an uncaught `Control::Panic(e)` from the entry run and send `WorkerReply::Panic(e.message)` (carry worker-side span context in the message string). In `dispatch_worker`'s bridge task, convert `WorkerReply::Panic(msg)` into a **recoverable** `Control::Panic(AsError::new(msg))` resolved into the future's cell, so `recover` catches it. A `[value, err]` pair returns via `WorkerReply::Ok` (ordinary encoded data) — no special-casing.
 
-- [ ] **Step 4: Implement cancel-on-drop across the boundary.** The `SharedFuture` handle owns the abort `oneshot` SENDER (or a guard whose `Drop` fires it). When the last `Value::Future` clone drops, the guard drops → the isolate's `select!` sees the abort `oneshot` resolve → it stops the in-flight job and is reclaimed to the pool. Verify with a focused unit test in `dispatch.rs` if integration timing is flaky (mirror `task.rs::dropping_last_handle_aborts_the_task`).
+- [x] **Step 4: Implement cancel-on-drop across the boundary.** The `SharedFuture` handle owns the abort `oneshot` SENDER (or a guard whose `Drop` fires it). When the last `Value::Future` clone drops, the guard drops → the isolate's `select!` sees the abort `oneshot` resolve → it stops the in-flight job and is reclaimed to the pool. Verify with a focused unit test in `dispatch.rs` if integration timing is flaky (mirror `task.rs::dropping_last_handle_aborts_the_task`).
 
-- [ ] **Step 5: Implement the FIFO queue + inline nesting** (if not already complete in Task 8): jobs beyond `cap` enqueue and dispatch on isolate-free; `pool::in_isolate()` short-circuits to inline. Confirm `nested_worker_runs_inline_no_deadlock` passes at cap=1.
+- [x] **Step 5: Implement the FIFO queue + inline nesting** (if not already complete in Task 8): jobs beyond `cap` enqueue and dispatch on isolate-free; `pool::in_isolate()` short-circuits to inline. Confirm `nested_worker_runs_inline_no_deadlock` passes at cap=1.
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
   Run: the Step-1 commands.
   Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 ```bash
 git add tests/cli.rs src/worker/
 git commit -m "feat(worker): cancel-on-drop, recoverable worker-panic propagation, FIFO oversubscription queue, inline nesting; lazy-pool proof
