@@ -539,6 +539,13 @@ pub struct Interp {
     /// `None` until [`Interp::set_worker_source`] is called by the run entry point; a
     /// `worker fn` call with no source set raises a clear recoverable panic.
     worker_source: RefCell<Option<Rc<str>>>,
+    /// Workers Spec A (.aso path): the raw `.aso` bytes of the entry program, retained
+    /// so a `worker fn` dispatch can re-parse them into a top-level
+    /// [`crate::vm::chunk::Chunk`] and build its shippable code slice directly (via
+    /// `build_code_slice`) without recompiling from source. Set by `run_aso_file` (which
+    /// has no source); `worker_source` takes priority when BOTH are set (a run-from-source
+    /// always uses the source path). `None` in every run mode that sets `worker_source`.
+    worker_aso_bytes: RefCell<Option<Rc<[u8]>>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -811,6 +818,7 @@ impl Interp {
             determinism: RefCell::new(None),
             package_resolver: RefCell::new(None),
             worker_source: RefCell::new(None),
+            worker_aso_bytes: RefCell::new(None),
         }
     }
 
@@ -825,6 +833,20 @@ impl Interp {
     /// borrow never spans the compile/await below.
     pub(crate) fn worker_source(&self) -> Option<Rc<str>> {
         self.worker_source.borrow().clone()
+    }
+
+    /// Workers Spec A (.aso path): record the raw `.aso` bytes of the entry program so
+    /// `dispatch_worker_closure` can re-parse them into a top-level chunk and build a
+    /// code slice directly (no source recompile needed). Called by `run_aso_file` before
+    /// execution; `worker_source` takes priority and this is `None` whenever source is set.
+    pub fn set_worker_aso_bytes(&self, bytes: Rc<[u8]>) {
+        *self.worker_aso_bytes.borrow_mut() = Some(bytes);
+    }
+
+    /// The raw `.aso` bytes of the entry program (`.aso` run path), if recorded.
+    /// Cloned out so the borrow never spans the re-parse/dispatch below.
+    pub(crate) fn worker_aso_bytes(&self) -> Option<Rc<[u8]>> {
+        self.worker_aso_bytes.borrow().clone()
     }
 
     /// Store the script's trailing CLI arguments so `env.args()` can return them.

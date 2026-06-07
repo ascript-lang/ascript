@@ -7095,3 +7095,149 @@ async fn sp8_capture_before_later_reassignment() {
     )
     .await;
 }
+
+// ── Workers §11.3: all-four-modes byte-identical verification ─────────────────
+//
+// The three-way gate (tree-walker == specialized VM == generic VM) over the whole
+// corpus already covers the worker examples (they are not in EXAMPLE_SKIPS and are
+// auto-enumerated by all_corpus_examples()). The FOURTH mode required by §11.3 is
+// `.aso`-compiled: `ascript build <example>.as -o <tmp>.aso` then `ascript run
+// <tmp>.aso`. This proves the worker bytecode survives serialization through the
+// `.aso` format and produces byte-identical stdout.
+//
+// Worker programs are order-deterministic by construction (gather + ordered consume),
+// so the stdout oracle is stable across runs. ASCRIPT_WORKERS=2 caps the pool to
+// keep resource pressure low under parallel test execution.
+
+/// Build `source_path` to a `.aso` in a unique temp directory and run it via the
+/// real `ascript` binary. Returns the stdout of the run. Sets `ASCRIPT_WORKERS=2`
+/// so the pool stays lean during parallel test execution (all worker examples use
+/// at most a handful of isolates and are order-deterministic regardless of pool
+/// size — only throughput differs, not output).
+async fn build_and_run_aso(source_path: &std::path::Path) -> String {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    // Unique temp dir — no two parallel tests share a dir.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tag = source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("prog");
+    let dir = std::env::temp_dir().join(format!("ascript_workers_aso_{tag}_{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create temp dir: {e}"));
+    // Copy the source into the temp dir so relative paths stay self-contained.
+    let src_name = source_path.file_name().unwrap();
+    let dest = dir.join(src_name);
+    std::fs::copy(source_path, &dest)
+        .unwrap_or_else(|e| panic!("copy {} to temp dir: {e}", source_path.display()));
+    // `ascript build <file>` → produces `<stem>.aso` in the same dir.
+    let build_out = std::process::Command::new(bin)
+        .arg("build")
+        .arg(src_name)
+        .current_dir(&dir)
+        .env("ASCRIPT_WORKERS", "2")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn ascript build: {e}"));
+    assert!(
+        build_out.status.success(),
+        "ascript build {} failed\n  stdout: {}\n  stderr: {}",
+        source_path.display(),
+        String::from_utf8_lossy(&build_out.stdout),
+        String::from_utf8_lossy(&build_out.stderr)
+    );
+    let stem = source_path.file_stem().unwrap().to_string_lossy();
+    let aso_path = dir.join(format!("{stem}.aso"));
+    assert!(
+        aso_path.exists(),
+        "expected {aso_path:?} after `ascript build`"
+    );
+    // `ascript run <stem>.aso` — VM path, no compile step.
+    let run_out = std::process::Command::new(bin)
+        .arg("run")
+        .arg(format!("{stem}.aso"))
+        .current_dir(&dir)
+        .env("ASCRIPT_WORKERS", "2")
+        .output()
+        .unwrap_or_else(|e| panic!("spawn ascript run .aso: {e}"));
+    // Non-zero exit is itself a divergence (all worker examples exit 0).
+    assert!(
+        run_out.status.success(),
+        "ascript run {stem}.aso exited with {:?}\n  stdout: {}\n  stderr: {}",
+        run_out.status.code(),
+        String::from_utf8_lossy(&run_out.stdout),
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    String::from_utf8_lossy(&run_out.stdout).into_owned()
+}
+
+/// Workers §11.3: every worker example must produce IDENTICAL, order-deterministic
+/// output across all four modes: tree-walker, specialized VM, generic VM, and
+/// .aso-compiled. Worker programs are byte-identical by construction (gather +
+/// ordered consume).
+#[tokio::test]
+async fn worker_examples_all_modes_byte_identical() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let worker_examples: Vec<String> = all_corpus_examples()
+        .into_iter()
+        .filter(|p| {
+            p.contains("workers_")
+                // file stem starts with "workers_" (guards against a hypothetical
+                // "no_workers_foo.as" path component that contains the substring but
+                // isn't actually a worker example).
+                && std::path::Path::new(p)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("workers_"))
+                    .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !worker_examples.is_empty(),
+        "no worker examples found — expected workers_*.as files in examples/ or examples/advanced/"
+    );
+    for rel in &worker_examples {
+        let path = std::path::Path::new(root).join(rel);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read worker example {rel}: {e}"));
+        // Skip if a required stdlib module is unavailable in this build config.
+        if feature_unavailable_in_this_build(&src).await {
+            continue;
+        }
+        // Modes 1–3: tree-walker, specialized VM, generic VM (already covered by the
+        // whole-corpus three-way gate, but we assert them here too for an explicit
+        // per-worker-example §11.3 record and to obtain the tree-walker reference).
+        let tw = ascript::run_source_exit(&src)
+            .await
+            .unwrap_or_else(|e| panic!("tree-walker failed on worker example {rel}: {e:?}"));
+        let spec = ascript::vm_run_source(&src)
+            .await
+            .unwrap_or_else(|e| panic!("specialized VM failed on worker example {rel}: {e:?}"));
+        let gen = ascript::vm_run_source_generic(&src)
+            .await
+            .unwrap_or_else(|e| panic!("generic VM failed on worker example {rel}: {e:?}"));
+        assert_eq!(
+            tw, spec,
+            "tree-walker vs specialized VM diverged for worker example {rel}"
+        );
+        assert_eq!(
+            tw, gen,
+            "tree-walker vs generic VM diverged for worker example {rel}"
+        );
+        // Mode 4: .aso-compiled. Build the source to bytecode, run the .aso, compare
+        // stdout. This is the new assertion that Task 15 adds.
+        let aso_out = build_and_run_aso(&path).await;
+        assert_eq!(
+            tw.0, aso_out,
+            ".aso output diverged from tree-walker for worker example {rel}\n  \
+             tree-walker stdout: {:?}\n  .aso stdout:        {aso_out:?}",
+            tw.0
+        );
+    }
+    eprintln!(
+        "worker §11.3 all-modes gate: {} worker examples verified across \
+         tree-walker + specialized VM + generic VM + .aso",
+        worker_examples.len()
+    );
+}

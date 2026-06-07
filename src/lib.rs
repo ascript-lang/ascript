@@ -397,6 +397,9 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
+    // Workers Spec A (.aso path): retain the raw bytes so `dispatch_worker_closure` can
+    // re-parse them into the top-level chunk and build a worker code slice without source.
+    interp.set_worker_aso_bytes(Rc::from(bytes.into_boxed_slice()));
     interp.install_self();
     let vm = Vm::new(interp.clone());
     // Resolve relative imports against the .aso's directory.

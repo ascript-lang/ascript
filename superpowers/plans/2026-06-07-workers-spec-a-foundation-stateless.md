@@ -1331,7 +1331,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `tests/vm_differential.rs` (the whole-corpus gate @940; add the generic-VM + `.aso` passes for worker programs)
 - Test: the new gate functions themselves
 
-- [ ] **Step 1: Write the failing all-modes test** — add to `tests/vm_differential.rs`:
+- [x] **Step 1: Write the failing all-modes test** — add to `tests/vm_differential.rs`:
 
 ```rust
 /// Workers §11.3: every worker example must produce IDENTICAL, order-deterministic
@@ -1363,18 +1363,18 @@ async fn worker_examples_all_modes_byte_identical() {
 ```
 (Add `build_and_run_aso(&Path) -> String`: spawn `ascript build <file> -o tmp.aso` then `ascript run tmp.aso`, capture stdout — mirror the binary-spawning helpers; if `vm_differential.rs` lacks binary spawning, add it via `env!("CARGO_BIN_EXE_ascript")`.)
 
-- [ ] **Step 2: Run to verify it fails (or passes once examples + dispatch are correct)**
+- [x] **Step 2: Run to verify it fails (or passes once examples + dispatch are correct)**
   Run: `cargo test --test vm_differential worker_examples_all_modes`
   Expected: initially FAIL if any mode diverges (a real bug — fix the engine/dispatch, NEVER weaken the assertion). PASS once worker dispatch is byte-identical across engines.
 
-- [ ] **Step 3: Ensure the whole-corpus gate includes the worker examples.** The new `examples/workers_*.as` are auto-enumerated by `all_corpus_examples()` (@897). Confirm none are silently on `EXAMPLE_SKIPS` (@792); they must NOT be skipped (they are order-deterministic by design). Run `cargo test --test vm_differential vm_run_whole_corpus_matches_treewalker` and `vm_whole_corpus_skips_are_still_justified`.
+- [x] **Step 3: Ensure the whole-corpus gate includes the worker examples.** The new `examples/workers_*.as` are auto-enumerated by `all_corpus_examples()` (@897). Confirm none are silently on `EXAMPLE_SKIPS` (@792); they must NOT be skipped (they are order-deterministic by design). Run `cargo test --test vm_differential vm_run_whole_corpus_matches_treewalker` and `vm_whole_corpus_skips_are_still_justified`.
   Expected: PASS; the worker examples count toward `ran`.
 
-- [ ] **Step 4: Run both feature configs**
+- [x] **Step 4: Run both feature configs**
   Run: `cargo test --test vm_differential worker_examples_all_modes` and `cargo test --no-default-features --test vm_differential worker_examples_all_modes`
   Expected: PASS in both (worker subsystem is core; `std/json`-using examples are feature-skipped under `--no-default-features` via the existing mechanism).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add tests/vm_differential.rs
 git commit -m "test(differential): worker examples byte-identical across tree-walker, specialized VM, generic VM, and .aso

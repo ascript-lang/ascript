@@ -223,10 +223,12 @@ impl Vm {
     }
 
     /// Workers Spec A: dispatch a `worker fn` closure to a pooled isolate, returning
-    /// the `Value::Future`. Builds the shippable code slice from the entry program's
-    /// source (shared with the tree-walker via `Interp::worker_source`), then routes
-    /// through the engine-agnostic `worker::dispatch_worker`. The entry name is the
-    /// closure's compiled chunk name (a top-level `worker fn`).
+    /// the `Value::Future`. Builds the shippable code slice — preferring the source
+    /// recompile path (via `Interp::worker_source`) when source is available (the normal
+    /// run-from-source path, shared with the tree-walker), or falling back to building
+    /// the slice directly from the stored pre-compiled top-level chunk (the `.aso`
+    /// run path, via `Interp::worker_chunk`) when no source is recorded. The entry name
+    /// is the closure's compiled chunk name (a top-level `worker fn`).
     fn dispatch_worker_closure(
         &self,
         callee: &crate::vm::value_ext::Closure,
@@ -244,8 +246,28 @@ impl Vm {
         if crate::worker::pool::in_isolate() {
             return crate::worker::dispatch_worker_inline(&self.interp, entry_name, args, span);
         }
-        let slice =
-            crate::worker::build_code_slice_from_source(&self.interp, entry_name, None)?;
+        // Prefer the source recompile path (produces an identical slice for any run
+        // mode that has source). Fall back to the pre-compiled chunk derived from the raw
+        // `.aso` bytes stored by `run_aso_file` when no source is recorded (the .aso path).
+        let slice = if self.interp.worker_source().is_some() {
+            crate::worker::build_code_slice_from_source(&self.interp, entry_name, None)?
+        } else if let Some(raw) = self.interp.worker_aso_bytes() {
+            let top = crate::vm::chunk::Chunk::from_bytes(&raw).map_err(|e| {
+                Control::Panic(crate::error::AsError::at(
+                    format!("cannot re-parse .aso for worker dispatch: {e:?}"),
+                    span,
+                ))
+            })?;
+            crate::worker::build_code_slice(&top, entry_name, None)?
+        } else {
+            return Err(Control::Panic(crate::error::AsError::at(
+                format!(
+                    "cannot dispatch worker '{entry_name}': the program source is unavailable \
+                     (worker fns require running via `ascript run`)"
+                ),
+                span,
+            )));
+        };
         crate::worker::dispatch_worker(&self.interp, slice, args, span)
     }
 
