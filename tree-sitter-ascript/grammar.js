@@ -232,6 +232,7 @@ module.exports = grammar({
 
     // ----- Classes & Enums (§8) -------------------------------------------
     class_declaration: $ => seq(
+      optional($.worker_keyword),  // `worker class` — dedicated-isolate actor (Spec B)
       'class',
       field('name', $.identifier),
       optional(seq('extends', field('superclass', $.identifier))),

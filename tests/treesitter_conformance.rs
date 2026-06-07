@@ -203,6 +203,32 @@ fn treesitter_parses_worker_decls() {
 }
 
 #[test]
+fn treesitter_parses_worker_class_and_worker_generator() {
+    // `worker class C {}` must parse without ERROR node — the grammar needs
+    // `optional($.worker_keyword)` on `class_declaration` (Task 2, Spec B).
+    // `worker fn* g() {}` must also be error-free — `worker?` and `*` are
+    // independent optionals on `function_declaration`, already in the grammar
+    // from Plan A (verify here as a standing regression guard).
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        "worker class C { fn m(x) { return x } }",
+        "worker fn* g() { yield 1 }",
+        // `worker` is contextual — still an ordinary identifier elsewhere.
+        "let worker = 5",
+        "fn worker() { return 1 }",
+        "let r = f(worker)",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter ERROR node in: {src}"
+        );
+    }
+}
+
+#[test]
 fn interpreter_parser_accepts_all_examples() {
     let mut failures = Vec::new();
     for path in example_files() {

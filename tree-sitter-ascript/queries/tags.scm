@@ -7,6 +7,8 @@
 
 (class_declaration
   name: (identifier) @name) @definition.class
+; Note: `worker class C {}` is intentionally a class for symbol tagging — the
+; optional leading `worker_keyword` modifier does not affect this structural match.
 
 (enum_declaration
   name: (identifier) @name) @definition.enum

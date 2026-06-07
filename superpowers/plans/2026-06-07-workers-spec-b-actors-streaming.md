@@ -94,24 +94,24 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 > **If Plan A and Spec B land together, a SINGLE `./scripts/sync-grammar.sh` run + ONE pin bump covers both** — do the grammar work for both, then one sync. If Plan A already synced, this task re-syncs after adding the class `worker`.
 
-- [ ] **Step 1: Failing conformance test.** In `tests/treesitter_conformance.rs`, add cases asserting the vendored tree-sitter parser produces an error-free tree for `worker class C { fn f() {} }` and `worker fn* g() { yield 1 }`, and that `worker` appears as a keyword/modifier node. Run `cargo test --test treesitter_conformance worker` → **expect FAIL**.
+- [x] **Step 1: Failing conformance test.** In `tests/treesitter_conformance.rs`, add cases asserting the vendored tree-sitter parser produces an error-free tree for `worker class C { fn f() {} }` and `worker fn* g() { yield 1 }`, and that `worker` appears as a keyword/modifier node. Run `cargo test --test treesitter_conformance worker` → **expect FAIL**.
 
-- [ ] **Step 2: Grammar.** In `tree-sitter-ascript/grammar.js` `class_declaration` (line ~233), add `optional('worker')` immediately before `'class'`. Confirm `function_declaration` already has Plan A's `optional('worker')` before `optional('async')`, and that `optional('*')` after `'fn'` covers `worker fn*` (the combination needs no new rule). If `worker` is a distinct token in Plan A, reuse it; otherwise add it to the keyword set. Check for new GLR conflicts (`worker` is contextual — a bare identifier `worker` must still parse as an expression).
+- [x] **Step 2: Grammar.** In `tree-sitter-ascript/grammar.js` `class_declaration` (line ~234), added `optional($.worker_keyword)` immediately before `'class'`. Confirmed `function_declaration` already has Plan A's `optional($.worker_keyword)` before `optional('async')`, and that `optional('*')` after `'fn'` covers `worker fn*` (the combination needs no new rule — verified). `worker_keyword` is the existing distinct token from Plan A; `worker` remains contextual (the new test confirms `let worker = 5` / `fn worker() {}` / `f(worker)` still parse without ERROR). No new GLR conflicts introduced.
 
-- [ ] **Step 3: Regen.** `cd tree-sitter-ascript && tree-sitter generate --abi 14` (regenerates `src/parser.c`). Verify it compiles via the `cc` build in `build.rs` (a `cargo build` triggers it).
+- [x] **Step 3: Regen.** `cd tree-sitter-ascript && tree-sitter generate --abi 14` regenerated `src/parser.c`. Verified via `cargo build` (clean build, no warnings).
 
-- [ ] **Step 4: Queries.** In `tree-sitter-ascript/queries/highlights.scm`, ensure `"worker"` is captured as `@keyword` (or `@keyword.modifier`) on both class and function declarations (Plan A added the function case; add/confirm the class case). In `tags.scm`, ensure a `worker class` is still tagged as a class definition (a `(class_declaration name: (identifier) @name) @definition.class` pattern already matches regardless of the leading modifier — verify; add a comment that `worker class` is intentionally a class for symbol tagging).
+- [x] **Step 4: Queries.** `tree-sitter-ascript/queries/highlights.scm` already has `(worker_keyword) @keyword` (Plan A), which captures `worker` on both function and class declarations — no change needed. `tags.scm` uses `(class_declaration name: (identifier) @name) @definition.class` which matches `worker class` (the leading optional modifier does not affect the structural match) — verified; added a comment in tags.scm confirming this.
 
-- [ ] **Step 5: Editor highlight copies.** Add `worker` (as a storage modifier / keyword, alongside `async`/`static`) to:
-  - `editors/vscode/syntaxes/ascript.tmLanguage.json` keyword/storage-modifier pattern (TextMate runs independently of the LSP — Plan A added it; verify it also colors `worker class`).
-  - `editors/zed/languages/ascript/highlights.scm` and `editors/nvim/queries/ascript/highlights.scm` — mirror the canonical `highlights.scm` `worker` capture.
-  - `editors/nvim/tests/treesitter_spec.lua` — extend if it asserts on keyword tokens.
+- [x] **Step 5: Editor highlight copies.** Verified all three editor surfaces already cover `worker`:
+  - `editors/vscode/syntaxes/ascript.tmLanguage.json`: `\b(static|worker|async)\b` storage-modifier pattern (Plan A) — colors `worker` before `class` correctly.
+  - `editors/zed/languages/ascript/highlights.scm` and `editors/nvim/queries/ascript/highlights.scm`: both already have `(worker_keyword) @keyword` — no changes needed.
+  - `editors/nvim/tests/treesitter_spec.lua`: does not assert on keyword tokens; no change needed.
 
-- [ ] **Step 6:** Run `cargo test --test treesitter_conformance worker` and the full `cargo test --test treesitter_conformance` → **expect PASS**.
+- [x] **Step 6:** `cargo test --test treesitter_conformance` → 8/8 PASS (both new cases + existing). Full `cargo test` → all green. `cargo test --no-default-features` → all green. Both clippy configs → zero warnings.
 
-- [ ] **Step 7: Sync + pin bump (mandatory on any `tree-sitter-ascript/**` change).** Run `./scripts/sync-grammar.sh` (subtree-split + push to the `ascript-lang/tree-sitter-ascript` mirror; prints the new SHA). Bump that SHA in `editors/zed/extension.toml` (`commit`) and `editors/nvim/lua/ascript/treesitter.lua` (`revision`). *(If landing with Plan A, do this once after both grammar changes.)*
+- [ ] **Step 7: Sync + pin bump (DONE-ON-RELEASE fallback).** `./scripts/sync-grammar.sh` requires push credentials to `git@github.com:ascript-lang/tree-sitter-ascript.git` (not available in this environment). Grammar sync + SHA pin bump in `editors/zed/extension.toml` (`rev`) and `editors/nvim/lua/ascript/treesitter.lua` (`GRAMMAR_REV`) are deferred to release time, consistent with Plan A Task 3's handling. The vendored `tree-sitter-ascript/src/parser.c` is updated in the monorepo and builds correctly; editors will receive the update when the grammar mirror is synced.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
   ```bash
   git add tree-sitter-ascript/ editors/ tests/treesitter_conformance.rs
   git commit -m "feat(grammar): 'worker class' + 'worker fn*' in tree-sitter + queries + editor highlights; sync + pin bump
