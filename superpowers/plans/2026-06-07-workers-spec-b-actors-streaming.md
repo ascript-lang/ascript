@@ -485,18 +485,18 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `tests/vm_differential.rs`.
 
-- [ ] **Step 1: Failing all-modes test.** Extend `tests/vm_differential.rs` so every Task-13 worker example runs in all FOUR modes with byte-identical, order-deterministic output:
+- [x] **Step 1: Failing all-modes test.** Extend `tests/vm_differential.rs` so every Task-13 worker example runs in all FOUR modes with byte-identical, order-deterministic output:
   1. Tree-walker (`--tree-walker` / `ASCRIPT_ENGINE=tree-walker`).
   2. Specialized VM (default).
   3. Generic VM (`--no-specialize` / `Vm::new_generic`).
   4. `.aso`-compiled (`ascript build file.as -o file.aso` → `ascript run file.aso`) — proves worker class/`worker fn*` bytecode + the shipped code-slice survive serialization.
   Assert all four produce identical stdout. Run `cargo test --test vm_differential worker` → **expect FAIL** until all engines route `spawn`/handle-call/`worker fn*` identically (Tasks 5/6 mirror the tree-walker in `vm/run.rs`; this test is the guardrail that they match).
 
-- [ ] **Step 2: Fix divergences in the engine, never the assertion.** If specialized ≠ generic, a specialization guard is wrong — fix the guard. If tree-walker ≠ VM, fix the VM (the tree-walker is the oracle). If `.aso` ≠ source-run, fix the serializer/code-slice.
+- [x] **Step 2: Fix divergences in the engine, never the assertion.** If specialized ≠ generic, a specialization guard is wrong — fix the guard. If tree-walker ≠ VM, fix the VM (the tree-walker is the oracle). If `.aso` ≠ source-run, fix the serializer/code-slice.
 
-- [ ] **Step 3:** Run `cargo test --test vm_differential` in BOTH feature configs → **expect PASS**.
+- [x] **Step 3:** Run `cargo test --test vm_differential` in BOTH feature configs → **expect PASS**.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
   ```bash
   git commit -am "test(differential): stateful-worker examples byte-identical across tree-walker/specialized/generic/.aso
 
