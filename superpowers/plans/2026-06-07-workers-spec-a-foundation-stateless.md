@@ -414,7 +414,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `src/vm/verify.rs`
 - Test: `src/vm/aso.rs` test module (near @1639)
 
-- [ ] **Step 1: Write the failing round-trip test** — add to `src/vm/aso.rs` tests:
+- [x] **Step 1: Write the failing round-trip test** — add to `src/vm/aso.rs` tests:
 
 ```rust
 #[test]
@@ -430,11 +430,11 @@ fn proto_is_worker_survives_aso_roundtrip() {
 ```
 (If there is no `test_fn_proto` helper, construct an `FnProto { …, is_worker: true, … }` inline matching the @1639 literal.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
   Run: `cargo test --lib proto_is_worker_survives_aso_roundtrip`
   Expected: FAIL — `is_worker` lost (defaults false) / missing field.
 
-- [ ] **Step 3: Extend the flags byte.** In `write_proto` (@730), add bit 3:
+- [x] **Step 3: Extend the flags byte.** In `write_proto` (@730), add bit 3:
   ```rust
   let flags = u8::from(p.has_rest)
       | (u8::from(p.is_async) << 1)
@@ -443,15 +443,15 @@ fn proto_is_worker_survives_aso_roundtrip() {
   ```
   In `read_proto` (@747), add `let is_worker = flags & 8 != 0;` and set `is_worker,` in the returned `FnProto` (@757).
 
-- [ ] **Step 4: Bump the format version + comment.** In `src/vm/aso.rs`, bump `ASO_FORMAT_VERSION` from `15` to `16` (@96). Update the module-level "bump on ANY change to … FnProto …" doc note (@34) is already general; add a one-line changelog comment near the constant: `// v16: FnProto flags byte gained bit3 = is_worker (Workers Spec A).`
+- [x] **Step 4: Bump the format version + comment.** In `src/vm/aso.rs`, bump `ASO_FORMAT_VERSION` from `15` to `16` (@96). Update the module-level "bump on ANY change to … FnProto …" doc note (@34) is already general; add a one-line changelog comment near the constant: `// v16: FnProto flags byte gained bit3 = is_worker (Workers Spec A).`
 
-- [ ] **Step 5: Update verify.** In `src/vm/verify.rs`, if it validates the flags byte or asserts on proto layout, allow bit 3. (If verify is structural-only and does not inspect the flags byte, no change — confirm by reading the proto-verify path.)
+- [x] **Step 5: Update verify.** In `src/vm/verify.rs`, if it validates the flags byte or asserts on proto layout, allow bit 3. (If verify is structural-only and does not inspect the flags byte, no change — confirm by reading the proto-verify path.)
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
   Run: `cargo test --lib proto_is_worker_survives_aso_roundtrip` and `cargo test --lib aso`
   Expected: PASS (the version-mismatch tests @1720/@1783 still pass against the new constant).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 ```bash
 git add src/vm/aso.rs src/vm/verify.rs
 git commit -m "feat(aso): serialize FnProto.is_worker (flags bit3); bump ASO_FORMAT_VERSION 15->16
