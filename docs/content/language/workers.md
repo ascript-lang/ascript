@@ -23,7 +23,10 @@ lasts.
   calls. Ideal for embarrassingly-parallel `map`/`gather` workloads.
 - **Dedicated isolate** (`worker class`, `worker fn*`). A long-lived isolate is created for the
   lifetime of one actor handle or one generator. State persists across messages (actors) or
-  across `yield`s (streams). Torn down on `close()` or when the last handle is dropped.
+  across `yield`s (streams). A **stream** is torn down on `close()` or when its generator handle is
+  dropped. An **actor** is reclaimed on `close()` or at program exit — like other native resources
+  (sockets, DB connections), the handle lives in the runtime's resource table, so call `close()`
+  when you're done with it rather than relying on the value going out of scope.
 
 ### The sendability line
 
@@ -216,8 +219,11 @@ The semantics that make actors safe:
 - **Owns in-isolate resources.** A resource (a file, a connection, an in-memory store) opened in
   `init` or a method lives and dies inside the isolate; it never crosses the boundary. Only data
   returned from methods crosses.
-- **`close()` / last-drop teardown.** Call `close()` to shut the actor down explicitly; dropping
-  the last handle also tears down the isolate. No zombie threads are left behind.
+- **`close()` / program-exit teardown.** Call `close()` to shut the actor down explicitly and
+  reclaim its isolate thread. Like other native resources (sockets, DB connections), an actor whose
+  handle simply goes out of scope is *not* eagerly reclaimed — it lives in the runtime resource
+  table until `close()` or program exit. Always `close()` long-lived actors. No zombie threads are
+  left behind (every isolate is joined on `close()` or at exit).
 
 Actors survive panics. A method that asserts produces a recoverable `[nil, err]` on the caller;
 the actor keeps running and answers subsequent messages correctly:

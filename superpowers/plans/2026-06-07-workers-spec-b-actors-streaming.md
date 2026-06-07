@@ -109,7 +109,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 - [x] **Step 6:** `cargo test --test treesitter_conformance` → 8/8 PASS (both new cases + existing). Full `cargo test` → all green. `cargo test --no-default-features` → all green. Both clippy configs → zero warnings.
 
-- [ ] **Step 7: Sync + pin bump (DONE-ON-RELEASE fallback).** `./scripts/sync-grammar.sh` requires push credentials to `git@github.com:ascript-lang/tree-sitter-ascript.git` (not available in this environment). Grammar sync + SHA pin bump in `editors/zed/extension.toml` (`rev`) and `editors/nvim/lua/ascript/treesitter.lua` (`GRAMMAR_REV`) are deferred to release time, consistent with Plan A Task 3's handling. The vendored `tree-sitter-ascript/src/parser.c` is updated in the monorepo and builds correctly; editors will receive the update when the grammar mirror is synced.
+- [x] **Step 7: Sync + pin bump (DONE-ON-RELEASE fallback).** `./scripts/sync-grammar.sh` requires push credentials to `git@github.com:ascript-lang/tree-sitter-ascript.git` (not available in this environment). Grammar sync + SHA pin bump in `editors/zed/extension.toml` (`rev`) and `editors/nvim/lua/ascript/treesitter.lua` (`GRAMMAR_REV`) are deferred to release time, consistent with Plan A Task 3's handling. The vendored `tree-sitter-ascript/src/parser.c` is updated in the monorepo and builds correctly; editors will receive the update when the grammar mirror is synced.
 
 - [x] **Step 8: Commit**
   ```bash
@@ -162,7 +162,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `src/value.rs` (`NativeKind::WorkerActor`), `src/interp.rs` (`ResourceState::WorkerActor`, `spawn` routing, handle member dispatch, non-reentrancy guard), `src/worker/actor.rs`, `src/worker/actor_handle.rs`, `src/vm/run.rs` (mirror), `tests/workers_stateful.rs`.
 
-- [ ] **Step 1: Failing behavioral test (actor state persists).** New `tests/workers_stateful.rs`, spawning the built binary on a `.as` program:
+- [x] **Step 1: Failing behavioral test (actor state persists).** New `tests/workers_stateful.rs`, spawning the built binary on a `.as` program:
   ```
   worker class Counter {
     field n = 0
@@ -177,34 +177,34 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   ```
   Assert stdout `1\n2\n2\n`. Run `cargo test --test workers_stateful actor_counter` → **expect FAIL** (`spawn` unknown).
 
-- [ ] **Step 2: `NativeKind::WorkerActor` + `ResourceState::WorkerActor`.** Add `WorkerActor` to `NativeKind` (`src/value.rs`) with `type_name() => "workerActor"` and a fields entry (e.g. the declared class name, readable but not the actor's state). Add `ResourceState::WorkerActor(Box<WorkerActorHandle>)` in `src/interp.rs` (boxed for `large_enum_variant`). `WorkerActorHandle` (in `actor_handle.rs`) holds: the outbound `Send` mpsc sender of `ActorMsg`, the `IsolateHandle` (its `Drop` tears down — last-handle-drop teardown is automatic), the declared class id/name (for `instanceof` + completion), and a `Cell<bool> in_call` re-entrancy flag.
+- [x] **Step 2: `NativeKind::WorkerActor` + `ResourceState::WorkerActor`.** Add `WorkerActor` to `NativeKind` (`src/value.rs`) with `type_name() => "workerActor"` and a fields entry (e.g. the declared class name, readable but not the actor's state). Add `ResourceState::WorkerActor(Box<WorkerActorHandle>)` in `src/interp.rs` (boxed for `large_enum_variant`). `WorkerActorHandle` (in `actor_handle.rs`) holds: the outbound `Send` mpsc sender of `ActorMsg`, the `IsolateHandle` (its `Drop` tears down — last-handle-drop teardown is automatic), the declared class id/name (for `instanceof` + completion), and a `Cell<bool> in_call` re-entrancy flag.
 
-- [ ] **Step 3: `ClassName.spawn(args)` routing.** In `src/interp.rs`, intercept a call whose callee is `Member { object: <class value>, name: "spawn" }` (the same call-site-hook style `std/schema` uses) when the class value's decl `is_worker`. The handler:
+- [x] **Step 3: `ClassName.spawn(args)` routing.** In `src/interp.rs`, intercept a call whose callee is `Member { object: <class value>, name: "spawn" }` (the same call-site-hook style `std/schema` uses) when the class value's decl `is_worker`. The handler:
   1. `check_sendable` each arg (Plan A serializer; field-path panic on failure).
   2. `dispatch::ensure_loaded` the class code-slice (superclass chain + method table) to a freshly `spawn_isolate`'d dedicated isolate.
   3. Send an `ActorMsg::Init { class_id, args: encode(args) }`; the isolate decodes args, constructs the instance via `init` IN the isolate (so `init`'s resource opens stay in the isolate), and acks.
   4. Register a `ResourceState::WorkerActor` in `Interp.resources` (`next_resource_id`), return `future<Value::Native(WorkerActor)>` (spawning is async). A bare `ClassName(args)` is UNCHANGED (still a local instance — no overloading of construction).
   Mirror the routing in `src/vm/run.rs` so the VM matches the tree-walker.
 
-- [ ] **Step 4: FIFO mailbox, one-at-a-time.** In `src/worker/actor.rs`, the isolate's main loop awaits inbound `ActorMsg::Call { method, args, reply }` from the mpsc receiver and processes **each to completion before receiving the next** (a plain `while let Some(msg) = rx.recv().await` loop — single-consumer = serialized = no internal locks, the GenServer guarantee). Each call: `decode` args → look up + run the method on the in-isolate instance (the method body may `await` its own I/O) → `encode` the return value (or the panic message) → send back over `reply` (`oneshot`). A `[value, err]` Result crosses as ordinary data (Plan A). An uncaught Tier-2 panic re-raises as a recoverable panic on the caller (Plan A error model).
+- [x] **Step 4: FIFO mailbox, one-at-a-time.** In `src/worker/actor.rs`, the isolate's main loop awaits inbound `ActorMsg::Call { method, args, reply }` from the mpsc receiver and processes **each to completion before receiving the next** (a plain `while let Some(msg) = rx.recv().await` loop — single-consumer = serialized = no internal locks, the GenServer guarantee). Each call: `decode` args → look up + run the method on the in-isolate instance (the method body may `await` its own I/O) → `encode` the return value (or the panic message) → send back over `reply` (`oneshot`). A `[value, err]` Result crosses as ordinary data (Plan A). An uncaught Tier-2 panic re-raises as a recoverable panic on the caller (Plan A error model).
 
-- [ ] **Step 5: Async method dispatch on the handle.** In `src/interp.rs`, member access on a `Value::Native(WorkerActor)` returns a bound `Value::NativeMethod`-style callable (mirror the events/task native-method dispatch pattern at `src/interp.rs:3254`/`3346`). Calling it: `check_sendable(args)` → send `ActorMsg::Call` → return a `future<T>` that awaits the `oneshot` reply and `decode`s it. **Take the channel sender out across the `.await` (clone the `Sender`, which is cheap), never hold a `resources` borrow across the await** (take-out-across-await pattern). Mirror in `src/vm/run.rs`.
+- [x] **Step 5: Async method dispatch on the handle.** In `src/interp.rs`, member access on a `Value::Native(WorkerActor)` returns a bound `Value::NativeMethod`-style callable (mirror the events/task native-method dispatch pattern at `src/interp.rs:3254`/`3346`). Calling it: `check_sendable(args)` → send `ActorMsg::Call` → return a `future<T>` that awaits the `oneshot` reply and `decode`s it. **Take the channel sender out across the `.await` (clone the `Sender`, which is cheap), never hold a `resources` borrow across the await** (take-out-across-await pattern). Mirror in `src/vm/run.rs`.
 
-- [ ] **Step 6: Non-reentrancy guard.** When dispatching a method call, set `in_call=true` for the duration on the handle and detect a same-handle call delivered while the mailbox is already processing a message *from this same caller-side handle re-entering itself*. Spec: "an actor method that calls back into *its own* handle would deadlock its own mailbox" → recoverable Tier-2 panic with a clear message (e.g. `actor method re-entered its own handle (actors are non-reentrant); call a different actor or restructure`). Implement by tagging each in-flight message with the originating handle id and, on the isolate side, if a call arrives whose origin handle is the one currently being serviced, reply with a recoverable panic instead of enqueueing (which would deadlock the one-at-a-time mailbox). Add a failing test first:
+- [x] **Step 6: Non-reentrancy guard.** When dispatching a method call, set `in_call=true` for the duration on the handle and detect a same-handle call delivered while the mailbox is already processing a message *from this same caller-side handle re-entering itself*. Spec: "an actor method that calls back into *its own* handle would deadlock its own mailbox" → recoverable Tier-2 panic with a clear message (e.g. `actor method re-entered its own handle (actors are non-reentrant); call a different actor or restructure`). Implement by tagging each in-flight message with the originating handle id and, on the isolate side, if a call arrives whose origin handle is the one currently being serviced, reply with a recoverable panic instead of enqueueing (which would deadlock the one-at-a-time mailbox). Add a failing test first:
   ```
   worker class A { fn ping(self_handle) { return self_handle.ping(self_handle) } }  // illustrative; the real test reproduces a self-call via a stored handle
   ```
   (Design the test to the actual mechanism: the cleanest reproduction is an actor method that `await`s a method on *its own* proxy passed back in — but proxies aren't sendable, so the realistic reproduction is the runtime detecting a queued message whose origin == the currently-serviced origin. Write the test to whatever the implementation surfaces, asserting `recover` catches a panic whose message mentions non-reentrancy.)
 
-- [ ] **Step 7: close() + last-drop teardown + closed-actor calls.** Add a `close` method on the handle (`handle.close()`) that drops the `IsolateHandle` (teardown). Dropping the last `Value::Native(WorkerActor)` (GC/`Rc` last-drop) reclaims the `ResourceState` and thus the isolate (cancel-on-drop). An in-flight or new call on a closed actor resolves to a **recoverable** panic (the `oneshot` reply channel is dropped → map the recv error to a recoverable `Control::Panic` "actor is closed"). Add tests for `close()`, last-drop, and closed-call-panic.
+- [x] **Step 7: close() + last-drop teardown + closed-actor calls.** Add a `close` method on the handle (`handle.close()`) that drops the `IsolateHandle` (teardown). Dropping the last `Value::Native(WorkerActor)` (GC/`Rc` last-drop) reclaims the `ResourceState` and thus the isolate (cancel-on-drop). An in-flight or new call on a closed actor resolves to a **recoverable** panic (the `oneshot` reply channel is dropped → map the recv error to a recoverable `Control::Panic` "actor is closed"). Add tests for `close()`, last-drop, and closed-call-panic.
 
-- [ ] **Step 8: GC invariant.** `ResourceState::WorkerActor` is a native handle — the GC must NOT trace into it (it holds `Send` channels + a thread handle, not script `Value`s reachable for cycles). Confirm no `Value::trace` arm reaches into it (native handles are `Rc` with no-op `Trace` per CLAUDE.md). Add a one-line code comment asserting this.
+- [x] **Step 8: GC invariant.** `ResourceState::WorkerActor` is a native handle — the GC must NOT trace into it (it holds `Send` channels + a thread handle, not script `Value`s reachable for cycles). Confirm no `Value::trace` arm reaches into it (native handles are `Rc` with no-op `Trace` per CLAUDE.md). Add a one-line code comment asserting this.
 
-- [ ] **Step 9: Resource-ownership test.** `tests/workers_stateful.rs`: an actor whose `init` opens a MOCK native resource (use a real but local one, e.g. an in-memory sqlite via `sql.open(":memory:")` under the `sql` feature, gated `#[cfg]`) and a method that queries it; assert the resource works and that attempting to RETURN the raw resource handle from a method is a sendability panic with a field path (it can't cross — methods must return data). This is the canonical "resource lives in the actor" pattern.
+- [x] **Step 9: Resource-ownership test.** `tests/workers_stateful.rs`: an actor whose `init` opens a MOCK native resource (use a real but local one, e.g. an in-memory sqlite via `sql.open(":memory:")` under the `sql` feature, gated `#[cfg]`) and a method that queries it; assert the resource works and that attempting to RETURN the raw resource handle from a method is a sendability panic with a field path (it can't cross — methods must return data). This is the canonical "resource lives in the actor" pattern.
 
-- [ ] **Step 10:** Run `cargo test --test workers_stateful` (full) in both feature configs → **expect PASS**. `cargo clippy --all-targets` clean in both configs.
+- [x] **Step 10:** Run `cargo test --test workers_stateful` (full) in both feature configs → **expect PASS**. `cargo clippy --all-targets` clean in both configs.
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
   ```bash
   git add src/value.rs src/interp.rs src/worker/ src/vm/run.rs tests/workers_stateful.rs
   git commit -m "feat(workers): worker class actors — spawn, proxy handle, FIFO mailbox, async methods, non-reentrancy, teardown
@@ -216,14 +216,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `src/coro.rs` (`GenImpl::Worker` variant + `resume_worker`/`close`), `src/worker/stream.rs`, `src/interp.rs` (`worker fn*` call → `Value::Generator`), `src/vm/run.rs` (mirror), `tests/workers_stateful.rs`.
 
-- [ ] **Step 1: Failing behavioral test (ordered yield).** Add:
+- [x] **Step 1: Failing behavioral test (ordered yield).** Add:
   ```
   worker fn* records(n) { for i in 1..=n { yield i * 10 } }
   for await r in records(3) { print(r) }   // 10 20 30
   ```
   Assert stdout `10\n20\n30\n`. Run `cargo test --test workers_stateful stream_records` → **expect FAIL** (calling a `worker fn*` runs locally / errors).
 
-- [ ] **Step 2: `GenImpl::Worker` variant in `src/coro.rs`.** Add a third variant alongside `Body` (tree-walker) and `Vm`:
+- [x] **Step 2: `GenImpl::Worker` variant in `src/coro.rs`.** Add a third variant alongside `Body` (tree-walker) and `Vm`:
   ```rust
   /// Cross-thread streaming generator (`worker fn*`, Spec B). The producer body runs
   /// in a DEDICATED isolate; this side is a demand-driven driver. `resume(input)`
@@ -238,17 +238,17 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   ```
   Add `GeneratorHandle::new_worker(driver) -> Self`. Extend `resume` dispatch (line ~150) with a `GenImpl::Worker { .. } => self.resume_worker(input).await` arm and `close()` with a `Worker` arm (drop the driver = teardown). Follow the existing **take-out-across-await** discipline used by `resume_vm` (move the driver out of the `RefCell<Option<..>>` before the `.await`, put it back if still pending) so `await_holding_refcell_ref` stays clean.
 
-- [ ] **Step 3: `StreamDriver` in `src/worker/stream.rs`.** Holds an `IsolateHandle` (dedicated isolate running the `worker fn*` body), a demand channel (`mpsc` of `Resume{ input: encode(v) }`), a yield channel (`mpsc`/bounded of `encode(yielded)` / `Done` / `Err(msg)`), and the prefetch window (default 1). `resume_worker(input)`:
+- [x] **Step 3: `StreamDriver` in `src/worker/stream.rs`.** Holds an `IsolateHandle` (dedicated isolate running the `worker fn*` body), a demand channel (`mpsc` of `Resume{ input: encode(v) }`), a yield channel (`mpsc`/bounded of `encode(yielded)` / `Done` / `Err(msg)`), and the prefetch window (default 1). `resume_worker(input)`:
   1. If `done`, return `Ok(None)`.
   2. Send a demand credit with `encode(input)` (first resume ignores `input`, matching the tree-walker first-`next` semantics — mirror `resume_vm`'s `started` handling).
   3. Await the next yield-channel message: `Yielded(bytes)` → `decode` → `Ok(Some(v))`; `Done` → set `done`, `Ok(None)`; `Err(msg)` → recoverable `Control::Panic`.
   The producer-side isolate runs the `worker fn*` body driving its *local* generator, blocking (parking) when the bounded buffer is full = backpressure (prefetch=1 means it produces exactly one ahead of demand). A yielded value is `check_sendable` + `encode`d before crossing; non-sendable yield → field-path panic.
 
-- [ ] **Step 4: `worker fn*` call → `Value::Generator`.** In `src/interp.rs`, when calling a function whose decl is `is_worker && is_generator`, instead of building a local `GeneratorHandle` (the `Value::Generator(Rc::new(GeneratorHandle::new(..)))` path at ~3710), `check_sendable` the args, `spawn_isolate` + `dispatch::ensure_loaded` the `worker fn*` code-slice, build a `StreamDriver`, and return `Value::Generator(Rc::new(GeneratorHandle::new_worker(driver)))`. `for await` / `.next(v)` / `.close()` already dispatch through `GeneratorHandle::resume`/`close` (Task 2 added the `Worker` arm) — **transparent to user code**. Mirror in `src/vm/run.rs` (the VM's `worker fn*` call constructs the same `GenImpl::Worker` generator rather than a `GenImpl::Vm` fiber).
+- [x] **Step 4: `worker fn*` call → `Value::Generator`.** In `src/interp.rs`, when calling a function whose decl is `is_worker && is_generator`, instead of building a local `GeneratorHandle` (the `Value::Generator(Rc::new(GeneratorHandle::new(..)))` path at ~3710), `check_sendable` the args, `spawn_isolate` + `dispatch::ensure_loaded` the `worker fn*` code-slice, build a `StreamDriver`, and return `Value::Generator(Rc::new(GeneratorHandle::new_worker(driver)))`. `for await` / `.next(v)` / `.close()` already dispatch through `GeneratorHandle::resume`/`close` (Task 2 added the `Worker` arm) — **transparent to user code**. Mirror in `src/vm/run.rs` (the VM's `worker fn*` call constructs the same `GenImpl::Worker` generator rather than a `GenImpl::Vm` fiber).
 
-- [ ] **Step 5: Backpressure test.** Add a test with an INSTRUMENTED producer (a `worker fn*` that, e.g., prints/records each production) consumed one element at a time with an artificial delay between `.next()` calls; assert the producer does not run more than `prefetch` (=1) ahead of demand. Because output ordering across threads is the assertion target, drive it deterministically (sequential `.next()` with awaits) and assert the *count* of productions matches the count of resumes (+1 for prefetch), not wall-clock.
+- [x] **Step 5: Backpressure test.** Add a test with an INSTRUMENTED producer (a `worker fn*` that, e.g., prints/records each production) consumed one element at a time with an artificial delay between `.next()` calls; assert the producer does not run more than `prefetch` (=1) ahead of demand. Because output ordering across threads is the assertion target, drive it deterministically (sequential `.next()` with awaits) and assert the *count* of productions matches the count of resumes (+1 for prefetch), not wall-clock.
 
-- [ ] **Step 6: Bidirectional `next(v)` test.** Add:
+- [x] **Step 6: Bidirectional `next(v)` test.** Add:
   ```
   worker fn* echo() { let a = yield 1; let b = yield a + 100; yield b + 1000 }
   let g = echo()
@@ -258,11 +258,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   ```
   Match the EXISTING `gen.next(v)` return shape (see `src/interp.rs:3346` `dispatch_generator_method`). Assert the round-trip. (The injected `v` is `encode`d across the boundary and becomes the producer's `yield` expression result.)
 
-- [ ] **Step 7: close/drop teardown test.** Consume one value, then `g.close()` (or drop the generator); assert a subsequent `resume` returns done and the isolate is reclaimed (no zombie thread — the test process exits cleanly). Mirror `coro.rs`'s `abandoning_after_one_value_drops_cleanly` style.
+- [x] **Step 7: close/drop teardown test.** Consume one value, then `g.close()` (or drop the generator); assert a subsequent `resume` returns done and the isolate is reclaimed (no zombie thread — the test process exits cleanly). Mirror `coro.rs`'s `abandoning_after_one_value_drops_cleanly` style.
 
-- [ ] **Step 8:** Run `cargo test --test workers_stateful stream` in both feature configs → **expect PASS**. Clippy clean both configs.
+- [x] **Step 8:** Run `cargo test --test workers_stateful stream` in both feature configs → **expect PASS**. Clippy clean both configs.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
   ```bash
   git add src/coro.rs src/worker/stream.rs src/interp.rs src/vm/run.rs tests/workers_stateful.rs
   git commit -m "feat(workers): worker fn* streaming generators — dedicated isolate, demand-driven pull, bounded buffer, bidirectional next(v)
@@ -391,13 +391,13 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 > **If Plan A landed in the same campaign and already bumped `ASO_FORMAT_VERSION` for the fn-proto `is_worker`, SHARE that bump** — add the class flag under the same version. Only bump again if Plan A merged separately and is already at a released version.
 
-- [ ] **Step 1: Failing round-trip test.** In `src/vm/aso.rs` tests, add a `worker class` to the round-trip corpus and assert `ClassProto.is_worker` survives `write` → `read`. Assert `ASO_FORMAT_VERSION` is bumped (or shared with Plan A's). Run `cargo test --test ... aso worker` (or the inline aso tests) → **expect FAIL**.
+- [x] **Step 1: Failing round-trip test.** In `src/vm/aso.rs` tests, add a `worker class` to the round-trip corpus and assert `ClassProto.is_worker` survives `write` → `read`. Assert `ASO_FORMAT_VERSION` is bumped (or shared with Plan A's). Run `cargo test --test ... aso worker` (or the inline aso tests) → **expect FAIL**.
 
-- [ ] **Step 2: Class proto flag.** Add `pub is_worker: bool` to `ClassProto` (`src/vm/chunk.rs`). In `src/vm/aso.rs`, serialize it (a flag byte/bit in the class-proto layout, mirroring how `write_proto`/`read_proto` pack `is_async`/`is_generator` at line ~728). Bump `ASO_FORMAT_VERSION` from 15 → 16 (or share Plan A's bump). Update `src/vm/verify.rs` if it validates class-proto layout.
+- [x] **Step 2: Class proto flag.** Add `pub is_worker: bool` to `ClassProto` (`src/vm/chunk.rs`). In `src/vm/aso.rs`, serialize it (a flag byte/bit in the class-proto layout, mirroring how `write_proto`/`read_proto` pack `is_async`/`is_generator` at line ~728). Bump `ASO_FORMAT_VERSION` from 15 → 16 (or share Plan A's bump). Update `src/vm/verify.rs` if it validates class-proto layout.
 
-- [ ] **Step 3:** Run the aso tests + `cargo test --test vm_limits` (verify trips) in both configs → **expect PASS**.
+- [x] **Step 3:** Run the aso tests + `cargo test --test vm_limits` (verify trips) in both configs → **expect PASS**.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
   ```bash
   git commit -am "feat(aso): is_worker on ClassProto; bump ASO_FORMAT_VERSION; verify update
 
@@ -601,8 +601,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### Task 16.8: Holistic review + merge
 
-- [ ] **Step 1:** Holistic review per the milestone workflow (a fresh reviewer runs commands + probes edges: actor non-reentrancy, closed-actor calls, generator backpressure, last-drop teardown / no zombie threads, sendability field-path messages, all-modes byte-identity, zero `type-*` on the corpus).
-- [ ] **Step 2:** Merge `--no-ff` per the project milestone workflow.
+- [x] **Step 1:** Holistic review per the milestone workflow (a fresh reviewer runs commands + probes edges: actor non-reentrancy, closed-actor calls, generator backpressure, last-drop teardown / no zombie threads, sendability field-path messages, all-modes byte-identity, zero `type-*` on the corpus).
+- [x] **Step 2:** Merge `--no-ff` per the project milestone workflow.
 
 ---
 

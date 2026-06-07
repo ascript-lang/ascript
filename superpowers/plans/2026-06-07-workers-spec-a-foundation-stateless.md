@@ -629,7 +629,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `src/worker/mod.rs` (export `WorkerCodeSlice`, `build_code_slice`)
 - Test: `src/worker/dispatch.rs` `#[cfg(test)]`
 
-- [ ] **Step 1: Write the failing closure test** — in `src/worker/dispatch.rs` tests:
+- [x] **Step 1: Write the failing closure test** — in `src/worker/dispatch.rs` tests:
 
 ```rust
 #[cfg(test)]
@@ -667,11 +667,11 @@ mod tests {
 ```
 (`build_slice_for_test` / `run_slice_in_fresh_isolate` / `dep_names` are test-only helpers you add in this module; `run_slice_in_fresh_isolate` constructs a new `Interp`, loads the slice's `.aso` (the deps + entry), and calls the entry — the synchronous in-process analog of the isolate run loop, validating the slice before the threading lands.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
   Run: `cargo test --lib worker::dispatch`
   Expected: FAIL — functions do not exist.
 
-- [ ] **Step 3: Define `WorkerCodeSlice`** in `src/worker/mod.rs`:
+- [x] **Step 3: Define `WorkerCodeSlice`** in `src/worker/mod.rs`:
 ```rust
 use std::rc::Rc;
 /// The shippable bytecode payload for one worker fn: its compiled chunk(s) plus
@@ -684,13 +684,13 @@ pub struct WorkerCodeSlice {
 }
 ```
 
-- [ ] **Step 4: Implement the closure walk + slice build** in `src/worker/dispatch.rs`. The closure walks the compiled `Chunk`'s constant pool / global references (the same `GET_GLOBAL` name set + nested `FnProto` consts) to find referenced top-level names; resolve each name to its top-level binding (fn or const); recurse. For consts, the VALUE is structured-clone'd into the isolate at dispatch (per §4); for fns, the `FnProto`/AST is serialized. Materialize the slice via the `.aso` Writer (`src/vm/aso.rs`) — write a small "module fragment": the set of `(name, FnProto|const-bytes)` plus the entry name. `fn_id` is a stable hash of the entry's identity (e.g. its def span + name). Provide `build_code_slice(interp, entry_proto_or_fn, class_name) -> Result<WorkerCodeSlice, Control>`. (For the tree-walker oracle, the equivalent slice ships the AST closure — Task 8 wires the per-engine materialization; here implement the VM/`.aso` path and the closure algorithm engine-agnostically over names.)
+- [x] **Step 4: Implement the closure walk + slice build** in `src/worker/dispatch.rs`. The closure walks the compiled `Chunk`'s constant pool / global references (the same `GET_GLOBAL` name set + nested `FnProto` consts) to find referenced top-level names; resolve each name to its top-level binding (fn or const); recurse. For consts, the VALUE is structured-clone'd into the isolate at dispatch (per §4); for fns, the `FnProto`/AST is serialized. Materialize the slice via the `.aso` Writer (`src/vm/aso.rs`) — write a small "module fragment": the set of `(name, FnProto|const-bytes)` plus the entry name. `fn_id` is a stable hash of the entry's identity (e.g. its def span + name). Provide `build_code_slice(interp, entry_proto_or_fn, class_name) -> Result<WorkerCodeSlice, Control>`. (For the tree-walker oracle, the equivalent slice ships the AST closure — Task 8 wires the per-engine materialization; here implement the VM/`.aso` path and the closure algorithm engine-agnostically over names.)
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
   Run: `cargo test --lib worker::dispatch`
   Expected: PASS. Also `--no-default-features`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 ```bash
 git add src/worker/dispatch.rs src/worker/mod.rs
 git commit -m "feat(worker): dependency-closure code-slice builder reusing .aso; ships entry + transitive top-level deps
@@ -708,7 +708,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `Cargo.toml` (add `num_cpus`)
 - Test: `tests/cli.rs` (integration, spawning the binary)
 
-- [ ] **Step 1: Write the failing integration test** — add to `tests/cli.rs`:
+- [x] **Step 1: Write the failing integration test** — add to `tests/cli.rs`:
 
 ```rust
 #[test]
@@ -736,13 +736,13 @@ fn no_worker_program_starts_no_pool() {
 ```
 (Use the existing `tests/cli.rs` helper for spawning `env!("CARGO_BIN_EXE_ascript")` over a temp file; mirror a current test.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
   Run: `cargo test --test cli worker_parallel_map_runs`
   Expected: FAIL — `worker fn` dispatch not implemented (currently runs inline or errors).
 
-- [ ] **Step 3: Add `num_cpus`** to `Cargo.toml` `[dependencies]` (core, not feature-gated). Run `cargo build`.
+- [x] **Step 3: Add `num_cpus`** to `Cargo.toml` `[dependencies]` (core, not feature-gated). Run `cargo build`.
 
-- [ ] **Step 4: Implement one isolate** in `src/worker/isolate.rs`. An isolate is a `std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(...)` (mirror `run_on_worker_stack`, `src/lib.rs:52`) hosting a fresh current-thread tokio runtime + `LocalSet` + a fresh `Interp` (`Interp::new()`). It owns a `Send` request channel (`tokio::sync::mpsc`) and replies on a per-request `oneshot`. Request message (all `Send` bytes):
+- [x] **Step 4: Implement one isolate** in `src/worker/isolate.rs`. An isolate is a `std::thread::Builder::new().stack_size(WORKER_STACK_SIZE).spawn(...)` (mirror `run_on_worker_stack`, `src/lib.rs:52`) hosting a fresh current-thread tokio runtime + `LocalSet` + a fresh `Interp` (`Interp::new()`). It owns a `Send` request channel (`tokio::sync::mpsc`) and replies on a per-request `oneshot`. Request message (all `Send` bytes):
 ```rust
 pub struct WorkerRequest {
     pub fn_id: u64,
@@ -757,13 +757,13 @@ pub enum WorkerReply { Ok(Vec<u8>), Panic(String) } // result bytes or worker-si
 ```
 The isolate loop: on a request, ensure the slice is cached (load the `.aso` into the isolate's `Interp` if `slice_bytes` is `Some` and `fn_id` is new); `decode` the args against the isolate's `Interp`; `select!` the entry-fn run against the `abort` receiver; on completion `encode` the result and send `WorkerReply::Ok`, or `WorkerReply::Panic(message)` on an uncaught Tier-2 panic. A `[value, err]` Result is ordinary data and rides through `Ok`.
 
-- [ ] **Step 5: Implement the pool** in `src/worker/pool.rs`. A process-global `thread_local!`/`OnceCell`-backed `RefCell<Option<Pool>>` (the caller thread owns it; isolates are spawned from here). `Pool`: a cap = `env::var("ASCRIPT_WORKERS").ok().and_then(parse).unwrap_or_else(num_cpus::get)`, a `Vec<IsolateHandle>` (each = the `Send` request sender + a "busy" flag), and a FIFO `VecDeque` of pending jobs. `acquire()`:
+- [x] **Step 5: Implement the pool** in `src/worker/pool.rs`. A process-global `thread_local!`/`OnceCell`-backed `RefCell<Option<Pool>>` (the caller thread owns it; isolates are spawned from here). `Pool`: a cap = `env::var("ASCRIPT_WORKERS").ok().and_then(parse).unwrap_or_else(num_cpus::get)`, a `Vec<IsolateHandle>` (each = the `Send` request sender + a "busy" flag), and a FIFO `VecDeque` of pending jobs. `acquire()`:
   - if an idle isolate exists → use it;
   - else if `live < cap` → spawn a new isolate (demand growth) → use it;
   - else → enqueue the job (backpressure); it dispatches when an isolate frees up.
   `pool_is_initialized()` returns whether the `OnceCell` is set. **Inline nesting:** the pool exposes `in_isolate()` (a thread-local flag set inside an isolate's run loop); `dispatch_worker` checks it FIRST and, when true, runs the worker body INLINE in the current isolate (no re-dispatch) — deadlock-free per §7.
 
-- [ ] **Step 6: Implement `dispatch_worker`** in `src/worker/mod.rs`:
+- [x] **Step 6: Implement `dispatch_worker`** in `src/worker/mod.rs`:
 ```rust
 pub fn dispatch_worker(
     interp: &Interp, slice: WorkerCodeSlice, args: Vec<Value>, span: Span,
@@ -771,7 +771,7 @@ pub fn dispatch_worker(
 ```
 Behavior: if `pool::in_isolate()` → run inline (call the entry locally) and wrap as a resolved `Value::Future`. Otherwise: `serialize::check_sendable` each arg (mapping `SendError` → a recoverable `Control::Panic` carrying `span`); `encode` the args; build a `SharedFuture` (`crate::task::SharedFuture::new()`); create the `oneshot` reply + `oneshot` abort; hand the request to `pool::acquire()`; `spawn_local` a SMALL bridge task on the CALLER thread that awaits the reply `oneshot`, `decode`s the result bytes against `interp` (or converts `WorkerReply::Panic(msg)` into a recoverable `Control::Panic`), and resolves the `SharedFuture`'s cell. Wire `SharedFuture::set_abort` to a handle that drops the abort `oneshot` sender → cancel-on-drop sends the abort signal across the channel (Task 9 tests this). Return `Value::Future(fut)`.
 
-- [ ] **Step 7: Hook the dispatch into both engines.**
+- [x] **Step 7: Hook the dispatch into both engines.**
   - Legacy interp (`src/interp.rs`, the `call_function` async region @3714): BEFORE the `if func.is_async` block, add:
     ```rust
     if func.is_worker {
@@ -782,11 +782,11 @@ Behavior: if `pool::in_isolate()` → run inline (call the entry locally) and wr
   - VM (`src/vm/run.rs` @1061 and @3215): alongside the `callee.proto.is_async` branch, add a `closure.proto.is_worker` branch that calls `crate::worker::dispatch_worker(...)` with the VM's `Interp` and pushes the returned `Value::Future`. (The VM's `Interp` is reachable via the `Vm`'s interp ref used by the async path — pin it by reading the @1061 context.)
   - For `static worker fn` (a `ClassMethod`/`Method` with `is_worker`), hook the static-method call path the same way (set `class_name = Some(class.name)` in the slice).
 
-- [ ] **Step 8: Run the tests**
+- [x] **Step 8: Run the tests**
   Run: `cargo test --test cli worker_parallel_map_runs no_worker_program_starts_no_pool`
   Expected: PASS.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 ```bash
 git add src/worker/isolate.rs src/worker/pool.rs src/worker/mod.rs src/interp.rs src/vm/run.rs Cargo.toml
 git commit -m "feat(worker): lazy demand-grown isolate pool + Send byte-channel dispatch; worker fn returns future<T>
@@ -1451,7 +1451,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 - [x] **Step 3: README note.** Add one line in `README.md` where concurrency/stdlib is described: "`worker fn` runs CPU-bound work on a pooled shared-nothing isolate (multi-core), returning `future<T>`." Do NOT attempt the full README/CLAUDE.md/roadmap sweep — that is Plan B §8.2.
 
-- [ ] **Step 4: Serve-and-eyeball (optional sanity)**
+- [x] **Step 4: Serve-and-eyeball (optional sanity)**
   Run: `cd docs && python3 -m http.server` and load the modules-async page; confirm the Workers section renders and its in-content links resolve.
 
 - [x] **Step 5: Commit**
@@ -1466,14 +1466,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ## Final verification (before holistic review + merge)
 
-- [ ] **Step 1:** `cargo test` — full suite green.
-- [ ] **Step 2:** `cargo test --no-default-features` — core-only green (worker subsystem builds and serializer/dispatch tests pass with no stdlib).
-- [ ] **Step 3:** `cargo clippy --all-targets` AND `cargo clippy --no-default-features --all-targets` — both clean (no `await_holding_refcell_ref`).
-- [ ] **Step 4:** `cargo test --test vm_differential` — whole-corpus + worker all-modes byte-identical in both configs.
-- [ ] **Step 5:** `cargo test --test frontend_conformance --test treesitter_conformance` — both parsers + tree-sitter accept `worker`.
-- [ ] **Step 6:** `cargo build --release && for f in examples/workers_*.as examples/advanced/workers_*.as; do target/release/ascript run "$f"; done` — every example runs.
-- [ ] **Step 7:** `bash bench/run_workers_bench.sh` — report regenerated; speedup confirmed.
-- [ ] **Step 8:** Holistic review (independent reviewer runs the commands + probes edges: a 10k-item `.map(worker)` doesn't spawn 10k threads; cancel-on-drop reclaims; nested at cap=1 doesn't deadlock; `async worker fn` parses; a class field named `worker` still works). Then merge `--no-ff` per the milestone workflow.
+- [x] **Step 1:** `cargo test` — full suite green.
+- [x] **Step 2:** `cargo test --no-default-features` — core-only green (worker subsystem builds and serializer/dispatch tests pass with no stdlib).
+- [x] **Step 3:** `cargo clippy --all-targets` AND `cargo clippy --no-default-features --all-targets` — both clean (no `await_holding_refcell_ref`).
+- [x] **Step 4:** `cargo test --test vm_differential` — whole-corpus + worker all-modes byte-identical in both configs.
+- [x] **Step 5:** `cargo test --test frontend_conformance --test treesitter_conformance` — both parsers + tree-sitter accept `worker`.
+- [x] **Step 6:** `cargo build --release && for f in examples/workers_*.as examples/advanced/workers_*.as; do target/release/ascript run "$f"; done` — every example runs.
+- [x] **Step 7:** `bash bench/run_workers_bench.sh` — report regenerated; speedup confirmed.
+- [x] **Step 8:** Holistic review (independent reviewer runs the commands + probes edges: a 10k-item `.map(worker)` doesn't spawn 10k threads; cancel-on-drop reclaims; nested at cap=1 doesn't deadlock; `async worker fn` parses; a class field named `worker` still works). Then merge `--no-ff` per the milestone workflow.
 
 ---
 
