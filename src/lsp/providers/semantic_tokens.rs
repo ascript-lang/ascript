@@ -81,11 +81,37 @@ pub fn classify(model: &SemanticModel) -> Vec<ClassifiedToken> {
     // Member-access NAME spans (`obj.field`'s `field`) → PROPERTY, or ENUM_MEMBER
     // when the receiver resolves to an enum. Built once per pass off the CST.
     let members = member_name_spans(model);
+    // Byte spans of contextual-keyword `Ident` tokens that the CST parser remapped
+    // to `WorkerKw`/`StaticKw` — the raw lexer emits `Ident` for these, but they
+    // are keywords in context and should be styled accordingly.
+    let ctx_kw_spans = contextual_keyword_spans(model);
     let mut out = Vec::new();
     for t in &toks {
-        if let Some(c) = classify_one(model, t, &members) {
+        if let Some(c) = classify_one(model, t, &members, &ctx_kw_spans) {
             out.push(c);
         }
+    }
+    out
+}
+
+/// The byte spans `(start, end)` of every CST token of kind `WorkerKw` or
+/// `StaticKw`. The raw lexer produces `Ident` for these contextual keywords,
+/// so we intersect the lexer stream against the CST to fix their classification.
+fn contextual_keyword_spans(model: &SemanticModel) -> std::collections::HashSet<(usize, usize)> {
+    let mut out = std::collections::HashSet::new();
+    for tok in model
+        .tree
+        .descendants_with_tokens()
+        .filter_map(|el| el.into_token())
+        .filter(|t| {
+            matches!(
+                t.kind(),
+                SyntaxKind::WorkerKw | SyntaxKind::StaticKw
+            )
+        })
+    {
+        let r = tok.text_range();
+        out.insert((usize::from(r.start()), usize::from(r.end())));
     }
     out
 }
@@ -94,6 +120,7 @@ fn classify_one(
     model: &SemanticModel,
     t: &TokenSpan,
     members: &HashMap<(usize, usize), u32>,
+    ctx_kw_spans: &std::collections::HashSet<(usize, usize)>,
 ) -> Option<ClassifiedToken> {
     let (token_type, modifiers) = match t.kind {
         SyntaxKind::LineComment | SyntaxKind::BlockComment => (TYPE_COMMENT, 0),
@@ -105,6 +132,12 @@ fn classify_one(
         | SyntaxKind::TemplateStart
         | SyntaxKind::TemplateMiddle
         | SyntaxKind::TemplateEnd => (TYPE_STRING, 0),
+        // A contextual keyword (`worker`, `static`) remapped by the CST parser:
+        // the raw lexer emits `Ident`, but the CST has `WorkerKw`/`StaticKw` at
+        // the same span — intercept before the member-name / ident paths.
+        SyntaxKind::Ident if ctx_kw_spans.contains(&(t.start, t.end())) => {
+            (TYPE_KEYWORD, 0)
+        }
         // A member-access NAME (`obj.field`) is a PROPERTY/ENUM_MEMBER, not a
         // resolver use — check it BEFORE the resolver-based ident classification.
         SyntaxKind::Ident if members.contains_key(&(t.start, t.end())) => {
@@ -449,5 +482,54 @@ mod encode_tests {
         // First emitted token is on line 1 (delta_line == 1 from the (0,0) baseline).
         assert!(!st.data.is_empty());
         assert_eq!(st.data[0].delta_line, 1);
+    }
+}
+
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use crate::check::LintConfig;
+
+    fn model(src: &str) -> SemanticModel {
+        SemanticModel::build(src.to_string(), None, &LintConfig::default())
+    }
+
+    /// The `worker` contextual keyword in `worker fn f()` must be classified as
+    /// KEYWORD (type 0) even though the raw lexer emits it as `Ident`.
+    #[test]
+    fn worker_fn_contextual_keyword_is_keyword() {
+        let cs = classify(&model("worker fn f() { return 1 }\n"));
+        let worker = cs.iter().find(|c| c.start == 0).expect("token at 0");
+        assert_eq!(
+            worker.token_type, TYPE_KEYWORD,
+            "`worker` in `worker fn` must be KEYWORD; got type {}",
+            worker.token_type
+        );
+        assert_eq!(worker.len, 6, "`worker` length must be 6");
+    }
+
+    /// The `worker` contextual keyword in `worker class Db {}` must be KEYWORD.
+    #[test]
+    fn worker_class_contextual_keyword_is_keyword() {
+        let cs = classify(&model("worker class Db {}\n"));
+        let worker = cs.iter().find(|c| c.start == 0).expect("token at 0");
+        assert_eq!(
+            worker.token_type, TYPE_KEYWORD,
+            "`worker` in `worker class` must be KEYWORD; got type {}",
+            worker.token_type
+        );
+    }
+
+    /// The `worker` contextual keyword in `worker fn* s()` must be KEYWORD.
+    #[test]
+    fn worker_fn_star_contextual_keyword_is_keyword() {
+        let cs = classify(&model("worker fn* s(n: number) { yield n }\n"));
+        let worker = cs.iter().find(|c| c.start == 0).expect("token at 0");
+        assert_eq!(
+            worker.token_type, TYPE_KEYWORD,
+            "`worker` in `worker fn*` must be KEYWORD; got type {}",
+            worker.token_type
+        );
     }
 }

@@ -1256,17 +1256,13 @@ fn lsp_worker_is_keyword_token() {
         .expect("semanticTokens data array");
     // The wire format is groups of 5 integers: [delta_line, delta_start, length,
     // token_type, token_modifiers_bitset].
-    // KEYWORD = legend index 0; "worker" is 6 characters.
-    // Scan all tokens for a KEYWORD (token_type==0) of length 6.
+    // KEYWORD = legend index 0; `worker` is the FIRST token (delta_line=0,
+    // delta_start=0, length=6, token_type=0).
     let nums: Vec<u32> = raw.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
-    let has_worker_kw = nums.chunks(5).any(|t| {
-        t.len() == 5
-            && t[2] == 6   // length == len("worker")
-            && t[3] == 0   // token_type == KEYWORD
-    });
+    // The first token must be `worker` at (line=0, char=0, len=6, type=KEYWORD).
     assert!(
-        has_worker_kw,
-        "`worker` must be emitted as a KEYWORD (type 0, len 6); raw data: {nums:?}"
+        nums.len() >= 5 && nums[0] == 0 && nums[1] == 0 && nums[2] == 6 && nums[3] == 0,
+        "`worker` at position 0 must be the first token (KEYWORD, len 6); raw data: {nums:?}"
     );
 
     client.request_no_params(99, "shutdown");
@@ -1542,4 +1538,349 @@ fn lsp_navigation_finds_worker_fn() {
     client.close_stdin();
     let _ = client.wait_for_exit(Duration::from_secs(10));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Task 9: worker class / actor handle / worker fn* LSP tests ───────────────
+
+/// Task 9 Step 1a: the `worker` keyword before `class` is emitted as a KEYWORD
+/// semantic token.  `worker class Db { fn query(): string { return "ok" } }` —
+/// `worker` at line 0 char 0, length 6, token_type 0 (KEYWORD).
+#[test]
+fn lsp_worker_class_is_keyword_token() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://worker_class_kw.as";
+    let text = "worker class Db { fn query(): string { return \"ok\" } }\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let st_resp = client.read_response(2, overall);
+    let raw = st_resp["result"]["data"]
+        .as_array()
+        .expect("semanticTokens data array");
+    let nums: Vec<u32> = raw.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+    // The first token must be `worker` at (line=0, char=0, len=6, type=KEYWORD=0).
+    assert!(
+        nums.len() >= 5 && nums[0] == 0 && nums[1] == 0 && nums[2] == 6 && nums[3] == 0,
+        "`worker` before `class` must be the first KEYWORD token (len 6); raw: {nums:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Task 9 Step 1b: a `worker class` appears in document symbols as CLASS (kind
+/// 5), and its methods are listed as METHOD children.
+#[test]
+fn lsp_worker_class_appears_in_document_symbols() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://worker_class_sym.as";
+    let text = "worker class Counter {\n  fn init() {}\n  fn inc(): number { return 1 }\n}\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let sym_resp = client.read_response(2, overall);
+    let symbols = sym_resp["result"]
+        .as_array()
+        .expect("documentSymbol array result");
+    let names: Vec<&str> = symbols.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(
+        names.contains(&"Counter"),
+        "`Counter` worker class must appear in symbols; got: {names:?}"
+    );
+
+    // The `Counter` symbol must have kind CLASS (5).
+    let counter = symbols
+        .iter()
+        .find(|s| s["name"].as_str() == Some("Counter"))
+        .expect("Counter in symbols");
+    assert_eq!(
+        counter["kind"].as_i64(),
+        Some(5),
+        "Counter worker class must have kind CLASS (5): {counter}"
+    );
+
+    // Its methods (`init`, `inc`) must appear as children of kind METHOD (6).
+    let children = counter["children"].as_array().expect("Counter children");
+    let child_names: Vec<&str> = children.iter().filter_map(|c| c["name"].as_str()).collect();
+    assert!(
+        child_names.contains(&"init") && child_names.contains(&"inc"),
+        "worker class methods must appear as children; got: {child_names:?}"
+    );
+    assert!(
+        children.iter().all(|c| c["kind"].as_i64() == Some(6)),
+        "worker class method children must be METHOD (6): {children:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Task 9 Step 1c: hovering the name of a `worker class` mentions "worker" in
+/// the hover text.
+#[test]
+fn lsp_hover_worker_class_mentions_worker() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://worker_class_hover.as";
+    // Line 0: "worker class Db { fn query(): string { return "ok" } }"
+    // `Db` starts at char 13.
+    let text = "worker class Db { fn query(): string { return \"ok\" } }\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Hover over `Db` in the declaration (char 13 on line 0).
+    client.request(
+        2,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 13 }
+        }),
+    );
+    let hover_resp = client.read_response(2, overall);
+    assert!(
+        !hover_resp["result"].is_null(),
+        "hover on worker class name must not be null: {hover_resp}"
+    );
+    let content = hover_resp["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        content.contains("worker"),
+        "hover on a `worker class` must mention 'worker'; got: {content:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Task 9 Step 1d: goto-definition on `Counter` used in a `Counter.spawn()`
+/// call lands at the `worker class` declaration.
+#[test]
+fn lsp_navigation_finds_worker_class() {
+    let dir = std::env::temp_dir()
+        .join(format!("ascript_lsp_worker_class_nav_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f_path = dir.join("wc.as");
+    // `worker class Counter` declared; its name referenced in an async fn.
+    std::fs::write(
+        &f_path,
+        "worker class Counter { fn inc(): number { return 1 } }\nasync fn main() { let h = await Counter.spawn() }\n",
+    )
+    .unwrap();
+    let f_uri = format!("file://{}", f_path.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let file_text = std::fs::read_to_string(&f_path).unwrap();
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": f_uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": file_text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // `Counter` in `Counter.spawn()` on line 1.
+    // "async fn main() { let h = await Counter.spawn() }"
+    // `Counter` starts at char 31 on line 1.
+    client.request(
+        2,
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": f_uri },
+            "position": { "line": 1, "character": 31 }
+        }),
+    );
+    let def_resp = client.read_response(2, overall);
+    let result = &def_resp["result"];
+    assert!(
+        !result.is_null(),
+        "goto-def on a worker class use must not be null: {def_resp}"
+    );
+    let loc_uri = if result.is_array() {
+        let arr = result.as_array().unwrap();
+        assert!(!arr.is_empty(), "expected at least 1 definition: {def_resp}");
+        arr[0]["uri"].as_str().unwrap_or("").to_string()
+    } else {
+        result["uri"].as_str().unwrap_or("").to_string()
+    };
+    assert!(
+        loc_uri.ends_with("wc.as"),
+        "goto-def should point to wc.as; got: {loc_uri}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Task 9 Step 1e: a `worker fn*` (generator) is emitted as a KEYWORD token
+/// (the `worker` token) AND appears in document symbols as a FUNCTION.
+#[test]
+fn lsp_worker_gen_fn_symbol_and_token() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://worker_gen.as";
+    let text = "worker fn* stream(n: number) { for i in 1..=n { yield i } }\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Semantic tokens: `worker` (len 6) is a KEYWORD.
+    client.request(
+        2,
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let st_resp = client.read_response(2, overall);
+    let raw = st_resp["result"]["data"]
+        .as_array()
+        .expect("semanticTokens data");
+    let nums: Vec<u32> = raw.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+    // The first token must be `worker` at (line=0, char=0, len=6, type=KEYWORD=0).
+    assert!(
+        nums.len() >= 5 && nums[0] == 0 && nums[1] == 0 && nums[2] == 6 && nums[3] == 0,
+        "`worker` before `fn*` must be the first KEYWORD token (len 6); raw: {nums:?}"
+    );
+
+    // Document symbols: `stream` appears as FUNCTION (kind 12).
+    client.request(
+        3,
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let sym_resp = client.read_response(3, overall);
+    let symbols = sym_resp["result"]
+        .as_array()
+        .expect("documentSymbol array");
+    let names: Vec<&str> = symbols.iter().filter_map(|s| s["name"].as_str()).collect();
+    assert!(
+        names.contains(&"stream"),
+        "`stream` worker fn* must appear in document symbols; got: {names:?}"
+    );
+    let stream_sym = symbols
+        .iter()
+        .find(|s| s["name"].as_str() == Some("stream"))
+        .unwrap();
+    assert_eq!(
+        stream_sym["kind"].as_i64(),
+        Some(12),
+        "worker fn* must be a FUNCTION symbol (kind 12): {stream_sym}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
 }

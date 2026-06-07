@@ -287,6 +287,44 @@ mod tests {
         assert!(cnames.contains(&"m") && cnames.contains(&"n"), "{cnames:?}");
     }
 
+    // ── Task 9 symbols unit tests ───────────────────────────────────────────
+
+    /// A `worker class` must appear in document symbols as CLASS, with its
+    /// methods listed as METHOD children — identical to a plain class.
+    #[test]
+    #[allow(deprecated)]
+    fn worker_class_appears_as_class_with_method_children() {
+        let src = "worker class Counter {\n  fn init() {}\n  fn inc(): number { return 1 }\n}\n";
+        let syms = document_symbols(&model(src));
+        let counter = syms.iter().find(|s| s.name == "Counter").expect("Counter");
+        assert_eq!(counter.kind, SymbolKind::CLASS, "worker class must be CLASS kind");
+        let children = counter.children.as_ref().expect("Counter children");
+        let cnames: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            cnames.contains(&"init") && cnames.contains(&"inc"),
+            "worker class methods must be children; got: {cnames:?}"
+        );
+        assert!(
+            children.iter().all(|c| c.kind == SymbolKind::METHOD),
+            "worker class children must be METHOD; got: {children:?}"
+        );
+    }
+
+    /// A `worker fn*` appears in document symbols as FUNCTION.
+    #[test]
+    #[allow(deprecated)]
+    fn worker_fn_star_appears_as_function() {
+        let src = "worker fn* stream(n: number) { for i in 1..=n { yield i } }\n";
+        let syms = document_symbols(&model(src));
+        let stream = syms.iter().find(|s| s.name == "stream").expect("stream");
+        assert_eq!(
+            stream.kind,
+            SymbolKind::FUNCTION,
+            "worker fn* must appear as FUNCTION; got {:?}",
+            stream.kind
+        );
+    }
+
     #[test]
     #[allow(deprecated)]
     fn nests_class_fields_before_methods_and_enum_variants() {

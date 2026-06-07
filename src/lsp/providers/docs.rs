@@ -6,7 +6,7 @@
 
 use crate::lsp::model::SemanticModel;
 use crate::syntax::kind::SyntaxKind;
-use crate::syntax::resolve::is_worker_fn;
+use crate::syntax::resolve::{is_worker_class, is_worker_fn};
 use tower_lsp::lsp_types::{Position, SymbolKind};
 
 /// The byte offset under an LSP `Position`: char offset via the model's
@@ -127,7 +127,14 @@ fn decl_doc(name: &str, model: &SemanticModel) -> Option<String> {
             }
             "fn"
         }
-        SymbolKind::CLASS => "class",
+        SymbolKind::CLASS => {
+            if class_decl_is_worker(name, model) {
+                return Some(format!(
+                    "```\nworker class {name}\n```\nworker class — stateful actor; call `{name}.spawn()` to get a handle."
+                ));
+            }
+            "class"
+        }
         SymbolKind::ENUM => "enum",
         SymbolKind::CONSTANT => "const",
         SymbolKind::VARIABLE => "let",
@@ -158,6 +165,33 @@ fn fn_decl_is_worker(name: &str, model: &SemanticModel) -> bool {
             continue;
         }
         if is_worker_fn(decl) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return `true` if the top-level `ClassDecl` named `name` in `model` carries a
+/// `WorkerKw` token (i.e. it is a `worker class`).
+fn class_decl_is_worker(name: &str, model: &SemanticModel) -> bool {
+    for child in model.tree.children() {
+        // Unwrap a leading `export <decl>`.
+        let decl = if child.kind() == SyntaxKind::ExportStmt {
+            match child.children().next() {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            child
+        };
+        if decl.kind() != SyntaxKind::ClassDecl {
+            continue;
+        }
+        let decl_name = crate::syntax::resolve::ident_text(decl).unwrap_or_default();
+        if decl_name != name {
+            continue;
+        }
+        if is_worker_class(decl) {
             return true;
         }
     }
@@ -215,5 +249,47 @@ mod tests {
         // Line 1, char 0 is the `p` of print at byte 10.
         let off = byte_offset_at(&m, Position::new(1, 0));
         assert_eq!(off, 10);
+    }
+
+    // ── Task 9 docs unit tests ──────────────────────────────────────────────
+
+    /// Hovering the name of a `worker class` must mention "worker" in the doc.
+    #[test]
+    fn doc_at_worker_class_mentions_worker() {
+        let src = "worker class Db { fn query(): string { return \"ok\" } }\n";
+        let m = model(src);
+        // `Db` starts at byte 13 ("worker class Db").
+        let off = src.find("Db").unwrap();
+        let doc = doc_at(&m, off).expect("hover on Db");
+        assert!(
+            doc.contains("worker"),
+            "hover on a worker class must mention 'worker'; got: {doc}"
+        );
+    }
+
+    /// Hovering the name of a `worker fn` must mention "worker" in the doc.
+    #[test]
+    fn doc_at_worker_fn_mentions_worker() {
+        let src = "worker fn render(s: number): number { return s }\n";
+        let m = model(src);
+        let off = src.find("render").unwrap();
+        let doc = doc_at(&m, off).expect("hover on render");
+        assert!(
+            doc.contains("worker"),
+            "hover on a worker fn must mention 'worker'; got: {doc}"
+        );
+    }
+
+    /// A plain (non-worker) class hover must NOT contain "worker".
+    #[test]
+    fn doc_at_plain_class_does_not_mention_worker() {
+        let src = "class Counter {}\n";
+        let m = model(src);
+        let off = src.find("Counter").unwrap();
+        let doc = doc_at(&m, off).expect("hover on Counter");
+        assert!(
+            !doc.contains("worker"),
+            "hover on a plain class must not mention 'worker'; got: {doc}"
+        );
     }
 }

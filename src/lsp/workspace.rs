@@ -1276,4 +1276,38 @@ mod tests {
         assert!(idx.exported_fn_arity(&a, "helper").is_none());
         assert!(idx.exported_fn_arity(&a, "nope").is_none());
     }
+
+    // ── Task 9: workspace index for worker class / worker fn* ──────────────
+
+    /// A `worker class` is indexed as `DefKind::Class` in the workspace index.
+    #[test]
+    fn worker_class_indexed_as_class() {
+        let files = vec![(
+            PathBuf::from("/ws/w.as"),
+            "worker class Counter { fn inc(): number { return 1 } }\n".to_string(),
+        )];
+        let idx = WorkspaceIndex::build_from_files(&files);
+        let defs = &idx.defs_by_name["Counter"];
+        assert!(
+            defs.iter().any(|d| d.kind == DefKind::Class),
+            "worker class must be indexed as Class; got: {defs:?}"
+        );
+    }
+
+    /// A `worker fn*` is indexed as `DefKind::Fn` in the workspace index.
+    #[test]
+    fn worker_fn_star_indexed_as_fn() {
+        let files = vec![(
+            PathBuf::from("/ws/w.as"),
+            // Body uses `yield` directly (no for-range) so the CST parser accepts it
+            // cleanly; the workspace indexer requires a parse-error-free file to index.
+            "worker fn* stream(n: number) { yield n }\n".to_string(),
+        )];
+        let idx = WorkspaceIndex::build_from_files(&files);
+        let defs = &idx.defs_by_name["stream"];
+        assert!(
+            defs.iter().any(|d| d.kind == DefKind::Fn),
+            "worker fn* must be indexed as Fn; got: {defs:?}"
+        );
+    }
 }
