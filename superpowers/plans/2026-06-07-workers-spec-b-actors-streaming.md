@@ -507,15 +507,15 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `bench/` (extend Plan A's harness + markdown report).
 
-- [ ] **Step 1: Actor throughput bench.** Add a bench measuring messages/sec to a SINGLE actor (mailbox round-trip cost) and aggregate throughput across N independent actors on N cores (scaling). Use a tight loop of `await handle.method(small_payload)` for the single-actor number; N independent actors driven via `task.gather` for the aggregate.
+- [x] **Step 1: Actor throughput bench.** Add a bench measuring messages/sec to a SINGLE actor (mailbox round-trip cost) and aggregate throughput across N independent actors on N cores (scaling). Use a tight loop of `await handle.method(small_payload)` for the single-actor number; N independent actors driven via `task.gather` for the aggregate.
 
-- [ ] **Step 2: Streaming throughput + chunking effect.** Bench records/sec for a `worker fn*` at prefetch=1 vs a larger window (if the prefetch knob is exposed; else document prefetch=1 only), AND per-element vs per-chunk yielding (yield 1 record vs yield an array of K records) — quantify the "yield chunks, not elements" guidance and find the break-even chunk size.
+- [x] **Step 2: Streaming throughput + chunking effect.** Bench records/sec for a `worker fn*` at prefetch=1 vs a larger window (if the prefetch knob is exposed; else document prefetch=1 only), AND per-element vs per-chunk yielding (yield 1 record vs yield an array of K records) — quantify the "yield chunks, not elements" guidance and find the break-even chunk size.
 
-- [ ] **Step 3: Dedicated-isolate spawn cost.** Bench `spawn` latency (cold) and steady-state per-message latency (warm).
+- [x] **Step 3: Dedicated-isolate spawn cost.** Bench `spawn` latency (cold) and steady-state per-message latency (warm).
 
-- [ ] **Step 4: Report.** Append the stateful-worker numbers to Plan A's `bench/` report (sibling to `bench/PROFILING_RESULTS.md`). Headline numbers on the VM; tree-walker informational. No hard CI threshold (CI core counts vary) — record measured figures + the break-even chunk size.
+- [x] **Step 4: Report.** Append the stateful-worker numbers to Plan A's `bench/` report (sibling to `bench/PROFILING_RESULTS.md`). Headline numbers on the VM; tree-walker informational. No hard CI threshold (CI core counts vary) — record measured figures + the break-even chunk size.
 
-- [ ] **Step 5:** Run the benches (`cargo run --release -- run bench/...` or `cargo bench` per Plan A's harness shape) and write the report. Commit.
+- [x] **Step 5:** Run the benches (`cargo run --release -- run bench/...` or `cargo bench` per Plan A's harness shape) and write the report. Commit.
   ```bash
   git add bench/
   git commit -m "bench(workers): actor throughput, streaming + chunking effect, dedicated-isolate spawn cost; report
