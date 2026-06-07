@@ -301,29 +301,34 @@ impl<'a> Reader<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Reader { buf, pos: 0 }
     }
+    /// Bytes left to read. A sound upper bound for any pre-allocation, since every
+    /// wire element occupies at least one byte (see `decode_value`'s array arm).
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
     fn u8(&mut self) -> Result<u8, SendError> {
-        let b = *self
-            .buf
-            .get(self.pos)
-            .ok_or_else(truncated_err)?;
-        self.pos += 1;
+        let b = *self.buf.get(self.pos).ok_or_else(truncated_err)?;
+        // `checked_add` so a corrupt/maximal `pos` can never wrap (target-independent).
+        self.pos = self.pos.checked_add(1).ok_or_else(truncated_err)?;
         Ok(b)
     }
     fn u32(&mut self) -> Result<u32, SendError> {
-        let end = self.pos + 4;
+        let end = self.pos.checked_add(4).ok_or_else(truncated_err)?;
         let slice = self.buf.get(self.pos..end).ok_or_else(truncated_err)?;
         self.pos = end;
         Ok(u32::from_le_bytes(slice.try_into().unwrap()))
     }
     fn u64(&mut self) -> Result<u64, SendError> {
-        let end = self.pos + 8;
+        let end = self.pos.checked_add(8).ok_or_else(truncated_err)?;
         let slice = self.buf.get(self.pos..end).ok_or_else(truncated_err)?;
         self.pos = end;
         Ok(u64::from_le_bytes(slice.try_into().unwrap()))
     }
     fn bytes(&mut self) -> Result<Vec<u8>, SendError> {
         let len = self.u32()? as usize;
-        let end = self.pos + len;
+        // `checked_add` guards a huge `len` from wrapping `pos`; the `get` then
+        // bounds-checks, so a bogus length returns `Err` without allocating.
+        let end = self.pos.checked_add(len).ok_or_else(truncated_err)?;
         let slice = self.buf.get(self.pos..end).ok_or_else(truncated_err)?;
         self.pos = end;
         Ok(slice.to_vec())
@@ -552,7 +557,11 @@ fn decode_value(
             let value = Value::Array(cell.clone());
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
-            let mut elems = Vec::with_capacity(len);
+            // Bound the reservation against bytes remaining: `len` is attacker-
+            // controlled and each element is ≥1 byte, so a 9-byte payload claiming
+            // `len = 0xFFFFFFFF` cannot force a multi-GB allocation. The push loop
+            // still errors on the first short read.
+            let mut elems = Vec::with_capacity(len.min(r.remaining()));
             for _ in 0..len {
                 elems.push(decode_value(r, table, interp)?);
             }
@@ -964,5 +973,61 @@ mod tests {
             is_generator: false,
         }));
         assert!(encode(&func).is_err());
+    }
+
+    // --- Adversarial decode: `decode` runs on bytes from another isolate, so it
+    // must NEVER panic and NEVER OOM on corrupt input — only return `Err`. ---
+
+    #[test]
+    fn decode_rejects_truncated_buffer() {
+        // A valid array payload cut short mid-element.
+        let full = encode(&arr(vec![num(1.0), num(2.0), num(3.0)])).unwrap();
+        for cut in 1..full.len() {
+            let interp = Interp::new();
+            // Truncating anywhere inside must Err, never panic.
+            assert!(
+                decode(&full[..cut], &interp).is_err(),
+                "truncation at {cut} should be Err"
+            );
+        }
+        // Empty buffer too.
+        assert!(decode(&[], &Interp::new()).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_unknown_tag() {
+        assert!(decode(&[99], &Interp::new()).is_err());
+        assert!(decode(&[200, 0, 0, 0, 0], &Interp::new()).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_dangling_ref() {
+        // TAG_REF (13) + id=7, but no container with id 7 was ever registered.
+        let mut bytes = vec![TAG_REF];
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        assert!(decode(&bytes, &Interp::new()).is_err());
+    }
+
+    #[test]
+    fn decode_huge_length_does_not_allocate() {
+        // Regression for the bounded-reservation fix: TAG_ARRAY + id=0 + len=u32::MAX
+        // with NO element bytes. Must return Err quickly without a giant allocation
+        // (the reservation is bounded by `remaining()`, and the first element read
+        // hits end-of-buffer).
+        let mut bytes = vec![TAG_ARRAY];
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // serial id
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // claimed length
+        assert!(decode(&bytes, &Interp::new()).is_err());
+
+        // Same shape for Bytes and Str (their length-prefixed `bytes()` reader is
+        // bounds-checked before copying, so a bogus length Errs without allocating).
+        let mut b2 = vec![TAG_BYTES];
+        b2.extend_from_slice(&0u32.to_le_bytes());
+        b2.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&b2, &Interp::new()).is_err());
+
+        let mut b3 = vec![TAG_STR];
+        b3.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&b3, &Interp::new()).is_err());
     }
 }
