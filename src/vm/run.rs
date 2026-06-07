@@ -3404,6 +3404,17 @@ impl Vm {
         self.struct_gen.get()
     }
 
+    /// Read a module-scope user-global's (cloned) `Value` by name, or `None` if it
+    /// is not (yet) defined. Public so the worker subsystem can fetch a freshly-run
+    /// code-slice's ENTRY function out of a fresh isolate's globals and call it
+    /// (`src/worker/dispatch.rs`); also the natural read hook for the REPL/embedders.
+    pub fn user_global(&self, name: &str) -> Option<Value> {
+        self.user_globals
+            .borrow()
+            .get(name)
+            .map(|s| s.value.clone())
+    }
+
     /// Resolve a module-scope user-global by name, returning BOTH its stable
     /// `IndexMap` index and its (cloned) `Value`, or `None` if not yet defined (SP8).
     /// The index is stable for the `Vm`'s life (user-globals are only ever inserted),
