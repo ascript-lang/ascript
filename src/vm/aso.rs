@@ -93,7 +93,8 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   `by_value: bool`, serialized as a trailing u8 after the slot. The descriptor
 ///   layout changed (a v14 reader would mis-parse the extra byte), so older readers
 ///   must reject a v15 chunk and vice versa.
-pub const ASO_FORMAT_VERSION: u32 = 15;
+/// - 16: FnProto flags byte gained bit3 = is_worker (Workers Spec A).
+pub const ASO_FORMAT_VERSION: u32 = 16;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -727,8 +728,10 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
 
 fn write_proto(w: &mut Writer, p: &FnProto) -> Result<(), AsoError> {
     w.u8(p.arity);
-    let flags =
-        u8::from(p.has_rest) | (u8::from(p.is_async) << 1) | (u8::from(p.is_generator) << 2);
+    let flags = u8::from(p.has_rest)
+        | (u8::from(p.is_async) << 1)
+        | (u8::from(p.is_generator) << 2)
+        | (u8::from(p.is_worker) << 3);
     w.u8(flags);
     // params
     w.len(p.params.len());
@@ -747,6 +750,7 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
     let has_rest = flags & 1 != 0;
     let is_async = flags & 2 != 0;
     let is_generator = flags & 4 != 0;
+    let is_worker = flags & 8 != 0;
     let n = r.len()?;
     let mut params = Vec::with_capacity(n);
     for _ in 0..n {
@@ -760,7 +764,7 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
         has_rest,
         is_async,
         is_generator,
-        is_worker: false, // .aso v1: not yet serialized; defaults to false on load
+        is_worker,
         params,
         ret,
     })
@@ -1763,6 +1767,47 @@ run()
             run_chunk(rt),
             "output differs after capture-by-value .aso round-trip"
         );
+    }
+
+    #[test]
+    fn proto_is_worker_survives_aso_roundtrip() {
+        // Guards v16: FnProto flags bit3 = is_worker must survive write_proto →
+        // read_proto. Uses the module-private Writer/Reader directly to test the
+        // codec in isolation (independent of the full Chunk round-trip).
+        let proto = FnProto {
+            chunk: Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: true,
+            params: Vec::new(),
+            ret: None,
+        };
+        let mut w = Writer::new();
+        write_proto(&mut w, &proto).unwrap();
+        let mut r = Reader::new(&w.buf);
+        let back = read_proto(&mut r).unwrap();
+        assert!(back.is_worker, "is_worker must survive the .aso round-trip");
+        // Also confirm the false case is still preserved.
+        let proto_false = FnProto {
+            is_worker: false,
+            ..FnProto {
+                chunk: Chunk::new(),
+                arity: 0,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_worker: false,
+                params: Vec::new(),
+                ret: None,
+            }
+        };
+        let mut w2 = Writer::new();
+        write_proto(&mut w2, &proto_false).unwrap();
+        let mut r2 = Reader::new(&w2.buf);
+        let back_false = read_proto(&mut r2).unwrap();
+        assert!(!back_false.is_worker, "is_worker=false must also be preserved");
     }
 
     #[test]
