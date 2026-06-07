@@ -322,21 +322,21 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `src/check/infer/pass.rs`, `src/check/infer/ty.rs`, optionally `src/check/rules/worker_reentrancy.rs` + `src/check/rules/mod.rs` (`rules::ALL`), `tests/check.rs`.
 
-- [ ] **Step 1: Failing inference tests.** In `tests/check.rs` (or infer unit tests), assert via hover/synth:
+- [x] **Step 1: Failing inference tests.** In `tests/check.rs` (or infer unit tests), assert via hover/synth:
   - `ClassName.spawn(args)` on a `worker class` synthesizes `future<handle>` (a class-handle type — reuse the constructor-call → instance-type path at `pass.rs:1047`, wrapped in `CheckTy::Future`). Concretely the synthesized type displays as `future<Db handle>` (or `future<Db>` if a distinct handle type is too costly — match the LSP hover requirement in Task 9).
   - An actor-method call on a handle synthesizes `future<T>` where `T` is the method's declared/inferred return type.
   - A `worker fn*` call synthesizes the SAME generator type as a local generator (the streaming handle is surface-identical).
   - **Invariant:** `examples/**` (incl. the new Task-13 examples) emit ZERO `type-*` diagnostics in BOTH feature configs (default to `Unknown` for anything uncertain — never relax the gate). Run `cargo test --test check infer_worker` → **expect FAIL**.
 
-- [ ] **Step 2: Inference.** In `src/check/infer/pass.rs` `synth_call`: detect `Member{object, name:"spawn"}` where `object` resolves to a `worker class` → `CheckTy::Future(Box::new(<class instance/handle type>))`. Detect a method call on a value whose type is that handle → `CheckTy::Future(Box::new(<method ret>))` (mirror the async-fn-call → `future<R>` logic at `pass.rs:1070`). Detect a call to a `worker fn*` → the generator type (reuse the existing generator-call synthesis; the `is_worker` flag changes nothing in the TYPE, only the runtime). Where the class/method is not statically known, return `Unknown` (gradual escape).
+- [x] **Step 2: Inference.** In `src/check/infer/pass.rs` `synth_call`: detect `Member{object, name:"spawn"}` where `object` resolves to a `worker class` → `CheckTy::Future(Box::new(<class instance/handle type>))`. Detect a method call on a value whose type is that handle → `CheckTy::Future(Box::new(<method ret>))` (mirror the async-fn-call → `future<R>` logic at `pass.rs:1070`). Detect a call to a `worker fn*` → the generator type (reuse the existing generator-call synthesis; the `is_worker` flag changes nothing in the TYPE, only the runtime). Where the class/method is not statically known, return `Unknown` (gradual escape).
 
-- [ ] **Step 3: Re-verify the zero-diagnostic invariant.** Run `cargo run -- check` over every `examples/**` worker file in both configs; assert zero `type-*`. If any appears, fix `assignable`/`synth` to default to `Unknown` — DO NOT relax the gate (CLAUDE.md SP10 invariant 1).
+- [x] **Step 3: Re-verify the zero-diagnostic invariant.** Run `cargo run -- check` over every `examples/**` worker file in both configs; assert zero `type-*`. If any appears, fix `assignable`/`synth` to default to `Unknown` — DO NOT relax the gate (CLAUDE.md SP10 invariant 1).
 
-- [ ] **Step 4: Optional `worker-reentrancy` lint (additive, default Warning).** A best-effort static rule flagging an OBVIOUS literal self-call inside a `worker class` method (e.g. a method body that calls a method on a binding statically known to be its own `self` proxy). Keep it conservative — only fire on a provable literal case; the real guarantee is the Task-5 runtime guard. Add to `rules::ALL`. Add a `tests/check.rs` case (the lint fires on the obvious case, silent otherwise). *(This step is OPTIONAL per the spec; if it produces ANY false positive on the corpus, defer it with a documented note rather than ship a noisy lint.)*
+- [x] **Step 4: Optional `worker-reentrancy` lint (additive, default Warning).** DOCUMENTED SKIP: the lint would require tracking whether a binding in a worker-class method body is statically known to be a proxy handle for the currently-executing actor instance — information not available in the static checker without a full alias-analysis pass. Any heuristic approximation would produce false positives on valid code that stores a handle in a field and retrieves it in a method body. The runtime Task-5 non-reentrancy guard provides the real safety guarantee; a noisy static lint would violate the zero-FP SP10 invariant. Deferred per the plan's documented-skip option.
 
-- [ ] **Step 5:** Run `cargo test --test check` in both configs → **expect PASS**.
+- [x] **Step 5:** Run `cargo test --test check` in both configs → **expect PASS**.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
   ```bash
   git commit -am "feat(check): infer future<handle> for spawn, future<T> for actor methods, generator for worker fn*; optional worker-reentrancy lint
 

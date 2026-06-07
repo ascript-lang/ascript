@@ -20,6 +20,8 @@ pub struct ClassInfo {
     pub parent: Option<ClassId>,
     pub fields: HashMap<String, CheckTy>,
     pub methods: HashMap<String, CheckTy>,
+    /// True if the class was declared `worker class` (Spec B: stateful actor).
+    pub is_worker: bool,
 }
 
 /// An enum entry: name and variant names.
@@ -54,8 +56,10 @@ impl Table {
                 ClassDecl => {
                     let name = class_name(node).unwrap_or_default();
                     let id = t.classes.len();
+                    let is_worker = crate::syntax::resolve::is_worker_class(node);
                     t.classes.push(ClassInfo {
                         name: name.clone(),
+                        is_worker,
                         ..Default::default()
                     });
                     if !name.is_empty() {
@@ -121,6 +125,11 @@ impl Table {
     /// The [`ClassId`] for a class name, if known.
     pub fn class_id(&self, name: &str) -> Option<ClassId> {
         self.class_by_name.get(name).copied()
+    }
+
+    /// True if the class at `id` was declared `worker class` (Spec B actor).
+    pub fn is_worker_class(&self, id: ClassId) -> bool {
+        self.classes.get(id).map(|c| c.is_worker).unwrap_or(false)
     }
 
     /// The [`EnumId`] for an enum name, if known.
