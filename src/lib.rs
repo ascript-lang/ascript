@@ -186,6 +186,8 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
     let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
     let interp = Rc::new(Interp::new());
     interp.install_self();
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice.
+    interp.set_worker_source(src);
     // Run in a child of the builtins env so the program can shadow builtins
     // (`let len = 5`) and import names that collide with builtins.
     let env = crate::interp::global_env().child();
@@ -478,6 +480,8 @@ pub async fn run_file_on_vm_with_packages(
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice.
+    interp.set_worker_source(&src);
     if let Some(map) = packages {
         interp.set_package_resolver(map);
     }
@@ -549,6 +553,8 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
 
     let interp = Rc::new(Interp::new());
     interp.install_self();
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice.
+    interp.set_worker_source(src);
     let vm = Vm::with_specialize(interp.clone(), specialize);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 

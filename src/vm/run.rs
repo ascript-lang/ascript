@@ -224,6 +224,33 @@ impl Vm {
         &self.interp
     }
 
+    /// Workers Spec A: dispatch a `worker fn` closure to a pooled isolate, returning
+    /// the `Value::Future`. Builds the shippable code slice from the entry program's
+    /// source (shared with the tree-walker via `Interp::worker_source`), then routes
+    /// through the engine-agnostic `worker::dispatch_worker`. The entry name is the
+    /// closure's compiled chunk name (a top-level `worker fn`).
+    fn dispatch_worker_closure(
+        &self,
+        callee: &crate::vm::value_ext::Closure,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let entry_name = callee.proto.chunk.name.as_deref().ok_or_else(|| {
+            Control::Panic(crate::error::AsError::at(
+                "worker fn has no name (internal invariant)".to_string(),
+                span,
+            ))
+        })?;
+        // Inline-nesting: a worker fn called from inside an isolate runs locally (no
+        // pool round-trip, no slice build) — the entry is already a global on the VM.
+        if crate::worker::pool::in_isolate() {
+            return crate::worker::dispatch_worker_inline(&self.interp, entry_name, args, span);
+        }
+        let slice =
+            crate::worker::build_code_slice_from_source(&self.interp, entry_name, None)?;
+        crate::worker::dispatch_worker(&self.interp, slice, args, span)
+    }
+
     /// SP3 §B: increment the SHARED logical call-depth on establishing a new VM
     /// call frame, returning the clean Tier-2 panic if it would exceed
     /// [`crate::interp::MAX_CALL_DEPTH`]. Called at the in-loop `fiber.frames.push`
@@ -1059,6 +1086,20 @@ impl Vm {
                         // and its args move into the `'static` spawned task; `vm` is an
                         // owned `Rc<Vm>`; no `fiber` RefCell borrow is held across the
                         // spawn/await below.
+                        // A `worker fn` closure dispatches to a pooled isolate
+                        // (Workers Spec A): pop the args, build the code slice from the
+                        // entry program source, ship + return a `Value::Future`. Must
+                        // precede the `is_async` branch (a worker fn is not async).
+                        Value::Closure(callee) if callee.proto.is_worker => {
+                            let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let mut args = vec![Value::Nil; argc];
+                            for slot in args.iter_mut().rev() {
+                                *slot = fiber.pop();
+                            }
+                            fiber.pop(); // the callee value at callee_idx
+                            let fut = self.dispatch_worker_closure(&callee, args, call_span)?;
+                            fiber.push(fut);
+                        }
                         Value::Closure(callee) if callee.proto.is_async => {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             // Pop the `argc` args into an owned vec (top of stack is
@@ -2782,6 +2823,7 @@ impl Vm {
                                     body: Vec::new(),
                                     is_async: false,
                                     is_generator: false,
+                                    is_worker: false,
                                 }),
                                 defining_class: found_class,
                                 name: name.to_string(),
@@ -3323,7 +3365,8 @@ impl Vm {
                             ret: None,
                             body: Vec::new(),
                             is_async: false,
-                                    is_generator: false,
+                            is_generator: false,
+                            is_worker: false,
                         }),
                         defining_class: def_class,
                         name: name.to_string(),

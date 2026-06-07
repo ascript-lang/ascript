@@ -933,6 +933,7 @@ mod tests {
             closure: crate::interp::global_env(),
             is_async: false,
             is_generator: false,
+            is_worker: false,
         }));
         let v = arr(vec![num(1.0), obj(&[("cb", func)])]);
         let err = check_sendable(&v).unwrap_err();
@@ -971,6 +972,7 @@ mod tests {
             closure: crate::interp::global_env(),
             is_async: false,
             is_generator: false,
+            is_worker: false,
         }));
         assert!(encode(&func).is_err());
     }

@@ -302,7 +302,39 @@ pub fn build_code_slice(
         fn_id: entry_fn_id(entry_name, class_name.as_deref()),
         entry_aso: Rc::from(bytes.into_boxed_slice()),
         class_name,
+        entry_name: Rc::from(entry_name),
     })
+}
+
+/// Build a [`WorkerCodeSlice`] for the worker entry named `entry_name` by recompiling
+/// the entry program's source (retained on the [`crate::interp::Interp`] at run time
+/// — see `Interp::set_worker_source`). This is the SINGLE slice path shared by BOTH
+/// engines: the tree-walker has no compiled chunk of its own, so it (like the VM)
+/// recompiles the source here and ships the resulting `.aso` fragment to the isolate,
+/// whose own VM runs it — guaranteeing byte-identical worker behavior across engines.
+///
+/// The recompiled slice is keyed by `fn_id` and cached per-isolate (Task 8), so the
+/// per-dispatch recompile cost is paid at most once per distinct worker entry; the
+/// caller [`crate::worker::dispatch_worker`] does the encode/transport.
+///
+/// Returns a recoverable `Control::Panic` when no source is recorded (an embedder
+/// that drove the engine without `set_worker_source`) or the entry is missing / not a
+/// top-level function (mirrors [`build_code_slice`]).
+pub fn build_code_slice_from_source(
+    interp: &crate::interp::Interp,
+    entry_name: &str,
+    class_name: Option<Rc<str>>,
+) -> Result<WorkerCodeSlice, Control> {
+    let src = interp.worker_source().ok_or_else(|| {
+        Control::Panic(crate::error::AsError::new(format!(
+            "cannot dispatch worker '{entry_name}': the program source is unavailable \
+             (worker fns require running via `ascript run`)"
+        )))
+    })?;
+    let top = crate::compile::compile_source(&src).map_err(|e| {
+        Control::Panic(crate::error::AsError::at(e.message, e.span))
+    })?;
+    build_code_slice(&top, entry_name, class_name)
 }
 
 /// Emit a value-producing instruction that pushes `v` onto the stack. Literal

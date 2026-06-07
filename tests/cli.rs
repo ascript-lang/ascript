@@ -2247,3 +2247,125 @@ fn single_module_panic_provenance_unchanged() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Workers Spec A (Task 8): isolate pool + worker fn dispatch over both engines.
+// ---------------------------------------------------------------------------
+
+/// Write `src` to a unique temp `.as` file and run it via `ascript run`, optionally
+/// on the tree-walker and/or with extra env vars. Returns trimmed stdout; asserts the
+/// process succeeded.
+fn run_worker_program(src: &str, tree_walker: bool, env: &[(&str, &str)]) -> String {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let tag = if tree_walker { "tw" } else { "vm" };
+    let file = std::env::temp_dir().join(format!(
+        "ascript_worker_{}_{}_{}.as",
+        tag,
+        std::process::id(),
+        // a cheap per-call uniquifier
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&file, src).unwrap();
+    let mut cmd = Command::new(bin);
+    cmd.arg("run");
+    if tree_walker {
+        cmd.arg("--tree-walker");
+    }
+    cmd.arg(&file);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "process failed ({tag}): stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn worker_parallel_map_runs() {
+    let src = r#"
+        import * as array from "std/array"
+        import { gather } from "std/task"
+        worker fn sq(n) { return n * n }
+        let fs = array.map([1, 2, 3, 4], sq)
+        let r = await gather(fs)
+        print(r)
+    "#;
+    // Both engines must agree (byte-identical behavior).
+    assert_eq!(run_worker_program(src, false, &[]), "[1, 4, 9, 16]");
+    assert_eq!(run_worker_program(src, true, &[]), "[1, 4, 9, 16]");
+}
+
+#[test]
+fn no_worker_program_starts_no_pool() {
+    // A program with zero worker fns must still run normally (lazy-pool: the unit
+    // proof lives in src/worker/pool.rs; this confirms no regression).
+    let src = "print(1 + 1)";
+    assert_eq!(run_worker_program(src, false, &[]), "2");
+    assert_eq!(run_worker_program(src, true, &[]), "2");
+}
+
+#[test]
+fn worker_single_await_returns_value() {
+    let src = r#"
+        worker fn sq(n) { return n * n }
+        print(await sq(9))
+    "#;
+    assert_eq!(run_worker_program(src, false, &[]), "81");
+    assert_eq!(run_worker_program(src, true, &[]), "81");
+}
+
+#[test]
+fn worker_uses_transitive_top_level_deps() {
+    // The shipped code slice must include `helper` and const `K` that `sq` uses.
+    let src = r#"
+        const K = 100
+        fn helper(x) { return x + K }
+        worker fn sq(n) { return helper(n * n) }
+        print(await sq(3))
+    "#;
+    assert_eq!(run_worker_program(src, false, &[]), "109");
+    assert_eq!(run_worker_program(src, true, &[]), "109");
+}
+
+#[test]
+fn oversubscription_completes_via_queue() {
+    // More calls than the pool cap; all must complete (queues drain).
+    let src = r#"
+        import * as array from "std/array"
+        import * as math from "std/math"
+        import { gather } from "std/task"
+        worker fn sq(n) { return n * n }
+        let nums = []
+        for n in 1..=20 { array.push(nums, n) }
+        let fs = array.map(nums, sq)
+        print(math.sum(await gather(fs)))
+    "#;
+    // 1^2 + .. + 20^2 = 2870
+    assert_eq!(
+        run_worker_program(src, false, &[("ASCRIPT_WORKERS", "2")]),
+        "2870"
+    );
+}
+
+#[test]
+fn nested_worker_runs_inline_no_deadlock() {
+    let src = r#"
+        worker fn inner(n) { return n + 1 }
+        worker fn outer(n) { return await inner(n) * 2 }
+        print(await outer(10))
+    "#;
+    // (10+1)*2 = 22, no deadlock even at pool size 1 (nested runs inline).
+    assert_eq!(
+        run_worker_program(src, false, &[("ASCRIPT_WORKERS", "1")]),
+        "22"
+    );
+}

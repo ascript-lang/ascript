@@ -288,6 +288,9 @@ pub struct Method {
     pub body: Vec<Stmt>,
     pub is_async: bool,
     pub is_generator: bool,
+    /// `worker fn` / `static worker fn` — Spec A: dispatched to a pooled isolate,
+    /// returns `future<T>`. Tree-walker reads this on the static-method call path.
+    pub is_worker: bool,
 }
 
 #[derive(Clone)]
@@ -598,6 +601,9 @@ pub struct Function {
     pub closure: Environment,
     pub is_async: bool,
     pub is_generator: bool,
+    /// `worker fn` — Spec A: dispatched to a pooled isolate, returns `future<T>`.
+    /// The tree-walker reads this in `call_function` to route to the worker pool.
+    pub is_worker: bool,
 }
 
 #[derive(Clone)]
@@ -1041,6 +1047,7 @@ mod tests {
             closure: Environment::global(),
             is_async: false,
             is_generator: false,
+            is_worker: false,
         })
     }
 

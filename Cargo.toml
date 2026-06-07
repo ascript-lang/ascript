@@ -32,6 +32,10 @@ indexmap = "2"
 # adds the dep + `Trace` impls only; the actual Rc→Cc migration of cycle-capable
 # Value variants is V13-T2. Native resources STAY on Rc (deterministic Drop).
 gcmodule = "0.3"
+# Worker isolate pool sizing (Workers Spec A): the default isolate cap is the host
+# core count (overridable via $ASCRIPT_WORKERS). CORE/unconditional — the worker
+# subsystem is not feature-gated, so this must build under --no-default-features.
+num_cpus = "1"
 cstree = { version = "0.14", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 ariadne = "0.6"

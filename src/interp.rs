@@ -531,6 +531,14 @@ pub struct Interp {
     /// `.await` (the resolved target is cloned out first — never hold this borrow
     /// across an await; `await_holding_refcell_ref` stays satisfied).
     package_resolver: RefCell<Option<PackageMap>>,
+    /// Workers Spec A: the entry program's full source text, retained so a
+    /// `worker fn` dispatch can (re)compile it to a top-level [`crate::vm::chunk::Chunk`]
+    /// and build the shippable code slice (entry fn + transitive top-level deps).
+    /// Shared by BOTH engines — the tree-walker has no compiled chunk of its own, so
+    /// this is how it produces an identical `.aso` slice that the isolate's VM runs.
+    /// `None` until [`Interp::set_worker_source`] is called by the run entry point; a
+    /// `worker fn` call with no source set raises a clear recoverable panic.
+    worker_source: RefCell<Option<Rc<str>>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -802,7 +810,21 @@ impl Interp {
             cli_args: RefCell::new(Vec::new()),
             determinism: RefCell::new(None),
             package_resolver: RefCell::new(None),
+            worker_source: RefCell::new(None),
         }
+    }
+
+    /// Workers Spec A: record the entry program's full source so a `worker fn`
+    /// dispatch can recompile it into the shippable code slice. Idempotent; the run
+    /// entry points call it once before execution.
+    pub fn set_worker_source(&self, src: &str) {
+        *self.worker_source.borrow_mut() = Some(Rc::from(src));
+    }
+
+    /// The entry program's source, if recorded (Workers Spec A). Cloned out so the
+    /// borrow never spans the compile/await below.
+    pub(crate) fn worker_source(&self) -> Option<Rc<str>> {
+        self.worker_source.borrow().clone()
     }
 
     /// Store the script's trailing CLI arguments so `env.args()` can return them.
@@ -1973,6 +1995,14 @@ impl Interp {
             text: src.clone(),
         });
 
+        // Workers Spec A: record the ENTRY module's source the first time we load a
+        // module so a `worker fn` dispatch can recompile it into a code slice. Only
+        // the first (entry) module sets it — imported modules don't overwrite it, so
+        // the slice builder sees the program the worker fn was declared in.
+        if self.worker_source().is_none() {
+            self.set_worker_source(&src);
+        }
+
         let tokens =
             lexer::lex(&src).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
         let program =
@@ -2360,6 +2390,7 @@ impl Interp {
                 body,
                 is_async,
                 is_generator,
+                is_worker,
                 ..
             } => {
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
@@ -2370,6 +2401,7 @@ impl Interp {
                     closure: env.clone(),
                     is_async: *is_async,
                     is_generator: *is_generator,
+                    is_worker: *is_worker,
                 }));
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -2452,6 +2484,7 @@ impl Interp {
                         body: m.body.clone(),
                         is_async: m.is_async,
                         is_generator: m.is_generator,
+                        is_worker: m.is_worker,
                     });
                     if m.is_static {
                         // `from` is reserved on classes (collides with the built-in
@@ -2641,6 +2674,8 @@ impl Interp {
                     closure: env.clone(),
                     is_async: *is_async,
                     is_generator: *is_generator,
+                    // Arrows are never `worker` (no `worker` arrow syntax).
+                    is_worker: false,
                 })))
             }
             ExprKind::Array(items) => {
@@ -3711,6 +3746,30 @@ impl Interp {
                 crate::coro::GeneratorHandle::new(body),
             )));
         }
+        // A `worker fn` is dispatched to a pooled isolate (Workers Spec A): build the
+        // shippable code slice from the entry program's source and hand the args +
+        // slice over a `Send` byte channel; the returned `Value::Future` resolves with
+        // the worker's result. Only bytes cross threads — the `!Send` runtime stays on
+        // this thread. Inline-nesting (a worker fn called from inside an isolate) is
+        // handled inside `dispatch_worker`. A worker fn cannot also be `async`/`fn*`
+        // (the surface form has no such combination), so this precedes those branches.
+        if func.is_worker {
+            let entry_name = func
+                .name
+                .clone()
+                .ok_or_else(|| Control::Panic(AsError::at(
+                    "worker fn must be a named top-level function".to_string(),
+                    span,
+                )))?;
+            // Inline-nesting: a worker fn called from inside an isolate runs locally
+            // (no pool round-trip, no slice build) — the entry is already a global.
+            if crate::worker::pool::in_isolate() {
+                return crate::worker::dispatch_worker_inline(self, &entry_name, args, span);
+            }
+            let slice =
+                crate::worker::build_code_slice_from_source(self, &entry_name, None)?;
+            return crate::worker::dispatch_worker(self, slice, args, span);
+        }
         // A script `async fn` is scheduled eagerly: build the body future, spawn it
         // onto the current-thread LocalSet, and hand back a `Value::Future`
         // immediately. `await` later drives it; the top-level drain ensures even an
@@ -4105,6 +4164,20 @@ impl Interp {
         name: &str,
     ) -> Result<Value, Control> {
         let call_env = defining.def_env.child();
+        // A `static worker fn` dispatches to a pooled isolate (Workers Spec A). The
+        // entry global is the bare method name; the code slice carries the class name
+        // for diagnostics + future class binding.
+        if method.is_worker {
+            if crate::worker::pool::in_isolate() {
+                return crate::worker::dispatch_worker_inline(self, name, args, span);
+            }
+            let slice = crate::worker::build_code_slice_from_source(
+                self,
+                name,
+                Some(Rc::from(defining.name.as_str())),
+            )?;
+            return crate::worker::dispatch_worker(self, slice, args, span);
+        }
         if method.is_generator {
             let vm = self.rc();
             let m = method.clone();
