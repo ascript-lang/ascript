@@ -1074,7 +1074,7 @@ impl<'a> Pass<'a> {
             return CheckTy::Any; // a generator handle, not the declared scalar
         }
         let ret = self.fn_declared_or_inferred(fn_decl);
-        if is_async(fn_decl) {
+        if is_async(fn_decl) || is_worker(fn_decl) {
             CheckTy::Future(Box::new(ret))
         } else {
             ret
@@ -1355,6 +1355,14 @@ fn is_async(decl: &ResolvedNode) -> bool {
         .any(|t| t.kind() == SyntaxKind::AsyncKw)
 }
 
+/// Is this fn/method declared `worker` (carries a `WorkerKw` token)?
+/// A worker fn call, like an async fn call, synthesizes `future<T>`.
+fn is_worker(decl: &ResolvedNode) -> bool {
+    decl.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == SyntaxKind::WorkerKw)
+}
+
 /// Is this fn/method a generator (`fn*`/`async fn*` — carries a `Star` token at the
 /// decl level, before the param list)?
 fn is_generator(decl: &ResolvedNode) -> bool {
@@ -1607,5 +1615,37 @@ mod tests {
         // after `if (x == nil) { return 0 }` the tail sees x : number.
         let src = "fn f(x: number?): number {\n  if (x == nil) { return 0 }\n  let y = x + 1\n  return y\n}\n";
         assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    // ----- worker fn call synthesizes future<T> (SP workers Task 11) -----
+
+    #[test]
+    fn worker_call_infers_future_like_async() {
+        // Awaiting a worker fn yields the scalar; the inference must NOT flag a
+        // type-mismatch when the awaited number is used as a number.
+        let src = "
+            worker fn sq(n: number): number { return n * n }
+            fn use_it(): number { return await sq(3) }
+        ";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "worker fn awaited call produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn worker_call_unawaited_no_false_positive() {
+        // A non-awaited worker fn call (assigned to a let) must not cause
+        // type-mismatch or possibly-nil false positives.
+        let src = "
+            worker fn sq(n: number): number { return n * n }
+            let f = sq(3)
+        ";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "unawaited worker fn call produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
     }
 }

@@ -970,7 +970,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `src/check/infer/pass.rs` (`fn_return_type` @1072; new `is_worker` helper near @1352)
 - Test: `tests/check.rs` (or `src/check/infer` unit test, matching where async-call inference is tested)
 
-- [ ] **Step 1: Write the failing test** — add a test asserting a `worker fn` call's awaited value is the scalar return type and that the un-awaited call is a `future<T>` (no `possibly-nil`/`type-mismatch` false positives), AND that `examples/**` stays zero `type-*`:
+- [x] **Step 1: Write the failing test** — add a test asserting a `worker fn` call's awaited value is the scalar return type and that the un-awaited call is a `future<T>` (no `possibly-nil`/`type-mismatch` false positives), AND that `examples/**` stays zero `type-*`:
 
 ```rust
 #[test]
@@ -985,11 +985,11 @@ fn worker_call_infers_future_like_async() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails (or proves the gap)**
+- [x] **Step 2: Run to verify it fails (or proves the gap)**
   Run: `cargo test --test check worker_call_infers_future`
   Expected: Initially may PASS-by-accident if `worker fn` already falls to the non-async branch returning the bare scalar (so `await scalar` is identity and no mismatch). Make the intent explicit and robust by Step 3 regardless. If it FAILS (a spurious `type-` diagnostic), proceed.
 
-- [ ] **Step 3: Wrap worker calls in `Future`.** In `src/check/infer/pass.rs`:
+- [x] **Step 3: Wrap worker calls in `Future`.** In `src/check/infer/pass.rs`:
   - Add a helper near `is_async` (@1352):
     ```rust
     fn is_worker(decl: &ResolvedNode) -> bool {
@@ -1009,11 +1009,11 @@ fn worker_call_infers_future_like_async() {
     ```
   (`await future<T>` already unwraps to `T` at `pass.rs:607`, so downstream reasoning is unchanged.)
 
-- [ ] **Step 4: Run the tests + the invariant**
+- [x] **Step 4: Run the tests + the invariant**
   Run: `cargo test --test check worker_call_infers_future` then `cargo test --test check` AND `cargo test --no-default-features --test check` (the `examples/**` zero-`type-*` invariant in BOTH configs).
   Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add src/check/infer/pass.rs
 git commit -m "feat(infer): worker fn call synthesizes future<T> (like async); examples stay zero type-* in both configs
