@@ -177,3 +177,12 @@ ai = ["data", "net", "dep:genai"]
 
 [lints.clippy]
 await_holding_refcell_ref = "deny"
+
+# Phase-0 profiling profile: identical codegen to `release` but with debug
+# symbols so a sampling profiler (samply) can attribute time to functions.
+# Separate from `release` so the shipped binary stays untouched.
+# Build with: cargo build --profile profiling   (→ target/profiling/ascript)
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
