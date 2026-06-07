@@ -65,12 +65,16 @@ pub enum WorkerReply {
     Cancelled,
 }
 
-/// A live isolate: the `Send` request channel into it plus its joinable thread.
+/// A live isolate: the `Send` request channel into it plus its OS thread handle.
 pub struct Isolate {
     /// Sends [`WorkerRequest`]s into the isolate's run loop.
     pub tx: mpsc::UnboundedSender<WorkerRequest>,
-    /// The OS thread handle. Joined on pool teardown (the channel closing ends the
-    /// loop). `Option` so `Drop`/teardown can take it.
+    /// The OS thread handle for this isolate.  Kept as `Option` so it can be taken
+    /// if a future teardown path wants to join it, but no explicit `Drop`/join is
+    /// currently implemented: idle isolates block on `recv()` and exit naturally with
+    /// the process.  The pool is a capped, reused set of threads; they are not joined
+    /// explicitly — address-space and thread-count overhead is bounded by
+    /// `ASCRIPT_WORKERS`.
     pub thread: Option<std::thread::JoinHandle<()>>,
 }
 

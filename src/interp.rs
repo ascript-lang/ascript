@@ -2413,8 +2413,19 @@ impl Interp {
                 is_async,
                 is_generator,
                 is_worker,
+                span,
                 ..
             } => {
+                // Spec A: `worker async fn` and `worker fn*` are not valid combinations.
+                // Workers already return an awaitable future — adding `async` or generator
+                // semantics is unsupported in Spec A and must be a clean error, not a silent
+                // drop of the modifier.
+                if *is_worker && (*is_async || *is_generator) {
+                    return Err(Control::Panic(AsError::at(
+                        "worker functions cannot be async or generators (workers already return an awaitable future; worker fn* is out of Spec A scope)".to_string(),
+                        *span,
+                    )));
+                }
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),

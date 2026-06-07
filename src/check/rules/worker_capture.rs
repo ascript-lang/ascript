@@ -1,5 +1,13 @@
-//! `worker-capture` (Error): inside a `worker fn`, flag references to outer
-//! mutable bindings and writes to any top-level/outer global.
+//! `worker-capture` (Error): validate `worker fn` declarations for two classes
+//! of errors:
+//!
+//! 1. **Invalid modifier combinations.** `worker async fn` and `worker fn*` are
+//!    not valid in Spec A (workers already return an awaitable future; generator
+//!    workers are out of scope). These are rejected early so the capture checks
+//!    below never run on an invalid declaration.
+//!
+//! 2. **Illegal captures.** Inside a `worker fn`, flag references to outer
+//!    mutable bindings and writes to any top-level/outer global.
 //!
 //! Workers run in a SEPARATE ISOLATE (a fresh `Interp` on a worker thread). Any
 //! outer mutable `let` would be a DIFFERENT copy at dispatch time, so reading it
@@ -38,6 +46,32 @@ pub fn check(tree: &ResolvedNode, res: &ResolveResult, _src: &str) -> Vec<AsDiag
         }
         if !crate::syntax::resolve::is_worker_fn(node) {
             continue;
+        }
+
+        // Spec A: `worker async fn` / `async worker fn` and `worker fn*` are
+        // not valid modifier combinations.  Workers already return an awaitable
+        // future; `async` is redundant and unsupported.  `fn*` (generator
+        // workers) are out of Spec A scope.  Flag the declaration directly.
+        {
+            let has_async = node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == AsyncKw);
+            let has_star = node
+                .children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == Star);
+            if has_async || has_star {
+                out.push(AsDiagnostic {
+                    range: code_range(node),
+                    severity: Severity::Error,
+                    code: "worker-capture".to_string(),
+                    message: "worker functions cannot be async or generators (workers already return an awaitable future; worker fn* is out of Spec A scope)".to_string(),
+                    fix: None,
+                });
+                // Skip capture checks for invalid combos — the fn won't run anyway.
+                continue;
+            }
         }
         // Collect the params of THIS worker fn so we know which slots are params.
         // Params resolve to Local(slot) inside the worker fn's own frame; we only

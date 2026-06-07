@@ -609,3 +609,47 @@ mod corpus {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Workers Spec A: invalid modifier combos must be flagged by `ascript check`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn checker_flags_worker_async_fn() {
+    // `worker async fn` must produce an Error-severity `worker-capture` diagnostic.
+    let p = write_tmp("worker_async.as", "worker async fn g() { return 2 }\n");
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "check must exit non-zero for worker async fn; output: {combined}"
+    );
+    assert!(
+        combined.contains("worker functions cannot be async or generators"),
+        "expected worker-modifiers message; output: {combined}"
+    );
+}
+
+#[test]
+fn checker_flags_worker_generator_fn() {
+    // `worker fn*` must produce an Error-severity `worker-capture` diagnostic.
+    let p = write_tmp("worker_gen.as", "worker fn* h() { yield 1 }\n");
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "check must exit non-zero for worker fn*; output: {combined}"
+    );
+    assert!(
+        combined.contains("worker functions cannot be async or generators"),
+        "expected worker-modifiers message; output: {combined}"
+    );
+}

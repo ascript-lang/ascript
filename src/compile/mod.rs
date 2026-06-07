@@ -2530,6 +2530,17 @@ impl Compiler {
             }
         }
 
+        // Spec A: `worker async fn` and `worker fn*` are not valid combinations.
+        // Workers already return an awaitable future — adding `async` or generator
+        // semantics is unsupported in Spec A and must be a clean error, not a silent
+        // drop of the modifier.
+        if is_worker && (is_async || is_generator) {
+            return Err(CompileError::new(
+                "worker functions cannot be async or generators (workers already return an awaitable future; worker fn* is out of Spec A scope)",
+                span,
+            ));
+        }
+
         // Build a fresh chunk for the body, sized from the function's own frame,
         // and swap it (plus a fresh loop stack and temp cursor) into `self` so the
         // existing compile_* methods emit into it. `self.resolved` (whole-tree) is
@@ -5861,12 +5872,24 @@ mod tests {
         assert!(proto.is_worker, "expected is_worker = true on worker fn");
         assert!(!proto.is_async, "expected is_async = false on plain worker fn");
         assert!(!proto.is_generator);
+    }
 
-        // `worker async fn g()` — both flags set.
-        let chunk2 = compile_source("worker async fn g() { return 2 }\n").expect("compiles");
-        let proto2 = chunk2.protos.first().expect("one nested proto");
-        assert!(proto2.is_worker);
-        assert!(proto2.is_async);
+    #[test]
+    fn worker_async_fn_is_a_compile_error() {
+        // Spec A: `worker async fn` and `worker fn*` are rejected at compile time
+        // (they were accepted by the parser — permissive parsing, semantic rejection).
+        let err_async =
+            compile_source("worker async fn g() { return 2 }\n").expect_err("must be a compile error");
+        assert!(
+            err_async.message.contains("worker functions cannot be async or generators"),
+            "unexpected message: {}", err_async.message
+        );
+        let err_gen =
+            compile_source("worker fn* h() { yield 1 }\n").expect_err("must be a compile error");
+        assert!(
+            err_gen.message.contains("worker functions cannot be async or generators"),
+            "unexpected message: {}", err_gen.message
+        );
     }
 
     #[test]

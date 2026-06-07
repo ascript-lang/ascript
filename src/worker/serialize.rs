@@ -694,12 +694,14 @@ fn register(table: &mut Vec<Value>, id: usize, v: Value) -> Result<(), SendError
     Ok(())
 }
 
-/// Reconstruct the `Rc<Class>` for an instance by name. The far isolate that runs the
-/// shipped worker code has the real class definition; class identity is unified there
-/// (Task 8). When no registry is available (e.g. an anonymously-scoped class, or this
-/// task's same-interp round-trip), build a faithful standalone class carrying the
-/// name so the instance displays, types (`type()` → "instance"), and holds its fields
-/// correctly — methods / `instanceof` identity follow once code-shipping lands.
+/// Reconstruct the `Rc<Class>` for an instance by name. A decoded `Instance` always
+/// gets a standalone class shell with the original name, empty methods, and empty
+/// fields — because classes are NOT shipped in the code slice (Spec A limitation).
+/// The shell is sufficient for `type()` → `"instance"` and field access, but
+/// `instanceof` identity and method dispatch are NOT preserved across the isolate
+/// boundary.  Class shipping (full method transfer) is a Spec B / future TODO; see
+/// `dispatch.rs`.  `_interp` is unused for now but is kept in the hook signature
+/// as the intended future insertion point for a class-table registry lookup.
 fn resolve_class(_interp: &Interp, name: &str) -> std::rc::Rc<crate::value::Class> {
     std::rc::Rc::new(crate::value::Class {
         name: name.to_string(),

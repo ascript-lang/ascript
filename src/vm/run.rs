@@ -227,7 +227,7 @@ impl Vm {
     /// recompile path (via `Interp::worker_source`) when source is available (the normal
     /// run-from-source path, shared with the tree-walker), or falling back to building
     /// the slice directly from the stored pre-compiled top-level chunk (the `.aso`
-    /// run path, via `Interp::worker_chunk`) when no source is recorded. The entry name
+    /// run path, via `Interp::worker_aso_bytes`) when no source is recorded. The entry name
     /// is the closure's compiled chunk name (a top-level `worker fn`).
     fn dispatch_worker_closure(
         &self,

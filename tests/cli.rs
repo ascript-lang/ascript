@@ -2451,3 +2451,93 @@ fn sendability_violation_reports_field_path() {
         "expected sendability message, got: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Spec A: `worker async fn` and `worker fn*` are invalid modifier combos
+// and must be rejected (not silently dropped) on BOTH engines.
+// ---------------------------------------------------------------------------
+
+/// Run `src` on the given engine and return (success, combined output).
+/// Used to check programs that must FAIL.
+fn run_worker_program_raw(src: &str, tree_walker: bool) -> (bool, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ2: AtomicU64 = AtomicU64::new(0);
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let tag = if tree_walker { "tw" } else { "vm" };
+    let file = std::env::temp_dir().join(format!(
+        "ascript_worker_invalid_{}_{}_{}.as",
+        tag,
+        std::process::id(),
+        SEQ2.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&file, src).unwrap();
+    let mut cmd = Command::new(bin);
+    cmd.arg("run");
+    if tree_walker {
+        cmd.arg("--tree-walker");
+    }
+    cmd.arg(&file);
+    let out = cmd.output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), combined)
+}
+
+#[test]
+fn worker_async_fn_is_rejected_on_both_engines() {
+    // `worker async fn` must fail on BOTH engines with the expected message.
+    // The parser accepts both flags (permissive parsing); the semantic layer rejects.
+    let src = "worker async fn g() { return 2 }\nprint(await g())\n";
+    let expected = "worker functions cannot be async or generators";
+
+    let (ok_vm, out_vm) = run_worker_program_raw(src, false);
+    assert!(
+        !ok_vm,
+        "VM must reject `worker async fn` but it succeeded; output: {out_vm}"
+    );
+    assert!(
+        out_vm.contains(expected),
+        "VM error must contain expected message; output: {out_vm}"
+    );
+
+    let (ok_tw, out_tw) = run_worker_program_raw(src, true);
+    assert!(
+        !ok_tw,
+        "tree-walker must reject `worker async fn` but it succeeded; output: {out_tw}"
+    );
+    assert!(
+        out_tw.contains(expected),
+        "tree-walker error must contain expected message; output: {out_tw}"
+    );
+}
+
+#[test]
+fn worker_generator_fn_is_rejected_on_both_engines() {
+    // `worker fn*` must fail on BOTH engines with the expected message.
+    let src = "worker fn* h() { yield 1 }\nprint(await h())\n";
+    let expected = "worker functions cannot be async or generators";
+
+    let (ok_vm, out_vm) = run_worker_program_raw(src, false);
+    assert!(
+        !ok_vm,
+        "VM must reject `worker fn*` but it succeeded; output: {out_vm}"
+    );
+    assert!(
+        out_vm.contains(expected),
+        "VM error must contain expected message; output: {out_vm}"
+    );
+
+    let (ok_tw, out_tw) = run_worker_program_raw(src, true);
+    assert!(
+        !ok_tw,
+        "tree-walker must reject `worker fn*` but it succeeded; output: {out_tw}"
+    );
+    assert!(
+        out_tw.contains(expected),
+        "tree-walker error must contain expected message; output: {out_tw}"
+    );
+}
