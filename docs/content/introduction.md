@@ -63,7 +63,7 @@ the same binary. See [The ascript CLI](cli).
 These are deliberate non-goals, not missing features:
 
 - **No mandatory, blocking type checker.** Types are enforced as *runtime contracts*, checked at boundaries and never erased. A static checker (`ascript check`) does flag likely type errors — `type-mismatch`, `possibly-nil`, and friends — but only as **advisory** diagnostics that never block a run. See [Type contracts](language/type-contracts).
-- **No user-level multithreading.** A single-threaded cooperative event loop (see [Modules & async](language/modules-async)) with structured concurrency via `std/task`; no data races, ever.
+- **No shared-memory multithreading.** A single-threaded cooperative event loop per isolate (see [Modules & async](language/modules-async)) with structured concurrency via `std/task`; no data races, ever. Multi-core parallelism comes from shared-nothing [workers](language/workers) — separate isolates that share no memory.
 - **No exceptions.** Recoverable errors are values; bugs panic. See [Errors & results](language/errors).
 - **No macros, operator overloading, or metaprogramming.**
 - **No tagged-union enums.** Enums are simple named variants; use a class for per-variant data.

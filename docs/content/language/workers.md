@@ -42,7 +42,7 @@ worker fn takesObj(o): number { return 1 }
 // A closure cannot cross the isolate boundary:
 let [_, err] = recover(() => await takesObj({ cb: () => 1 }))
 print(err.message)
-// "cannot be sent to a worker at field path [.cb]: function values are not sendable"
+// "value of kind function cannot be sent to a worker at .cb"
 ```
 
 ## `worker fn` — pooled, stateless

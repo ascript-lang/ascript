@@ -533,66 +533,66 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `docs/content/language/workers.md` (new or extend), `docs/assets/app.js` (`NAV`), `docs/content/language/modules-async.md`.
 
-- [ ] **Step 1:** Create `docs/content/language/workers.md` (or extend if Plan A created it). Sections (per §8.1):
+- [x] **Step 1:** Create `docs/content/language/workers.md` (or extend if Plan A created it). Sections (per §8.1):
   - The model + two lifecycles (intra- vs inter-isolate; the sendability line).
   - `worker fn` / `static worker fn` (Spec A) + cost model + capture/sendability rules.
   - `worker class` actor semantics: proxy handle, async-only methods, NO field access across the boundary, non-reentrancy, owns resources (resource born in the isolate), `spawn` vs local construction, close/last-drop.
   - `worker fn*` streaming: demand-driven pull, bounded buffer/backpressure, bidirectional `next(v)`, the "yield chunks, not elements" guidance.
   - "Workers and the event bus": intra- vs inter-isolate layering + the bridge idiom + `task.pipe`.
   - Use RELATIVE in-content links (`](modules-async)`, `](../stdlib/async)`) — resolved relative to the current page's directory, NOT absolute-from-root (CLAUDE.md docs note).
-- [ ] **Step 2:** Add the slug to the `NAV` array in `docs/assets/app.js` under the `Language` section: `['language/workers', 'Workers & parallelism']` (sidebar + cmd-K search both derive from `NAV` — a page with no entry is unreachable).
-- [ ] **Step 3:** Cross-link `docs/content/language/modules-async.md` ↔ `workers.md` in BOTH directions (add a "Parallelism: see Workers" pointer in modules-async, and a "see Modules & async" pointer in workers).
-- [ ] **Step 4: Commit.**
+- [x] **Step 2:** Add the slug to the `NAV` array in `docs/assets/app.js` under the `Language` section: `['language/workers', 'Workers & parallelism']` (sidebar + cmd-K search both derive from `NAV` — a page with no entry is unreachable).
+- [x] **Step 3:** Cross-link `docs/content/language/modules-async.md` ↔ `workers.md` in BOTH directions (add a "Parallelism: see Workers" pointer in modules-async, and a "see Modules & async" pointer in workers).
+- [x] **Step 4: Commit.**
 
 ### Task 16.2: README.md
 
 **Files:** `README.md`.
 
-- [ ] **Step 1:** Add workers to the concurrency/capability description and the stdlib/feature table. Reconcile any "single-threaded"/"no multithreading" phrasing into the accurate framing: **single-threaded per isolate, multi-core via shared-nothing workers**. Verify the CLI list and links (the `run`/`build`/`repl` table is unaffected; confirm). Add `task.pipe` if a stdlib table lists `std/task` fns.
-- [ ] **Step 2: Commit.**
+- [x] **Step 1:** Add workers to the concurrency/capability description and the stdlib/feature table. Reconcile any "single-threaded"/"no multithreading" phrasing into the accurate framing: **single-threaded per isolate, multi-core via shared-nothing workers**. Verify the CLI list and links (the `run`/`build`/`repl` table is unaffected; confirm). Add `task.pipe` if a stdlib table lists `std/task` fns.
+- [x] **Step 2: Commit.**
 
 ### Task 16.3: docs/ static site — landing stats + concurrency content + link/nav integrity
 
 **Files:** `docs/index.html`, `docs/content/language/modules-async.md`.
 
-- [ ] **Step 1:** `docs/index.html` — re-verify headline stats. The **core value-kind count stays 16** (actor + generator handles are modeled as `Native`, not new `Value` variants — confirm and do NOT change the `16` at line 41). The module count: if a `worker` stdlib HELPER module was added it changes (`task.pipe` lives in the existing `std/task`, so the `54` std modules / `28` framing is UNCHANGED — confirm). Update any capability claim that asserts single-threaded-only.
-- [ ] **Step 2:** `docs/content/language/modules-async.md` (and any page asserting the execution model) — update to include workers; remove/repair contradictions with the new parallelism story (the page currently states a single-threaded event loop — refine to "single-threaded per isolate; parallelism via workers").
-- [ ] **Step 3: Link & nav integrity.** Confirm every page (incl. the new workers page) has a `NAV` entry and that in-content relative links resolve (the documented orphan/relative-link gotchas).
-- [ ] **Step 4: Commit.**
+- [x] **Step 1:** `docs/index.html` — re-verify headline stats. The **core value-kind count stays 16** (actor + generator handles are modeled as `Native`, not new `Value` variants — confirm and do NOT change the `16` at line 41). The module count: if a `worker` stdlib HELPER module was added it changes (`task.pipe` lives in the existing `std/task`, so the `54` std modules / `28` framing is UNCHANGED — confirm). Update any capability claim that asserts single-threaded-only.
+- [x] **Step 2:** `docs/content/language/modules-async.md` (and any page asserting the execution model) — update to include workers; remove/repair contradictions with the new parallelism story (the page currently states a single-threaded event loop — refine to "single-threaded per isolate; parallelism via workers").
+- [x] **Step 3: Link & nav integrity.** Confirm every page (incl. the new workers page) has a `NAV` entry and that in-content relative links resolve (the documented orphan/relative-link gotchas).
+- [x] **Step 4: Commit.**
 
 ### Task 16.4: CLAUDE.md
 
 **Files:** `CLAUDE.md`.
 
-- [ ] **Step 1:** Update the "What this is" / concurrency description to mention shared-nothing worker parallelism.
-- [ ] **Step 2:** Clarify in the interpreter section that the `!Send`, single-threaded, `Rc`/`RefCell` model is **per-isolate** — parallelism is achieved by ISOLATION (multiple complete runtimes on separate threads sharing no memory), NOT by shared memory — so it isn't misread as "no parallelism possible". Keep the "never hold a `RefCell` borrow across `.await`" invariant intact and note it applies within each isolate.
-- [ ] **Step 3:** Add a **"Workers" entry under "Larger subsystems (campaign work, condensed)"** documenting the architecture for future sessions: the two lifecycles (Spec A pooled/stateless `worker fn`; Spec B dedicated-isolate `worker class` actors + `worker fn*` streaming generators); the serializer airlock (`src/worker/serialize.rs` — only bytes cross, the runtime stays `!Send`); the pool (Spec A) vs dedicated isolates (Spec B); actor handle = `Value::Native(WorkerActor)` in `Interp.resources` with a FIFO one-at-a-time mailbox + non-reentrancy guard; streaming handle = `Value::Generator` over `GenImpl::Worker` (`src/coro.rs`) with demand-driven pull + bounded buffer; both torn down on `close()`/last-drop; GC must NOT trace into either (native-handle invariant); `task.pipe` bridge.
-- [ ] **Step 4:** State the feature-flag status: workers are **core / default-on**, built under `--no-default-features` (like the GC). Confirm against `Cargo.toml` (the `src/worker/` module is unconditional, NOT behind a feature) and state it.
-- [ ] **Step 5: Commit.**
+- [x] **Step 1:** Update the "What this is" / concurrency description to mention shared-nothing worker parallelism.
+- [x] **Step 2:** Clarify in the interpreter section that the `!Send`, single-threaded, `Rc`/`RefCell` model is **per-isolate** — parallelism is achieved by ISOLATION (multiple complete runtimes on separate threads sharing no memory), NOT by shared memory — so it isn't misread as "no parallelism possible". Keep the "never hold a `RefCell` borrow across `.await`" invariant intact and note it applies within each isolate.
+- [x] **Step 3:** Add a **"Workers" entry under "Larger subsystems (campaign work, condensed)"** documenting the architecture for future sessions: the two lifecycles (Spec A pooled/stateless `worker fn`; Spec B dedicated-isolate `worker class` actors + `worker fn*` streaming generators); the serializer airlock (`src/worker/serialize.rs` — only bytes cross, the runtime stays `!Send`); the pool (Spec A) vs dedicated isolates (Spec B); actor handle = `Value::Native(WorkerActor)` in `Interp.resources` with a FIFO one-at-a-time mailbox + non-reentrancy guard; streaming handle = `Value::Generator` over `GenImpl::Worker` (`src/coro.rs`) with demand-driven pull + bounded buffer; both torn down on `close()`/last-drop; GC must NOT trace into either (native-handle invariant); `task.pipe` bridge.
+- [x] **Step 4:** State the feature-flag status: workers are **core / default-on**, built under `--no-default-features` (like the GC). Confirm against `Cargo.toml` (the `src/worker/` module is unconditional, NOT behind a feature) and state it.
+- [x] **Step 5: Commit.**
 
 ### Task 16.5: Main design spec non-goal supersession
 
 **Files:** `superpowers/specs/2026-05-29-ascript-design.md`.
 
-- [ ] **Step 1:** Amend line ~50 (`- No multithreading in user code (single-threaded event loop; see §7).`) with a supersession note pointing at the two worker specs: e.g. `- No SHARED-MEMORY multithreading in user code (single-threaded event loop PER ISOLATE; see §7). Superseded/refined by shared-nothing worker parallelism — see specs 2026-06-07-workers-foundation-stateless-design.md and 2026-06-07-workers-stateful-actors-streaming-design.md (parallelism by isolation, no data races).`
-- [ ] **Step 2:** Cross-reference from §7 (async model) — add a pointer to the worker specs noting parallelism is now available via shared-nothing isolates.
-- [ ] **Step 3: Commit.**
+- [x] **Step 1:** Amend line ~50 (`- No multithreading in user code (single-threaded event loop; see §7).`) with a supersession note pointing at the two worker specs: e.g. `- No SHARED-MEMORY multithreading in user code (single-threaded event loop PER ISOLATE; see §7). Superseded/refined by shared-nothing worker parallelism — see specs 2026-06-07-workers-foundation-stateless-design.md and 2026-06-07-workers-stateful-actors-streaming-design.md (parallelism by isolation, no data races).`
+- [x] **Step 2:** Cross-reference from §7 (async model) — add a pointer to the worker specs noting parallelism is now available via shared-nothing isolates.
+- [x] **Step 3: Commit.**
 
 ### Task 16.6: roadmap.md milestone entry
 
 **Files:** `superpowers/roadmap.md`.
 
-- [ ] **Step 1:** Add the workers milestone entry (consistent with the existing milestone-by-milestone record), referencing both plan paths (Spec A + Spec B) and summarizing: shared-nothing isolates for multi-core parallelism; `worker fn`/`static worker fn` (pooled, stateless); `worker class` actors + `worker fn*` streaming (dedicated isolates); the serializer airlock; `.aso` bump; all-modes differential coverage.
-- [ ] **Step 2: Commit.**
+- [x] **Step 1:** Add the workers milestone entry (consistent with the existing milestone-by-milestone record), referencing both plan paths (Spec A + Spec B) and summarizing: shared-nothing isolates for multi-core parallelism; `worker fn`/`static worker fn` (pooled, stateless); `worker class` actors + `worker fn*` streaming (dedicated isolates); the serializer airlock; `.aso` bump; all-modes differential coverage.
+- [x] **Step 2: Commit.**
 
 ### Task 16.7: End-to-end whole-doc-set sanity verification
 
 **Files:** read-only sweep across README + `docs/content/**` + CLAUDE.md; fix anything stale discovered.
 
-- [ ] **Step 1:** Read README + `docs/content/**` + CLAUDE.md end-to-end for internal consistency (stats, counts, capability claims, execution-model statements, dead links). Fix anything stale discovered in the process — worker-related or not (the §8.2 mandate is a GENERAL staleness sweep).
-- [ ] **Step 2: Serve & verify the site.** `cd docs && python3 -m http.server` (the site `fetch`es Markdown — must be served, not `file://`). Confirm: the site renders; the new workers page is reachable via the sidebar AND cmd-K search; in-content relative links on the workers page resolve; no console 404s for the new content. Capture the result in the commit message.
-- [ ] **Step 3: Final full-suite green gate.** Run `cargo test`, `cargo test --no-default-features`, `cargo clippy --all-targets`, and `cargo clippy --no-default-features --all-targets` — all clean. (Clippy must be clean in BOTH configs per CLAUDE.md.)
-- [ ] **Step 4: Commit.**
+- [x] **Step 1:** Read README + `docs/content/**` + CLAUDE.md end-to-end for internal consistency (stats, counts, capability claims, execution-model statements, dead links). Fix anything stale discovered in the process — worker-related or not (the §8.2 mandate is a GENERAL staleness sweep).
+- [x] **Step 2: Serve & verify the site.** `cd docs && python3 -m http.server` (the site `fetch`es Markdown — must be served, not `file://`). Confirm: the site renders; the new workers page is reachable via the sidebar AND cmd-K search; in-content relative links on the workers page resolve; no console 404s for the new content. Capture the result in the commit message.
+- [x] **Step 3: Final full-suite green gate.** Run `cargo test`, `cargo test --no-default-features`, `cargo clippy --all-targets`, and `cargo clippy --no-default-features --all-targets` — all clean. (Clippy must be clean in BOTH configs per CLAUDE.md.)
+- [x] **Step 4: Commit.**
   ```bash
   git commit -am "docs(sweep): integrate workers + whole-doc-set staleness pass (README/docs/CLAUDE/design-spec/roadmap); verified served site
 
