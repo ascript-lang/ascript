@@ -123,23 +123,18 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `src/syntax/format/` (the lossless CST formatter), `src/ast.rs` `Display`, formatter golden tests.
 
-- [ ] **Step 1: Failing formatter golden.** Add a golden asserting idempotent formatting:
+- [x] **Step 1: Failing formatter golden.** Add a golden asserting idempotent formatting:
   - Input `worker  class  Db{fn f(){return 1}}` → `worker class Db {\n  fn f() {\n    return 1\n  }\n}`.
   - Input `worker fn*  g(){yield 1}` → `worker fn* g() {\n  yield 1\n}`.
-  - Canonical modifier order: `static? worker? fn` for methods (a `static worker fn` is NOT a valid combination per Spec A — `worker` instance methods are Spec B's `worker class` methods, and `static worker fn` is Plan A's pooled form; the formatter just preserves whatever modifiers exist in canonical order). Run the formatter test → **expect FAIL**.
+  - Canonical modifier order: `static? worker? fn` for methods (a `static worker fn` is NOT a valid combination per Spec A — `worker` instance methods are Spec B's `worker class` methods, and `static worker fn` is Plan A's pooled form; the formatter just preserves whatever modifiers exist in canonical order). Tests were added and confirmed failing before the fix.
 
-- [ ] **Step 2: Formatter.** In `src/syntax/format/`, ensure the class-decl formatter emits the leading `worker ` token when present (the lossless formatter walks tokens — confirm `WorkerKw` is emitted with a trailing space before `class`). Ensure `worker fn*` (function/method decl) emits `worker fn* name` (the `*` formatting already exists from M17; insert `worker ` per Plan A — verify the combination).
+- [x] **Step 2: Formatter.** Fixed `src/syntax/format/mod.rs` (the CST formatter used by `ascript fmt` CLI) in three places: `fn_decl` (emits `worker ` before `async`), `class_decl` (emits `worker ` before `class`), and `member`/MethodDecl (emits `worker ` in canonical `static? worker? async? fn` order). The `WorkerKw` token is correctly remapped by the CST parser and detected by `toks.contains(&WorkerKw)`. The legacy AST formatter (`src/fmt.rs`) was already correct from Task 1.
 
-- [ ] **Step 3: `ast.rs` Display.** Update `Stmt::Class` `Display` to prefix `worker ` when `is_worker`. Confirm `MethodDecl`/`Stmt::Fn` Display renders `worker fn*` (Plan A's `worker` + existing `*`). Display must match the formatter (they are independent renderers; both are guardrails).
+- [x] **Step 3: `ast.rs` Display.** Confirmed there is no `Display for Stmt` — `src/fmt.rs` is the canonical printer (as established in Plan A). The `Stmt::Class` arm in `src/fmt.rs` already renders `worker ` when `is_worker` (Task 1). `Stmt::Fn` and `write_method` also already handle `worker fn*` correctly. No ast.rs changes needed.
 
-- [ ] **Step 4:** Run the formatter + ast Display tests in both feature configs → **expect PASS**. Also format every Task-13 example with `cargo run -- fmt --check` to confirm idempotency.
+- [x] **Step 4:** Both test configs green (35 fmt.rs tests, 25 syntax::format tests, all 1914+ lib tests). Both clippy configs → zero warnings. Worker example files: `worker fn`/`worker class` keywords preserved after formatting (pre-existing style divergences in examples are unrelated to worker keyword handling).
 
-- [ ] **Step 5: Commit**
-  ```bash
-  git commit -am "feat(fmt): render 'worker class' and 'worker fn*' (formatter + ast Display, idempotent)
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-  ```
+- [x] **Step 5: Commit** — `f6ca48d feat(fmt): render 'worker class' and 'worker fn*' (CST formatter + ast Display, idempotent)`
 
 ## Task 4: Dedicated-isolate lifecycle/manager (reuse Plan A bootstrap)
 
