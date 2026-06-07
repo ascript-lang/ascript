@@ -274,7 +274,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `src/stdlib/task_mod.rs`, `src/stdlib/mod.rs`, `src/check/std_arity.rs`, `tests/workers_stateful.rs`.
 
-- [ ] **Step 1: Failing test (bridge fans out in order).** Add a `.as` test:
+- [x] **Step 1: Failing test (bridge fans out in order).** Add a `.as` test:
   ```
   worker fn* source() { yield {kind:"a", n:1}; yield {kind:"a", n:2} }
   let bus = events.new()
@@ -285,7 +285,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   ```
   Assert `[1, 2]`. Run `cargo test --test workers_stateful bridge` → **expect FAIL** (`task.pipe` unknown).
 
-- [ ] **Step 2: `pipe`.** In `src/stdlib/task_mod.rs`, add an async `pipe(gen, bus)` to `exports()` (`("pipe", bi("task.pipe"))`) and the dispatch match. Implementation (exactly the spec's idiom):
+- [x] **Step 2: `pipe`.** In `src/stdlib/task_mod.rs`, add an async `pipe(gen, bus)` to `exports()` (`("pipe", bi("task.pipe"))`) and the dispatch match. Implementation (exactly the spec's idiom):
   ```rust
   async fn task_pipe(&self, args: &[Value], span: Span) -> Result<Value, Control> {
       let gen = want_generator(&arg(args, 0), span, "task.pipe")?;
@@ -305,13 +305,13 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   ```
   Backpressure threads end-to-end for free: a slow local `on` listener slows `emit`, which slows the loop, which slows `resume`, which slows the producer. Keep it engine-agnostic (`Value` layer) — both engines reuse it.
 
-- [ ] **Step 3: std_arity.** In `src/check/std_arity.rs`, register `("task", "pipe") => required 2` so `call-arity` checks it (`max=None` per native-fn convention). Confirm the `every_entry_is_a_real_export` test still passes (it asserts every arity entry is a real export).
+- [x] **Step 3: std_arity.** In `src/check/std_arity.rs`, register `("task", "pipe") => required 2` so `call-arity` checks it (`max=None` per native-fn convention). Confirm the `every_entry_is_a_real_export` test still passes (it asserts every arity entry is a real export).
 
-- [ ] **Step 4: Multi-listener + slow-listener backpressure test.** Extend the test: two `on("a", ...)` listeners both observe both events in order; a deliberately slow listener (awaits a short sleep) still receives all events and the final `seen` is complete and ordered.
+- [x] **Step 4: Multi-listener + slow-listener backpressure test.** Extend the test: two `on("a", ...)` listeners both observe both events in order; a deliberately slow listener (awaits a short sleep) still receives all events and the final `seen` is complete and ordered.
 
-- [ ] **Step 5:** Run `cargo test --test workers_stateful bridge` + `cargo test --test check std_arity` in both configs → **expect PASS**.
+- [x] **Step 5:** Run `cargo test --test workers_stateful bridge` + `cargo test --test check std_arity` in both configs → **expect PASS**.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
   ```bash
   git commit -am "feat(workers): task.pipe bridge (worker stream -> local event bus) + std_arity
 
