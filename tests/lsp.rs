@@ -1211,3 +1211,335 @@ fn lsp_diagnostics_match_ascript_check() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── Task 12: worker fn LSP tests ──────────────────────────────────────────────
+
+/// Task 12 Step 1a: the `worker` contextual keyword is emitted as a semantic
+/// token of type KEYWORD (legend index 0). The first token in
+/// `worker fn f() { return 1 }` is `worker` at line 0, char 0, length 6,
+/// token_type 0 (KEYWORD).
+#[test]
+fn lsp_worker_is_keyword_token() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://worker_kw.as";
+    let text = "worker fn f() { return 1 }\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/semanticTokens/full",
+        json!({ "textDocument": { "uri": uri } }),
+    );
+    let st_resp = client.read_response(2, overall);
+    let raw = st_resp["result"]["data"]
+        .as_array()
+        .expect("semanticTokens data array");
+    // The wire format is groups of 5 integers: [delta_line, delta_start, length,
+    // token_type, token_modifiers_bitset].
+    // KEYWORD = legend index 0; "worker" is 6 characters.
+    // Scan all tokens for a KEYWORD (token_type==0) of length 6.
+    let nums: Vec<u32> = raw.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+    let has_worker_kw = nums.chunks(5).any(|t| {
+        t.len() == 5
+            && t[2] == 6   // length == len("worker")
+            && t[3] == 0   // token_type == KEYWORD
+    });
+    assert!(
+        has_worker_kw,
+        "`worker` must be emitted as a KEYWORD (type 0, len 6); raw data: {nums:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Task 12 Step 1b: `worker` is offered as a completion keyword at a top-level
+/// position.
+#[test]
+fn lsp_offers_worker_completion() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    // An empty document; we request completions at the top level.
+    let uri = "ascript-test://worker_comp.as";
+    let text = "\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    client.request(
+        2,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": 0 }
+        }),
+    );
+    let comp_resp = client.read_response(2, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"worker"),
+        "`worker` must appear in keyword completions; got: {labels:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Task 12 Step 1c: hovering the name of a `worker fn` declaration (or a call
+/// to it) mentions "worker" and "future" in the hover response, reflecting that
+/// calls return `future<T>`.
+#[test]
+fn lsp_hover_worker_fn_mentions_future() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    // `render` is declared as a worker fn; hover its name in the declaration.
+    let uri = "ascript-test://worker_hover.as";
+    // "worker fn render(s: number): number { return s }"
+    // The return-type annotation lets hover_type_at infer future<number> for calls.
+    let text = "worker fn render(s: number): number { return s }\nlet x = render(1)\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Hover on `render` at the declaration (line 0).
+    // "worker fn render" — `render` starts at byte offset 10 = char 10.
+    let render_decl_char: u32 = 10;
+    client.request(
+        2,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": render_decl_char }
+        }),
+    );
+    let hover_resp = client.read_response(2, overall);
+    let hover_value = &hover_resp["result"];
+    assert!(
+        !hover_value.is_null(),
+        "hover on `render` (worker fn decl) should not be null: {hover_resp}"
+    );
+    let content = hover_value["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        content.contains("worker"),
+        "hover on a worker fn must mention 'worker'; got: {content:?}"
+    );
+
+    // Hover over the render(1) CALL on line 1 — the inferred type is future<number>.
+    // "let x = render(1)" — `render` is at char 8 on line 1.
+    client.request(
+        3,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 8 }
+        }),
+    );
+    let call_hover = client.read_response(3, overall);
+    // The hover must carry a result with contents mentioning "future".
+    let call_content = call_hover["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        call_content.contains("future"),
+        "hover on a worker fn CALL should show future<T>; got: {call_content:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Task 12 Step 1d: a `worker-capture` violation is surfaced as an LSP
+/// diagnostic with code `"worker-capture"`.
+#[test]
+fn lsp_worker_capture_flows_to_diagnostics() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://worker_capture.as";
+    // Capturing a mutable `let` binding from an outer scope is a worker-capture error.
+    let text = "let c = 0\nworker fn g(n) { return n + c }\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": text
+            }
+        }),
+    );
+    let note = client.read_notification("textDocument/publishDiagnostics", overall);
+    let diags = note["params"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    let codes: Vec<&str> = diags
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(
+        codes.iter().any(|&c| c == "worker-capture"),
+        "expected a `worker-capture` diagnostic; got codes: {codes:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
+/// Task 12 Step 1e: goto-definition on a call to a `worker fn` lands at the
+/// declaration, just like a plain `fn` — navigation reuses the existing resolver
+/// index.
+#[test]
+fn lsp_navigation_finds_worker_fn() {
+    let dir =
+        std::env::temp_dir().join(format!("ascript_lsp_worker_nav_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f_path = dir.join("wf.as");
+    // A `worker fn g` declared and called in the same file.
+    std::fs::write(
+        &f_path,
+        "worker fn g() { return 1 }\nlet x = g()\n",
+    )
+    .unwrap();
+    let f_uri = format!("file://{}", f_path.display());
+    let root_uri = format!("file://{}", dir.display());
+
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": root_uri, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let file_text = std::fs::read_to_string(&f_path).unwrap();
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": f_uri,
+                "languageId": "ascript",
+                "version": 1,
+                "text": file_text
+            }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // `g` in `g()` on line 1 (the call). "let x = g()" — `g` is at char 8.
+    client.request(
+        2,
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": f_uri },
+            "position": { "line": 1, "character": 8 }
+        }),
+    );
+    let def_resp = client.read_response(2, overall);
+    // The result is either a Location or an array; either way it must be non-null
+    // and point to the same file (same-file goto-def).
+    let result = &def_resp["result"];
+    assert!(
+        !result.is_null(),
+        "goto-def on a worker fn call must not be null: {def_resp}"
+    );
+    // Normalise: accept a single Location or an array with one element.
+    let loc_uri = if result.is_array() {
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "expected exactly 1 definition: {def_resp}");
+        arr[0]["uri"].as_str().unwrap_or("").to_string()
+    } else {
+        result["uri"].as_str().unwrap_or("").to_string()
+    };
+    assert!(
+        loc_uri.ends_with("wf.as"),
+        "goto-def should point to wf.as; got: {loc_uri}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+    let _ = std::fs::remove_dir_all(&dir);
+}
