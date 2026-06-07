@@ -428,7 +428,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 > Each example MUST be order-deterministic (drive actors with sequenced awaits; consume generators in order) so the Task-14 byte-identical comparison is meaningful. Verify each with `target/release/ascript run <file>` AND `cargo run -- fmt --check <file>` (idempotent formatting).
 
-- [ ] **Step 1: `workers_actor_counter.as`** — a stateful counter/cache actor; state persists across calls. Full content:
+- [x] **Step 1: `workers_actor_counter.as`** — a stateful counter/cache actor; state persists across calls. Full content:
   ```
   worker class Counter {
     field n = 0
@@ -451,9 +451,9 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   ```
   Expected stdout: `1\n2\n42\n42\n3\n`.
 
-- [ ] **Step 2: `workers_actor_service.as`** — a service actor owning a MOCK connection opened INSIDE the isolate, fully error-handled (the "resource lives in the actor" pattern). Use a self-contained mock (no external service): the `init` builds an in-isolate state object standing in for a connection; methods query it; demonstrate `[value, err]` Result crossing as data and `recover` on a method panic. Keep output deterministic.
+- [x] **Step 2: `workers_actor_service.as`** — a service actor owning a MOCK connection opened INSIDE the isolate, fully error-handled (the "resource lives in the actor" pattern). Use a self-contained mock (no external service): the `init` builds an in-isolate state object standing in for a connection; methods query it; demonstrate `[value, err]` Result crossing as data and `recover` on a method panic. Keep output deterministic.
 
-- [ ] **Step 3: `workers_stream_records.as`** — `worker fn*` streaming parsed records with demand-driven backpressure, consumed via `for await`:
+- [x] **Step 3: `workers_stream_records.as`** — `worker fn*` streaming parsed records with demand-driven backpressure, consumed via `for await`:
   ```
   worker fn* records(n) {
     for i in 1..=n { yield { id: i, label: "rec-" + string(i) } }
@@ -465,15 +465,15 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   ```
   Expected: `1:rec-1\n2:rec-2\n3:rec-3\n4:rec-4\n`.
 
-- [ ] **Step 4: `workers_stream_bidirectional.as`** — `gen.next(v)` injecting values back into the producer (round-trip across the boundary). Deterministic.
+- [x] **Step 4: `workers_stream_bidirectional.as`** — `gen.next(v)` injecting values back into the producer (round-trip across the boundary). Deterministic.
 
-- [ ] **Step 5: `workers_event_bridge.as`** — the bridge: a `worker fn*` event source piped onto a LOCAL `events` bus that fans out to multiple listeners, via `task.pipe`. Deterministic ordered output.
+- [x] **Step 5: `workers_event_bridge.as`** — the bridge: a `worker fn*` event source piped onto a LOCAL `events` bus that fans out to multiple listeners, via `task.pipe`. Deterministic ordered output.
 
-- [ ] **Step 6: `workers_actor_subscribe.as`** — an actor exposing a `fn*` `subscribe` method (a producer actor); consume it in order. *(Note: an actor method returning a generator — confirm the streaming-handle-from-actor-method path works or document it as the `worker fn*`-only form if the actor-method-generator combination is deferred; the spec lists it under §7.3 so it must run. If the actor's `fn*` method must itself stream across the boundary, route its consumption through the same `GenImpl::Worker` driver, with the actor's mailbox delivering demand credits.)*
+- [x] **Step 6: `workers_actor_subscribe.as`** — an actor exposing a `fn*` `subscribe` method (a producer actor); consume it in order. *(DEFERRED: actor method returning a generator cannot cross the isolate boundary — a generator handle is non-sendable. Workaround: actor.snapshot() returns a plain array; a separate `worker fn* subscribe(entries)` streams from it — gives identical observable semantics. Documented in the example file header.)*
 
-- [ ] **Step 7:** Build release (`cargo build --release`) and run each: `for f in examples/advanced/workers_actor_counter.as examples/advanced/workers_*.as; do target/release/ascript run "$f"; done` → **expect each runs with the documented output**. Also run each under `--no-default-features` build (skip `sql`-gated bits behind `#[cfg]` if used).
+- [x] **Step 7:** Build release (`cargo build --release`) and run each: `for f in examples/advanced/workers_actor_counter.as examples/advanced/workers_*.as; do target/release/ascript run "$f"; done` → **expect each runs with the documented output**. Also run each under `--no-default-features` build (skip `sql`-gated bits behind `#[cfg]` if used).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
   ```bash
   git add examples/advanced/workers_*.as
   git commit -m "docs(examples): stateful-worker corpus — actors, streaming, bidirectional, event bridge, subscribe
