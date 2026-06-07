@@ -201,6 +201,7 @@ module.exports = grammar({
 
     function_declaration: $ => seq(
       optional('async'),
+      optional($.worker_keyword),
       'fn',
       optional('*'),  // `fn*` / `async fn*` — a generator (§7, M17)
       field('name', $.identifier),
@@ -250,6 +251,7 @@ module.exports = grammar({
     ),
     method_definition: $ => seq(
       optional($.static_keyword),  // `static fn` / `static async fn` / `static fn*` (SP1 §3)
+      optional($.worker_keyword),
       optional('async'),
       'fn',
       optional('*'),  // `fn*` generator method (§7, M17)
@@ -388,6 +390,12 @@ module.exports = grammar({
     // (which use a token of lookahead) do accept it. No corpus/example program
     // names a field `static`, so the three parsers agree on all real code.
     static_keyword: _ => 'static',
+    // The contextual `worker` soft-keyword (Workers Spec A): the fn/method modifier
+    // that dispatches the body to a pooled isolate and returns `future<T>`. `worker`
+    // is NOT reserved — it is a plain identifier in every non-modifier position
+    // (`let worker = 5`, `fn worker() {}`, `f(worker)`). Same contextual treatment as
+    // `static_keyword`.
+    worker_keyword: _ => 'worker',
 
     unary_expression: $ => prec.right(PREC.unary, seq(
       field('operator', choice('!', '-')),

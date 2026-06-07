@@ -2221,6 +2221,16 @@
           }
         ]
       }
+    },
+    "children": {
+      "multiple": false,
+      "required": false,
+      "types": [
+        {
+          "type": "worker_keyword",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -3688,11 +3698,15 @@
       }
     },
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
         {
           "type": "static_keyword",
+          "named": true
+        },
+        {
+          "type": "worker_keyword",
           "named": true
         }
       ]
@@ -6716,6 +6730,10 @@
   },
   {
     "type": "wildcard_pattern",
+    "named": true
+  },
+  {
+    "type": "worker_keyword",
     "named": true
   },
   {

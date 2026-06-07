@@ -723,6 +723,18 @@
           ]
         },
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "worker_keyword"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "STRING",
           "value": "fn"
         },
@@ -1160,6 +1172,18 @@
             {
               "type": "SYMBOL",
               "name": "static_keyword"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "worker_keyword"
             },
             {
               "type": "BLANK"
@@ -2333,6 +2357,10 @@
     "static_keyword": {
       "type": "STRING",
       "value": "static"
+    },
+    "worker_keyword": {
+      "type": "STRING",
+      "value": "worker"
     },
     "unary_expression": {
       "type": "PREC_RIGHT",

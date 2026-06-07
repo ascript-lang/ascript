@@ -180,6 +180,25 @@ fn queries_compile_against_grammar() {
     );
 }
 
+fn parse_has_error(src: &str) -> bool {
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    let tree = parser.parse(src.as_bytes(), None).expect("parse");
+    tree.root_node().has_error()
+}
+
+#[test]
+fn treesitter_parses_worker_decls() {
+    for src in [
+        "worker fn f() { return 1 }",
+        "class C { static worker fn h(x) { return x } }",
+        "class C { worker fn m(x) { return x } }",
+    ] {
+        assert!(!parse_has_error(src), "tree-sitter ERROR node in: {src}");
+    }
+}
+
 #[test]
 fn interpreter_parser_accepts_all_examples() {
     let mut failures = Vec::new();
