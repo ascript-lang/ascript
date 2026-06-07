@@ -1445,16 +1445,16 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `docs/assets/app.js` (NAV — only if a NEW page is added; this appends to an existing page, so verify NAV needs no change)
 - Modify: `README.md` (one-line note in the feature/concurrency area)
 
-- [ ] **Step 1: Append a Workers section** to `docs/content/language/modules-async.md` covering: the shared-nothing model; `worker fn` and `static worker fn` returning `future<T>`; the cost model (~0.5–2 ms birth, ~512 MB virtual stack, amortized to ~0 after warmup; "parallelize coarse work, not tight loops"); the capture rules (params + top-level fns + consts only; mutable-`let` capture / top-level mutation is a `worker-capture` Error); sendability (the structured-clone kinds + the field-path error + the channel/emitter hint); the pool (lazy, demand-grown to `num_cpus`, `ASCRIPT_WORKERS`, FIFO backpressure, inline nesting). Include a runnable snippet mirroring `examples/workers_parallel_map.as`.
+- [x] **Step 1: Append a Workers section** to `docs/content/language/modules-async.md` covering: the shared-nothing model; `worker fn` and `static worker fn` returning `future<T>`; the cost model (~0.5–2 ms birth, ~512 MB virtual stack, amortized to ~0 after warmup; "parallelize coarse work, not tight loops"); the capture rules (params + top-level fns + consts only; mutable-`let` capture / top-level mutation is a `worker-capture` Error); sendability (the structured-clone kinds + the field-path error + the channel/emitter hint); the pool (lazy, demand-grown to `num_cpus`, `ASCRIPT_WORKERS`, FIFO backpressure, inline nesting). Include a runnable snippet mirroring `examples/workers_parallel_map.as`.
 
-- [ ] **Step 2: NAV check.** Since the content is appended to an EXISTING page (`modules-async`), the `NAV` array in `docs/assets/app.js` already lists it — confirm and make NO change. (If, instead, you create a NEW `workers` page, you MUST add its slug to `NAV` or it is unreachable — do not do this; Plan B owns the dedicated page if any.)
+- [x] **Step 2: NAV check.** Since the content is appended to an EXISTING page (`modules-async`), the `NAV` array in `docs/assets/app.js` already lists it — confirm and make NO change. (If, instead, you create a NEW `workers` page, you MUST add its slug to `NAV` or it is unreachable — do not do this; Plan B owns the dedicated page if any.)
 
-- [ ] **Step 3: README note.** Add one line in `README.md` where concurrency/stdlib is described: "`worker fn` runs CPU-bound work on a pooled shared-nothing isolate (multi-core), returning `future<T>`." Do NOT attempt the full README/CLAUDE.md/roadmap sweep — that is Plan B §8.2.
+- [x] **Step 3: README note.** Add one line in `README.md` where concurrency/stdlib is described: "`worker fn` runs CPU-bound work on a pooled shared-nothing isolate (multi-core), returning `future<T>`." Do NOT attempt the full README/CLAUDE.md/roadmap sweep — that is Plan B §8.2.
 
 - [ ] **Step 4: Serve-and-eyeball (optional sanity)**
   Run: `cd docs && python3 -m http.server` and load the modules-async page; confirm the Workers section renders and its in-content links resolve.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add docs/content/language/modules-async.md README.md
 git commit -m "docs: workers section in the language guide (model, cost, capture, sendability, pool)
