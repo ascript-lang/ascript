@@ -371,3 +371,74 @@ await main()
 "#;
     assert_both_engines("stream_nonsendable_arg", src, "true\n");
 }
+
+// ---------------------------------------------------------------------------
+// Task 7 — `task.pipe(gen, bus)` bridge helper
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pipe_bridge_fans_out_in_order() {
+    // Basic bridge: pipe a worker generator's items onto a local event bus.
+    // Items arrive in order; the bus listener receives them with correct field values.
+    let src = r#"
+import { pipe } from "std/task"
+import * as events from "std/events"
+worker fn* source() { yield {kind:"a", n:1}; yield {kind:"a", n:2} }
+async fn main() {
+  let bus = events.new()
+  let seen = []
+  bus.on("a", (e) => { seen = [...seen, e.n] })
+  await pipe(source(), bus)
+  print(seen)
+}
+await main()
+"#;
+    assert_both_engines("bridge_basic", src, "[1, 2]\n");
+}
+
+#[test]
+fn pipe_bridge_multi_listener_both_receive_in_order() {
+    // Multi-listener: two `on("a", ...)` listeners both observe both events in order.
+    let src = r#"
+import { pipe } from "std/task"
+import * as events from "std/events"
+worker fn* source() { yield {kind:"a", n:10}; yield {kind:"a", n:20} }
+async fn main() {
+  let bus = events.new()
+  let seenA = []
+  let seenB = []
+  bus.on("a", (e) => { seenA = [...seenA, e.n] })
+  bus.on("a", (e) => { seenB = [...seenB, e.n] })
+  await pipe(source(), bus)
+  print(seenA)
+  print(seenB)
+}
+await main()
+"#;
+    assert_both_engines("bridge_multi", src, "[10, 20]\n[10, 20]\n");
+}
+
+#[test]
+fn pipe_bridge_slow_listener_still_receives_all() {
+    // Backpressure: a slow listener (awaits a short sleep) still receives all events
+    // and the final result is complete and ordered. Slowness threads back through
+    // emit → consume loop → resume → producer (demand-driven pull).
+    let src = r#"
+import { pipe } from "std/task"
+import * as events from "std/events"
+import { sleep } from "std/time"
+worker fn* source() { yield {kind:"a", n:1}; yield {kind:"a", n:2}; yield {kind:"a", n:3} }
+async fn main() {
+  let bus = events.new()
+  let seen = []
+  bus.on("a", async (e) => {
+    await sleep(1)
+    seen = [...seen, e.n]
+  })
+  await pipe(source(), bus)
+  print(seen)
+}
+await main()
+"#;
+    assert_both_engines("bridge_slow", src, "[1, 2, 3]\n");
+}

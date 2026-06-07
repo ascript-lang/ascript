@@ -35,6 +35,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("race", bi("task.race")),
         ("timeout", bi("task.timeout")),
         ("retry", bi("task.retry")),
+        ("pipe", bi("task.pipe")),
     ]
 }
 
@@ -63,6 +64,7 @@ impl Interp {
             "race" => self.task_race(args, span).await,
             "timeout" => self.task_timeout(args, span).await,
             "retry" => self.task_retry(args, span).await,
+            "pipe" => self.task_pipe(args, span).await,
             _ => Err(AsError::at(format!("unknown function 'task.{}'", func), span).into()),
         }
     }
@@ -313,6 +315,129 @@ impl Interp {
 
         // All attempts exhausted — re-raise the last panic.
         Err(Control::Panic(last_panic.expect("at least one attempt")))
+    }
+
+    /// `pipe(gen, bus)` — consume a (worker) generator and re-emit each yielded
+    /// item on a local event bus.
+    ///
+    /// Each item `e` must be an Object with a `kind` string field; `bus.emit(e.kind, e)`
+    /// fans the item out to every registered listener in order. Backpressure threads
+    /// end-to-end for free: a slow `on` listener slows `emit`, which slows the loop,
+    /// which slows `resume`, which slows the producer (demand-driven pull).
+    ///
+    /// Both arguments are required: `gen` must be a `Value::Generator`; `bus` must be a
+    /// `Value::Native` with `NativeKind::Events`. Type misuse → Tier-2 panic (spec §11.3).
+    async fn task_pipe(&self, args: &[Value], span: Span) -> Result<Value, Control> {
+        let gen_val = arg(args, 0);
+        let bus = arg(args, 1);
+
+        // Validate gen is a Generator.
+        let gen = match gen_val {
+            Value::Generator(ref g) => g.clone(),
+            other => {
+                return Err(AsError::at(
+                    format!(
+                        "task.pipe: first argument must be a generator, got {}",
+                        crate::interp::type_name(&other)
+                    ),
+                    span,
+                )
+                .into());
+            }
+        };
+
+        // Validate bus is a Native Events handle.
+        let native_obj = match &bus {
+            Value::Native(n) if n.kind == crate::value::NativeKind::Events => n.clone(),
+            other => {
+                return Err(AsError::at(
+                    format!(
+                        "task.pipe: second argument must be an event bus (emitter), got {}",
+                        crate::interp::type_name(other)
+                    ),
+                    span,
+                )
+                .into());
+            }
+        };
+
+        // Consume the generator: drive it one step at a time, fan each item onto the bus.
+        loop {
+            let item = match gen.resume(Value::Nil).await? {
+                Some(v) => v,
+                None => break,
+            };
+
+            // Extract e.kind — must be a string field on an Object.
+            let kind: std::rc::Rc<str> = match &item {
+                Value::Object(o) => match o.borrow().get("kind") {
+                    Some(Value::Str(s)) => s.clone(),
+                    Some(other) => {
+                        return Err(AsError::at(
+                            format!(
+                                "task.pipe: yielded item's 'kind' field must be a string, got {}",
+                                crate::interp::type_name(other)
+                            ),
+                            span,
+                        )
+                        .into());
+                    }
+                    None => {
+                        return Err(AsError::at(
+                            "task.pipe: yielded item must have a 'kind' string field",
+                            span,
+                        )
+                        .into());
+                    }
+                },
+                Value::Instance(inst) => match inst.borrow().fields.get("kind") {
+                    Some(Value::Str(s)) => s.clone(),
+                    Some(other) => {
+                        return Err(AsError::at(
+                            format!(
+                                "task.pipe: yielded item's 'kind' field must be a string, got {}",
+                                crate::interp::type_name(other)
+                            ),
+                            span,
+                        )
+                        .into());
+                    }
+                    None => {
+                        return Err(AsError::at(
+                            "task.pipe: yielded item must have a 'kind' string field",
+                            span,
+                        )
+                        .into());
+                    }
+                },
+                other => {
+                    return Err(AsError::at(
+                        format!(
+                            "task.pipe: yielded value must be an object with a 'kind' field, got {}",
+                            crate::interp::type_name(other)
+                        ),
+                        span,
+                    )
+                    .into());
+                }
+            };
+
+            // Build and dispatch: bus.emit(kind, item).
+            // No RefCell borrow is held across this await — `native_obj` is a cloned Rc.
+            let emit_method = std::rc::Rc::new(crate::value::NativeMethod {
+                receiver: native_obj.clone(),
+                method: "emit".to_string(),
+            });
+            let result = self
+                .call_native_method(emit_method, vec![Value::Str(kind), item], span)
+                .await?;
+            // emit may return a Future (async listeners) — drive it to completion.
+            if let Value::Future(f) = result {
+                f.get().await?;
+            }
+        }
+
+        Ok(Value::Nil)
     }
 }
 
