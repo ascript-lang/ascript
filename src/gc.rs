@@ -601,6 +601,7 @@ mod tests {
             methods: IndexMap::new(),
             static_methods: IndexMap::new(),
             def_env: crate::env::Environment::global(),
+            is_worker: false,
         });
         let mut held_inst = Vec::with_capacity(N);
         for _ in 0..N {

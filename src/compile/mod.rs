@@ -1720,6 +1720,9 @@ impl Compiler {
             methods: indexmap::IndexMap::new(),
             static_methods: indexmap::IndexMap::new(),
             def_env: crate::interp::global_env(),
+            // Workers Spec B: carry the `worker class` flag onto the prebuilt
+            // template so `Op::Class` (VM) materializes a `worker`-tagged class.
+            is_worker: crate::syntax::resolve::is_worker_class(class_decl.syntax()),
         });
 
         // For an `extends` clause, emit the SUPERCLASS class-value FIRST (so it

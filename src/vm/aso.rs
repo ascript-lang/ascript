@@ -99,7 +99,10 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   enclosing class name for `static worker fn` methods. Required so the VM
 ///   can route higher-order worker dispatch to
 ///   `build_code_slice_for_static_method` instead of `build_code_slice`.
-pub const ASO_FORMAT_VERSION: u32 = 17;
+/// - 18: the class template gained a `worker class` flag byte (Workers Spec B,
+///   `Class.is_worker`), written by `write_class` before the field list. Drives
+///   `ClassName.spawn(args)` actor routing on both engines.
+pub const ASO_FORMAT_VERSION: u32 = 18;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -1430,6 +1433,8 @@ fn write_class(
     // `methods` empty, and `def_env = global_env()` placeholder. Serialize only
     // the name + field schemas; the rest is rebuilt as the same inert template.
     w.str(&c.name);
+    // Workers Spec B: the `worker class` flag (v18). One byte before the field list.
+    w.u8(u8::from(c.is_worker));
     w.len(c.fields.len());
     for (fname, schema) in &c.fields {
         w.str(fname);
@@ -1477,6 +1482,7 @@ fn write_field_default(
 /// consults) — preserving `.aso` round-trip idempotence for these defaults.
 fn read_class(r: &mut Reader) -> Result<(Class, Vec<(String, String)>), AsoError> {
     let name = r.str()?;
+    let is_worker = r.u8()? != 0;
     let n = r.len()?;
     let mut fields = indexmap::IndexMap::with_capacity(n);
     let mut sources: Vec<(String, String)> = Vec::new();
@@ -1510,6 +1516,7 @@ fn read_class(r: &mut Reader) -> Result<(Class, Vec<(String, String)>), AsoError
         // class template; see C6.
         static_methods: indexmap::IndexMap::new(),
         def_env: crate::interp::global_env(),
+        is_worker,
     };
     Ok((class, sources))
 }

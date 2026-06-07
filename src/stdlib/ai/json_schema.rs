@@ -328,6 +328,7 @@ mod tests {
             methods: IndexMap::new(),
             static_methods: IndexMap::new(),
             def_env: crate::interp::global_env(),
+            is_worker: false,
         }
     }
 

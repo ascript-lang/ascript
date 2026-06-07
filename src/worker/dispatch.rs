@@ -212,6 +212,418 @@ pub fn build_code_slice(
     materialize_slice(top, &defs, entry_name, &entry_proto, class_name, false)
 }
 
+// ---------------------------------------------------------------------------
+// Workers Spec B — CLASS code slice (actor support).
+//
+// An actor needs the FULL class — superclass chain + method table + field
+// defaults — shipped into its dedicated isolate so the isolate can construct the
+// instance and run methods locally. `build_code_slice` ships only top-level `fn`s
+// and literal `const`s; this builds the analogous "module fragment" for a
+// `worker class`: it copies the class's `Op::Class` instruction group (the
+// contiguous `Op::Closure` run for default thunks + methods + statics, then
+// `Op::Class`, then `DEFINE_GLOBAL`), remapping the proto/const/class-proto
+// indices into the fragment, plus the transitive top-level fn/const dependency
+// closure of every method body, plus any superclass classes (recursively).
+//
+// SUPPORTED: a DIRECT-child top-level `worker class` whose methods reference only
+// globals (`GET_GLOBAL`) + their own params/`self` — i.e. no enclosing-frame
+// upvalue captures (the normal case for a top-level class). UNSUPPORTED cases
+// (a non-top-level worker class, or method/default closures that capture an
+// enclosing LOCAL via an upvalue) are reported as a recoverable `Control::Panic`
+// at slice-build time — never a wrong or silently-partial result.
+// ---------------------------------------------------------------------------
+
+/// One copied member of a class group, in stack order below `Op::Class`.
+enum GroupMember {
+    /// A superclass class-value push: `GET_GLOBAL <name>` for a top-level class.
+    SuperGlobal(Rc<str>),
+    /// A `CLOSURE proto_idx` (default thunk / method / static), carrying its proto.
+    Closure(Rc<FnProto>),
+}
+
+/// Locate the `Op::Class` instruction for `class_name` in `top` and decode its
+/// instruction group into ordered members. Returns the members (bottom-to-top of
+/// the stack: optional superclass push, then thunk/method/static closures) plus the
+/// `ClassProto`. Errors (recoverable panic) if the class is missing, is not a
+/// top-level DEFINE_GLOBAL, or its group contains an unsupported instruction
+/// (anything other than a contiguous run of `CLOSURE`/superclass `GET_GLOBAL`).
+fn locate_class_group(
+    top: &Chunk,
+    class_name: &str,
+) -> Result<(Vec<GroupMember>, Rc<crate::vm::chunk::ClassProto>), Control> {
+    // Walk the code, tracking the run of instructions since the last "break" op.
+    // A class group is a contiguous run of `CLOSURE` ops (and, for `extends`, a
+    // single leading superclass `GET_GLOBAL`) ending at `Op::Class`.
+    let mut run: Vec<(Op, u16)> = Vec::new();
+    let mut ip = 0usize;
+    while ip < top.code.len() {
+        let Some(op) = Op::from_u8(top.code[ip]) else {
+            break;
+        };
+        let width = op.operand_width();
+        let operand = if width >= 2 { top.read_u16(ip + 1) } else { 0 };
+        match op {
+            Op::Closure | Op::GetGlobal => run.push((op, operand)),
+            Op::Class => {
+                let cp = top
+                    .class_protos
+                    .get(operand as usize)
+                    .cloned()
+                    .ok_or_else(|| panic_build("class proto index out of range"))?;
+                if cp.class.name == class_name {
+                    return decode_class_group(top, &run, cp);
+                }
+                run.clear();
+            }
+            _ => run.clear(),
+        }
+        ip += 1 + width;
+    }
+    Err(panic_build(&format!(
+        "worker class '{class_name}' is not a top-level class in this program"
+    )))
+}
+
+/// Decode a class group's preceding instruction `run` into ordered [`GroupMember`]s.
+fn decode_class_group(
+    top: &Chunk,
+    run: &[(Op, u16)],
+    cp: Rc<crate::vm::chunk::ClassProto>,
+) -> Result<(Vec<GroupMember>, Rc<crate::vm::chunk::ClassProto>), Control> {
+    let n_closures = cp.default_fields.len() + cp.method_names.len() + cp.static_method_names.len();
+    // The group's instructions, in stack-push order, are the LAST `expected` ops of
+    // `run` (a top-level `fn`'s `CLOSURE; DEFINE_GLOBAL` breaks the run, so the run
+    // ends exactly at this class group). For `extends` a leading superclass push
+    // (`GET_GLOBAL`) precedes the closure run.
+    let expected = n_closures + usize::from(cp.has_super);
+    if run.len() < expected {
+        return Err(panic_build(
+            "worker class group is malformed (too few preceding instructions)",
+        ));
+    }
+    let group = &run[run.len() - expected..];
+    let mut members = Vec::with_capacity(expected);
+    let mut idx = 0;
+    if cp.has_super {
+        let (op, operand) = group[0];
+        if op != Op::GetGlobal {
+            return Err(panic_build(
+                "worker class with `extends` must reference a top-level superclass \
+                 (a non-global superclass is not yet shippable to an actor isolate)",
+            ));
+        }
+        let name = class_name_from_const(top, operand)?;
+        members.push(GroupMember::SuperGlobal(name));
+        idx = 1;
+    }
+    for (op, operand) in &group[idx..] {
+        if *op != Op::Closure {
+            return Err(panic_build(
+                "worker class methods/defaults must not capture an enclosing local \
+                 (only top-level worker classes are shippable to an actor isolate)",
+            ));
+        }
+        let proto = top
+            .protos
+            .get(*operand as usize)
+            .cloned()
+            .ok_or_else(|| panic_build("class member proto index out of range"))?;
+        // A method/default closure that captures an enclosing variable via an upvalue
+        // cannot be shipped — the upvalue would dangle in the fresh isolate. Top-level
+        // class members reference only globals (`GET_GLOBAL`) + their own params/`self`,
+        // so their protos have NO upvalues. A non-empty `upvalues` means the class is
+        // nested inside another function scope (unsupported for actor spawning).
+        if !proto.chunk.upvalues.is_empty() {
+            return Err(panic_build(
+                "worker class member captures an enclosing local — only top-level \
+                 worker classes (whose members reference globals only) can be spawned",
+            ));
+        }
+        members.push(GroupMember::Closure(proto));
+    }
+    Ok((members, cp))
+}
+
+fn class_name_from_const(top: &Chunk, operand: u16) -> Result<Rc<str>, Control> {
+    match top.consts.get(operand as usize) {
+        Some(Value::Str(s)) => Ok(s.clone()),
+        _ => Err(panic_build("superclass GET_GLOBAL has no name constant")),
+    }
+}
+
+fn panic_build(msg: &str) -> Control {
+    Control::Panic(crate::error::AsError::new(msg.to_string()))
+}
+
+/// Build the shippable [`WorkerCodeSlice`] for a `worker class` named `class_name`.
+/// The fragment, when loaded on a fresh isolate `Vm`, defines: every superclass
+/// (recursively), the transitive top-level fn/const deps of all method bodies, and
+/// the class itself (as a top-level `DEFINE_GLOBAL <class_name>`). The actor then
+/// constructs the instance by looking up the class global and calling its `init`.
+///
+/// `fn_id`/`entry_name` are set to the class name (the actor's `ActorMsg::Init`
+/// fetches the class global by `entry_name`).
+pub fn build_class_slice(top: &Chunk, class_name: &str) -> Result<WorkerCodeSlice, Control> {
+    let defs = top_level_defs(top);
+
+    let mut frag = Chunk::new();
+    frag.name = Some("<worker-class-slice>".to_string());
+    let span = Span::new(0, 0);
+
+    // Emit each class (superclasses first, then the target) and collect the union of
+    // their method bodies' GET_GLOBAL references for the fn/const dep closure.
+    let mut emitted_classes: HashSet<String> = HashSet::new();
+    let mut method_refs: Vec<Rc<str>> = Vec::new();
+    emit_class_recursive(
+        top,
+        class_name,
+        &mut frag,
+        &mut emitted_classes,
+        &mut method_refs,
+        span,
+    )?;
+
+    // Compute the transitive top-level fn/const dependency closure of the collected
+    // method references (same fixpoint as `materialize_slice`), and emit those defs
+    // BEFORE the classes would need them. They are late-bound `GET_GLOBAL`s, so
+    // emission order between deps and classes does not matter for correctness, but
+    // we emit deps first for readability.
+    let mut frag_deps = Chunk::new();
+    frag_deps.name = Some("<worker-class-deps>".to_string());
+    emit_dep_closure(top, &defs, &method_refs, &mut frag_deps, span)?;
+
+    // Splice: top-level imports first (so a method's `GET_GLOBAL` of an imported name
+    // resolves), then fn/const deps, then classes. Rebuild one fragment in order.
+    let mut whole = Chunk::new();
+    whole.name = Some("<worker-class-slice>".to_string());
+    emit_top_imports(top, &mut whole, span);
+    append_chunk_defs(&mut whole, &frag_deps);
+    append_chunk_defs(&mut whole, &frag);
+    whole.emit(Op::Nil, span);
+    whole.emit(Op::Return, span);
+
+    if let Some(limit) = whole.take_overflow() {
+        let ce = limit.into_compile_error();
+        return Err(Control::Panic(crate::error::AsError::at(ce.message, ce.span)));
+    }
+
+    let bytes = whole.to_bytes().map_err(|e| {
+        Control::Panic(crate::error::AsError::new(format!(
+            "worker class slice could not be serialized: {e:?}"
+        )))
+    })?;
+
+    Ok(WorkerCodeSlice {
+        fn_id: entry_fn_id(class_name, None),
+        entry_aso: Rc::from(bytes.into_boxed_slice()),
+        class_name: Some(Rc::from(class_name)),
+        entry_name: Rc::from(class_name),
+    })
+}
+
+/// Like [`build_class_slice`] but recompiling from the program source retained on
+/// the [`crate::interp::Interp`] (the SINGLE slice path shared by both engines — the
+/// tree-walker has no compiled chunk of its own). Mirrors
+/// [`build_code_slice_from_source`].
+pub fn build_class_slice_from_source(
+    interp: &crate::interp::Interp,
+    class_name: &str,
+) -> Result<WorkerCodeSlice, Control> {
+    let src = interp.worker_source().ok_or_else(|| {
+        Control::Panic(crate::error::AsError::new(format!(
+            "cannot spawn worker class '{class_name}': the program source is \
+             unavailable (worker classes require running via `ascript run`)"
+        )))
+    })?;
+    let top = crate::compile::compile_source(&src)
+        .map_err(|e| Control::Panic(crate::error::AsError::at(e.message, e.span)))?;
+    build_class_slice(&top, class_name)
+}
+
+/// Emit `class_name`'s definition into `frag`, recursively emitting any superclass
+/// first. Accumulates the union of all method/default GET_GLOBAL references into
+/// `method_refs`. `emitted` de-dups classes (a diamond superclass is emitted once).
+fn emit_class_recursive(
+    top: &Chunk,
+    class_name: &str,
+    frag: &mut Chunk,
+    emitted: &mut HashSet<String>,
+    method_refs: &mut Vec<Rc<str>>,
+    span: Span,
+) -> Result<(), Control> {
+    if !emitted.insert(class_name.to_string()) {
+        return Ok(());
+    }
+    let (members, cp) = locate_class_group(top, class_name)?;
+
+    // Emit any superclass FIRST (so its global is defined before this class's
+    // `Op::Class` pops it). Also collect its members' refs.
+    for m in &members {
+        if let GroupMember::SuperGlobal(sup) = m {
+            emit_class_recursive(top, sup, frag, emitted, method_refs, span)?;
+        }
+    }
+
+    // Re-emit the group into the fragment: superclass push (GET_GLOBAL) + each
+    // CLOSURE (proto copied into the fragment) + Op::Class (class proto copied) +
+    // DEFINE_GLOBAL <class_name>.
+    for m in &members {
+        match m {
+            GroupMember::SuperGlobal(sup) => {
+                let name_idx = frag.add_const(Value::Str(sup.clone()));
+                frag.emit_u16(Op::GetGlobal, name_idx, span);
+            }
+            GroupMember::Closure(proto) => {
+                // Collect this member's transitive top-level refs for the dep closure.
+                collect_get_global_names(&proto.chunk, method_refs);
+                let proto_idx = frag.add_proto(proto.clone());
+                frag.emit_u16(Op::Closure, proto_idx, span);
+            }
+        }
+    }
+    let cp_idx = frag.add_class_proto(cp);
+    frag.emit_u16(Op::Class, cp_idx, span);
+    let name_idx = frag.add_const(Value::Str(Rc::from(class_name)));
+    frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
+    Ok(())
+}
+
+/// Re-emit every top-level `Op::Import` into `frag`. A `worker class` method may
+/// reference an imported binding (e.g. `import { open } from "std/sqlite"`); the
+/// import statement is NOT a fn/const dep (so the closure misses it) and is left
+/// late-bound. Shipping all top-level imports makes those names resolve on the
+/// isolate (std imports are side-effect-free; a file import re-runs its module on the
+/// isolate, the shared-nothing analog of a fresh process).
+fn emit_top_imports(top: &Chunk, frag: &mut Chunk, span: Span) {
+    let mut ip = 0usize;
+    while ip < top.code.len() {
+        let Some(op) = Op::from_u8(top.code[ip]) else {
+            break;
+        };
+        let width = op.operand_width();
+        if op == Op::Import {
+            let idx = top.read_u16(ip + 1) as usize;
+            if let Some(desc) = top.imports.get(idx) {
+                let new_idx = frag.add_import(desc.clone());
+                frag.emit_u16(Op::Import, new_idx, span);
+            }
+        }
+        ip += 1 + width;
+    }
+}
+
+/// Emit the transitive top-level fn/const dependency closure of `roots` into `frag`
+/// (same fixpoint + source-order emit as `materialize_slice`, minus the entry).
+fn emit_dep_closure(
+    top: &Chunk,
+    defs: &HashMap<Rc<str>, TopDef>,
+    roots: &[Rc<str>],
+    frag: &mut Chunk,
+    span: Span,
+) -> Result<(), Control> {
+    let mut seen: HashSet<Rc<str>> = HashSet::new();
+    let mut included: HashSet<Rc<str>> = HashSet::new();
+    let mut work: Vec<Rc<str>> = roots.to_vec();
+    while let Some(name) = work.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        included.insert(name.clone());
+        if let Some(TopDef::Fn(proto)) = defs.get(name.as_ref()) {
+            let mut refs = Vec::new();
+            collect_get_global_names(&proto.chunk, &mut refs);
+            for r in refs {
+                if !seen.contains(&r) {
+                    work.push(r);
+                }
+            }
+        }
+    }
+    // Emit in original source (DEFINE_GLOBAL) order.
+    let mut ip = 0usize;
+    while ip < top.code.len() {
+        let Some(op) = Op::from_u8(top.code[ip]) else {
+            break;
+        };
+        let width = op.operand_width();
+        if op == Op::DefineGlobal {
+            let idx = top.read_u16(ip + 1) as usize;
+            if let Some(Value::Str(name)) = top.consts.get(idx) {
+                if included.contains(name) && defs.contains_key(name.as_ref()) {
+                    match defs.get(name.as_ref()).expect("included ⊆ defs") {
+                        TopDef::Const(v) => emit_const_load(frag, v.clone(), span),
+                        TopDef::Fn(proto) => {
+                            let proto_idx = frag.add_proto(proto.clone());
+                            frag.emit_u16(Op::Closure, proto_idx, span);
+                        }
+                    }
+                    let name_idx = frag.add_const(Value::Str(name.clone()));
+                    frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
+                }
+            }
+        }
+        ip += 1 + width;
+    }
+    Ok(())
+}
+
+/// Append `src`'s definition instructions (everything before its trailing
+/// `Nil; Return`, if any) into `dst`, remapping const/proto/class-proto indices.
+/// Used to splice the dep fragment and the class fragment into one ordered chunk.
+fn append_chunk_defs(dst: &mut Chunk, src: &Chunk) {
+    // Map src indices → dst indices as we copy referenced pool entries.
+    let mut ip = 0usize;
+    let span = Span::new(0, 0);
+    while ip < src.code.len() {
+        let Some(op) = Op::from_u8(src.code[ip]) else {
+            break;
+        };
+        let width = op.operand_width();
+        match op {
+            Op::Nil if ip + 1 < src.code.len() && Op::from_u8(src.code[ip + 1]) == Some(Op::Return) => {
+                // The trailing `Nil; Return` terminator — skip it (dst adds its own).
+                break;
+            }
+            Op::Const => {
+                let v = src.consts[src.read_u16(ip + 1) as usize].clone();
+                let idx = dst.add_const(v);
+                dst.emit_u16(Op::Const, idx, span);
+            }
+            Op::Closure => {
+                let p = src.protos[src.read_u16(ip + 1) as usize].clone();
+                let idx = dst.add_proto(p);
+                dst.emit_u16(Op::Closure, idx, span);
+            }
+            Op::Class => {
+                let cp = src.class_protos[src.read_u16(ip + 1) as usize].clone();
+                let idx = dst.add_class_proto(cp);
+                dst.emit_u16(Op::Class, idx, span);
+            }
+            Op::GetGlobal => {
+                let v = src.consts[src.read_u16(ip + 1) as usize].clone();
+                let idx = dst.add_const(v);
+                dst.emit_u16(Op::GetGlobal, idx, span);
+            }
+            Op::DefineGlobal => {
+                let v = src.consts[src.read_u16(ip + 1) as usize].clone();
+                let idx = dst.add_const(v);
+                let mutable = src.code[ip + 3];
+                dst.emit_u16_u8(Op::DefineGlobal, idx, mutable, span);
+            }
+            Op::Nil => dst.emit(Op::Nil, span),
+            Op::True => dst.emit(Op::True, span),
+            Op::False => dst.emit(Op::False, span),
+            other => {
+                // Defensive: the dep/class fragments only ever emit the ops handled
+                // above. Anything else is a builder bug — skip it (it would only
+                // appear if a future change emits a new op into these fragments).
+                debug_assert!(false, "append_chunk_defs: unexpected op {other:?}");
+            }
+        }
+        ip += 1 + width;
+    }
+}
+
 /// Build a [`WorkerCodeSlice`] for a `static worker fn` (Spec A): the entry is a
 /// static METHOD body (no `self`; it may reference top-level fns/consts + its own
 /// params), located in the compiled program by `(class_name, method_name)`. The

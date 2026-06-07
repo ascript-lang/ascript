@@ -2716,6 +2716,7 @@ impl Vm {
                         // table (SP1 §3, C5).
                         static_methods: indexmap::IndexMap::new(),
                         def_env: def_env.clone(),
+                        is_worker: cp.class.is_worker,
                     });
                     // Register the class into the shared env so a sibling/forward
                     // nested-class field type (or a default-expr name) resolves at
@@ -2911,6 +2912,28 @@ impl Vm {
     /// surfaces arity/contract panics byte-identically. The return-type contract is
     /// enforced by `Op::Return` against the frame's `ret_span` (the call span),
     /// exactly as for an in-VM call.
+    /// Workers Spec B §Task 5 (actor isolate side): call the method `name` on a VM
+    /// instance `receiver` with `args`, resolving the method through the VM's
+    /// per-class method side table (`vm_read_member` → `BoundMethod`) and driving any
+    /// returned `Value::Future` (an `async` method) to its value. Used by the actor
+    /// mailbox loop, which runs on the isolate's own `Vm` — `Interp::read_member`
+    /// cannot be used because a VM-built class keeps its methods in the side table,
+    /// not in `Class.methods`.
+    pub async fn call_method_named(
+        &self,
+        receiver: Value,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let bound = self.vm_read_member(&receiver, name, span)?;
+        let r = self.call_value(bound, args, span).await?;
+        match r {
+            Value::Future(f) => f.get().await,
+            other => Ok(other),
+        }
+    }
+
     #[async_recursion::async_recursion(?Send)]
     pub async fn call_value(
         &self,
@@ -3291,6 +3314,27 @@ impl Vm {
             let v = self.interp.call_workflow_ctx(name, &wargs, span).await?;
             fiber.push(v);
             return Ok(());
+        }
+        // (1a') Workers Spec B §Task 5: `WorkerClass.spawn(args)` → spawn an actor
+        // isolate, return `future<handle>`. Mirrors the tree-walker `eval_chain` hook
+        // exactly (same `Interp::spawn_actor`), so the VM matches byte-for-byte. A
+        // bare `WorkerClass(args)` construction is UNCHANGED (handled by `Op::Call`).
+        if let Value::Class(class) = &recv {
+            if class.is_worker && name == "spawn" {
+                let v = self.interp.spawn_actor(class, args, span).await?;
+                fiber.push(v);
+                return Ok(());
+            }
+        }
+        // (1a'') Actor-handle async method dispatch: a member-CALL on a
+        // `Value::Native(WorkerActor)` sends an `ActorMsg::Call` (or `close()`) and
+        // returns `future<T>`. Same `Interp::actor_handle_call` as the tree-walker.
+        if let Value::Native(n) = &recv {
+            if n.kind == crate::value::NativeKind::WorkerActor {
+                let v = self.interp.actor_handle_call(n, name, args, span).await?;
+                fiber.push(v);
+                return Ok(());
+            }
         }
         // (1b) STATIC method call `C.name(args)` (SP1 §3): the receiver is a VM
         // class whose `name` resolves (up the chain) to a compiled STATIC closure.

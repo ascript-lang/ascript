@@ -710,6 +710,7 @@ fn resolve_class(_interp: &Interp, name: &str) -> std::rc::Rc<crate::value::Clas
         methods: indexmap::IndexMap::new(),
         static_methods: indexmap::IndexMap::new(),
         def_env: crate::interp::global_env(),
+        is_worker: false,
     })
 }
 
@@ -868,6 +869,7 @@ mod tests {
             methods: IndexMap::new(),
             static_methods: IndexMap::new(),
             def_env: crate::interp::global_env(),
+            is_worker: false,
         });
         let mut fields = IndexMap::new();
         fields.insert("x".to_string(), num(1.0));

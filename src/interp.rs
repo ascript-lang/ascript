@@ -328,6 +328,16 @@ pub(crate) enum ResourceState {
     // the `ResourceState` enum compact. Feature `ai`.
     #[cfg(feature = "ai")]
     AiStream(Box<crate::stdlib::ai::AiStreamState>),
+    /// Workers Spec B §Task 5: a `worker class` ACTOR proxy. Holds the outbound
+    /// `Send` mailbox sender + the dedicated `IsolateHandle` (whose `Drop` tears the
+    /// isolate down) + the declared class name. The actor instance + any native
+    /// resources it opens live IN the isolate, never here. Boxed for
+    /// `large_enum_variant`.
+    ///
+    /// GC INVARIANT: this is a native handle holding `Send` channels + a thread
+    /// handle — NOT script `Value`s. The GC must NEVER trace into it. `Value::Native`
+    /// already traces as a no-op (`gc.rs`'s `_ => {}` arm), so the invariant holds.
+    WorkerActor(Box<crate::worker::actor::WorkerActorHandle>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -1841,6 +1851,183 @@ impl Interp {
         self.resources.borrow_mut().remove(&id)
     }
 
+    // -----------------------------------------------------------------------
+    // Workers Spec B §Task 5: actor host (`ClassName.spawn`, handle dispatch).
+    // Shared by BOTH engines (the tree-walker `eval_chain` hook and the VM
+    // `Op::Call*` hook call these, so actor behavior is byte-identical).
+    // -----------------------------------------------------------------------
+
+    /// `WorkerClass.spawn(args)` → spawn a dedicated actor isolate, ship the class
+    /// code slice + init args, register a `ResourceState::WorkerActor`, and return a
+    /// `future<Value::Native(WorkerActor)>` (spawning is async — the future resolves
+    /// once the isolate has constructed the instance via `init`).
+    ///
+    /// `!Send` integrity: the isolate builds its OWN `Interp`/`Vm`; only `Send` bytes
+    /// (the encoded args + class slice) and `Send` channels cross. The proxy stays on
+    /// this thread.
+    pub(crate) async fn spawn_actor(
+        &self,
+        class: &Rc<crate::value::Class>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // Sendability gate on the init args (field-path panic on failure).
+        for a in &args {
+            crate::worker::serialize::check_sendable(a)
+                .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+        }
+        // Build the class code slice (superclass chain + methods + defaults) from the
+        // program source — the SINGLE path shared by both engines.
+        let slice = crate::worker::build_class_slice_from_source(self, &class.name)?;
+        // Encode the init args as one array (preserving cross-arg sharing).
+        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let encoded = crate::worker::serialize::encode(&args_array)
+            .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+
+        // Spawn the dedicated actor isolate + its mailbox.
+        let (tx, isolate) = crate::worker::actor::spawn_actor_isolate().map_err(|e| {
+            Control::Panic(AsError::at(
+                format!("could not spawn actor isolate: {e}"),
+                span,
+            ))
+        })?;
+
+        // Send the Init message; await the ack on a future.
+        let (init_reply_tx, init_reply_rx) =
+            tokio::sync::oneshot::channel::<crate::worker::actor::ActorReply>();
+        let init_msg = crate::worker::actor::ActorMsg::Init {
+            class_name: class.name.clone(),
+            slice_bytes: slice.entry_aso.to_vec(),
+            args: encoded,
+            reply: init_reply_tx,
+        };
+        if tx.send(init_msg).is_err() {
+            return Err(Control::Panic(AsError::at(
+                "actor isolate terminated before initialization".to_string(),
+                span,
+            )));
+        }
+
+        // Register the handle as a native resource (its Drop tears the isolate down).
+        let mut fields = indexmap::IndexMap::new();
+        fields.insert("name".to_string(), Value::Str(class.name.clone().into()));
+        let handle = crate::worker::actor::WorkerActorHandle::new(
+            tx,
+            isolate,
+            Rc::from(class.name.as_str()),
+        );
+        let native = self.register_resource(
+            crate::value::NativeKind::WorkerActor,
+            fields,
+            ResourceState::WorkerActor(Box::new(handle)),
+        );
+
+        // The future resolves to the native handle once Init acks. We must keep the
+        // native handle alive across the await (it owns the isolate) — so move a clone
+        // into the bridge task and resolve with it.
+        let fut = crate::task::SharedFuture::new();
+        let cell = fut.cell();
+        let native_for_task = native.clone();
+        let bridge = tokio::task::spawn_local(async move {
+            let result = match init_reply_rx.await {
+                Ok(crate::worker::actor::ActorReply::Ok(_)) => Ok(native_for_task),
+                Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
+                    Err(Control::Panic(AsError::at(msg, span)))
+                }
+                Err(_) => Err(Control::Panic(AsError::at(
+                    "actor isolate terminated during initialization".to_string(),
+                    span,
+                ))),
+            };
+            cell.resolve(result);
+        });
+        fut.set_abort(bridge.abort_handle());
+        Ok(Value::Future(fut))
+    }
+
+    /// An async method call on an actor handle (`await handle.method(args)`), OR the
+    /// synchronous `handle.close()` teardown. For a method: `check_sendable` the args,
+    /// send an `ActorMsg::Call`, and return a `future<T>` awaiting the oneshot reply +
+    /// decode. TAKE-OUT-ACROSS-AWAIT: the `Send` sender is cloned OUT of the resources
+    /// table BEFORE the future awaits; no `resources` borrow is held across `.await`.
+    pub(crate) async fn actor_handle_call(
+        &self,
+        native: &Rc<crate::value::NativeObject>,
+        method: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // `close()` is a host-side teardown: take the resource out (dropping the
+        // handle → dropping the IsolateHandle → channel close + thread join).
+        if method == "close" {
+            self.take_resource(native.id);
+            return Ok(Value::Nil);
+        }
+
+        // Sendability gate on the args (field-path panic).
+        for a in &args {
+            crate::worker::serialize::check_sendable(a)
+                .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+        }
+        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let encoded = crate::worker::serialize::encode(&args_array)
+            .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+
+        // TAKE-OUT-ACROSS-AWAIT: clone the Send sender out under a SHORT borrow, then
+        // drop the borrow before building/awaiting the future.
+        let tx = {
+            let table = self.resources.borrow();
+            match table.get(&native.id) {
+                Some(ResourceState::WorkerActor(h)) => h.tx.clone(),
+                _ => {
+                    // The actor was closed (resource removed) → recoverable panic.
+                    return Err(Control::Panic(AsError::at(
+                        "actor is closed".to_string(),
+                        span,
+                    )));
+                }
+            }
+        };
+
+        let (reply_tx, reply_rx) =
+            tokio::sync::oneshot::channel::<crate::worker::actor::ActorReply>();
+        let call_msg = crate::worker::actor::ActorMsg::Call {
+            method: method.to_string(),
+            args: encoded,
+            reply: reply_tx,
+        };
+        if tx.send(call_msg).is_err() {
+            return Err(Control::Panic(AsError::at(
+                "actor is closed".to_string(),
+                span,
+            )));
+        }
+
+        // Bridge: await the reply, decode against THIS interp, resolve the future.
+        let interp_rc = self.rc();
+        let fut = crate::task::SharedFuture::new();
+        let cell = fut.cell();
+        let bridge = tokio::task::spawn_local(async move {
+            let result = match reply_rx.await {
+                Ok(crate::worker::actor::ActorReply::Ok(bytes)) => {
+                    crate::worker::serialize::decode(&bytes, &interp_rc)
+                        .map_err(|e| Control::Panic(e.into()))
+                }
+                Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
+                    Err(Control::Panic(AsError::at(msg, span)))
+                }
+                // The reply sender dropped without replying → the actor was closed.
+                Err(_) => Err(Control::Panic(AsError::at(
+                    "actor is closed".to_string(),
+                    span,
+                ))),
+            };
+            cell.resolve(result);
+        });
+        fut.set_abort(bridge.abort_handle());
+        Ok(Value::Future(fut))
+    }
+
     /// Run `f` with a shared borrow of the resource for `id` (handle methods that
     /// only inspect state, e.g. `conn.query` re-resolving a statement). The closure
     /// must NOT `.await` — the borrow is held for its duration.
@@ -2465,6 +2652,7 @@ impl Interp {
                 superclass,
                 fields,
                 methods,
+                is_worker,
                 ..
             } => {
                 let parent = match superclass {
@@ -2542,6 +2730,7 @@ impl Interp {
                     methods: method_map,
                     static_methods: static_method_map,
                     def_env: env.clone(),
+                    is_worker: *is_worker,
                 }));
                 env.define(name, class, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -3166,6 +3355,32 @@ impl Interp {
                             self.call_workflow_ctx(name, &wargs, expr.span).await?,
                             false,
                         ));
+                    }
+                    // Workers Spec B §Task 5: `WorkerClass.spawn(args)` → spawn an
+                    // actor isolate, return `future<handle>`. SAME call-site-hook
+                    // style as schema/ctx: receiver first, then args. A bare
+                    // `WorkerClass(args)` (construction) is UNCHANGED — only the
+                    // `.spawn` member-call on a `worker class` is intercepted.
+                    if let Value::Class(c) = &recv {
+                        if c.is_worker && name == "spawn" {
+                            let values = self.eval_call_args(args, env).await?;
+                            return Ok((self.spawn_actor(c, values, expr.span).await?, false));
+                        }
+                    }
+                    // Actor-handle async method dispatch: a member-CALL on a
+                    // `Value::Native(WorkerActor)` sends an `ActorMsg::Call` and
+                    // returns `future<T>`. Intercept here (call-position) so the
+                    // fallback member-read does not see a missing method.
+                    if let Value::Native(n) = &recv {
+                        if n.kind == crate::value::NativeKind::WorkerActor {
+                            // `close` is a host-side teardown method (synchronous),
+                            // everything else is an async actor message.
+                            let values = self.eval_call_args(args, env).await?;
+                            return Ok((
+                                self.actor_handle_call(n, name, values, expr.span).await?,
+                                false,
+                            ));
+                        }
                     }
                     // Fallback — byte-for-byte with the prior
                     // `eval_chain(callee) → eval_args → call_value` path: read
