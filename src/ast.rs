@@ -304,6 +304,7 @@ pub enum Stmt {
         body: Vec<Stmt>,
         is_async: bool,
         is_generator: bool,
+        is_worker: bool,
         span: Span,
         name_span: Span,
     },
@@ -352,6 +353,8 @@ pub struct MethodDecl {
     pub body: Vec<Stmt>,
     pub is_async: bool,
     pub is_generator: bool,
+    /// `worker fn` / `static worker fn` — Spec A: dispatched to a pooled isolate, returns future<T>.
+    pub is_worker: bool,
     /// `static fn` / `static async fn` / `static fn*` — a class-level method with
     /// no `self`, called as `C.name(args)` (SP1 Phase C).
     pub is_static: bool,

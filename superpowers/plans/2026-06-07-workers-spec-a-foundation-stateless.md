@@ -83,7 +83,7 @@
 - Modify: `src/parser.rs` (`statement` @76, `export_decl` @178, `fn_decl` @218, class-member loop @350)
 - Test: `src/parser.rs` `#[cfg(test)]` (near `parses_async_fn_decl` @2118)
 
-- [ ] **Step 1: Write the failing test** — add to `src/parser.rs` test module:
+- [x] **Step 1: Write the failing test** — add to `src/parser.rs` test module:
 
 ```rust
 #[test]
@@ -119,13 +119,13 @@ fn parses_static_worker_method() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
   Run: `cargo test parses_worker_fn_decl worker_is_contextual parses_static_worker -- --nocapture`
   Expected: FAIL — `no field is_worker on Stmt::Fn` / `MethodDecl` (compile error).
 
-- [ ] **Step 3: Add the AST fields.** In `src/ast.rs`, add `is_worker: bool,` to `Stmt::Fn` (after `is_generator,` @306) and `pub is_worker: bool,` to `MethodDecl` (after `pub is_generator: bool,` @354). Add a doc line on `MethodDecl::is_worker`: `/// `worker fn` / `static worker fn` — Spec A: dispatched to a pooled isolate, returns future<T>.`
+- [x] **Step 3: Add the AST fields.** In `src/ast.rs`, add `is_worker: bool,` to `Stmt::Fn` (after `is_generator,` @306) and `pub is_worker: bool,` to `MethodDecl` (after `pub is_generator: bool,` @354). Add a doc line on `MethodDecl::is_worker`: `/// `worker fn` / `static worker fn` — Spec A: dispatched to a pooled isolate, returns future<T>.`
 
-- [ ] **Step 4: Thread it through the legacy parser.** In `src/parser.rs`:
+- [x] **Step 4: Thread it through the legacy parser.** In `src/parser.rs`:
   - Change `fn fn_decl(&mut self, is_async: bool)` → `fn fn_decl(&mut self, is_async: bool, is_worker: bool)` (@218); set `is_worker,` in the returned `Stmt::Fn` (@248).
   - In `statement` (@85–91): keep `Tok::Fn => self.fn_decl(false, false)`; keep the `async fn` arm calling `self.fn_decl(true, false)`. Add BEFORE the `Tok::Fn` arm a contextual `worker` arm:
     ```rust
@@ -146,13 +146,13 @@ fn parses_static_worker_method() {
     ```
     Also widen the member-start guard so a bare `worker fn` (no `static`) is recognized as a method: change the `if *self.peek() == Tok::Async || *self.peek() == Tok::Fn || is_static_method` condition to also accept a leading contextual `worker` followed by `fn`/`async`. Set `is_worker,` in the pushed `MethodDecl` (@403 region).
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
   Run: `cargo test parses_worker_fn_decl worker_is_contextual parses_static_worker`
   Expected: PASS.
 
-- [ ] **Step 6: Fix the exhaustiveness fallout.** Building now fails wherever `Stmt::Fn`/`MethodDecl` are constructed or destructured (fmt, interp, value lowering, syntax/resolve, tree_builder, tests). For each `Stmt::Fn { … }` / `MethodDecl { … }` construction in non-Task-1 files, set `is_worker: false` for now (later tasks turn the flag on at the real sites). For destructures using `..`, no change. Run `cargo build` and resolve each error minimally. Commit only after `cargo build` is clean.
+- [x] **Step 6: Fix the exhaustiveness fallout.** Building now fails wherever `Stmt::Fn`/`MethodDecl` are constructed or destructured (fmt, interp, value lowering, syntax/resolve, tree_builder, tests). For each `Stmt::Fn { … }` / `MethodDecl { … }` construction in non-Task-1 files, set `is_worker: false` for now (later tasks turn the flag on at the real sites). For destructures using `..`, no change. Run `cargo build` and resolve each error minimally. Commit only after `cargo build` is clean.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 ```bash
 git add src/ast.rs src/parser.rs
 git commit -m "feat(parser): is_worker flag on Stmt::Fn/MethodDecl; worker contextual keyword in legacy oracle front-end
