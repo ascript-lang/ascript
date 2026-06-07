@@ -1253,4 +1253,46 @@ mod tests {
         let once = format_source("worker fn f() { return 1 }").unwrap();
         assert_eq!(format_source(&once).unwrap(), once);
     }
+
+    // ---- Spec B Task 3: worker class + worker fn* (legacy AST formatter) ----
+
+    #[test]
+    fn formats_worker_class_canonical() {
+        // `worker` prefix is preserved and extra whitespace normalised.
+        assert_eq!(
+            format_source("worker  class  Db{fn f(){return 1}}").unwrap(),
+            "worker class Db {\n  fn f() {\n    return 1\n  }\n}\n"
+        );
+    }
+
+    #[test]
+    fn worker_class_fmt_is_idempotent() {
+        let once = format_source("worker  class  Db{fn f(){return 1}}").unwrap();
+        assert_eq!(format_source(&once).unwrap(), once, "worker class not idempotent");
+    }
+
+    #[test]
+    fn formats_worker_fn_star_canonical() {
+        // `worker fn*` — both modifiers preserved; `*` attaches to `fn`.
+        assert_eq!(
+            format_source("worker fn*  g(){yield 1}").unwrap(),
+            "worker fn* g() {\n  yield 1\n}\n"
+        );
+    }
+
+    #[test]
+    fn worker_fn_star_fmt_is_idempotent() {
+        let once = format_source("worker fn*  g(){yield 1}").unwrap();
+        assert_eq!(format_source(&once).unwrap(), once, "worker fn* not idempotent");
+    }
+
+    #[test]
+    fn formats_worker_method_in_worker_class() {
+        // A `worker class` body with a `worker fn` method inside — both modifiers.
+        let src = "worker class Db { worker fn  run(x){return x} }";
+        let out = format_source(src).unwrap();
+        assert!(out.starts_with("worker class Db {"), "missing 'worker class Db': {out}");
+        assert!(out.contains("worker fn run"), "missing 'worker fn run': {out}");
+        assert_eq!(format_source(&out).unwrap(), out, "not idempotent");
+    }
 }
