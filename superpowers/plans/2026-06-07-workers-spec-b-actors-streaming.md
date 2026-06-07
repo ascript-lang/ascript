@@ -54,18 +54,18 @@ Before starting, read the merged Plan A and pin these exact symbols (this plan a
 
 **Files:** `src/ast.rs`, `src/parser.rs`, `src/syntax/parser.rs`, `src/syntax/ast/ascript.ungram` (+ generated accessor), `src/syntax/resolve/mod.rs`, `src/compile/mod.rs`, `tests/frontend_conformance.rs`.
 
-- [ ] **Step 1: Failing parse test (both front-ends).** Add to `tests/frontend_conformance.rs` cases that BOTH the legacy parser and the CST parser accept:
+- [x] **Step 1: Failing parse test (both front-ends).** Add to `tests/frontend_conformance.rs` cases that BOTH the legacy parser and the CST parser accept:
   ```
   worker class Db { field conn; init(url) { self.conn = url } fn query(sql) { return sql } }
   worker fn* records(path) { yield path }
   ```
   Assert the legacy `Stmt::Class { is_worker: true, .. }` and the legacy `Stmt::Fn { is_worker: true, is_generator: true, .. }` (the fn-decl `is_worker` is Plan A's; this asserts it combines with `is_generator`). Assert the CST `ClassDecl` has a `WorkerKw` child and the `Stmt::Fn` parses without error. Run `cargo test --test frontend_conformance worker_class` → **expect FAIL** (legacy parser does not accept `worker class`; `Stmt::Class` has no `is_worker` field).
 
-- [ ] **Step 2: AST field.** In `src/ast.rs`, add `is_worker: bool` to `Stmt::Class { .. }` (next to `name`/`superclass`). Update every constructor/match of `Stmt::Class` across the codebase (compile errors will list them — `interp.rs`, `compile/mod.rs`, `parser.rs`, `fmt.rs` if any, `lsp`).
+- [x] **Step 2: AST field.** In `src/ast.rs`, add `is_worker: bool` to `Stmt::Class { .. }` (next to `name`/`superclass`). Update every constructor/match of `Stmt::Class` across the codebase (compile errors will list them — `interp.rs`, `compile/mod.rs`, `parser.rs`, `fmt.rs` if any, `lsp`).
 
-- [ ] **Step 3: Legacy parser.** In `src/parser.rs`, before `class_decl` is dispatched, accept an optional leading `worker` (Plan A's `WorkerKw`/contextual `Tok::Ident("worker")` check — reuse the exact predicate Plan A added for `worker fn`). Set `is_worker` on the produced `Stmt::Class`. (The `worker fn*` case is already covered — Plan A's `worker fn` path + the existing `*` generator flag combine; verify `fn_decl` reads `*` after `worker fn`.)
+- [x] **Step 3: Legacy parser.** In `src/parser.rs`, before `class_decl` is dispatched, accept an optional leading `worker` (Plan A's `WorkerKw`/contextual `Tok::Ident("worker")` check — reuse the exact predicate Plan A added for `worker fn`). Set `is_worker` on the produced `Stmt::Class`. (The `worker fn*` case is already covered — Plan A's `worker fn` path + the existing `*` generator flag combine; verify `fn_decl` reads `*` after `worker fn`.)
 
-- [ ] **Step 4: CST parser.** In `src/syntax/parser.rs` `class_decl` (line ~1264), if the cursor is at the `worker` contextual keyword, `p.bump_remap(WorkerKw)` before `p.bump(); // class` (mirror `at_static_method`/`bump_remap(StaticKw)`). Add `worker` to the ungrammar `ClassDecl` node (`src/syntax/ast/ascript.ungram`) so the generated typed accessor exposes the token. Add a resolver helper in `src/syntax/resolve/mod.rs` next to `is_static_method`:
+- [x] **Step 4: CST parser.** In `src/syntax/parser.rs` `class_decl` (line ~1264), if the cursor is at the `worker` contextual keyword, `p.bump_remap(WorkerKw)` before `p.bump(); // class` (mirror `at_static_method`/`bump_remap(StaticKw)`). Add `worker` to the ungrammar `ClassDecl` node (`src/syntax/ast/ascript.ungram`) so the generated typed accessor exposes the token. Add a resolver helper in `src/syntax/resolve/mod.rs` next to `is_static_method`:
   ```rust
   pub fn is_worker_class(node: &ResolvedNode) -> bool {
       node.children_with_tokens()
@@ -75,11 +75,12 @@ Before starting, read the merged Plan A and pin these exact symbols (this plan a
   }
   ```
 
-- [ ] **Step 5: Compiler reads the flag.** In `src/compile/mod.rs` `compile_class`, set `ClassProto.is_worker = crate::syntax::resolve::is_worker_class(class_decl.syntax())` (the proto field is added in Task 11; for now compile to `false`-default and wire after Task 11, OR add the bool field now and default it). Keep compilation otherwise identical (a `worker class` still compiles its method table — it must, so the code-slice can ship).
+- [x] **Step 5: Compiler reads the flag.** In `src/compile/mod.rs` `compile_class`, set `ClassProto.is_worker = crate::syntax::resolve::is_worker_class(class_decl.syntax())` (the proto field is added in Task 11; for now compile to `false`-default and wire after Task 11, OR add the bool field now and default it). Keep compilation otherwise identical (a `worker class` still compiles its method table — it must, so the code-slice can ship).
+  > **Note (Task 1 impl):** `ClassProto.is_worker` does not exist yet — that's Task 11. Per the plan's "for now compile to `false`-default", no change to `compile/mod.rs` was made; `is_worker_class()` is wired here and ready for Task 11 to call it.
 
-- [ ] **Step 6:** Run `cargo test --test frontend_conformance worker_class && cargo test --no-default-features --test frontend_conformance worker_class` → **expect PASS**.
+- [x] **Step 6:** Run `cargo test --test frontend_conformance worker_class && cargo test --no-default-features --test frontend_conformance worker_class` → **expect PASS**.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
   ```bash
   git add src/ast.rs src/parser.rs src/syntax/ tests/frontend_conformance.rs src/compile/mod.rs
   git commit -m "feat(workers): parse 'worker class' + 'worker fn*' in both front-ends (is_worker on class AST)

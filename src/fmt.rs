@@ -288,9 +288,13 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             superclass,
             fields,
             methods,
+            is_worker,
             ..
         } => {
             indent(out, level);
+            if *is_worker {
+                out.push_str("worker ");
+            }
             out.push_str("class ");
             out.push_str(name);
             if let Some(sup) = superclass {

@@ -45,6 +45,18 @@ pub fn is_worker_fn(node: &ResolvedNode) -> bool {
         .any(|t| t.kind() == SyntaxKind::WorkerKw)
 }
 
+/// Spec B: true if `node` is a `ClassDecl` declared with the contextual
+/// `worker` modifier (carries a direct `WorkerKw` child token).
+/// Used by the compiler (`compile_class`) and the checker to set the
+/// `is_worker` flag on the class proto.
+pub fn is_worker_class(node: &ResolvedNode) -> bool {
+    node.kind() == SyntaxKind::ClassDecl
+        && node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == SyntaxKind::WorkerKw)
+}
+
 fn is_expr(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(

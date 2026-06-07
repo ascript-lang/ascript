@@ -82,11 +82,15 @@ impl<'a> Parser<'a> {
             Tok::While => self.while_stmt(),
             Tok::For => self.for_stmt(),
             Tok::Return => self.return_stmt(),
-            // `worker fn` / `worker async fn` — contextual keyword like `async`.
-            Tok::Ident(s) if s == "worker" && matches!(self.peek_nth(1), Tok::Fn | Tok::Async) => {
+            // `worker fn` / `worker async fn` / `worker class` — contextual keyword like `async`.
+            Tok::Ident(s) if s == "worker" && matches!(self.peek_nth(1), Tok::Fn | Tok::Async | Tok::Class) => {
                 self.advance(); // consume contextual `worker`
-                let is_async = if *self.peek() == Tok::Async { self.advance(); true } else { false };
-                self.fn_decl(is_async, true)
+                if *self.peek() == Tok::Class {
+                    self.class_decl_inner(true)
+                } else {
+                    let is_async = if *self.peek() == Tok::Async { self.advance(); true } else { false };
+                    self.fn_decl(is_async, true)
+                }
             }
             Tok::Fn => self.fn_decl(false, false),
             // `async fn` is a declaration; `async (…) =>` / `async x =>` are
@@ -194,11 +198,15 @@ impl<'a> Parser<'a> {
                 }
                 self.fn_decl(true, false)?
             }
-            // `export worker fn` / `export worker async fn`
-            Tok::Ident(s) if s == "worker" && matches!(self.peek_nth(1), Tok::Fn | Tok::Async) => {
+            // `export worker fn` / `export worker async fn` / `export worker class`
+            Tok::Ident(s) if s == "worker" && matches!(self.peek_nth(1), Tok::Fn | Tok::Async | Tok::Class) => {
                 self.advance(); // consume contextual `worker`
-                let is_async = if *self.peek() == Tok::Async { self.advance(); true } else { false };
-                self.fn_decl(is_async, true)?
+                if *self.peek() == Tok::Class {
+                    self.class_decl_inner(true)?
+                } else {
+                    let is_async = if *self.peek() == Tok::Async { self.advance(); true } else { false };
+                    self.fn_decl(is_async, true)?
+                }
             }
             Tok::Class => self.class_decl()?,
             Tok::Enum => self.enum_decl()?,
@@ -324,6 +332,10 @@ impl<'a> Parser<'a> {
     }
 
     fn class_decl(&mut self) -> Result<Stmt, AsError> {
+        self.class_decl_inner(false)
+    }
+
+    fn class_decl_inner(&mut self, is_worker: bool) -> Result<Stmt, AsError> {
         let start = self.span().start;
         self.eat(&Tok::Class)?;
         let name_span = self.span();
@@ -486,6 +498,7 @@ impl<'a> Parser<'a> {
             superclass,
             fields,
             methods,
+            is_worker,
             span,
             name_span,
         })

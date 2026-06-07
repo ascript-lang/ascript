@@ -203,6 +203,8 @@ fn stmt(p: &mut Parser) {
         AsyncKw if is_async_fn(p) => fn_decl(p),
         // `worker fn` / `worker async fn` — contextual; `worker` is an Ident.
         Ident if at_worker_modifier(p) => fn_decl(p),
+        // `worker class C { … }` — Spec B actor class declaration.
+        Ident if at_worker_class(p) => class_decl(p),
         LBrace => {
             block(p);
         }
@@ -244,6 +246,18 @@ fn at_worker_modifier(p: &Parser) -> bool {
     matches!(
         p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
         Some(SyntaxKind::FnKw) | Some(SyntaxKind::AsyncKw)
+    )
+}
+
+/// True if the cursor is at a `worker class` declaration: an `Ident` whose text
+/// is `"worker"` immediately followed by the `class` keyword (Spec B actors).
+fn at_worker_class(p: &Parser) -> bool {
+    if !p.at_kw("worker") {
+        return false;
+    }
+    matches!(
+        p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
+        Some(SyntaxKind::ClassKw)
     )
 }
 
@@ -1284,6 +1298,12 @@ fn type_primary(p: &mut Parser) -> CompletedMarker {
 fn class_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
+    // `worker class C { … }` — remap the contextual `worker` identifier to WorkerKw
+    // before bumping the `class` keyword (mirrors how `worker fn` is handled in
+    // `fn_decl`).
+    if at_worker_class(p) {
+        p.bump_remap(WorkerKw);
+    }
     p.bump(); // class
     if p.at(Ident) {
         p.bump();

@@ -319,6 +319,9 @@ pub enum Stmt {
         superclass: Option<String>,
         fields: Vec<FieldDecl>,
         methods: Vec<MethodDecl>,
+        /// `worker class C { … }` — Spec B: a stateful actor class whose instances
+        /// are spawned into a dedicated isolate. The runtime side is wired in Task 5.
+        is_worker: bool,
         span: Span,
         name_span: Span,
     },

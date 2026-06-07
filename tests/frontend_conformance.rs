@@ -324,3 +324,89 @@ fn both_frontends_reject_bare_hash() {
     legacy_rejects("let x = # 5");
     cst_rejects("let x = # 5");
 }
+
+// ---- Spec B Task 1: `worker class` + `worker fn*` parsing -----------------
+
+/// Both front-ends accept `worker class C { … }` and produce a class AST node
+/// (legacy: `Stmt::Class { is_worker: true, .. }`; CST: `ClassDecl` with a
+/// `WorkerKw` child). The minimal worker class from the Spec B plan.
+#[test]
+fn both_frontends_accept_worker_class() {
+    let src = "worker class Db { fn query(sql) { return sql } }";
+    both_accept(src);
+
+    // Legacy: assert Stmt::Class { is_worker: true }
+    let toks = ascript::lexer::lex(src).unwrap();
+    let stmts = ascript::parser::parse(&toks).unwrap();
+    match &stmts[0] {
+        ascript::ast::Stmt::Class { name, is_worker, .. } => {
+            assert_eq!(name, "Db");
+            assert!(*is_worker, "expected is_worker=true for 'worker class Db'");
+        }
+        other => panic!("expected Stmt::Class, got {other:?}"),
+    }
+
+    // CST: assert ClassDecl has a WorkerKw child token
+    let tree = ascript::syntax::parse_to_tree(src);
+    let has_worker_kw = tree
+        .descendants_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == ascript::syntax::kind::SyntaxKind::WorkerKw);
+    assert!(has_worker_kw, "CST ClassDecl should have a WorkerKw token for 'worker class Db'");
+}
+
+/// Both front-ends accept the full worker class from the plan (field + init + method).
+#[test]
+fn both_frontends_accept_worker_class_with_field_init_method() {
+    both_accept(
+        "worker class Db { conn: any = nil fn init(url) { self.conn = url } fn query(sql) { return sql } }",
+    );
+}
+
+/// Both front-ends accept `worker fn* records(path) { yield path }` and the
+/// legacy parser sets both `is_worker=true` and `is_generator=true` on the fn.
+#[test]
+fn both_frontends_accept_worker_generator() {
+    let src = "worker fn* records(path) { yield path }";
+    both_accept(src);
+
+    // Legacy: assert Stmt::Fn { is_worker: true, is_generator: true }
+    let toks = ascript::lexer::lex(src).unwrap();
+    let stmts = ascript::parser::parse(&toks).unwrap();
+    match &stmts[0] {
+        ascript::ast::Stmt::Fn { name, is_worker, is_generator, .. } => {
+            assert_eq!(name, "records");
+            assert!(*is_worker, "expected is_worker=true");
+            assert!(*is_generator, "expected is_generator=true");
+        }
+        other => panic!("expected Stmt::Fn, got {other:?}"),
+    }
+}
+
+/// `worker` remains a plain identifier where it is NOT immediately followed by
+/// `class`, `fn`, or `async` — it must not be reserved.
+#[test]
+fn worker_stays_contextual_not_reserved_for_class() {
+    both_accept("let worker = 5");
+    both_accept("fn worker() { return 1 }");
+    // `worker` as a variable followed by something that's not `class`/`fn`/`async`
+    both_accept("let x = worker + 1");
+    both_accept("worker(1)");
+}
+
+/// A plain (non-worker) class still parses cleanly — no regression.
+#[test]
+fn both_frontends_accept_plain_class_unchanged() {
+    both_accept("class Point { x: number\n y: number\n fn init(x, y) { self.x = x; self.y = y } }");
+
+    let src = "class Foo {}";
+    let toks = ascript::lexer::lex(src).unwrap();
+    let stmts = ascript::parser::parse(&toks).unwrap();
+    match &stmts[0] {
+        ascript::ast::Stmt::Class { name, is_worker, .. } => {
+            assert_eq!(name, "Foo");
+            assert!(!*is_worker, "plain class must have is_worker=false");
+        }
+        other => panic!("expected Stmt::Class, got {other:?}"),
+    }
+}
