@@ -47,7 +47,11 @@ Design priorities, in strict order:
   bytecode VM is now the **default** engine and the tree-walker is the byte-identical reference
   oracle (`--tree-walker`; CLAUDE.md architecture, `src/lib.rs` `vm_run_source`). JIT itself
   remains a non-goal.
-- No multithreading in user code (single-threaded event loop; see §7).
+- No SHARED-MEMORY multithreading in user code (single-threaded event loop PER ISOLATE; see §7).
+  **Superseded/refined** by shared-nothing worker parallelism — see
+  `specs/2026-06-07-workers-foundation-stateless-design.md` and
+  `specs/2026-06-07-workers-stateful-actors-streaming-design.md` (parallelism by isolation, no data
+  races: multiple complete runtimes on separate threads sharing no memory; only deep-copied data crosses).
 - No macro system, operator overloading, or metaprogramming.
 - ~~No package manager / registry (deferred to a future spec).~~ **Shipped in
   SP6** (`docs/superpowers/specs/2026-06-04-sp6-package-manager-design.md`):
@@ -426,7 +430,15 @@ AScript supports `async fn`, `await`, generators (`fn*` / `async fn*`), `yield`,
 `async fn` in Rust running on a single-threaded Tokio executor, which *is* the event
 loop. Concurrent tasks ride a `tokio::task::LocalSet` with `spawn_local`, which accepts
 `!Send` futures — so the `Rc<RefCell<…>>` value model (§9) is preserved unchanged and
-there is still **no user-visible multithreading**.
+there is still **no shared-memory multithreading** within an isolate.
+
+> **Update — parallelism via shared-nothing workers.** The single-threaded model above is now
+> **per isolate**. Multi-core parallelism is available through shared-nothing workers (`worker fn`
+> pools, `worker class` actors, `worker fn*` streaming generators): each runs a complete,
+> independent `!Send` runtime on a separate thread, sharing no memory — only deep-copied data
+> crosses the boundary, so there are no data races. See
+> `specs/2026-06-07-workers-foundation-stateless-design.md` and
+> `specs/2026-06-07-workers-stateful-actors-streaming-design.md`.
 
 The key realization driving the whole design: Rust `async`/`.await` *is* a stackless
 coroutine transform, and `eval` is *already* an `async fn`. So both real concurrency and
