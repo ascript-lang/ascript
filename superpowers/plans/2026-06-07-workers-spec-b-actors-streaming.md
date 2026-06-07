@@ -408,22 +408,21 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Files:** `src/det.rs`, `src/stdlib/workflow.rs`, `src/check/rules/` (the `workflow-determinism` lint), tests inline.
 
-- [ ] **Step 1: Failing det test.** Assert that, under a `DeterminismContext` (Record then Replay), an actor's inbound message sequence + results and a generator's yield/resume sequence are recorded as boundary `DetEvent`s and replayed deterministically (the replay returns the recorded result without re-crossing the isolate boundary, matching the SP9 model where the `None` branch is inert and `Some` routes through recorded events). Run → **expect FAIL**.
+- [x] **Step 1: Failing det test.** Assert that, under a `DeterminismContext` (Record then Replay), an actor's inbound message sequence + results and a generator's yield/resume sequence are recorded as boundary `DetEvent`s and replayed deterministically (the replay returns the recorded result without re-crossing the isolate boundary, matching the SP9 model where the `None` branch is inert and `Some` routes through recorded events). Run → **expect FAIL**.
 
-- [ ] **Step 2: Boundary events.** In `src/det.rs`, add `DetEvent` variants (e.g. `ActorCall { method, result }`, `GeneratorYield { value }`) recording each cross-isolate interaction. In the actor/stream dispatch (Tasks 5/6), when `self.determinism` is `Some`, record on Record and return the recorded result on Replay (clone the cell out, never hold across `.await` — SP9 invariant). When `None` (default), the path is the exact pre-Spec-B behavior (byte-identical).
+- [x] **Step 2: Boundary events.** In `src/det.rs`, add `DetEvent` variants (e.g. `ActorCall { method, result }`, `GeneratorYield { value }`) recording each cross-isolate interaction. In the actor/stream dispatch (Tasks 5/6), when `self.determinism` is `Some`, record on Record and return the recorded result on Replay (clone the cell out, never hold across `.await` — SP9 invariant). When `None` (default), the path is the exact pre-Spec-B behavior (byte-identical).
 
-- [ ] **Step 3: Lint extension.** Extend the `workflow-determinism` lint (`src/stdlib/workflow.rs` / the rule) to flag UNRECORDED cross-isolate interaction (an actor call / `worker fn*` consumption) inside a `workflow.run` body that isn't event-sourced. Add a `tests/check.rs` case.
+- [x] **Step 3: Lint extension.** Extend the `workflow-determinism` lint (`src/stdlib/workflow.rs` / the rule) to flag UNRECORDED cross-isolate interaction (an actor call / `worker fn*` consumption) inside a `workflow.run` body that isn't event-sourced. Add a `tests/check.rs` case.
 
-- [ ] **Step 4:** Run `cargo test --test check workflow_determinism` + the det tests in both configs → **expect PASS**.
+- [x] **Step 4:** Run `cargo test --test check workflow_determinism` + the det tests in both configs → **expect PASS**.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
   ```bash
   git commit -am "feat(det): event-source actor messages + generator yields; extend workflow-determinism lint
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   ```
-
-## Task 13: Example corpus (§7.3) — runnable, doubles as docs & all-modes tests
+: Example corpus (§7.3) — runnable, doubles as docs & all-modes tests
 
 **Files:** `examples/advanced/workers_actor_counter.as`, `workers_actor_service.as`, `workers_stream_records.as`, `workers_stream_bidirectional.as`, `workers_event_bridge.as`, `workers_actor_subscribe.as`.
 
