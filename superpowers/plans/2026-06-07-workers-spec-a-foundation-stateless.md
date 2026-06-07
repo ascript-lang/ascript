@@ -1122,14 +1122,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ---
 
-## Task 14: Example corpus (§11.4) — runnable, order-deterministic
+## Task 14: Example corpus (§11.4) — runnable, order-deterministic ✓ DONE
 
 **Files:**
 - Create: `examples/workers_parallel_map.as`, `examples/workers_static_method.as`, `examples/workers_nested_inline.as`, `examples/workers_errors.as`
 - Create: `examples/advanced/workers_sample_sort.as`, `examples/advanced/workers_monte_carlo.as`, `examples/advanced/workers_parse_files.as`
 - Test: verified via `target/release/ascript run <file>` (and Task 15's all-modes gate)
 
-- [ ] **Step 1: Write `examples/workers_parallel_map.as`** (canonical CPU-bound fan-out; order-deterministic via `gather`):
+- [x] **Step 1: Write `examples/workers_parallel_map.as`** (canonical CPU-bound fan-out; order-deterministic via `gather`):
 ```
 // Parallel map: square each block in its own isolate, gather in order.
 import { gather } from "std/task"
@@ -1148,7 +1148,7 @@ fn main() {
 await main()
 ```
 
-- [ ] **Step 2: Write `examples/workers_static_method.as`**:
+- [x] **Step 2: Write `examples/workers_static_method.as`**:
 ```
 import { gather } from "std/task"
 
@@ -1167,7 +1167,7 @@ fn main() {
 await main()
 ```
 
-- [ ] **Step 3: Write `examples/workers_nested_inline.as`** (inline nesting, no deadlock):
+- [x] **Step 3: Write `examples/workers_nested_inline.as`** (inline nesting, no deadlock):
 ```
 worker fn inner(n: number): number {
   return n + 1
@@ -1186,7 +1186,7 @@ fn main() {
 await main()
 ```
 
-- [ ] **Step 4: Write `examples/workers_errors.as`** (recoverable worker panic + sendability path error):
+- [x] **Step 4: Write `examples/workers_errors.as`** (recoverable worker panic + sendability path error):
 ```
 worker fn risky(n: number): number {
   if (n < 0) { panic("negative input") }
@@ -1208,7 +1208,7 @@ fn main() {
 await main()
 ```
 
-- [ ] **Step 5: Write `examples/advanced/workers_sample_sort.as`** (chunk → parallel sort → k-way merge; fully error-handled):
+- [x] **Step 5: Write `examples/advanced/workers_sample_sort.as`** (chunk → parallel sort → k-way merge; fully error-handled):
 ```
 import { gather } from "std/task"
 
@@ -1250,7 +1250,7 @@ await main()
 ```
 (Verify the exact stdlib method names — `sorted`, `slice`, `min`, `sum` — against `docs/content/stdlib/*` and adjust to the real API at implementation time; the example must run.)
 
-- [ ] **Step 6: Write `examples/advanced/workers_monte_carlo.as`** (embarrassingly parallel π estimate; deterministic via fixed per-chunk seeds so the all-modes gate matches):
+- [x] **Step 6: Write `examples/advanced/workers_monte_carlo.as`** (embarrassingly parallel π estimate; deterministic via fixed per-chunk seeds so the all-modes gate matches):
 ```
 import { gather } from "std/task"
 
@@ -1281,7 +1281,7 @@ await main()
 ```
 (`toFixed` etc. — confirm the real numeric-format method; the point is a FIXED, deterministic estimate string so all four modes agree byte-for-byte.)
 
-- [ ] **Step 7: Write `examples/advanced/workers_parse_files.as`** (parse N inputs in parallel, gather, error-handled — uses in-memory strings, NOT fs, so it is self-isolating and feature-independent):
+- [x] **Step 7: Write `examples/advanced/workers_parse_files.as`** (parse N inputs in parallel, gather, error-handled — uses in-memory strings, NOT fs, so it is self-isolating and feature-independent):
 ```
 import { gather } from "std/task"
 import { parse } from "std/json"
@@ -1307,15 +1307,15 @@ await main()
 ```
 (Confirm `std/json`'s `parse` signature/return — `[value, err]` per the typed-parse contract; adjust the destructure accordingly.)
 
-- [ ] **Step 8: Build release + run each example**
+- [x] **Step 8: Build release + run each example**
   Run: `cargo build --release` then for each file `target/release/ascript run <file>` and confirm the documented output.
   Expected: each runs and prints the expected, order-deterministic output. Fix any stdlib-method-name mismatches against the real API.
 
-- [ ] **Step 9: `ascript check` each example** to confirm zero `worker-capture` / `type-*` diagnostics:
+- [x] **Step 9: `ascript check` each example** to confirm zero `worker-capture` / `type-*` diagnostics:
   Run: `for f in examples/workers_*.as examples/advanced/workers_*.as; do target/release/ascript check "$f"; done`
   Expected: clean.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 ```bash
 git add examples/workers_*.as examples/advanced/workers_*.as
 git commit -m "examples: worker fn corpus (parallel map, static method, inline nesting, errors, sample-sort, monte-carlo, parse)
