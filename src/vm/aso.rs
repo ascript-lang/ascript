@@ -760,6 +760,7 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
         has_rest,
         is_async,
         is_generator,
+        is_worker: false, // .aso v1: not yet serialized; defaults to false on load
         params,
         ret,
     })
@@ -1642,6 +1643,7 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
             params: Vec::new(),
             ret: None,
         });

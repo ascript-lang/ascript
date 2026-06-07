@@ -214,6 +214,7 @@ async fn eval_line_vm(vm: &Rc<Vm>, line: &str) -> bool {
         has_rest: false,
         is_async: false,
         is_generator: false,
+        is_worker: false,
         params: Vec::new(),
         ret: None,
     });

@@ -172,7 +172,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `src/vm/chunk.rs` (`FnProto.is_worker` @335)
 - Test: `src/syntax/parser.rs` test module (near `async_and_generator_fns` @2134), `src/compile/mod.rs` test module (near @5831)
 
-- [ ] **Step 1: Write the failing parser test** — add to `src/syntax/parser.rs` tests:
+- [x] **Step 1: Write the failing parser test** — add to `src/syntax/parser.rs` tests:
 
 ```rust
 #[test]
@@ -200,13 +200,13 @@ fn worker_stays_identifier_when_not_a_modifier() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
   Run: `cargo test -p ascript worker_fn_and_static_worker worker_stays_identifier`
   Expected: FAIL — parse errors (`worker` not recognized) / `no variant WorkerKw`.
 
-- [ ] **Step 3: Add `WorkerKw`.** In `src/syntax/kind.rs`, add `WorkerKw,` immediately after `StaticKw` (@243). (Place it in the same keyword cluster so `is_keyword_kind` and other closed matches surface it as a compile error to handle — by design.)
+- [x] **Step 3: Add `WorkerKw`.** In `src/syntax/kind.rs`, add `WorkerKw,` immediately after `StaticKw` (@243). (Place it in the same keyword cluster so `is_keyword_kind` and other closed matches surface it as a compile error to handle — by design.)
 
-- [ ] **Step 4: Recognize `worker` in the CST parser.** In `src/syntax/parser.rs`:
+- [x] **Step 4: Recognize `worker` in the CST parser.** In `src/syntax/parser.rs`:
   - Add a helper next to `is_async_fn` (@227):
     ```rust
     /// True if the cursor is at the contextual `worker` modifier: an `Ident`
@@ -228,9 +228,9 @@ fn worker_stays_identifier_when_not_a_modifier() {
     ```
   - In `method_decl` (@1342): after the `at_static_method` bump (@1346), before the `AsyncKw` check, add the same `if at_worker_modifier(p) { p.bump_remap(WorkerKw); }`. Also update `at_static_method` is fine — but ensure the class-member dispatch reaches `method_decl` for a leading `worker fn` with no `static`. Find the class-member loop that decides field-vs-method (the `at_static_method`/`AsyncKw`/`FnKw` predicate) and add `|| at_worker_modifier(p)` to the method predicate.
 
-- [ ] **Step 5: Add the `FnProto.is_worker` field.** In `src/vm/chunk.rs` `FnProto` (@335), add `pub is_worker: bool,` after `pub is_generator: bool,` (@340) with a doc line. Fix the two non-aso `FnProto { … }` constructions in `src/compile/mod.rs` (@2358 region and @2552) and `src/vm/run.rs` (@419, @2782) and `src/vm/aso.rs` test (@1639) to set `is_worker` (real value in compiler, `false` in the VM/test stubs).
+- [x] **Step 5: Add the `FnProto.is_worker` field.** In `src/vm/chunk.rs` `FnProto` (@335), add `pub is_worker: bool,` after `pub is_generator: bool,` (@340) with a doc line. Fix the two non-aso `FnProto { … }` constructions in `src/compile/mod.rs` (@2358 region and @2552) and `src/vm/run.rs` (@419, @2782) and `src/vm/aso.rs` test (@1639) to set `is_worker` (real value in compiler, `false` in the VM/test stubs).
 
-- [ ] **Step 6: Read the flag in the compiler.** In `src/compile/mod.rs` `compile_fn_proto` (@2501–2512), add `is_worker` alongside `is_async`/`is_generator`:
+- [x] **Step 6: Read the flag in the compiler.** In `src/compile/mod.rs` `compile_fn_proto` (@2501–2512), add `is_worker` alongside `is_async`/`is_generator`:
   ```rust
   let mut is_worker = false;
   // … inside the token loop:
@@ -238,7 +238,7 @@ fn worker_stays_identifier_when_not_a_modifier() {
   ```
   Set `is_worker,` in the returned `FnProto` (@2556 region). Do the same flag-read in the method-proto path (`compile_method_proto` @2242 delegates to `compile_fn_proto`, so the token loop already covers it — verify the `MethodDecl` node carries the `WorkerKw` child token).
 
-- [ ] **Step 7: Add the resolver helper (parallel to `is_static_method`).** In `src/syntax/resolve/mod.rs` near @34:
+- [x] **Step 7: Add the resolver helper (parallel to `is_static_method`).** In `src/syntax/resolve/mod.rs` near @34:
   ```rust
   /// Spec A: a fn/method declared `worker` (carries a direct `WorkerKw` child token).
   pub fn is_worker_fn(node: &ResolvedNode) -> bool {
@@ -248,7 +248,7 @@ fn worker_stays_identifier_when_not_a_modifier() {
   }
   ```
 
-- [ ] **Step 8: Write a compiler unit test** — in `src/compile/mod.rs` tests (near @5831):
+- [x] **Step 8: Write a compiler unit test** — in `src/compile/mod.rs` tests (near @5831):
   ```rust
   #[test]
   fn compiles_worker_fn_proto_flag() {
@@ -259,11 +259,11 @@ fn worker_stays_identifier_when_not_a_modifier() {
   ```
   (Use whatever helper the existing `is_async`/`is_generator` proto tests at @5831 use to fetch the first `FnProto`; mirror it.)
 
-- [ ] **Step 9: Run the tests**
+- [x] **Step 9: Run the tests**
   Run: `cargo test -p ascript worker_fn_and_static_worker worker_stays_identifier compiles_worker_fn_proto_flag`
   Expected: PASS. Then `cargo build` clean.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 ```bash
 git add src/syntax/kind.rs src/syntax/parser.rs src/syntax/resolve/mod.rs src/compile/mod.rs src/vm/chunk.rs src/vm/run.rs src/vm/aso.rs
 git commit -m "feat(cst): worker contextual keyword (WorkerKw) in CST parser + FnProto.is_worker compile

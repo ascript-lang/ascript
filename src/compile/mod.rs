@@ -2357,6 +2357,7 @@ impl Compiler {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
             params: Vec::new(),
             ret: None,
         }))
@@ -2497,9 +2498,10 @@ impl Compiler {
             .and_then(|rt| rt.children().find(|c| is_type_node(c.kind())))
             .and_then(cst_type);
 
-        // `async fn` / `fn*` / `async fn*` flags, read from the fn's own tokens.
+        // `async fn` / `fn*` / `async fn*` / `worker fn` flags, read from the fn's own tokens.
         let mut is_async = false;
         let mut is_generator = false;
+        let mut is_worker = false;
         for tok in fn_node
             .children_with_tokens()
             .filter_map(|el| el.into_token())
@@ -2507,6 +2509,7 @@ impl Compiler {
             match tok.kind() {
                 SyntaxKind::AsyncKw => is_async = true,
                 SyntaxKind::Star => is_generator = true,
+                SyntaxKind::WorkerKw => is_worker = true,
                 _ => {}
             }
         }
@@ -2555,6 +2558,7 @@ impl Compiler {
             has_rest,
             is_async,
             is_generator,
+            is_worker,
             params: proto_params,
             ret: ret_type,
         }))
@@ -5830,6 +5834,22 @@ mod tests {
         assert!(!proto.has_rest);
         assert!(!proto.is_async);
         assert!(!proto.is_generator);
+    }
+
+    #[test]
+    fn compiles_worker_fn_proto_flag() {
+        // `worker fn f()` must produce a proto with `is_worker = true` and `is_async = false`.
+        let chunk = compile_source("worker fn f() { return 1 }\n").expect("compiles");
+        let proto = chunk.protos.first().expect("one nested proto");
+        assert!(proto.is_worker, "expected is_worker = true on worker fn");
+        assert!(!proto.is_async, "expected is_async = false on plain worker fn");
+        assert!(!proto.is_generator);
+
+        // `worker async fn g()` — both flags set.
+        let chunk2 = compile_source("worker async fn g() { return 2 }\n").expect("compiles");
+        let proto2 = chunk2.protos.first().expect("one nested proto");
+        assert!(proto2.is_worker);
+        assert!(proto2.is_async);
     }
 
     #[test]

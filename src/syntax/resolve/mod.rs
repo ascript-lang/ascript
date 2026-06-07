@@ -37,6 +37,14 @@ pub fn is_static_method(node: &ResolvedNode) -> bool {
         .any(|t| t.kind() == SyntaxKind::StaticKw)
 }
 
+/// Spec A: true if `node` is a `FnDecl` or `MethodDecl` declared with the
+/// contextual `worker` modifier (carries a direct `WorkerKw` child token).
+pub fn is_worker_fn(node: &ResolvedNode) -> bool {
+    node.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == SyntaxKind::WorkerKw)
+}
+
 fn is_expr(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(

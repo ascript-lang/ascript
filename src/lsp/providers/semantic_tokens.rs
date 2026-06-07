@@ -256,6 +256,7 @@ fn is_keyword_kind(k: SyntaxKind) -> bool {
             | AwaitKw
             | YieldKw
             | StaticKw
+            | WorkerKw
     )
 }
 

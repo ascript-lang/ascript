@@ -364,11 +364,12 @@ impl<'a> Parser<'a> {
             // by `fn`/`async`/`worker`) is a method. `static` lexes as
             // `Tok::Ident("static")`; it is a method modifier ONLY when directly
             // followed by `fn`/`async`/`worker`, so `static: T` stays a field.
-            let is_static_method = matches!(self.peek(), Tok::Ident(s) if s == "static")
-                && matches!(self.peek_nth(1), Tok::Async | Tok::Fn)
-                || matches!(self.peek(), Tok::Ident(s) if s == "static")
-                    && matches!(self.peek_nth(1), Tok::Ident(s) if s == "worker")
-                    && matches!(self.peek_nth(2), Tok::Async | Tok::Fn);
+            // Factor out the `static` peek to avoid calling `self.peek()` twice.
+            let at_static = matches!(self.peek(), Tok::Ident(s) if s == "static");
+            let is_static_method = at_static
+                && (matches!(self.peek_nth(1), Tok::Async | Tok::Fn)
+                    || matches!(self.peek_nth(1), Tok::Ident(s) if s == "worker")
+                        && matches!(self.peek_nth(2), Tok::Async | Tok::Fn));
             // A bare `worker fn` / `worker async fn` at the start of a member.
             let is_bare_worker_method = matches!(self.peek(), Tok::Ident(s) if s == "worker")
                 && matches!(self.peek_nth(1), Tok::Async | Tok::Fn);
@@ -2239,6 +2240,34 @@ mod tests {
                 assert!(methods[0].is_worker);
             }
             other => panic!("expected Stmt::Class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_async_fn_sets_both_flags() {
+        let p = parse(&lex("worker async fn foo() { return 1 }").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::Fn { name, is_worker, is_async, .. } => {
+                assert_eq!(name, "foo");
+                assert!(*is_worker, "expected is_worker = true");
+                assert!(*is_async, "expected is_async = true");
+            }
+            other => panic!("expected Stmt::Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_worker_fn_has_is_worker() {
+        let p = parse(&lex("export worker fn bar() { return 2 }").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::Export(inner) => match inner.as_ref() {
+                Stmt::Fn { name, is_worker, .. } => {
+                    assert_eq!(name, "bar");
+                    assert!(*is_worker, "expected exported fn to have is_worker = true");
+                }
+                other => panic!("expected Stmt::Fn inside export, got {other:?}"),
+            },
+            other => panic!("expected Stmt::Export, got {other:?}"),
         }
     }
 

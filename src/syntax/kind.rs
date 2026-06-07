@@ -241,6 +241,12 @@ pub enum SyntaxKind {
     // `fn`/`async fn`/`fn*`), so `let static = 1` keeps `static` an `Ident`.
     // No `#[static_text]` — it is never matched by `keyword_kind`.
     StaticKw,
+    // `worker` is a CONTEXTUAL/soft keyword: the lexer never produces it (an
+    // identifier `worker` lexes as `Ident`). The parser REMAPS the `worker`
+    // identifier to this kind only in fn/method-modifier position (before
+    // `fn` or `async`), so `let worker = 1` or `worker(x)` keep `worker` an
+    // `Ident`.  No `#[static_text]` — it is never matched by `keyword_kind`.
+    WorkerKw,
 
     // --- sentinel for unrecognized input ---
     Error,

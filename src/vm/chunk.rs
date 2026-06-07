@@ -338,6 +338,10 @@ pub struct FnProto {
     pub has_rest: bool,
     pub is_async: bool,
     pub is_generator: bool,
+    /// True when the function was declared with the contextual `worker` modifier
+    /// (`worker fn f()`). The VM will spawn this closure on a worker thread
+    /// (Task 3+). Propagated from the CST `WorkerKw` token by the compiler.
+    pub is_worker: bool,
     /// The parameter list in declaration order (including a trailing rest param),
     /// carrying each param's name, declared type contract, and `rest` flag. The VM
     /// CALL feeds this straight into [`crate::interp::check_call_args`] — the SAME
@@ -817,6 +821,7 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
             params: Vec::new(),
             ret: None,
         });
