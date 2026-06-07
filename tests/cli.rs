@@ -2392,3 +2392,49 @@ fn static_worker_method_parallel_map_runs() {
         "[1, 4, 9, 16]"
     );
 }
+
+// Workers Spec A (Task 9): cancel-on-drop, panic propagation, result pairs, sendability.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_panic_is_recoverable_on_caller() {
+    // A worker fn that panic()s must produce a recoverable error on the caller,
+    // catchable via recover(). The result is an error pair [nil, err].
+    let src = r#"
+        worker fn boom(n) { panic("kaboom " + n) }
+        let r = recover(() => await boom(7))
+        print(r[1] != nil)
+    "#;
+    assert_eq!(run_worker_program(src, false, &[]), "true");
+}
+
+#[test]
+fn worker_result_pair_crosses_as_data() {
+    // A worker fn that returns [value, nil] ships the pair as ordinary data
+    // through WorkerReply::Ok; `?` propagation works on the awaited result.
+    // Uses the builtin `len` function (not a method — s.len() doesn't exist).
+    let src = r#"
+        worker fn parse(s) { return [len(s), nil] }
+        let r = await parse("abcd")?
+        print(r)
+    "#;
+    assert_eq!(run_worker_program(src, false, &[]), "4");
+}
+
+#[test]
+fn sendability_violation_reports_field_path() {
+    // Passing a non-sendable value (a function) nested in an object must produce
+    // a recoverable panic whose message contains the field path.
+    let src = r#"
+        worker fn f(o) { return 1 }
+        let cb = () => 1
+        let obj = {cb: cb}
+        let r = recover(() => await f(obj))
+        print(r[1].message)
+    "#;
+    let out = run_worker_program(src, false, &[]);
+    assert!(
+        out.contains("cannot be sent to a worker at"),
+        "expected sendability message, got: {out}"
+    );
+}

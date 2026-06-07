@@ -11,7 +11,22 @@ pub mod serialize;
 use crate::interp::{Control, Interp};
 use crate::span::Span;
 use crate::value::Value;
+use std::cell::Cell;
 use std::rc::Rc;
+
+/// RAII guard that decrements an isolate's in-flight counter on drop. This ensures
+/// the counter is decremented even if the caller-thread bridge task is aborted
+/// (cancel-on-drop: the last `Value::Future` clone drops → `SharedFuture::Drop` fires
+/// the abort handle → the bridge `spawn_local` task is cancelled → this guard drops →
+/// the counter is decremented). Without the guard the counter leaks on cancel, making
+/// the isolate appear busier than it is and starving future jobs.
+struct InflightGuard(Rc<Cell<usize>>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
 
 pub use dispatch::{
     build_code_slice, build_code_slice_for_static_method,
@@ -127,8 +142,11 @@ pub fn dispatch_worker(
         // `abort_tx` lives in this task; if the task is aborted (future dropped), it
         // is dropped, signalling the isolate to cancel.
         let _abort_tx = abort_tx;
+        // RAII guard: decrements the inflight counter when dropped, even on task
+        // abort (cancel-on-drop). Prevents inflight-counter drift when the caller
+        // drops the future before the reply arrives.
+        let _inflight_guard = InflightGuard(inflight);
         let reply = reply_rx.await;
-        inflight.set(inflight.get().saturating_sub(1));
         let result = match reply {
             Ok(isolate::WorkerReply::Ok(bytes)) => {
                 serialize::decode(&bytes, &interp_rc).map_err(|e| Control::Panic(e.into()))
@@ -260,4 +278,32 @@ fn run_slice_inline(
     });
     fut.set_abort(handle.abort_handle());
     Ok(Value::Future(fut))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InflightGuard;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// RAII guard decrements even when dropped early (simulates cancel-on-drop:
+    /// the bridge task is aborted before `reply_rx.await` resolves, so only the
+    /// guard's `Drop` decrements the counter — never a manual `.set()` call).
+    #[test]
+    fn inflight_guard_decrements_on_drop() {
+        let counter = Rc::new(Cell::new(3usize));
+        let guard = InflightGuard(counter.clone());
+        assert_eq!(counter.get(), 3);
+        drop(guard);
+        assert_eq!(counter.get(), 2, "guard must decrement on drop");
+    }
+
+    /// Guard saturates at zero — never wraps around.
+    #[test]
+    fn inflight_guard_saturates_at_zero() {
+        let counter = Rc::new(Cell::new(0usize));
+        let guard = InflightGuard(counter.clone());
+        drop(guard);
+        assert_eq!(counter.get(), 0, "saturating_sub must not underflow");
+    }
 }
