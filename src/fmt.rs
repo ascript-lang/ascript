@@ -251,9 +251,13 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             body,
             is_async,
             is_generator,
+            is_worker,
             ..
         } => {
             indent(out, level);
+            if *is_worker {
+                out.push_str("worker ");
+            }
             if *is_async {
                 out.push_str("async ");
             }
@@ -358,9 +362,12 @@ fn write_field(out: &mut String, fd: &FieldDecl, level: usize) {
 
 fn write_method(out: &mut String, m: &MethodDecl, level: usize) {
     indent(out, level);
-    // `static fn` / `static async fn` / `static fn*` (SP1 §3): modifier first.
+    // Canonical modifier order: `static? worker? async? fn` (SP1 §3, Spec A workers).
     if m.is_static {
         out.push_str("static ");
+    }
+    if m.is_worker {
+        out.push_str("worker ");
     }
     if m.is_async {
         out.push_str("async ");
@@ -1221,5 +1228,25 @@ mod tests {
         let twice = format_source(&once).unwrap();
         assert_eq!(once, twice, "pattern_matching.as fmt is not idempotent");
         assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn formats_worker_modifier_canonical_order() {
+        // Free worker fn: canonical order is `worker fn`.
+        assert_eq!(
+            format_source("worker fn   f( )  { return 1 }").unwrap(),
+            "worker fn f() {\n  return 1\n}\n"
+        );
+        // Static worker method in a class: canonical order is `static worker fn`.
+        assert_eq!(
+            format_source("class C { static   worker   fn h(x){return x} }").unwrap(),
+            "class C {\n  static worker fn h(x) {\n    return x\n  }\n}\n"
+        );
+    }
+
+    #[test]
+    fn worker_fmt_is_idempotent() {
+        let once = format_source("worker fn f() { return 1 }").unwrap();
+        assert_eq!(format_source(&once).unwrap(), once);
     }
 }
