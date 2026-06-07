@@ -45,8 +45,10 @@ A handful of builtins need no import and are available everywhere: `print`, `len
 
 ## Async
 
-AScript supports `async fn` and `await` on a **single-threaded event loop** — a single-threaded Tokio
-runtime that *is* the loop. There is no second thread, so there are no data races to reason about.
+AScript supports `async fn` and `await` on a **single-threaded event loop per isolate** — a
+single-threaded Tokio runtime that *is* the loop. Within an isolate there is no second thread, so
+there are no data races to reason about. (Multi-core parallelism comes from running work in
+separate shared-nothing isolates — see [Workers & parallelism](workers).)
 
 ```ascript
 async fn fetchUser(id: number): Result<object> {
@@ -220,3 +222,13 @@ for await (v in doubled(ticks())) {
 ### `type()` of a generator
 
 `type(gen)` returns `"generator"`. The `fn*` / `async fn*` declaration itself is a `"function"`.
+
+## Parallelism: workers
+
+The `async`/`await` model above is **single-threaded per isolate** — one thread, no data races.
+For multi-core parallelism, AScript provides **shared-nothing workers**: `worker fn` (pooled,
+stateless), `worker class` actors, and `worker fn*` streaming generators, each running in its own
+isolate with only deep-copied data crossing the boundary.
+
+See **[Workers & parallelism](workers)** for the full story — the model, the two lifecycles, the
+sendability line, actors, streaming, and the `task.pipe` event-bus bridge.

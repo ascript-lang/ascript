@@ -201,6 +201,10 @@ fn stmt(p: &mut Parser) {
         ReturnKw => return_stmt(p),
         FnKw => fn_decl(p),
         AsyncKw if is_async_fn(p) => fn_decl(p),
+        // `worker fn` / `worker async fn` — contextual; `worker` is an Ident.
+        Ident if at_worker_modifier(p) => fn_decl(p),
+        // `worker class C { … }` — Spec B actor class declaration.
+        Ident if at_worker_class(p) => class_decl(p),
         LBrace => {
             block(p);
         }
@@ -228,6 +232,32 @@ fn is_async_fn(p: &Parser) -> bool {
     matches!(
         p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
         Some(SyntaxKind::FnKw)
+    )
+}
+
+/// True if the cursor is at the contextual `worker` modifier: an `Ident` whose
+/// text is `"worker"` immediately followed by `fn` or `async` (i.e. the start
+/// of a `worker fn` or `worker async fn` declaration). The `worker` identifier
+/// is never reserved — `let worker = 5` and `worker(x)` keep `worker` as `Ident`.
+fn at_worker_modifier(p: &Parser) -> bool {
+    if !p.at_kw("worker") {
+        return false;
+    }
+    matches!(
+        p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
+        Some(SyntaxKind::FnKw) | Some(SyntaxKind::AsyncKw)
+    )
+}
+
+/// True if the cursor is at a `worker class` declaration: an `Ident` whose text
+/// is `"worker"` immediately followed by the `class` keyword (Spec B actors).
+fn at_worker_class(p: &Parser) -> bool {
+    if !p.at_kw("worker") {
+        return false;
+    }
+    matches!(
+        p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
+        Some(SyntaxKind::ClassKw)
     )
 }
 
@@ -575,6 +605,10 @@ fn return_stmt(p: &mut Parser) {
 fn fn_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
+    // `worker fn` / `worker async fn` — remap the contextual identifier to WorkerKw.
+    if at_worker_modifier(p) {
+        p.bump_remap(WorkerKw);
+    }
     if p.at(AsyncKw) {
         p.bump();
     }
@@ -1264,6 +1298,12 @@ fn type_primary(p: &mut Parser) -> CompletedMarker {
 fn class_decl(p: &mut Parser) {
     use SyntaxKind::*;
     let m = p.start();
+    // `worker class C { … }` — remap the contextual `worker` identifier to WorkerKw
+    // before bumping the `class` keyword (mirrors how `worker fn` is handled in
+    // `fn_decl`).
+    if at_worker_class(p) {
+        p.bump_remap(WorkerKw);
+    }
     p.bump(); // class
     if p.at(Ident) {
         p.bump();
@@ -1285,7 +1325,7 @@ fn class_decl(p: &mut Parser) {
     }
     while !p.at(RBrace) && !p.at_end() {
         let before = p.pos;
-        if p.at(AsyncKw) || p.at(FnKw) || at_static_method(p) {
+        if p.at(AsyncKw) || p.at(FnKw) || at_static_method(p) || at_worker_modifier(p) {
             method_decl(p);
         } else if p.at(Ident) {
             field_decl(p);
@@ -1326,17 +1366,22 @@ fn field_decl(p: &mut Parser) {
 }
 
 /// True when the cursor is at a `static` member modifier: the soft keyword
-/// `static` (an `Ident`) immediately followed by `fn` or `async` (the start of a
-/// method). This is the ONLY position where `static` is recognized as a keyword;
-/// `static: T` (a field) or `static = …` keep `static` an ordinary identifier.
+/// `static` (an `Ident`) immediately followed by `fn`, `async`, or `worker`
+/// (the start of a method). This is the ONLY position where `static` is
+/// recognized as a keyword; `static: T` (a field) or `static = …` keep
+/// `static` an ordinary identifier.
 fn at_static_method(p: &Parser) -> bool {
     if !p.at_kw("static") {
         return false;
     }
-    matches!(
-        p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind),
-        Some(SyntaxKind::FnKw) | Some(SyntaxKind::AsyncKw)
-    )
+    // `static fn`, `static async fn`, `static worker fn`, `static worker async fn`.
+    let next_kind = p.nontrivia.get(p.pos + 1).map(|&ti| p.tokens[ti].kind);
+    let next_text = p
+        .nontrivia
+        .get(p.pos + 1)
+        .map(|&ti| p.tokens[ti].text.as_str());
+    matches!(next_kind, Some(SyntaxKind::FnKw) | Some(SyntaxKind::AsyncKw))
+        || matches!(next_kind, Some(SyntaxKind::Ident)) && matches!(next_text, Some("worker"))
 }
 
 fn method_decl(p: &mut Parser) {
@@ -1344,6 +1389,10 @@ fn method_decl(p: &mut Parser) {
     let m = p.start();
     if at_static_method(p) {
         p.bump_remap(StaticKw); // contextual `static` modifier
+    }
+    // `worker fn` / `worker async fn` — remap the contextual identifier to WorkerKw.
+    if at_worker_modifier(p) {
+        p.bump_remap(WorkerKw);
     }
     if p.at(AsyncKw) {
         p.bump();
@@ -2147,6 +2196,34 @@ mod tests {
             );
         }
         assert!(tree_shape("fn add(a: number): number {}").contains(&SyntaxKind::RetType));
+    }
+
+    #[test]
+    fn worker_fn_and_static_worker_parse() {
+        for src in [
+            "worker fn f() { return 1 }",
+            "worker fn g(a, b) { return a }",
+            "class C { static worker fn h(x) { return x } }",
+            "class C { worker fn m(x) { return x } }",
+        ] {
+            let r = parse(src);
+            assert!(r.errors.is_empty(), "errors for {src}: {:?}", r.errors);
+            assert!(
+                tree_shape(src).contains(&SyntaxKind::FnDecl)
+                    || tree_shape(src).contains(&SyntaxKind::MethodDecl),
+                "no Fn/Method decl for {src}"
+            );
+            assert!(
+                !tree_shape(src).contains(&SyntaxKind::Error),
+                "Error node in tree for {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_stays_identifier_when_not_a_modifier() {
+        assert!(parse("let worker = 5").errors.is_empty());
+        assert!(parse("worker(1)").errors.is_empty());
     }
 
     #[test]

@@ -218,10 +218,74 @@ impl Vm {
     }
 
     /// The shared interpreter state.
-    // used by V2+ (globals/native dispatch): no caller yet in V1.
-    #[allow(dead_code)]
     pub fn interp(&self) -> &Rc<Interp> {
         &self.interp
+    }
+
+    /// Workers Spec A: dispatch a `worker fn` closure to a pooled isolate, returning
+    /// the `Value::Future`. Builds the shippable code slice — preferring the source
+    /// recompile path (via `Interp::worker_source`) when source is available (the normal
+    /// run-from-source path, shared with the tree-walker), or falling back to building
+    /// the slice directly from the stored pre-compiled top-level chunk (the `.aso`
+    /// run path, via `Interp::worker_aso_bytes`) when no source is recorded. The entry name
+    /// is the closure's compiled chunk name (a top-level `worker fn`).
+    fn dispatch_worker_closure(
+        &self,
+        callee: &crate::vm::value_ext::Closure,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let entry_name = callee.proto.chunk.name.as_deref().ok_or_else(|| {
+            Control::Panic(crate::error::AsError::at(
+                "worker fn has no name (internal invariant)".to_string(),
+                span,
+            ))
+        })?;
+        // Inline-nesting: a worker fn called from inside an isolate runs locally (no
+        // pool round-trip, no slice build) — the entry is already a global on the VM.
+        if crate::worker::pool::in_isolate() {
+            return crate::worker::dispatch_worker_inline(&self.interp, entry_name, args, span);
+        }
+        // Route to the static-method or free-function slice builder depending on
+        // whether the proto carries an owning class name. A `static worker fn`
+        // compiled on a class has `proto.owning_class = Some(class_name)` (set by
+        // the compiler when emitting static method protos); a free `worker fn` has
+        // `owning_class = None` and goes through the ordinary top-level path.
+        let class_name: Option<&str> = callee.proto.owning_class.as_deref();
+
+        // Prefer the source recompile path (produces an identical slice for any run
+        // mode that has source). Fall back to the pre-compiled chunk derived from the raw
+        // `.aso` bytes stored by `run_aso_file` when no source is recorded (the .aso path).
+        let slice = if self.interp.worker_source().is_some() {
+            if let Some(cls) = class_name {
+                crate::worker::build_code_slice_for_static_method_from_source(
+                    &self.interp, cls, entry_name,
+                )?
+            } else {
+                crate::worker::build_code_slice_from_source(&self.interp, entry_name, None)?
+            }
+        } else if let Some(raw) = self.interp.worker_aso_bytes() {
+            let top = crate::vm::chunk::Chunk::from_bytes(&raw).map_err(|e| {
+                Control::Panic(crate::error::AsError::at(
+                    format!("cannot re-parse .aso for worker dispatch: {e:?}"),
+                    span,
+                ))
+            })?;
+            if let Some(cls) = class_name {
+                crate::worker::build_code_slice_for_static_method(&top, cls, entry_name)?
+            } else {
+                crate::worker::build_code_slice(&top, entry_name, None)?
+            }
+        } else {
+            return Err(Control::Panic(crate::error::AsError::at(
+                format!(
+                    "cannot dispatch worker '{entry_name}': the program source is unavailable \
+                     (worker fns require running via `ascript run`)"
+                ),
+                span,
+            )));
+        };
+        crate::worker::dispatch_worker(&self.interp, slice, args, span)
     }
 
     /// SP3 §B: increment the SHARED logical call-depth on establishing a new VM
@@ -418,6 +482,8 @@ impl Vm {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -1004,6 +1070,40 @@ impl Vm {
                         // at the call (the tree-walker also binds args eagerly when
                         // building the generator). AWAIT DISCIPLINE: no await here;
                         // the fiber is built synchronously and handed to the handle.
+                        // A `worker fn*` (Spec B Task 6) is a STREAMING generator: its
+                        // body runs in a DEDICATED isolate, consumed via a cross-thread
+                        // demand-driven driver. Must precede the plain-generator arm (a
+                        // `worker fn*` has BOTH flags) and the `worker fn` arm. Same
+                        // `Interp::spawn_worker_stream` as the tree-walker → byte-
+                        // identical. AWAIT DISCIPLINE: pop the args synchronously, then
+                        // `.await` the spawn with no fiber borrow held.
+                        Value::Closure(callee)
+                            if callee.proto.is_worker && callee.proto.is_generator =>
+                        {
+                            let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let entry_name = callee
+                                .proto
+                                .chunk
+                                .name
+                                .clone()
+                                .ok_or_else(|| {
+                                    Control::Panic(crate::error::AsError::at(
+                                        "worker fn* must be a named top-level function"
+                                            .to_string(),
+                                        call_span,
+                                    ))
+                                })?;
+                            let mut args = vec![Value::Nil; argc];
+                            for slot in args.iter_mut().rev() {
+                                *slot = fiber.pop();
+                            }
+                            fiber.pop(); // the callee value at callee_idx
+                            let gen = self
+                                .interp
+                                .spawn_worker_stream(&entry_name, args, call_span)
+                                .await?;
+                            fiber.push(gen);
+                        }
                         Value::Closure(callee) if callee.proto.is_generator => {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             let what = callee.proto.chunk.name.as_deref().unwrap_or("function");
@@ -1058,6 +1158,20 @@ impl Vm {
                         // and its args move into the `'static` spawned task; `vm` is an
                         // owned `Rc<Vm>`; no `fiber` RefCell borrow is held across the
                         // spawn/await below.
+                        // A `worker fn` closure dispatches to a pooled isolate
+                        // (Workers Spec A): pop the args, build the code slice from the
+                        // entry program source, ship + return a `Value::Future`. Must
+                        // precede the `is_async` branch (a worker fn is not async).
+                        Value::Closure(callee) if callee.proto.is_worker => {
+                            let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                            let mut args = vec![Value::Nil; argc];
+                            for slot in args.iter_mut().rev() {
+                                *slot = fiber.pop();
+                            }
+                            fiber.pop(); // the callee value at callee_idx
+                            let fut = self.dispatch_worker_closure(&callee, args, call_span)?;
+                            fiber.push(fut);
+                        }
                         Value::Closure(callee) if callee.proto.is_async => {
                             let call_span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                             // Pop the `argc` args into an owned vec (top of stack is
@@ -2636,6 +2750,7 @@ impl Vm {
                         // table (SP1 §3, C5).
                         static_methods: indexmap::IndexMap::new(),
                         def_env: def_env.clone(),
+                        is_worker: cp.class.is_worker,
                     });
                     // Register the class into the shared env so a sibling/forward
                     // nested-class field type (or a default-expr name) resolves at
@@ -2781,6 +2896,7 @@ impl Vm {
                                     body: Vec::new(),
                                     is_async: false,
                                     is_generator: false,
+                                    is_worker: false,
                                 }),
                                 defining_class: found_class,
                                 name: name.to_string(),
@@ -2830,6 +2946,28 @@ impl Vm {
     /// surfaces arity/contract panics byte-identically. The return-type contract is
     /// enforced by `Op::Return` against the frame's `ret_span` (the call span),
     /// exactly as for an in-VM call.
+    /// Workers Spec B §Task 5 (actor isolate side): call the method `name` on a VM
+    /// instance `receiver` with `args`, resolving the method through the VM's
+    /// per-class method side table (`vm_read_member` → `BoundMethod`) and driving any
+    /// returned `Value::Future` (an `async` method) to its value. Used by the actor
+    /// mailbox loop, which runs on the isolate's own `Vm` — `Interp::read_member`
+    /// cannot be used because a VM-built class keeps its methods in the side table,
+    /// not in `Class.methods`.
+    pub async fn call_method_named(
+        &self,
+        receiver: Value,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let bound = self.vm_read_member(&receiver, name, span)?;
+        let r = self.call_value(bound, args, span).await?;
+        match r {
+            Value::Future(f) => f.get().await,
+            other => Ok(other),
+        }
+    }
+
     #[async_recursion::async_recursion(?Send)]
     pub async fn call_value(
         &self,
@@ -2839,6 +2977,63 @@ impl Vm {
     ) -> Result<Value, Control> {
         match callee {
             Value::Closure(closure) => {
+                // Workers Spec A: a `worker fn` passed as a higher-order value (e.g.
+                // `array.map(seeds, workerFn)`) must be dispatched to a pooled isolate
+                // when running on the CALLER thread — otherwise the worker body runs
+                // inline and NO parallelism occurs. Mirror the `Op::Call` arm's
+                // `is_worker` branch so that the native → VM re-entry path produces a
+                // `Value::Future` (dispatched) rather than a synchronously-computed
+                // result.
+                //
+                // INSIDE an isolate, this path is NOT taken: the `Op::Call` handler
+                // dispatches `dispatch_worker_inline` for the inline-nesting case, and
+                // `dispatch_worker_inline`'s `spawn_local` task calls `vm.call_value`
+                // on the entry — at that point we are still inside the isolate thread
+                // and the entry must run as a plain closure (the code-slice already
+                // defined it; running it inline IS the intended behavior). Skip the
+                // re-dispatch to avoid infinite recursion:
+                //   dispatch_worker_closure → in_isolate → dispatch_worker_inline
+                //   → vm.call_value → is_worker → dispatch_worker_closure → ...
+                // Only re-dispatch when there is something to build a slice FROM;
+                // if neither worker_source nor worker_aso_bytes is set, we are in a
+                // test harness or a fresh isolate that loaded the slice directly —
+                // fall through to the plain inline path (which is correct there).
+                if closure.proto.is_worker
+                    && !closure.proto.is_generator
+                    && !crate::worker::pool::in_isolate()
+                    && (self.interp.worker_source().is_some()
+                        || self.interp.worker_aso_bytes().is_some())
+                {
+                    return self.dispatch_worker_closure(&closure, args, span);
+                }
+                // A GENERATOR closure (`fn*` / `async fn*` / `worker fn*`) is NOT run to
+                // completion here — it builds a NOT-STARTED VM fiber wrapped in a
+                // `GeneratorHandle`, returning a `Value::Generator` (the consumer drives
+                // it via `resume`). This mirrors the `Op::Call` generator arm and is the
+                // path taken when a `worker fn*` runs ON ITS DEDICATED ISOLATE: the
+                // isolate's `build_producer` calls `call_value(entry, ..)` and expects a
+                // LOCAL generator back (the cross-thread streaming is the CALLER-side
+                // driver, not the isolate's). Without this, the body would run inline and
+                // hit "a closure cannot yield".
+                if closure.proto.is_generator {
+                    let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
+                    let bound =
+                        crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                    let mut gfiber = Fiber::new(closure);
+                    gfiber.frame_mut().ret_span = span;
+                    gfiber.frame_mut().argc = bound.supplied;
+                    let cells = gfiber.frame().cells.clone();
+                    for (slot, v) in bound.values.into_iter().enumerate() {
+                        if let Some(cell) = &cells[slot] {
+                            *cell.borrow_mut() = v;
+                        } else {
+                            gfiber.stack[slot] = v;
+                        }
+                    }
+                    let handle =
+                        crate::coro::GeneratorHandle::new_vm(gfiber, Rc::downgrade(&self.rc()));
+                    return Ok(Value::Generator(Rc::new(handle)));
+                }
                 // `what` mirrors the tree-walker's
                 // `func.name.as_deref().unwrap_or("function")` so an arity/contract
                 // panic message matches.
@@ -3183,6 +3378,27 @@ impl Vm {
             fiber.push(v);
             return Ok(());
         }
+        // (1a') Workers Spec B §Task 5: `WorkerClass.spawn(args)` → spawn an actor
+        // isolate, return `future<handle>`. Mirrors the tree-walker `eval_chain` hook
+        // exactly (same `Interp::spawn_actor`), so the VM matches byte-for-byte. A
+        // bare `WorkerClass(args)` construction is UNCHANGED (handled by `Op::Call`).
+        if let Value::Class(class) = &recv {
+            if class.is_worker && name == "spawn" {
+                let v = self.interp.spawn_actor(class, args, span).await?;
+                fiber.push(v);
+                return Ok(());
+            }
+        }
+        // (1a'') Actor-handle async method dispatch: a member-CALL on a
+        // `Value::Native(WorkerActor)` sends an `ActorMsg::Call` (or `close()`) and
+        // returns `future<T>`. Same `Interp::actor_handle_call` as the tree-walker.
+        if let Value::Native(n) = &recv {
+            if n.kind == crate::value::NativeKind::WorkerActor {
+                let v = self.interp.actor_handle_call(n, name, args, span).await?;
+                fiber.push(v);
+                return Ok(());
+            }
+        }
         // (1b) STATIC method call `C.name(args)` (SP1 §3): the receiver is a VM
         // class whose `name` resolves (up the chain) to a compiled STATIC closure.
         // Dispatch with NO receiver, with full generator/async/sync handling
@@ -3322,7 +3538,8 @@ impl Vm {
                             ret: None,
                             body: Vec::new(),
                             is_async: false,
-                                    is_generator: false,
+                            is_generator: false,
+                            is_worker: false,
                         }),
                         defining_class: def_class,
                         name: name.to_string(),
@@ -3401,6 +3618,17 @@ impl Vm {
     /// its stable `IndexMap` index with this generation.
     fn struct_gen(&self) -> u64 {
         self.struct_gen.get()
+    }
+
+    /// Read a module-scope user-global's (cloned) `Value` by name, or `None` if it
+    /// is not (yet) defined. Public so the worker subsystem can fetch a freshly-run
+    /// code-slice's ENTRY function out of a fresh isolate's globals and call it
+    /// (`src/worker/dispatch.rs`); also the natural read hook for the REPL/embedders.
+    pub fn user_global(&self, name: &str) -> Option<Value> {
+        self.user_globals
+            .borrow()
+            .get(name)
+            .map(|s| s.value.clone())
     }
 
     /// Resolve a module-scope user-global by name, returning BOTH its stable
@@ -4126,6 +4354,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -4479,6 +4709,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -4924,6 +5156,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -5243,6 +5477,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -5266,6 +5502,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });

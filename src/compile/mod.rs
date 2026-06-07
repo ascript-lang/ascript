@@ -1720,6 +1720,9 @@ impl Compiler {
             methods: indexmap::IndexMap::new(),
             static_methods: indexmap::IndexMap::new(),
             def_env: crate::interp::global_env(),
+            // Workers Spec B: carry the `worker class` flag onto the prebuilt
+            // template so `Op::Class` (VM) materializes a `worker`-tagged class.
+            is_worker: crate::syntax::resolve::is_worker_class(class_decl.syntax()),
         });
 
         // For an `extends` clause, emit the SUPERCLASS class-value FIRST (so it
@@ -1842,6 +1845,21 @@ impl Compiler {
         }
         for method in &static_methods {
             let proto = self.compile_method_proto(method)?;
+            // For `static worker fn`, stamp the owning class name so that
+            // `dispatch_worker_closure` can route to
+            // `build_code_slice_for_static_method` (which needs the class name to
+            // locate the method's compiled proto inside the top-level chunk). The
+            // `Rc` is freshly created by `compile_method_proto` (refcount == 1), so
+            // `try_unwrap` always succeeds here (it would only fail if there were a
+            // second holder, which is impossible — the Rc was just minted).
+            let proto = if proto.is_worker {
+                let mut owned = Rc::try_unwrap(proto)
+                    .expect("static worker proto Rc freshly created — refcount must be 1");
+                owned.owning_class = Some(Rc::from(name.as_str()));
+                Rc::new(owned)
+            } else {
+                proto
+            };
             let idx = self.chunk.add_proto(proto);
             self.chunk.emit_u16(Op::Closure, idx, span);
         }
@@ -2357,6 +2375,8 @@ impl Compiler {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         }))
@@ -2497,9 +2517,10 @@ impl Compiler {
             .and_then(|rt| rt.children().find(|c| is_type_node(c.kind())))
             .and_then(cst_type);
 
-        // `async fn` / `fn*` / `async fn*` flags, read from the fn's own tokens.
+        // `async fn` / `fn*` / `async fn*` / `worker fn` flags, read from the fn's own tokens.
         let mut is_async = false;
         let mut is_generator = false;
+        let mut is_worker = false;
         for tok in fn_node
             .children_with_tokens()
             .filter_map(|el| el.into_token())
@@ -2507,8 +2528,22 @@ impl Compiler {
             match tok.kind() {
                 SyntaxKind::AsyncKw => is_async = true,
                 SyntaxKind::Star => is_generator = true,
+                SyntaxKind::WorkerKw => is_worker = true,
                 _ => {}
             }
+        }
+
+        // `worker async fn` is not a valid combination: a worker already returns an
+        // awaitable future, so `async` is redundant and unsupported — a clean error,
+        // not a silent drop of the modifier. `worker fn*` IS valid (Spec B Task 6: a
+        // streaming generator running in a dedicated isolate); it is compiled like any
+        // generator (its `is_worker`/`is_generator` flags route the CALL to the
+        // streaming-worker driver at runtime).
+        if is_worker && is_async {
+            return Err(CompileError::new(
+                "worker functions cannot be async (a worker already returns an awaitable future; combine worker with fn* for a streaming generator, not async)",
+                span,
+            ));
         }
 
         // Build a fresh chunk for the body, sized from the function's own frame,
@@ -2555,6 +2590,8 @@ impl Compiler {
             has_rest,
             is_async,
             is_generator,
+            is_worker,
+            owning_class: None,
             params: proto_params,
             ret: ret_type,
         }))
@@ -5830,6 +5867,41 @@ mod tests {
         assert!(!proto.has_rest);
         assert!(!proto.is_async);
         assert!(!proto.is_generator);
+    }
+
+    #[test]
+    fn compiles_worker_fn_proto_flag() {
+        // `worker fn f()` must produce a proto with `is_worker = true` and `is_async = false`.
+        let chunk = compile_source("worker fn f() { return 1 }\n").expect("compiles");
+        let proto = chunk.protos.first().expect("one nested proto");
+        assert!(proto.is_worker, "expected is_worker = true on worker fn");
+        assert!(!proto.is_async, "expected is_async = false on plain worker fn");
+        assert!(!proto.is_generator);
+    }
+
+    #[test]
+    fn worker_async_fn_is_a_compile_error() {
+        // `worker async fn` is rejected at compile time (accepted by the parser —
+        // permissive parsing, semantic rejection).
+        let err_async =
+            compile_source("worker async fn g() { return 2 }\n").expect_err("must be a compile error");
+        assert!(
+            err_async.message.contains("worker functions cannot be async"),
+            "unexpected message: {}", err_async.message
+        );
+    }
+
+    #[test]
+    fn worker_generator_compiles_with_both_flags() {
+        // Spec B Task 6: `worker fn*` is now VALID — a streaming generator. The proto
+        // carries BOTH is_worker and is_generator; the runtime CALL routes it to the
+        // dedicated-isolate streaming driver.
+        let chunk =
+            compile_source("worker fn* h() { yield 1 }\n").expect("worker fn* compiles");
+        let proto = chunk.protos.first().expect("one nested proto");
+        assert!(proto.is_worker, "expected is_worker = true on worker fn*");
+        assert!(proto.is_generator, "expected is_generator = true on worker fn*");
+        assert!(!proto.is_async, "worker fn* is not async");
     }
 
     #[test]

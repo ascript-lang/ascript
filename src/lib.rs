@@ -22,6 +22,7 @@ pub mod task;
 pub mod token;
 pub mod value;
 pub mod vm;
+pub mod worker;
 
 use crate::error::{AsError, SourceInfo};
 use crate::interp::Interp;
@@ -185,6 +186,8 @@ pub async fn run_source_exit(src: &str) -> Result<(String, Option<i32>), AsError
     let program = parser::parse(&tokens).map_err(|e| e.with_source(src_info.clone()))?;
     let interp = Rc::new(Interp::new());
     interp.install_self();
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice.
+    interp.set_worker_source(src);
     // Run in a child of the builtins env so the program can shadow builtins
     // (`let len = 5`) and import names that collide with builtins.
     let env = crate::interp::global_env().child();
@@ -293,6 +296,8 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
         has_rest: false,
         is_async: false,
         is_generator: false,
+        is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });
@@ -393,6 +398,9 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
+    // Workers Spec A (.aso path): retain the raw bytes so `dispatch_worker_closure` can
+    // re-parse them into the top-level chunk and build a worker code slice without source.
+    interp.set_worker_aso_bytes(Rc::from(bytes.into_boxed_slice()));
     interp.install_self();
     let vm = Vm::new(interp.clone());
     // Resolve relative imports against the .aso's directory.
@@ -406,6 +414,8 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
         has_rest: false,
         is_async: false,
         is_generator: false,
+        is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });
@@ -475,6 +485,8 @@ pub async fn run_file_on_vm_with_packages(
 
     let interp = Rc::new(Interp::new_live());
     interp.set_cli_args(script_args);
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice.
+    interp.set_worker_source(&src);
     if let Some(map) = packages {
         interp.set_package_resolver(map);
     }
@@ -491,6 +503,8 @@ pub async fn run_file_on_vm_with_packages(
         has_rest: false,
         is_async: false,
         is_generator: false,
+        is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });
@@ -537,6 +551,8 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
         has_rest: false,
         is_async: false,
         is_generator: false,
+        is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });
@@ -544,6 +560,8 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
 
     let interp = Rc::new(Interp::new());
     interp.install_self();
+    // Workers Spec A: retain the source so a `worker fn` call can build its slice.
+    interp.set_worker_source(src);
     let vm = Vm::with_specialize(interp.clone(), specialize);
     let mut fiber = crate::vm::fiber::Fiber::new(closure);
 

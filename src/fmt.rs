@@ -251,9 +251,13 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             body,
             is_async,
             is_generator,
+            is_worker,
             ..
         } => {
             indent(out, level);
+            if *is_worker {
+                out.push_str("worker ");
+            }
             if *is_async {
                 out.push_str("async ");
             }
@@ -284,9 +288,13 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
             superclass,
             fields,
             methods,
+            is_worker,
             ..
         } => {
             indent(out, level);
+            if *is_worker {
+                out.push_str("worker ");
+            }
             out.push_str("class ");
             out.push_str(name);
             if let Some(sup) = superclass {
@@ -358,9 +366,12 @@ fn write_field(out: &mut String, fd: &FieldDecl, level: usize) {
 
 fn write_method(out: &mut String, m: &MethodDecl, level: usize) {
     indent(out, level);
-    // `static fn` / `static async fn` / `static fn*` (SP1 §3): modifier first.
+    // Canonical modifier order: `static? worker? async? fn` (SP1 §3, Spec A workers).
     if m.is_static {
         out.push_str("static ");
+    }
+    if m.is_worker {
+        out.push_str("worker ");
     }
     if m.is_async {
         out.push_str("async ");
@@ -1221,5 +1232,67 @@ mod tests {
         let twice = format_source(&once).unwrap();
         assert_eq!(once, twice, "pattern_matching.as fmt is not idempotent");
         assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn formats_worker_modifier_canonical_order() {
+        // Free worker fn: canonical order is `worker fn`.
+        assert_eq!(
+            format_source("worker fn   f( )  { return 1 }").unwrap(),
+            "worker fn f() {\n  return 1\n}\n"
+        );
+        // Static worker method in a class: canonical order is `static worker fn`.
+        assert_eq!(
+            format_source("class C { static   worker   fn h(x){return x} }").unwrap(),
+            "class C {\n  static worker fn h(x) {\n    return x\n  }\n}\n"
+        );
+    }
+
+    #[test]
+    fn worker_fmt_is_idempotent() {
+        let once = format_source("worker fn f() { return 1 }").unwrap();
+        assert_eq!(format_source(&once).unwrap(), once);
+    }
+
+    // ---- Spec B Task 3: worker class + worker fn* (legacy AST formatter) ----
+
+    #[test]
+    fn formats_worker_class_canonical() {
+        // `worker` prefix is preserved and extra whitespace normalised.
+        assert_eq!(
+            format_source("worker  class  Db{fn f(){return 1}}").unwrap(),
+            "worker class Db {\n  fn f() {\n    return 1\n  }\n}\n"
+        );
+    }
+
+    #[test]
+    fn worker_class_fmt_is_idempotent() {
+        let once = format_source("worker  class  Db{fn f(){return 1}}").unwrap();
+        assert_eq!(format_source(&once).unwrap(), once, "worker class not idempotent");
+    }
+
+    #[test]
+    fn formats_worker_fn_star_canonical() {
+        // `worker fn*` — both modifiers preserved; `*` attaches to `fn`.
+        assert_eq!(
+            format_source("worker fn*  g(){yield 1}").unwrap(),
+            "worker fn* g() {\n  yield 1\n}\n"
+        );
+    }
+
+    #[test]
+    fn worker_fn_star_fmt_is_idempotent() {
+        let once = format_source("worker fn*  g(){yield 1}").unwrap();
+        assert_eq!(format_source(&once).unwrap(), once, "worker fn* not idempotent");
+    }
+
+    #[test]
+    fn formats_worker_method_in_worker_class() {
+        // A `worker class` body with a `worker fn` method inside — both modifiers.
+        let src = "worker class Db { worker fn  run(x){return x} }";
+        let out = format_source(src).unwrap();
+        assert!(out.starts_with("worker class Db {"), "missing 'worker class Db': {out}");
+        assert!(out.contains("worker fn run"), "missing 'worker fn run': {out}");
+        assert_eq!(format_source(&out).unwrap(), out, "not idempotent");
     }
 }

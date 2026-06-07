@@ -278,6 +278,10 @@ impl Printer<'_> {
             .filter_map(|el| el.into_token())
             .map(|t| t.kind())
             .collect();
+        // Canonical modifier order: `worker? async? fn` (Spec A + Plan A).
+        if toks.contains(&WorkerKw) {
+            self.out.text("worker ");
+        }
         if toks.contains(&AsyncKw) {
             self.out.text("async ");
         }
@@ -304,6 +308,14 @@ impl Printer<'_> {
 
     fn class_decl(&mut self, node: &ResolvedNode) {
         use SyntaxKind::*;
+        // Emit leading `worker ` modifier when present (Spec B actor class).
+        let has_worker = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == WorkerKw);
+        if has_worker {
+            self.out.text("worker ");
+        }
         self.out.text("class ");
         let idents: Vec<String> = node
             .children_with_tokens()
@@ -393,10 +405,13 @@ impl Printer<'_> {
                     .filter_map(|el| el.into_token())
                     .map(|t| t.kind())
                     .collect();
-                // `static fn` / `static async fn` / `static fn*` (SP1 §3): the
-                // `static` modifier prints first, then `async`, then `fn`.
+                // Canonical modifier order: `static? worker? async? fn`
+                // (SP1 §3 + Spec A workers + Spec B worker class methods).
                 if toks.contains(&StaticKw) {
                     self.out.text("static ");
+                }
+                if toks.contains(&WorkerKw) {
+                    self.out.text("worker ");
                 }
                 if toks.contains(&AsyncKw) {
                     self.out.text("async ");
@@ -1440,5 +1455,83 @@ mod tests {
                 "fmt not idempotent for {src:?}:\n{once}\n---\n{twice}"
             );
         }
+    }
+
+    // ---- Spec B Task 3: worker class + worker fn* formatter round-trip ----
+
+    #[test]
+    fn formats_worker_class_canonical() {
+        // `worker` prefix is preserved and extra whitespace is normalized.
+        let out = fmt("worker  class  Db{fn f(){return 1}}");
+        assert_eq!(
+            out,
+            "worker class Db {\n  fn f() {\n    return 1\n  }\n}\n",
+            "worker class should emit 'worker class Name {{...}}'"
+        );
+    }
+
+    #[test]
+    fn worker_class_fmt_is_idempotent() {
+        // Formatting the canonical output a second time must be a no-op.
+        let once = fmt("worker  class  Db{fn f(){return 1}}");
+        let twice = fmt(&once);
+        assert_eq!(once, twice, "worker class fmt not idempotent");
+    }
+
+    #[test]
+    fn formats_worker_class_with_field_and_init() {
+        // Full actor class: field, init method, query method — exercises class_decl
+        // + member ordering (fields before methods) with worker prefix.
+        let src = "worker class Cache { ttl: number = 60 fn init(t) { self.ttl = t } fn get(k) { return k } }";
+        let out = fmt(src);
+        assert!(out.starts_with("worker class Cache {"), "missing 'worker class': {out}");
+        let ttl = out.find("ttl:").expect("field present");
+        let init = out.find("fn init").expect("init method present");
+        assert!(ttl < init, "field should appear before method in: {out}");
+        // Idempotent.
+        let twice = fmt(&out);
+        assert_eq!(out, twice, "worker class with field+init not idempotent");
+    }
+
+    #[test]
+    fn formats_worker_fn_star_canonical() {
+        // `worker fn*` (free generator): both modifiers preserved and normalized.
+        let out = fmt("worker fn*  g(){yield 1}");
+        assert_eq!(
+            out,
+            "worker fn* g() {\n  yield 1\n}\n",
+            "worker fn* should emit 'worker fn* name {{...}}'"
+        );
+    }
+
+    #[test]
+    fn worker_fn_star_fmt_is_idempotent() {
+        let once = fmt("worker fn*  g(){yield 1}");
+        let twice = fmt(&once);
+        assert_eq!(once, twice, "worker fn* fmt not idempotent");
+    }
+
+    #[test]
+    fn formats_worker_method_in_class() {
+        // A `worker fn` method inside a plain class (Spec A pooled method).
+        let out = fmt("class C { worker fn  run(x){return x} }");
+        assert!(
+            out.contains("worker fn run"),
+            "worker method should emit 'worker fn run': {out}"
+        );
+        let twice = fmt(&out);
+        assert_eq!(out, twice, "worker method in class not idempotent");
+    }
+
+    #[test]
+    fn formats_static_worker_fn_star_in_class() {
+        // Canonical modifier order: `static worker fn*`.
+        let out = fmt("class C { static  worker  fn*  gen(x){yield x} }");
+        assert!(
+            out.contains("static worker fn* gen"),
+            "canonical order should be 'static worker fn* gen': {out}"
+        );
+        let twice = fmt(&out);
+        assert_eq!(out, twice, "static worker fn* in class not idempotent");
     }
 }

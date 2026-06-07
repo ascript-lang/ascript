@@ -328,6 +328,16 @@ pub(crate) enum ResourceState {
     // the `ResourceState` enum compact. Feature `ai`.
     #[cfg(feature = "ai")]
     AiStream(Box<crate::stdlib::ai::AiStreamState>),
+    /// Workers Spec B §Task 5: a `worker class` ACTOR proxy. Holds the outbound
+    /// `Send` mailbox sender + the dedicated `IsolateHandle` (whose `Drop` tears the
+    /// isolate down) + the declared class name. The actor instance + any native
+    /// resources it opens live IN the isolate, never here. Boxed for
+    /// `large_enum_variant`.
+    ///
+    /// GC INVARIANT: this is a native handle holding `Send` channels + a thread
+    /// handle — NOT script `Value`s. The GC must NEVER trace into it. `Value::Native`
+    /// already traces as a no-op (`gc.rs`'s `_ => {}` arm), so the invariant holds.
+    WorkerActor(Box<crate::worker::actor::WorkerActorHandle>),
     /// A resource that has been closed/consumed. Also the always-present variant
     /// so the enum is non-empty under `--no-default-features`.
     #[allow(dead_code)]
@@ -531,6 +541,21 @@ pub struct Interp {
     /// `.await` (the resolved target is cloned out first — never hold this borrow
     /// across an await; `await_holding_refcell_ref` stays satisfied).
     package_resolver: RefCell<Option<PackageMap>>,
+    /// Workers Spec A: the entry program's full source text, retained so a
+    /// `worker fn` dispatch can (re)compile it to a top-level [`crate::vm::chunk::Chunk`]
+    /// and build the shippable code slice (entry fn + transitive top-level deps).
+    /// Shared by BOTH engines — the tree-walker has no compiled chunk of its own, so
+    /// this is how it produces an identical `.aso` slice that the isolate's VM runs.
+    /// `None` until [`Interp::set_worker_source`] is called by the run entry point; a
+    /// `worker fn` call with no source set raises a clear recoverable panic.
+    worker_source: RefCell<Option<Rc<str>>>,
+    /// Workers Spec A (.aso path): the raw `.aso` bytes of the entry program, retained
+    /// so a `worker fn` dispatch can re-parse them into a top-level
+    /// [`crate::vm::chunk::Chunk`] and build its shippable code slice directly (via
+    /// `build_code_slice`) without recompiling from source. Set by `run_aso_file` (which
+    /// has no source); `worker_source` takes priority when BOTH are set (a run-from-source
+    /// always uses the source path). `None` in every run mode that sets `worker_source`.
+    worker_aso_bytes: RefCell<Option<Rc<[u8]>>>,
 }
 
 /// Above this many in-flight async tasks, an async-fn call cooperatively yields
@@ -802,7 +827,36 @@ impl Interp {
             cli_args: RefCell::new(Vec::new()),
             determinism: RefCell::new(None),
             package_resolver: RefCell::new(None),
+            worker_source: RefCell::new(None),
+            worker_aso_bytes: RefCell::new(None),
         }
+    }
+
+    /// Workers Spec A: record the entry program's full source so a `worker fn`
+    /// dispatch can recompile it into the shippable code slice. Idempotent; the run
+    /// entry points call it once before execution.
+    pub fn set_worker_source(&self, src: &str) {
+        *self.worker_source.borrow_mut() = Some(Rc::from(src));
+    }
+
+    /// The entry program's source, if recorded (Workers Spec A). Cloned out so the
+    /// borrow never spans the compile/await below.
+    pub(crate) fn worker_source(&self) -> Option<Rc<str>> {
+        self.worker_source.borrow().clone()
+    }
+
+    /// Workers Spec A (.aso path): record the raw `.aso` bytes of the entry program so
+    /// `dispatch_worker_closure` can re-parse them into a top-level chunk and build a
+    /// code slice directly (no source recompile needed). Called by `run_aso_file` before
+    /// execution; `worker_source` takes priority and this is `None` whenever source is set.
+    pub fn set_worker_aso_bytes(&self, bytes: Rc<[u8]>) {
+        *self.worker_aso_bytes.borrow_mut() = Some(bytes);
+    }
+
+    /// The raw `.aso` bytes of the entry program (`.aso` run path), if recorded.
+    /// Cloned out so the borrow never spans the re-parse/dispatch below.
+    pub(crate) fn worker_aso_bytes(&self) -> Option<Rc<[u8]>> {
+        self.worker_aso_bytes.borrow().clone()
     }
 
     /// Store the script's trailing CLI arguments so `env.args()` can return them.
@@ -1797,6 +1851,304 @@ impl Interp {
         self.resources.borrow_mut().remove(&id)
     }
 
+    // -----------------------------------------------------------------------
+    // Workers Spec B §Task 5: actor host (`ClassName.spawn`, handle dispatch).
+    // Shared by BOTH engines (the tree-walker `eval_chain` hook and the VM
+    // `Op::Call*` hook call these, so actor behavior is byte-identical).
+    // -----------------------------------------------------------------------
+
+    /// `WorkerClass.spawn(args)` → spawn a dedicated actor isolate, ship the class
+    /// code slice + init args, register a `ResourceState::WorkerActor`, and return a
+    /// `future<Value::Native(WorkerActor)>` (spawning is async — the future resolves
+    /// once the isolate has constructed the instance via `init`).
+    ///
+    /// `!Send` integrity: the isolate builds its OWN `Interp`/`Vm`; only `Send` bytes
+    /// (the encoded args + class slice) and `Send` channels cross. The proxy stays on
+    /// this thread.
+    pub(crate) async fn spawn_actor(
+        &self,
+        class: &Rc<crate::value::Class>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // Sendability gate on the init args (field-path panic on failure).
+        for a in &args {
+            crate::worker::serialize::check_sendable(a)
+                .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+        }
+        // Build the class code slice (superclass chain + methods + defaults) from the
+        // program source — the SINGLE path shared by both engines — or, when running a
+        // compiled `.aso` (no source), from the stored `.aso` bytes (Plan A Task 15
+        // mechanism extended to actor spawn).
+        let slice = crate::worker::build_class_slice_for_interp(self, &class.name)?;
+        // Encode the init args as one array (preserving cross-arg sharing).
+        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let encoded = crate::worker::serialize::encode(&args_array)
+            .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+
+        // Spawn the dedicated actor isolate + its mailbox.
+        let (tx, isolate) = crate::worker::actor::spawn_actor_isolate().map_err(|e| {
+            Control::Panic(AsError::at(
+                format!("could not spawn actor isolate: {e}"),
+                span,
+            ))
+        })?;
+
+        // Send the Init message; await the ack on a future.
+        let (init_reply_tx, init_reply_rx) =
+            tokio::sync::oneshot::channel::<crate::worker::actor::ActorReply>();
+        let init_msg = crate::worker::actor::ActorMsg::Init {
+            class_name: class.name.clone(),
+            slice_bytes: slice.entry_aso.to_vec(),
+            args: encoded,
+            reply: init_reply_tx,
+        };
+        if tx.send(init_msg).is_err() {
+            return Err(Control::Panic(AsError::at(
+                "actor isolate terminated before initialization".to_string(),
+                span,
+            )));
+        }
+
+        // Register the handle as a native resource (its Drop tears the isolate down).
+        let mut fields = indexmap::IndexMap::new();
+        fields.insert("name".to_string(), Value::Str(class.name.clone().into()));
+        let handle = crate::worker::actor::WorkerActorHandle::new(
+            tx,
+            isolate,
+            Rc::from(class.name.as_str()),
+        );
+        let native = self.register_resource(
+            crate::value::NativeKind::WorkerActor,
+            fields,
+            ResourceState::WorkerActor(Box::new(handle)),
+        );
+
+        // The future resolves to the native handle once Init acks. We must keep the
+        // native handle alive across the await (it owns the isolate) — so move a clone
+        // into the bridge task and resolve with it.
+        let fut = crate::task::SharedFuture::new();
+        let cell = fut.cell();
+        let native_for_task = native.clone();
+        let bridge = tokio::task::spawn_local(async move {
+            let result = match init_reply_rx.await {
+                Ok(crate::worker::actor::ActorReply::Ok(_)) => Ok(native_for_task),
+                Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
+                    Err(Control::Panic(AsError::at(msg, span)))
+                }
+                Err(_) => Err(Control::Panic(AsError::at(
+                    "actor isolate terminated during initialization".to_string(),
+                    span,
+                ))),
+            };
+            cell.resolve(result);
+        });
+        fut.set_abort(bridge.abort_handle());
+        Ok(Value::Future(fut))
+    }
+
+    /// An async method call on an actor handle (`await handle.method(args)`), OR the
+    /// synchronous `handle.close()` teardown. For a method: `check_sendable` the args,
+    /// send an `ActorMsg::Call`, and return a `future<T>` awaiting the oneshot reply +
+    /// decode. TAKE-OUT-ACROSS-AWAIT: the `Send` sender is cloned OUT of the resources
+    /// table BEFORE the future awaits; no `resources` borrow is held across `.await`.
+    pub(crate) async fn actor_handle_call(
+        &self,
+        native: &Rc<crate::value::NativeObject>,
+        method: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // `close()` is a host-side teardown: take the resource out (dropping the
+        // handle → dropping the IsolateHandle → channel close + thread join).
+        if method == "close" {
+            self.take_resource(native.id);
+            return Ok(Value::Nil);
+        }
+
+        // Sendability gate on the args (field-path panic).
+        for a in &args {
+            crate::worker::serialize::check_sendable(a)
+                .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+        }
+        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let encoded = crate::worker::serialize::encode(&args_array)
+            .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+
+        // SP9 determinism (Spec B Task 12) — REPLAY: if a determinism context is active
+        // in Replay mode AND it has a recorded `ActorCall` at the cursor, return the
+        // recorded reply WITHOUT crossing the isolate boundary (the actor's side effect
+        // already ran exactly once, at Record). The `None`/default and Record paths fall
+        // through to the real boundary crossing below — byte-identical when inert.
+        // The borrow is a SHORT sync borrow inside `with_determinism_mut`, never held
+        // across an `.await`.
+        let replayed: Option<crate::det::BoundaryOutcome> = self.with_determinism_mut(|ctx| {
+            if ctx.mode == crate::det::Mode::Replay {
+                ctx.replay_actor_call(method)
+            } else {
+                None
+            }
+        }).flatten();
+        if let Some(outcome) = replayed {
+            return Ok(self.resolve_boundary_outcome(outcome, span));
+        }
+
+        // TAKE-OUT-ACROSS-AWAIT: clone the Send sender out under a SHORT borrow, then
+        // drop the borrow before building/awaiting the future.
+        let tx = {
+            let table = self.resources.borrow();
+            match table.get(&native.id) {
+                Some(ResourceState::WorkerActor(h)) => h.tx.clone(),
+                _ => {
+                    // The actor was closed (resource removed) → recoverable panic.
+                    return Err(Control::Panic(AsError::at(
+                        "actor is closed".to_string(),
+                        span,
+                    )));
+                }
+            }
+        };
+
+        let (reply_tx, reply_rx) =
+            tokio::sync::oneshot::channel::<crate::worker::actor::ActorReply>();
+        let call_msg = crate::worker::actor::ActorMsg::Call {
+            method: method.to_string(),
+            args: encoded,
+            reply: reply_tx,
+        };
+        if tx.send(call_msg).is_err() {
+            return Err(Control::Panic(AsError::at(
+                "actor is closed".to_string(),
+                span,
+            )));
+        }
+
+        // Bridge: await the reply, decode against THIS interp, resolve the future.
+        let interp_rc = self.rc();
+        let method_owned = method.to_string();
+        let fut = crate::task::SharedFuture::new();
+        let cell = fut.cell();
+        let bridge = tokio::task::spawn_local(async move {
+            let reply = reply_rx.await;
+            // SP9 determinism (Task 12) — RECORD: if a Record-mode context is active,
+            // event-source the boundary OUTCOME (the encoded reply bytes / panic) so a
+            // later Replay reproduces it without re-crossing the isolate. The borrow is
+            // a SHORT sync borrow AFTER the `.await`, never held across it.
+            if let Ok(ref r) = reply {
+                let outcome = match r {
+                    crate::worker::actor::ActorReply::Ok(bytes) => {
+                        crate::det::BoundaryOutcome::Bytes(bytes.clone())
+                    }
+                    crate::worker::actor::ActorReply::Panic(msg) => {
+                        crate::det::BoundaryOutcome::Panic(msg.clone())
+                    }
+                };
+                interp_rc.with_determinism_mut(|ctx| {
+                    if ctx.mode == crate::det::Mode::Record {
+                        ctx.record_actor_call(&method_owned, &outcome);
+                    }
+                });
+            }
+            let result = match reply {
+                Ok(crate::worker::actor::ActorReply::Ok(bytes)) => {
+                    crate::worker::serialize::decode(&bytes, &interp_rc)
+                        .map_err(|e| Control::Panic(e.into()))
+                }
+                Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
+                    Err(Control::Panic(AsError::at(msg, span)))
+                }
+                // The reply sender dropped without replying → the actor was closed.
+                Err(_) => Err(Control::Panic(AsError::at(
+                    "actor is closed".to_string(),
+                    span,
+                ))),
+            };
+            cell.resolve(result);
+        });
+        fut.set_abort(bridge.abort_handle());
+        Ok(Value::Future(fut))
+    }
+
+    /// SP9 determinism (Task 12): wrap a REPLAYED actor-call boundary outcome into an
+    /// already-resolved `Value::Future`, matching the shape `actor_handle_call` returns
+    /// for the real path. The recorded bytes are decoded on THIS consumer thread (no
+    /// isolate crossing). A recorded panic replays as the same recoverable Tier-2 panic.
+    fn resolve_boundary_outcome(
+        &self,
+        outcome: crate::det::BoundaryOutcome,
+        span: Span,
+    ) -> Value {
+        let result = match outcome {
+            crate::det::BoundaryOutcome::Bytes(bytes) => {
+                crate::worker::serialize::decode(&bytes, &self.rc())
+                    .map_err(|e| Control::Panic(e.into()))
+            }
+            crate::det::BoundaryOutcome::Panic(msg) => {
+                Err(Control::Panic(AsError::at(msg, span)))
+            }
+            // An actor call never yields "done"; treat defensively as nil.
+            crate::det::BoundaryOutcome::Done => Ok(Value::Nil),
+        };
+        let fut = crate::task::SharedFuture::new();
+        fut.cell().resolve(result);
+        Value::Future(fut)
+    }
+
+    /// Workers Spec B §Task 6: build a streaming-generator handle for a `worker fn*`.
+    /// Spawns a DEDICATED isolate running the generator body, ships the code slice +
+    /// call args, and returns a `Value::Generator` backed by a cross-thread
+    /// [`crate::coro::GenImpl::Worker`] demand-driven driver. `for await` / `.next(v)` /
+    /// `.close()` then work transparently — each consumer step is one demand credit
+    /// across the boundary (strict pull = backpressure).
+    ///
+    /// Shared by BOTH engines (the tree-walker `call_function` and the VM `Op::Call`
+    /// hooks call this), so streaming behavior is byte-identical.
+    ///
+    /// SPAWN IS SYNCHRONOUS here (unlike `spawn_actor`'s `future<handle>`): a generator
+    /// call returns a `Value::Generator` immediately, matching local generators — the
+    /// isolate is spawned + the producer built (its `Init` ack awaited) before returning,
+    /// so a build failure surfaces eagerly at the call, exactly like a local generator's
+    /// eager arg binding.
+    ///
+    /// `!Send` integrity: the isolate builds its OWN `Interp`/`Vm` and runs its OWN
+    /// generator; only `Send` bytes (slice + encoded args) cross. The driver stays here.
+    pub(crate) async fn spawn_worker_stream(
+        &self,
+        entry_name: &str,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // Sendability gate on the call args (field-path panic on failure).
+        for a in &args {
+            crate::worker::serialize::check_sendable(a)
+                .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+        }
+        // Build the `worker fn*` code slice (entry + transitive top-level deps) from the
+        // program source — the SINGLE path shared by both engines — or, when running a
+        // compiled `.aso` (no source), from the stored `.aso` bytes (Plan A Task 15
+        // mechanism extended to the worker-generator stream path).
+        let slice = crate::worker::build_stream_slice_for_interp(self, entry_name)?;
+        // Encode the call args as one array (preserving cross-arg sharing).
+        let args_array = Value::Array(crate::value::ArrayCell::new(args));
+        let encoded = crate::worker::serialize::encode(&args_array)
+            .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
+
+        // Spawn the dedicated isolate + build the producer (awaits the Init ack).
+        let driver = crate::worker::stream::StreamDriver::spawn(
+            entry_name.to_string(),
+            slice.entry_aso.to_vec(),
+            encoded,
+        )
+        .await
+        .map_err(|msg| Control::Panic(AsError::at(msg, span)))?;
+
+        let handle = crate::coro::GeneratorHandle::new_worker(
+            Box::new(driver),
+            std::rc::Rc::downgrade(&self.rc()),
+        );
+        Ok(Value::Generator(Rc::new(handle)))
+    }
+
     /// Run `f` with a shared borrow of the resource for `id` (handle methods that
     /// only inspect state, e.g. `conn.query` re-resolving a statement). The closure
     /// must NOT `.await` — the borrow is held for its duration.
@@ -1972,6 +2324,14 @@ impl Interp {
             path: canon.display().to_string(),
             text: src.clone(),
         });
+
+        // Workers Spec A: record the ENTRY module's source the first time we load a
+        // module so a `worker fn` dispatch can recompile it into a code slice. Only
+        // the first (entry) module sets it — imported modules don't overwrite it, so
+        // the slice builder sees the program the worker fn was declared in.
+        if self.worker_source().is_none() {
+            self.set_worker_source(&src);
+        }
 
         let tokens =
             lexer::lex(&src).map_err(|e| Control::Panic(e.with_source(src_info.clone())))?;
@@ -2360,8 +2720,20 @@ impl Interp {
                 body,
                 is_async,
                 is_generator,
+                is_worker,
+                span,
                 ..
             } => {
+                // `worker async fn` is not a valid combination (a worker already returns
+                // an awaitable future, so `async` is redundant). `worker fn*` IS valid
+                // (Spec B Task 6: a streaming generator running in a dedicated isolate) —
+                // its is_worker/is_generator flags route the CALL to the streaming driver.
+                if *is_worker && *is_async {
+                    return Err(Control::Panic(AsError::at(
+                        "worker functions cannot be async (a worker already returns an awaitable future; combine worker with fn* for a streaming generator, not async)".to_string(),
+                        *span,
+                    )));
+                }
                 let func = Value::Function(std::rc::Rc::new(crate::value::Function {
                     name: Some(name.clone()),
                     params: params.clone(),
@@ -2370,6 +2742,7 @@ impl Interp {
                     closure: env.clone(),
                     is_async: *is_async,
                     is_generator: *is_generator,
+                    is_worker: *is_worker,
                 }));
                 env.define(name, func, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -2400,6 +2773,7 @@ impl Interp {
                 superclass,
                 fields,
                 methods,
+                is_worker,
                 ..
             } => {
                 let parent = match superclass {
@@ -2452,6 +2826,7 @@ impl Interp {
                         body: m.body.clone(),
                         is_async: m.is_async,
                         is_generator: m.is_generator,
+                        is_worker: m.is_worker,
                     });
                     if m.is_static {
                         // `from` is reserved on classes (collides with the built-in
@@ -2476,6 +2851,7 @@ impl Interp {
                     methods: method_map,
                     static_methods: static_method_map,
                     def_env: env.clone(),
+                    is_worker: *is_worker,
                 }));
                 env.define(name, class, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -2641,6 +3017,8 @@ impl Interp {
                     closure: env.clone(),
                     is_async: *is_async,
                     is_generator: *is_generator,
+                    // Arrows are never `worker` (no `worker` arrow syntax).
+                    is_worker: false,
                 })))
             }
             ExprKind::Array(items) => {
@@ -3098,6 +3476,32 @@ impl Interp {
                             self.call_workflow_ctx(name, &wargs, expr.span).await?,
                             false,
                         ));
+                    }
+                    // Workers Spec B §Task 5: `WorkerClass.spawn(args)` → spawn an
+                    // actor isolate, return `future<handle>`. SAME call-site-hook
+                    // style as schema/ctx: receiver first, then args. A bare
+                    // `WorkerClass(args)` (construction) is UNCHANGED — only the
+                    // `.spawn` member-call on a `worker class` is intercepted.
+                    if let Value::Class(c) = &recv {
+                        if c.is_worker && name == "spawn" {
+                            let values = self.eval_call_args(args, env).await?;
+                            return Ok((self.spawn_actor(c, values, expr.span).await?, false));
+                        }
+                    }
+                    // Actor-handle async method dispatch: a member-CALL on a
+                    // `Value::Native(WorkerActor)` sends an `ActorMsg::Call` and
+                    // returns `future<T>`. Intercept here (call-position) so the
+                    // fallback member-read does not see a missing method.
+                    if let Value::Native(n) = &recv {
+                        if n.kind == crate::value::NativeKind::WorkerActor {
+                            // `close` is a host-side teardown method (synchronous),
+                            // everything else is an async actor message.
+                            let values = self.eval_call_args(args, env).await?;
+                            return Ok((
+                                self.actor_handle_call(n, name, values, expr.span).await?,
+                                false,
+                            ));
+                        }
                     }
                     // Fallback — byte-for-byte with the prior
                     // `eval_chain(callee) → eval_args → call_value` path: read
@@ -3700,6 +4104,22 @@ impl Interp {
         // the future is `'static`. The body's `yield` finds this generator via the
         // current-generator stack that `resume` maintains while polling. Both sync
         // and async generators take this path (the body may itself `await`).
+        // A `worker fn*` (Spec B Task 6) is a STREAMING generator: its body runs in a
+        // DEDICATED isolate and is consumed via a cross-thread demand-driven driver.
+        // This precedes the local-generator branch (a `worker fn*` has BOTH flags) and
+        // the `worker fn` branch (a streaming worker is not a request/response worker).
+        // Inline-nesting (a `worker fn*` called from inside an isolate) is NOT special-
+        // cased — it spawns a nested dedicated isolate (a generator inside a worker is a
+        // rare composition; correctness over the extra thread).
+        if func.is_worker && func.is_generator {
+            let entry_name = func.name.clone().ok_or_else(|| {
+                Control::Panic(AsError::at(
+                    "worker fn* must be a named top-level function".to_string(),
+                    span,
+                ))
+            })?;
+            return self.spawn_worker_stream(&entry_name, args, span).await;
+        }
         if func.is_generator {
             let vm = self.rc();
             let func = func.clone();
@@ -3710,6 +4130,30 @@ impl Interp {
             return Ok(Value::Generator(Rc::new(
                 crate::coro::GeneratorHandle::new(body),
             )));
+        }
+        // A `worker fn` is dispatched to a pooled isolate (Workers Spec A): build the
+        // shippable code slice from the entry program's source and hand the args +
+        // slice over a `Send` byte channel; the returned `Value::Future` resolves with
+        // the worker's result. Only bytes cross threads — the `!Send` runtime stays on
+        // this thread. Inline-nesting (a worker fn called from inside an isolate) is
+        // handled inside `dispatch_worker`. A worker fn cannot also be `async`/`fn*`
+        // (the surface form has no such combination), so this precedes those branches.
+        if func.is_worker {
+            let entry_name = func
+                .name
+                .clone()
+                .ok_or_else(|| Control::Panic(AsError::at(
+                    "worker fn must be a named top-level function".to_string(),
+                    span,
+                )))?;
+            // Inline-nesting: a worker fn called from inside an isolate runs locally
+            // (no pool round-trip, no slice build) — the entry is already a global.
+            if crate::worker::pool::in_isolate() {
+                return crate::worker::dispatch_worker_inline(self, &entry_name, args, span);
+            }
+            let slice =
+                crate::worker::build_code_slice_from_source(self, &entry_name, None)?;
+            return crate::worker::dispatch_worker(self, slice, args, span);
         }
         // A script `async fn` is scheduled eagerly: build the body future, spawn it
         // onto the current-thread LocalSet, and hand back a `Value::Future`
@@ -4105,6 +4549,20 @@ impl Interp {
         name: &str,
     ) -> Result<Value, Control> {
         let call_env = defining.def_env.child();
+        // A `static worker fn` dispatches to a pooled isolate (Workers Spec A). The
+        // entry global is the bare method name; the code slice carries the class name
+        // for diagnostics + future class binding.
+        if method.is_worker {
+            if crate::worker::pool::in_isolate() {
+                return crate::worker::dispatch_worker_inline(self, name, args, span);
+            }
+            let slice = crate::worker::build_code_slice_for_static_method_from_source(
+                self,
+                &defining.name,
+                name,
+            )?;
+            return crate::worker::dispatch_worker(self, slice, args, span);
+        }
         if method.is_generator {
             let vm = self.rc();
             let m = method.clone();
@@ -5910,6 +6368,8 @@ print(y)
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });

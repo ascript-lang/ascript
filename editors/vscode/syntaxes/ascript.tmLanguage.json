@@ -115,7 +115,7 @@
         },
         {
           "name": "storage.modifier.ascript",
-          "match": "\\b(static|async)\\b"
+          "match": "\\b(static|worker|async)\\b"
         }
       ]
     },

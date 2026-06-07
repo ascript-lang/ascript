@@ -538,6 +538,66 @@ fn repl_vm_buffers_multiline_input() {
     assert!(out.contains('5'), "multiline buffering; stdout: {out:?}");
 }
 
+/// Regression: a `worker fn` defined across multiple buffered lines (brace-delimited
+/// — `worker` is a contextual keyword, so `is_incomplete` sees only the `{`/`}` tokens
+/// and buffers correctly) must persist in the session and be callable on a later REPL
+/// input.  This guards against `worker_source` not being set in the REPL, which would
+/// produce "program source is unavailable" at call time.
+#[test]
+fn repl_accepts_multiline_worker_fn_and_calls_it() {
+    // Lines 1–3 buffer as one input (open `{`…`}`); line 4 is a separate input.
+    let input = "worker fn sq(n) {\n  return n * n\n}\nprint(await sq(6))\n";
+    let (out, err) = run_repl_session(input, false);
+    assert!(out.contains("36"), "expected 36; stdout: {out:?}  stderr: {err:?}");
+}
+
+/// Regression (Spec B Task 10): a `worker class` defined across multiple buffered REPL
+/// lines (brace-delimited — the `worker` keyword is contextual, so `is_incomplete` only
+/// sees `{`/`}` tokens and buffers correctly) must persist in the session and be usable
+/// on subsequent REPL inputs: `spawn`, method calls, and `close` all round-trip through
+/// the same session-accumulated `worker_source`.  Guards against the actor dispatch not
+/// seeing the class definition when it recompiles the source slice in a fresh isolate.
+#[test]
+fn repl_accepts_multiline_worker_class_and_calls_method() {
+    // Lines 1–4 buffer as one input (open `{`…`}`); subsequent lines are separate inputs.
+    let input = concat!(
+        "worker class Counter {\n",
+        "  n: number = 0\n",
+        "  fn inc(): number { self.n = self.n + 1; return self.n }\n",
+        "}\n",
+        "let c = await Counter.spawn()\n",
+        "print(await c.inc())\n",
+        "print(await c.inc())\n",
+        "c.close()\n",
+    );
+    let (out, err) = run_repl_session(input, false);
+    assert!(
+        out.contains("1\n2"),
+        "expected incremented counter; stdout: {out:?}  stderr: {err:?}"
+    );
+}
+
+/// Regression (Spec B Task 10): a `worker fn*` streaming generator defined across multiple
+/// buffered REPL lines must persist in the session scope and stream values via `for await`
+/// on a subsequent REPL input.  Mirrors the `worker fn` regression from Plan A Task 13 but
+/// exercises the streaming path.
+#[test]
+fn repl_accepts_multiline_worker_gen_and_streams_it() {
+    // Lines 1–3 buffer as one input (open `{`…`}`); lines 4–5 are separate inputs.
+    let input = concat!(
+        "worker fn* count(n) {\n",
+        "  for (i in 1..=n) { yield i * 10 }\n",
+        "}\n",
+        "let g = count(3)\n",
+        "for await (x in g) { print(x) }\n",
+    );
+    let (out, err) = run_repl_session(input, false);
+    assert!(
+        out.contains("10") && out.contains("20") && out.contains("30"),
+        "expected 10/20/30 from stream; stdout: {out:?}  stderr: {err:?}"
+    );
+}
+
 #[test]
 fn repl_tree_walker_flag_still_works() {
     let (out, _) = run_repl_session("let x = 21\nx * 2\n", true);
@@ -2246,4 +2306,279 @@ fn single_module_panic_provenance_unchanged() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Workers Spec A (Task 8): isolate pool + worker fn dispatch over both engines.
+// ---------------------------------------------------------------------------
+
+/// Write `src` to a unique temp `.as` file and run it via `ascript run`, optionally
+/// on the tree-walker and/or with extra env vars. Returns trimmed stdout; asserts the
+/// process succeeded.
+fn run_worker_program(src: &str, tree_walker: bool, env: &[(&str, &str)]) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let tag = if tree_walker { "tw" } else { "vm" };
+    // A process-unique, monotonically-increasing counter makes the temp path
+    // collision-proof across PARALLEL test threads (a nanosecond timestamp can
+    // collide, letting one test remove a file another's subprocess is still reading).
+    let file = std::env::temp_dir().join(format!(
+        "ascript_worker_{}_{}_{}.as",
+        tag,
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&file, src).unwrap();
+    let mut cmd = Command::new(bin);
+    cmd.arg("run");
+    if tree_walker {
+        cmd.arg("--tree-walker");
+    }
+    cmd.arg(&file);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "process failed ({tag}): stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn worker_parallel_map_runs() {
+    let src = r#"
+        import * as array from "std/array"
+        import { gather } from "std/task"
+        worker fn sq(n) { return n * n }
+        let fs = array.map([1, 2, 3, 4], sq)
+        let r = await gather(fs)
+        print(r)
+    "#;
+    // Both engines must agree (byte-identical behavior).
+    assert_eq!(run_worker_program(src, false, &[]), "[1, 4, 9, 16]");
+    assert_eq!(run_worker_program(src, true, &[]), "[1, 4, 9, 16]");
+}
+
+#[test]
+fn no_worker_program_starts_no_pool() {
+    // A program with zero worker fns must still run normally (lazy-pool: the unit
+    // proof lives in src/worker/pool.rs; this confirms no regression).
+    let src = "print(1 + 1)";
+    assert_eq!(run_worker_program(src, false, &[]), "2");
+    assert_eq!(run_worker_program(src, true, &[]), "2");
+}
+
+#[test]
+fn worker_single_await_returns_value() {
+    let src = r#"
+        worker fn sq(n) { return n * n }
+        print(await sq(9))
+    "#;
+    assert_eq!(run_worker_program(src, false, &[]), "81");
+    assert_eq!(run_worker_program(src, true, &[]), "81");
+}
+
+#[test]
+fn worker_uses_transitive_top_level_deps() {
+    // The shipped code slice must include `helper` and const `K` that `sq` uses.
+    let src = r#"
+        const K = 100
+        fn helper(x) { return x + K }
+        worker fn sq(n) { return helper(n * n) }
+        print(await sq(3))
+    "#;
+    assert_eq!(run_worker_program(src, false, &[]), "109");
+    assert_eq!(run_worker_program(src, true, &[]), "109");
+}
+
+#[test]
+fn oversubscription_completes_via_queue() {
+    // More calls than the pool cap; all must complete (queues drain).
+    let src = r#"
+        import * as array from "std/array"
+        import * as math from "std/math"
+        import { gather } from "std/task"
+        worker fn sq(n) { return n * n }
+        let nums = []
+        for n in 1..=20 { array.push(nums, n) }
+        let fs = array.map(nums, sq)
+        print(math.sum(await gather(fs)))
+    "#;
+    // 1^2 + .. + 20^2 = 2870
+    assert_eq!(
+        run_worker_program(src, false, &[("ASCRIPT_WORKERS", "2")]),
+        "2870"
+    );
+}
+
+#[test]
+fn nested_worker_runs_inline_no_deadlock() {
+    let src = r#"
+        worker fn inner(n) { return n + 1 }
+        worker fn outer(n) { return await inner(n) * 2 }
+        print(await outer(10))
+    "#;
+    // (10+1)*2 = 22, no deadlock even at pool size 1 (nested runs inline).
+    assert_eq!(
+        run_worker_program(src, false, &[("ASCRIPT_WORKERS", "1")]),
+        "22"
+    );
+}
+
+#[test]
+fn static_worker_method_parallel_map_runs() {
+    // Spec A `static worker fn`: the static method body is shipped as a standalone
+    // entry fn (no `self`) + its transitive top-level deps. Mirrors
+    // worker_parallel_map_runs. ASCRIPT_WORKERS=2 keeps virtual-memory pressure low.
+    let src = r#"
+        import * as array from "std/array"
+        import { gather } from "std/task"
+        class Img { static worker fn sq(n) { return n * n } }
+        let fs = array.map([1, 2, 3, 4], Img.sq)
+        print(await gather(fs))
+    "#;
+    assert_eq!(
+        run_worker_program(src, false, &[("ASCRIPT_WORKERS", "2")]),
+        "[1, 4, 9, 16]"
+    );
+    assert_eq!(
+        run_worker_program(src, true, &[("ASCRIPT_WORKERS", "2")]),
+        "[1, 4, 9, 16]"
+    );
+}
+
+// Workers Spec A (Task 9): cancel-on-drop, panic propagation, result pairs, sendability.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_panic_is_recoverable_on_caller() {
+    // A worker fn that panic()s must produce a recoverable error on the caller,
+    // catchable via recover(). The result is an error pair [nil, err].
+    let src = r#"
+        worker fn boom(n) { panic("kaboom " + n) }
+        let r = recover(() => await boom(7))
+        print(r[1] != nil)
+    "#;
+    assert_eq!(run_worker_program(src, false, &[]), "true");
+}
+
+#[test]
+fn worker_result_pair_crosses_as_data() {
+    // A worker fn that returns [value, nil] ships the pair as ordinary data
+    // through WorkerReply::Ok; `?` propagation works on the awaited result.
+    // Uses the builtin `len` function (not a method — s.len() doesn't exist).
+    let src = r#"
+        worker fn parse(s) { return [len(s), nil] }
+        let r = await parse("abcd")?
+        print(r)
+    "#;
+    assert_eq!(run_worker_program(src, false, &[]), "4");
+}
+
+#[test]
+fn sendability_violation_reports_field_path() {
+    // Passing a non-sendable value (a function) nested in an object must produce
+    // a recoverable panic whose message contains the field path.
+    let src = r#"
+        worker fn f(o) { return 1 }
+        let cb = () => 1
+        let obj = {cb: cb}
+        let r = recover(() => await f(obj))
+        print(r[1].message)
+    "#;
+    let out = run_worker_program(src, false, &[]);
+    assert!(
+        out.contains("cannot be sent to a worker at"),
+        "expected sendability message, got: {out}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spec A: `worker async fn` and `worker fn*` are invalid modifier combos
+// and must be rejected (not silently dropped) on BOTH engines.
+// ---------------------------------------------------------------------------
+
+/// Run `src` on the given engine and return (success, combined output).
+/// Used to check programs that must FAIL.
+fn run_worker_program_raw(src: &str, tree_walker: bool) -> (bool, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ2: AtomicU64 = AtomicU64::new(0);
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let tag = if tree_walker { "tw" } else { "vm" };
+    let file = std::env::temp_dir().join(format!(
+        "ascript_worker_invalid_{}_{}_{}.as",
+        tag,
+        std::process::id(),
+        SEQ2.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&file, src).unwrap();
+    let mut cmd = Command::new(bin);
+    cmd.arg("run");
+    if tree_walker {
+        cmd.arg("--tree-walker");
+    }
+    cmd.arg(&file);
+    let out = cmd.output().unwrap();
+    let _ = std::fs::remove_file(&file);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), combined)
+}
+
+#[test]
+fn worker_async_fn_is_rejected_on_both_engines() {
+    // `worker async fn` must fail on BOTH engines with the expected message.
+    // The parser accepts both flags (permissive parsing); the semantic layer rejects.
+    let src = "worker async fn g() { return 2 }\nprint(await g())\n";
+    let expected = "worker functions cannot be async";
+
+    let (ok_vm, out_vm) = run_worker_program_raw(src, false);
+    assert!(
+        !ok_vm,
+        "VM must reject `worker async fn` but it succeeded; output: {out_vm}"
+    );
+    assert!(
+        out_vm.contains(expected),
+        "VM error must contain expected message; output: {out_vm}"
+    );
+
+    let (ok_tw, out_tw) = run_worker_program_raw(src, true);
+    assert!(
+        !ok_tw,
+        "tree-walker must reject `worker async fn` but it succeeded; output: {out_tw}"
+    );
+    assert!(
+        out_tw.contains(expected),
+        "tree-walker error must contain expected message; output: {out_tw}"
+    );
+}
+
+#[test]
+fn worker_generator_fn_streams_on_both_engines() {
+    // Spec B Task 6: `worker fn*` is a VALID streaming generator running in a
+    // dedicated isolate. It yields its ordered sequence transparently via `for await`,
+    // byte-identically on BOTH engines.
+    let src = "worker fn* records(n) { for (i in 1..=n) { yield i * 10 } }\n\
+               async fn main() { for await (r in records(3)) { print(r) } }\n\
+               await main()\n";
+
+    let (ok_vm, out_vm) = run_worker_program_raw(src, false);
+    assert!(ok_vm, "VM must stream `worker fn*`; output: {out_vm}");
+    assert_eq!(out_vm, "10\n20\n30\n", "VM streamed sequence");
+
+    let (ok_tw, out_tw) = run_worker_program_raw(src, true);
+    assert!(
+        ok_tw,
+        "tree-walker must stream `worker fn*`; output: {out_tw}"
+    );
+    assert_eq!(out_tw, "10\n20\n30\n", "tree-walker streamed sequence");
 }

@@ -26,6 +26,9 @@
   "import" "export" "from" "as"
 ] @keyword
 
+(worker_keyword) @keyword
+(static_keyword) @keyword
+
 ; ----- Operators -------------------------------------------------------------
 [
   "+" "-" "*" "/" "%" "**"

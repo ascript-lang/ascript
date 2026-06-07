@@ -1,0 +1,7 @@
+# exit: none
+10
+32
+42
+not found: missing
+caught panic: key must be non-empty
+true

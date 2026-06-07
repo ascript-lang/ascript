@@ -1,9 +1,11 @@
 # Async, Concurrency & Generators
 
-AScript runs on a **single-threaded cooperative event loop** (a current-thread Tokio
-`LocalSet`). There is no parallelism and no shared-memory data races, so concurrent code
-needs no locks — values are plain `Rc`/`RefCell` under the hood. Concurrency comes from
-*interleaving at `await` points*, and lazy iteration comes from *generators*.
+AScript runs on a **single-threaded cooperative event loop per isolate** (a current-thread Tokio
+`LocalSet`). Within an isolate there is no shared-memory parallelism and no data races, so
+concurrent code needs no locks — values are plain `Rc`/`RefCell` under the hood. Concurrency comes
+from *interleaving at `await` points*, and lazy iteration comes from *generators*. For multi-core
+parallelism, run work in separate shared-nothing isolates — see
+[Workers & parallelism](../language/workers).
 
 ## async / await
 
@@ -357,8 +359,9 @@ This is the shape used to re-stream LLM/SSE tokens through transformations to a 
 
 ## Model notes & limits
 
-- **Single-threaded:** no data races; shared mutable state needs no locks. CPU-bound work in a
-  handler blocks the loop — offload heavy work, keep handlers I/O-bound.
+- **Single-threaded per isolate:** no data races; shared mutable state needs no locks. CPU-bound
+  work in a handler blocks the loop — offload heavy work to a [worker](../language/workers) (a
+  shared-nothing isolate on another core), keep handlers I/O-bound.
 - **Cancel-on-drop:** an un-awaited, un-held async call is cancelled; use `task.spawn` for
   fire-and-forget. `race` cancels losers; `timeout` cancels the timed-out work. Memory is
   bounded by construction.

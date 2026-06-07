@@ -288,6 +288,9 @@ pub struct Method {
     pub body: Vec<Stmt>,
     pub is_async: bool,
     pub is_generator: bool,
+    /// `worker fn` / `static worker fn` — Spec A: dispatched to a pooled isolate,
+    /// returns `future<T>`. Tree-walker reads this on the static-method call path.
+    pub is_worker: bool,
 }
 
 #[derive(Clone)]
@@ -307,6 +310,11 @@ pub struct Class {
     /// receiver; inherited up the superclass chain like instance methods.
     pub static_methods: IndexMap<String, Rc<Method>>,
     pub def_env: Environment,
+    /// Workers Spec B: this class was declared `worker class`. A `worker class` is
+    /// spawned into a dedicated isolate via `ClassName.spawn(args)` (returns
+    /// `future<handle>`); a bare `ClassName(args)` still builds a LOCAL instance.
+    /// Set from the AST/CST `is_worker` flag on both engines.
+    pub is_worker: bool,
 }
 
 pub struct Instance {
@@ -462,6 +470,13 @@ pub enum NativeKind {
     // ai.generate's `tools:` map. Feature `ai`.
     #[cfg(feature = "ai")]
     AiTool,
+    // Workers Spec B §Task 5: a `worker class` ACTOR proxy handle. The actor
+    // instance lives in a dedicated isolate; this handle's method calls become FIFO
+    // mailbox messages over a `Send` channel. Backed by `ResourceState::WorkerActor`
+    // (the outbound sender + the `IsolateHandle`, whose `Drop` tears the isolate
+    // down). Not feature-gated — `worker` is core syntax. Readable field: the
+    // declared class `name`.
+    WorkerActor,
 }
 
 impl NativeKind {
@@ -511,6 +526,7 @@ impl NativeKind {
             NativeKind::AiTextStream => "aiTextStream",
             #[cfg(feature = "ai")]
             NativeKind::AiTool => "aiTool",
+            NativeKind::WorkerActor => "workerActor",
         }
     }
 }
@@ -598,6 +614,9 @@ pub struct Function {
     pub closure: Environment,
     pub is_async: bool,
     pub is_generator: bool,
+    /// `worker fn` — Spec A: dispatched to a pooled isolate, returns `future<T>`.
+    /// The tree-walker reads this in `call_function` to route to the worker pool.
+    pub is_worker: bool,
 }
 
 #[derive(Clone)]
@@ -993,6 +1012,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -1018,6 +1039,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         }));
@@ -1039,6 +1062,7 @@ mod tests {
             closure: Environment::global(),
             is_async: false,
             is_generator: false,
+            is_worker: false,
         })
     }
 

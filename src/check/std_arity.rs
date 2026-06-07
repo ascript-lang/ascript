@@ -49,6 +49,8 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/math", "sqrt") => 1,
         // std/math — two required numeric args.
         ("std/math", "pow") => 2,
+        // std/task — pipe requires exactly 2 args (generator + event bus).
+        ("std/task", "pipe") => 2,
         _ => return None,
     };
     Some(n)
@@ -93,6 +95,7 @@ mod tests {
             ("std/math", "sign"),
             ("std/math", "sqrt"),
             ("std/math", "pow"),
+            ("std/task", "pipe"),
         ];
         for (module, name) in keys {
             // The entry must actually be in the table.

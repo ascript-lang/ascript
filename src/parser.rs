@@ -82,12 +82,22 @@ impl<'a> Parser<'a> {
             Tok::While => self.while_stmt(),
             Tok::For => self.for_stmt(),
             Tok::Return => self.return_stmt(),
-            Tok::Fn => self.fn_decl(false),
+            // `worker fn` / `worker async fn` / `worker class` — contextual keyword like `async`.
+            Tok::Ident(s) if s == "worker" && matches!(self.peek_nth(1), Tok::Fn | Tok::Async | Tok::Class) => {
+                self.advance(); // consume contextual `worker`
+                if *self.peek() == Tok::Class {
+                    self.class_decl_inner(true)
+                } else {
+                    let is_async = if *self.peek() == Tok::Async { self.advance(); true } else { false };
+                    self.fn_decl(is_async, true)
+                }
+            }
+            Tok::Fn => self.fn_decl(false, false),
             // `async fn` is a declaration; `async (…) =>` / `async x =>` are
             // arrow expressions, handled by the expression path below.
             Tok::Async if self.tokens[self.pos + 1].tok == Tok::Fn => {
                 self.advance(); // consume `async`
-                self.fn_decl(true)
+                self.fn_decl(true, false)
             }
             Tok::Enum => self.enum_decl(),
             Tok::Class => self.class_decl(),
@@ -177,7 +187,7 @@ impl<'a> Parser<'a> {
         let inner = match self.peek() {
             Tok::Let => self.let_stmt(true)?,
             Tok::Const => self.let_stmt(false)?,
-            Tok::Fn => self.fn_decl(false)?,
+            Tok::Fn => self.fn_decl(false, false)?,
             Tok::Async => {
                 self.advance(); // consume `async`
                 if *self.peek() != Tok::Fn {
@@ -186,7 +196,17 @@ impl<'a> Parser<'a> {
                         self.span(),
                     ));
                 }
-                self.fn_decl(true)?
+                self.fn_decl(true, false)?
+            }
+            // `export worker fn` / `export worker async fn` / `export worker class`
+            Tok::Ident(s) if s == "worker" && matches!(self.peek_nth(1), Tok::Fn | Tok::Async | Tok::Class) => {
+                self.advance(); // consume contextual `worker`
+                if *self.peek() == Tok::Class {
+                    self.class_decl_inner(true)?
+                } else {
+                    let is_async = if *self.peek() == Tok::Async { self.advance(); true } else { false };
+                    self.fn_decl(is_async, true)?
+                }
             }
             Tok::Class => self.class_decl()?,
             Tok::Enum => self.enum_decl()?,
@@ -215,7 +235,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn fn_decl(&mut self, is_async: bool) -> Result<Stmt, AsError> {
+    fn fn_decl(&mut self, is_async: bool, is_worker: bool) -> Result<Stmt, AsError> {
         let start = self.span().start; // at the `fn` keyword
         self.eat(&Tok::Fn)?;
         // `fn*` / `async fn*` — a generator declaration. The `*` immediately
@@ -252,6 +272,7 @@ impl<'a> Parser<'a> {
             body,
             is_async,
             is_generator,
+            is_worker,
             span,
             name_span,
         })
@@ -311,6 +332,10 @@ impl<'a> Parser<'a> {
     }
 
     fn class_decl(&mut self) -> Result<Stmt, AsError> {
+        self.class_decl_inner(false)
+    }
+
+    fn class_decl_inner(&mut self, is_worker: bool) -> Result<Stmt, AsError> {
         let start = self.span().start;
         self.eat(&Tok::Class)?;
         let name_span = self.span();
@@ -347,16 +372,36 @@ impl<'a> Parser<'a> {
             if *self.peek() == Tok::RBrace {
                 break;
             }
-            // A member starting with `async` or `fn` is a method (optionally
-            // preceded by the soft keyword `static`); otherwise a field. `static`
-            // lexes as `Tok::Ident("static")`; it is a method modifier ONLY when
-            // directly followed by `fn`/`async`, so `static: T` stays a field.
-            let is_static_method = matches!(self.peek(), Tok::Ident(s) if s == "static")
+            // A member starting with `async`, `fn`, `worker`, or `static` (followed
+            // by `fn`/`async`/`worker`) is a method. `static` lexes as
+            // `Tok::Ident("static")`; it is a method modifier ONLY when directly
+            // followed by `fn`/`async`/`worker`, so `static: T` stays a field.
+            // Factor out the `static` peek to avoid calling `self.peek()` twice.
+            let at_static = matches!(self.peek(), Tok::Ident(s) if s == "static");
+            let is_static_method = at_static
+                && (matches!(self.peek_nth(1), Tok::Async | Tok::Fn)
+                    || matches!(self.peek_nth(1), Tok::Ident(s) if s == "worker")
+                        && matches!(self.peek_nth(2), Tok::Async | Tok::Fn));
+            // A bare `worker fn` / `worker async fn` at the start of a member.
+            let is_bare_worker_method = matches!(self.peek(), Tok::Ident(s) if s == "worker")
                 && matches!(self.peek_nth(1), Tok::Async | Tok::Fn);
-            if *self.peek() == Tok::Async || *self.peek() == Tok::Fn || is_static_method {
+            if *self.peek() == Tok::Async
+                || *self.peek() == Tok::Fn
+                || is_static_method
+                || is_bare_worker_method
+            {
                 let mstart = self.span().start;
                 let is_static = if is_static_method {
                     self.advance(); // consume the contextual `static`
+                    true
+                } else {
+                    false
+                };
+                // Optional contextual `worker` after optional `static`.
+                let is_worker = if matches!(self.peek(), Tok::Ident(s) if s == "worker")
+                    && matches!(self.peek_nth(1), Tok::Async | Tok::Fn)
+                {
+                    self.advance(); // consume `worker`
                     true
                 } else {
                     false
@@ -400,6 +445,7 @@ impl<'a> Parser<'a> {
                     body,
                     is_async,
                     is_generator,
+                    is_worker,
                     is_static,
                     span: mspan,
                     name_span: mname_span,
@@ -452,6 +498,7 @@ impl<'a> Parser<'a> {
             superclass,
             fields,
             methods,
+            is_worker,
             span,
             name_span,
         })
@@ -2175,6 +2222,65 @@ mod tests {
                 assert!(methods[0].is_generator);
             }
             other => panic!("expected a class with a generator method, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_worker_fn_decl() {
+        let p = parse(&lex("worker fn render(s) { return s }").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::Fn { name, is_worker, is_async, .. } => {
+                assert_eq!(name, "render");
+                assert!(*is_worker);
+                assert!(!*is_async);
+            }
+            other => panic!("expected Stmt::Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_is_contextual_not_reserved() {
+        assert!(parse(&lex("let worker = 5").unwrap()).is_ok());
+        assert!(parse(&lex("fn worker() { return 1 }").unwrap()).is_ok());
+    }
+
+    #[test]
+    fn parses_static_worker_method() {
+        let p = parse(&lex("class Img { static worker fn encode(px) { return px } }").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::Class { methods, .. } => {
+                assert!(methods[0].is_static);
+                assert!(methods[0].is_worker);
+            }
+            other => panic!("expected Stmt::Class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn worker_async_fn_sets_both_flags() {
+        let p = parse(&lex("worker async fn foo() { return 1 }").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::Fn { name, is_worker, is_async, .. } => {
+                assert_eq!(name, "foo");
+                assert!(*is_worker, "expected is_worker = true");
+                assert!(*is_async, "expected is_async = true");
+            }
+            other => panic!("expected Stmt::Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn export_worker_fn_has_is_worker() {
+        let p = parse(&lex("export worker fn bar() { return 2 }").unwrap()).unwrap();
+        match &p[0] {
+            Stmt::Export(inner) => match inner.as_ref() {
+                Stmt::Fn { name, is_worker, .. } => {
+                    assert_eq!(name, "bar");
+                    assert!(*is_worker, "expected exported fn to have is_worker = true");
+                }
+                other => panic!("expected Stmt::Fn inside export, got {other:?}"),
+            },
+            other => panic!("expected Stmt::Export, got {other:?}"),
         }
     }
 

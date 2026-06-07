@@ -93,7 +93,16 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   `by_value: bool`, serialized as a trailing u8 after the slot. The descriptor
 ///   layout changed (a v14 reader would mis-parse the extra byte), so older readers
 ///   must reject a v15 chunk and vice versa.
-pub const ASO_FORMAT_VERSION: u32 = 15;
+/// - 16: FnProto flags byte gained bit3 = is_worker (Workers Spec A).
+/// - 17: FnProto flags byte gained bit4 = owning_class_present; if set, a
+///   length-prefixed UTF-8 string follows the params/ret, carrying the
+///   enclosing class name for `static worker fn` methods. Required so the VM
+///   can route higher-order worker dispatch to
+///   `build_code_slice_for_static_method` instead of `build_code_slice`.
+/// - 18: the class template gained a `worker class` flag byte (Workers Spec B,
+///   `Class.is_worker`), written by `write_class` before the field list. Drives
+///   `ClassName.spawn(args)` actor routing on both engines.
+pub const ASO_FORMAT_VERSION: u32 = 18;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -727,8 +736,11 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
 
 fn write_proto(w: &mut Writer, p: &FnProto) -> Result<(), AsoError> {
     w.u8(p.arity);
-    let flags =
-        u8::from(p.has_rest) | (u8::from(p.is_async) << 1) | (u8::from(p.is_generator) << 2);
+    let flags = u8::from(p.has_rest)
+        | (u8::from(p.is_async) << 1)
+        | (u8::from(p.is_generator) << 2)
+        | (u8::from(p.is_worker) << 3)
+        | (u8::from(p.owning_class.is_some()) << 4);
     w.u8(flags);
     // params
     w.len(p.params.len());
@@ -737,6 +749,10 @@ fn write_proto(w: &mut Writer, p: &FnProto) -> Result<(), AsoError> {
     }
     // ret
     write_opt_type(w, p.ret.as_ref());
+    // owning_class (v17+): present only when bit4 is set
+    if let Some(cls) = &p.owning_class {
+        w.str(cls);
+    }
     // recursive chunk
     write_chunk(w, &p.chunk)
 }
@@ -747,12 +763,20 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
     let has_rest = flags & 1 != 0;
     let is_async = flags & 2 != 0;
     let is_generator = flags & 4 != 0;
+    let is_worker = flags & 8 != 0;
+    let has_owning_class = flags & 16 != 0;
     let n = r.len()?;
     let mut params = Vec::with_capacity(n);
     for _ in 0..n {
         params.push(read_param(r)?);
     }
     let ret = read_opt_type(r)?;
+    // owning_class (v17+): present when bit4 is set
+    let owning_class = if has_owning_class {
+        Some(Rc::from(r.str()?.as_str()))
+    } else {
+        None
+    };
     let chunk = read_chunk(r)?;
     Ok(FnProto {
         chunk,
@@ -760,6 +784,8 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
         has_rest,
         is_async,
         is_generator,
+        is_worker,
+        owning_class,
         params,
         ret,
     })
@@ -1407,6 +1433,8 @@ fn write_class(
     // `methods` empty, and `def_env = global_env()` placeholder. Serialize only
     // the name + field schemas; the rest is rebuilt as the same inert template.
     w.str(&c.name);
+    // Workers Spec B: the `worker class` flag (v18). One byte before the field list.
+    w.u8(u8::from(c.is_worker));
     w.len(c.fields.len());
     for (fname, schema) in &c.fields {
         w.str(fname);
@@ -1454,6 +1482,7 @@ fn write_field_default(
 /// consults) — preserving `.aso` round-trip idempotence for these defaults.
 fn read_class(r: &mut Reader) -> Result<(Class, Vec<(String, String)>), AsoError> {
     let name = r.str()?;
+    let is_worker = r.u8()? != 0;
     let n = r.len()?;
     let mut fields = indexmap::IndexMap::with_capacity(n);
     let mut sources: Vec<(String, String)> = Vec::new();
@@ -1487,6 +1516,7 @@ fn read_class(r: &mut Reader) -> Result<(Class, Vec<(String, String)>), AsoError
         // class template; see C6.
         static_methods: indexmap::IndexMap::new(),
         def_env: crate::interp::global_env(),
+        is_worker,
     };
     Ok((class, sources))
 }
@@ -1642,6 +1672,8 @@ mod tests {
             has_rest: false,
             is_async: false,
             is_generator: false,
+            is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -1761,6 +1793,139 @@ run()
             run_chunk(rt),
             "output differs after capture-by-value .aso round-trip"
         );
+    }
+
+    #[test]
+    fn proto_is_worker_survives_aso_roundtrip() {
+        // Guards v16: FnProto flags bit3 = is_worker must survive write_proto →
+        // read_proto. Uses the module-private Writer/Reader directly to test the
+        // codec in isolation (independent of the full Chunk round-trip).
+        let proto = FnProto {
+            chunk: Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: true,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+        };
+        let mut w = Writer::new();
+        write_proto(&mut w, &proto).unwrap();
+        let mut r = Reader::new(&w.buf);
+        let back = read_proto(&mut r).unwrap();
+        assert!(back.is_worker, "is_worker must survive the .aso round-trip");
+        // Also confirm the false case is still preserved.
+        let proto_false = FnProto {
+            is_worker: false,
+            owning_class: None,
+            ..FnProto {
+                chunk: Chunk::new(),
+                arity: 0,
+                has_rest: false,
+                is_async: false,
+                is_generator: false,
+                is_worker: false,
+                owning_class: None,
+                params: Vec::new(),
+                ret: None,
+            }
+        };
+        let mut w2 = Writer::new();
+        write_proto(&mut w2, &proto_false).unwrap();
+        let mut r2 = Reader::new(&w2.buf);
+        let back_false = read_proto(&mut r2).unwrap();
+        assert!(!back_false.is_worker, "is_worker=false must also be preserved");
+    }
+
+    #[test]
+    fn proto_owning_class_survives_aso_roundtrip() {
+        // Guards v17: FnProto flags bit4 = owning_class_present + trailing string
+        // must survive write_proto → read_proto (used by static worker fn dispatch).
+        let proto_with = FnProto {
+            chunk: Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: true,
+            owning_class: Some(Rc::from("Img")),
+            params: Vec::new(),
+            ret: None,
+        };
+        let mut w = Writer::new();
+        write_proto(&mut w, &proto_with).unwrap();
+        let mut r = Reader::new(&w.buf);
+        let back = read_proto(&mut r).unwrap();
+        assert_eq!(back.owning_class.as_deref(), Some("Img"),
+                   "owning_class must survive the .aso round-trip");
+
+        // None case: no extra bytes written.
+        let proto_none = FnProto {
+            chunk: Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: true,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+        };
+        let mut w2 = Writer::new();
+        write_proto(&mut w2, &proto_none).unwrap();
+        let mut r2 = Reader::new(&w2.buf);
+        let back_none = read_proto(&mut r2).unwrap();
+        assert!(back_none.owning_class.is_none(),
+                "owning_class=None must also be preserved");
+    }
+
+    #[test]
+    fn class_is_worker_survives_aso_roundtrip() {
+        // Guards v18: the runtime Class `is_worker` flag (a `worker class`) must
+        // survive write_class → read_class. This is what lets a compiled `.aso`
+        // recover the actor-class shape for `.aso`-mode actor spawn.
+        let sources: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+
+        let mk = |is_worker: bool| crate::value::Class {
+            name: "C".to_string(),
+            superclass: None,
+            fields: indexmap::IndexMap::new(),
+            methods: indexmap::IndexMap::new(),
+            static_methods: indexmap::IndexMap::new(),
+            def_env: crate::interp::global_env(),
+            is_worker,
+        };
+
+        // true case round-trips as true.
+        let mut w = Writer::new();
+        write_class(&mut w, &mk(true), &sources).unwrap();
+        let mut r = Reader::new(&w.buf);
+        let (back, _) = read_class(&mut r).unwrap();
+        assert!(back.is_worker, "Class.is_worker=true must survive the .aso round-trip");
+
+        // false case round-trips as false.
+        let mut w2 = Writer::new();
+        write_class(&mut w2, &mk(false), &sources).unwrap();
+        let mut r2 = Reader::new(&w2.buf);
+        let (back_false, _) = read_class(&mut r2).unwrap();
+        assert!(!back_false.is_worker, "Class.is_worker=false must also be preserved");
+    }
+
+    #[test]
+    fn worker_class_program_roundtrips_is_worker() {
+        // End-to-end: a `worker class` compiled to a full chunk must carry
+        // is_worker=true through a complete Chunk::to_bytes → from_bytes cycle (the
+        // class proto lives in the chunk's class-proto table).
+        let chunk = compile("worker class Counter { count: number = 0 }");
+        let restored = Chunk::from_bytes(&chunk.to_bytes().expect("serialize")).expect("decode");
+        let cp = restored
+            .class_protos
+            .iter()
+            .find(|cp| &*cp.class.name == "Counter")
+            .expect("Counter class proto present after round-trip");
+        assert!(cp.class.is_worker, "worker class must round-trip is_worker=true");
     }
 
     #[test]

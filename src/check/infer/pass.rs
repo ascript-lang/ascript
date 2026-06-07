@@ -798,10 +798,59 @@ impl<'a> Pass<'a> {
                     self.check_call_args(&fn_decl, arg_list, &name, env);
                     return self.fn_return_type(&fn_decl);
                 }
+            } else if callee.kind() == MemberExpr {
+                // Workers Spec B (Task 8):
+                // (1) `WorkerClass.spawn(args)` → `future<WorkerClass>`.
+                // (2) `handle.method(args)` where handle : WorkerClass → `future<method_ret>`.
+                if let Some(ty) = self.synth_member_call(callee, arg_list, env) {
+                    return ty;
+                }
             }
         }
         self.synth_arg_list(arg_list, env);
         CheckTy::Any
+    }
+
+    /// Synthesize a method call on a `MemberExpr` callee for the two worker
+    /// patterns (Spec B Task 8). Returns `Some(ty)` when recognized, else `None`
+    /// (falls through to the default `Any` path — gradual escape).
+    fn synth_member_call(
+        &mut self,
+        member: &ResolvedNode,
+        arg_list: Option<&ResolvedNode>,
+        env: &mut Env,
+    ) -> Option<CheckTy> {
+        let recv = member
+            .children()
+            .find(|c| crate::check::rules::is_expr_kind(c.kind()))?;
+        let method = member_name(member)?;
+
+        // Pattern (1): `WorkerClass.spawn(args)` — receiver is a NameRef naming a
+        // known worker class, method name is exactly "spawn".
+        if method == "spawn" && recv.kind() == SyntaxKind::NameRef {
+            let class_name = crate::syntax::resolve::ident_text(recv)?;
+            let cid = self.callee_class_id(recv, &class_name)?;
+            if self.table.is_worker_class(cid) {
+                self.synth_arg_list(arg_list, env);
+                return Some(CheckTy::Future(Box::new(CheckTy::Class(cid))));
+            }
+            // Not a worker class — fall through to default.
+            return None;
+        }
+
+        // Pattern (2): `handle.method(args)` — receiver has type `Class(cid)` for a
+        // known worker class. All methods synthesize `future<method_ret>`.
+        let recv_ty = self.synth(recv, env);
+        if let CheckTy::Class(cid) = recv_ty {
+            if self.table.is_worker_class(cid) {
+                self.synth_arg_list(arg_list, env);
+                let ret = self.table.method_return(cid, &method).unwrap_or(CheckTy::Any);
+                return Some(CheckTy::Future(Box::new(ret)));
+            }
+        }
+
+        // Not a recognized worker-call pattern.
+        None
     }
 
     fn synth_arg_list(&mut self, arg_list: Option<&ResolvedNode>, env: &mut Env) {
@@ -1074,7 +1123,7 @@ impl<'a> Pass<'a> {
             return CheckTy::Any; // a generator handle, not the declared scalar
         }
         let ret = self.fn_declared_or_inferred(fn_decl);
-        if is_async(fn_decl) {
+        if is_async(fn_decl) || is_worker(fn_decl) {
             CheckTy::Future(Box::new(ret))
         } else {
             ret
@@ -1355,6 +1404,14 @@ fn is_async(decl: &ResolvedNode) -> bool {
         .any(|t| t.kind() == SyntaxKind::AsyncKw)
 }
 
+/// Is this fn/method declared `worker` (carries a `WorkerKw` token)?
+/// A worker fn call, like an async fn call, synthesizes `future<T>`.
+fn is_worker(decl: &ResolvedNode) -> bool {
+    decl.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == SyntaxKind::WorkerKw)
+}
+
 /// Is this fn/method a generator (`fn*`/`async fn*` — carries a `Star` token at the
 /// decl level, before the param list)?
 fn is_generator(decl: &ResolvedNode) -> bool {
@@ -1607,5 +1664,144 @@ mod tests {
         // after `if (x == nil) { return 0 }` the tail sees x : number.
         let src = "fn f(x: number?): number {\n  if (x == nil) { return 0 }\n  let y = x + 1\n  return y\n}\n";
         assert!(!has(src, "possibly-nil"), "{:?}", analyze(src).diagnostics);
+    }
+
+    // ----- worker fn call synthesizes future<T> (SP workers Task 11) -----
+
+    #[test]
+    fn worker_call_infers_future_like_async() {
+        // Awaiting a worker fn yields the scalar; the inference must NOT flag a
+        // type-mismatch when the awaited number is used as a number.
+        let src = "
+            worker fn sq(n: number): number { return n * n }
+            fn use_it(): number { return await sq(3) }
+        ";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "worker fn awaited call produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn worker_call_unawaited_no_false_positive() {
+        // A non-awaited worker fn call (assigned to a let) must not cause
+        // type-mismatch or possibly-nil false positives.
+        let src = "
+            worker fn sq(n: number): number { return n * n }
+            let f = sq(3)
+        ";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "unawaited worker fn call produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    // ----- Spec B Task 8: worker class spawn + handle method + worker fn* -----
+
+    #[test]
+    fn infer_worker_spawn_synthesizes_future_of_class() {
+        // `WorkerClass.spawn(args)` must synthesize `future<WorkerClass>`.
+        // Awaiting it must unwrap to the class type; assigning to a non-class slot
+        // annotated as `string` must produce a type-mismatch (proving the type is
+        // NOT Any).
+        let src = "
+            worker class Db { fn query(): string { return \"ok\" } }
+            let handle_fut = Db.spawn()
+        ";
+        // No false type-* diagnostics on spawn itself.
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "Db.spawn() produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn infer_worker_spawn_await_no_false_positive() {
+        // `await Db.spawn()` unwraps the future; the handle must not cause
+        // false possibly-nil or type-mismatch errors.
+        let src = "
+            worker class Db { fn query(): string { return \"ok\" } }
+            let handle = await Db.spawn()
+            let result = await handle.query()
+        ";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "await Db.spawn() + handle.method produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn infer_actor_method_synthesizes_future_of_return_type() {
+        // A method call on a worker-class handle synthesizes `future<T>`.
+        // `await handle.query()` should unwrap to `string`; assigning to
+        // `let r: string = await handle.query()` must be silent.
+        let src = "
+            worker class Db { fn query(): string { return \"ok\" } }
+            fn use_db(): string {
+                let handle = await Db.spawn()
+                let r: string = await handle.query()
+                return r
+            }
+        ";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "actor method call produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn infer_actor_method_wrong_slot_emits_mismatch() {
+        // `await handle.query()` returns `string`; assigning to a `number` slot
+        // must produce type-mismatch (proving the type is NOT Any/opaque).
+        let src = "
+            worker class Db { fn query(): string { return \"ok\" } }
+            fn use_db(): number {
+                let handle = await Db.spawn()
+                let r: number = await handle.query()
+                return r
+            }
+        ";
+        assert!(
+            codes(src).iter().any(|c| c.starts_with("type-")),
+            "actor method return type mismatch was not flagged: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn infer_worker_gen_fn_no_false_positive() {
+        // A `worker fn*` call synthesizes the generator type (same as a local
+        // `fn*` — currently `Any`). Must emit ZERO type-* diagnostics.
+        let src = "
+            worker fn* stream(n: number) { for i in 1..=n { yield i } }
+            let gen = stream(5)
+        ";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "worker fn* call produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn non_worker_class_spawn_silent() {
+        // `Foo.spawn()` on a PLAIN (non-worker) class must stay silent (gradual
+        // escape — don't treat a normal class's `.spawn` method as actor spawn).
+        let src = "
+            class Foo { fn spawn(): string { return \"not an actor\" } }
+            let result = await Foo.spawn()
+        ";
+        // Must NOT produce type-* diagnostics — the spawn here is an ordinary
+        // method and we have no type info to flag.
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "non-worker Foo.spawn() produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
     }
 }

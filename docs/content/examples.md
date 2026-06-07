@@ -75,11 +75,13 @@ Short, single-concept programs in `examples/`:
 Robust, heavily-commented programs in `examples/advanced/` — each one handles every error path and is
 verified to run end-to-end.
 
-AScript runs on a **single-threaded cooperative event loop**: all async tasks share one OS thread, scheduled
-by the Tokio runtime. `std/task` provides `spawn` (fire-and-forget detach), `gather` (await all),
-`race` (first-wins, losers cancelled), and `timeout` — enabling structured concurrency patterns without
-multiple threads. Because everything is single-threaded, a full HTTP or WebSocket round-trip between a
-server and a client still requires **two separate processes**; see the networking section below.
+AScript runs on a **single-threaded cooperative event loop per isolate**: within one isolate all async
+tasks share one OS thread, scheduled by the Tokio runtime. `std/task` provides `spawn` (fire-and-forget
+detach), `gather` (await all), `race` (first-wins, losers cancelled), `timeout`, and `pipe` — enabling
+structured concurrency patterns without locks. (For multi-core parallelism, shared-nothing
+[workers](language/workers) run on separate isolates.) Because each isolate's event loop is
+single-threaded, a full HTTP or WebSocket round-trip between a server and a client still requires
+**two separate processes**; see the networking section below.
 
 ### Self-contained
 

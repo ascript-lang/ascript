@@ -24,7 +24,7 @@ use tower_lsp::lsp_types::{
 const KEYWORDS: &[&str] = &[
     "let", "const", "fn", "return", "if", "else", "while", "for", "of", "in", "match", "async",
     "await", "yield", "class", "enum", "import", "export", "nil", "true", "false", "break",
-    "continue",
+    "continue", "worker",
 ];
 
 /// The global builtins offered as completions (FUNCTION kind). Mirrors `builtin_doc`.

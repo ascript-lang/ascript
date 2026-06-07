@@ -2768,6 +2768,7 @@ mod tests {
             closure: crate::interp::global_env(),
             is_async: false,
             is_generator: false,
+            is_worker: false,
         };
         // Suppress unused import warning on CallArg
         let _ = CallArg::Pos(Expr {
@@ -2819,6 +2820,7 @@ mod tests {
             closure: crate::interp::global_env(),
             is_async: false,
             is_generator: false,
+            is_worker: false,
         };
         let fn_val = Value::Function(std::rc::Rc::new(func));
 
@@ -2880,6 +2882,7 @@ mod tests {
             closure: crate::interp::global_env(),
             is_async: false,
             is_generator: false,
+            is_worker: false,
         };
         let fn_val = Value::Function(std::rc::Rc::new(func));
 
