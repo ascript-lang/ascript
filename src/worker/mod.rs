@@ -31,9 +31,10 @@ impl Drop for InflightGuard {
 }
 
 pub use dispatch::{
-    build_class_slice, build_class_slice_from_source, build_code_slice,
-    build_code_slice_for_static_method, build_code_slice_for_static_method_from_source,
-    build_code_slice_from_source,
+    build_class_slice, build_class_slice_for_interp, build_class_slice_from_source,
+    build_code_slice, build_code_slice_for_static_method,
+    build_code_slice_for_static_method_from_source, build_code_slice_from_source,
+    build_stream_slice_for_interp,
 };
 pub use pool::pool_is_initialized;
 

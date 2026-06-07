@@ -1877,8 +1877,10 @@ impl Interp {
                 .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
         }
         // Build the class code slice (superclass chain + methods + defaults) from the
-        // program source — the SINGLE path shared by both engines.
-        let slice = crate::worker::build_class_slice_from_source(self, &class.name)?;
+        // program source — the SINGLE path shared by both engines — or, when running a
+        // compiled `.aso` (no source), from the stored `.aso` bytes (Plan A Task 15
+        // mechanism extended to actor spawn).
+        let slice = crate::worker::build_class_slice_for_interp(self, &class.name)?;
         // Encode the init args as one array (preserving cross-arg sharing).
         let args_array = Value::Array(crate::value::ArrayCell::new(args));
         let encoded = crate::worker::serialize::encode(&args_array)
@@ -2058,8 +2060,10 @@ impl Interp {
                 .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
         }
         // Build the `worker fn*` code slice (entry + transitive top-level deps) from the
-        // program source — the SINGLE path shared by both engines.
-        let slice = crate::worker::build_code_slice_from_source(self, entry_name, None)?;
+        // program source — the SINGLE path shared by both engines — or, when running a
+        // compiled `.aso` (no source), from the stored `.aso` bytes (Plan A Task 15
+        // mechanism extended to the worker-generator stream path).
+        let slice = crate::worker::build_stream_slice_for_interp(self, entry_name)?;
         // Encode the call args as one array (preserving cross-arg sharing).
         let args_array = Value::Array(crate::value::ArrayCell::new(args));
         let encoded = crate::worker::serialize::encode(&args_array)

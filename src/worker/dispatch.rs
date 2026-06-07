@@ -870,6 +870,69 @@ pub fn build_code_slice_for_static_method_from_source(
     build_code_slice_for_static_method(&top, class_name, method_name)
 }
 
+/// Resolve the top-level program [`Chunk`] for a worker slice build, mirroring the
+/// source-vs-`.aso`-bytes branch in [`crate::vm::Vm::dispatch_worker_closure`]
+/// (Plan A Task 15). Prefers recompiling the retained program SOURCE (the path
+/// shared by both engines for any run-from-source mode); falls back to re-parsing
+/// the stored `.aso` bytes (`Interp::worker_aso_bytes`, set by `run_aso_file`) when
+/// no source is recorded — the 4th execution mode (`ascript run x.aso`). Returns a
+/// recoverable `Control::Panic` (never `.expect`/`panic!`) when neither is available
+/// or the `.aso` is malformed. `what` describes the entity for the diagnostic
+/// (e.g. `"worker class 'C'"`).
+fn resolve_worker_top_chunk(
+    interp: &crate::interp::Interp,
+    what: &str,
+    require_kind: &str,
+) -> Result<Chunk, Control> {
+    if let Some(src) = interp.worker_source() {
+        return crate::compile::compile_source(&src)
+            .map_err(|e| Control::Panic(crate::error::AsError::at(e.message, e.span)));
+    }
+    if let Some(raw) = interp.worker_aso_bytes() {
+        return Chunk::from_bytes(&raw).map_err(|e| {
+            Control::Panic(crate::error::AsError::new(format!(
+                "cannot re-parse .aso for {what}: {e:?}"
+            )))
+        });
+    }
+    Err(Control::Panic(crate::error::AsError::new(format!(
+        "cannot dispatch {what}: the program source is unavailable \
+         ({require_kind} require running via `ascript run` or a compiled `.aso`)"
+    ))))
+}
+
+/// Build the `worker class` slice for `class_name`, resolving the top-level chunk
+/// from either retained source (run-from-source) or the stored `.aso` bytes
+/// (`ascript run x.aso`). Mirrors [`build_class_slice_from_source`] but adds the
+/// `.aso`-mode fallback (Plan A Task 15 mechanism extended to actor spawn).
+pub fn build_class_slice_for_interp(
+    interp: &crate::interp::Interp,
+    class_name: &str,
+) -> Result<WorkerCodeSlice, Control> {
+    let top = resolve_worker_top_chunk(
+        interp,
+        &format!("worker class '{class_name}'"),
+        "worker classes",
+    )?;
+    build_class_slice(&top, class_name)
+}
+
+/// Build the `worker fn*` stream slice for `entry_name`, resolving the top-level
+/// chunk from either retained source or the stored `.aso` bytes. Mirrors
+/// [`build_code_slice_from_source`] but adds the `.aso`-mode fallback (Plan A
+/// Task 15 mechanism extended to the worker-generator stream path).
+pub fn build_stream_slice_for_interp(
+    interp: &crate::interp::Interp,
+    entry_name: &str,
+) -> Result<WorkerCodeSlice, Control> {
+    let top = resolve_worker_top_chunk(
+        interp,
+        &format!("worker fn* '{entry_name}'"),
+        "worker generators",
+    )?;
+    build_code_slice(&top, entry_name, None)
+}
+
 /// Emit a value-producing instruction that pushes `v` onto the stack. Literal
 /// scalars use their dedicated ops where available (matching the compiler) and
 /// otherwise pool the value as a `CONST`. Only literal kinds reach here (a

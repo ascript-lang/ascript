@@ -1882,6 +1882,53 @@ run()
     }
 
     #[test]
+    fn class_is_worker_survives_aso_roundtrip() {
+        // Guards v18: the runtime Class `is_worker` flag (a `worker class`) must
+        // survive write_class → read_class. This is what lets a compiled `.aso`
+        // recover the actor-class shape for `.aso`-mode actor spawn.
+        let sources: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+
+        let mk = |is_worker: bool| crate::value::Class {
+            name: "C".to_string(),
+            superclass: None,
+            fields: indexmap::IndexMap::new(),
+            methods: indexmap::IndexMap::new(),
+            static_methods: indexmap::IndexMap::new(),
+            def_env: crate::interp::global_env(),
+            is_worker,
+        };
+
+        // true case round-trips as true.
+        let mut w = Writer::new();
+        write_class(&mut w, &mk(true), &sources).unwrap();
+        let mut r = Reader::new(&w.buf);
+        let (back, _) = read_class(&mut r).unwrap();
+        assert!(back.is_worker, "Class.is_worker=true must survive the .aso round-trip");
+
+        // false case round-trips as false.
+        let mut w2 = Writer::new();
+        write_class(&mut w2, &mk(false), &sources).unwrap();
+        let mut r2 = Reader::new(&w2.buf);
+        let (back_false, _) = read_class(&mut r2).unwrap();
+        assert!(!back_false.is_worker, "Class.is_worker=false must also be preserved");
+    }
+
+    #[test]
+    fn worker_class_program_roundtrips_is_worker() {
+        // End-to-end: a `worker class` compiled to a full chunk must carry
+        // is_worker=true through a complete Chunk::to_bytes → from_bytes cycle (the
+        // class proto lives in the chunk's class-proto table).
+        let chunk = compile("worker class Counter { count: number = 0 }");
+        let restored = Chunk::from_bytes(&chunk.to_bytes().expect("serialize")).expect("decode");
+        let cp = restored
+            .class_protos
+            .iter()
+            .find(|cp| &*cp.class.name == "Counter")
+            .expect("Counter class proto present after round-trip");
+        assert!(cp.class.is_worker, "worker class must round-trip is_worker=true");
+    }
+
+    #[test]
     fn double_roundtrip_is_stable() {
         let original = compile(COMPLEX);
         let once = Chunk::from_bytes(&original.to_bytes().expect("serialize")).expect("decode 1");

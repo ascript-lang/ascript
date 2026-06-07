@@ -442,3 +442,121 @@ await main()
 "#;
     assert_both_engines("bridge_slow", src, "[1, 2, 3]\n");
 }
+
+// ---------------------------------------------------------------------------
+// Task 11 — the 4th execution mode: a `worker class` actor AND a `worker fn*`
+// streaming generator must work when run from a COMPILED `.aso` file (no source
+// available). The slice is rebuilt from the stored `.aso` bytes
+// (`Interp::worker_aso_bytes`) — Plan A Task 15's mechanism extended to actor
+// spawn and the worker-generator stream path.
+// ---------------------------------------------------------------------------
+
+/// Build `src` to a `.aso` with `ascript build`, then run the `.aso` with
+/// `ascript run`. Returns (success, stdout, stderr) of the run step.
+fn build_then_run_aso(name: &str, src: &str) -> (bool, String, String) {
+    let dir = std::env::temp_dir();
+    let as_file = dir.join(format!("ascript_workers_aso_{name}.as"));
+    let aso_file = dir.join(format!("ascript_workers_aso_{name}.aso"));
+    std::fs::write(&as_file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+
+    let build = Command::new(bin)
+        .arg("build")
+        .arg(&as_file)
+        .arg("-o")
+        .arg(&aso_file)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "[build] failed: stderr={}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let run = Command::new(bin).arg("run").arg(&aso_file).output().unwrap();
+    (
+        run.status.success(),
+        String::from_utf8_lossy(&run.stdout).to_string(),
+        String::from_utf8_lossy(&run.stderr).to_string(),
+    )
+}
+
+#[test]
+fn aso_mode_worker_class_actor_spawn() {
+    // A `worker class` spawned + driven from a compiled `.aso` (no source on the
+    // Interp): the class slice is rebuilt from the stored `.aso` bytes.
+    let src = r#"
+worker class Counter {
+  n: number = 0
+  fn inc(): number { self.n = self.n + 1; return self.n }
+  fn get(): number { return self.n }
+}
+async fn main() {
+  let c = await Counter.spawn()
+  print(await c.inc())
+  print(await c.inc())
+  print(await c.get())
+  c.close()
+}
+await main()
+"#;
+    let (ok, out, err) = build_then_run_aso("counter", src);
+    assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "1\n2\n2\n", "[.aso run] stdout mismatch (stderr={err:?})");
+}
+
+#[test]
+fn aso_mode_worker_class_actor_with_init_args() {
+    // Init args ship to the isolate and `init` runs there — from a `.aso` too.
+    let src = r#"
+worker class Greeter {
+  prefix: string = ""
+  fn init(p) { self.prefix = p }
+  fn hello(name): string { return self.prefix + name }
+}
+async fn main() {
+  let g = await Greeter.spawn("Hi, ")
+  print(await g.hello("Ada"))
+  print(await g.hello("Bob"))
+  g.close()
+}
+await main()
+"#;
+    let (ok, out, err) = build_then_run_aso("greeter", src);
+    assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "Hi, Ada\nHi, Bob\n", "[.aso run] stdout mismatch (stderr={err:?})");
+}
+
+#[test]
+fn aso_mode_worker_generator_stream() {
+    // A `worker fn*` streamed from a compiled `.aso` (no source): the producer
+    // slice is rebuilt from the stored `.aso` bytes.
+    let src = r#"
+worker fn* records(n) { for (i in 1..=n) { yield i * 10 } }
+async fn main() {
+  for await (r in records(3)) { print(r) }
+}
+await main()
+"#;
+    let (ok, out, err) = build_then_run_aso("records", src);
+    assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "10\n20\n30\n", "[.aso run] stdout mismatch (stderr={err:?})");
+}
+
+#[test]
+fn aso_mode_worker_generator_bidirectional() {
+    // Bidirectional `next(v)` resume across the isolate boundary, from a `.aso`.
+    let src = r#"
+worker fn* echo() { let a = yield 1; let b = yield a + 100; yield b + 1000 }
+async fn main() {
+  let g = echo()
+  print(await g.next())
+  print(await g.next(5))
+  print(await g.next(7))
+}
+await main()
+"#;
+    let (ok, out, err) = build_then_run_aso("echo", src);
+    assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "1\n105\n1007\n", "[.aso run] stdout mismatch (stderr={err:?})");
+}
