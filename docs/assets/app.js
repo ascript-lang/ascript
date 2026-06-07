@@ -23,6 +23,7 @@ const NAV = [
     ['language/errors', 'Errors & results'],
     ['language/classes-enums', 'Classes, enums, match'],
     ['language/modules-async', 'Modules & async'],
+    ['language/workers', 'Workers & parallelism'],
   ]},
   { title: 'Standard library', items: [
     ['stdlib/overview', 'Overview'],
