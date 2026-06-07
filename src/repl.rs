@@ -117,6 +117,10 @@ async fn run_tty_vm(vm: &Rc<Vm>) -> std::io::Result<()> {
 
     let mut rl = DefaultEditor::new().map_err(|e| std::io::Error::other(e.to_string()))?;
     let mut buf = String::new();
+    // Accumulated session source for `worker fn` slice building: each completed
+    // line is appended here so `worker_source` always contains the full context
+    // needed to recompile a `worker fn` in an isolate.
+    let mut session_src = String::new();
     loop {
         let prompt = if buf.is_empty() { ">> " } else { ".. " };
         match rl.readline(prompt) {
@@ -129,7 +133,7 @@ async fn run_tty_vm(vm: &Rc<Vm>) -> std::io::Result<()> {
                     continue;
                 }
                 let _ = rl.add_history_entry(buf.as_str());
-                let exiting = eval_line_vm(vm, &buf).await;
+                let exiting = eval_line_vm(vm, &buf, &mut session_src).await;
                 buf.clear();
                 if exiting {
                     return Ok(());
@@ -161,6 +165,8 @@ async fn run_tty_vm(vm: &Rc<Vm>) -> std::io::Result<()> {
 async fn run_piped_vm(vm: &Rc<Vm>) -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let mut buf = String::new();
+    // Accumulated session source for `worker fn` slice building (see `eval_line_vm`).
+    let mut session_src = String::new();
     for line in stdin.lock().lines() {
         let line = line?;
         if !buf.is_empty() {
@@ -170,14 +176,14 @@ async fn run_piped_vm(vm: &Rc<Vm>) -> std::io::Result<()> {
         if is_incomplete(&buf) {
             continue;
         }
-        if eval_line_vm(vm, &buf).await {
+        if eval_line_vm(vm, &buf, &mut session_src).await {
             return Ok(());
         }
         buf.clear();
     }
     // EOF: surface any leftover (e.g. an input that never closed its delimiter).
     if !buf.trim().is_empty() {
-        eval_line_vm(vm, &buf).await;
+        eval_line_vm(vm, &buf, &mut session_src).await;
     }
     Ok(())
 }
@@ -190,7 +196,7 @@ async fn run_piped_vm(vm: &Rc<Vm>) -> std::io::Result<()> {
 /// reported and swallowed so the loop continues with the session scope intact (the
 /// per-line fiber is discarded; the `Vm` and its `user_globals` persist). Returns
 /// `true` when `exit()` was called and the loop should end.
-async fn eval_line_vm(vm: &Rc<Vm>, line: &str) -> bool {
+async fn eval_line_vm(vm: &Rc<Vm>, line: &str, session_src: &mut String) -> bool {
     if line.trim().is_empty() {
         return false;
     }
@@ -208,6 +214,18 @@ async fn eval_line_vm(vm: &Rc<Vm>, line: &str) -> bool {
             return false;
         }
     };
+
+    // Workers Spec A: keep `worker_source` up-to-date so a `worker fn` defined on
+    // an earlier REPL line can be recompiled into a code slice when called.  We
+    // append this (successfully compiled) line to the accumulated session source and
+    // record it on the interpreter.  We do this AFTER compilation succeeds (so
+    // syntax-invalid lines are not accumulated) but BEFORE running (so the source
+    // is available even when the line defines-then-calls a worker fn in one shot).
+    if !session_src.is_empty() {
+        session_src.push('\n');
+    }
+    session_src.push_str(line);
+    vm.interp().set_worker_source(session_src);
     let proto = Rc::new(FnProto {
         chunk,
         arity: 0,

@@ -218,8 +218,6 @@ impl Vm {
     }
 
     /// The shared interpreter state.
-    // used by V2+ (globals/native dispatch): no caller yet in V1.
-    #[allow(dead_code)]
     pub fn interp(&self) -> &Rc<Interp> {
         &self.interp
     }

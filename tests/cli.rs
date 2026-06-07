@@ -538,6 +538,19 @@ fn repl_vm_buffers_multiline_input() {
     assert!(out.contains('5'), "multiline buffering; stdout: {out:?}");
 }
 
+/// Regression: a `worker fn` defined across multiple buffered lines (brace-delimited
+/// — `worker` is a contextual keyword, so `is_incomplete` sees only the `{`/`}` tokens
+/// and buffers correctly) must persist in the session and be callable on a later REPL
+/// input.  This guards against `worker_source` not being set in the REPL, which would
+/// produce "program source is unavailable" at call time.
+#[test]
+fn repl_accepts_multiline_worker_fn_and_calls_it() {
+    // Lines 1–3 buffer as one input (open `{`…`}`); line 4 is a separate input.
+    let input = "worker fn sq(n) {\n  return n * n\n}\nprint(await sq(6))\n";
+    let (out, err) = run_repl_session(input, false);
+    assert!(out.contains("36"), "expected 36; stdout: {out:?}  stderr: {err:?}");
+}
+
 #[test]
 fn repl_tree_walker_flag_still_works() {
     let (out, _) = run_repl_session("let x = 21\nx * 2\n", true);
