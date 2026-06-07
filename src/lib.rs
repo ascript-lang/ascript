@@ -22,6 +22,7 @@ pub mod task;
 pub mod token;
 pub mod value;
 pub mod vm;
+pub mod worker;
 
 use crate::error::{AsError, SourceInfo};
 use crate::interp::Interp;

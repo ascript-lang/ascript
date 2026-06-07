@@ -469,7 +469,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `src/lib.rs` (add `pub mod worker;`)
 - Test: `src/worker/serialize.rs` `#[cfg(test)]`
 
-- [ ] **Step 1: Write the failing round-trip + rejection tests** — create `src/worker/serialize.rs` starting with tests:
+- [x] **Step 1: Write the failing round-trip + rejection tests** — create `src/worker/serialize.rs` starting with tests:
 
 ```rust
 #[cfg(test)]
@@ -554,11 +554,11 @@ mod tests {
 ```
 (Add a small `interp_eval_to_value(&Interp, &str) -> Value` test helper in this module — synchronously run a single-expr program via `crate::interp` and return the value; if no sync eval helper exists, gate these tests with `#[tokio::test]` and use `vm_run_source`-style plumbing, or build the `Value`s directly with the public constructors. Prefer direct `Value` construction where eval plumbing is heavy. `ptr_eq_cc` is illustrative — use the actual `Cc` identity check, `gcmodule`'s pointer compare.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
   Run: `cargo test --lib worker::serialize`
   Expected: FAIL — module/functions do not exist.
 
-- [ ] **Step 3: Implement `SendError`.** At the top of `src/worker/serialize.rs`:
+- [x] **Step 3: Implement `SendError`.** At the top of `src/worker/serialize.rs`:
 ```rust
 //! Structured-clone Value serializer (Workers Spec A §5). The airlock: only bytes
 //! cross threads — never a `Value`, never the `Interp`. Semantics follow the WHATWG
@@ -594,13 +594,13 @@ const CHANNEL_HINT: &str = "event emitters / channels are isolate-local; communi
 across workers via worker results (Spec A) or actor/generator messages (Spec B)";
 ```
 
-- [ ] **Step 4: Implement `check_sendable`.** A recursive walk building a path string; rejects `Value::Function`, `Value::Builtin`, `Value::BoundMethod`, `Value::NativeMethod`, `Value::Native` (append `CHANNEL_HINT` when the native is an events emitter or `std/sync` channel — detect by the `NativeObject` kind), `Value::Future`, `Value::Generator`, `Value::GeneratorMethod`, `Value::ClassMethod`, `Value::Class`, `Value::Enum`. Recurse into `Array`, `Object` (key in path: `.key`), `Map` (`["key"]`), `Set`, `Instance` (fields by name). Guard cycles with an identity `HashSet` of visited container pointers so `check_sendable` itself terminates. Path grammar: array `[i]`, object/instance `.name` (or `["name"]` if not an ident), map `["display(key)"]`.
+- [x] **Step 4: Implement `check_sendable`.** A recursive walk building a path string; rejects `Value::Function`, `Value::Builtin`, `Value::BoundMethod`, `Value::NativeMethod`, `Value::Native` (append `CHANNEL_HINT` when the native is an events emitter or `std/sync` channel — detect by the `NativeObject` kind), `Value::Future`, `Value::Generator`, `Value::GeneratorMethod`, `Value::ClassMethod`, `Value::Class`, `Value::Enum`. Recurse into `Array`, `Object` (key in path: `.key`), `Map` (`["key"]`), `Set`, `Instance` (fields by name). Guard cycles with an identity `HashSet` of visited container pointers so `check_sendable` itself terminates. Path grammar: array `[i]`, object/instance `.name` (or `["name"]` if not an ident), map `["display(key)"]`.
 
-- [ ] **Step 5: Implement `encode`.** A `Writer` (reuse the byte-writer pattern from `src/vm/aso.rs` — a `Vec<u8>` with `u8`/`u32`/`len`/`str` helpers, or a private mini-writer here) plus a **visited table**: a `Vec<*const ()>` (or `IndexMap<ptr,u32>`) assigning each container a serial id on first visit. Tag byte per kind: `0=Nil 1=Bool 2=Number 3=Decimal 4=Str 5=Bytes 6=Array 7=Object 8=Map 9=Set 10=Enum/EnumVariant 11=Regex(source+flags) 12=Instance 13=Ref(id)`. On encountering an already-visited container, emit `13` + its id. `encode` calls `check_sendable` first (so a bad value never produces half a payload), then walks. Returns `Result<Vec<u8>, SendError>`.
+- [x] **Step 5: Implement `encode`.** A `Writer` (reuse the byte-writer pattern from `src/vm/aso.rs` — a `Vec<u8>` with `u8`/`u32`/`len`/`str` helpers, or a private mini-writer here) plus a **visited table**: a `Vec<*const ()>` (or `IndexMap<ptr,u32>`) assigning each container a serial id on first visit. Tag byte per kind: `0=Nil 1=Bool 2=Number 3=Decimal 4=Str 5=Bytes 6=Array 7=Object 8=Map 9=Set 10=Enum/EnumVariant 11=Regex(source+flags) 12=Instance 13=Ref(id)`. On encountering an already-visited container, emit `13` + its id. `encode` calls `check_sendable` first (so a bad value never produces half a payload), then walks. Returns `Result<Vec<u8>, SendError>`.
 
-- [ ] **Step 6: Implement `decode`.** A `Reader` over the bytes + a **reconstruction table** `Vec<Value>` indexed by serial id. For containers, FIRST allocate the empty container, push it into the table (so a forward `Ref(id)` resolves), THEN fill it (this is how cycles round-trip). For `Instance` (tag 12): read the class name, look it up in `interp` (the far isolate's globals/classes), read the field map, and reconstruct via the same shape machinery `validate_into` uses (apply the class's field schema; do NOT run `init`). For `Regex`: re-compile from source+flags. `MapKey` is rebuilt via `MapKey::from_value` so −0.0/NaN canonicalization is reapplied on the far side. Returns `Result<Value, SendError>` (decode errors — e.g. unknown class — are `SendError { kind: "class", path: "<name>", hint: None }`).
+- [x] **Step 6: Implement `decode`.** A `Reader` over the bytes + a **reconstruction table** `Vec<Value>` indexed by serial id. For containers, FIRST allocate the empty container, push it into the table (so a forward `Ref(id)` resolves), THEN fill it (this is how cycles round-trip). For `Instance` (tag 12): read the class name, look it up in `interp` (the far isolate's globals/classes), read the field map, and reconstruct via the same shape machinery `validate_into` uses (apply the class's field schema; do NOT run `init`). For `Regex`: re-compile from source+flags. `MapKey` is rebuilt via `MapKey::from_value` so −0.0/NaN canonicalization is reapplied on the far side. Returns `Result<Value, SendError>` (decode errors — e.g. unknown class — are `SendError { kind: "class", path: "<name>", hint: None }`).
 
-- [ ] **Step 7: Stub `src/worker/mod.rs`:**
+- [x] **Step 7: Stub `src/worker/mod.rs`:**
 ```rust
 //! Workers Spec A: shared-nothing isolates. `serialize` is the value airlock;
 //! `pool`/`isolate`/`dispatch` (later tasks) host the isolate pool + transport.
@@ -608,11 +608,11 @@ pub mod serialize;
 ```
 Add `pub mod worker;` to `src/lib.rs` (near the other `pub mod` declarations).
 
-- [ ] **Step 8: Run the tests**
+- [x] **Step 8: Run the tests**
   Run: `cargo test --lib worker::serialize` and `cargo test --no-default-features --lib worker::serialize`
   Expected: PASS in both configs (the serializer is core).
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 ```bash
 git add src/worker/serialize.rs src/worker/mod.rs src/lib.rs
 git commit -m "feat(worker): structured-clone Value serializer + sendability gate (cycles, class reconstruction, field-path errors)
