@@ -271,6 +271,31 @@ is preserved — no opcode/Value eval change):
    English-`%B` limitation).
 9. Docs/README/holistic.
 
+## Workers — shared-nothing parallelism ✅ COMPLETE (2026-06)
+
+Two-spec campaign adding multi-core parallelism by **isolation** (no shared memory, no data
+races): Spec A `specs/2026-06-07-workers-foundation-stateless-design.md` +
+`plans/2026-06-07-workers-foundation-stateless.md`; Spec B
+`specs/2026-06-07-workers-stateful-actors-streaming-design.md` +
+`plans/2026-06-07-workers-spec-b-actors-streaming.md`. CORE / default-on (`src/worker/`,
+unconditional — builds under `--no-default-features`, like the GC). The `worker` keyword fronts:
+
+1. **`worker fn` / `static worker fn`** (Spec A) — pooled, stateless; each call runs once on a
+   lazy, demand-grown isolate pool bounded to `num_cpus` (`$ASCRIPT_WORKERS`), returns `future<T>`.
+2. **`worker class` actors** (Spec B) — a stateful instance in its own dedicated isolate; `spawn()`
+   → `future<handle>`; async-only proxy methods (FIFO one-at-a-time mailbox, non-reentrant);
+   no cross-boundary field access; state persists across messages; close/last-drop teardown.
+3. **`worker fn*` streaming generators** (Spec B) — a producer body in a dedicated isolate, consumed
+   via `for await`; demand-driven pull + bounded-buffer backpressure; bidirectional `next(v)`.
+
+The **serializer airlock** (`src/worker/serialize.rs`) deep-copies only data across the boundary
+(structured clone); non-sendable values (closures, native/generator/actor handles) raise a
+recoverable field-path panic. `task.pipe(gen, bus)` bridges a worker stream onto a `std/events`
+bus (intra/inter-isolate layering). `.aso` bumped to `ASO_FORMAT_VERSION = 18`. All-modes
+differential coverage (tree-walker == specialized-VM == generic-VM == `.aso`, both feature configs).
+Docs: `docs/content/language/workers.md`. (Known separate bug, out of scope:
+`recover(fn(){...})` fails — use the arrow form `recover(() => ...)`.)
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred
