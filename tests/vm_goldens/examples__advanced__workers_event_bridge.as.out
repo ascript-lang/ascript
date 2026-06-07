@@ -1,0 +1,8 @@
+# exit: none
+listenerA saw: 1
+listenerB saw: 1
+listenerA saw: 2
+listenerB saw: 2
+listenerA saw: 3
+listenerB saw: 3
+done: received 3 items

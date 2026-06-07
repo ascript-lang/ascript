@@ -1,0 +1,7 @@
+# exit: none
+event: login user=alice
+event: purchase item=book amount=29
+event: login user=bob
+subscriber 2 -- login user=alice
+subscriber 2 -- purchase item=book amount=29
+subscriber 2 -- login user=bob
