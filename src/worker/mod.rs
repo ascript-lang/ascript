@@ -3,10 +3,12 @@
 //! dependency closure, materialized as a `.aso` module fragment); `pool`/`isolate`
 //! (later tasks) host the isolate pool + the `Send` byte-channel transport.
 
+pub mod actor;
 pub mod dispatch;
 pub mod isolate;
 pub mod pool;
 pub mod serialize;
+pub mod stream;
 
 use crate::interp::{Control, Interp};
 use crate::span::Span;

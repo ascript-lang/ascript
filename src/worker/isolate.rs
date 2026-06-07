@@ -98,12 +98,13 @@ impl Isolate {
     /// dispatcher gracefully degrades to running the worker INLINE on the caller thread
     /// (correct result, just not parallel) — never a panic. So this returns the spawn
     /// error instead of `.expect()`ing.
+    ///
+    /// Built on the shared [`bootstrap`] used by the dedicated [`spawn_isolate`]: the
+    /// pool's stateless request loop is just one particular run-loop body over the same
+    /// thread + runtime + `LocalSet` + fresh `Interp`/`Vm` substrate.
     pub fn spawn() -> std::io::Result<Isolate> {
         let (tx, rx) = mpsc::unbounded_channel::<WorkerRequest>();
-        let thread = std::thread::Builder::new()
-            .name("ascript-isolate".to_string())
-            .stack_size(ISOLATE_STACK_SIZE)
-            .spawn(move || run_isolate(rx))?;
+        let thread = bootstrap(move |vm| isolate_loop(vm, rx))?;
         Ok(Isolate {
             tx,
             thread: Some(thread),
@@ -111,15 +112,112 @@ impl Isolate {
     }
 }
 
-/// The isolate thread entry: build the runtime + a fresh `Interp`/`Vm`, then drive
-/// the request loop on the `LocalSet`. Returns when the request channel closes.
+/// Spawn a fresh isolate thread (own `current_thread` runtime + `LocalSet` + a fresh
+/// shared-NOTHING [`Vm`]/[`Interp`] with `global_env`, on the [`ISOLATE_STACK_SIZE`]
+/// stack) and run a CALLER-SUPPLIED async run-loop on it, driven by an inbound `Send`
+/// byte channel. The handle is the `Send` byte sender plus the thread; dropping the
+/// handle closes the channel (so the run-loop's `recv().await` returns `None` and the
+/// body ends) and joins the thread — cancel-on-drop / clean teardown, no zombie thread.
+///
+/// This is the DEDICATED (non-pooled) isolate substrate. Unlike the pool's reused
+/// stateless isolates, a dedicated isolate is spawned per actor (Task 5) / streaming
+/// generator (Task 6), lives for that handle's lifetime holding its own state, and is
+/// torn down on `close`/last-drop. The shared [`bootstrap`] guarantees the SAME
+/// shared-nothing `!Send` integrity (the isolate builds its own runtime types; only
+/// `Send` bytes cross the `mpsc`).
+///
+/// `make_loop` receives the freshly-built `Rc<Vm>` (its `Interp` is reachable via
+/// `vm.interp()`) plus the inbound `mpsc::UnboundedReceiver<Vec<u8>>`, and returns the
+/// run-loop future. Returning the receiver lets the actor/stream driver own the
+/// protocol; Task 4 only provides the spawn/hold/teardown mechanism.
+///
+/// FALLIBLE for the same reason as [`Isolate::spawn`] (thread-limit / memory pressure
+/// → `Err`); callers map that to a recoverable panic rather than aborting.
+// Task 4 ships this dedicated-isolate substrate; the actor (Task 5) and streaming
+// generator (Task 6) drivers are its only non-test callers, so it reads as dead code
+// until those land. The inline unit test below exercises the full spawn/use/teardown.
+#[allow(dead_code)]
+pub(crate) fn spawn_isolate<F, Fut>(make_loop: F) -> std::io::Result<IsolateHandle>
+where
+    F: FnOnce(Rc<Vm>, mpsc::UnboundedReceiver<Vec<u8>>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let thread = bootstrap(move |vm| make_loop(vm, rx))?;
+    Ok(IsolateHandle {
+        tx,
+        thread: Some(thread),
+    })
+}
+
+/// A live DEDICATED isolate: the inbound `Send` byte channel into its run-loop plus the
+/// OS thread handle. Held for the lifetime of the actor / streaming generator it backs.
+///
+/// **Teardown (cancel-on-drop):** `Drop` drops the `tx` sender — the run-loop's
+/// `rx.recv().await` then resolves to `None`, ending the body — and joins the thread so
+/// no zombie thread leaks. (Plan A's pooled `Isolate` deliberately does NOT join idle
+/// isolates because they are reused for the pool's lifetime; a dedicated isolate is the
+/// opposite — bound to one handle, reclaimed when it drops.) This extends Plan A's
+/// cancel-on-drop to the held-for-lifetime case.
+pub struct IsolateHandle {
+    /// Sends serialized (`Send`) protocol messages into the dedicated isolate's
+    /// run-loop. The actor wraps this with a mailbox; the stream wraps it with a
+    /// demand driver (Tasks 5/6 define the on-the-wire message framing).
+    pub tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// The OS thread handle, taken + joined on `Drop`.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for IsolateHandle {
+    fn drop(&mut self) {
+        // Replace the sender with a fresh, immediately-dropped one so the live `tx` is
+        // dropped HERE: that closes the channel, so the isolate's run-loop sees
+        // `recv().await == None` and returns, letting `block_on` finish and the thread
+        // exit. We then join to reclaim it (no zombie thread).
+        let (dead_tx, _dead_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        self.tx = dead_tx; // drops the real sender → closes the inbound channel
+        if let Some(thread) = self.thread.take() {
+            // Join cannot deadlock: the channel is closed above, so the run-loop's
+            // `recv().await` resolves to `None` and the body returns. A panicked
+            // isolate thread surfaces here as a join `Err`, which we ignore (the
+            // caller-side reply channels already mapped any failure to a recoverable
+            // panic) rather than re-panicking on the dropping thread.
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Shared isolate THREAD BOOTSTRAP: spawn an OS thread with the [`ISOLATE_STACK_SIZE`]
+/// stack that builds a `current_thread` tokio runtime + `LocalSet` + a fresh
+/// shared-NOTHING `Interp`/`Vm` (with `global_env` via `install_self`/`Vm::new`), then
+/// `block_on`s the run-loop produced by `make_loop(vm)`. Used by BOTH the pooled
+/// [`Isolate::spawn`] (its loop is [`isolate_loop`]) and the dedicated
+/// [`spawn_isolate`]. The `!Send` runtime types are constructed INSIDE the thread; only
+/// the `Send` `make_loop` closure crosses.
+fn bootstrap<F, Fut>(make_loop: F) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce(Rc<Vm>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .name("ascript-isolate".to_string())
+        .stack_size(ISOLATE_STACK_SIZE)
+        .spawn(move || run_isolate_thread(make_loop))
+}
+
+/// The isolate thread entry: build the runtime + `LocalSet` + a fresh `Interp`/`Vm`,
+/// then drive the run-loop produced by `make_loop` on the `LocalSet`. Returns when the
+/// run-loop future completes (its inbound channel closed).
 ///
 /// If the tokio runtime cannot be built (resource pressure), the thread simply ends
-/// WITHOUT panicking — the request channel's senders see no receiver, so every
-/// dispatch to this isolate fails its reply `oneshot` and surfaces as a recoverable
-/// "isolate terminated" panic at the caller's `await`, rather than aborting the
-/// process. (In practice the pool prefers other isolates / inline execution.)
-fn run_isolate(rx: mpsc::UnboundedReceiver<WorkerRequest>) {
+/// WITHOUT panicking — the inbound channel's senders see no receiver, so every send /
+/// reply fails and surfaces as a recoverable "isolate terminated" panic at the caller's
+/// `await`, rather than aborting the process.
+fn run_isolate_thread<F, Fut>(make_loop: F)
+where
+    F: FnOnce(Rc<Vm>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     IN_ISOLATE.with(|c| c.set(true));
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -129,17 +227,18 @@ fn run_isolate(rx: mpsc::UnboundedReceiver<WorkerRequest>) {
         Err(_) => return, // graceful: no panic; the channel closing signals callers
     };
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, isolate_loop(rx));
+    let interp = Rc::new(crate::interp::Interp::new());
+    interp.install_self();
+    let vm = Vm::new(interp);
+    local.block_on(&rt, make_loop(vm));
 }
 
 /// The per-isolate request loop. A fresh `Interp`/`Vm` is created ONCE and reused for
 /// every request on this isolate (shared-nothing across isolates, but stateful within
 /// one — Spec A workers are stateless, so reuse is observably a fresh-globals run per
 /// distinct slice). `loaded` tracks which slices' globals are already defined.
-async fn isolate_loop(mut rx: mpsc::UnboundedReceiver<WorkerRequest>) {
-    let interp = Rc::new(crate::interp::Interp::new());
-    interp.install_self();
-    let vm = Vm::new(interp.clone());
+async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>) {
+    let interp = vm.interp().clone();
     let mut loaded: HashSet<u64> = HashSet::new();
 
     while let Some(req) = rx.recv().await {
@@ -260,5 +359,68 @@ pub(crate) fn decode_args(
             "worker args payload did not decode to an array (got {})",
             crate::interp::type_name(&other)
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc as std_mpsc;
+    use std::sync::Arc;
+
+    /// The dedicated (non-pooled) isolate substrate: `spawn_isolate` births a thread
+    /// with its own runtime + fresh `Interp`/`Vm`, runs a caller-supplied run-loop that
+    /// receives `Send` bytes over time, decodes each against ITS OWN `Interp` (proving
+    /// the shared-nothing bootstrap), replies with `Send` bytes over a `std::mpsc`
+    /// back-channel, and — when the `IsolateHandle` is dropped — its inbound channel
+    /// closes, the loop ends, and the thread is joined cleanly (no zombie thread).
+    #[test]
+    fn spawn_isolate_runs_loop_and_drops_cleanly() {
+        // `Send` back-channel for results + a flag the run-loop sets when its body ends.
+        let (result_tx, result_rx) = std_mpsc::channel::<f64>();
+        let loop_ended = Arc::new(AtomicBool::new(false));
+        let loop_ended_in = loop_ended.clone();
+
+        let handle = spawn_isolate(move |vm, mut rx| async move {
+            // The fresh, isolate-owned interp (built by `bootstrap`, shared with no one).
+            let interp = vm.interp().clone();
+            while let Some(msg) = rx.recv().await {
+                // Decode the shipped bytes against THIS isolate's own interp, double the
+                // number, and report it back over the `Send` back-channel.
+                if let Ok(Value::Number(n)) =
+                    crate::worker::serialize::decode(&msg, &interp)
+                {
+                    let _ = result_tx.send(n * 2.0);
+                }
+            }
+            // Inbound channel closed (handle dropped) → body returns → thread can exit.
+            loop_ended_in.store(true, Ordering::SeqCst);
+        })
+        .expect("dedicated isolate should spawn");
+
+        // Ship a trivial value as bytes; expect the doubled result back.
+        let payload = crate::worker::serialize::encode(&Value::Number(21.0))
+            .expect("encode sendable number");
+        handle.tx.send(payload).expect("isolate inbound channel open");
+        let got = result_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("isolate should reply within 5s");
+        assert_eq!(got, 42.0, "isolate ran the shipped work on its own Vm");
+
+        // Sanity: the loop has NOT ended while the handle is still alive.
+        assert!(
+            !loop_ended.load(Ordering::SeqCst),
+            "run-loop must stay alive while the handle is held"
+        );
+
+        // Dropping the handle closes the inbound channel and JOINS the thread (clean
+        // teardown). After `drop` returns, the joined loop must have ended — proving no
+        // zombie thread is left behind.
+        drop(handle);
+        assert!(
+            loop_ended.load(Ordering::SeqCst),
+            "dropping the handle must end the run-loop and join the thread (no zombie)"
+        );
     }
 }
