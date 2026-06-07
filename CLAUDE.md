@@ -16,7 +16,8 @@ The design goal is **a focused core with a Go-class standard library**: the core
 small set of value kinds, gradual contracts, no hidden control flow) but is genuinely multi-paradigm —
 object-oriented (classes, inheritance, `instanceof`), functional (closures, pattern matching, generators,
 destructuring, ranges, lazy streams), and concurrent (`async`/`await`, structured concurrency, channels,
-durable workflows) — while the stdlib is deliberately rich. The authoritative design is
+durable workflows, plus **shared-nothing workers** for multi-core parallelism — `worker fn` pools,
+`worker class` actors, `worker fn*` streaming) — while the stdlib is deliberately rich. The authoritative design is
 `superpowers/specs/2026-05-29-ascript-design.md` (the entire spec is implemented);
 `superpowers/roadmap.md` is the milestone-by-milestone record.
 
@@ -173,6 +174,32 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   `unknown package '<k>' — add it with 'ascript add'`). Clone the resolver borrow out, never hold across the
   loader `.await`. CLI: `add`/`remove`/`install`/`update`/`lock`/`tree`/`verify`. Hermetic tests only
   (`tests/pkg.rs`). SP6 touches neither `.aso` nor `ASO_FORMAT_VERSION`.
+- **Workers — shared-nothing parallelism** (`src/worker/`, **CORE / default-on, unconditional — NOT behind
+  a Cargo feature**, like the GC; builds under `--no-default-features`). Two specs:
+  `specs/2026-06-07-workers-foundation-stateless-design.md` (Spec A) +
+  `specs/2026-06-07-workers-stateful-actors-streaming-design.md` (Spec B); plans of the same dates. The
+  `worker` keyword fronts three forms over **two lifecycles**: (1) **pooled / stateless** — `worker fn` /
+  `static worker fn` (Spec A), each call runs once on a lazy, demand-grown pool bounded to `num_cpus`
+  (`$ASCRIPT_WORKERS`), returns `future<T>`; (2) **dedicated isolate** (Spec B) — `worker class` actors and
+  `worker fn*` streaming generators, a long-lived isolate per handle. **Parallelism by ISOLATION:** each
+  isolate is a full, independent `!Send` `Interp` on its own OS thread sharing no memory. The **serializer
+  airlock** (`src/worker/serialize.rs`) is the ONLY thing that crosses — structured-clone of bytes; the
+  runtime stays `!Send`, so non-sendable values (closures, native handles, generator/actor handles) raise a
+  recoverable field-path panic. **Actor handle** = `Value::Native(NativeKind::WorkerActor)` backed by
+  `ResourceState::WorkerActor` in `Interp.resources` (`src/worker/actor.rs`): a FIFO **one-message-at-a-time
+  mailbox** over a `Send` channel + **non-reentrancy** guard; methods are async-only (each call → a
+  `future<T>` message), NO cross-boundary field access; `spawn()` (not local construction) creates it,
+  returns `future<handle>`. **Streaming handle** = `Value::Generator` over `GenImpl::Worker` (`src/coro.rs`),
+  driven by **demand-driven pull** with a bounded buffer (backpressure across the boundary) and bidirectional
+  `gen.next(v)`. Both actors and streams own in-isolate resources and are **torn down on `close()` /
+  last-drop** (no zombie threads). **GC invariant:** the GC must NOT trace into either native handle (the
+  native-resource rule — they reclaim via deterministic `Drop`). `task.pipe(gen, bus)` (`src/stdlib/task_mod.rs`)
+  bridges a worker generator stream onto a local `std/events` bus (intra- vs inter-isolate layering).
+  `.aso` bumped to **`ASO_FORMAT_VERSION = 18`**. All-modes byte-identical (tree-walker == specialized-VM ==
+  generic-VM == `.aso`); examples in `examples/workers_*.as` + `examples/advanced/workers_*.as`; docs at
+  `docs/content/language/workers.md`. (Carry-forward bug, OUT of workers scope: `recover(fn(){...})` — an
+  anonymous-fn-expression call arg — fails with "function declaration has no resolver binding"; use the arrow
+  form `recover(() => ...)`.)
 
 ## Commands
 
@@ -202,7 +229,7 @@ considering work done.
 
 ### Pipeline
 **Two front-ends, two engines — same observable behavior.** The DEFAULT path is the **bytecode VM**: a
-lossless **CST front-end** (`src/cst/` — trivia-preserving lexer + parser → typed AST) → resolver
+lossless **CST front-end** (`src/syntax/` — trivia-preserving lexer + parser → typed AST) → resolver
 (scopes/upvalues/slots, classifies module top-level as user-globals) → bytecode compiler (`src/compile/`) →
 a `Chunk` → the async VM (`src/vm/`). `ascript run file.as` compiles and runs on the VM; `ascript build`
 serializes the `Chunk` to a versioned, verified `.aso` (`src/vm/aso.rs` + `src/vm/verify.rs`).
@@ -223,7 +250,11 @@ lines). Token-depth counting keeps `${…}` braces from skewing depth.
 - `eval_expr`/`exec` are `async` (`#[async_recursion]`) and take **`&self`** — `Interp` state lives behind
   interior-mutability cells so multiple eval futures can be live at once (M17). The runtime is `Rc`/`RefCell`
   and therefore **`!Send`**: `#[tokio::main(flavor = "current_thread")]` + a `LocalSet`. Do not introduce
-  `Send` bounds or a multi-thread runtime.
+  `Send` bounds or a multi-thread runtime. **This single-threaded, `!Send` model is PER ISOLATE**, not a
+  ceiling on parallelism: workers (see "Workers" below) run COMPLETE, independent `Interp` runtimes on
+  separate OS threads that share NO memory — parallelism is achieved by ISOLATION, not shared memory, so
+  there are still no data races. Only deep-copied bytes cross between isolates (the serializer airlock), and
+  the "never hold a `RefCell` borrow across `.await`" invariant applies within each isolate.
 - **M17 async model (spec §7):** calling a script `async fn` returns a `Value::Future` and **eagerly
   schedules** the body via `spawn_local` (`self.rc()` → owned `Rc<Interp>` via a self-`Weak`); `await` drives
   it (`await` on a non-future is identity). **Invariant: never hold a `RefCell` borrow across `.await`**
