@@ -220,3 +220,183 @@ for await (v in doubled(ticks())) {
 ### `type()` of a generator
 
 `type(gen)` returns `"generator"`. The `fn*` / `async fn*` declaration itself is a `"function"`.
+
+## Workers
+
+A **worker function** runs in a **shared-nothing isolate** on a background thread, enabling
+multi-core parallelism without shared memory or data races. Calling a `worker fn` returns a
+`future<T>` — just like an `async fn` — so you `await` the result the same way.
+
+```ascript
+import * as task from "std/task"
+import * as array from "std/array"
+
+worker fn square(n: number): number {
+  return n * n
+}
+
+fn main() {
+  let inputs = [1, 2, 3, 4, 5, 6, 7, 8]
+  let futures = array.map(inputs, square)
+  let results = await task.gather(futures)
+  print(results)          // [1, 4, 9, 16, 25, 36, 49, 64]
+}
+
+await main()
+```
+
+### `static worker fn`
+
+A class method can also be a worker:
+
+```ascript
+import * as task from "std/task"
+import * as array from "std/array"
+
+class Img {
+  static worker fn encode(px: number): number {
+    return px * 2 + 1
+  }
+}
+
+let futures = array.map([10, 20, 30], Img.encode)
+print(await task.gather(futures))   // [21, 41, 61]
+```
+
+### The shared-nothing model
+
+Each worker invocation runs in an **isolate**: a fresh AScript interpreter on a pooled OS thread,
+sharing no memory with the caller. All arguments and return values are **structured-cloned** across
+the boundary — the same deep-copy rules as JSON-serializable data, extended to cover AScript's
+`array`, `object`, `map`, `set`, `bytes`, `number`, `string`, `bool`, `nil`, and class instances.
+
+Values that cannot cross the boundary produce a clear runtime error with the exact field path of
+the offending value:
+
+```ascript
+worker fn takesObj(o): number { return 1 }
+
+// A closure cannot cross the isolate boundary:
+let [_, err] = recover(() => await takesObj({ cb: () => 1 }))
+print(err.message)
+// "cannot be sent to a worker at field path [.cb]: function values are not sendable"
+```
+
+### Capture rules
+
+Worker functions run in an isolated scope, so the compiler enforces these capture rules:
+
+- **Allowed:** function parameters; other top-level `worker fn` and regular `fn` definitions
+  (shipped transitively); top-level `const` bindings with literal initializers (copied by value).
+- **Not allowed:** capturing a mutable outer `let`, or reading or writing a top-level mutable
+  global. Violations are `worker-capture` **compile errors** — they are caught before the program runs.
+
+```ascript
+const FACTOR = 10           // ✓ top-level const — copied into the isolate
+
+worker fn scale(n: number): number {
+  return n * FACTOR         // ✓ fine
+}
+```
+
+### Error handling
+
+A worker panic (e.g. a failing `assert`) is recovered on the calling side as a `[nil, err]` pair,
+just like any other recoverable panic:
+
+```ascript
+worker fn risky(n: number): number {
+  if (n < 0) { assert(false, "negative input") }
+  return n * n
+}
+
+let [_, err] = recover(() => await risky(-1))
+print(err.message)   // "negative input"
+```
+
+Note: use `assert(false, msg)` to raise a named error inside a worker body. The `recover()`
+built-in requires arrow syntax for its argument — `recover(() => ...)` — not `recover(fn() {...})`.
+
+### Inline nesting
+
+A `worker fn` called from *inside* another worker isolate runs **inline** — no re-dispatch, no
+extra thread, no deadlock:
+
+```ascript
+worker fn inner(n: number): number { return n + 1 }
+worker fn outer(n: number): number {
+  let bumped = await inner(n)   // inline when already in an isolate
+  return bumped * 10
+}
+
+print(await outer(4))   // 50
+```
+
+### The worker pool
+
+Workers are executed on a **lazy, demand-grown pool** bounded to `num_cpus` threads (override with
+the `ASCRIPT_WORKERS` environment variable). The pool is created on first use and threads are
+reused across calls; FIFO backpressure prevents unbounded queuing. Pool warmup adds ~80 ms on the
+first call; steady-state per-call overhead is ~60–250 ms depending on payload size.
+
+### Cost model
+
+> Parallelize **coarse, CPU-bound work** — not tight inner loops.
+
+The serialization round-trip costs roughly 0.2–1.3 ms per call depending on payload size
+(measured on Apple M4, 10 logical cores). For fine-grained work this overhead dominates. For
+coarse work the pool delivers real speedups: on the same machine, 8 workers processing 32
+CPU-bound chunks yields ~5× wall-clock speedup (2 182 ms → 439 ms).
+
+### Known limitations
+
+**1. No stdlib module imports inside the worker body.**
+The code slice shipped to the isolate includes top-level `fn` and `const` definitions; it does
+*not* include `import` bindings. Calling `math.sum(...)`, `array.sort(...)`, or any other stdlib
+function *inside* a worker body will fail at runtime with `undefined variable`.
+
+The idiom: do the stdlib-dependent work on the caller side and pass only data into the worker. If
+you need a helper computation, write it as a plain top-level `fn` (no imports) and call that:
+
+```ascript
+import * as math from "std/math"
+import * as array from "std/array"
+import * as task from "std/task"
+
+// Pure arithmetic helper — no stdlib imports needed
+fn lcg(state: number): number {
+  return (state * 1103515245 + 12345) % 2147483648
+}
+
+worker fn countHits(seed: number): number {
+  let state = seed
+  let hits = 0
+  let i = 0
+  while (i < 1000) {
+    state = lcg(state)          // ✓ top-level fn, shipped transitively
+    let x = state / 2147483648.0
+    state = lcg(state)
+    let y = state / 2147483648.0
+    if (x * x + y * y <= 1.0) { hits = hits + 1 }
+    i = i + 1
+  }
+  return hits
+}
+
+fn main() {
+  let seeds = [1, 2, 3, 4, 5, 6, 7, 8]
+  let futures = array.map(seeds, countHits)
+  let hitCounts = await task.gather(futures)
+  // stdlib work on the caller side:
+  print(math.sum(hitCounts))
+}
+
+await main()
+```
+
+**2. Computed-initializer consts and `class`/`enum` definitions are not shipped.**
+Only top-level `const` bindings whose initializer is a literal (number, string, bool, nil, or a
+literal array/object of those) are copied into the isolate. A `const` initialized from a
+function call, and any `class` or `enum` definition that the worker body references directly,
+will fail at runtime with `undefined variable`. Keep worker bodies purely arithmetic and
+data-transforming; reconstruct class instances on the caller side.
