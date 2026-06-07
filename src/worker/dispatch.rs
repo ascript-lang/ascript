@@ -18,8 +18,30 @@
 //! never an upvalue — verified: top-level fn protos have empty `upvalues`). So the
 //! closure is a fixpoint over names: seed with the entry, scan each included fn's
 //! chunk (recursively through nested `protos`) for `GET_GLOBAL` names, and pull in
-//! any that resolve to a top-level `fn` or `const`, recursing into newly-added fns.
-//! Unrelated top-level fns are never reached, so they are never shipped.
+//! any that resolve to a shippable top-level `fn` or LITERAL-initializer `const`,
+//! recursing into newly-added fns. Unrelated top-level fns are never reached, so
+//! they are never shipped.
+//!
+//! ## What gets shipped — and what is left late-bound
+//!
+//! The closure ships top-level FUNCTIONS and LITERAL-initializer `const`s
+//! (transitively). A referenced name that this builder cannot classify as a
+//! shippable definition — a `const` with a COMPUTED initializer, a `class`/`enum`/
+//! `import` binding, or a plain builtin — is NOT an error here: it is simply left as
+//! a late-bound `GET_GLOBAL` reference in the shipped bytecode. On the far isolate
+//! that reference resolves against the isolate's own globals (builtins are present
+//! there) or, if the name is genuinely absent, raises the STANDARD recoverable
+//! `undefined variable '<name>'` runtime panic at the call site — exactly as any
+//! unbound reference would. So `build_code_slice` returns `Ok` with a slice that
+//! omits such a name; the failure (if any) surfaces LATER, loudly, at isolate
+//! runtime — never as a wrong or silently-partial result.
+//!
+//! TODO(Task 8 / Spec B): two follow-ups make computed-const / class deps work for
+//! workers that need them: (1) dispatch-time structured-clone of computed-`const`
+//! VALUES into the isolate (the plan's "consts structured-clone'd at dispatch", §4),
+//! so a worker reading a computed top-level const sees its value; (2) shipping
+//! `class`/`enum` definitions for worker fns that construct or return class
+//! instances. Until then those deps stay late-bound as described above.
 
 use crate::interp::Control;
 use crate::span::Span;
@@ -128,6 +150,13 @@ fn collect_get_global_names(chunk: &Chunk, out: &mut Vec<Rc<str>>) {
 /// A stable identity hash for a worker entry: its `class_name` (if any) + its
 /// function name. Used to key the per-isolate code-slice cache so a repeatedly
 /// dispatched worker ships its bytecode at most once per isolate.
+///
+/// NOTE (Task 8): this hashes ONLY name + class — NOT the module path or the entry's
+/// def-span. It is therefore safe as a SINGLE-PROGRAM per-isolate cache key (one
+/// running program, distinct worker fn names), but two DIFFERENT programs with a
+/// same-named worker fn would collide if a cache is ever SHARED across programs.
+/// If Task 8 introduces a cross-program/shared isolate cache, fold the module
+/// identity (path + def-span) into this hash.
 fn entry_fn_id(name: &str, class_name: Option<&str>) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     class_name.hash(&mut h);
@@ -148,10 +177,17 @@ fn entry_fn_id(name: &str, class_name: Option<&str>) -> u64 {
 /// then fetch and call the entry with zero access to the original heap.
 ///
 /// `class_name` is `Some` for a `static worker fn` (Task 8 binds the class); for a
-/// free `worker fn` it is `None`. Returns a recoverable `Control::Panic` if the
-/// entry is missing or references a top-level binding that is not a shippable
-/// fn/literal-const (e.g. a computed-initializer const, a class, or an import) — a
-/// clean error, never a silently-incomplete slice.
+/// free `worker fn` it is `None`.
+///
+/// Returns a recoverable `Control::Panic` ONLY when the entry itself is missing or
+/// is not a top-level function. A referenced DEPENDENCY that cannot be classified as
+/// a shippable def (a computed-initializer `const`, a `class`/`enum`/`import`, or a
+/// builtin) is NOT a build-time error: this returns `Ok` with a slice that omits the
+/// name, leaving it as a late-bound `GET_GLOBAL` reference. On the far isolate that
+/// reference resolves against the isolate's own globals/builtins or, if genuinely
+/// absent, raises the standard recoverable `undefined variable '<name>'` panic at
+/// run time (see the module-level docs). It is never a wrong or silently-partial
+/// result — an unsatisfiable dependency fails loudly at isolate runtime.
 pub fn build_code_slice(
     top: &Chunk,
     entry_name: &str,
