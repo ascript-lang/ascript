@@ -201,36 +201,136 @@ pub fn build_code_slice(
             "worker entry '{entry_name}' is not a top-level function"
         )))
     })?;
-    let TopDef::Fn(_) = &entry_def else {
+    let TopDef::Fn(entry_proto) = entry_def else {
         return Err(Control::Panic(crate::error::AsError::new(format!(
             "worker entry '{entry_name}' is not a function"
         ))));
     };
 
-    // Fixpoint over names: include the entry, then pull in every referenced
-    // top-level fn/const, recursing into newly-added fns. `order` keeps a stable,
-    // dependency-before-use-agnostic (globals are late-bound) declaration order so
-    // the fragment is deterministic; `seen` de-dups.
+    // The top-level entry is itself one of the closure's emitted members (it has a
+    // top-level DEFINE_GLOBAL), so it does NOT need to be emitted separately.
+    materialize_slice(top, &defs, entry_name, &entry_proto, class_name, false)
+}
+
+/// Build a [`WorkerCodeSlice`] for a `static worker fn` (Spec A): the entry is a
+/// static METHOD body (no `self`; it may reference top-level fns/consts + its own
+/// params), located in the compiled program by `(class_name, method_name)`. The
+/// method's compiled `FnProto` becomes the slice's entry fn — emitted as a top-level
+/// `CLOSURE; DEFINE_GLOBAL <method_name>` in the fragment — and its transitive
+/// top-level dependency closure ships exactly as for a free `worker fn`. `fn_id`
+/// folds in `class_name`, so two same-named static workers on different classes get
+/// distinct per-isolate cache keys.
+pub fn build_code_slice_for_static_method(
+    top: &Chunk,
+    class_name: &str,
+    method_name: &str,
+) -> Result<WorkerCodeSlice, Control> {
+    let defs = top_level_defs(top);
+    let entry_proto = find_static_method_proto(top, class_name, method_name).ok_or_else(|| {
+        Control::Panic(crate::error::AsError::new(format!(
+            "static worker '{class_name}.{method_name}' could not be located in the program"
+        )))
+    })?;
+    // The static method is NOT a top-level DEFINE_GLOBAL, so emit it explicitly as the
+    // entry member (emit_entry = true) named by the method name.
+    materialize_slice(
+        top,
+        &defs,
+        method_name,
+        &entry_proto,
+        Some(Rc::from(class_name)),
+        true,
+    )
+}
+
+/// Locate the compiled `FnProto` of a static method `class_name.method_name` in the
+/// top-level chunk. Static-method closures are emitted (in declaration order) right
+/// before each `Op::Class`, after the default-field thunks and the instance methods:
+/// `[super?, ..thunks.., ..methods.., ..statics..]`. We track the rolling run of
+/// `Op::Closure` proto-indices and, at the matching `Op::Class`, index into the
+/// STATIC tail by the method's position in `static_method_names`.
+fn find_static_method_proto(
+    top: &Chunk,
+    class_name: &str,
+    method_name: &str,
+) -> Option<Rc<FnProto>> {
+    // `closures` accumulates the proto-indices of a CONTIGUOUS run of `Op::Closure`
+    // ops. A class group emits its thunk + method + static closures as one such
+    // uninterrupted run ending at `Op::Class`; any other op (e.g. the `DEFINE_GLOBAL`
+    // after a top-level `fn`'s `CLOSURE`) breaks the run and clears it.
+    let mut closures: Vec<u16> = Vec::new();
+    let mut ip = 0usize;
+    while ip < top.code.len() {
+        let op = Op::from_u8(top.code[ip])?;
+        let width = op.operand_width();
+        if op == Op::Closure {
+            closures.push(top.read_u16(ip + 1));
+        } else if op == Op::Class {
+            let cp_idx = top.read_u16(ip + 1) as usize;
+            if let Some(cp) = top.class_protos.get(cp_idx) {
+                if cp.class.name == class_name {
+                    if let Some(pos) = cp.static_method_names.iter().position(|n| n == method_name) {
+                        // The static run is the LAST `static_method_names.len()`
+                        // closures of this class group; thunks + instance methods
+                        // precede them in the same contiguous run.
+                        let n_static = cp.static_method_names.len();
+                        let static_start = closures.len().checked_sub(n_static)?;
+                        let proto_idx = *closures.get(static_start + pos)? as usize;
+                        return top.protos.get(proto_idx).cloned();
+                    }
+                }
+            }
+            closures.clear();
+        } else {
+            closures.clear();
+        }
+        ip += 1 + width;
+    }
+    None
+}
+
+/// Shared fragment builder for both the top-level and static-method slice paths.
+/// Computes the entry's transitive top-level dependency closure and materializes a
+/// self-contained "module fragment" chunk. When `emit_entry` is true the entry fn is
+/// appended as an explicit `CLOSURE; DEFINE_GLOBAL <entry_name>` (used for a static
+/// method, which has no top-level DEFINE_GLOBAL of its own); when false the entry is
+/// already among the top-level members emitted in source order.
+fn materialize_slice(
+    top: &Chunk,
+    defs: &HashMap<Rc<str>, TopDef>,
+    entry_name: &str,
+    entry_proto: &Rc<FnProto>,
+    class_name: Option<Rc<str>>,
+    emit_entry: bool,
+) -> Result<WorkerCodeSlice, Control> {
+    // Fixpoint over names: seed with the entry proto's own GET_GLOBAL refs, then pull
+    // in every referenced top-level fn/const, recursing into newly-added fns. `seen`
+    // de-dups; `order` is unused beyond membership (the emit walk reuses source order).
     let mut seen: HashSet<Rc<str>> = HashSet::new();
-    let mut order: Vec<Rc<str>> = Vec::new();
-    let mut work: Vec<Rc<str>> = vec![Rc::from(entry_name)];
+    let mut included: HashSet<Rc<str>> = HashSet::new();
+    let mut work: Vec<Rc<str>> = Vec::new();
+
+    // Seed from the entry proto's references (for a top-level entry this also re-adds
+    // the entry's own deps; the entry name itself is handled via the source walk /
+    // emit_entry).
+    {
+        let mut refs = Vec::new();
+        collect_get_global_names(&entry_proto.chunk, &mut refs);
+        for r in refs {
+            work.push(r);
+        }
+    }
+    // For a top-level entry, also include the entry NAME so the source walk emits it.
+    if !emit_entry {
+        work.push(Rc::from(entry_name));
+    }
 
     while let Some(name) = work.pop() {
         if !seen.insert(name.clone()) {
             continue;
         }
-        let Some(def) = defs.get(name.as_ref()) else {
-            // A referenced name that is NOT a shippable top-level binding. It may be
-            // a builtin (resolved on the far isolate's bare globals — fine, skip it)
-            // OR a top-level class/enum/import/computed-const we cannot ship. We
-            // cannot tell the two apart here without the builtin table; defer the
-            // decision to the inclusion step below (we only ship names present in
-            // `defs`), and treat an absent name as a builtin/late-bound reference.
-            order.push(name.clone());
-            continue;
-        };
-        order.push(name.clone());
-        if let TopDef::Fn(proto) = def {
+        included.insert(name.clone());
+        if let Some(TopDef::Fn(proto)) = defs.get(name.as_ref()) {
             let mut refs = Vec::new();
             collect_get_global_names(&proto.chunk, &mut refs);
             for r in refs {
@@ -241,15 +341,10 @@ pub fn build_code_slice(
         }
     }
 
-    // Materialize the fragment, in DECLARATION order (as the original top-level
-    // chunk lists them) for determinism, restricted to the closure members that are
-    // shippable top-level definitions. Entry last so it is defined after its deps
-    // (not strictly required — globals are late-bound — but it reads cleanly).
-    let included: HashSet<&Rc<str>> = order.iter().collect();
     let mut frag = Chunk::new();
     frag.name = Some("<worker-slice>".to_string());
 
-    // Walk the original DEFINE_GLOBAL order so members emit in source order.
+    // Walk the original DEFINE_GLOBAL order so dep members emit in source order.
     let mut emit_order: Vec<Rc<str>> = Vec::new();
     let mut ip = 0usize;
     while ip < top.code.len() {
@@ -280,10 +375,17 @@ pub fn build_code_slice(
             }
         }
         let name_idx = frag.add_const(Value::Str(name.clone()));
-        // Immutable (0): fragment members are `fn`/`const` — never reassigned. (The
-        // entry is a fn; literal consts are immutable.)
         frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
     }
+
+    // For a static method, the entry has no top-level DEFINE_GLOBAL; emit it last.
+    if emit_entry {
+        let proto_idx = frag.add_proto(entry_proto.clone());
+        frag.emit_u16(Op::Closure, proto_idx, span);
+        let name_idx = frag.add_const(Value::Str(Rc::from(entry_name)));
+        frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
+    }
+
     frag.emit(Op::Nil, span);
     frag.emit(Op::Return, span);
 
@@ -335,6 +437,25 @@ pub fn build_code_slice_from_source(
         Control::Panic(crate::error::AsError::at(e.message, e.span))
     })?;
     build_code_slice(&top, entry_name, class_name)
+}
+
+/// Like [`build_code_slice_from_source`] but for a `static worker fn` (Spec A): builds
+/// the slice from the static method `class_name.method_name` (see
+/// [`build_code_slice_for_static_method`]). Shared by both engines.
+pub fn build_code_slice_for_static_method_from_source(
+    interp: &crate::interp::Interp,
+    class_name: &str,
+    method_name: &str,
+) -> Result<WorkerCodeSlice, Control> {
+    let src = interp.worker_source().ok_or_else(|| {
+        Control::Panic(crate::error::AsError::new(format!(
+            "cannot dispatch worker '{class_name}.{method_name}': the program source is \
+             unavailable (worker fns require running via `ascript run`)"
+        )))
+    })?;
+    let top = crate::compile::compile_source(&src)
+        .map_err(|e| Control::Panic(crate::error::AsError::at(e.message, e.span)))?;
+    build_code_slice_for_static_method(&top, class_name, method_name)
 }
 
 /// Emit a value-producing instruction that pushes `v` onto the stack. Literal

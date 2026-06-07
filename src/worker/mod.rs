@@ -13,7 +13,10 @@ use crate::span::Span;
 use crate::value::Value;
 use std::rc::Rc;
 
-pub use dispatch::{build_code_slice, build_code_slice_from_source};
+pub use dispatch::{
+    build_code_slice, build_code_slice_for_static_method,
+    build_code_slice_for_static_method_from_source, build_code_slice_from_source,
+};
 pub use pool::pool_is_initialized;
 
 /// The shippable bytecode payload for one worker fn: its compiled chunk plus its
@@ -100,7 +103,23 @@ pub fn dispatch_worker(
         reply: reply_tx,
         abort: abort_rx,
     };
-    let inflight = pool::dispatch(req);
+    let inflight = match pool::dispatch(req) {
+        Ok(inflight) => inflight,
+        // GRACEFUL DEGRADATION: no isolate available and none spawnable (memory /
+        // thread-limit pressure). Run the worker INLINE on the caller thread — correct
+        // result, just not parallel. We load the SAME code slice into a fresh
+        // in-process `Vm` and run the entry exactly as an isolate would (just without a
+        // thread). Engine-independent (works on the tree-walker caller, which has no
+        // VM of its own); preserves shared-nothing semantics (a fresh slice run).
+        Err(req) => {
+            return run_slice_inline(
+                req.slice_bytes.as_deref(),
+                &req.entry_name,
+                &req.args,
+                span,
+            );
+        }
+    };
 
     // --- Caller-thread bridge: await the reply, decode, resolve the future. ---
     let interp_rc = interp.rc();
@@ -172,6 +191,71 @@ pub fn dispatch_worker_inline(
     let cell = fut.cell();
     let handle = tokio::task::spawn_local(async move {
         let r = vm.call_value(entry, args, span).await;
+        cell.resolve(r);
+    });
+    fut.set_abort(handle.abort_handle());
+    Ok(Value::Future(fut))
+}
+
+/// Caller-thread INLINE FALLBACK (graceful degradation, #1): when the pool cannot
+/// place a job on any isolate and cannot spawn one (memory / thread-limit pressure),
+/// run the worker on the caller thread by loading the SAME code slice into a FRESH
+/// in-process `Vm` and calling the entry — exactly what an isolate does, minus the
+/// thread. Engine-independent: builds its own `Interp`/`Vm`, so it works even on the
+/// tree-walker caller (which has no VM). Preserves shared-nothing semantics (a fresh
+/// slice run, no access to the caller's heap), so the result is byte-identical to the
+/// parallel path; only the parallelism is lost.
+///
+/// Returns a `Value::Future` that resolves with the worker's result (scheduled on the
+/// caller's `LocalSet`, like any async call).
+fn run_slice_inline(
+    slice_bytes: Option<&[u8]>,
+    entry_name: &str,
+    encoded_args: &[u8],
+    span: Span,
+) -> Result<Value, Control> {
+    // Build a fresh, shared-nothing Interp/Vm on THIS thread.
+    let iso_interp = Rc::new(Interp::new());
+    iso_interp.install_self();
+    let vm = crate::vm::Vm::new(iso_interp.clone());
+
+    // Decode the args against the fresh interp (cycles / class reconstruction resolve
+    // against its own globals once the slice is loaded — same as the isolate).
+    let args = isolate::decode_args(encoded_args, &iso_interp)
+        .map_err(|msg| Control::Panic(crate::error::AsError::at(msg, span)))?;
+
+    let slice_owned: Option<Vec<u8>> = slice_bytes.map(|b| b.to_vec());
+    let entry_owned = entry_name.to_string();
+
+    let fut = crate::task::SharedFuture::new();
+    let cell = fut.cell();
+    let handle = tokio::task::spawn_local(async move {
+        // Load the slice's globals into the fresh Vm.
+        if let Err(msg) = isolate::load_slice(&vm, slice_owned.as_deref()).await {
+            cell.resolve(Err(Control::Panic(crate::error::AsError::at(msg, span))));
+            return;
+        }
+        let entry = match vm.user_global(&entry_owned) {
+            Some(v) => v,
+            None => {
+                cell.resolve(Err(Control::Panic(crate::error::AsError::at(
+                    format!("worker entry '{entry_owned}' is not defined in the code slice"),
+                    span,
+                ))));
+                return;
+            }
+        };
+        let r = match vm.call_value(entry, args, span).await {
+            Ok(v) => Ok(v),
+            // A top-level `?` propagation inside the worker body ends with nil (matches
+            // the isolate's WorkerReply handling).
+            Err(Control::Propagate(_)) => Ok(Value::Nil),
+            Err(Control::Exit(_)) => Err(Control::Panic(crate::error::AsError::at(
+                "exit() is not allowed inside a worker".to_string(),
+                span,
+            ))),
+            Err(other) => Err(other),
+        };
         cell.resolve(r);
     });
     fut.set_abort(handle.abort_handle());

@@ -58,28 +58,41 @@ impl Pool {
     /// Pick the slot to run `req` on, applying the idle → grow → least-loaded policy,
     /// and return its in-flight counter (already incremented for this job). The
     /// request is SENT here; the caller only wires the reply bridge.
-    fn dispatch(&mut self, req: WorkerRequest) -> Rc<Cell<usize>> {
+    ///
+    /// GRACEFUL DEGRADATION: if no isolate exists and a new one CANNOT be spawned
+    /// (memory / thread-limit pressure), this returns `Err(req)` — handing the request
+    /// back so the caller runs the worker INLINE on its own thread (correct result,
+    /// just not parallel). Once at least one isolate is live, jobs always queue onto an
+    /// existing isolate (its mpsc gives FIFO backpressure), so a transient spawn
+    /// failure never strands work.
+    fn dispatch(&mut self, req: WorkerRequest) -> Result<Rc<Cell<usize>>, WorkerRequest> {
         // 1. An idle isolate?
         if let Some(slot) = self.slots.iter().find(|s| s.inflight.get() == 0) {
-            return Self::send_to(slot, req);
+            return Ok(Self::send_to(slot, req));
         }
-        // 2. Room to grow?
+        // 2. Room to grow? Try to spawn; on failure, fall through (don't grow).
         if self.slots.len() < self.cap {
-            let slot = Slot {
-                isolate: Isolate::spawn(),
-                inflight: Rc::new(Cell::new(0)),
-            };
-            self.slots.push(slot);
-            let slot = self.slots.last().unwrap();
-            return Self::send_to(slot, req);
+            if let Ok(isolate) = Isolate::spawn() {
+                let slot = Slot {
+                    isolate,
+                    inflight: Rc::new(Cell::new(0)),
+                };
+                self.slots.push(slot);
+                let slot = self.slots.last().unwrap();
+                return Ok(Self::send_to(slot, req));
+            }
+            // Spawn failed: if there is at least one live isolate, queue on it
+            // (step 3). If there are NONE, degrade to inline (return the request).
+            if self.slots.is_empty() {
+                return Err(req);
+            }
         }
-        // 3. Least-loaded (its mpsc queue provides FIFO backpressure).
-        let slot = self
-            .slots
-            .iter()
-            .min_by_key(|s| s.inflight.get())
-            .expect("pool has at least one isolate once cap >= 1");
-        Self::send_to(slot, req)
+        // 3. Least-loaded existing isolate (its mpsc queue provides FIFO backpressure).
+        match self.slots.iter().min_by_key(|s| s.inflight.get()) {
+            Some(slot) => Ok(Self::send_to(slot, req)),
+            // No isolates at all and at/over cap with none spawnable — run inline.
+            None => Err(req),
+        }
     }
 
     fn send_to(slot: &Slot, req: WorkerRequest) -> Rc<Cell<usize>> {
@@ -93,9 +106,11 @@ impl Pool {
     }
 }
 
-/// Dispatch `req` onto the (lazily-initialized) pool, returning the chosen isolate's
-/// shared in-flight counter so the caller's bridge task can decrement it on reply.
-pub fn dispatch(req: WorkerRequest) -> Rc<Cell<usize>> {
+/// Dispatch `req` onto the (lazily-initialized) pool. On success returns the chosen
+/// isolate's shared in-flight counter so the caller's bridge task can decrement it on
+/// reply. On `Err(req)` no isolate was available and none could be spawned — the
+/// caller must run the worker inline (graceful degradation under resource pressure).
+pub fn dispatch(req: WorkerRequest) -> Result<Rc<Cell<usize>>, WorkerRequest> {
     POOL.with(|cell| {
         let mut guard = cell.borrow_mut();
         let pool = guard.get_or_insert_with(Pool::new);

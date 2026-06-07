@@ -74,31 +74,56 @@ pub struct Isolate {
     pub thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// The base native stack (bytes) each isolate thread reserves. Deliberately MODEST
+/// (8 MiB) rather than the main thread's 512 MiB `WORKER_STACK_SIZE`: an isolate's VM
+/// goes through the SAME `stacker::maybe_grow` re-entry funnels (`src/vm/stack.rs`
+/// `grow_future`, invoked by `call_value`/`invoke_compiled_method`/generator resume),
+/// so deep recursion grows fresh heap segments on demand and still reaches the SP3
+/// `MAX_CALL_DEPTH` cap cleanly — without each isolate reserving half a gigabyte of
+/// virtual address space. Reserving 512 MiB × `num_cpus` per subprocess is what made
+/// `thread::Builder::spawn` fail intermittently under parallel test/production load
+/// (address-space / thread-limit pressure); 8 MiB × `num_cpus` does not.
+pub const ISOLATE_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 impl Isolate {
-    /// Spawn a fresh isolate thread (enlarged stack, own runtime + `LocalSet` +
-    /// `Interp`/`Vm`) and return the channel handle to it.
-    pub fn spawn() -> Isolate {
+    /// Spawn a fresh isolate thread (own runtime + `LocalSet` + `Interp`/`Vm`) and
+    /// return the channel handle to it.
+    ///
+    /// FALLIBLE by design: under memory / thread-limit pressure `thread::Builder::spawn`
+    /// can return `Err`. The pool treats that as "cannot grow right now" and the
+    /// dispatcher gracefully degrades to running the worker INLINE on the caller thread
+    /// (correct result, just not parallel) — never a panic. So this returns the spawn
+    /// error instead of `.expect()`ing.
+    pub fn spawn() -> std::io::Result<Isolate> {
         let (tx, rx) = mpsc::unbounded_channel::<WorkerRequest>();
         let thread = std::thread::Builder::new()
             .name("ascript-isolate".to_string())
-            .stack_size(crate::interp::WORKER_STACK_SIZE)
-            .spawn(move || run_isolate(rx))
-            .expect("failed to spawn worker isolate thread");
-        Isolate {
+            .stack_size(ISOLATE_STACK_SIZE)
+            .spawn(move || run_isolate(rx))?;
+        Ok(Isolate {
             tx,
             thread: Some(thread),
-        }
+        })
     }
 }
 
 /// The isolate thread entry: build the runtime + a fresh `Interp`/`Vm`, then drive
 /// the request loop on the `LocalSet`. Returns when the request channel closes.
+///
+/// If the tokio runtime cannot be built (resource pressure), the thread simply ends
+/// WITHOUT panicking — the request channel's senders see no receiver, so every
+/// dispatch to this isolate fails its reply `oneshot` and surfaces as a recoverable
+/// "isolate terminated" panic at the caller's `await`, rather than aborting the
+/// process. (In practice the pool prefers other isolates / inline execution.)
 fn run_isolate(rx: mpsc::UnboundedReceiver<WorkerRequest>) {
     IN_ISOLATE.with(|c| c.set(true));
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("failed to build isolate tokio runtime");
+    {
+        Ok(rt) => rt,
+        Err(_) => return, // graceful: no panic; the channel closing signals callers
+    };
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, isolate_loop(rx));
 }
@@ -185,10 +210,11 @@ async fn isolate_loop(mut rx: mpsc::UnboundedReceiver<WorkerRequest>) {
     }
 }
 
-/// Load a code slice's fragment `.aso` into the isolate's `Vm`, defining its globals
-/// (the worker entry + its transitive top-level deps). Returns the rendered error
-/// message on any failure (decode / run).
-async fn load_slice(vm: &Rc<Vm>, slice_bytes: Option<&[u8]>) -> Result<(), String> {
+/// Load a code slice's fragment `.aso` into a `Vm`, defining its globals (the worker
+/// entry + its transitive top-level deps). Returns the rendered error message on any
+/// failure (decode / run). Shared by the isolate loop AND the caller-thread inline
+/// fallback (`crate::worker::run_slice_inline`).
+pub(crate) async fn load_slice(vm: &Rc<Vm>, slice_bytes: Option<&[u8]>) -> Result<(), String> {
     let bytes = slice_bytes
         .ok_or_else(|| "worker code slice missing for an uncached entry".to_string())?;
     let chunk = Chunk::from_bytes(bytes)
@@ -218,7 +244,10 @@ async fn load_slice(vm: &Rc<Vm>, slice_bytes: Option<&[u8]>) -> Result<(), Strin
 /// Decode the structured-clone arg payload into the isolate's `Value`s. The payload is
 /// an encoded ARRAY of the positional args (the caller wraps them so one decode call
 /// reconstructs the whole arg list, preserving cross-arg shared references / cycles).
-fn decode_args(bytes: &[u8], interp: &crate::interp::Interp) -> Result<Vec<Value>, String> {
+pub(crate) fn decode_args(
+    bytes: &[u8],
+    interp: &crate::interp::Interp,
+) -> Result<Vec<Value>, String> {
     let decoded = crate::worker::serialize::decode(bytes, interp).map_err(|e| e.message())?;
     match decoded {
         Value::Array(a) => Ok(a.borrow().clone()),

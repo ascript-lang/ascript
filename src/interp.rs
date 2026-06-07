@@ -4171,10 +4171,10 @@ impl Interp {
             if crate::worker::pool::in_isolate() {
                 return crate::worker::dispatch_worker_inline(self, name, args, span);
             }
-            let slice = crate::worker::build_code_slice_from_source(
+            let slice = crate::worker::build_code_slice_for_static_method_from_source(
                 self,
+                &defining.name,
                 name,
-                Some(Rc::from(defining.name.as_str())),
             )?;
             return crate::worker::dispatch_worker(self, slice, args, span);
         }

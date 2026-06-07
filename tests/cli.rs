@@ -2256,17 +2256,18 @@ fn single_module_panic_provenance_unchanged() {
 /// on the tree-walker and/or with extra env vars. Returns trimmed stdout; asserts the
 /// process succeeded.
 fn run_worker_program(src: &str, tree_walker: bool, env: &[(&str, &str)]) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let bin = env!("CARGO_BIN_EXE_ascript");
     let tag = if tree_walker { "tw" } else { "vm" };
+    // A process-unique, monotonically-increasing counter makes the temp path
+    // collision-proof across PARALLEL test threads (a nanosecond timestamp can
+    // collide, letting one test remove a file another's subprocess is still reading).
     let file = std::env::temp_dir().join(format!(
         "ascript_worker_{}_{}_{}.as",
         tag,
         std::process::id(),
-        // a cheap per-call uniquifier
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        SEQ.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::write(&file, src).unwrap();
     let mut cmd = Command::new(bin);
@@ -2367,5 +2368,27 @@ fn nested_worker_runs_inline_no_deadlock() {
     assert_eq!(
         run_worker_program(src, false, &[("ASCRIPT_WORKERS", "1")]),
         "22"
+    );
+}
+
+#[test]
+fn static_worker_method_parallel_map_runs() {
+    // Spec A `static worker fn`: the static method body is shipped as a standalone
+    // entry fn (no `self`) + its transitive top-level deps. Mirrors
+    // worker_parallel_map_runs. ASCRIPT_WORKERS=2 keeps virtual-memory pressure low.
+    let src = r#"
+        import * as array from "std/array"
+        import { gather } from "std/task"
+        class Img { static worker fn sq(n) { return n * n } }
+        let fs = array.map([1, 2, 3, 4], Img.sq)
+        print(await gather(fs))
+    "#;
+    assert_eq!(
+        run_worker_program(src, false, &[("ASCRIPT_WORKERS", "2")]),
+        "[1, 4, 9, 16]"
+    );
+    assert_eq!(
+        run_worker_program(src, true, &[("ASCRIPT_WORKERS", "2")]),
+        "[1, 4, 9, 16]"
     );
 }
