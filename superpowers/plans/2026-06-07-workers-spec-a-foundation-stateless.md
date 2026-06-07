@@ -898,7 +898,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `src/check/rules/mod.rs` (declare + register in `ALL`)
 - Test: `tests/check.rs`
 
-- [ ] **Step 1: Write the failing test** — add to `tests/check.rs`:
+- [x] **Step 1: Write the failing test** — add to `tests/check.rs`:
 
 ```rust
 #[test]
@@ -935,11 +935,11 @@ fn worker_capture_rejects_top_level_mutation() {
 ```
 (Use `tests/check.rs`'s existing `diagnostics(src)` helper and `Severity` import; mirror a current rule test like `workflow_determinism`.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
   Run: `cargo test --test check worker_capture`
   Expected: FAIL — no such code emitted.
 
-- [ ] **Step 3: Implement the rule.** Create `src/check/rules/worker_capture.rs` modeled on `src/check/rules/workflow_determinism.rs` (same `fn check(root: &ResolvedNode, res: &ResolveResult, src: &str) -> Vec<AsDiagnostic>` signature, `Rule` type). For each `FnDecl`/`MethodDecl` where `crate::syntax::resolve::is_worker_fn(node)` is true: walk the body's `NameRef`s and `AssignExpr` targets. Using the resolver result (`res`), classify each referenced name's binding:
+- [x] **Step 3: Implement the rule.** Create `src/check/rules/worker_capture.rs` modeled on `src/check/rules/workflow_determinism.rs` (same `fn check(root: &ResolvedNode, res: &ResolveResult, src: &str) -> Vec<AsDiagnostic>` signature, `Rule` type). For each `FnDecl`/`MethodDecl` where `crate::syntax::resolve::is_worker_fn(node)` is true: walk the body's `NameRef`s and `AssignExpr` targets. Using the resolver result (`res`), classify each referenced name's binding:
   - param of THIS worker fn → OK;
   - top-level fn → OK;
   - top-level `const` → OK (copied at dispatch);
@@ -948,13 +948,13 @@ fn worker_capture_rejects_top_level_mutation() {
   - outer (non-top-level, non-param) mutable `let` capture → Error (same as the mutable-capture case).
   Emit `AsDiagnostic { code: "worker-capture", severity: Severity::Error, span, message }`. Default severity is Error (a correctness gate). Use the `ByteSpan` of the offending `NameRef`/`AssignExpr`.
 
-- [ ] **Step 4: Register the rule.** In `src/check/rules/mod.rs`: add `pub mod worker_capture;` (@24) and `worker_capture::check,` to `ALL` (@47).
+- [x] **Step 4: Register the rule.** In `src/check/rules/mod.rs`: add `pub mod worker_capture;` (@24) and `worker_capture::check,` to `ALL` (@47).
 
-- [ ] **Step 5: Run the tests + the corpus zero-regression check**
+- [x] **Step 5: Run the tests + the corpus zero-regression check**
   Run: `cargo test --test check worker_capture` then `cargo test --test check` (ensure `examples/**` still emits no unexpected `worker-capture`).
   Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 ```bash
 git add src/check/rules/worker_capture.rs src/check/rules/mod.rs
 git commit -m "feat(check): worker-capture rule (default Error) — reject mutable-let capture / top-level mutation in worker fn
