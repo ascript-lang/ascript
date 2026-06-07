@@ -560,3 +560,197 @@ await main()
     assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
     assert_eq!(out, "1\n105\n1007\n", "[.aso run] stdout mismatch (stderr={err:?})");
 }
+
+// ---------------------------------------------------------------------------
+// Task 12: SP9 determinism — cross-isolate boundary record/replay.
+//
+// A `worker fn*` consumed INSIDE a `workflow.run` body is event-sourced (each
+// yielded value crossing the isolate boundary becomes a `GeneratorYield` event in
+// the workflow log). On `workflow.resume` after a crash (the completion line is
+// missing), the workflow body re-runs but the generator's yields are REPLAYED from
+// the log WITHOUT re-driving the producer isolate.
+//
+// DECISIVE PROOF: between record and resume we CHANGE the producer body (so a real
+// re-drive would yield different values). Because replay returns the RECORDED yields
+// from the log, the resumed run produces the ORIGINAL sum — proving the producer
+// isolate was not re-driven for the recorded prefix.
+//
+// (Actors are exercised by the in-crate det.rs unit tests + the same hook; the
+// generator path is the harder one and is what this end-to-end test pins.)
+// ---------------------------------------------------------------------------
+
+/// Run a `.as` `src` through the binary on the default VM engine, with a stable file
+/// name so an associated workflow log path is predictable. Returns (ok, stdout, stderr).
+#[cfg(feature = "workflow")]
+fn run_vm_named(file: &std::path::Path, src: &str) -> (bool, String, String) {
+    std::fs::write(file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let out = Command::new(bin).arg("run").arg(file).output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+#[cfg(feature = "workflow")]
+#[test]
+fn determinism_replays_worker_stream_yields_in_workflow() {
+    let dir = std::env::temp_dir();
+    let as_file = dir.join("ascript_workers_det_stream.as");
+    let log_file = dir.join("ascript_workers_det_stream.log");
+    let _ = std::fs::remove_file(&log_file);
+
+    // PHASE 1 — RECORD: a workflow body consumes a `worker fn*`. Each yield crosses
+    // the isolate boundary and is event-sourced into the log.
+    let log_path = log_file.to_string_lossy().replace('\\', "/");
+    let record_src = format!(
+        r#"
+import {{ run }} from "std/workflow"
+worker fn* records(n) {{ for (i in 1..=n) {{ yield i * 10 }} }}
+async fn body(ctx, input) {{
+  let total = 0
+  for await (r in records(3)) {{ total = total + r }}
+  return total
+}}
+async fn main() {{
+  let result = await run(body, 0, {{ log: "{log_path}" }})
+  print(result)
+}}
+await main()
+"#
+    );
+    let (ok, out, err) = run_vm_named(&as_file, &record_src);
+    assert!(ok, "[record] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "60\n", "[record] real producer sums 10+20+30 (stderr={err:?})");
+
+    // The log must contain the event-sourced generator yields.
+    let log = std::fs::read_to_string(&log_file).expect("workflow log written");
+    let yield_lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("\"GeneratorYield\""))
+        .collect();
+    assert!(
+        yield_lines.len() >= 3,
+        "expected >=3 GeneratorYield events in the log, got {}:\n{log}",
+        yield_lines.len()
+    );
+
+    // PHASE 2 — DOCTOR + RESUME: strip the completion line so `resume` RE-RUNS the body.
+    let doctored: String = log
+        .lines()
+        .filter(|l| !l.contains("\"WorkflowCompleted\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&log_file, &doctored).unwrap();
+
+    // Resume with a CHANGED producer (`i * 1000` instead of `i * 10`). If resume
+    // re-drove the producer isolate it would sum 1000+2000+3000 = 6000; because the
+    // yields are REPLAYED from the recorded log, the sum is the ORIGINAL 60 — decisive
+    // proof the boundary is not re-crossed for the recorded prefix.
+    let resume_src = format!(
+        r#"
+import {{ resume }} from "std/workflow"
+worker fn* records(n) {{ for (i in 1..=n) {{ yield i * 1000 }} }}
+async fn body(ctx, input) {{
+  let total = 0
+  for await (r in records(3)) {{ total = total + r }}
+  return total
+}}
+async fn main() {{
+  let result = await resume(body, 0, {{ log: "{log_path}" }})
+  print(result)
+}}
+await main()
+"#
+    );
+    let (ok, out, err) = run_vm_named(&as_file, &resume_src);
+    assert!(ok, "[resume] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(
+        out, "60\n",
+        "[resume] replays the recorded yields (NOT the changed producer's 6000) (stderr={err:?})"
+    );
+
+    let _ = std::fs::remove_file(&log_file);
+}
+
+#[cfg(feature = "workflow")]
+#[test]
+fn determinism_replays_actor_messages_in_workflow() {
+    let dir = std::env::temp_dir();
+    let as_file = dir.join("ascript_workers_det_actor.as");
+    let log_file = dir.join("ascript_workers_det_actor.log");
+    let _ = std::fs::remove_file(&log_file);
+    let log_path = log_file.to_string_lossy().replace('\\', "/");
+
+    // PHASE 1 — RECORD: a workflow body spawns an actor and calls a method; the reply
+    // crosses the isolate boundary and is event-sourced into the log as `ActorCall`.
+    let record_src = format!(
+        r#"
+import {{ run }} from "std/workflow"
+worker class Adder {{
+  base: number = 0
+  fn init(b) {{ self.base = b }}
+  fn add(x): number {{ return self.base + x }}
+}}
+async fn body(ctx, input) {{
+  let a = await Adder.spawn(100)
+  let r = await a.add(5)
+  a.close()
+  return r
+}}
+async fn main() {{
+  print(await run(body, 0, {{ log: "{log_path}" }}))
+}}
+await main()
+"#
+    );
+    let (ok, out, err) = run_vm_named(&as_file, &record_src);
+    assert!(ok, "[record] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "105\n", "[record] real actor returns 100+5 (stderr={err:?})");
+
+    let log = std::fs::read_to_string(&log_file).expect("workflow log written");
+    assert!(
+        log.lines().any(|l| l.contains("\"ActorCall\"")),
+        "expected an ActorCall event in the log:\n{log}"
+    );
+
+    // PHASE 2 — DOCTOR + RESUME: strip the completion line so `resume` re-runs the body.
+    let doctored: String = log
+        .lines()
+        .filter(|l| !l.contains("\"WorkflowCompleted\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&log_file, &doctored).unwrap();
+
+    // Resume with a CHANGED actor method (`base * x` instead of `base + x`). A real
+    // re-cross would return 100*5 = 500; replay-from-log returns the recorded 105.
+    let resume_src = format!(
+        r#"
+import {{ resume }} from "std/workflow"
+worker class Adder {{
+  base: number = 0
+  fn init(b) {{ self.base = b }}
+  fn add(x): number {{ return self.base * x }}
+}}
+async fn body(ctx, input) {{
+  let a = await Adder.spawn(100)
+  let r = await a.add(5)
+  a.close()
+  return r
+}}
+async fn main() {{
+  print(await resume(body, 0, {{ log: "{log_path}" }}))
+}}
+await main()
+"#
+    );
+    let (ok, out, err) = run_vm_named(&as_file, &resume_src);
+    assert!(ok, "[resume] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(
+        out, "105\n",
+        "[resume] replays the recorded ActorCall (NOT the changed method's 500) (stderr={err:?})"
+    );
+
+    let _ = std::fs::remove_file(&log_file);
+}

@@ -1975,6 +1975,24 @@ impl Interp {
         let encoded = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
+        // SP9 determinism (Spec B Task 12) — REPLAY: if a determinism context is active
+        // in Replay mode AND it has a recorded `ActorCall` at the cursor, return the
+        // recorded reply WITHOUT crossing the isolate boundary (the actor's side effect
+        // already ran exactly once, at Record). The `None`/default and Record paths fall
+        // through to the real boundary crossing below — byte-identical when inert.
+        // The borrow is a SHORT sync borrow inside `with_determinism_mut`, never held
+        // across an `.await`.
+        let replayed: Option<crate::det::BoundaryOutcome> = self.with_determinism_mut(|ctx| {
+            if ctx.mode == crate::det::Mode::Replay {
+                ctx.replay_actor_call(method)
+            } else {
+                None
+            }
+        }).flatten();
+        if let Some(outcome) = replayed {
+            return Ok(self.resolve_boundary_outcome(outcome, span));
+        }
+
         // TAKE-OUT-ACROSS-AWAIT: clone the Send sender out under a SHORT borrow, then
         // drop the borrow before building/awaiting the future.
         let tx = {
@@ -2007,10 +2025,31 @@ impl Interp {
 
         // Bridge: await the reply, decode against THIS interp, resolve the future.
         let interp_rc = self.rc();
+        let method_owned = method.to_string();
         let fut = crate::task::SharedFuture::new();
         let cell = fut.cell();
         let bridge = tokio::task::spawn_local(async move {
-            let result = match reply_rx.await {
+            let reply = reply_rx.await;
+            // SP9 determinism (Task 12) — RECORD: if a Record-mode context is active,
+            // event-source the boundary OUTCOME (the encoded reply bytes / panic) so a
+            // later Replay reproduces it without re-crossing the isolate. The borrow is
+            // a SHORT sync borrow AFTER the `.await`, never held across it.
+            if let Ok(ref r) = reply {
+                let outcome = match r {
+                    crate::worker::actor::ActorReply::Ok(bytes) => {
+                        crate::det::BoundaryOutcome::Bytes(bytes.clone())
+                    }
+                    crate::worker::actor::ActorReply::Panic(msg) => {
+                        crate::det::BoundaryOutcome::Panic(msg.clone())
+                    }
+                };
+                interp_rc.with_determinism_mut(|ctx| {
+                    if ctx.mode == crate::det::Mode::Record {
+                        ctx.record_actor_call(&method_owned, &outcome);
+                    }
+                });
+            }
+            let result = match reply {
                 Ok(crate::worker::actor::ActorReply::Ok(bytes)) => {
                     crate::worker::serialize::decode(&bytes, &interp_rc)
                         .map_err(|e| Control::Panic(e.into()))
@@ -2028,6 +2067,31 @@ impl Interp {
         });
         fut.set_abort(bridge.abort_handle());
         Ok(Value::Future(fut))
+    }
+
+    /// SP9 determinism (Task 12): wrap a REPLAYED actor-call boundary outcome into an
+    /// already-resolved `Value::Future`, matching the shape `actor_handle_call` returns
+    /// for the real path. The recorded bytes are decoded on THIS consumer thread (no
+    /// isolate crossing). A recorded panic replays as the same recoverable Tier-2 panic.
+    fn resolve_boundary_outcome(
+        &self,
+        outcome: crate::det::BoundaryOutcome,
+        span: Span,
+    ) -> Value {
+        let result = match outcome {
+            crate::det::BoundaryOutcome::Bytes(bytes) => {
+                crate::worker::serialize::decode(&bytes, &self.rc())
+                    .map_err(|e| Control::Panic(e.into()))
+            }
+            crate::det::BoundaryOutcome::Panic(msg) => {
+                Err(Control::Panic(AsError::at(msg, span)))
+            }
+            // An actor call never yields "done"; treat defensively as nil.
+            crate::det::BoundaryOutcome::Done => Ok(Value::Nil),
+        };
+        let fut = crate::task::SharedFuture::new();
+        fut.cell().resolve(result);
+        Value::Future(fut)
     }
 
     /// Workers Spec B §Task 6: build a streaming-generator handle for a `worker fn*`.

@@ -164,7 +164,41 @@ fn event_to_json(seq: usize, ev: &DetEvent) -> serde_json::Value {
             "result": serde_json::from_str::<serde_json::Value>(result_json)
                 .unwrap_or(serde_json::Value::Null),
         }),
+        // Workers Spec B (Task 12): cross-isolate boundary events. The structured-
+        // clone bytes are stored as a JSON number array (no new base64 dep — the
+        // `workflow` feature only pulls `data`/`serde_json`).
+        DetEvent::ActorCall {
+            method,
+            result,
+            panic,
+        } => json!({
+            "seq": seq,
+            "kind": "ActorCall",
+            "method": method,
+            "result": result,
+            "panic": panic,
+        }),
+        DetEvent::GeneratorYield { value, panic } => json!({
+            "seq": seq,
+            "kind": "GeneratorYield",
+            "value": value,
+            "panic": panic,
+        }),
     }
+}
+
+/// Parse a JSON value that is a number array of bytes back into `Vec<u8>` (the
+/// boundary-event byte encoding). A non-array / out-of-range entry yields an empty
+/// vec (best-effort; the runtime replay-mismatch guard is authoritative).
+fn json_bytes(v: Option<&serde_json::Value>) -> Vec<u8> {
+    v.and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|n| n.as_u64())
+                .map(|n| n as u8)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse the newline-JSON log back into a `DetEvent` stream (resume). A malformed
@@ -222,6 +256,34 @@ fn log_to_events(text: &str) -> Vec<DetEvent> {
                     args_hash,
                     result_json,
                 });
+            }
+            "ActorCall" => {
+                let method = rec
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let result = json_bytes(rec.get("result"));
+                let panic = rec
+                    .get("panic")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                events.push(DetEvent::ActorCall {
+                    method,
+                    result,
+                    panic,
+                });
+            }
+            "GeneratorYield" => {
+                let value = rec
+                    .get("value")
+                    .filter(|v| !v.is_null())
+                    .map(|v| json_bytes(Some(v)));
+                let panic = rec
+                    .get("panic")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                events.push(DetEvent::GeneratorYield { value, panic });
             }
             _ => {}
         }

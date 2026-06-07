@@ -366,6 +366,42 @@ impl GeneratorHandle {
             .upgrade()
             .expect("interp dropped while a streaming generator is still live (wiring bug)");
 
+        // SP9 determinism (Spec B Task 12) — REPLAY: if a determinism context is active
+        // in Replay mode AND it has a recorded `GeneratorYield` at the cursor, return the
+        // recorded yield/done/panic WITHOUT re-driving the producer isolate (the producer
+        // ran exactly once, at Record). The borrow is a SHORT sync borrow, never held
+        // across the `.await` below. The `None`/default + Record paths fall through to the
+        // real resume — byte-identical when inert.
+        let replayed: Option<crate::det::BoundaryOutcome> = interp
+            .with_determinism_mut(|ctx| {
+                if ctx.mode == crate::det::Mode::Replay {
+                    ctx.replay_generator_yield()
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let Some(outcome) = replayed {
+            // Mark started so subsequent injected values are honored (matches the real
+            // path's first-resume bookkeeping).
+            started.set(true);
+            return match outcome {
+                crate::det::BoundaryOutcome::Bytes(bytes) => {
+                    let v = crate::worker::serialize::decode(&bytes, &interp)
+                        .map_err(|e| Control::Panic(crate::error::AsError::new(e.message())))?;
+                    Ok(Some(v))
+                }
+                crate::det::BoundaryOutcome::Done => {
+                    done.set(true);
+                    Ok(None)
+                }
+                crate::det::BoundaryOutcome::Panic(msg) => {
+                    done.set(true);
+                    Err(Control::Panic(crate::error::AsError::new(msg)))
+                }
+            };
+        }
+
         // Encode the injected value on FIRST resume too, but the producer ignores it
         // (first-`next` semantics) — we pass nil's encoding then to keep the protocol
         // uniform. Encode against the consumer's serializer (sendability gate applies).
@@ -384,6 +420,21 @@ impl GeneratorHandle {
         };
 
         let outcome = driver.resume(encoded_input).await;
+
+        // SP9 determinism (Task 12) — RECORD: event-source the boundary outcome (the
+        // yielded bytes / done / panic) so a later Replay reproduces it without re-driving
+        // the producer. SHORT sync borrow AFTER the `.await`, never across it.
+        interp.with_determinism_mut(|ctx| {
+            if ctx.mode == crate::det::Mode::Record {
+                let ev = match &outcome {
+                    Ok(Some(bytes)) => crate::det::BoundaryOutcome::Bytes(bytes.clone()),
+                    Ok(None) => crate::det::BoundaryOutcome::Done,
+                    Err(msg) => crate::det::BoundaryOutcome::Panic(msg.clone()),
+                };
+                ctx.record_generator_yield(&ev);
+            }
+        });
+
         match outcome {
             Ok(Some(bytes)) => {
                 // Still producing: put the driver back for the next demand credit.

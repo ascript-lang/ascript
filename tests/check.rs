@@ -635,6 +635,31 @@ fn checker_flags_worker_async_fn() {
 }
 
 #[test]
+fn checker_flags_actor_spawn_inside_workflow() {
+    // Workers Spec B Task 12: a cross-isolate actor spawn inside a `workflow.run` body
+    // must emit a `workflow-determinism` warning (drive it through an activity instead).
+    let src = r#"
+import { run } from "std/workflow"
+worker class Counter { n: number = 0  fn inc(): number { self.n = self.n + 1; return self.n } }
+await run((ctx, input) => {
+  let c = Counter.spawn()
+  return c
+}, 0, { log: "wf.log" })
+"#;
+    let p = write_tmp("workflow_actor_spawn.as", src);
+    let out = Command::new(bin()).arg("check").arg(&p).output().unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("workflow-determinism"),
+        "expected a workflow-determinism warning for an actor spawn in a workflow; output: {combined}"
+    );
+}
+
+#[test]
 fn checker_accepts_worker_generator_fn() {
     // Spec B Task 6: `worker fn*` is a VALID streaming generator — the checker must
     // NOT flag it as an invalid modifier combination (no `worker-capture` error for

@@ -111,6 +111,26 @@ fn flag_seams_in(wf: &ResolvedNode, out: &mut Vec<AsDiagnostic>) {
         let (Some(ns), Some(prop)) = (member_object_name(member), member_property(member)) else {
             continue;
         };
+        // Workers Spec B (Task 12): a cross-isolate interaction (`X.spawn(...)` — a
+        // `worker class` actor spawn or `task.spawn`) inside a workflow body is
+        // non-deterministic unless event-sourced. The SP9 boundary record/replay hooks
+        // only fire when the spawn+calls happen UNDER a determinism context, which is
+        // the case inside `workflow.run`; but spawning concurrency directly (rather than
+        // through `ctx.call`/an `activity`) means the workflow author is relying on the
+        // implicit boundary record — flag it so the recommended explicit form is used.
+        if prop == "spawn" {
+            out.push(AsDiagnostic {
+                range: code_range(call),
+                severity: Severity::Warning,
+                code: "workflow-determinism".to_string(),
+                message: format!(
+                    "`{ns}.spawn(...)` starts a cross-isolate/cross-task interaction; in a workflow, drive it through an `activity` (via `ctx.call`) so the boundary is event-sourced and replay stays deterministic"
+                ),
+                fix: None,
+            });
+            continue;
+        }
+
         let is_seam = SEAM_MODULES.contains(&ns.as_str())
             || SEAM_CALLS.iter().any(|(m, f)| *m == ns && *f == prop);
         if is_seam {
@@ -212,6 +232,31 @@ await run((ctx, input) => {
     #[test]
     fn time_now_outside_any_workflow_not_flagged() {
         let src = "import { now } from \"std/time\"\nlet t = time.now()\n";
+        assert!(!has(src, "workflow-determinism"));
+    }
+
+    /// Workers Spec B (Task 12): a cross-isolate actor spawn inside a workflow body is
+    /// flagged (the recommended form drives it through an `activity`/`ctx.call`).
+    #[test]
+    fn flags_actor_spawn_in_inline_workflow() {
+        let src = r#"
+import { run } from "std/workflow"
+await run((ctx, input) => {
+  let a = Counter.spawn()
+  return a
+}, 0, { log: "x" })
+"#;
+        assert!(
+            has(src, "workflow-determinism"),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    /// A `.spawn(...)` OUTSIDE any workflow is not flagged (the rule is workflow-scoped).
+    #[test]
+    fn actor_spawn_outside_workflow_not_flagged() {
+        let src = "let a = Counter.spawn()\n";
         assert!(!has(src, "workflow-determinism"));
     }
 

@@ -65,6 +65,39 @@ pub enum DetEvent {
         args_hash: u64,
         result_json: String,
     },
+    /// Workers Spec B (Task 12): one actor method call crossed the isolate boundary.
+    /// `result` is the structured-clone-encoded reply bytes (the same `Vec<u8>` the
+    /// actor's `oneshot` carried back). On Replay the recorded bytes are decoded on the
+    /// caller thread WITHOUT re-crossing the isolate boundary, so the actor's side
+    /// effect runs exactly once (at Record). `panic` carries an uncaught Tier-2 panic
+    /// message instead of a result, so a recorded failure replays as the same failure.
+    ActorCall {
+        method: String,
+        result: Vec<u8>,
+        panic: Option<String>,
+    },
+    /// Workers Spec B (Task 12): one `worker fn*` resume crossed the isolate boundary.
+    /// `value` is the structured-clone-encoded yielded value bytes, or `None` when the
+    /// producer finished (the resume returned done). On Replay the recorded outcome is
+    /// returned WITHOUT re-driving the producer isolate. `panic` carries a producer
+    /// panic message instead of a yield.
+    GeneratorYield {
+        value: Option<Vec<u8>>,
+        panic: Option<String>,
+    },
+}
+
+/// The outcome of one recorded cross-isolate boundary interaction, as it crosses
+/// back to the caller thread. Used by the actor / generator record-replay helpers so
+/// the determinism core stays free of `Value`/serde (only `Send` bytes + a message).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoundaryOutcome {
+    /// A successful reply / yield: the structured-clone-encoded bytes.
+    Bytes(Vec<u8>),
+    /// A `worker fn*` resume that returned "done" (no value). Meaningless for actors.
+    Done,
+    /// An uncaught Tier-2 panic message raised across the boundary.
+    Panic(String),
 }
 
 /// A virtual ms-epoch clock. In deterministic mode the engine reads it instead of
@@ -282,6 +315,78 @@ impl DeterminismContext {
         }
     }
 
+    /// Workers Spec B (Task 12): record one actor method-call boundary result.
+    /// Record-mode ONLY (the caller checks `mode` first and crosses the isolate
+    /// boundary for real before calling this); appends an [`DetEvent::ActorCall`].
+    pub fn record_actor_call(&mut self, method: &str, outcome: &BoundaryOutcome) {
+        let (result, panic) = match outcome {
+            BoundaryOutcome::Bytes(b) => (b.clone(), None),
+            // An actor call has no "done" outcome; treat it as empty bytes defensively.
+            BoundaryOutcome::Done => (Vec::new(), None),
+            BoundaryOutcome::Panic(msg) => (Vec::new(), Some(msg.clone())),
+        };
+        self.events.push(DetEvent::ActorCall {
+            method: method.to_string(),
+            result,
+            panic,
+        });
+    }
+
+    /// Workers Spec B (Task 12): replay one actor method-call boundary result.
+    /// Returns the recorded outcome WITHOUT crossing the isolate boundary, or `None`
+    /// when the recorded stream is exhausted (the caller then falls through to a real
+    /// boundary crossing + a Record append, mirroring the clock/RNG seams). A recorded
+    /// event of a different kind is a replay mismatch → `None` (fall through), keeping
+    /// the workflow-level detector as the authoritative non-determinism guard.
+    pub fn replay_actor_call(&mut self, _method: &str) -> Option<BoundaryOutcome> {
+        match self.peek_event() {
+            Some(DetEvent::ActorCall { result, panic, .. }) => {
+                self.cursor += 1;
+                Some(match panic {
+                    Some(msg) => BoundaryOutcome::Panic(msg),
+                    None => BoundaryOutcome::Bytes(result),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Workers Spec B (Task 12): record one `worker fn*` resume boundary outcome.
+    /// Record-mode ONLY; appends a [`DetEvent::GeneratorYield`].
+    pub fn record_generator_yield(&mut self, outcome: &BoundaryOutcome) {
+        let (value, panic) = match outcome {
+            BoundaryOutcome::Bytes(b) => (Some(b.clone()), None),
+            BoundaryOutcome::Done => (None, None),
+            BoundaryOutcome::Panic(msg) => (None, Some(msg.clone())),
+        };
+        self.events.push(DetEvent::GeneratorYield { value, panic });
+    }
+
+    /// Workers Spec B (Task 12): replay one `worker fn*` resume boundary outcome.
+    /// Returns the recorded yield / done / panic WITHOUT re-driving the producer
+    /// isolate, or `None` when the stream is exhausted (fall through to a real resume +
+    /// a Record append). A different recorded kind → `None` (fall through).
+    pub fn replay_generator_yield(&mut self) -> Option<BoundaryOutcome> {
+        match self.peek_event() {
+            Some(DetEvent::GeneratorYield { value, panic }) => {
+                self.cursor += 1;
+                Some(match (value, panic) {
+                    (_, Some(msg)) => BoundaryOutcome::Panic(msg),
+                    (Some(b), None) => BoundaryOutcome::Bytes(b),
+                    (None, None) => BoundaryOutcome::Done,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Peek the event at `cursor` WITHOUT advancing (the boundary replay helpers only
+    /// advance the cursor when the event kind matches, so a mismatch leaves the cursor
+    /// in place for the fall-through path to re-record).
+    fn peek_event(&self) -> Option<DetEvent> {
+        self.events.get(self.cursor).cloned()
+    }
+
     /// Advance the cursor and return the event it pointed at (Replay helper).
     fn next_event(&mut self) -> Option<DetEvent> {
         let e = self.events.get(self.cursor).cloned();
@@ -357,6 +462,91 @@ mod tests {
         assert_eq!(rep.clock_now_ms(), c0);
         assert_eq!(rep.next_random_f64(), r0);
         assert_eq!(rep.next_random_f64(), r1);
+    }
+
+    #[test]
+    fn record_then_replay_actor_message_sequence() {
+        // Record a sequence of three actor calls (the encoded replies are opaque
+        // `Send` bytes — here just stand-in payloads).
+        let mut rec = DeterminismContext::record(7, 0.0);
+        rec.record_actor_call("inc", &BoundaryOutcome::Bytes(vec![1]));
+        rec.record_actor_call("inc", &BoundaryOutcome::Bytes(vec![2]));
+        rec.record_actor_call("get", &BoundaryOutcome::Bytes(vec![2]));
+        let events = rec.events.clone();
+
+        // Replay returns the recorded results IN ORDER without re-crossing the boundary.
+        let mut rep = DeterminismContext::replay(7, 0.0, events);
+        assert_eq!(
+            rep.replay_actor_call("inc"),
+            Some(BoundaryOutcome::Bytes(vec![1]))
+        );
+        assert_eq!(
+            rep.replay_actor_call("inc"),
+            Some(BoundaryOutcome::Bytes(vec![2]))
+        );
+        assert_eq!(
+            rep.replay_actor_call("get"),
+            Some(BoundaryOutcome::Bytes(vec![2]))
+        );
+        // Exhausted → None (caller falls through to a real boundary crossing).
+        assert_eq!(rep.replay_actor_call("get"), None);
+    }
+
+    #[test]
+    fn record_then_replay_actor_panic() {
+        let mut rec = DeterminismContext::record(1, 0.0);
+        rec.record_actor_call("boom", &BoundaryOutcome::Panic("kaboom".to_string()));
+        let events = rec.events.clone();
+        let mut rep = DeterminismContext::replay(1, 0.0, events);
+        assert_eq!(
+            rep.replay_actor_call("boom"),
+            Some(BoundaryOutcome::Panic("kaboom".to_string()))
+        );
+    }
+
+    #[test]
+    fn record_then_replay_generator_yield_sequence() {
+        // Record a yield sequence ending in Done.
+        let mut rec = DeterminismContext::record(3, 0.0);
+        rec.record_generator_yield(&BoundaryOutcome::Bytes(vec![10]));
+        rec.record_generator_yield(&BoundaryOutcome::Bytes(vec![20]));
+        rec.record_generator_yield(&BoundaryOutcome::Bytes(vec![30]));
+        rec.record_generator_yield(&BoundaryOutcome::Done);
+        let events = rec.events.clone();
+
+        // Replay reproduces the same yields then Done, no producer re-run.
+        let mut rep = DeterminismContext::replay(3, 0.0, events);
+        assert_eq!(
+            rep.replay_generator_yield(),
+            Some(BoundaryOutcome::Bytes(vec![10]))
+        );
+        assert_eq!(
+            rep.replay_generator_yield(),
+            Some(BoundaryOutcome::Bytes(vec![20]))
+        );
+        assert_eq!(
+            rep.replay_generator_yield(),
+            Some(BoundaryOutcome::Bytes(vec![30]))
+        );
+        assert_eq!(rep.replay_generator_yield(), Some(BoundaryOutcome::Done));
+        assert_eq!(rep.replay_generator_yield(), None); // exhausted
+    }
+
+    #[test]
+    fn boundary_replay_mismatch_falls_through_without_advancing() {
+        // A recorded actor event but a generator replay attempt (or vice versa) must
+        // NOT consume the event — it returns None so the caller falls through.
+        let mut rec = DeterminismContext::record(2, 0.0);
+        rec.record_actor_call("m", &BoundaryOutcome::Bytes(vec![9]));
+        let events = rec.events.clone();
+        let mut rep = DeterminismContext::replay(2, 0.0, events);
+        // Wrong kind → None, cursor unmoved.
+        assert_eq!(rep.replay_generator_yield(), None);
+        // The correct kind still finds the event.
+        assert_eq!(
+            rep.replay_actor_call("m"),
+            Some(BoundaryOutcome::Bytes(vec![9]))
+        );
     }
 
     #[test]
