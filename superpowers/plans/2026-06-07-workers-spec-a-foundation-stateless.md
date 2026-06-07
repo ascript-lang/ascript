@@ -352,7 +352,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `src/ast.rs` (`Display` for `Stmt` @415, Fn arm)
 - Test: `src/fmt.rs` test module
 
-- [ ] **Step 1: Write the failing test** — add to `src/fmt.rs` tests:
+- [x] **Step 1: Write the failing test** — add to `src/fmt.rs` tests:
 
 ```rust
 #[test]
@@ -372,11 +372,11 @@ fn worker_fmt_is_idempotent() {
 ```
 (Use the file's existing formatter test helper — likely `fmt_str` / `format_source`; mirror the nearest fn-formatting test.)
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
   Run: `cargo test --lib formats_worker_modifier worker_fmt_is_idempotent`
   Expected: FAIL — `worker` not emitted.
 
-- [ ] **Step 3: Render in `src/fmt.rs`.**
+- [x] **Step 3: Render in `src/fmt.rs`.**
   - `Stmt::Fn` arm (@252): destructure `is_worker,`; emit the modifier in canonical order — `async` then `worker` is wrong; the spec's canonical decl order is `static? worker? fn`. For a free fn (no static) emit `worker ` BEFORE the `fn`/`fn* ` and BEFORE any `async`:
     ```rust
     if *is_worker { out.push_str("worker "); }
@@ -391,13 +391,13 @@ fn worker_fmt_is_idempotent() {
     out.push_str(if m.is_generator { "fn* " } else { "fn " });
     ```
 
-- [ ] **Step 4: Render in `ast.rs` `Display`.** In `src/ast.rs` the `Display for Stmt`/expr `fmt` impl (@415), find the `Stmt::Fn` rendering and add the `worker ` prefix in the SAME order as the formatter so `Display` and `fmt` agree.
+- [x] **Step 4: Render in `ast.rs` `Display`.** No `Display for Stmt` exists in `ast.rs` — the formatter (`src/fmt.rs`) IS the canonical printer. Step is a no-op: no stale rendering to fix. Consistency is achieved solely through `fmt.rs`.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
   Run: `cargo test --lib formats_worker_modifier worker_fmt_is_idempotent`
   Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 ```bash
 git add src/fmt.rs src/ast.rs
 git commit -m "feat(fmt): render worker modifier in canonical static? worker? fn order; ast Display matches
