@@ -1096,7 +1096,7 @@ fn lsp_navigation_finds_worker_fn() {
 - Test: `tests/cli.rs` (REPL piped-input test) or `src/repl.rs` test
 - Modify: only if a gap surfaces (expected: none — `worker fn` uses braces; delimiter-depth buffering + session `Vm`/`Interp` persistence already cover it).
 
-- [ ] **Step 1: Write the failing/regression test** — add to `tests/cli.rs` (mirror an existing REPL-via-stdin test):
+- [x] **Step 1: Write the failing/regression test** — add to `tests/cli.rs` (mirror an existing REPL-via-stdin test):
 
 ```rust
 #[test]
@@ -1107,11 +1107,12 @@ fn repl_accepts_multiline_worker_fn_and_calls_it() {
 }
 ```
 
-- [ ] **Step 2: Run**
+- [x] **Step 2: Run**
   Run: `cargo test --test cli repl_accepts_multiline_worker_fn`
   Expected: PASS (if not, the only plausible cause is `is_incomplete` not counting the worker-fn braces — fix by confirming `worker` doesn't perturb the delimiter-depth tokenizer in `src/repl.rs`; it shouldn't, since `worker` is a plain identifier to the depth counter).
+  Note: production fix needed — REPL never called `set_worker_source`; fixed by accumulating session source in `eval_line_vm`.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 ```bash
 git add tests/cli.rs
 git commit -m "test(repl): worker fn multi-line entry + cross-line persistence regression
