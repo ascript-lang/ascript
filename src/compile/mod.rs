@@ -1842,6 +1842,21 @@ impl Compiler {
         }
         for method in &static_methods {
             let proto = self.compile_method_proto(method)?;
+            // For `static worker fn`, stamp the owning class name so that
+            // `dispatch_worker_closure` can route to
+            // `build_code_slice_for_static_method` (which needs the class name to
+            // locate the method's compiled proto inside the top-level chunk). The
+            // `Rc` is freshly created by `compile_method_proto` (refcount == 1), so
+            // `try_unwrap` always succeeds here (it would only fail if there were a
+            // second holder, which is impossible — the Rc was just minted).
+            let proto = if proto.is_worker {
+                let mut owned = Rc::try_unwrap(proto)
+                    .expect("static worker proto Rc freshly created — refcount must be 1");
+                owned.owning_class = Some(Rc::from(name.as_str()));
+                Rc::new(owned)
+            } else {
+                proto
+            };
             let idx = self.chunk.add_proto(proto);
             self.chunk.emit_u16(Op::Closure, idx, span);
         }
@@ -2358,6 +2373,7 @@ impl Compiler {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         }))
@@ -2559,6 +2575,7 @@ impl Compiler {
             is_async,
             is_generator,
             is_worker,
+            owning_class: None,
             params: proto_params,
             ret: ret_type,
         }))

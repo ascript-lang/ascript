@@ -94,7 +94,12 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   layout changed (a v14 reader would mis-parse the extra byte), so older readers
 ///   must reject a v15 chunk and vice versa.
 /// - 16: FnProto flags byte gained bit3 = is_worker (Workers Spec A).
-pub const ASO_FORMAT_VERSION: u32 = 16;
+/// - 17: FnProto flags byte gained bit4 = owning_class_present; if set, a
+///   length-prefixed UTF-8 string follows the params/ret, carrying the
+///   enclosing class name for `static worker fn` methods. Required so the VM
+///   can route higher-order worker dispatch to
+///   `build_code_slice_for_static_method` instead of `build_code_slice`.
+pub const ASO_FORMAT_VERSION: u32 = 17;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -731,7 +736,8 @@ fn write_proto(w: &mut Writer, p: &FnProto) -> Result<(), AsoError> {
     let flags = u8::from(p.has_rest)
         | (u8::from(p.is_async) << 1)
         | (u8::from(p.is_generator) << 2)
-        | (u8::from(p.is_worker) << 3);
+        | (u8::from(p.is_worker) << 3)
+        | (u8::from(p.owning_class.is_some()) << 4);
     w.u8(flags);
     // params
     w.len(p.params.len());
@@ -740,6 +746,10 @@ fn write_proto(w: &mut Writer, p: &FnProto) -> Result<(), AsoError> {
     }
     // ret
     write_opt_type(w, p.ret.as_ref());
+    // owning_class (v17+): present only when bit4 is set
+    if let Some(cls) = &p.owning_class {
+        w.str(cls);
+    }
     // recursive chunk
     write_chunk(w, &p.chunk)
 }
@@ -751,12 +761,19 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
     let is_async = flags & 2 != 0;
     let is_generator = flags & 4 != 0;
     let is_worker = flags & 8 != 0;
+    let has_owning_class = flags & 16 != 0;
     let n = r.len()?;
     let mut params = Vec::with_capacity(n);
     for _ in 0..n {
         params.push(read_param(r)?);
     }
     let ret = read_opt_type(r)?;
+    // owning_class (v17+): present when bit4 is set
+    let owning_class = if has_owning_class {
+        Some(Rc::from(r.str()?.as_str()))
+    } else {
+        None
+    };
     let chunk = read_chunk(r)?;
     Ok(FnProto {
         chunk,
@@ -765,6 +782,7 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
         is_async,
         is_generator,
         is_worker,
+        owning_class,
         params,
         ret,
     })
@@ -1648,6 +1666,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -1781,6 +1800,7 @@ run()
             is_async: false,
             is_generator: false,
             is_worker: true,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         };
@@ -1792,6 +1812,7 @@ run()
         // Also confirm the false case is still preserved.
         let proto_false = FnProto {
             is_worker: false,
+            owning_class: None,
             ..FnProto {
                 chunk: Chunk::new(),
                 arity: 0,
@@ -1799,6 +1820,7 @@ run()
                 is_async: false,
                 is_generator: false,
                 is_worker: false,
+                owning_class: None,
                 params: Vec::new(),
                 ret: None,
             }
@@ -1808,6 +1830,48 @@ run()
         let mut r2 = Reader::new(&w2.buf);
         let back_false = read_proto(&mut r2).unwrap();
         assert!(!back_false.is_worker, "is_worker=false must also be preserved");
+    }
+
+    #[test]
+    fn proto_owning_class_survives_aso_roundtrip() {
+        // Guards v17: FnProto flags bit4 = owning_class_present + trailing string
+        // must survive write_proto → read_proto (used by static worker fn dispatch).
+        let proto_with = FnProto {
+            chunk: Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: true,
+            owning_class: Some(Rc::from("Img")),
+            params: Vec::new(),
+            ret: None,
+        };
+        let mut w = Writer::new();
+        write_proto(&mut w, &proto_with).unwrap();
+        let mut r = Reader::new(&w.buf);
+        let back = read_proto(&mut r).unwrap();
+        assert_eq!(back.owning_class.as_deref(), Some("Img"),
+                   "owning_class must survive the .aso round-trip");
+
+        // None case: no extra bytes written.
+        let proto_none = FnProto {
+            chunk: Chunk::new(),
+            arity: 0,
+            has_rest: false,
+            is_async: false,
+            is_generator: false,
+            is_worker: true,
+            owning_class: None,
+            params: Vec::new(),
+            ret: None,
+        };
+        let mut w2 = Writer::new();
+        write_proto(&mut w2, &proto_none).unwrap();
+        let mut r2 = Reader::new(&w2.buf);
+        let back_none = read_proto(&mut r2).unwrap();
+        assert!(back_none.owning_class.is_none(),
+                "owning_class=None must also be preserved");
     }
 
     #[test]

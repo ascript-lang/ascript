@@ -1391,7 +1391,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Create: `bench/run_workers_bench.sh` (drives `ASCRIPT_WORKERS=1,2,4,8`, payload sweep, cold-vs-warm; writes the report)
 - Output: `bench/WORKERS_RESULTS.md` (generated; sibling to `bench/PROFILING_RESULTS.md`)
 
-- [ ] **Step 1: Write `bench/workers_bench.as`** — a CPU-bound workload (Monte-Carlo / block-hash) timed with `std/bench`. The real API is `measure(fn, iterations?) -> {iterations, totalMs, avgMs, opsPerSec}` (it drives the returned Future each iteration), exported from `std/bench` (`src/stdlib/bench.rs::exports()`):
+- [x] **Step 1: Write `bench/workers_bench.as`** — a CPU-bound workload (Monte-Carlo / block-hash) timed with `std/bench`. The real API is `measure(fn, iterations?) -> {iterations, totalMs, avgMs, opsPerSec}` (it drives the returned Future each iteration), exported from `std/bench` (`src/stdlib/bench.rs::exports()`):
 ```
 import { measure } from "std/bench"
 import { gather } from "std/task"
@@ -1416,18 +1416,19 @@ await main()
 ```
 (The headline numbers are on the VM, the production engine; tree-walker numbers are informational.)
 
-- [ ] **Step 2: Write `bench/run_workers_bench.sh`** — a bash driver:
+- [x] **Step 2: Write `bench/run_workers_bench.sh`** — a bash driver:
   - Builds release once.
   - **Speedup vs cores:** runs the workload at `ASCRIPT_WORKERS` = 1, 2, 4, 8 (capped at host cores), records wall-clock; computes speedup vs the 1-worker baseline and parallel efficiency (speedup ÷ workers).
   - **Serialization overhead vs payload size:** a second `.as` (or a parameterized run) varying arg/result array size; records per-call round-trip cost vs payload bytes; identifies the break-even payload size.
   - **Pool warmup:** first-call (cold) vs steady-state (warm) latency.
   - Writes a Markdown table to `bench/WORKERS_RESULTS.md` with the measured figures and an Engine note (VM headline; tree-walker informational). Documented expectation: clear super-1× scaling (e.g. ≳3× on 4 cores for coarse work) — REPORTED, not a hard CI gate.
 
-- [ ] **Step 3: Run the harness**
+- [x] **Step 3: Run the harness**
   Run: `bash bench/run_workers_bench.sh`
   Expected: produces `bench/WORKERS_RESULTS.md` with non-empty speedup/efficiency/overhead/warmup sections. Sanity-check that 4-worker wall-clock < 1-worker wall-clock on the host.
+  Result: W=1 2182ms, W=2 1054ms (2.07×), W=4 691ms (3.16×), W=8 439ms (4.98×). Checksum=17072, deterministic.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 ```bash
 git add bench/workers_bench.as bench/run_workers_bench.sh bench/WORKERS_RESULTS.md
 git commit -m "bench(worker): speedup-vs-cores, serialization-overhead-vs-payload, cold-vs-warm harness + report

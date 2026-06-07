@@ -342,6 +342,13 @@ pub struct FnProto {
     /// (`worker fn f()`). The VM will spawn this closure on a worker thread
     /// (Task 3+). Propagated from the CST `WorkerKw` token by the compiler.
     pub is_worker: bool,
+    /// For a `static worker fn` the name of the ENCLOSING class, set by the
+    /// compiler when compiling static method protos. `None` for free functions
+    /// and non-static/non-worker methods. Used by the VM's
+    /// `dispatch_worker_closure` to route to
+    /// `build_code_slice_for_static_method` instead of `build_code_slice` (which
+    /// only handles top-level fns). Serialized in `.aso` format version 17+.
+    pub owning_class: Option<Rc<str>>,
     /// The parameter list in declaration order (including a trailing rest param),
     /// carrying each param's name, declared type contract, and `rest` flag. The VM
     /// CALL feeds this straight into [`crate::interp::check_call_args`] — the SAME
@@ -822,6 +829,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });

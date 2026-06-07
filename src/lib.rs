@@ -297,6 +297,7 @@ pub async fn vm_eval_source(src: &str) -> Result<crate::value::Value, AsError> {
         is_async: false,
         is_generator: false,
         is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });
@@ -414,6 +415,7 @@ pub async fn run_aso_file(path: &Path, script_args: &[String]) -> Result<i32, As
         is_async: false,
         is_generator: false,
         is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });
@@ -502,6 +504,7 @@ pub async fn run_file_on_vm_with_packages(
         is_async: false,
         is_generator: false,
         is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });
@@ -549,6 +552,7 @@ async fn vm_run_source_with(src: &str, specialize: bool) -> Result<(String, Opti
         is_async: false,
         is_generator: false,
         is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });

@@ -246,11 +246,24 @@ impl Vm {
         if crate::worker::pool::in_isolate() {
             return crate::worker::dispatch_worker_inline(&self.interp, entry_name, args, span);
         }
+        // Route to the static-method or free-function slice builder depending on
+        // whether the proto carries an owning class name. A `static worker fn`
+        // compiled on a class has `proto.owning_class = Some(class_name)` (set by
+        // the compiler when emitting static method protos); a free `worker fn` has
+        // `owning_class = None` and goes through the ordinary top-level path.
+        let class_name: Option<&str> = callee.proto.owning_class.as_deref();
+
         // Prefer the source recompile path (produces an identical slice for any run
         // mode that has source). Fall back to the pre-compiled chunk derived from the raw
         // `.aso` bytes stored by `run_aso_file` when no source is recorded (the .aso path).
         let slice = if self.interp.worker_source().is_some() {
-            crate::worker::build_code_slice_from_source(&self.interp, entry_name, None)?
+            if let Some(cls) = class_name {
+                crate::worker::build_code_slice_for_static_method_from_source(
+                    &self.interp, cls, entry_name,
+                )?
+            } else {
+                crate::worker::build_code_slice_from_source(&self.interp, entry_name, None)?
+            }
         } else if let Some(raw) = self.interp.worker_aso_bytes() {
             let top = crate::vm::chunk::Chunk::from_bytes(&raw).map_err(|e| {
                 Control::Panic(crate::error::AsError::at(
@@ -258,7 +271,11 @@ impl Vm {
                     span,
                 ))
             })?;
-            crate::worker::build_code_slice(&top, entry_name, None)?
+            if let Some(cls) = class_name {
+                crate::worker::build_code_slice_for_static_method(&top, cls, entry_name)?
+            } else {
+                crate::worker::build_code_slice(&top, entry_name, None)?
+            }
         } else {
             return Err(Control::Panic(crate::error::AsError::at(
                 format!(
@@ -466,6 +483,7 @@ impl Vm {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -2902,6 +2920,34 @@ impl Vm {
     ) -> Result<Value, Control> {
         match callee {
             Value::Closure(closure) => {
+                // Workers Spec A: a `worker fn` passed as a higher-order value (e.g.
+                // `array.map(seeds, workerFn)`) must be dispatched to a pooled isolate
+                // when running on the CALLER thread — otherwise the worker body runs
+                // inline and NO parallelism occurs. Mirror the `Op::Call` arm's
+                // `is_worker` branch so that the native → VM re-entry path produces a
+                // `Value::Future` (dispatched) rather than a synchronously-computed
+                // result.
+                //
+                // INSIDE an isolate, this path is NOT taken: the `Op::Call` handler
+                // dispatches `dispatch_worker_inline` for the inline-nesting case, and
+                // `dispatch_worker_inline`'s `spawn_local` task calls `vm.call_value`
+                // on the entry — at that point we are still inside the isolate thread
+                // and the entry must run as a plain closure (the code-slice already
+                // defined it; running it inline IS the intended behavior). Skip the
+                // re-dispatch to avoid infinite recursion:
+                //   dispatch_worker_closure → in_isolate → dispatch_worker_inline
+                //   → vm.call_value → is_worker → dispatch_worker_closure → ...
+                // Only re-dispatch when there is something to build a slice FROM;
+                // if neither worker_source nor worker_aso_bytes is set, we are in a
+                // test harness or a fresh isolate that loaded the slice directly —
+                // fall through to the plain inline path (which is correct there).
+                if closure.proto.is_worker
+                    && !crate::worker::pool::in_isolate()
+                    && (self.interp.worker_source().is_some()
+                        || self.interp.worker_aso_bytes().is_some())
+                {
+                    return self.dispatch_worker_closure(&closure, args, span);
+                }
                 // `what` mirrors the tree-walker's
                 // `func.name.as_deref().unwrap_or("function")` so an arity/contract
                 // panic message matches.
@@ -4202,6 +4248,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -4556,6 +4603,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -5002,6 +5050,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -5322,6 +5371,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });
@@ -5346,6 +5396,7 @@ mod tests {
             is_async: false,
             is_generator: false,
             is_worker: false,
+            owning_class: None,
             params: Vec::new(),
             ret: None,
         });

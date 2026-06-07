@@ -226,6 +226,7 @@ pub(crate) async fn load_slice(vm: &Rc<Vm>, slice_bytes: Option<&[u8]>) -> Resul
         is_async: false,
         is_generator: false,
         is_worker: false,
+        owning_class: None,
         params: Vec::new(),
         ret: None,
     });
