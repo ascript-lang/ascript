@@ -1453,7 +1453,7 @@ fn lsp_worker_capture_flows_to_diagnostics() {
         .filter_map(|d| d["code"].as_str())
         .collect();
     assert!(
-        codes.iter().any(|&c| c == "worker-capture"),
+        codes.contains(&"worker-capture"),
         "expected a `worker-capture` diagnostic; got codes: {codes:?}"
     );
 

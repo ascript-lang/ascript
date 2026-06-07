@@ -153,11 +153,11 @@ fn fn_decl_is_worker(name: &str, model: &SemanticModel) -> bool {
             continue;
         }
         // Check the name matches.
-        let decl_name = crate::syntax::resolve::ident_text(&decl).unwrap_or_default();
+        let decl_name = crate::syntax::resolve::ident_text(decl).unwrap_or_default();
         if decl_name != name {
             continue;
         }
-        if is_worker_fn(&decl) {
+        if is_worker_fn(decl) {
             return true;
         }
     }
