@@ -1031,7 +1031,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Modify: `src/lsp/providers/hover.rs`
 - Test: `tests/lsp.rs`
 
-- [ ] **Step 1: Write the failing tests** — add to `tests/lsp.rs`:
+- [x] **Step 1: Write the failing tests** — add to `tests/lsp.rs`:
 
 ```rust
 #[test]
@@ -1065,31 +1065,28 @@ fn lsp_navigation_finds_worker_fn() {
     assert_eq!(defs.len(), 1);
 }
 ```
-(Use `tests/lsp.rs`'s existing helpers — `semantic_tokens`, `completions_at`, `hover_at`, `lsp_diagnostics`, `goto_def` — mirror current tests; adjust signatures to the file's actual helpers.)
+(Implemented using LspClient wire-protocol helpers matching the file's actual pattern.)
 
-- [ ] **Step 2: Run to verify failures**
+- [x] **Step 2: Run to verify failures**
   Run: `cargo test --test lsp lsp_worker`
   Expected: FAIL (`worker` not a keyword token / not completed / hover lacks future).
 
-- [ ] **Step 3: Classify `WorkerKw` as a keyword token.** In `src/lsp/providers/semantic_tokens.rs` `is_keyword_kind` (@230, the closed match @249–258), add `| WorkerKw` next to `StaticKw`. (This is exactly the "future keyword fails the build here" hook from the comment @229 — satisfy it.)
+- [x] **Step 3: Classify `WorkerKw` as a keyword token.** In `src/lsp/providers/semantic_tokens.rs` `is_keyword_kind` (@230, the closed match @249–258), add `| WorkerKw` next to `StaticKw`. (This is exactly the "future keyword fails the build here" hook from the comment @229 — satisfy it.)
+  NOTE: Already done in Task 2 — verified at line 259.
 
-- [ ] **Step 4: Offer `worker` completion.** In `src/lsp/providers/completion.rs`, add `"worker"` to the keyword list (@25, alongside `"async"`).
+- [x] **Step 4: Offer `worker` completion.** In `src/lsp/providers/completion.rs`, add `"worker"` to the keyword list (@25, alongside `"async"`).
 
-- [ ] **Step 5: Hover.** In `src/lsp/providers/hover.rs`, where it builds the hover for a fn/method via `infer::hover_type_at`, detect `is_worker` (reuse `crate::syntax::resolve::is_worker_fn` on the decl node) and prepend a line: `worker fn — runs in a pooled isolate; calls return future<T>`. The type line already renders `future<T>` from Task 11's inference.
+- [x] **Step 5: Hover.** In `src/lsp/providers/docs.rs`: added `WorkerKw` to `keyword_doc`; added `fn_decl_is_worker` CST walker and updated `decl_doc` to detect worker fns and emit "worker fn — runs in a pooled isolate; calls return future<T>".
 
-- [ ] **Step 6: Navigation & diagnostics need no new code** — `worker fn` is an ordinary named fn (the resolver/index already cover it once the parser sets the flag) and `worker-capture` flows through `check::analyze` → the existing LSP diagnostic path. The Step-1 tests confirm this; if `goto_def`/references fail, the cause is a missing parser flag (re-check Task 2), not a new LSP code path.
+- [x] **Step 6: Navigation & diagnostics need no new code** — `worker fn` is an ordinary named fn (the resolver/index already cover it once the parser sets the flag) and `worker-capture` flows through `check::analyze` → the existing LSP diagnostic path. The Step-1 tests confirm this; if `goto_def`/references fail, the cause is a missing parser flag (re-check Task 2), not a new LSP code path.
 
-- [ ] **Step 7: Run the tests**
+- [x] **Step 7: Run the tests**
   Run: `cargo test --test lsp lsp_worker`
   Expected: PASS.
+  Result: All 5 new tests pass; all 10 LSP tests pass.
 
-- [ ] **Step 8: Commit**
-```bash
-git add src/lsp/providers/semantic_tokens.rs src/lsp/providers/completion.rs src/lsp/providers/hover.rs tests/lsp.rs
-git commit -m "feat(lsp): worker semantic token + completion + hover (future<T>); diagnostics/nav reuse the existing path
-
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
-```
+- [x] **Step 8: Commit**
+  Committed as ffc2f3c.
 
 ---
 
