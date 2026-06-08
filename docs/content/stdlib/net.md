@@ -4,9 +4,9 @@
 
 AScript's networking stack — DNS resolution, raw TCP, UDP datagrams, a modern HTTP client, a small HTTP server, and WebSockets — lives in several modules under `std/net`. All are provided by the `net` Cargo feature, which is **enabled by default**. If you build AScript with a custom feature set, include `net` to keep these modules available.
 
-The interpreter is **single-threaded with an inline async model**: there is no background thread of execution, and almost every networking operation suspends the program until it completes. Consequently nearly every method on these modules is `await`ed — `lookup`, `connect`, `accept`, `read`, `write`, `send`, `recv`, the HTTP verbs, `serve`, and so on. The synchronous exceptions are the handle-teardown methods (`close()`) and the in-memory builders on the server handle (`route`, `use`).
+Each isolate is **single-threaded per isolate with an inline async model**: there is no background thread of execution within an isolate, and almost every networking operation suspends the program until it completes. Consequently nearly every method on these modules is `await`ed — `lookup`, `connect`, `accept`, `read`, `write`, `send`, `recv`, the HTTP verbs, `serve`, and so on. The synchronous exceptions are the handle-teardown methods (`close()`) and the in-memory builders on the server handle (`route`, `use`).
 
-> [!NOTE] Although the runtime is single-threaded, it is genuinely concurrent: `std/task` provides
+> [!NOTE] Although each isolate is single-threaded, it is genuinely concurrent: `std/task` provides
 > `spawn`/`gather`/`race`/`timeout` over the cooperative event loop, so a server's `accept` loop and a
 > client can run **in the same process** — `spawn` the server task, then connect to it, then `await`
 > both. See [Async & concurrency](async) and `examples/advanced/` for full HTTP/WebSocket round-trips.
@@ -575,7 +575,7 @@ await server.serve({ maxRequests: 3 })
 
 ## std/net/ws
 
-WebSocket client and server handles, built on tokio-tungstenite. The server is **accept-based**, mirroring `std/net/tcp` and matching the single-threaded model — there is no `listen(host, port, handler)` callback form.
+WebSocket client and server handles, built on tokio-tungstenite. The server is **accept-based**, mirroring `std/net/tcp` and matching the single-threaded-per-isolate model — there is no `listen(host, port, handler)` callback form.
 
 ```ascript
 import * as ws from "std/net/ws"

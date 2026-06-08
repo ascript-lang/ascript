@@ -82,16 +82,6 @@ pub struct WorkerActorHandle {
     pub isolate: IsolateHandle,
     /// The declared class name (a readable proxy field; future `instanceof`).
     pub class_name: Rc<str>,
-    /// Non-reentrancy flag: set while a synchronous (un-awaited) call into this
-    /// handle is on the stack. The FIFO one-at-a-time mailbox already SERIALIZES
-    /// concurrent calls (a second message simply queues behind the first — no
-    /// deadlock), and the proxy is `!Send`/isolate-local so an actor method cannot
-    /// reach its OWN handle to re-enter it; this flag exists so a future
-    /// synchronous-reentry path (should one be introduced) can be detected and
-    /// turned into a recoverable Tier-2 panic instead of a deadlock. See the Task 5
-    /// report: in the current design same-handle reentrancy is structurally
-    /// unreachable, so the flag is currently inert.
-    pub in_call: std::cell::Cell<bool>,
 }
 
 impl WorkerActorHandle {
@@ -104,7 +94,6 @@ impl WorkerActorHandle {
             tx,
             isolate,
             class_name,
-            in_call: std::cell::Cell::new(false),
         }
     }
 }

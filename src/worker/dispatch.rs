@@ -677,24 +677,6 @@ pub fn build_class_slice(top: &Chunk, class_name: &str) -> Result<WorkerCodeSlic
     })
 }
 
-/// Like [`build_class_slice`] but recompiling from the program source retained on
-/// the [`crate::interp::Interp`] (the SINGLE slice path shared by both engines — the
-/// tree-walker has no compiled chunk of its own). Mirrors
-/// [`build_code_slice_from_source`].
-pub fn build_class_slice_from_source(
-    interp: &crate::interp::Interp,
-    class_name: &str,
-) -> Result<WorkerCodeSlice, Control> {
-    let src = interp.worker_source().ok_or_else(|| {
-        Control::Panic(crate::error::AsError::new(format!(
-            "cannot spawn worker class '{class_name}': the program source is \
-             unavailable (worker classes require running via `ascript run`)"
-        )))
-    })?;
-    let top = crate::compile::compile_source(&src)
-        .map_err(|e| Control::Panic(crate::error::AsError::at(e.message, e.span)))?;
-    build_class_slice(&top, class_name)
-}
 
 /// Emit `class_name`'s definition into `frag`, recursively emitting any superclass
 /// first. Accumulates the union of all method/default GET_GLOBAL references into
