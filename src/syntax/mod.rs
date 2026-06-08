@@ -43,8 +43,21 @@ pub struct SyntaxError {
 /// consult this before trusting the tree's shape. Lexical errors are reported
 /// before grammar errors only when they occur earlier in the source (both are
 /// mapped to byte ranges and the earliest is chosen).
+///
+/// Convenience for callers that only hold a `&str`. A caller that ALSO needs the
+/// tree (e.g. the VM compile path) should parse ONCE and call
+/// [`first_syntax_error_in`] on the resulting [`parser::Parse`], then hand that
+/// same `Parse` to [`tree_builder::build_tree`] — parsing twice is wasted work.
 pub fn first_syntax_error(src: &str) -> Option<SyntaxError> {
-    let parsed = parser::parse(src);
+    first_syntax_error_in(&parser::parse(src))
+}
+
+/// The earliest [`SyntaxError`] recorded on an already-built [`parser::Parse`]
+/// (grammar or lexical, by byte `start`), or `None` if the parse was clean. This
+/// is the single source of truth; [`first_syntax_error`] is the parse-from-`&str`
+/// wrapper. Reading the errors off the `Parse` is borrow-only, so the caller can
+/// still move the `Parse` into `build_tree` afterwards.
+pub fn first_syntax_error_in(parsed: &parser::Parse) -> Option<SyntaxError> {
     // Map a non-trivia token index to a byte range (mirrors `check::analyze`).
     let grammar = parsed.errors.first().map(|e| {
         let mut byte = 0usize;

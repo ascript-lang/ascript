@@ -21,7 +21,9 @@ use crate::syntax::ast::{
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{Resolution, ResolveResult};
-use crate::syntax::{first_syntax_error, parse_to_tree, resolve::resolve};
+use crate::syntax::parser::parse;
+use crate::syntax::tree_builder::build_tree;
+use crate::syntax::{first_syntax_error_in, resolve::resolve};
 use crate::value::Value;
 use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc};
 use crate::vm::opcode::Op;
@@ -719,9 +721,11 @@ fn short_circuit_op(op: SyntaxKind) -> Option<Op> {
 
 /// Compile `src` into a top-level [`Chunk`].
 ///
-/// Pipeline: `parse_to_tree` → `SourceFile::cast` → `resolve` (wired so the full
-/// front-end runs even though V1 has no locals/globals to bind) → walk the
-/// statements, compiling the trailing expression and emitting `RETURN`.
+/// Pipeline: `parse` → syntax-error gate → `build_tree` → `SourceFile::cast` →
+/// `resolve` (wired so the full front-end runs even though V1 has no
+/// locals/globals to bind) → walk the statements, compiling the trailing
+/// expression and emitting `RETURN`. The source is parsed exactly once: the
+/// gate reads the errors off the `Parse` and the same `Parse` becomes the tree.
 pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     // The CST parser is error-RECOVERING: it never aborts, it records a
     // diagnostic and patches a best-effort tree (e.g. an anonymous `fn(){...}`
@@ -730,10 +734,14 @@ pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
     // confusing internal "compiler bug" panic, so reject malformed source up
     // front with the FIRST syntax error, exactly as the legacy tree-walker
     // front-end rejects it at its own parser (keeping the two engines aligned).
-    if let Some(err) = first_syntax_error(src) {
+    // Parse ONCE: read the recorded syntax errors off the `Parse` (borrow-only),
+    // reject up front if any, then move that SAME `Parse` into the tree builder —
+    // never parse the source a second time (mirrors `check::analyze`).
+    let parsed = parse(src);
+    if let Some(err) = first_syntax_error_in(&parsed) {
         return Err(CompileError::new(err.message, Span::new(err.start, err.end)));
     }
-    let root = parse_to_tree(src);
+    let root = build_tree(parsed);
     let file = SourceFile::cast(root.clone())
         .ok_or_else(|| CompileError::new("expected a source file", Span::new(0, src.len())))?;
 
