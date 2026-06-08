@@ -2233,7 +2233,7 @@ await s.serve({{ maxRequests: 1 }})
         let (status, body) =
             with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
         assert_eq!(status, "HTTP/1.1 200 OK");
-        assert_eq!(body, "id+1=8", "param coerced to number then +1");
+        assert_eq!(body, "id+1=8.0", "param coerced to number then +1");
     }
 
     /// A bad param (non-numeric where number expected) → 400 with where:"params".
@@ -2279,7 +2279,7 @@ await s.serve({{ maxRequests: 1 }})
         let (status, body) =
             with_server(&src, move || async move { client_request("GET", &url, None).await }).await;
         assert_eq!(status, "HTTP/1.1 200 OK");
-        assert_eq!(body, "page+1=3");
+        assert_eq!(body, "page+1=3.0");
     }
 
     /// A bad query field → 400 with where:"query".
@@ -2330,7 +2330,7 @@ await s.serve({{ maxRequests: 1 }})
         })
         .await;
         assert_eq!(status, "HTTP/1.1 200 OK");
-        assert_eq!(body, "9|true|widget");
+        assert_eq!(body, "9.0|true|widget");
     }
 
     /// A body schema declared via the options object (not bare) still validates.

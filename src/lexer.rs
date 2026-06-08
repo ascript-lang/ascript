@@ -494,10 +494,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B' | 'o' | 'O')
                 {
                     let radix_char = chars[i + 1];
+                    // Scan the radix body GREEDILY (all ascii digits for octal/
+                    // binary, all hexdigits for hex) so an out-of-base digit
+                    // (`0o19`, `0b12`) is part of the SAME token and reaches
+                    // `parse_number_text`, which reports `invalid digit in integer
+                    // literal` rather than silently splitting the token. This
+                    // matches the CST lexer (`src/syntax/lexer.rs` `scan_number`)
+                    // so both front-ends agree (frontend conformance).
                     let is_digit: fn(char) -> bool = match radix_char {
-                        'x' | 'X' => |d| d.is_ascii_hexdigit(),
-                        'o' | 'O' => |d| ('0'..='7').contains(&d),
-                        _ => |d| d == '0' || d == '1',
+                        'x' | 'X' => |d: char| d.is_ascii_hexdigit(),
+                        _ => |d: char| d.is_ascii_digit(),
                     };
                     j = i + 2;
                     while j < chars.len() && (is_digit(chars[j]) || chars[j] == '_') {
@@ -1092,7 +1098,21 @@ mod tests {
 
     #[test]
     fn invalid_binary_literal_errors() {
+        // NUM §4: the binary radix body is scanned GREEDILY, so `0b2`'s out-of-base
+        // digit `2` is part of the token and reported as an invalid digit (a more
+        // precise cause than the old empty-body "invalid binary number literal").
         let err = lex("0b2").unwrap_err();
-        assert!(err.message.contains("invalid binary number literal"));
+        assert!(
+            err.message.contains("invalid digit in integer literal"),
+            "message was {:?}",
+            err.message
+        );
+        // `0o19` (out-of-base octal digit `9`) likewise reports invalid digit.
+        let err = lex("0o19").unwrap_err();
+        assert!(
+            err.message.contains("invalid digit in integer literal"),
+            "message was {:?}",
+            err.message
+        );
     }
 }

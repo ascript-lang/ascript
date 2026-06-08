@@ -64,7 +64,8 @@ print(t1 - t0)
         .await
         .expect("run");
     let elapsed = started.elapsed();
-    assert_eq!(out.trim(), "600000", "virtual clock advanced by the slept ms");
+    // NUM §4: `time.now()` returns a float, so the elapsed delta prints "600000.0".
+    assert_eq!(out.trim(), "600000.0", "virtual clock advanced by the slept ms");
     assert!(
         elapsed < std::time::Duration::from_secs(5),
         "deterministic sleep must not block real time (took {elapsed:?})"

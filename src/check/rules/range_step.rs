@@ -234,7 +234,11 @@ mod tests {
 
     #[test]
     fn mismatch_message_matches_runtime() {
-        // `step -2 moves away from end (10)` — byte-identical to the runtime panic.
+        // The message MUST stay byte-identical to the runtime panic. `resolve_step`
+        // works on `f64` bounds and formats them via `format_number` (the
+        // `Value::Float` Display path), which NUM §4 renders with a decimal — so
+        // both the lint and the runtime print `-2.0`/`10.0`. The differential
+        // (lint == runtime panic) is what this test pins.
         let src = "for (i in 1..10 step -2){}\n";
         let d = analyze(src)
             .diagnostics
@@ -243,7 +247,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             d.message,
-            "step -2 moves away from end (10); range can never progress"
+            "step -2.0 moves away from end (10.0); range can never progress"
         );
     }
 

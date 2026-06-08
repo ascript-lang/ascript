@@ -74,6 +74,29 @@ let color = (0xAB << 16) | (0xCD << 8) | 0xEF
 print((color >> 8) & 0xFF)   // 205
 ```
 
+**Printing.** An `int` prints with no decimal (`5`); a `float` **always** prints with at least one
+fractional digit (`5.0`, `1500.0`, `-0.0`) so the two subtypes are visually distinguishable
+(`inf`/`-inf`/`NaN` are unchanged).
+
+```ascript
+print(5)          // 5
+print(5.0)        // 5.0
+print(10.0 / 2)   // 5.0
+print([1.0, 2.0]) // [1.0, 2.0]
+```
+
+**Conversions.** `int(x)` and `float(x)` convert between the subtypes: `int(5.7)` truncates toward
+zero → `5`; `float(3)` → `3.0`; `int("42")` / `float("3.5")` parse a string and return a Tier-1
+`[value, err]` pair (`int("x")` → `[nil, err]`). An identity conversion (`int` of an `int`, `float` of
+a `float`) is a no-op.
+
+```ascript
+print(int(5.7))     // 5    (truncates toward zero)
+print(float(3))     // 3.0
+print(int("42"))    // [42, nil]
+print(int("x"))     // [nil, {message: ...}]
+```
+
 **Exact cross-subtype comparison.** `1 == 1.0` is `true`, but a large `int` not exactly representable
 as a `float` compares exactly — no precision bug at the `2^53` boundary.
 

@@ -213,7 +213,10 @@ fn scan_number(chars: &[char], mut i: usize) -> usize {
     }
     if chars[i] == '0' && i + 1 < n && (chars[i + 1] == 'b' || chars[i + 1] == 'B') {
         i += 2;
-        while i < n && (chars[i] == '0' || chars[i] == '1' || chars[i] == '_') {
+        // Scan all ascii digits greedily (not just 0/1): an out-of-base digit
+        // (`0b12`) stays in the SAME token so `parse_number_text` reports
+        // `invalid digit in integer literal` (matches the legacy lexer).
+        while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
             i += 1;
         }
         return i;

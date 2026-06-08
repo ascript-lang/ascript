@@ -94,7 +94,8 @@ pub enum Stage {
         buffer: VecDeque<Value>,
     },
     /// wrap each item as `[index, value]`, `index` starting at 0.
-    Enumerate { index: f64 },
+    /// NUM §4: the index is an `int`.
+    Enumerate { index: i64 },
     /// pair each item with the next item pulled from stream `other_id`; ends when
     /// either side ends.
     Zip { other_id: u64 },
@@ -380,7 +381,7 @@ impl Interp {
     fn stream_enumerate(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_stream_id(&arg(args, 0), span, "stream.enumerate")?;
         let (source, mut stages) = self.snapshot_stream(id, span, "stream.enumerate")?;
-        stages.push(Stage::Enumerate { index: 0.0 });
+        stages.push(Stage::Enumerate { index: 0 });
         Ok(self.register_stream(StreamState { source, stages }))
     }
 
@@ -621,9 +622,9 @@ impl Interp {
                 }
                 Stage::Enumerate { index } => {
                     let idx = *index;
-                    *index += 1.0;
+                    *index += 1;
                     value = Value::Array(crate::value::ArrayCell::new(vec![
-                        Value::Float(idx),
+                        Value::Int(idx),
                         value,
                     ]));
                 }
@@ -684,11 +685,12 @@ impl Interp {
     /// `stream.count(s)` — number of items the stream produces.
     async fn stream_count(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_stream_id(&arg(args, 0), span, "stream.count")?;
-        let mut n = 0.0;
+        // NUM §4: a count is an integer quantity → `Int`.
+        let mut n: i64 = 0;
         while self.pull_next(id, span).await?.is_some() {
-            n += 1.0;
+            n += 1;
         }
-        Ok(Value::Float(n))
+        Ok(Value::Int(n))
     }
 
     /// `stream.find(s, fn)` — first item where `fn(value)` is truthy, else `nil`.
@@ -944,7 +946,7 @@ await collect(range(1, 10, -2))
         let err = result.expect_err("expected mismatch panic");
         assert!(
             format!("{err:?}")
-                .contains("step -2 moves away from end (10); range can never progress"),
+                .contains("step -2.0 moves away from end (10.0); range can never progress"),
             "unexpected error: {err:?}"
         );
     }

@@ -4807,7 +4807,7 @@ mod tests {
         c.emit(Op::Return, s());
         let (outcome, out) = run_chunk_with_output(c);
         assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "ran ok");
-        assert_eq!(out, "42\n", "print wrote to the shared capture sink");
+        assert_eq!(out, "42.0\n", "print wrote to the shared capture sink");
     }
 
     #[test]
@@ -5367,7 +5367,7 @@ mod tests {
             assert!(matches!(r, Value::Nil), "print returns nil");
             vm.interp().output()
         });
-        assert_eq!(out, "7\n", "print wrote through the delegated path");
+        assert_eq!(out, "7.0\n", "print wrote through the delegated path");
     }
 
     #[test]

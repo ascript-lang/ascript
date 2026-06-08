@@ -321,7 +321,8 @@ fn usage_value(n: &NeutralResponse) -> Value {
 
 fn opt_num(v: Option<i64>) -> Value {
     match v {
-        Some(n) => Value::Float(n as f64),
+        // NUM §4: a token count is an `int`.
+        Some(n) => Value::Int(n),
         None => Value::Nil,
     }
 }

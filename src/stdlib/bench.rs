@@ -85,7 +85,8 @@ impl Interp {
         };
 
         let mut obj = IndexMap::new();
-        obj.insert("iterations".to_string(), Value::Float(iterations as f64));
+        // NUM §4: an iteration count is an `int`; timings stay `float`.
+        obj.insert("iterations".to_string(), Value::Int(iterations as i64));
         obj.insert("totalMs".to_string(), Value::Float(total_ms));
         obj.insert("avgMs".to_string(), Value::Float(avg_ms));
         // Cap opsPerSec at a very large but representable number if infinite.

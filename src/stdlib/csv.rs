@@ -184,6 +184,6 @@ mod tests {
             arr(vec![Value::Float(1.0), Value::Float(2.0)]),
         ]);
         let out = call("stringify", std::slice::from_ref(&data), sp()).unwrap();
-        assert_eq!(out.to_string(), "[\"x,y\\n1,2\\n\", nil]");
+        assert_eq!(out.to_string(), "[\"x,y\\n1.0,2.0\\n\", nil]");
     }
 }

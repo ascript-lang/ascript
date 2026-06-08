@@ -82,7 +82,8 @@ print(read("{counter}")[0])
     // during record; the idempotent resume re-ran nothing).
     assert_eq!(lines[0], "20", "record result");
     assert_eq!(lines[1], "20", "resume result equals record (idempotent)");
-    assert_eq!(lines[2], "2", "activities ran exactly twice total (not on resume)");
+    // NUM §4: the counter file holds toNumber()+1, which is a float → "2.0".
+    assert_eq!(lines[2], "2.0", "activities ran exactly twice total (not on resume)");
 }
 
 #[test]
@@ -122,7 +123,8 @@ print(r)
     assert_eq!(code, Some(0), "record run: {out}");
     assert_eq!(out.lines().next(), Some("201"), "clean record result 1→101→201");
     let counter_after_record = std::fs::read_to_string(&counter).unwrap();
-    assert_eq!(counter_after_record.trim(), "2", "both activities ran in record");
+    // NUM §4: the counter file holds toNumber()+1, a float → "2.0".
+    assert_eq!(counter_after_record.trim(), "2.0", "both activities ran in record");
 
     // Truncate the log to ONLY the first ActivityCompleted line (the crash point).
     let full = std::fs::read_to_string(&log).unwrap();
@@ -160,7 +162,8 @@ print(r)
     let counter_after_resume = std::fs::read_to_string(&counter).unwrap();
     assert_eq!(
         counter_after_resume.trim(),
-        "1",
+        // NUM §4: the counter file holds toNumber()+1, a float → "1.0".
+        "1.0",
         "exactly one activity executed on resume (first replayed, not re-run)"
     );
 }
@@ -238,7 +241,8 @@ print(r)
     let started = std::time::Instant::now();
     let (out, code) = run_as(&src, "sleep");
     assert_eq!(code, Some(0), "{out}");
-    assert_eq!(out.lines().next(), Some("3600000"), "virtual clock advanced 1h");
+    // NUM §4: the clock delta comes from time (float) → "3600000.0".
+    assert_eq!(out.lines().next(), Some("3600000.0"), "virtual clock advanced 1h");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(10),
         "durable sleep must not block real time"

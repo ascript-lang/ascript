@@ -262,10 +262,12 @@ fn runs_stdlib_example() {
     assert!(output.status.success(), "process failed: {:?}", output);
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(out.contains("brown, fox, quick, the"));
-    assert!(out.contains("[1, 4, 9, 16]"));
+    // NUM §4: `math.pow` returns a float, so the squares print with decimals.
+    assert!(out.contains("[1.0, 4.0, 9.0, 16.0]"));
     assert!(out.contains("\"name\", \"age\"")); // object.keys
     assert!(out.contains("cannot parse 'xyz' as a number")); // Result destructuring
-    assert!(out.contains("\n50\n")); // 42 + 8 after parseNumber + destructure
+    // NUM §4: `convert.parseNumber` yields a float, so `42 + 8` prints "50.0".
+    assert!(out.contains("\n50.0\n")); // 42 + 8 after parseNumber + destructure
 }
 
 #[test]
@@ -315,9 +317,10 @@ fn runs_datetime_example() {
     let out = String::from_utf8_lossy(&output.stdout);
     // time: seconds(3) = 3000 (deterministic; elapsed>=5 line varies, not asserted)
     assert!(out.contains("3000"));
-    // date: parse + strftime format, and June 15 + 7 days = the 22nd
+    // date: parse + strftime format, and June 15 + 7 days = the 22nd.
+    // NUM §4: date components print as floats (the date module returns floats).
     assert!(out.contains("2021/06/15"));
-    assert!(out.contains("\n22\n"));
+    assert!(out.contains("\n22.0\n"));
     // intl: locale-aware grouping differs between en-US and de-DE
     assert!(out.contains("1,234,567"));
     assert!(out.contains("1.234.567"));
@@ -1470,7 +1473,7 @@ fn stepped_ranges_iterate_both_engines() {
         ("for (i in 1..10 step 2) { print(i) }", "1\n3\n5\n7\n9\n"),
         ("for (i in 10..1 step -2) { print(i) }", "10\n8\n6\n4\n2\n"),
         ("print(1..=10 step 2)", "[1, 3, 5, 7, 9]\n"),
-        ("print(0..=1 step 0.25)", "[0, 0.25, 0.5, 0.75, 1]\n"),
+        ("print(0..=1 step 0.25)", "[0.0, 0.25, 0.5, 0.75, 1.0]\n"),
         // omitted-step descending: present-step rows above are unaffected by
         // Phase 4 (which only changes the OMITTED-step default direction).
         ("print(10..1 step -2)", "[10, 8, 6, 4, 2]\n"),
@@ -1553,11 +1556,11 @@ fn stepped_ranges_validation_panics_both_engines() {
         ),
         (
             "for (i in 1..10 step -2) {}",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
         (
             "for (i in 10..1 step 2) {}",
-            "step 2 moves away from end (1); range can never progress",
+            "step 2.0 moves away from end (1.0); range can never progress",
         ),
     ]
     .iter()
@@ -1632,7 +1635,7 @@ fn stdlib_stream_range_validation_panics_both_engines() {
     for (i, (src, msg)) in [
         (
             "import { range, collect } from \"std/stream\"\nawait collect(range(1, 10, -2))",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
         (
             "import { range, collect } from \"std/stream\"\nawait collect(range(1, 10, 0))",
@@ -1734,7 +1737,7 @@ fn stepped_match_pattern_validation_panics_both_engines() {
         ),
         (
             "print(match 5 { 1..=10 step -2 => 1, _ => 0 })",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
     ]
     .iter()
@@ -2479,10 +2482,10 @@ fn oversubscription_completes_via_queue() {
         let fs = array.map(nums, sq)
         print(math.sum(await gather(fs)))
     "#;
-    // 1^2 + .. + 20^2 = 2870
+    // 1^2 + .. + 20^2 = 2870 (math.sum returns a float → "2870.0")
     assert_eq!(
         run_worker_program(src, false, &[("ASCRIPT_WORKERS", "2")]),
-        "2870"
+        "2870.0"
     );
 }
 

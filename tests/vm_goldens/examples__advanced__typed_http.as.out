@@ -1,6 +1,6 @@
 # exit: none
 ok user: Ada Lovelace (role=guest)
 rejected bad payload: type contract violated at user.id: expected number, got string
-typed param: doubled=42
-typed query: page=3
+typed param: doubled=42.0
+typed query: page=3.0
 typed_http ok

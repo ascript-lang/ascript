@@ -405,7 +405,8 @@ mod tests {
                 sp()
             )
             .unwrap(),
-            s("1 + 2 = 3")
+            // NUM §4: the float args format with a decimal.
+            s("1.0 + 2.0 = 3.0")
         );
         assert_eq!(
             call("format", &[s("{{literal}}")], sp()).unwrap(),

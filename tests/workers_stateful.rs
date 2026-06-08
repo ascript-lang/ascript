@@ -902,7 +902,8 @@ async fn main() {
 }
 await main()
 "#;
-    assert_both_engines("import_math", src, "9\n");
+    // NUM §4: math.max returns a float → "9.0".
+    assert_both_engines("import_math", src, "9.0\n");
 }
 
 #[test]
@@ -1016,7 +1017,8 @@ async fn main() {
 }
 await main()
 "#;
-    assert_both_engines("computed_const_import", src, "25\n");
+    // NUM §4: math.max returns a float, so M + n is a float → "25.0".
+    assert_both_engines("computed_const_import", src, "25.0\n");
 }
 
 #[test]
@@ -1042,7 +1044,8 @@ await main()
 "#;
     let (ok, out, err) = build_then_run_aso("fn_import_class_const", src);
     assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
-    assert_eq!(out, "17\n", "[.aso run] stdout mismatch (stderr={err:?})");
+    // NUM §4: math.max returns a float, so K + n is a float → "17.0".
+    assert_eq!(out, "17.0\n", "[.aso run] stdout mismatch (stderr={err:?})");
 }
 
 #[test]

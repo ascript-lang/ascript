@@ -592,8 +592,9 @@ impl Interp {
                 Err(AsError::at("sync.available: first argument is not a semaphore", span).into())
             }
             Some(sem) => {
-                let count = *sem.available.borrow() as f64;
-                Ok(Value::Float(count))
+                // NUM §4: a permit count is an `int`.
+                let count = *sem.available.borrow() as i64;
+                Ok(Value::Int(count))
             }
         }
     }

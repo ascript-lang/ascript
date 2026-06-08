@@ -155,9 +155,10 @@ mod tests {
 
     #[test]
     fn coercions() {
+        // NUM §4: a `float` stringifies with a decimal.
         assert_eq!(
             call("toString", &[Value::Float(7.0)], sp()).unwrap(),
-            s("7")
+            s("7.0")
         );
         assert_eq!(
             call("toNumber", &[Value::Bool(true)], sp()).unwrap(),
@@ -193,9 +194,10 @@ mod tests {
     #[test]
     fn parse_number_scientific_and_special() {
         let sp = sp();
+        // NUM §4: `parseNumber` yields a `float`, which always prints with a decimal.
         assert_eq!(
             call("parseNumber", &[s("1e3")], sp).unwrap().to_string(),
-            "[1000, nil]"
+            "[1000.0, nil]"
         );
         // inf/NaN are accepted (IEEE-754 stance); confirm they parse to a [value, nil] pair, not Err.
         let inf = call("parseNumber", &[s("inf")], sp).unwrap();
@@ -230,7 +232,7 @@ mod tests {
             )
             .unwrap()
             .to_string(),
-            "[1, 2]"
+            "[1.0, 2.0]"
         );
     }
 }

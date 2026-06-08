@@ -136,7 +136,8 @@ fn usage_object(n: &NeutralResponse) -> Value {
 
 fn opt_num(v: Option<i64>) -> Value {
     match v {
-        Some(n) => Value::Float(n as f64),
+        // NUM §4: a token count is an `int`.
+        Some(n) => Value::Int(n),
         None => Value::Nil,
     }
 }
@@ -167,7 +168,8 @@ pub(crate) fn embed_object(resp: &genai::embed::EmbedResponse, many: bool) -> Va
     usage.insert(
         "inputTokens".to_string(),
         match resp.usage.prompt_tokens {
-            Some(n) => Value::Float(n as f64),
+            // NUM §4: a token count is an `int`.
+            Some(n) => Value::Int(n as i64),
             None => Value::Nil,
         },
     );

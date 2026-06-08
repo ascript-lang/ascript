@@ -130,7 +130,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         .map(|d| Value::Float(d.as_millis() as f64))
                         .unwrap_or(Value::Nil);
                     let mut m = IndexMap::new();
-                    m.insert("size".to_string(), Value::Float(md.len() as f64));
+                    // NUM §4: a byte size is an integer length → `Int`.
+                    m.insert("size".to_string(), Value::Int(md.len() as i64));
                     m.insert("isFile".to_string(), Value::Bool(md.is_file()));
                     m.insert("isDir".to_string(), Value::Bool(md.is_dir()));
                     m.insert("modifiedMs".to_string(), modified);
@@ -359,8 +360,9 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
                 let column = line[..m.start()].chars().count() + 1;
                 let mut entry_obj = IndexMap::new();
                 entry_obj.insert("path".to_string(), Value::Str(path_str.clone().into()));
-                entry_obj.insert("line".to_string(), Value::Float((line_idx + 1) as f64));
-                entry_obj.insert("column".to_string(), Value::Float(column as f64));
+                // NUM §4: line/column are 1-based integer offsets → `Int`.
+                entry_obj.insert("line".to_string(), Value::Int((line_idx + 1) as i64));
+                entry_obj.insert("column".to_string(), Value::Int(column as i64));
                 entry_obj.insert("text".to_string(), Value::Str(line.into()));
                 matches.push(obj(entry_obj));
             }
@@ -467,7 +469,7 @@ mod tests {
             Value::Object(o) => o.borrow(),
             other => panic!("expected object, got {:?}", other),
         };
-        assert_eq!(o.get("size"), Some(&Value::Float(5.0)));
+        assert_eq!(o.get("size"), Some(&Value::Int(5)));
         assert_eq!(o.get("isFile"), Some(&Value::Bool(true)));
         assert_eq!(o.get("isDir"), Some(&Value::Bool(false)));
         assert!(matches!(o.get("modifiedMs"), Some(Value::Float(_))));

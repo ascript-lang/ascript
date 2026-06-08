@@ -126,7 +126,8 @@ impl Interp {
                     }
                     _ => 0,
                 });
-                Ok(Value::Float(removed as f64))
+                // NUM §4: a count of removed listeners is an `int`.
+                Ok(Value::Int(removed as i64))
             }
             "listenerCount" => {
                 let event = want_event(&arg(&args, 0), span, "listenerCount")?;
@@ -136,7 +137,8 @@ impl Interp {
                     }
                     _ => 0,
                 });
-                Ok(Value::Float(n as f64))
+                // NUM §4: a listener count is an `int`.
+                Ok(Value::Int(n as i64))
             }
             "emit" => {
                 let event = want_event(&arg(&args, 0), span, "emit")?;
@@ -167,7 +169,8 @@ impl Interp {
                         f.get().await?;
                     }
                 }
-                Ok(Value::Float(count as f64))
+                // NUM §4: a count of invoked listeners is an `int`.
+                Ok(Value::Int(count as i64))
             }
             other => Err(AsError::at(format!("emitter has no method '{}'", other), span).into()),
         }

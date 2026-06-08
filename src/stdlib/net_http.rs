@@ -344,7 +344,8 @@ impl SseState {
         map.insert(
             "retry".to_string(),
             match ev.retry {
-                Some(ms) => Value::Float(ms as f64),
+                // NUM §4: a retry interval (ms) is an integer → `Int`.
+                Some(ms) => Value::Int(ms as i64),
                 None => Value::Nil,
             },
         );

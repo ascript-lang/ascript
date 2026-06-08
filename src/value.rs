@@ -932,6 +932,28 @@ impl fmt::Debug for Value {
     }
 }
 
+/// NUM §4: render a `float` (`f64`) the way AScript prints/`str()`s it. Unlike
+/// Rust's `f64` Display (which prints `7.0` as `"7"`), a `float` ALWAYS shows at
+/// least one fractional digit so it is visually distinguishable from an `int`
+/// (the Python/Swift convention): `5.0`, `1500.0`, `-0.0`. `inf`/`-inf`/`nan`
+/// pass through Rust's Display unchanged. This is the single shared spelling so
+/// the tree-walker and the VM (and every str()/print/template path that routes
+/// through `Value::Float` Display) agree byte-for-byte.
+pub fn format_float(n: f64) -> String {
+    if n.is_finite() {
+        if n.fract() == 0.0 {
+            // Integral finite float: append `.0`. `{}` on `-0.0` yields `-0`, so
+            // the `.0` suffix gives `-0.0` / `0.0` / `7.0` uniformly.
+            format!("{n}.0")
+        } else {
+            format!("{n}")
+        }
+    } else {
+        // inf / -inf / NaN: unchanged ("inf", "-inf", "NaN").
+        format!("{n}")
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.write_display(f, &mut Vec::new())
@@ -944,8 +966,9 @@ impl Value {
             Value::Nil => write!(f, "nil"),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Int(i) => write!(f, "{}", i),
-            // Rust's f64 Display already prints 7.0 as "7" and 2.5 as "2.5".
-            Value::Float(n) => write!(f, "{}", n),
+            // NUM §4: a `float` always shows a decimal (`5.0`, not `5`) so it is
+            // distinguishable from an `int`. See `format_float`.
+            Value::Float(n) => write!(f, "{}", format_float(*n)),
             // Decimal: print the canonical string (scale preserved, e.g. "1.50").
             Value::Decimal(d) => write!(f, "{}", d),
             Value::Str(s) => write!(f, "{}", s),
@@ -1062,11 +1085,31 @@ mod tests {
 
     #[test]
     fn displays_values_like_a_script_language() {
-        assert_eq!(Value::Float(7.0).to_string(), "7");
+        // NUM §4: a `float` always renders with at least one fractional digit so it
+        // is visually distinguishable from an `int` (Python/Swift convention).
+        assert_eq!(Value::Float(7.0).to_string(), "7.0");
         assert_eq!(Value::Float(2.5).to_string(), "2.5");
+        assert_eq!(Value::Float(1500.0).to_string(), "1500.0");
+        assert_eq!(Value::Float(-0.0).to_string(), "-0.0");
+        assert_eq!(Value::Float(0.0).to_string(), "0.0");
+        assert_eq!(Value::Float(f64::INFINITY).to_string(), "inf");
+        assert_eq!(Value::Float(f64::NEG_INFINITY).to_string(), "-inf");
+        assert_eq!(Value::Float(f64::NAN).to_string(), "NaN");
+        // `int` keeps NO decimal.
+        assert_eq!(Value::Int(5).to_string(), "5");
+        assert_eq!(Value::Int(-7).to_string(), "-7");
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Nil.to_string(), "nil");
         assert_eq!(Value::Str("hi".into()).to_string(), "hi");
+    }
+
+    #[test]
+    fn float_in_collections_keeps_decimal() {
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![
+            Value::Float(1.0),
+            Value::Float(2.0),
+        ]));
+        assert_eq!(arr.to_string(), "[1.0, 2.0]");
     }
 
     #[test]
@@ -1116,7 +1159,7 @@ mod tests {
             Value::Float(1.0),
             Value::Str("two".into()),
         ]));
-        assert_eq!(a.to_string(), "[1, \"two\"]");
+        assert_eq!(a.to_string(), "[1.0, \"two\"]");
         // identity: a clone of the SAME Rc is equal; a fresh array is not
         assert_eq!(a.clone(), a);
         let b = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
@@ -1131,7 +1174,7 @@ mod tests {
         m.insert(MapKey::Str("a".into()), Value::Float(1.0));
         m.insert(MapKey::Num(0.0f64.to_bits()), Value::Str("zero".into()));
         let map = Value::Map(crate::value::MapCell::new(m));
-        assert_eq!(map.to_string(), "map {\"a\": 1, 0: \"zero\"}");
+        assert_eq!(map.to_string(), "map {\"a\": 1.0, 0.0: \"zero\"}");
         assert_eq!(map.clone(), map);
         assert!(map.is_truthy());
         assert!(MapKey::from_value(&Value::Float(0.0)).is_some());
@@ -1367,7 +1410,7 @@ mod tests {
         m.insert("a".to_string(), Value::Float(1.0));
         m.insert("b".to_string(), Value::Str("x".into()));
         let o = Value::Object(ObjectCell::new(m));
-        assert_eq!(o.to_string(), "{a: 1, b: \"x\"}");
+        assert_eq!(o.to_string(), "{a: 1.0, b: \"x\"}");
         assert_eq!(o.clone(), o);
         assert!(o.is_truthy());
     }

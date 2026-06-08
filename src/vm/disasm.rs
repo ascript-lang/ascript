@@ -337,8 +337,9 @@ mod tests {
         assert!(lines[3].starts_with("0006 "), "got {:?}", lines[3]);
         assert!(lines[4].starts_with("0007 "), "got {:?}", lines[4]);
 
-        assert!(lines[1].contains("CONST") && lines[1].ends_with("; 1"));
-        assert!(lines[2].contains("CONST") && lines[2].ends_with("; 2"));
+        // NUM §4: a `float` const renders with a decimal in the disasm comment.
+        assert!(lines[1].contains("CONST") && lines[1].ends_with("; 1.0"));
+        assert!(lines[2].contains("CONST") && lines[2].ends_with("; 2.0"));
         assert!(lines[3].contains("ADD"));
         assert!(lines[4].contains("RETURN"));
     }

@@ -392,13 +392,13 @@ mod tests {
             call("values", std::slice::from_ref(&o), sp())
                 .unwrap()
                 .to_string(),
-            "[1, 2]"
+            "[1.0, 2.0]"
         );
         assert_eq!(
             call("entries", std::slice::from_ref(&o), sp())
                 .unwrap()
                 .to_string(),
-            "[[\"a\", 1], [\"b\", 2]]"
+            "[[\"a\", 1.0], [\"b\", 2.0]]"
         );
     }
 
@@ -430,7 +430,7 @@ mod tests {
             sp(),
         )
         .unwrap();
-        assert_eq!(merged.to_string(), "{a: 1, b: 9, c: 3}");
+        assert_eq!(merged.to_string(), "{a: 1.0, b: 9.0, c: 3.0}");
     }
 
     #[test]
@@ -447,7 +447,7 @@ mod tests {
         // merge with one arg → a copy (independent of the input)
         let src = obj_ref(&[("a", Value::Float(1.0))]);
         let copy = call("merge", std::slice::from_ref(&src), sp).unwrap();
-        assert_eq!(copy.to_string(), "{a: 1}");
+        assert_eq!(copy.to_string(), "{a: 1.0}");
         // mutating the copy via delete does NOT affect the source (independence)
         call("delete", &[copy, Value::Str("a".into())], sp).unwrap();
         assert_eq!(
@@ -653,7 +653,7 @@ mod tests {
             .call_object("mapValues", &[o, f], sp())
             .await
             .unwrap();
-        assert_eq!(result.to_string(), "{a: 2, b: 4}");
+        assert_eq!(result.to_string(), "{a: 2.0, b: 4.0}");
     }
 
     #[tokio::test]
@@ -695,7 +695,7 @@ mod tests {
             .call_object("values", std::slice::from_ref(&o), sp())
             .await
             .unwrap();
-        assert_eq!(vals.to_string(), "[1, 2]");
+        assert_eq!(vals.to_string(), "[1.0, 2.0]");
         // unknown function still panics
         assert!(matches!(
             interp.call_object("nope", &[o], sp()).await,
@@ -744,7 +744,8 @@ let __inst = P()"#,
             .unwrap();
         assert_eq!(
             omitted.to_string(),
-            obj(vec![("age", Value::Float(3.0))]).to_string()
+            // NUM §4: the `age: number = 3` default is the int literal `3` → `Int(3)`.
+            obj(vec![("age", Value::Int(3))]).to_string()
         );
 
         // mapValues on an instance -> Object with mapped values

@@ -3,11 +3,11 @@
 [3, 5, 5, 3]
 16
 brown, fox, quick, the
-[1, 4, 9, 16]
-9
+[1.0, 4.0, 9.0, 16.0]
+9.0
 ["name", "age"]
 true
 100
 2
-50
+50.0
 cannot parse 'xyz' as a number

@@ -5079,11 +5079,27 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
                         span,
                     ))
                 }
-                Err(NumLitError::Invalid) => {
+                Err(NumLitError::InvalidDigit) => {
                     return Err(CompileError::new(
-                        format!("malformed number literal {text:?}"),
+                        "invalid digit in integer literal".to_string(),
                         span,
                     ))
+                }
+                Err(NumLitError::Invalid) => {
+                    // An empty radix body (`0x`, `0xZZ` → token `0x`) reports the
+                    // radix-specific cause, matching the legacy lexer's label so
+                    // both front-ends agree; a non-radix malformed decimal keeps
+                    // the generic message.
+                    let label = match text.as_bytes() {
+                        [b'0', b'x' | b'X', ..] => "invalid hex number literal",
+                        [b'0', b'o' | b'O', ..] => "invalid octal number literal",
+                        [b'0', b'b' | b'B', ..] => "invalid binary number literal",
+                        _ => return Err(CompileError::new(
+                            format!("malformed number literal {text:?}"),
+                            span,
+                        )),
+                    };
+                    return Err(CompileError::new(label.to_string(), span));
                 }
             }
         }
@@ -5431,6 +5447,22 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn hex_literal_evaluates() {
         assert_eq!(eval_number("0xff").await, 255.0);
+    }
+
+    #[test]
+    fn radix_literal_error_messages_name_the_cause() {
+        // NUM §4: the CST compile path reports the SAME radix-aware causes as the
+        // legacy lexer (frontend agreement). An out-of-base digit → "invalid digit
+        // in integer literal"; an empty radix body → the radix-specific label; an
+        // overflowing literal → "out of range".
+        let msg = |src: &str| compile_source(src).unwrap_err().message;
+        assert_eq!(msg("let a = 0o19"), "invalid digit in integer literal");
+        assert_eq!(msg("let a = 0b12"), "invalid digit in integer literal");
+        assert_eq!(msg("let a = 0xZZ"), "invalid hex number literal");
+        assert_eq!(
+            msg("let a = 99999999999999999999"),
+            "integer literal out of range for int (i64)"
+        );
     }
 
     #[test]

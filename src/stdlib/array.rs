@@ -494,7 +494,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(len, n(3.0));
-        assert_eq!(a.to_string(), "[1, 2, 3]");
+        assert_eq!(a.to_string(), "[1.0, 2.0, 3.0]");
     }
 
     #[tokio::test]
@@ -581,7 +581,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[20, 30]"
+            "[20.0, 30.0]"
         );
         assert_eq!(
             interp
@@ -589,7 +589,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[30, 40]"
+            "[30.0, 40.0]"
         );
         // start >= end → empty
         assert_eq!(
@@ -655,7 +655,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[[1, 2], [3, 4], [5]]"
+            "[[1.0, 2.0], [3.0, 4.0], [5.0]]"
         );
         let b = arr(vec![n(10.0), n(20.0)]);
         assert_eq!(
@@ -664,7 +664,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[[1, 10], [2, 20]]"
+            "[[1.0, 10.0], [2.0, 20.0]]"
         );
         assert!(matches!(
             interp.call_array("chunk", &[a.clone(), n(0.0)], sp()).await,
@@ -688,19 +688,19 @@ mod tests {
             map.get(&MapKey::from_value(&Value::Str("odd".into())).unwrap())
                 .unwrap()
                 .to_string(),
-            "[1, 3, 5]"
+            "[1.0, 3.0, 5.0]"
         );
         assert_eq!(
             map.get(&MapKey::from_value(&Value::Str("even".into())).unwrap())
                 .unwrap()
                 .to_string(),
-            "[2, 4]"
+            "[2.0, 4.0]"
         );
         // Full stringification confirms insertion order.
         drop(map);
         assert_eq!(
             result.to_string(),
-            r#"map {"odd": [1, 3, 5], "even": [2, 4]}"#
+            r#"map {"odd": [1.0, 3.0, 5.0], "even": [2.0, 4.0]}"#
         );
     }
 
@@ -727,7 +727,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[[2, 4], [1, 3, 5]]"
+            "[[2.0, 4.0], [1.0, 3.0, 5.0]]"
         );
         // Empty input → two empty partitions.
         assert_eq!(
@@ -750,7 +750,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[3, 2, 2, 1]"
+            "[3.0, 2.0, 2.0, 1.0]"
         );
         assert_eq!(
             interp
@@ -758,7 +758,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[1, 2, 3]"
+            "[1.0, 2.0, 3.0]"
         );
         assert_eq!(
             interp
@@ -787,7 +787,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[1, 2]"
+            "[1.0, 2.0]"
         );
         assert_eq!(
             interp
@@ -795,7 +795,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[2, 3]"
+            "[2.0, 3.0]"
         );
         let nested = arr(vec![arr(vec![n(1.0)]), arr(vec![n(2.0), n(3.0)])]);
         assert_eq!(
@@ -804,7 +804,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[1, 2, 3]"
+            "[1.0, 2.0, 3.0]"
         );
         let b = arr(vec![n(4.0)]);
         assert_eq!(
@@ -813,7 +813,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[1, 4]"
+            "[1.0, 4.0]"
         );
     }
 }

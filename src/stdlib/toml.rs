@@ -91,13 +91,20 @@ mod tests {
 
     #[test]
     fn stringify_integer_not_float() {
-        // from_ascript renders integer-valued floats as JSON integers, so TOML
-        // should emit `k = 1`, not `k = 1.0`.
+        // NUM §4: an `int` renders as a TOML integer (`k = 1`); a `float` renders
+        // as a TOML float (`k = 1.0`) — the subtype is preserved through
+        // `from_ascript` (JSON), so the two are now genuinely distinguishable.
+        let mut m = indexmap::IndexMap::new();
+        m.insert("k".to_string(), Value::Int(1));
+        let obj = Value::Object(crate::value::ObjectCell::new(m));
+        let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
+        assert_eq!(out.to_string(), "[\"k = 1\\n\", nil]");
+
         let mut m = indexmap::IndexMap::new();
         m.insert("k".to_string(), Value::Float(1.0));
         let obj = Value::Object(crate::value::ObjectCell::new(m));
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
-        assert_eq!(out.to_string(), "[\"k = 1\\n\", nil]");
+        assert_eq!(out.to_string(), "[\"k = 1.0\\n\", nil]");
     }
 
     #[test]

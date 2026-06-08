@@ -130,7 +130,8 @@ pub enum SpanStatus {
 /// The bare (unqualified) builtin names installed in every program's global env.
 /// Shared with the checker (`undefined-variable`) so they cannot drift.
 pub const BUILTIN_NAMES: &[&str] = &[
-    "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit",
+    "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit", "int",
+    "float",
 ];
 
 pub fn global_env() -> Environment {
@@ -4773,6 +4774,85 @@ impl Interp {
                 let v = args.first().cloned().unwrap_or(Value::Nil);
                 Ok(Value::Str(type_name(&v).into()))
             }
+            // NUM §4: `int(x)` conversion.
+            //   float → int, truncated TOWARD ZERO (a non-finite float is a Tier-2 panic);
+            //   int    → identity;
+            //   string → parse, returning a Tier-1 `[int, err]` pair (bad input is a value,
+            //            not a bug);
+            //   bool   → 0/1 (matching `convert.toNumber`'s bool coercion).
+            "int" => {
+                let v = args.first().cloned().unwrap_or(Value::Nil);
+                match &v {
+                    Value::Int(_) => Ok(v),
+                    Value::Float(f) => {
+                        if !f.is_finite() {
+                            return Err(AsError::at(
+                                format!("cannot convert non-finite float {} to int", format_number(*f)),
+                                span,
+                            )
+                            .into());
+                        }
+                        let t = f.trunc();
+                        // `i64::MAX as f64` rounds UP to 2^63 (= 9223372036854775808.0),
+                        // which is OUT of i64 range, so a `<=` bound would admit 2^63 and
+                        // `as i64` would silently saturate to i64::MAX. Use a STRICT upper
+                        // bound: `-(i64::MIN as f64)` is exactly 2^63, and `<` excludes it
+                        // while still admitting the largest representable in-range float
+                        // (2^63 − 2048). The lower bound is exact (`i64::MIN as f64` == −2^63).
+                        if t >= i64::MIN as f64 && t < -(i64::MIN as f64) {
+                            Ok(Value::Int(t as i64))
+                        } else {
+                            Err(AsError::at(
+                                format!("float {} is out of range for int (i64)", format_number(*f)),
+                                span,
+                            )
+                            .into())
+                        }
+                    }
+                    Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+                    Value::Str(s) => match s.trim().parse::<i64>() {
+                        Ok(n) => Ok(make_pair(Value::Int(n), Value::Nil)),
+                        Err(_) => Ok(make_pair(
+                            Value::Nil,
+                            make_error(Value::Str(
+                                format!("cannot parse '{}' as an int", s).into(),
+                            )),
+                        )),
+                    },
+                    other => Err(AsError::at(
+                        format!("int() cannot convert {}", type_name(other)),
+                        span,
+                    )
+                    .into()),
+                }
+            }
+            // NUM §4: `float(x)` conversion.
+            //   int    → exact f64;
+            //   float  → identity;
+            //   string → parse, returning a Tier-1 `[float, err]` pair;
+            //   bool   → 0.0/1.0.
+            "float" => {
+                let v = args.first().cloned().unwrap_or(Value::Nil);
+                match &v {
+                    Value::Float(_) => Ok(v),
+                    Value::Int(i) => Ok(Value::Float(*i as f64)),
+                    Value::Bool(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
+                    Value::Str(s) => match s.trim().parse::<f64>() {
+                        Ok(n) => Ok(make_pair(Value::Float(n), Value::Nil)),
+                        Err(_) => Ok(make_pair(
+                            Value::Nil,
+                            make_error(Value::Str(
+                                format!("cannot parse '{}' as a float", s).into(),
+                            )),
+                        )),
+                    },
+                    other => Err(AsError::at(
+                        format!("float() cannot convert {}", type_name(other)),
+                        span,
+                    )
+                    .into()),
+                }
+            }
             "range" => {
                 // NUM §4: `range(..)` accepts Int OR Float args and, like the
                 // language `a..b` value-range, yields an Int array when EVERY
@@ -6675,9 +6755,11 @@ print(y)
 
     #[tokio::test]
     async fn number_literals_hex_binary_scientific_underscore() {
+        // NUM §4: `1e3` is a `float` (exponent ⇒ float) and prints `1000.0`; the
+        // hex/binary/underscore int literals print with no decimal.
         assert_eq!(
             run("print(0xFF)\nprint(0b1010)\nprint(1e3)\nprint(1_000)\nprint(0xFF_FF)").await,
-            "255\n10\n1000\n1000\n65535\n"
+            "255\n10\n1000.0\n1000\n65535\n"
         );
     }
 
@@ -6709,6 +6791,69 @@ print(y)
             err.message,
             "type contract violated: expected future<number>, got int (5)"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn int_float_conversion_builtins() {
+        // NUM §4: `int(x)` / `float(x)` conversion builtins.
+        // float → int truncates toward zero.
+        assert_eq!(run("print(int(5.7))").await, "5\n");
+        assert_eq!(run("print(int(-5.7))").await, "-5\n");
+        assert_eq!(run("print(int(5.0))").await, "5\n");
+        // int → int identity; type stays int.
+        assert_eq!(run("print(int(5))").await, "5\n");
+        assert_eq!(run("print(type(int(5.7)))").await, "int\n");
+        // float(int) → exact f64, prints with a decimal.
+        assert_eq!(run("print(float(3))").await, "3.0\n");
+        assert_eq!(run("print(type(float(3)))").await, "float\n");
+        // float → float identity.
+        assert_eq!(run("print(float(2.5))").await, "2.5\n");
+        // string parse returns a Tier-1 [value, err] pair.
+        assert_eq!(run("print(int(\"42\"))").await, "[42, nil]\n");
+        assert_eq!(run("print(type(int(\"42\")[0]))").await, "int\n");
+        assert_eq!(run("print(float(\"3.5\"))").await, "[3.5, nil]\n");
+        assert_eq!(run("print(type(float(\"3.5\")[0]))").await, "float\n");
+        // bad string parse → [nil, err].
+        let out = run("let r = int(\"x\")\nprint(r[0])\nprint(r[1] != nil)").await;
+        assert_eq!(out, "nil\ntrue\n");
+        let out = run("let r = float(\"nope\")\nprint(r[0])\nprint(r[1] != nil)").await;
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn int_conversion_out_of_range_boundary() {
+        // Regression: `i64::MAX as f64` rounds UP to 2^63, so a `<=` bound would admit
+        // the out-of-range value 2^63 and `as i64` would silently saturate to i64::MAX.
+        // The strict bound must REJECT 2^63 with a clean out-of-range error...
+        let out = run("print(recover(() => int(9223372036854775808.0))[1] != nil)").await;
+        assert_eq!(out, "true\n", "int(2^63) must error, not silently saturate");
+        // ...while still ADMITTING the largest representable in-range float (2^63 − 2048).
+        assert_eq!(
+            run("print(int(9223372036854773760.0))").await,
+            "9223372036854773760\n"
+        );
+        // i64::MIN is exactly representable and in range.
+        assert_eq!(
+            run("print(int(-9223372036854775808.0))").await,
+            "-9223372036854775808\n"
+        );
+        // non-finite → clean error, never a 0/garbage cast.
+        let inf = run("print(recover(() => int(1.0 / 0.0))[1] != nil)").await;
+        assert_eq!(inf, "true\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn int_float_names_still_work_as_types_and_instanceof() {
+        // The new `int`/`float` builtins must not break the reserved type names.
+        // Call position:
+        assert_eq!(run("print(int(7.9))").await, "7\n");
+        // instanceof:
+        assert_eq!(run("print(5 instanceof int)").await, "true\n");
+        assert_eq!(run("print(5 instanceof float)").await, "false\n");
+        assert_eq!(run("print(5.0 instanceof float)").await, "true\n");
+        // annotation (runtime contract):
+        assert_eq!(run("let x: int = 5\nprint(x)").await, "5\n");
+        assert_eq!(run("let y: float = 2.5\nprint(y)").await, "2.5\n");
     }
 
     #[test]
@@ -6861,7 +7006,7 @@ print(y)
         // the next accumulation exceeds 1 and is excluded. Accumulation drift is expected.
         assert_eq!(
             run("print(range(0, 1, 0.3))").await,
-            "[0, 0.3, 0.6, 0.8999999999999999]\n"
+            "[0.0, 0.3, 0.6, 0.8999999999999999]\n"
         );
     }
 
@@ -8176,7 +8321,7 @@ print(r[1])
     #[tokio::test]
     async fn imports_std_math() {
         let out = run("import * as math from \"std/math\"\nprint(math.abs(-5))\nprint(math.pow(2, 8))\nprint(math.pi > 3.14)").await;
-        assert_eq!(out, "5\n256\ntrue\n");
+        assert_eq!(out, "5.0\n256.0\ntrue\n");
     }
 
     #[tokio::test]
@@ -8217,7 +8362,7 @@ print(r[1])
         // NUM §3.3: `convert.toBool(0)` is now `false` (0 is falsy).
         assert_eq!(
             run(src).await,
-            "42\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\nfalse\n"
+            "42.0\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\nfalse\n"
         );
     }
 
@@ -8250,7 +8395,7 @@ print(r[1])
     #[tokio::test]
     async fn std_array_map_pointfree() {
         let src = "import * as array from \"std/array\"\nimport * as math from \"std/math\"\nprint(array.map([-1, -2, 3], math.abs))";
-        assert_eq!(run(src).await, "[1, 2, 3]\n");
+        assert_eq!(run(src).await, "[1.0, 2.0, 3.0]\n");
     }
 
     #[tokio::test]
@@ -8296,7 +8441,7 @@ print(r[1])
         let out =
             run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))")
                 .await;
-        assert_eq!(out, "12\n7\n");
+        assert_eq!(out, "12.0\n7.0\n");
     }
 
     #[tokio::test]
@@ -8308,13 +8453,13 @@ print(r[1])
     #[tokio::test]
     async fn std_module_import_is_cached() {
         let out = run("import * as m1 from \"std/math\"\nimport { abs } from \"std/math\"\nprint(m1.floor(3.7))\nprint(abs(-2))").await;
-        assert_eq!(out, "3\n2\n");
+        assert_eq!(out, "3.0\n2.0\n");
     }
 
     #[tokio::test]
     async fn std_time_now_and_durations() {
         let out = run("import * as time from \"std/time\"\nprint(time.seconds(2))\nprint(time.now() > 1700000000000)").await;
-        assert_eq!(out, "2000\ntrue\n");
+        assert_eq!(out, "2000.0\ntrue\n");
     }
 
     #[tokio::test]
@@ -8752,7 +8897,7 @@ print(t[0])   // 1 — the async body ran once on the leading edge
                    let later = date.addDays(d, 10)\n\
                    print(later.day)\n\
                    print(date.diffMs(later, d))";
-        assert_eq!(run(src).await, "2021\n6\n2021/06/15\n25\n864000000\n");
+        assert_eq!(run(src).await, "2021.0\n6.0\n2021/06/15\n25.0\n864000000.0\n");
     }
 
     #[cfg(feature = "intl")]
@@ -8766,7 +8911,7 @@ print(t[0])   // 1 — the async body ran once on the leading edge
                    print(intl.compare(\"apple\", \"banana\", \"en\"))";
         assert_eq!(
             run(src).await,
-            "1,234,567\n1.234.567\nİSTANBUL\nISTANBUL\n-1\n"
+            "1,234,567\n1.234.567\nİSTANBUL\nISTANBUL\n-1.0\n"
         );
     }
 
@@ -9347,7 +9492,7 @@ import * as math from "std/math"
 print(math.abs(-5))
 print(math.max(1, 2, 3))
 "#;
-        assert_eq!(run(src).await, "5\n3\n");
+        assert_eq!(run(src).await, "5.0\n3.0\n");
     }
 
     /// Instance method call still dispatches the bound method.

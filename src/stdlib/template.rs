@@ -168,7 +168,7 @@ mod tests {
             sp(),
         )
         .unwrap();
-        assert_eq!(ok(out), "v=1");
+        assert_eq!(ok(out), "v=1.0");
     }
 
     #[test]

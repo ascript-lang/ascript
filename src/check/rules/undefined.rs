@@ -118,8 +118,10 @@ mod tests {
         }
         // But a NON-reserved bare name used like a value IS still flagged.
         assert!(codes("print(nope)\n").contains(&"undefined-variable".to_string()));
-        // And `int` used as an ordinary value (not instanceof RHS) is still flagged.
-        assert!(codes("print(int)\n").contains(&"undefined-variable".to_string()));
+        // NUM §4: `int`/`float` are now real conversion BUILTINS, so using `int` as
+        // an ordinary value (e.g. `print(int)`) is NOT undefined — it is the builtin.
+        assert!(!codes("print(int)\n").contains(&"undefined-variable".to_string()));
+        assert!(!codes("print(float)\n").contains(&"undefined-variable".to_string()));
     }
 
     #[test]

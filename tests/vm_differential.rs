@@ -1664,7 +1664,7 @@ async fn both_engines_step_iteration_agree() {
         ("print(1..10 step 2)", "[1, 3, 5, 7, 9]\n"),
         ("print(1..=10 step 2)", "[1, 3, 5, 7, 9]\n"),
         // float step.
-        ("print(0..=1 step 0.25)", "[0, 0.25, 0.5, 0.75, 1]\n"),
+        ("print(0..=1 step 0.25)", "[0.0, 0.25, 0.5, 0.75, 1.0]\n"),
         // overshoot simply stops.
         ("print(1..10 step 100)", "[1]\n"),
         // Phase 4: omitted-step descending counts down (direction inferred).
@@ -1738,11 +1738,11 @@ async fn both_engines_step_validation_panics_agree() {
         ),
         (
             "for (i in 1..10 step -2) {}",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
         (
             "for (i in 10..1 step 2) {}",
-            "step 2 moves away from end (1); range can never progress",
+            "step 2.0 moves away from end (1.0); range can never progress",
         ),
         // value-position validation panics identically.
         (
@@ -1751,7 +1751,7 @@ async fn both_engines_step_validation_panics_agree() {
         ),
         (
             "print(1..10 step -2)",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
     ] {
         let tw = ascript::run_source(src).await;
@@ -1906,11 +1906,11 @@ async fn both_engines_pattern_step_validation_panics_agree() {
         ),
         (
             "print(match 5 { 1..=10 step -2 => 1, _ => 0 })",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
         (
             "print(match 5 { 10..=1 step 2 => 1, _ => 0 })",
-            "step 2 moves away from end (1); range can never progress",
+            "step 2.0 moves away from end (1.0); range can never progress",
         ),
     ] {
         let tw = ascript::run_source(src).await;

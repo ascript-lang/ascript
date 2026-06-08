@@ -88,6 +88,11 @@ pub(crate) enum NumLitError {
     /// Text the lexer would not have accepted (empty radix body, unparseable
     /// decimal). For a lexer-validated token this never fires.
     Invalid,
+    /// A radix-prefixed literal containing a digit out of range for its base
+    /// (e.g. `0o19` — `9` is not a valid octal digit, `0b12` — `2` is not
+    /// binary). The CST/legacy lexers scan the radix body greedily, so an
+    /// out-of-base digit reaches here rather than ending the token.
+    InvalidDigit,
     /// A syntactically-valid integer literal whose value does not fit in `i64`
     /// (NUM §3.1 — a clean lex/parse error, never a silent wrap or float
     /// fallback).
@@ -100,6 +105,7 @@ impl NumLitError {
     pub(crate) fn message(self, invalid_label: &str) -> &str {
         match self {
             NumLitError::Invalid => invalid_label,
+            NumLitError::InvalidDigit => "invalid digit in integer literal",
             NumLitError::OutOfRange => "integer literal out of range for int (i64)",
         }
     }
@@ -133,9 +139,17 @@ pub(crate) fn parse_number_text(text: &str) -> Result<NumLit, NumLitError> {
             }
             return match i64::from_str_radix(&digits, radix) {
                 Ok(n) => Ok(NumLit::Int(n)),
-                // `from_str_radix` fails on either bad digits (impossible — the
-                // lexer validated them) or overflow. Treat as out-of-range.
-                Err(_) => Err(NumLitError::OutOfRange),
+                // The lexer scans a radix body GREEDILY (e.g. octal consumes all
+                // ascii digits), so `from_str_radix` may fail on either an
+                // out-of-base digit (`0o19`, `0b12`) or i64 overflow. Distinguish
+                // them so the diagnostic names the real cause.
+                Err(e) => match e.kind() {
+                    std::num::IntErrorKind::PosOverflow
+                    | std::num::IntErrorKind::NegOverflow => Err(NumLitError::OutOfRange),
+                    std::num::IntErrorKind::InvalidDigit => Err(NumLitError::InvalidDigit),
+                    // `Empty` is handled above; any other kind is genuinely malformed.
+                    _ => Err(NumLitError::Invalid),
+                },
             };
         }
     }
@@ -213,6 +227,31 @@ mod tests {
         // Hex overflow.
         assert_eq!(
             parse_number_text("0xFFFFFFFFFFFFFFFF"),
+            Err(NumLitError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn parse_number_invalid_digit_vs_overflow() {
+        // The lexer scans the radix body greedily, so an out-of-base digit
+        // reaches `parse_number_text` and must be reported as InvalidDigit
+        // (NOT OutOfRange / overflow). `9` is not octal; `2` is not binary.
+        assert_eq!(parse_number_text("0o19"), Err(NumLitError::InvalidDigit));
+        assert_eq!(parse_number_text("0O78"), Err(NumLitError::InvalidDigit));
+        assert_eq!(parse_number_text("0b12"), Err(NumLitError::InvalidDigit));
+        assert_eq!(parse_number_text("0B102"), Err(NumLitError::InvalidDigit));
+        // The messages differ so the diagnostic names the real cause.
+        assert_eq!(
+            NumLitError::InvalidDigit.message("invalid octal number literal"),
+            "invalid digit in integer literal"
+        );
+        assert_eq!(
+            NumLitError::OutOfRange.message("invalid octal number literal"),
+            "integer literal out of range for int (i64)"
+        );
+        // A valid-but-overflowing octal/binary still reports OutOfRange.
+        assert_eq!(
+            parse_number_text("0o7777777777777777777777"),
             Err(NumLitError::OutOfRange)
         );
     }
