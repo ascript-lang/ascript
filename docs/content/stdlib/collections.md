@@ -992,6 +992,13 @@ Numeric functions and constants. The module exposes two constants alongside its 
 | `math.pi` | π (3.14159…) |
 | `math.e` | Euler's number (2.71828…) |
 
+> **Return subtypes.** Most `std/math` functions compute in floating point and **return a `float`**
+> (so `math.sqrt(9)` is `3.0` and `math.gcd(12, 8)` is `4.0`, even on integer input). The exceptions
+> that return an `int` are: `math.abs` (subtype-preserving), the rounding family
+> `math.floor`/`ceil`/`round`/`trunc`, the integer-division helpers
+> `math.floordiv`/`ceildiv`/`divmod`, and the bit helpers
+> `math.popcount`/`leading_zeros`/`trailing_zeros`/`rotl`/`rotr`.
+
 ```ascript
 import * as math from "std/math"
 ```
@@ -1053,25 +1060,27 @@ math.round(2.5)   // 3
 
 ### math.sqrt
 
-Square root.
+Square root. Like the other transcendental functions, it **always returns a `float`** — even
+for a perfect-square `int` argument (`sqrt(9)` is `3.0`, not `3`).
 
 - `x: number`
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
-math.sqrt(9)   // 3
+math.sqrt(9)   // 3.0
 ```
 
 ### math.pow
 
-Raise a base to an exponent.
+Raise a base to an exponent. Always returns a `float` (for exact integer powers with
+checked overflow, use the `**` operator on `int` operands instead).
 
 - `base: number`
 - `exp: number`
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
-math.pow(2, 10)   // 1024
+math.pow(2, 10)   // 1024.0
 ```
 
 ### math.min
@@ -1079,12 +1088,12 @@ math.pow(2, 10)   // 1024
 Return the smallest of one or more arguments.
 
 - `...nums: number` — at least one argument
-- Returns: `number`
+- Returns: `float`
 
 > [!TIER2] Panics if called with no arguments.
 
 ```ascript
-math.min(1, 9, 4)   // 1
+math.min(1, 9, 4)   // 1.0
 ```
 
 ### math.max
@@ -1092,12 +1101,12 @@ math.min(1, 9, 4)   // 1
 Return the largest of one or more arguments.
 
 - `...nums: number` — at least one argument
-- Returns: `number`
+- Returns: `float`
 
 > [!TIER2] Panics if called with no arguments.
 
 ```ascript
-math.max(1, 9, 4)   // 9
+math.max(1, 9, 4)   // 9.0
 ```
 
 ### math.random
@@ -1124,7 +1133,7 @@ Sine of an angle in radians.
 - Returns: `number`
 
 ```ascript
-math.sin(0)          // 0
+math.sin(0)          // 0.0
 math.sin(math.pi)    // ≈ 0 (floating-point rounding)
 ```
 
@@ -1136,7 +1145,7 @@ Cosine of an angle in radians.
 - Returns: `number`
 
 ```ascript
-math.cos(0)   // 1
+math.cos(0)   // 1.0
 ```
 
 ### math.tan
@@ -1147,7 +1156,7 @@ Tangent of an angle in radians.
 - Returns: `number`
 
 ```ascript
-math.tan(0)   // 0
+math.tan(0)   // 0.0
 ```
 
 ### math.asin
@@ -1158,7 +1167,7 @@ Arc-sine (inverse sine). Returns a value in `[-π/2, π/2]`.
 - Returns: `number` — angle in radians
 
 ```ascript
-math.asin(0)   // 0
+math.asin(0)   // 0.0
 math.asin(1)   // π/2 ≈ 1.5708
 ```
 
@@ -1170,7 +1179,7 @@ Arc-cosine (inverse cosine). Returns a value in `[0, π]`.
 - Returns: `number` — angle in radians
 
 ```ascript
-math.acos(1)   // 0
+math.acos(1)   // 0.0
 math.acos(0)   // π/2 ≈ 1.5708
 ```
 
@@ -1182,7 +1191,7 @@ Arc-tangent (inverse tangent). Returns a value in `(-π/2, π/2)`.
 - Returns: `number` — angle in radians
 
 ```ascript
-math.atan(0)   // 0
+math.atan(0)   // 0.0
 math.atan(1)   // π/4 ≈ 0.7854
 ```
 
@@ -1207,7 +1216,7 @@ Euler's number raised to the power `x` (eˣ).
 - Returns: `number`
 
 ```ascript
-math.exp(0)   // 1
+math.exp(0)   // 1.0
 math.exp(1)   // e ≈ 2.7183
 ```
 
@@ -1219,8 +1228,8 @@ Natural logarithm (base e).
 - Returns: `number`
 
 ```ascript
-math.ln(1)          // 0
-math.ln(math.e)     // 1
+math.ln(1)          // 0.0
+math.ln(math.e)     // 1.0
 ```
 
 ### math.log2
@@ -1231,8 +1240,8 @@ Base-2 logarithm.
 - Returns: `number`
 
 ```ascript
-math.log2(8)    // 3
-math.log2(1)    // 0
+math.log2(8)    // 3.0
+math.log2(1)    // 0.0
 ```
 
 ### math.log10
@@ -1243,21 +1252,21 @@ Base-10 logarithm.
 - Returns: `number`
 
 ```ascript
-math.log10(1000)   // 3
-math.log10(1)      // 0
+math.log10(1000)   // 3.0
+math.log10(1)      // 0.0
 ```
 
 ### math.sign
 
-Return `-1`, `0`, or `1` depending on the sign of `x`.
+Return `-1.0`, `0.0`, or `1.0` (a `float`) depending on the sign of `x`.
 
 - `x: number`
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
-math.sign(-5)   // -1
-math.sign(0)    // 0
-math.sign(3)    // 1
+math.sign(-5)   // -1.0
+math.sign(0)    // 0.0
+math.sign(3)    // 1.0
 ```
 
 ### math.trunc
@@ -1280,12 +1289,12 @@ Clamp `x` to the closed interval `[lo, hi]`.
 - `x: number`
 - `lo: number` — lower bound
 - `hi: number` — upper bound
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
-math.clamp(5, 0, 3)    // 3  (above hi)
-math.clamp(-1, 0, 3)   // 0  (below lo)
-math.clamp(2, 0, 3)    // 2  (in range)
+math.clamp(5, 0, 3)    // 3.0  (above hi)
+math.clamp(-1, 0, 3)   // 0.0  (below lo)
+math.clamp(2, 0, 3)    // 2.0  (in range)
 ```
 
 ### math.hypot
@@ -1294,10 +1303,10 @@ Euclidean distance — square root of the sum of squares. Numerically stable for
 
 - `a: number`
 - `b: number`
-- Returns: `number`
+- Returns: `float`
 
 ```ascript
-math.hypot(3, 4)   // 5
+math.hypot(3, 4)   // 5.0
 ```
 
 ### math.gcd
@@ -1311,8 +1320,8 @@ Greatest common divisor of two non-negative integers.
 > [!TIER2] Panics if either argument is not a finite integer.
 
 ```ascript
-math.gcd(12, 8)   // 4
-math.gcd(7, 0)    // 7
+math.gcd(12, 8)   // 4.0
+math.gcd(7, 0)    // 7.0
 ```
 
 ### math.lcm
@@ -1326,22 +1335,22 @@ Least common multiple of two non-negative integers.
 > [!TIER2] Panics if either argument is not a finite integer.
 
 ```ascript
-math.lcm(4, 6)    // 12
-math.lcm(5, 0)    // 0
+math.lcm(4, 6)    // 12.0
+math.lcm(5, 0)    // 0.0
 ```
 
 ### math.sum
 
-Sum all elements of a numeric array. Returns `0` for an empty array.
+Sum all elements of a numeric array. Returns `-0.0` (a `float` zero) for an empty array.
 
 - `arr: array` — array of `number`
-- Returns: `number`
+- Returns: `float`
 
 > [!TIER2] Panics if any element is not a number.
 
 ```ascript
-math.sum([1, 2, 3, 4])   // 10
-math.sum([])              // 0
+math.sum([1, 2, 3, 4])   // 10.0
+math.sum([])              // -0.0
 ```
 
 ### math.mean
@@ -1367,7 +1376,7 @@ Median of a numeric array. For even-length arrays returns the mean of the two mi
 > [!TIER2] Panics on an empty array or non-number elements.
 
 ```ascript
-math.median([3, 1, 2])      // 2
+math.median([3, 1, 2])      // 2.0
 math.median([1, 2, 3, 4])   // 2.5
 ```
 
@@ -1382,8 +1391,8 @@ Population or sample variance of a numeric array. Pass `true` as the second argu
 > [!TIER2] Panics on an empty array; panics for sample variance if the array has fewer than two elements.
 
 ```ascript
-math.variance([2, 4, 4, 4, 5, 5, 7, 9])        // 4  (population)
-math.variance([2, 4, 4, 4, 5, 5, 7, 9], true)   // 4.571…  (sample)
+math.variance([2, 4, 4, 4, 5, 5, 7, 9])        // 4.0  (population)
+math.variance([2, 4, 4, 4, 5, 5, 7, 9], true)   // 4.571428571428571  (sample)
 ```
 
 ### math.stddev
@@ -1397,22 +1406,24 @@ Population or sample standard deviation. Same signature as `math.variance`; retu
 > [!TIER2] Panics on an empty array; panics for sample stddev if the array has fewer than two elements.
 
 ```ascript
-math.stddev([2, 4, 4, 4, 5, 5, 7, 9])   // 2  (population)
+math.stddev([2, 4, 4, 4, 5, 5, 7, 9])   // 2.0  (population)
 ```
 
 ### math.randomInt
 
-Return a uniformly distributed random integer in the **inclusive** range `[min, max]`.
+Return a uniformly distributed random integer-valued `float` in the **inclusive** range
+`[min, max]`. (The value is integral but, like the rest of `std/math`, carries the `float`
+subtype — wrap with `int(...)` for an exact `int`.)
 
 - `min: number` — minimum value (integer)
 - `max: number` — maximum value (integer, must be ≥ `min`)
-- Returns: `number`
+- Returns: `float`
 
 > [!TIER2] Panics if `min > max` or if either argument is not a finite integer.
 
 ```ascript
-math.randomInt(1, 6)   // e.g. 4  (like rolling a die)
-math.randomInt(5, 5)   // always 5
+math.randomInt(1, 6)   // e.g. 4.0  (like rolling a die)
+math.randomInt(5, 5)   // always 5.0
 ```
 
 ### math.shuffle
@@ -1553,10 +1564,10 @@ import * as convert from "std/convert"
 
 ### convert.parseNumber
 
-Parse a string as a floating-point number. Accepts scientific notation (`"1e3"`) and the IEEE-754 specials `"inf"`, `"-inf"`, and `"NaN"`. For untrusted input, prefer this over `toNumber`.
+Parse a string as a floating-point number. Accepts scientific notation (`"1e3"`) and the IEEE-754 specials `"inf"`, `"-inf"`, and `"NaN"`. Always yields a `float`. For untrusted input, prefer this over `toNumber`.
 
 - `s: string` — the string to parse
-- Returns: `[number, nil]` on success, or `[nil, error]` on failure
+- Returns: `[float, nil]` on success, or `[nil, error]` on failure
 
 > [!TIER1] Returns `[value, err]` — destructure it.
 
@@ -1567,11 +1578,11 @@ let [bad, e] = convert.parseNumber("abc")   // bad = nil, e is an error
 
 ### convert.parseInt
 
-Parse a string as an integer in a given radix (2–36, default 10).
+Parse a string as an integer in a given radix (2–36, default 10). Yields an `int`.
 
 - `s: string` — the string to parse
 - `radix: number` (optional) — base 2–36, defaults to 10
-- Returns: `[number, nil]` on success, or `[nil, error]` on failure
+- Returns: `[int, nil]` on success, or `[nil, error]` on failure
 
 > [!TIER1] Returns `[value, err]` — destructure it.
 
@@ -1596,16 +1607,19 @@ convert.toString([1, 2])   // "[1, 2]"
 
 ### convert.toNumber
 
-Coerce a value to a number. Numbers pass through; `true`/`false` become `1`/`0`; `nil` becomes `0`; strings are parsed. The contract is "this **is** a number-like value" — use `parseNumber` for untrusted input.
+Coerce a value to a `float`. Numbers pass through (an `int` is widened to `float`); `true`/`false`
+become `1.0`/`0.0`; `nil` becomes `0.0`; strings are parsed. The contract is "this **is** a
+number-like value" — use `parseNumber` for untrusted input. For an exact integer, use the `int()`
+builtin or `convert.parseInt`.
 
 - `v` — a number, bool, nil, or numeric string
-- Returns: `number`
+- Returns: `float`
 
 > [!TIER2] Panics on a string that will not parse, or on any other non-coercible type (e.g. an array).
 
 ```ascript
-convert.toNumber(true)    // 1
-convert.toNumber(" 42 ")  // 42
+convert.toNumber(true)    // 1.0
+convert.toNumber(" 42 ")  // 42.0
 ```
 
 ### convert.toBool

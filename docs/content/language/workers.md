@@ -68,7 +68,7 @@ fn main() {
   let futures = array.map(inputs, square)
   let results = await task.gather(futures)
   print(results)                   // [1, 4, 9, 16, 25, 36, 49, 64]
-  print(math.sum(results))         // 204
+  print(math.sum(results))         // 204.0
 }
 
 await main()
@@ -413,7 +413,7 @@ worker fn summarize(xs: array<number>): Stats {
 
 fn main() {
   let s = await summarize([2, 4, 6, 8])
-  print(s.mean)                       // 5
+  print(s.mean)                       // 5.0
 }
 
 await main()

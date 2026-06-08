@@ -11,7 +11,7 @@ AScript has a small, fixed set of value kinds. `type(v)` returns the kind name a
 | Nil | `nil` | `nil` | `nil` |
 | Boolean | `bool` | `true`, `false` | `true` / `false` |
 | Int | `int` | `42`, `0xFF`, `0b1010`, `0o17`, `1_000` | `42`, `255` |
-| Float | `float` | `3.14`, `1e9`, `.5` | minimal form (`7`, `2.5`) |
+| Float | `float` | `3.14`, `1e9`, `.5` | always a decimal (`5.0`, `2.5`) |
 | String | `string` | `"double"`, `'single'`, `` `template ${x}` `` | the raw text |
 | Array | `array` | `[1, 2, 3]` | `[1, "two"]` |
 | Object | `object` | `{ key: value, "quoted": 1 }` | `{a: 1, b: "x"}` |

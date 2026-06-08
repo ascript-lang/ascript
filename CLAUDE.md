@@ -296,8 +296,13 @@ are `int`s (`string.codepoints`/`from_codepoints`/`code_at`). `number` is the an
 `int | float`. `x instanceof int|float|number|string|bool` is a runtime type guard (tree-walker intercepts
 the reserved-name RHS before eval; the VM uses a dedicated `Op::InstanceOfType` with a type-name const —
 byte-identical). Checker `CheckTy::Int`/`Float` (a `number`-typed value into an `int` slot stays gradual →
-silent; only provably-concrete-distinct subtypes diagnose). Float-printing-always-shows-`.0` (§4) is NOT
-yet implemented (the large golden migration is deferred).
+silent; only provably-concrete-distinct subtypes diagnose). **Float printing always shows a decimal**
+(`print(5.0)` → `5.0`, `print(5)` → `5`) so the subtypes are visually distinct; `int`-valued `std/math`
+results (e.g. `sqrt`/`sum`/`min`/`gcd`) still carry the `float` subtype and print `3.0` — only `abs`, the
+rounding family (`floor`/`ceil`/`round`/`trunc`), the int-div helpers (`floordiv`/`ceildiv`/`divmod`), and
+the bit helpers return `int`. **Truthiness is the NUM falsy set** (not just `nil`/`false`): `0`/`0.0`/`-0.0`/
+`NaN`/`0m`/`""` are falsy, but **collections/objects/instances stay truthy even when empty** (query empties
+with `len(x)`).
 
 - **Cycle-collecting GC (`src/gc.rs`).** Adopts `gcmodule` (refcounting `Cc<T>` + Bacon–Rajan cycle
   collector) — an unconditional, default-on, CORE dependency (must build under `--no-default-features`).

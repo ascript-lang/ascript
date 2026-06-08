@@ -2,16 +2,17 @@
 
 # AScript
 
-**A multi-paradigm scripting language with gradual types, structured concurrency, and a Go-class standard library.**
+**A general-purpose, multi-paradigm language with gradual types, a real integer/float numeric tower, structured concurrency, and a Go-class standard library.**
 
 [![CI](https://github.com/ascript-lang/ascript/actions/workflows/ci.yml/badge.svg)](https://github.com/ascript-lang/ascript/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-ascript--lang.github.io-3b82f6)](https://ascript-lang.github.io/ascript/)
 [![Vibe-coded](https://img.shields.io/badge/vibe--coded-%E2%9C%A8-ff69b4)](https://github.com/ascript-lang/ascript/commits/main)
 
-AScript is a gradually-typed, multi-paradigm scripting language with JavaScript-flavored syntax,
-runtime-checked type contracts (plus an advisory static checker), first-class structured concurrency,
-and a batteries-included standard library — all in a single Rust binary.
+AScript is a gradually-typed, general-purpose, multi-paradigm language with JavaScript-flavored
+syntax, runtime-checked type contracts (plus an advisory static checker), a real numeric model
+(64-bit `int` + IEEE-754 `float`, with bitwise operators and checked overflow), first-class
+structured concurrency, and a batteries-included standard library — all in a single Rust binary.
 
 _Vibe-coded: designed and built end-to-end with AI (Claude), human-directed._
 
@@ -53,7 +54,8 @@ Design priorities, in strict order: **simplicity → safety → familiarity → 
 here means a core you can hold in your head and no hidden control flow — not a feature-poor language.
 
 - **Familiar syntax** — braces, `fn`, arrows, template strings, `for…of`. If you read JavaScript, you read AScript.
-- **Gradual type contracts** — optional annotations, checked at runtime as contracts, never erased. Includes the nullable suffix `T?` (≡ `T | nil`) and typed class fields (required, optional, defaulted) checked on assignment.
+- **A real numeric model** — `int` (64-bit signed) and `float` (IEEE-754), with `number` as the union `int | float`. Division is **type-directed** (`7 / 2 == 3`, `7.0 / 2 == 3.5` — no `//` operator), integer overflow is **checked** (`+ - * **` and unary `-` trap, with explicit `+% -% *%` wrapping for hashing/codecs), and bitwise/shift operators `& | ^ << >> ~` are int-only at Go precedence (`a & b == c` parses as `(a & b) == c`). Literals come in decimal, hex `0x`, binary `0b`, and octal `0o` (with `_` digit groups); code points are plain `int`s (the Go "rune" model, no `char` type). This unlocks correct array-index/bit-flag/protocol work and self-hostable codecs — the integer + bitwise math a serious general-purpose language needs. See [the docs](docs/content/language/values-types.md#numbers).
+- **Gradual type contracts** — optional annotations, checked at runtime as contracts, never erased. Includes the numeric subtype annotations `int` / `float` / `number`, the nullable suffix `T?` (≡ `T | nil`), and typed class fields (required, optional, defaulted) checked on assignment.
 - **Errors as values** — no exceptions; fallible calls return `[value, err]`; the `?` operator propagates and the `!` force-unwrap asserts success (panicking, recoverably, with the original message). Bugs panic, loudly.
 - **Shape validation** — turn untrusted data into checked instances: `ClassName.from(obj)` validates a raw object (recursing into nested classes, `array<Class>`, and `map<K, Class>`), and the typed parse `json.parse(text, Class)` / `resp.json(Class)` fuses decode + validation into one result — `let user = await resp.json(User)?`.
 - **Composable schema validation** — `std/schema` lets you build and compose schemas independently of any class: `schema.object({name: schema.minLength(schema.string(), 1), age: schema.min(schema.number(), 0)})`, with `min`/`max`, `minLength`/`maxLength`, `pattern`, `refine` (custom async predicates), `default`, `optional`, `union`, `oneOf`, and coercion (`{coerce: true}`). Refiners and `parse` also chain as **fluent methods** — `schema.string().minLength(3).maxLength(12).pattern("^[a-z0-9_]+$").parse(input)` — equivalent to and interoperable with the free-function form. `schema.fromClass(Class)` derives a schema from class field declarations. Pass a schema to `json.parse(text, schema)` to fuse JSON decoding and validation into one Tier-1 pair.

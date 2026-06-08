@@ -98,7 +98,7 @@ let [pretty, _] = json.stringify({ n: 2 }, true)
 
 let [out, e] = json.stringify({ f: print })
 // out == nil
-// e   == { message: "cannot serialize a value of type builtin to JSON" }
+// e   == { message: "cannot serialize a value of type function to JSON" }
 ```
 
 ## std/csv
