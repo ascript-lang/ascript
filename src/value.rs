@@ -429,6 +429,11 @@ pub struct InterfaceDef {
     /// resolved LAZILY (interfaces forward-reference as late-bound module-globals) —
     /// NOT pre-flattened at declaration time (IFACE §4, C4).
     pub extends: Vec<String>,
+    /// The module `Environment` this interface was declared in (mirrors `Class.def_env`).
+    /// The lazy `flatten` resolves each `extends` NAME through it — late-bound, so a
+    /// forward-referenced `extends B` resolves once `B` is defined. Cheap `Rc` clone;
+    /// holds no cycle-capable `Value` the GC must trace into the descriptor.
+    pub def_env: Environment,
     /// MEMOIZED flattened method set (own + every transitively-extended interface's),
     /// deduplicated by name. `None` until the first `conforms`/contract check; filled
     /// on first use via the engine's `flatten()` lazy builder, then reused. Never
@@ -1494,6 +1499,7 @@ mod tests {
             name: name.to_string(),
             own_methods: IndexMap::new(),
             extends: Vec::new(),
+            def_env: crate::interp::global_env(),
             flat: RefCell::new(None),
         })
     }
