@@ -111,6 +111,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Enum => self.enum_decl(),
             Tok::Class => self.class_decl(),
+            Tok::Interface => self.interface_decl(),
             Tok::Import => self.import_decl(),
             Tok::Export => self.export_decl(),
             Tok::Break => {
@@ -220,10 +221,11 @@ impl<'a> Parser<'a> {
             }
             Tok::Class => self.class_decl()?,
             Tok::Enum => self.enum_decl()?,
+            Tok::Interface => self.interface_decl()?,
             other => {
                 return Err(AsError::at(
                     format!(
-                        "only let/const/fn/class/enum can be exported, found {:?}",
+                        "only let/const/fn/class/enum/interface can be exported, found {:?}",
                         other
                     ),
                     self.span(),
@@ -362,6 +364,126 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// IFACE §3: parse `interface Name [extends A, B] { (fn name(params)[: ret])* }`.
+    /// Each requirement is a plain instance-method signature with NO body; `;`/newlines
+    /// separate them (`skip_semicolons`). `async`/`fn*`/`static`/`worker` modifiers on a
+    /// requirement are a parse error in v1. `extends` is contextual (lexes as Ident).
+    fn interface_decl(&mut self) -> Result<Stmt, AsError> {
+        let start = self.span().start;
+        self.eat(&Tok::Interface)?;
+        let name_span = self.span();
+        let name = match self.advance() {
+            Tok::Ident(n) => n,
+            other => {
+                return Err(AsError::at(
+                    format!("expected interface name, found {:?}", other),
+                    self.tokens[self.pos - 1].span,
+                ))
+            }
+        };
+        // Optional `extends I1, I2, …` composition list (contextual keyword).
+        let extends = self.parse_iface_name_list("extends")?;
+        self.eat(&Tok::LBrace)?;
+        let mut methods: Vec<crate::ast::MethodReqNode> = Vec::new();
+        while *self.peek() != Tok::RBrace && *self.peek() != Tok::Eof {
+            self.skip_semicolons();
+            if *self.peek() == Tok::RBrace {
+                break;
+            }
+            // Reject method MODIFIERS: an interface requirement is a plain instance
+            // method. `static` lexes as Ident; `worker` is contextual; `async` is a
+            // keyword; `fn*` is a star after `fn`.
+            if *self.peek() == Tok::Async {
+                return Err(AsError::at(
+                    "an interface method requirement may not be 'async'",
+                    self.span(),
+                ));
+            }
+            if matches!(self.peek(), Tok::Ident(s) if s == "static") {
+                return Err(AsError::at(
+                    "an interface method requirement may not be 'static'",
+                    self.span(),
+                ));
+            }
+            if matches!(self.peek(), Tok::Ident(s) if s == "worker") {
+                return Err(AsError::at(
+                    "an interface method requirement may not be 'worker'",
+                    self.span(),
+                ));
+            }
+            let mstart = self.span().start;
+            self.eat(&Tok::Fn)?;
+            if *self.peek() == Tok::Star {
+                return Err(AsError::at(
+                    "an interface method requirement may not be a generator ('fn*')",
+                    self.span(),
+                ));
+            }
+            let mname_span = self.span();
+            let mname = match self.advance() {
+                Tok::Ident(n) => n,
+                other => {
+                    return Err(AsError::at(
+                        format!("expected method name, found {:?}", other),
+                        self.tokens[self.pos - 1].span,
+                    ))
+                }
+            };
+            let params = self.param_list()?;
+            let ret = if *self.peek() == Tok::Colon {
+                self.advance();
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let mspan = Span::new(mstart, self.prev_end());
+            methods.push(crate::ast::MethodReqNode {
+                name: mname,
+                params,
+                ret,
+                span: mspan,
+                name_span: mname_span,
+            });
+        }
+        self.eat(&Tok::RBrace)?;
+        let span = Span::new(start, self.prev_end());
+        Ok(Stmt::Interface {
+            name,
+            type_params: Vec::new(),
+            extends,
+            methods,
+            span,
+            name_span,
+        })
+    }
+
+    /// Parse an optional contextual-keyword-introduced comma list of names, e.g.
+    /// `implements A, B` or `extends A, B` (interface composition). Returns `[]` when
+    /// the keyword is absent. `keyword` lexes as a `Tok::Ident` (soft keyword).
+    fn parse_iface_name_list(&mut self, keyword: &str) -> Result<Vec<String>, AsError> {
+        let mut names = Vec::new();
+        if matches!(self.peek(), Tok::Ident(s) if s == keyword) {
+            self.advance(); // consume the contextual keyword
+            loop {
+                match self.advance() {
+                    Tok::Ident(n) => names.push(n),
+                    other => {
+                        return Err(AsError::at(
+                            format!("expected an interface name after '{}', found {:?}", keyword, other),
+                            self.tokens[self.pos - 1].span,
+                        ))
+                    }
+                }
+                if *self.peek() == Tok::Comma {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(names)
+    }
+
     /// ADT: parse a variant's `(field, field, …)` payload list. Each field is either
     /// named (`id: T`) or positional (`T`); the list must be UNIFORMLY one or the
     /// other (mixing is a parse error). A field type is REQUIRED. Assumes the current
@@ -458,8 +580,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // IFACE: optional `implements I1, I2` clause (Task 4 fills the parse).
-        let implements: Vec<String> = Vec::new();
+        // IFACE: optional `implements I1, I2` clause (after `extends`, before body).
+        let implements = self.parse_iface_name_list("implements")?;
         self.eat(&Tok::LBrace)?;
         let mut fields = Vec::new();
         let mut methods = Vec::new();
@@ -2230,6 +2352,107 @@ mod tests {
         match &stmts[0] {
             Stmt::Expr(e) => e.to_string(),
             _ => panic!("expected an expression statement"),
+        }
+    }
+
+    // ---- IFACE Task 4: lexer + legacy parser ----
+
+    fn parse_one(src: &str) -> Stmt {
+        let toks = lex(src).unwrap();
+        parse(&toks).unwrap().into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn iface_lexes_interface_keyword_and_contextual_extends_implements() {
+        // `interface` is a reserved keyword
+        assert!(lex("interface").unwrap().iter().any(|t| t.tok == Tok::Interface));
+        // `implements`/`extends` stay contextual (Tok::Ident)
+        let toks = lex("implements extends").unwrap();
+        assert!(matches!(&toks[0].tok, Tok::Ident(s) if s == "implements"));
+        assert!(matches!(&toks[1].tok, Tok::Ident(s) if s == "extends"));
+    }
+
+    #[test]
+    fn iface_parses_requirement_counts() {
+        // 0 requirements
+        match parse_one("interface Empty {}") {
+            Stmt::Interface { name, methods, extends, .. } => {
+                assert_eq!(name, "Empty");
+                assert!(methods.is_empty());
+                assert!(extends.is_empty());
+            }
+            o => panic!("expected Interface, got {o:?}"),
+        }
+        // 1 requirement with a return type
+        match parse_one("interface Reader { fn read(b): int }") {
+            Stmt::Interface { methods, .. } => {
+                assert_eq!(methods.len(), 1);
+                assert_eq!(methods[0].name, "read");
+                assert_eq!(methods[0].params.len(), 1);
+                assert!(methods[0].ret.is_some());
+            }
+            o => panic!("expected Interface, got {o:?}"),
+        }
+        // N requirements, semicolon-separated (class-body skip_semicolons rule)
+        match parse_one("interface RW { fn read(b): int; fn write(b): int }") {
+            Stmt::Interface { methods, .. } => assert_eq!(methods.len(), 2),
+            o => panic!("expected Interface, got {o:?}"),
+        }
+        // N requirements, newline-separated
+        match parse_one("interface RW {\n fn read(b)\n fn write(b)\n}") {
+            Stmt::Interface { methods, .. } => assert_eq!(methods.len(), 2),
+            o => panic!("expected Interface, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn iface_parses_extends_composition() {
+        match parse_one("interface RW extends A, B {}") {
+            Stmt::Interface { extends, methods, .. } => {
+                assert_eq!(extends, vec!["A".to_string(), "B".to_string()]);
+                assert!(methods.is_empty());
+            }
+            o => panic!("expected Interface, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn class_parses_implements_clause() {
+        match parse_one("class C extends Super implements A, B { fn read(b) { return 0 } }") {
+            Stmt::Class { superclass, implements, .. } => {
+                assert_eq!(superclass, Some("Super".to_string()));
+                assert_eq!(implements, vec!["A".to_string(), "B".to_string()]);
+            }
+            o => panic!("expected Class, got {o:?}"),
+        }
+        // implements with NO extends
+        match parse_one("class C implements A { fn read(b) {} }") {
+            Stmt::Class { superclass, implements, .. } => {
+                assert_eq!(superclass, None);
+                assert_eq!(implements, vec!["A".to_string()]);
+            }
+            o => panic!("expected Class, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn iface_rejects_modifiers_on_requirement() {
+        for src in [
+            "interface R { async fn read(b) }",
+            "interface R { fn* read(b) }",
+            "interface R { static fn read(b) }",
+            "interface R { worker fn read(b) }",
+        ] {
+            let toks = lex(src).unwrap();
+            assert!(parse(&toks).is_err(), "should reject: {src}");
+        }
+    }
+
+    #[test]
+    fn iface_can_be_exported() {
+        match parse_one("export interface R { fn read(b): int }") {
+            Stmt::Export(inner) => assert!(matches!(*inner, Stmt::Interface { .. })),
+            o => panic!("expected Export, got {o:?}"),
         }
     }
 

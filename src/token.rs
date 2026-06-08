@@ -92,6 +92,8 @@ pub enum Tok {
     Enum,
     Match,
     Class,
+    /// IFACE: `interface` — a new RESERVED keyword (only ever a top-level decl).
+    Interface,
     Import,
     Export,
     Async,

@@ -437,7 +437,9 @@ fn write_method_req(out: &mut String, m: &crate::ast::MethodReqNode, level: usiz
     out.push_str(&m.name);
     write_params(out, &m.params);
     if let Some(ret) = &m.ret {
-        out.push_str(" -> ");
+        // AScript return-type syntax is `: T` (the `-> T` in the spec prose is
+        // illustrative; the real grammar — class methods, fns — uses a colon).
+        out.push_str(": ");
         out.push_str(&render_type(ret));
     }
     out.push('\n');
@@ -988,7 +990,7 @@ mod tests {
         };
         let mut out = String::new();
         write_stmt(&mut out, &stmt, 0);
-        assert_eq!(out, "interface Reader {\n  fn read(b) -> int\n}\n");
+        assert_eq!(out, "interface Reader {\n  fn read(b): int\n}\n");
     }
 
     #[test]
