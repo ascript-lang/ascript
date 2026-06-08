@@ -479,7 +479,12 @@ pub fn build_code_slice(
 // contiguous `Op::Closure` run for default thunks + methods + statics, then
 // `Op::Class`, then `DEFINE_GLOBAL`), remapping the proto/const/class-proto
 // indices into the fragment, plus the transitive top-level fn/const dependency
-// closure of every method body, plus any superclass classes (recursively).
+// closure of every method body, plus any superclass classes (recursively), plus
+// any OTHER top-level `class`/`enum` a method constructs or references — shipped
+// via the SAME `emit_closure_classes` machinery the worker-fn slice uses, fully
+// transitively (a shipped class whose own method constructs yet another class
+// pulls that one in too). So an actor method can construct/reference any top-level
+// class or enum, identical to a `worker fn` body.
 //
 // SUPPORTED: a DIRECT-child top-level `worker class` whose methods reference only
 // globals (`GET_GLOBAL`) + their own params/`self` — i.e. no enclosing-frame
@@ -613,8 +618,10 @@ fn panic_build(msg: &str) -> Control {
 
 /// Build the shippable [`WorkerCodeSlice`] for a `worker class` named `class_name`.
 /// The fragment, when loaded on a fresh isolate `Vm`, defines: every superclass
-/// (recursively), the transitive top-level fn/const deps of all method bodies, and
-/// the class itself (as a top-level `DEFINE_GLOBAL <class_name>`). The actor then
+/// (recursively), every OTHER top-level `class`/`enum` the method bodies construct or
+/// reference (transitively, via [`emit_closure_classes`] — the same machinery the
+/// worker-fn slice uses), the transitive top-level fn/const deps of all method bodies,
+/// and the class itself (as a top-level `DEFINE_GLOBAL <class_name>`). The actor then
 /// constructs the instance by looking up the class global and calling its `init`.
 ///
 /// `fn_id`/`entry_name` are set to the class name (the actor's `ActorMsg::Init`
@@ -626,8 +633,8 @@ pub fn build_class_slice(top: &Chunk, class_name: &str) -> Result<WorkerCodeSlic
     frag.name = Some("<worker-class-slice>".to_string());
     let span = Span::new(0, 0);
 
-    // Emit each class (superclasses first, then the target) and collect the union of
-    // their method bodies' GET_GLOBAL references for the fn/const dep closure.
+    // Emit the actor's OWN class (superclasses first, then the target) and collect the
+    // union of its method bodies' GET_GLOBAL references for the dependency closure.
     let mut emitted_classes: HashSet<String> = HashSet::new();
     let mut method_refs: Vec<Rc<str>> = Vec::new();
     emit_class_recursive(
@@ -639,11 +646,33 @@ pub fn build_class_slice(top: &Chunk, class_name: &str) -> Result<WorkerCodeSlic
         span,
     )?;
 
-    // Compute the transitive top-level fn/const dependency closure of the collected
-    // method references (same fixpoint as `materialize_slice`), and emit those defs
-    // BEFORE the classes would need them. They are late-bound `GET_GLOBAL`s, so
-    // emission order between deps and classes does not matter for correctness, but
-    // we emit deps first for readability.
+    // Compute the transitive top-level dependency closure of the actor's method-body
+    // references (the SAME `compute_closure` fixpoint `materialize_slice` uses). It
+    // contains every fn/const AND every CLASS/ENUM reached transitively — including a
+    // class another method constructs, and THAT class's own method/superclass refs.
+    let included = compute_closure(top, &defs, method_refs.clone());
+
+    // Emit every OTHER top-level class the methods reference (the actor's own class is
+    // already in `emitted_classes`, so the shared dedup set skips it), reusing the
+    // SAME `emit_closure_classes` machinery the worker-fn slice uses. This is the fix
+    // for the actor class-dep gap: an actor method can now construct/reference any
+    // top-level class (+ its superclass chain, transitively). `emit_class_recursive`
+    // appends those classes' own method refs into `method_refs` — already covered by
+    // `included` above (the closure walked them via `collect_def_refs`).
+    emit_closure_classes(
+        top,
+        &defs,
+        &included,
+        &mut emitted_classes,
+        &mut method_refs,
+        &mut frag,
+        span,
+    )?;
+
+    // Emit the transitive fn / literal-const / computed-const deps (same closure),
+    // BEFORE the classes would need them. They are late-bound `GET_GLOBAL`s, so the
+    // deps/classes emission order does not matter for correctness; we emit deps first
+    // for readability. `emit_dep_closure` skips `TopDef::Class` (emitted above).
     let mut frag_deps = Chunk::new();
     frag_deps.name = Some("<worker-class-deps>".to_string());
     emit_dep_closure(top, &defs, &method_refs, &mut frag_deps, span)?;
@@ -753,9 +782,10 @@ fn emit_top_imports(top: &Chunk, frag: &mut Chunk, span: Span) {
 /// Emit the transitive top-level fn / literal-const / computed-const dependency
 /// closure of `roots` into `frag`, in original source order (used by the actor
 /// class-slice for the dep closure of all method bodies). Shares the
-/// [`compute_closure`] fixpoint with `materialize_slice`. Classes referenced by a
-/// method body are emitted by the class slice's own `emit_class_recursive` walk, not
-/// here (so a `TopDef::Class` in the closure is skipped at this emit site).
+/// [`compute_closure`] fixpoint with `materialize_slice`. Classes/enums referenced by
+/// a method body are emitted by the class slice's [`emit_closure_classes`] pass, not
+/// here (so a `TopDef::Class` in the closure is skipped at this emit site; enums are
+/// `TopDef::Const` and DO ship here as values).
 fn emit_dep_closure(
     top: &Chunk,
     defs: &HashMap<Rc<str>, TopDef>,
@@ -786,6 +816,36 @@ fn emit_dep_closure(
                 frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
             Some(TopDef::Class) | None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Emit every `class` in the dependency-closure `included` set into `frag`, in
+/// original source order, superclass-first (via [`emit_class_recursive`], which
+/// de-dups). SHARED by the worker-fn slice ([`materialize_slice`] step 2) and the
+/// actor class-slice ([`build_class_slice`]) so both ship referenced classes
+/// identically: a worker fn / actor method that constructs or references any
+/// top-level class pulls that class (+ its superclass chain) into the fragment.
+///
+/// The closure `included` already contains every transitively-referenced class name
+/// (`compute_closure` walks a `TopDef::Class`'s own method/superclass refs via
+/// [`collect_def_refs`]), so a class whose method constructs ANOTHER top-level class
+/// is reached and emitted here too — fully transitive. The `method_refs`
+/// [`emit_class_recursive`] re-accumulates are therefore already in `included` and are
+/// discarded.
+fn emit_closure_classes(
+    top: &Chunk,
+    defs: &HashMap<Rc<str>, TopDef>,
+    included: &HashSet<Rc<str>>,
+    emitted: &mut HashSet<String>,
+    method_refs: &mut Vec<Rc<str>>,
+    frag: &mut Chunk,
+    span: Span,
+) -> Result<(), Control> {
+    for name in source_order_define_names(top) {
+        if included.contains(&name) && matches!(defs.get(name.as_ref()), Some(TopDef::Class)) {
+            emit_class_recursive(top, &name, frag, emitted, method_refs, span)?;
         }
     }
     Ok(())
@@ -1083,25 +1143,22 @@ fn materialize_slice(
     // 2) Classes (with superclass chains) the closure references — emitted before the
     //    fn/const deps so a computed-const initializer that constructs a class finds
     //    it defined. `emit_class_recursive` de-dups and orders superclasses first.
-    let mut emitted_classes: HashSet<String> = HashSet::new();
-    let mut class_method_refs: Vec<Rc<str>> = Vec::new();
     {
         // Emit classes into their own fragment, then splice (the class fragment uses
         // fresh pool indices remapped by `append_chunk_defs`).
         let mut class_frag = Chunk::new();
         class_frag.name = Some("<worker-slice-classes>".to_string());
-        for name in source_order_define_names(top) {
-            if included.contains(&name) && matches!(defs.get(name.as_ref()), Some(TopDef::Class)) {
-                emit_class_recursive(
-                    top,
-                    &name,
-                    &mut class_frag,
-                    &mut emitted_classes,
-                    &mut class_method_refs,
-                    span,
-                )?;
-            }
-        }
+        let mut emitted_classes: HashSet<String> = HashSet::new();
+        let mut class_method_refs: Vec<Rc<str>> = Vec::new();
+        emit_closure_classes(
+            top,
+            defs,
+            &included,
+            &mut emitted_classes,
+            &mut class_method_refs,
+            &mut class_frag,
+            span,
+        )?;
         append_chunk_defs(&mut frag, &class_frag);
     }
 
