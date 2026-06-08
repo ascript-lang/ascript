@@ -124,8 +124,10 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   readers must reject a v22 chunk and a v21 reader must reject this one.
 ///
 /// - **v23 (ADT):** algebraic enums. The enum constant layout gains a per-variant
-///   payload SCHEMA (field names + types) and a payload-variant value can carry a
-///   constructed payload (positional/named); five new pattern opcodes (`MatchVariant`,
+///   payload SCHEMA (field names + types). NOTE: only enum *definitions* + schemas are
+///   pooled — a *constructed* payload-variant value is runtime-only and is rejected as
+///   a literal const (`NonLiteralConst`); the reader always reads `payload: None` for a
+///   pooled variant. Five new pattern opcodes (`MatchVariant`,
 ///   `VariantElem`, `VariantField`, `MatchVariantArity`, `MatchVariantHasField`,
 ///   appended at the END so existing byte values are unchanged). Old readers must
 ///   reject a v23 chunk. (Bumped by reading the NUM-left v22 and adding one.)
