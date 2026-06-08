@@ -520,6 +520,21 @@ pub enum Op {
     WrapSub,
     /// `a b -- (a *% b)` — int wrapping multiply (never panics).
     WrapMul,
+
+    // ---- annotated local/const binding contract (NUM) ---------------------
+    /// `CHECK_LOCAL(u16 type_const)` — contract-check the value on TOS (the just-
+    /// evaluated initializer of an annotated `let`/`const`) against the declared
+    /// type `chunk.type_consts[type_const]`. Peeks TOS (leaves it in place for the
+    /// following store). A mismatch is the byte-identical recoverable Tier-2 panic
+    /// the tree-walker's `Stmt::Let` raises (`type contract violated: expected {ty},
+    /// got {name} ({value})`, anchored at the initializer EXPRESSION's span — the op's
+    /// own span). The compiler emits it ONLY for an annotated binding (`let x: T = …`
+    /// / `const x: T = …`), for BOTH the module-global and slot-local store paths; an
+    /// un-annotated binding emits nothing. Operand indexes the per-chunk
+    /// `type_consts` side-pool (NOT the `Value` const pool — a `Type` is not a
+    /// `Value`). Appended at the END of the enum so existing opcode byte values are
+    /// unchanged (`.aso` version is bumped regardless).
+    CheckLocal,
 }
 
 impl Op {
@@ -654,6 +669,8 @@ impl Op {
             x if x == WrapSub as u8 => WrapSub,
             x if x == WrapMul as u8 => WrapMul,
 
+            x if x == CheckLocal as u8 => CheckLocal,
+
             _ => return None,
         })
     }
@@ -668,7 +685,7 @@ impl Op {
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | ImmutableError | Closure
             | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper
             | InstanceOfType | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest
-            | MatchHasKey | CallMethodSpread | DefineExport | CheckParam => 2,
+            | MatchHasKey | CallMethodSpread | DefineExport | CheckParam | CheckLocal => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -872,6 +889,7 @@ mod tests {
         Op::WrapAdd,
         Op::WrapSub,
         Op::WrapMul,
+        Op::CheckLocal,
     ];
 
     #[test]

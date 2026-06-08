@@ -3236,12 +3236,21 @@ impl Compiler {
             return self.compile_let_destructure(let_stmt, pat);
         }
 
+        // The declared `: T` contract, if any. Enforced ONLY when there is an
+        // initializer (mirrors the tree-walker's `Stmt::Let`, which leaves an
+        // initializer-less `let x: T` bound to nil unchecked).
+        let ty = self.let_type(let_stmt);
+
         // A DIRECT-child top-level `let`/`const` is a module-scope user-global: emit
-        // `<init>; DEFINE_GLOBAL name` (late-bound) instead of a frame-slot store.
+        // `<init>; [CHECK_LOCAL : T;] DEFINE_GLOBAL name` (late-bound) instead of a
+        // frame-slot store.
         if self.is_global_decl_site(let_stmt.syntax().text_range()) {
             let name = cst_first_ident(let_stmt.syntax()).unwrap_or_default();
             match let_stmt.expr() {
-                Some(init) => self.compile_expr(&init)?,
+                Some(init) => {
+                    self.compile_expr(&init)?;
+                    self.emit_check_local(ty, &init);
+                }
                 None => self.chunk.emit(Op::Nil, span),
             }
             self.emit_define_global(&name, span);
@@ -3251,12 +3260,42 @@ impl Compiler {
         let slot = self.let_slot(let_stmt)?;
 
         match let_stmt.expr() {
-            Some(init) => self.compile_expr(&init)?,
+            Some(init) => {
+                self.compile_expr(&init)?;
+                self.emit_check_local(ty, &init);
+            }
             // `let x` with no initializer binds nil (mirrors the tree-walker).
             None => self.chunk.emit(Op::Nil, span),
         }
         self.emit_set_local(slot, span);
         Ok(())
+    }
+
+    /// The declared `: T` contract on a `let`/`const`, lowered to an [`ast::Type`],
+    /// or `None` when the binding is un-annotated. The type node is a direct child
+    /// of the `LetStmt` (parsed by `type_ann` after the `:`). Reuses the SAME
+    /// `cst_type` lowering the param/return paths use, so the runtime
+    /// `interp::check_type` sees the identical `Type` the tree-walker built.
+    fn let_type(&self, let_stmt: &LetStmt) -> Option<crate::ast::Type> {
+        let_stmt
+            .syntax()
+            .children()
+            .find(|c| is_type_node(c.kind()))
+            .and_then(cst_type)
+    }
+
+    /// Emit `CHECK_LOCAL <type-const>` to contract-check the initializer value on
+    /// TOS (left in place for the following store) against `ty`, when the binding is
+    /// annotated. A no-op when `ty` is `None` (un-annotated → unchanged bytecode).
+    /// The op's span is the initializer EXPRESSION's trivia-trimmed code span, so a
+    /// mismatch panic anchors EXACTLY where the tree-walker's `Stmt::Let` does
+    /// (`value.span`), byte-for-byte.
+    fn emit_check_local(&mut self, ty: Option<crate::ast::Type>, init: &Expr) {
+        if let Some(ty) = ty {
+            let idx = self.chunk.add_type_const(ty);
+            self.chunk
+                .emit_u16(Op::CheckLocal, idx, node_code_span(init));
+        }
     }
 
     /// Whether the declaration at `decl_range` binds a MODULE-SCOPE user-global, per

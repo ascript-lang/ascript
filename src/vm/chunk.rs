@@ -183,6 +183,9 @@ pub enum ChunkLimit {
     ClassProtos(Span),
     /// The import table would exceed `u16::MAX` entries.
     Imports(Span),
+    /// The type-const side-pool (annotated `let`/`const` contract types) would
+    /// exceed `u16::MAX` entries.
+    TypeConsts(Span),
     /// A forward jump displacement would exceed the `i16` range (a single function
     /// body emits > 32 KB of bytecode between a jump and its target).
     Jump(Span),
@@ -198,6 +201,7 @@ impl ChunkLimit {
             | ChunkLimit::Protos(s)
             | ChunkLimit::ClassProtos(s)
             | ChunkLimit::Imports(s)
+            | ChunkLimit::TypeConsts(s)
             | ChunkLimit::Jump(s)
             | ChunkLimit::Loop(s) => s,
         }
@@ -217,6 +221,9 @@ impl ChunkLimit {
             }
             ChunkLimit::Imports(_) => {
                 "module exceeds 65535 imports; split the module into smaller files"
+            }
+            ChunkLimit::TypeConsts(_) => {
+                "module exceeds 65535 annotated-binding type contracts; split the module into smaller files"
             }
             ChunkLimit::Jump(_) | ChunkLimit::Loop(_) => {
                 "function body too large to compile (a single jump exceeds 32 KB of bytecode); split it into smaller functions"
@@ -287,6 +294,13 @@ pub struct Chunk {
     /// carries a u16 index into this table; the run loop reads the descriptor to
     /// resolve the `std/*` module and bind its exports into the recorded slots.
     pub imports: Vec<ImportDesc>,
+    /// Type contracts referenced by `CHECK_LOCAL` operands (NUM). Each
+    /// `Op::CheckLocal` carries a u16 index into this side-pool; the run loop reads
+    /// the declared `Type` and runs the SAME `interp::check_type` the tree-walker's
+    /// `Stmt::Let` + `Op::CheckParam` use. A `Type` is not a `Value`, so it cannot
+    /// live in the `consts` pool — this dedicated pool mirrors the proto's stored
+    /// param/return types. Empty for any module with no annotated `let`/`const`.
+    pub type_consts: Vec<crate::ast::Type>,
     /// Optional name (function name / `<script>`), for the disassembler & traces.
     pub name: Option<String>,
     /// The FIRST bytecode-capacity overflow this chunk hit while being built
@@ -502,6 +516,25 @@ impl Chunk {
             u16::MAX
         });
         self.consts.push(v);
+        idx
+    }
+
+    /// Append a type contract to the `type_consts` side-pool (for `CHECK_LOCAL`),
+    /// returning its index. Not deduplicated (annotated bindings are rare and a
+    /// `Type` has no cheap structural-equality key here); each annotated `let`/
+    /// `const` appends one entry.
+    ///
+    /// On capacity overflow (> `u16::MAX` entries) records a sticky
+    /// [`ChunkLimit::TypeConsts`] and returns the placeholder `u16::MAX` (SP3 §A);
+    /// the compiler turns the recorded overflow into a clean `CompileError` after
+    /// sealing the chunk, so the placeholder never executes.
+    pub fn add_type_const(&mut self, t: crate::ast::Type) -> u16 {
+        let idx = self.type_consts.len();
+        let idx = u16::try_from(idx).unwrap_or_else(|_| {
+            self.record_overflow(ChunkLimit::TypeConsts(self.cur_span()));
+            u16::MAX
+        });
+        self.type_consts.push(t);
         idx
     }
 

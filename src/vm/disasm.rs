@@ -145,6 +145,18 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
             let idx = chunk.read_u16(at + 1);
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
         }
+        // u16 type-const side-pool index → show the declared contract type.
+        Op::CheckLocal => {
+            let idx = chunk.read_u16(at + 1);
+            match chunk.type_consts.get(idx as usize) {
+                Some(ty) => {
+                    let _ = write!(line, "{idx:>5} ; : {ty}");
+                }
+                None => {
+                    let _ = write!(line, "{idx:>5} ; ?? type {idx}");
+                }
+            }
+        }
         // u16 expected length + u8 exact-match flag (1 = exact, 0 = >=).
         Op::MatchArray => {
             let len = chunk.read_u16(at + 1);
@@ -301,6 +313,7 @@ fn op_name(op: Op) -> &'static str {
         WrapAdd => "WRAP_ADD",
         WrapSub => "WRAP_SUB",
         WrapMul => "WRAP_MUL",
+        CheckLocal => "CHECK_LOCAL",
     }
 }
 

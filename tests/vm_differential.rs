@@ -7339,3 +7339,49 @@ async fn worker_examples_all_modes_byte_identical() {
         worker_examples.len()
     );
 }
+
+// ----- NUM: annotated `let`/`const` runtime type contracts (CHECK_LOCAL) -------
+// A `: T` annotation on a `let`/`const` binding is a runtime contract on the
+// initializer value, byte-identical to the tree-walker's `Stmt::Let` check (same
+// `type contract violated: expected {ty}, got {name} ({value})` message, same span
+// = the init EXPRESSION's span). Before CHECK_LOCAL the VM silently bound the
+// mismatched value; these regressions trip if that divergence ever returns.
+
+#[tokio::test]
+async fn vm_let_contract_mismatch_matches_treewalker() {
+    // Each MUST panic byte-identically on tree-walker == specialized-VM == generic-VM.
+    let cases = [
+        "let x: int = 5.0\nprint(x)\n",
+        "let x: float = 5\nprint(x)\n",
+        "let s: string = 5\nprint(s)\n",
+        "const c: int = 2.5\nprint(c)\n",
+        // module-global path AND slot-local (inside a fn body) path.
+        "fn f() {\n  let y: int = 1.5\n  return y\n}\nprint(f())\n",
+        "fn g() {\n  const k: string = 7\n  return k\n}\nprint(g())\n",
+    ];
+    for src in cases {
+        assert_opt_call_error_three_way(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_let_contract_ok_matches_treewalker() {
+    // Well-typed annotated bindings must run identically (no spurious panic) and
+    // print the value the same way on all three engines.
+    let cases = [
+        "let x: int = 5\nprint(x)\n",
+        "let x: number = 5\nprint(x)\n",
+        "let x: number = 5.0\nprint(x)\n",
+        "const c: int = 2\nprint(c)\n",
+        "let s: string = \"hi\"\nprint(s)\n",
+        // int is a subtype of number; float is a subtype of number.
+        "let n: number = 5\nlet f: float = 5.0\nprint(n + f)\n",
+        // slot-local path inside a fn body.
+        "fn f() {\n  let y: int = 5\n  return y\n}\nprint(f())\n",
+        // optional / nil-bearing annotation accepts nil.
+        "let m: int? = nil\nprint(m)\n",
+    ];
+    for src in cases {
+        assert_opt_call_ok_three_way(src).await;
+    }
+}

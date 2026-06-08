@@ -116,7 +116,13 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   (`InstanceOfType`, a u16 type-name-const operand; appended at the END of the
 ///   enum, so existing opcode byte values are UNCHANGED). Old chunks never contained
 ///   it, so older readers must reject a v21 chunk.
-pub const ASO_FORMAT_VERSION: u32 = 21;
+/// - 22: NUM annotated `let`/`const` runtime type contracts — one new appended
+///   opcode (`CheckLocal`, a u16 operand indexing a per-chunk `type_consts`
+///   side-pool; appended at the END of the enum, so existing opcode byte values are
+///   UNCHANGED) plus a new `type_consts` section in each chunk (a length-prefixed
+///   list of `Type`s, written after `imports`). Old chunks had neither, so older
+///   readers must reject a v22 chunk and a v21 reader must reject this one.
+pub const ASO_FORMAT_VERSION: u32 = 22;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -574,6 +580,11 @@ fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
     for imp in &c.imports {
         write_import(w, imp);
     }
+    // type_consts (annotated-binding contract types for CHECK_LOCAL; v22+)
+    w.len(c.type_consts.len());
+    for t in &c.type_consts {
+        write_type(w, t);
+    }
     // spans
     w.len(c.spans.len());
     for (off, span) in &c.spans {
@@ -626,6 +637,12 @@ fn read_chunk(r: &mut Reader) -> Result<Chunk, AsoError> {
     c.imports.reserve(n.min(r.remaining()));
     for _ in 0..n {
         c.imports.push(read_import(r)?);
+    }
+    // type_consts (v22+)
+    let n = r.len()?;
+    c.type_consts.reserve(n.min(r.remaining()));
+    for _ in 0..n {
+        c.type_consts.push(read_type(r)?);
     }
     // spans
     let n = r.len()?;
@@ -2049,6 +2066,58 @@ run()
                 assert_ne!(found, ASO_FORMAT_VERSION);
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    /// A chunk containing a `CHECK_LOCAL` op (from an annotated `let`/`const`)
+    /// round-trips through `.aso`: the new opcode AND its `type_consts` side-pool
+    /// entry survive, so the reloaded chunk disassembles identically (the type
+    /// comment proves the `Type` was recovered) and runs to the same output. A
+    /// stale-version copy of those same bytes is rejected, never run.
+    #[test]
+    fn check_local_round_trips_and_stale_version_rejected() {
+        // Two annotated bindings + one un-annotated, to exercise the pool index.
+        let src = "let a: int = 5\nconst b: string = \"hi\"\nlet c = 7\nprint(a)\nprint(b)\nprint(c)\n";
+        let original = compile(src);
+        // The compiler emitted at least one CHECK_LOCAL and populated type_consts.
+        assert!(
+            original.code.contains(&(crate::vm::opcode::Op::CheckLocal as u8)),
+            "expected a CHECK_LOCAL op in the compiled chunk"
+        );
+        assert_eq!(
+            original.type_consts.len(),
+            2,
+            "two annotated bindings → two type-const pool entries"
+        );
+
+        let bytes = original.to_bytes().expect("serialize");
+        let back = Chunk::from_bytes(&bytes).expect("a valid v22 .aso must decode");
+        assert_eq!(
+            back.type_consts.len(),
+            original.type_consts.len(),
+            "type_consts pool must survive the round-trip"
+        );
+        assert_eq!(
+            disasm(&original),
+            disasm(&back),
+            "CHECK_LOCAL + type_consts must round-trip byte-stably"
+        );
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(back),
+            "output must be identical after the .aso round-trip"
+        );
+
+        // A stale-version copy of these very bytes is rejected (never run).
+        let mut stale = bytes.clone();
+        stale[4] = stale[4].wrapping_sub(1); // → v21, the pre-CHECK_LOCAL format
+        match Chunk::from_bytes(&stale) {
+            Err(AsoError::VersionMismatch { found, expected }) => {
+                assert_eq!(expected, ASO_FORMAT_VERSION);
+                assert_eq!(expected, 22);
+                assert_ne!(found, ASO_FORMAT_VERSION);
+            }
+            other => panic!("expected VersionMismatch for a stale CHECK_LOCAL .aso, got {other:?}"),
         }
     }
 

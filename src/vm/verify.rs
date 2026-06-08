@@ -233,6 +233,8 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // CHECK_PARAM peeks TOS (the default value) and validates it in place.
         JumpIfArgSupplied => Effect::new(0, 0),
         CheckParam => Effect::new(1, 1),
+        // CHECK_LOCAL peeks TOS (the bound initializer) and validates it in place.
+        CheckLocal => Effect::new(1, 1),
 
         // ---- calls ----
         Call => Effect::new(argc_or_n + 1, 1),
@@ -413,6 +415,17 @@ fn check_operands(
         }
         Ok(())
     };
+    let check_type_const = |idx: usize| -> Result<(), VerifyError> {
+        if idx >= chunk.type_consts.len() {
+            return Err(VerifyError::OperandOutOfRange {
+                offset: off,
+                kind: "type-const",
+                index: idx,
+                len: chunk.type_consts.len(),
+            });
+        }
+        Ok(())
+    };
     let check_slot = |idx: usize| -> Result<(), VerifyError> {
         if idx >= chunk.slot_count as usize {
             return Err(VerifyError::OperandOutOfRange {
@@ -465,6 +478,9 @@ fn check_operands(
 
         // ---- OBJECT_REST: u16 const index naming the bound-keys ARRAY (not a Str) ----
         ObjectRest => check_const(chunk.read_u16(operand_at) as usize)?,
+
+        // ---- CHECK_LOCAL: u16 index into the type-const side-pool ----
+        CheckLocal => check_type_const(chunk.read_u16(operand_at) as usize)?,
 
         // ---- local slot index ----
         GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | CloseUpvalue => {

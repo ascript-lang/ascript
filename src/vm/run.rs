@@ -1533,6 +1533,32 @@ impl Vm {
                     }
                 }
 
+                Op::CheckLocal => {
+                    // Contract-check the just-evaluated initializer (TOS, left in
+                    // place) of an annotated `let`/`const` against its declared type,
+                    // byte-identical to the tree-walker's `Stmt::Let` check (same
+                    // message; span = the initializer EXPRESSION's span, which is this
+                    // op's own span). The operand indexes the chunk's `type_consts`
+                    // side-pool. The compiler emits CHECK_LOCAL only for an annotated
+                    // binding, so a type is always present at this index.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let ty = match fiber.frame().closure.proto.chunk.type_consts.get(idx) {
+                        Some(ty) => ty.clone(),
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CHECK_LOCAL type-const index {idx} out of range"),
+                            ))
+                        }
+                    };
+                    let v = fiber.peek(0).clone();
+                    if !crate::interp::check_type(&v, &ty) {
+                        return Err(crate::interp::contract_panic(&ty, &v, span));
+                    }
+                }
+
                 Op::NewArray => {
                     // Pop `n` elements (pushed in source order, so the last
                     // pushed is on top) into a Vec preserving source order, then
