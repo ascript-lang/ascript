@@ -199,10 +199,10 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
         "string" => {
             let mut m = Map::new();
             m.insert("type".to_string(), J::String("string".to_string()));
-            if let Some(Value::Float(n)) = field(schema, "minLength") {
+            if let Some(n) = field_num(schema, "minLength") {
                 m.insert("minLength".to_string(), json!(n as i64));
             }
-            if let Some(Value::Float(n)) = field(schema, "maxLength") {
+            if let Some(n) = field_num(schema, "maxLength") {
                 m.insert("maxLength".to_string(), json!(n as i64));
             }
             if let Some(Value::Str(p)) = field(schema, "pattern") {
@@ -213,10 +213,10 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
         "number" => {
             let mut m = Map::new();
             m.insert("type".to_string(), J::String("number".to_string()));
-            if let Some(Value::Float(n)) = field(schema, "min") {
+            if let Some(n) = field_num(schema, "min") {
                 m.insert("minimum".to_string(), json!(n));
             }
-            if let Some(Value::Float(n)) = field(schema, "max") {
+            if let Some(n) = field_num(schema, "max") {
                 m.insert("maximum".to_string(), json!(n));
             }
             J::Object(m)
@@ -300,10 +300,17 @@ fn field(v: &Value, key: &str) -> Option<Value> {
     }
 }
 
+/// NUM §4: read a numeric schema constraint as `f64`, accepting `Int` or `Float`.
+fn field_num(v: &Value, key: &str) -> Option<f64> {
+    field(v, key).and_then(|x| x.as_f64())
+}
+
 fn value_to_json(v: &Value) -> J {
     match v {
         Value::Nil => J::Null,
         Value::Bool(b) => J::Bool(*b),
+        // NUM §4: an `Int` emits as a JSON integer; a `Float` as a JSON number.
+        Value::Int(i) => json!(i),
         Value::Float(n) => json!(n),
         Value::Str(s) => J::String(s.to_string()),
         _ => J::Null,

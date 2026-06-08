@@ -64,8 +64,8 @@ fn make_instant(epoch_ms: i64) -> Value {
 fn instant_epoch(v: &Value, span: Span, ctx: &str) -> Result<i64, Control> {
     let o = want_object(v, span, ctx)?;
     let b = o.borrow();
-    match b.get("epochMs") {
-        Some(Value::Float(n)) => Ok(*n as i64),
+    match b.get("epochMs").and_then(|v| v.as_f64()) {
+        Some(n) => Ok(n as i64),
         _ => Err(AsError::at(
             format!(
                 "{} expects an instant object (with epochMs), got an object without it",

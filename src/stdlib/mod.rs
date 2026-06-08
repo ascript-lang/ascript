@@ -710,9 +710,9 @@ pub(crate) fn arg(args: &[Value], i: usize) -> Value {
 }
 
 pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Control> {
-    match v {
-        Value::Float(n) => Ok(*n),
-        _ => Err(AsError::at(
+    match v.as_f64() {
+        Some(n) => Ok(n),
+        None => Err(AsError::at(
             format!(
                 "{} expects a number, got {}",
                 ctx,

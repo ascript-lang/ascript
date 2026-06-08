@@ -105,6 +105,10 @@ impl Interp {
                 Value::Str(s) => {
                     command.arg(s.as_ref());
                 }
+                // NUM §4: an `Int` binds as an integer argument directly.
+                Value::Int(i) => {
+                    command.arg(*i);
+                }
                 Value::Float(n) => {
                     // Integers as integers; fractions as their text form.
                     if n.fract() == 0.0 && n.is_finite() {
@@ -161,7 +165,8 @@ fn redis_to_value(v: &redis::Value) -> Value {
     use std::cell::RefCell;
     match v {
         redis::Value::Nil => Value::Nil,
-        redis::Value::Int(i) => Value::Float(*i as f64),
+        // NUM §4: a Redis integer reply decodes to `Int`.
+        redis::Value::Int(i) => Value::Int(*i),
         redis::Value::BulkString(bytes) => match std::str::from_utf8(bytes) {
             Ok(s) => Value::Str(s.into()),
             Err(_) => Value::Bytes(Rc::new(RefCell::new(bytes.clone()))),
@@ -207,7 +212,7 @@ mod tests {
     #[test]
     fn reply_map_basic_kinds() {
         assert_eq!(redis_to_value(&redis::Value::Nil), Value::Nil);
-        assert_eq!(redis_to_value(&redis::Value::Int(7)), Value::Float(7.0));
+        assert_eq!(redis_to_value(&redis::Value::Int(7)), Value::Int(7));
         assert_eq!(redis_to_value(&redis::Value::Okay), Value::Str("OK".into()));
         assert_eq!(
             redis_to_value(&redis::Value::SimpleString("PONG".into())),

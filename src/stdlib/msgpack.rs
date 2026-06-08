@@ -42,6 +42,8 @@ pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
     match v {
         Value::Nil => Ok(Mp::Nil),
         Value::Bool(b) => Ok(Mp::Boolean(*b)),
+        // NUM §4: an `Int` encodes as a MessagePack integer directly.
+        Value::Int(i) => Ok(Mp::Integer((*i).into())),
         Value::Float(n) => Ok(number_to_mp(*n)),
         Value::Decimal(d) => Ok(Mp::String(d.to_string().into())),
         Value::Str(s) => Ok(Mp::String(s.to_string().into())),
@@ -127,12 +129,13 @@ pub(crate) fn from_mp(mp: &Mp) -> Value {
         Mp::Nil => Value::Nil,
         Mp::Boolean(b) => Value::Bool(*b),
         Mp::Integer(i) => {
-            // rmpv Integer is i64 or u64; both fit f64 with the usual precision
-            // caveat (documented lossy edge for very large integers).
-            if let Some(u) = i.as_u64() {
+            // NUM §4: a MessagePack integer decodes to `Int` when it fits `i64`; a
+            // `u64` value above `i64::MAX` is preserved as `Float` (the only lossy
+            // edge — `Int` is `i64`).
+            if let Some(s) = i.as_i64() {
+                Value::Int(s)
+            } else if let Some(u) = i.as_u64() {
                 Value::Float(u as f64)
-            } else if let Some(s) = i.as_i64() {
-                Value::Float(s as f64)
             } else {
                 Value::Float(f64::NAN)
             }

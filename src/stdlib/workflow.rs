@@ -482,10 +482,7 @@ impl Interp {
                 Ok(Value::Str(uuid::Uuid::from_bytes(bytes).to_string().into()))
             }
             "sleep" => {
-                let ms = match user.first() {
-                    Some(Value::Float(n)) => *n,
-                    _ => 0.0,
-                };
+                let ms = user.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
                 // Durable timer: advance the virtual clock + record a TimerSet; no
                 // real delay. On resume the recorded TimerSet is consumed and the
                 // clock fast-forwards.

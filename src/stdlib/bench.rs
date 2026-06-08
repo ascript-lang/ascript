@@ -129,14 +129,8 @@ impl Interp {
             let stats = self.bench_measure(&measure_args, span).await?;
             if let Value::Object(o) = &stats {
                 let o = o.borrow();
-                let avg_ms = match o.get("avgMs") {
-                    Some(Value::Float(n)) => *n,
-                    _ => 0.0,
-                };
-                let ops = match o.get("opsPerSec") {
-                    Some(Value::Float(n)) => *n,
-                    _ => 0.0,
-                };
+                let avg_ms = o.get("avgMs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let ops = o.get("opsPerSec").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 results.push((name.clone(), avg_ms, ops));
             }
         }

@@ -219,6 +219,13 @@ fn obj_field(obj: &Value, key: &str) -> Option<Value> {
     }
 }
 
+/// NUM §4: read a numeric constraint field (`min`/`max`/`minLength`/`maxLength`)
+/// as an `f64`, accepting BOTH `Int` and `Float` stored values. A stored `5`
+/// (now an `Int`) must drive the same constraint as a stored `5.0`.
+fn obj_field_num(obj: &Value, key: &str) -> Option<f64> {
+    obj_field(obj, key).and_then(|v| v.as_f64())
+}
+
 // ── Type → schema conversion (used by fromClass) ─────────────────────────────
 
 /// Convert an AScript `Type` annotation to its schema-tagged Object equivalent.
@@ -464,9 +471,12 @@ impl Interp {
         //   Str("false") → "bool"   : Bool(false)
         let coerced: Option<Value> = if coerce {
             match (kind.as_ref(), value) {
+                // NUM §4: a parsed-from-string number is a `Float` (it may be
+                // non-integral); a number→string coercion stringifies whichever
+                // numeric subtype it is (`Int` → "5", `Float` → "5.5").
                 ("number", Value::Str(s)) => s.parse::<f64>().ok().map(Value::Float),
-                ("string", Value::Float(n)) => {
-                    Some(Value::Str(Value::Float(*n).to_string().into()))
+                ("string", n @ (Value::Int(_) | Value::Float(_))) => {
+                    Some(Value::Str(n.to_string().into()))
                 }
                 ("bool", Value::Str(s)) if s.as_ref() == "true" => Some(Value::Bool(true)),
                 ("bool", Value::Str(s)) if s.as_ref() == "false" => Some(Value::Bool(false)),
@@ -495,7 +505,7 @@ impl Interp {
                     Value::Str(s) => {
                         let char_len = s.chars().count();
                         // minLength
-                        if let Some(Value::Float(min)) = obj_field(schema, "minLength") {
+                        if let Some(min) = obj_field_num(schema, "minLength") {
                             if (char_len as f64) < min {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
@@ -507,7 +517,7 @@ impl Interp {
                             }
                         }
                         // maxLength
-                        if let Some(Value::Float(max)) = obj_field(schema, "maxLength") {
+                        if let Some(max) = obj_field_num(schema, "maxLength") {
                             if (char_len as f64) > max {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
@@ -567,29 +577,32 @@ impl Interp {
 
             // ── "number" ──────────────────────────────────────────────────────
             "number" => {
-                match value {
-                    Value::Float(n) => {
+                // NUM §4: the `number` schema accepts BOTH numeric subtypes; bind the
+                // value's `f64` for the min/max constraint comparisons. The displayed
+                // number is the value itself (Int prints `5`, Float `5.0`).
+                match value.as_f64() {
+                    Some(n) => {
                         // min constraint
-                        if let Some(Value::Float(min)) = obj_field(schema, "min") {
-                            if *n < min {
+                        if let Some(min) = obj_field_num(schema, "min") {
+                            if n < min {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
-                                    format!("expected number >= {} (min), got {}", min, n),
+                                    format!("expected number >= {} (min), got {}", min, value),
                                 )));
                             }
                         }
                         // max constraint
-                        if let Some(Value::Float(max)) = obj_field(schema, "max") {
-                            if *n > max {
+                        if let Some(max) = obj_field_num(schema, "max") {
+                            if n > max {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
-                                    format!("expected number <= {} (max), got {}", max, n),
+                                    format!("expected number <= {} (max), got {}", max, value),
                                 )));
                             }
                         }
                         value.clone()
                     }
-                    _ => {
+                    None => {
                         return Err(ParseFail::Mismatch(err_obj(
                             path,
                             format!("expected number, got {}", type_name(value)),
@@ -655,7 +668,7 @@ impl Interp {
                             out.push(v);
                         }
                         // minLength / maxLength on the validated array
-                        if let Some(Value::Float(min)) = obj_field(schema, "minLength") {
+                        if let Some(min) = obj_field_num(schema, "minLength") {
                             if (out.len() as f64) < min {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
@@ -667,7 +680,7 @@ impl Interp {
                                 )));
                             }
                         }
-                        if let Some(Value::Float(max)) = obj_field(schema, "maxLength") {
+                        if let Some(max) = obj_field_num(schema, "maxLength") {
                             if (out.len() as f64) > max {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
@@ -1014,7 +1027,7 @@ impl Interp {
                             }
                         }
                         // minLength / maxLength on the validated array
-                        if let Some(Value::Float(min)) = obj_field(schema, "minLength") {
+                        if let Some(min) = obj_field_num(schema, "minLength") {
                             if (out.len() as f64) < min {
                                 errors.push(err_obj(
                                     path,
@@ -1026,7 +1039,7 @@ impl Interp {
                                 ));
                             }
                         }
-                        if let Some(Value::Float(max)) = obj_field(schema, "maxLength") {
+                        if let Some(max) = obj_field_num(schema, "maxLength") {
                             if (out.len() as f64) > max {
                                 errors.push(err_obj(
                                     path,
@@ -1843,7 +1856,8 @@ mod tests {
         match &msg {
             Value::Str(s) => {
                 assert!(s.contains("expected string"), "message was: {}", s);
-                assert!(s.contains("number"), "message was: {}", s);
+                // NUM §4: `type_name(Float)` is now "float".
+                assert!(s.contains("float"), "message was: {}", s);
             }
             _ => panic!("message was not a string: {:?}", msg),
         }

@@ -190,7 +190,8 @@ pub(crate) fn error_to_value(err: &genai::Error) -> Value {
     let (message, status) = describe_error(err);
     map.insert("message".to_string(), Value::Str(message.into()));
     if let Some(s) = status {
-        map.insert("status".to_string(), Value::Float(s as f64));
+        // NUM §4: an HTTP status code is an `Int`.
+        map.insert("status".to_string(), Value::Int(i64::from(s)));
     }
     Value::Object(crate::value::ObjectCell::new(map))
 }

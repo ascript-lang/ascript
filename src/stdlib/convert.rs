@@ -49,7 +49,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 );
             }
             match i64::from_str_radix(s.trim(), radix) {
-                Ok(n) => Ok(make_pair(Value::Float(n as f64), Value::Nil)),
+                // NUM §4: `parseInt` yields an `Int`.
+                Ok(n) => Ok(make_pair(Value::Int(n), Value::Nil)),
                 Err(_) => Ok(make_pair(
                     Value::Nil,
                     make_error(Value::Str(
@@ -63,8 +64,13 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         // because toNumber's contract is "this IS a number-like value" — use parseNumber for untrusted input.
         "toNumber" => {
             let v = arg(args, 0);
+            // NUM §4: a value that is ALREADY a number (Int or Float) passes through
+            // unchanged, preserving its subtype. Other coercions (bool/nil/string)
+            // produce a Float.
+            if v.is_number() {
+                return Ok(v);
+            }
             let n = match &v {
-                Value::Float(n) => *n,
                 Value::Bool(b) => {
                     if *b {
                         1.0
@@ -161,8 +167,13 @@ mod tests {
             call("toNumber", &[s(" 42 ")], sp()).unwrap(),
             Value::Float(42.0)
         );
+        // NUM §3.3: `0.0` is falsy.
         assert_eq!(
             call("toBool", &[Value::Float(0.0)], sp()).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            call("toBool", &[Value::Float(2.5)], sp()).unwrap(),
             Value::Bool(true)
         );
         assert_eq!(

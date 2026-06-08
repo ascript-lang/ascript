@@ -87,9 +87,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "find" => {
             let s = want_string(&arg(args, 0), span, &ctx("find"))?;
             let sub = want_string(&arg(args, 1), span, &ctx("find"))?;
+            // NUM §4: a character index/count is an `Int`.
             match s.find(sub.as_ref()) {
-                Some(byte_idx) => Ok(Value::Float(s[..byte_idx].chars().count() as f64)),
-                None => Ok(Value::Float(-1.0)),
+                Some(byte_idx) => Ok(Value::Int(s[..byte_idx].chars().count() as i64)),
+                None => Ok(Value::Int(-1)),
             }
         }
         "replace" => {
@@ -191,7 +192,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             } else {
                 s.matches(sub.as_ref()).count()
             };
-            Ok(Value::Float(n as f64))
+            // NUM §4: an occurrence count is an `Int`.
+            Ok(Value::Int(n as i64))
         }
         "splitN" => {
             let s = want_string(&arg(args, 0), span, &ctx("splitN"))?;
@@ -291,11 +293,11 @@ mod tests {
     fn find_replace_format_pad_repeat() {
         assert_eq!(
             call("find", &[s("hello"), s("ll")], sp()).unwrap(),
-            Value::Float(2.0)
+            Value::Int(2)
         );
         assert_eq!(
             call("find", &[s("hello"), s("z")], sp()).unwrap(),
-            Value::Float(-1.0)
+            Value::Int(-1)
         );
         // replace = FIRST occurrence only
         assert_eq!(
@@ -429,11 +431,11 @@ mod tests {
         assert_eq!(call("reverse", &[s("abc")], sp()).unwrap(), s("cba"));
         assert_eq!(
             call("count", &[s("a.a.a"), s(".")], sp()).unwrap(),
-            Value::Float(2.0)
+            Value::Int(2)
         );
         assert_eq!(
             call("count", &[s("abc"), s("")], sp()).unwrap(),
-            Value::Float(0.0)
+            Value::Int(0)
         );
         assert_eq!(
             call("splitN", &[s("a:b:c"), s(":"), Value::Float(2.0)], sp())

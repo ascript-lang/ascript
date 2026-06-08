@@ -56,8 +56,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 Ok(u) => {
                     // port: the url crate returns None when the port equals the
                     // scheme's default; we expose it as nil in that case too.
+                    // NUM §4: a port is an `Int`.
                     let port: Value = match u.port() {
-                        Some(p) => Value::Float(f64::from(p)),
+                        Some(p) => Value::Int(i64::from(p)),
                         None => Value::Nil,
                     };
                     // username / password: url crate returns "" (not None) when absent
@@ -123,6 +124,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             for (k, v) in o.borrow().iter() {
                 let val = match v {
                     Value::Str(s) => s.to_string(),
+                    // NUM §4: an `Int` formats without a decimal point.
+                    Value::Int(_) => v.to_string(),
                     Value::Float(n) => {
                         // integer-valued numbers without trailing ".0"
                         if n.fract() == 0.0 && n.is_finite() {
@@ -162,10 +165,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 }
             };
             let get_num = |key: &str| -> Option<f64> {
-                match borrow.get(key) {
-                    Some(Value::Float(n)) => Some(*n),
-                    _ => None,
-                }
+                // NUM §4: accept BOTH numeric subtypes.
+                borrow.get(key).and_then(|v| v.as_f64())
             };
 
             let scheme = match get_str("scheme") {

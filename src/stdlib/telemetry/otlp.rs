@@ -118,6 +118,8 @@ pub async fn flush(interp: &Interp, state: &mut TelemetryState) -> Result<(), St
 fn any_value(v: &Value) -> J {
     match v {
         Value::Bool(b) => json!({ "boolValue": b }),
+        // NUM §4: an `Int` maps directly to OTLP intValue.
+        Value::Int(i) => json!({ "intValue": i.to_string() }),
         Value::Float(n) => {
             // Integral numbers → intValue (as a string, proto3 64-bit mapping);
             // fractional → doubleValue.

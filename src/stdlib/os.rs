@@ -457,7 +457,8 @@ print(pct <= 100)
         )
         .await
         .expect("cpuUsage program should run");
-        assert_eq!(out, "number\ntrue\ntrue\n", "cpuUsage output: {}", out);
+        // NUM §4: a CPU usage percentage is fractional → `float`.
+        assert_eq!(out, "float\ntrue\ntrue\n", "cpuUsage output: {}", out);
     }
 
     #[cfg(feature = "sysinfo")]

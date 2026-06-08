@@ -89,7 +89,8 @@ impl Interp {
                 let item = arg(args, 1);
                 let mut b = arr.borrow_mut();
                 b.push(item);
-                Ok(Value::Float(b.len() as f64))
+                // NUM §4: the new length is an `Int`.
+                Ok(Value::Int(b.len() as i64))
             }
             "pop" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("pop"))?;
@@ -154,13 +155,13 @@ impl Interp {
                                         span,
                                     )
                                     .await?;
-                                let n = match r {
-                                    Value::Float(n) => n,
-                                    other => {
+                                let n = match r.as_f64() {
+                                    Some(n) => n,
+                                    None => {
                                         return Err(AsError::at(
                                             format!(
                                             "array.sort comparator must return a number, got {}",
-                                            crate::interp::type_name(&other)
+                                            crate::interp::type_name(&r)
                                         ),
                                             span,
                                         )
@@ -204,10 +205,11 @@ impl Interp {
                         .await?
                         .is_truthy()
                     {
-                        return Ok(Value::Float(i as f64));
+                        // NUM §4: an index is an `Int`.
+                        return Ok(Value::Int(i as i64));
                     }
                 }
-                Ok(Value::Float(-1.0))
+                Ok(Value::Int(-1))
             }
             "some" => {
                 let a = want_array(&arg(args, 0), span, &ctx("some"))?;
@@ -243,7 +245,8 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("indexOf"))?;
                 let needle = arg(args, 1);
                 let idx = a.borrow().iter().position(|x| *x == needle);
-                Ok(Value::Float(idx.map(|i| i as f64).unwrap_or(-1.0)))
+                // NUM §4: an index is an `Int`.
+                Ok(Value::Int(idx.map(|i| i as i64).unwrap_or(-1)))
             }
             "flat" => {
                 let a = want_array(&arg(args, 0), span, &ctx("flat"))?;
@@ -429,13 +432,13 @@ fn flatten_into(items: &[Value], depth: usize, out: &mut Vec<Value>) {
 
 /// Sort a homogeneous number or string array by natural order. Mixed/other kinds → panic.
 fn sort_default(items: &mut [Value], span: Span) -> Result<(), Control> {
-    let all_numbers = items.iter().all(|v| matches!(v, Value::Float(_)));
+    // NUM §4: a number array may mix `Int` and `Float`; both count as numbers and
+    // sort by their f64 value (cross-type ordering is well-defined).
+    let all_numbers = items.iter().all(|v| v.is_number());
     let all_strings = items.iter().all(|v| matches!(v, Value::Str(_)));
     if all_numbers {
-        items.sort_by(|a, b| match (a, b) {
-            (Value::Float(x), Value::Float(y)) => {
-                x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-            }
+        items.sort_by(|a, b| match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
             _ => std::cmp::Ordering::Equal,
         });
         Ok(())

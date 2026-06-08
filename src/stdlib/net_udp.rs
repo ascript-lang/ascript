@@ -117,7 +117,8 @@ impl Interp {
                 let result = sock.send_to(&data, &*addr).await;
                 self.return_resource(id, ResourceState::UdpSocket(sock));
                 match result {
-                    Ok(n) => Ok(make_pair(Value::Float(n as f64), Value::Nil)),
+                    // NUM §4: a byte count is an `Int`.
+                    Ok(n) => Ok(make_pair(Value::Int(n as i64), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("socket.send to {} failed: {}", addr, e))),
                 }
             }

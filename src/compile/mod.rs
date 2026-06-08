@@ -5280,9 +5280,12 @@ mod tests {
     }
 
     async fn eval_number(src: &str) -> f64 {
-        match crate::vm_eval_source(src).await.expect("evaluates") {
-            Value::Float(n) => n,
-            other => panic!("expected Number, got {other:?}"),
+        // NUM §4: arithmetic over int literals yields `Int`; this helper accepts
+        // BOTH numeric subtypes and returns the f64 value for the assertions.
+        let v = crate::vm_eval_source(src).await.expect("evaluates");
+        match v.as_f64() {
+            Some(n) => n,
+            None => panic!("expected Number, got {v:?}"),
         }
     }
 
@@ -5302,8 +5305,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn division_is_float() {
-        assert_eq!(eval_number("10 / 4").await, 2.5);
+    async fn division_is_int_for_int_operands() {
+        // NUM §3.2: `int / int` truncates toward zero (`10/4 == 2`); a float operand
+        // makes it float division (`10.0/4 == 2.5`).
+        assert_eq!(eval_number("10 / 4").await, 2.0);
+        assert_eq!(eval_number("10.0 / 4").await, 2.5);
     }
 
     #[tokio::test(flavor = "current_thread")]

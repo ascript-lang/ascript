@@ -2630,33 +2630,43 @@ impl Interp {
                 // a bare descending range counts DOWN (`for (i in 10..7)` → 10 9 8).
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
-                let (lo, hi) = match (start_v, end_v) {
-                    (Value::Float(a), Value::Float(b)) => (a, b),
+                // NUM §4: int bounds → an Int sequence (the loop var is `Int`); a
+                // float bound → a float sequence. Both kinds are accepted; the
+                // direction/validation math runs on f64 via the SHARED `resolve_step`.
+                let (lo, hi, bounds_int) = match (start_v.as_f64(), end_v.as_f64()) {
+                    (Some(a), Some(b)) => {
+                        (a, b, start_v.is_int_value() && end_v.is_int_value())
+                    }
                     _ => {
                         return Err(
                             AsError::at("for-range bounds must be numbers", start.span).into()
                         )
                     }
                 };
-                let step_v = match step {
-                    Some(e) => match self.eval_expr(e, env).await? {
-                        Value::Float(s) => Some(s),
-                        _ => {
-                            return Err(
-                                AsError::at("for-range step must be a number", e.span).into()
-                            )
+                let (step_v, step_int) = match step {
+                    Some(e) => {
+                        let sv = self.eval_expr(e, env).await?;
+                        match sv.as_f64() {
+                            Some(s) => (Some(s), sv.is_int_value()),
+                            None => {
+                                return Err(
+                                    AsError::at("for-range step must be a number", e.span).into()
+                                )
+                            }
                         }
-                    },
-                    None => None,
+                    }
+                    // Omitted step is the integral `±1`, so it never forces float.
+                    None => (None, true),
                 };
                 // Validation panic anchored at the START bound's span (matching the
                 // bounds panic above and the VM's range-setup op).
                 let step_n = resolve_step(lo, hi, step_v, start.span)?;
+                let yields_int = bounds_int && step_int;
                 let mut i = lo;
                 while range_has_next(i, hi, step_n, *inclusive) {
                     let child = env.child();
                     child
-                        .define(var, Value::Float(i), false)
+                        .define(var, range_counter_value(i, yields_int), false)
                         .map_err(AsError::new)?;
                     match self.exec(body, &child).await? {
                         Flow::Break => break,
@@ -3185,13 +3195,16 @@ impl Interp {
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
                 let step_v = match step {
-                    Some(e) => match self.eval_expr(e, env).await? {
-                        Value::Float(s) => Some(s),
-                        _ => return Err(AsError::at("range step must be a number", e.span).into()),
-                    },
+                    Some(e) => Some(self.eval_expr(e, env).await?),
                     None => None,
                 };
-                materialize_range_stepped(&start_v, &end_v, *inclusive, step_v, expr.span)
+                materialize_range_stepped(
+                    &start_v,
+                    &end_v,
+                    *inclusive,
+                    step_v.as_ref(),
+                    expr.span,
+                )
             }
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
             ExprKind::Try(inner) => {
@@ -3295,24 +3308,26 @@ impl Interp {
                 // then `range_pattern_contains` tests in-bounds + on-the-stride.
                 // With `step` omitted the membership degenerates to the plain
                 // in-bounds test, so existing no-step patterns are UNCHANGED.
-                let n = match subject {
-                    Value::Float(n) => *n,
-                    _ => return Ok(false),
+                // NUM §4: a number subject/bound is Int OR Float; a non-number is a
+                // (non-panic) mismatch. The membership math is exact-on-f64.
+                let n = match subject.as_f64() {
+                    Some(n) => n,
+                    None => return Ok(false),
                 };
-                let lo = match self.eval_expr(start, env).await? {
-                    Value::Float(x) => x,
-                    _ => return Ok(false),
+                let lo = match self.eval_expr(start, env).await?.as_f64() {
+                    Some(x) => x,
+                    None => return Ok(false),
                 };
-                let hi = match self.eval_expr(end, env).await? {
-                    Value::Float(x) => x,
-                    _ => return Ok(false),
+                let hi = match self.eval_expr(end, env).await?.as_f64() {
+                    Some(x) => x,
+                    None => return Ok(false),
                 };
                 // Resolve the step's `f64` (None when omitted). A non-number step
                 // expression is a Tier-2 type error, mirroring iteration.
                 let step_v = match step {
-                    Some(s) => match self.eval_expr(s, env).await? {
-                        Value::Float(x) => Some(x),
-                        _ => return Err(AsError::at("range step must be a number", s.span).into()),
+                    Some(s) => match self.eval_expr(s, env).await?.as_f64() {
+                        Some(x) => Some(x),
+                        None => return Err(AsError::at("range step must be a number", s.span).into()),
                     },
                     None => None,
                 };
@@ -4679,8 +4694,10 @@ impl Interp {
                 // exit(code?) — default 0; code must be an integer in 0..=255.
                 let code: i32 = match args.first() {
                     None => 0,
-                    Some(Value::Float(n)) => {
-                        let n = *n;
+                    // NUM §4: accept BOTH numeric subtypes; the code must be an
+                    // integer in 0..=255 either way.
+                    Some(v) if v.is_number() => {
+                        let n = v.as_f64().unwrap_or(f64::NAN);
                         if n.fract() != 0.0 || !(0.0..=255.0).contains(&n) {
                             return Err(AsError::at(
                                 format!("exit code must be an integer in 0..=255, got {}", n),
@@ -4734,28 +4751,40 @@ impl Interp {
                         .into())
                     }
                 };
-                Ok(Value::Float(n as f64))
+                // NUM §4: a length/count is an `Int`.
+                Ok(Value::Int(n as i64))
             }
             "type" => {
                 let v = args.first().cloned().unwrap_or(Value::Nil);
                 Ok(Value::Str(type_name(&v).into()))
             }
             "range" => {
-                let want_num = |i: usize| -> Result<f64, Control> {
+                // NUM §4: `range(..)` accepts Int OR Float args and, like the
+                // language `a..b` value-range, yields an Int array when EVERY
+                // provided argument is an Int (a float arg makes the whole sequence
+                // float). A missing arg defaults to `Int(0)`/`Int(1)`, which keeps
+                // the all-int case integral.
+                let want_num = |i: usize, default: f64| -> Result<(f64, bool), Control> {
                     match args.get(i) {
-                        Some(Value::Float(n)) => Ok(*n),
-                        Some(v) => Err(AsError::at(
-                            format!("range() expects number arguments, got {}", type_name(v)),
-                            span,
-                        )
-                        .into()),
-                        None => Ok(0.0),
+                        Some(v) => match v.as_f64() {
+                            Some(n) => Ok((n, v.is_int_value())),
+                            None => Err(AsError::at(
+                                format!(
+                                    "range() expects number arguments, got {}",
+                                    type_name(v)
+                                ),
+                                span,
+                            )
+                            .into()),
+                        },
+                        // An omitted bound/step is the integral default.
+                        None => Ok((default, true)),
                     }
                 };
-                let (start, end, step) = match args.len() {
-                    1 => (0.0, want_num(0)?, 1.0),
-                    2 => (want_num(0)?, want_num(1)?, 1.0),
-                    3 => (want_num(0)?, want_num(1)?, want_num(2)?),
+                let ((start, s_int), (end, e_int), (step, k_int)) = match args.len() {
+                    1 => ((0.0, true), want_num(0, 0.0)?, (1.0, true)),
+                    2 => (want_num(0, 0.0)?, want_num(1, 0.0)?, (1.0, true)),
+                    3 => (want_num(0, 0.0)?, want_num(1, 0.0)?, want_num(2, 1.0)?),
                     n => {
                         return Err(AsError::at(
                             format!("range() expects 1 to 3 arguments, got {}", n),
@@ -4767,16 +4796,17 @@ impl Interp {
                 if step == 0.0 {
                     return Err(AsError::at("range() step must not be zero", span).into());
                 }
+                let yields_int = s_int && e_int && k_int;
                 let mut out = Vec::new();
                 let mut i = start;
                 if step > 0.0 {
                     while i < end {
-                        out.push(Value::Float(i));
+                        out.push(range_counter_value(i, yields_int));
                         i += step;
                     }
                 } else {
                     while i > end {
-                        out.push(Value::Float(i));
+                        out.push(range_counter_value(i, yields_int));
                         i += step;
                     }
                 }
@@ -4987,6 +5017,22 @@ pub(crate) fn format_number(n: f64) -> String {
     Value::Float(n).to_string()
 }
 
+/// NUM §4: produce a range loop counter `Value`. When `yields_int` is true the
+/// f64 counter `i` is converted to a `Value::Int` (an integral in-range range step
+/// always lands the counter on an exact integer within `i64` range, so this is
+/// lossless); a counter that is somehow non-integral or out of `i64` range falls
+/// back to `Value::Float` rather than producing a wrong int. Otherwise the counter
+/// stays a `Value::Float`. This is the SINGLE shared decision so the tree-walker
+/// and the VM (which seeds Int slots when the bounds+step are Int) agree.
+pub(crate) fn range_counter_value(i: f64, yields_int: bool) -> Value {
+    if yields_int {
+        if let Some(n) = (Value::Float(i)).as_int_exact() {
+            return Value::Int(n);
+        }
+    }
+    Value::Float(i)
+}
+
 /// Materialize a range value `[lo .. hi)` / `[lo ..= hi]` into an eager
 /// `array<number>`, honoring the resolved/validated `step` (direction-aware). The
 /// step (`None` → omitted default) is resolved through `resolve_step` so direction,
@@ -4995,19 +5041,30 @@ pub(crate) fn materialize_range_stepped(
     l: &Value,
     r: &Value,
     inclusive: bool,
-    step_v: Option<f64>,
+    step: Option<&Value>,
     span: Span,
 ) -> Result<Value, Control> {
-    let (lo, hi) = match (l, r) {
-        (Value::Float(a), Value::Float(b)) => (*a, *b),
+    let (lo, hi, bounds_int) = match (l.as_f64(), r.as_f64()) {
+        (Some(a), Some(b)) => (a, b, l.is_int_value() && r.is_int_value()),
         _ => return Err(AsError::at("range bounds must be numbers", span).into()),
     };
-    let step = resolve_step(lo, hi, step_v, span)?;
+    // The step (when present) must be a number; its KIND is preserved so an Int
+    // materialized range requires Int bounds AND an Int step (`0..10 step 2` → Int,
+    // `0..10 step 2.0` → Float). An omitted step is the integral `±1`.
+    let (step_v, step_int) = match step {
+        Some(sv) => match sv.as_f64() {
+            Some(s) => (Some(s), sv.is_int_value()),
+            None => return Err(AsError::at("range step must be a number", span).into()),
+        },
+        None => (None, true),
+    };
+    let resolved = resolve_step(lo, hi, step_v, span)?;
+    let yields_int = bounds_int && step_int;
     let mut items = Vec::new();
     let mut i = lo;
-    while range_has_next(i, hi, step, inclusive) {
-        items.push(Value::Float(i));
-        i += step;
+    while range_has_next(i, hi, resolved, inclusive) {
+        items.push(range_counter_value(i, yields_int));
+        i += resolved;
     }
     Ok(Value::Array(crate::value::ArrayCell::new(items)))
 }
@@ -5338,7 +5395,11 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
     match (l, r) {
         // Decimal vs Decimal: use the inner value's own equality.
         (Value::Decimal(a), Value::Decimal(b)) => Ok(a == b),
-        // Decimal vs Number (or vice-versa): coerce the number to decimal.
+        // NUM §4: Decimal vs Int — the int converts EXACTLY.
+        (Value::Decimal(a), Value::Int(i)) | (Value::Int(i), Value::Decimal(a)) => {
+            Ok(*a == rust_decimal::Decimal::from(*i))
+        }
+        // Decimal vs Float (or vice-versa): coerce the number to decimal.
         (Value::Decimal(a), Value::Float(n)) | (Value::Float(n), Value::Decimal(a)) => {
             if !n.is_finite() {
                 // A non-finite float can never equal a finite decimal (lenient
@@ -5357,12 +5418,33 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
 }
 
 fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
+    // NUM §4: `Int` is the common (and canonical) index. A `Float` index is accepted
+    // only when it is exactly integral (e.g. `arr[2.0]`); a non-integral float is the
+    // Tier-2 panic `array index must be an int, got float`. Any number must be
+    // non-negative; a non-number is `array index must be a number`.
     match v {
-        Value::Float(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
-        Value::Float(_) => Err(AsError::at(
-            "array index must be a non-negative integer",
-            span,
-        )),
+        Value::Int(i) => {
+            if *i >= 0 {
+                Ok(*i as usize)
+            } else {
+                Err(AsError::at(
+                    "array index must be a non-negative integer",
+                    span,
+                ))
+            }
+        }
+        Value::Float(n) => {
+            if n.fract() != 0.0 {
+                Err(AsError::at("array index must be an int, got float", span))
+            } else if *n >= 0.0 {
+                Ok(*n as usize)
+            } else {
+                Err(AsError::at(
+                    "array index must be a non-negative integer",
+                    span,
+                ))
+            }
+        }
         _ => Err(AsError::at("array index must be a number", span)),
     }
 }
@@ -5828,7 +5910,9 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
     use crate::ast::Type;
     match ty {
         Type::Any => true,
-        Type::Number => matches!(value, Value::Float(_)),
+        // NUM §4: the `number` contract accepts BOTH numeric subtypes (`Int` and
+        // `Float`). `Int`/`Float` are not yet separate annotations (a later unit).
+        Type::Number => value.is_number(),
         Type::String => matches!(value, Value::Str(_)),
         Type::Bool => matches!(value, Value::Bool(_)),
         Type::Nil => matches!(value, Value::Nil),
@@ -6239,8 +6323,9 @@ print(y)
             run("let a = [1]\nprint(len(a) > 5 ? a[99] : \"safe\")").await,
             "safe\n"
         );
-        // Only nil/false are falsy: 0 and "" are truthy conditions.
-        assert_eq!(run("print(0 ? \"t\" : \"f\")").await, "t\n");
+        // NUM §3.3 (BREAKING): 0 and "" are now FALSY; a non-zero number is truthy.
+        assert_eq!(run("print(0 ? \"t\" : \"f\")").await, "f\n");
+        assert_eq!(run("print(1 ? \"t\" : \"f\")").await, "t\n");
         assert_eq!(run("print(nil ? \"t\" : \"f\")").await, "f\n");
     }
 
@@ -6470,9 +6555,10 @@ print(y)
             "message was {:?}",
             err.message
         );
+        // NUM §4: `type_name(5)` is now `"int"`.
         assert_eq!(
             err.message,
-            "type contract violated: expected future<number>, got number (5)"
+            "type contract violated: expected future<number>, got int (5)"
         );
     }
 
@@ -6553,7 +6639,9 @@ print(y)
         assert_eq!(run("print(len([1,2,3]))").await, "3\n");
         assert_eq!(run("print(len(\"hello\"))").await, "5\n");
         assert_eq!(run("print(len({a:1, b:2}))").await, "2\n");
-        assert_eq!(run("print(type(1))").await, "number\n");
+        // NUM §4: an int literal is `"int"`; a float literal is `"float"`.
+        assert_eq!(run("print(type(1))").await, "int\n");
+        assert_eq!(run("print(type(1.5))").await, "float\n");
         assert_eq!(run("print(type(\"x\"))").await, "string\n");
         assert_eq!(run("print(type([1]))").await, "array\n");
         assert_eq!(run("print(type(nil))").await, "nil\n");
@@ -7355,9 +7443,10 @@ print(r[1])
 
     #[tokio::test]
     async fn evaluates_arithmetic_with_precedence() {
+        // NUM §4: int-literal arithmetic yields `Int`.
         match eval_to_value("1 + 2 * 3").await {
-            Value::Float(n) => assert_eq!(n, 7.0),
-            other => panic!("expected number, got {:?}", other),
+            Value::Int(n) => assert_eq!(n, 7),
+            other => panic!("expected int, got {:?}", other),
         }
     }
 
@@ -7416,9 +7505,11 @@ print(r[1])
     async fn short_circuit_and_coalesce() {
         assert_eq!(eval_to_value("false && nope").await, Value::Bool(false));
         assert_eq!(eval_to_value("true || nope").await, Value::Bool(true));
-        assert_eq!(eval_to_value("nil ?? 5").await, Value::Float(5.0));
-        assert_eq!(eval_to_value("3 ?? nope").await, Value::Float(3.0));
-        assert_eq!(eval_to_value("!0").await, Value::Bool(false));
+        // NUM §4: int literals yield `Int`.
+        assert_eq!(eval_to_value("nil ?? 5").await, Value::Int(5));
+        assert_eq!(eval_to_value("3 ?? nope").await, Value::Int(3));
+        // NUM §3.3: `0` is falsy, so `!0` is `true`.
+        assert_eq!(eval_to_value("!0").await, Value::Bool(true));
     }
 
     #[tokio::test]
@@ -7958,9 +8049,10 @@ print(r[1])
                    print(convert.parseInt(\"ff\", 16)[0])\n\
                    print(convert.toString(123))\n\
                    print(convert.toBool(0))";
+        // NUM §3.3: `convert.toBool(0)` is now `false` (0 is falsy).
         assert_eq!(
             run(src).await,
-            "42\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\ntrue\n"
+            "42\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\nfalse\n"
         );
     }
 
@@ -8718,16 +8810,25 @@ let _ = decimal.from(1) % decimal.from(0)
     }
 
     #[tokio::test]
-    async fn decimal_is_truthy_regardless_of_zero() {
-        // spec §4: only nil and false are falsy — Decimal(0) is truthy.
+    async fn decimal_zero_is_falsy() {
+        // NUM §3.3 (BREAKING): a Decimal equal to zero is FALSY (the falsy set is
+        // nil, false, Int(0), a zero/NaN Float, a zero Decimal, and "").
         // Use `if (z)` since AScript requires parens around the condition.
-        let out = run(r#"
+        let zero = run(r#"
 import * as decimal from "std/decimal"
 let z = decimal.from("0")
 if (z) { print("truthy") } else { print("falsy") }
 "#)
         .await;
-        assert_eq!(out.trim(), "truthy");
+        assert_eq!(zero.trim(), "falsy");
+        // A non-zero Decimal is truthy.
+        let nonzero = run(r#"
+import * as decimal from "std/decimal"
+let z = decimal.from("0.5")
+if (z) { print("truthy") } else { print("falsy") }
+"#)
+        .await;
+        assert_eq!(nonzero.trim(), "truthy");
     }
 
     #[tokio::test]

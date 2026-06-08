@@ -49,6 +49,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 pub(crate) fn coerce_to_decimal(v: &Value, span: Span) -> Result<Option<Decimal>, Control> {
     match v {
         Value::Decimal(d) => Ok(Some(*d)),
+        // NUM §4: an `Int` converts EXACTLY (no f64 round-trip).
+        Value::Int(i) => Ok(Some(Decimal::from(*i))),
         Value::Float(n) => {
             if !n.is_finite() {
                 return Err(
@@ -79,6 +81,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let v = arg(args, 0);
             match &v {
                 Value::Decimal(d) => Ok(Value::Decimal(*d)),
+                // NUM §4: an `Int` converts EXACTLY.
+                Value::Int(i) => Ok(Value::Decimal(Decimal::from(*i))),
                 Value::Str(s) => Decimal::from_str(s.as_ref())
                     .map(Value::Decimal)
                     .map_err(|_| {
@@ -149,17 +153,19 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "round" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("round"))?;
             let places = match args.get(1) {
-                Some(Value::Float(n)) => {
-                    if n.fract() != 0.0 || !n.is_finite() || *n < 0.0 || *n > 28.0 {
+                Some(Value::Nil) | None => 0,
+                // NUM §4: accept BOTH numeric subtypes for `places`.
+                Some(v) if v.is_number() => {
+                    let n = v.as_f64().unwrap_or(f64::NAN);
+                    if n.fract() != 0.0 || !n.is_finite() || !(0.0..=28.0).contains(&n) {
                         return Err(AsError::at(
                             "decimal.round: places must be a non-negative integer (0–28)",
                             span,
                         )
                         .into());
                     }
-                    *n as u32
+                    n as u32
                 }
-                Some(Value::Nil) | None => 0,
                 _ => return Err(AsError::at("decimal.round: places must be a number", span).into()),
             };
             Ok(Value::Decimal(d.round_dp_with_strategy(

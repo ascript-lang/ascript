@@ -1914,7 +1914,7 @@ async fn vm_for_of_not_iterable_error_matches_treewalker() {
     for (src, expected) in [
         (
             "for (x of 5) { print(x) }",
-            "value of type number is not iterable",
+            "value of type int is not iterable",
         ),
         (
             "for (x of true) { print(x) }",
@@ -1996,11 +1996,11 @@ async fn vm_for_in_over_non_iterable_value_matches_treewalker() {
     for (src, expected) in [
         (
             "for (i in 5) { print(i) }",
-            "value of type number is not iterable",
+            "value of type int is not iterable",
         ),
         (
             "let n = 5\nfor (i in n) { print(i) }",
-            "value of type number is not iterable",
+            "value of type int is not iterable",
         ),
         (
             "for (i in true) { print(i) }",

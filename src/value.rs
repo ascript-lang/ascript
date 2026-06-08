@@ -723,6 +723,52 @@ impl Value {
             _ => true,
         }
     }
+
+    /// NUM: central numeric extraction. Returns the `f64` value of any number kind
+    /// (`Int` is widened via `i as f64`, `Float` returned as-is). `None` for every
+    /// non-number. This is the single helper every "accepts a number" site should
+    /// route through so `Int` is first-class everywhere a number was accepted.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Int(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// `true` for any number kind (`Int` or `Float`).
+    pub fn is_number(&self) -> bool {
+        matches!(self, Value::Int(_) | Value::Float(_))
+    }
+
+    /// `true` only for `Value::Int`. Used by range lowering to decide whether a
+    /// range yields an `Int` sequence (both bounds + step `Int`) or a `Float` one.
+    pub fn is_int_value(&self) -> bool {
+        matches!(self, Value::Int(_))
+    }
+
+    /// NUM: exact integer extraction for integral contexts (indexing, range bounds,
+    /// counts, repeat). `Int(i)` yields `i` directly. A `Float` yields `Some` ONLY
+    /// when it is finite and integral and within `i64` range; a non-integral or
+    /// out-of-range `Float` yields `None` (callers turn that into a Tier-2 panic
+    /// such as `array index must be an int, got float`). Non-numbers yield `None`.
+    pub fn as_int_exact(&self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(*i),
+            Value::Float(f) => {
+                if f.is_finite()
+                    && f.fract() == 0.0
+                    && *f >= i64::MIN as f64
+                    && *f <= i64::MAX as f64
+                {
+                    Some(*f as i64)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Exact `int`-vs-`float` equality (NUM §3.3): `true` iff `i` and `f` denote the

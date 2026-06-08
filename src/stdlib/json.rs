@@ -30,7 +30,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "stringify" => {
             let v = arg(args, 0);
-            let pretty = matches!(args.get(1), Some(Value::Float(n)) if *n > 0.0)
+            let pretty = matches!(args.get(1), Some(v) if v.as_f64().is_some_and(|n| n > 0.0))
                 || matches!(args.get(1), Some(Value::Bool(true)));
             match from_ascript(&v, &mut Vec::new()) {
                 Ok(jv) => {
@@ -59,7 +59,12 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
     match jv {
         serde_json::Value::Null => Value::Nil,
         serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+        // NUM §4: a JSON integer parses to `Int`; a fractional/exponent number to
+        // `Float`. `as_i64` succeeds only for integers within `i64` range.
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
         serde_json::Value::String(s) => Value::Str(s.as_str().into()),
         serde_json::Value::Array(a) => Value::Array(crate::value::ArrayCell::new(
             a.iter().map(to_ascript).collect(),
@@ -89,6 +94,8 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
                 .map_err(|_| format!("cannot serialize decimal {} to JSON", d))?;
             Ok(raw)
         }
+        // NUM §4: an `Int` serializes as a JSON integer directly (no float round-trip).
+        Value::Int(i) => Ok(serde_json::Value::Number(serde_json::Number::from(*i))),
         Value::Float(n) => {
             if !n.is_finite() {
                 return Err(format!("cannot serialize non-finite number {} to JSON", n));
@@ -188,6 +195,8 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
         Value::Bool(b) => J::Bool(*b),
         // Decimal: emit as a JSON number from the canonical string (always finite).
         Value::Decimal(d) => serde_json::from_str::<J>(&d.to_string()).unwrap_or(J::Null),
+        // NUM §4: an `Int` serializes as a JSON integer directly.
+        Value::Int(i) => J::Number(serde_json::Number::from(*i)),
         Value::Float(n) => {
             if !n.is_finite() {
                 return J::Null;

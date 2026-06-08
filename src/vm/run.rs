@@ -689,22 +689,15 @@ impl Vm {
                     let step = fiber.pop();
                     let hi = fiber.pop();
                     let lo = fiber.pop();
-                    let step_v = if present {
-                        match step {
-                            Value::Float(s) => Some(s),
-                            _ => {
-                                return Err(self.panic_at(
-                                    fiber,
-                                    fault_ip,
-                                    "range step must be a number".to_string(),
-                                ))
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                    // The SHARED stepped materializer preserves the step's KIND (an Int
+                    // bounds + Int step range yields Int elements; a Float step or
+                    // Float bound yields Float), so pass the step `Value` through when
+                    // present and `None` for the omitted-default placeholder. Direction,
+                    // validation, and panic messages are byte-identical to the
+                    // tree-walker's value-position `..`/`..=`.
+                    let step_arg = if present { Some(&step) } else { None };
                     let v = crate::interp::materialize_range_stepped(
-                        &lo, &hi, inclusive, step_v, span,
+                        &lo, &hi, inclusive, step_arg, span,
                     )?;
                     fiber.push(v);
                 }
@@ -717,19 +710,27 @@ impl Vm {
                     let present = fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let step = fiber.pop();
-                    // Peek lo/hi without disturbing them (they stay on the stack).
-                    let hi = match fiber.peek(0) {
-                        Value::Float(n) => *n,
-                        _ => unreachable!("RANGE_RESOLVE_STEP hi must be a number (CHECK_NUMBERS)"),
+                    // Peek lo/hi without disturbing them (they stay on the stack). NUM
+                    // §4: accept Int OR Float bounds; track Int-ness so the resolved
+                    // step (and thus the `Op::Add`-driven counter) stays Int when the
+                    // bounds + step are all Int — byte-identical to the tree-walker's
+                    // `range_counter_value`.
+                    let hi_v = fiber.peek(0);
+                    let hi = match hi_v.as_f64() {
+                        Some(n) => n,
+                        None => unreachable!("RANGE_RESOLVE_STEP hi must be a number (CHECK_NUMBERS)"),
                     };
-                    let lo = match fiber.peek(1) {
-                        Value::Float(n) => *n,
-                        _ => unreachable!("RANGE_RESOLVE_STEP lo must be a number (CHECK_NUMBERS)"),
+                    let hi_int = hi_v.is_int_value();
+                    let lo_v = fiber.peek(1);
+                    let lo = match lo_v.as_f64() {
+                        Some(n) => n,
+                        None => unreachable!("RANGE_RESOLVE_STEP lo must be a number (CHECK_NUMBERS)"),
                     };
-                    let step_v = if present {
-                        match step {
-                            Value::Float(s) => Some(s),
-                            _ => {
+                    let lo_int = lo_v.is_int_value();
+                    let (step_v, step_int) = if present {
+                        match step.as_f64() {
+                            Some(s) => (Some(s), step.is_int_value()),
+                            None => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
@@ -738,10 +739,12 @@ impl Vm {
                             }
                         }
                     } else {
-                        None
+                        // Omitted step is the integral `±1`.
+                        (None, true)
                     };
                     let resolved = crate::interp::resolve_step(lo, hi, step_v, span)?;
-                    fiber.push(Value::Float(resolved));
+                    let yields_int = lo_int && hi_int && step_int;
+                    fiber.push(crate::interp::range_counter_value(resolved, yields_int));
                 }
 
                 Op::RangeHasNext => {
@@ -753,9 +756,9 @@ impl Vm {
                     let step = fiber.pop();
                     let hi = fiber.pop();
                     let i = fiber.pop();
-                    let ok = match (&i, &hi, &step) {
-                        (Value::Float(i), Value::Float(hi), Value::Float(step)) => {
-                            crate::interp::range_has_next(*i, *hi, *step, inclusive)
+                    let ok = match (i.as_f64(), hi.as_f64(), step.as_f64()) {
+                        (Some(i), Some(hi), Some(step)) => {
+                            crate::interp::range_has_next(i, hi, step, inclusive)
                         }
                         _ => unreachable!("RANGE_HAS_NEXT operands must be numbers"),
                     };
@@ -1828,8 +1831,8 @@ impl Vm {
                     // the panic is byte-identical to the tree-walker's
                     // `Stmt::ForRange` ("for-range bounds must be numbers" at
                     // `start.span`).
-                    let end_ok = matches!(fiber.peek(0), Value::Float(_));
-                    let start_ok = matches!(fiber.peek(1), Value::Float(_));
+                    let end_ok = fiber.peek(0).is_number();
+                    let start_ok = fiber.peek(1).is_number();
                     if !(end_ok && start_ok) {
                         return Err(self.panic_at(
                             fiber,
@@ -2345,12 +2348,14 @@ impl Vm {
                     let hi = fiber.pop();
                     let lo = fiber.pop();
                     let subject = fiber.pop();
-                    let ok = match (&subject, &lo, &hi) {
-                        (Value::Float(n), Value::Float(lo), Value::Float(hi)) => {
+                    // NUM §4: a number subject/bound is Int OR Float (exact-on-f64
+                    // membership); a non-number subject/bound is a non-panic mismatch.
+                    let ok = match (subject.as_f64(), lo.as_f64(), hi.as_f64()) {
+                        (Some(n), Some(lo), Some(hi)) => {
                             let step_v = if present {
-                                match step {
-                                    Value::Float(s) => Some(s),
-                                    _ => {
+                                match step.as_f64() {
+                                    Some(s) => Some(s),
+                                    None => {
                                         return Err(self.panic_at(
                                             fiber,
                                             fault_ip,
@@ -2367,9 +2372,9 @@ impl Vm {
                             // no-stride behavior via the raw `Option`.
                             if step_v.is_some() {
                                 let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                                crate::interp::resolve_step(*lo, *hi, step_v, span)?;
+                                crate::interp::resolve_step(lo, hi, step_v, span)?;
                             }
-                            crate::interp::range_pattern_contains(*n, *lo, *hi, step_v, inclusive)
+                            crate::interp::range_pattern_contains(n, lo, hi, step_v, inclusive)
                         }
                         _ => false,
                     };

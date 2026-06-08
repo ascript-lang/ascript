@@ -277,9 +277,9 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
         }
         // maxResults semantics: a value > 0 caps the result count at exactly that
         // many; absent or <= 0 means NO limit (return all matches).
-        if let Some(Value::Float(n)) = o.get("maxResults") {
-            if *n > 0.0 {
-                max_results = Some(*n as usize);
+        if let Some(n) = o.get("maxResults").and_then(|v| v.as_f64()) {
+            if n > 0.0 {
+                max_results = Some(n as usize);
             }
         }
         if let Some(v) = o.get("respectGitignore") {
@@ -644,16 +644,8 @@ mod tests {
             .map(|m| match m {
                 Value::Object(o) => {
                     let o = o.borrow();
-                    let line = if let Some(Value::Float(n)) = o.get("line") {
-                        *n
-                    } else {
-                        -1.0
-                    };
-                    let col = if let Some(Value::Float(n)) = o.get("column") {
-                        *n
-                    } else {
-                        -1.0
-                    };
+                    let line = o.get("line").and_then(|v| v.as_f64()).unwrap_or(-1.0);
+                    let col = o.get("column").and_then(|v| v.as_f64()).unwrap_or(-1.0);
                     let text = o.get("text").map(|t| t.to_string()).unwrap_or_default();
                     let path = o.get("path").map(|t| t.to_string()).unwrap_or_default();
                     (path, line, col, text)

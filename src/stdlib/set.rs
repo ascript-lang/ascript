@@ -116,8 +116,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 
         "size" => {
             let s = want_set(&arg(args, 0), span, &ctx("size"))?;
-            let n = s.borrow().len() as f64;
-            Ok(Value::Float(n))
+            // NUM §4: a count is an `Int`.
+            let n = s.borrow().len() as i64;
+            Ok(Value::Int(n))
         }
 
         "values" => {

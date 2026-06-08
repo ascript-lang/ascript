@@ -191,7 +191,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 fn opt_level(v: Option<&Value>, span: Span, ctx: &str) -> Result<Option<i64>, Control> {
     match v {
         None | Some(Value::Nil) => Ok(None),
-        Some(Value::Float(n)) => Ok(Some(*n as i64)),
+        // NUM §4: accept BOTH numeric subtypes.
+        Some(v) if v.is_number() => Ok(v.as_f64().map(|n| n as i64)),
         Some(other) => Err(AsError::at(
             format!(
                 "compress.{} level must be a number, got {}",

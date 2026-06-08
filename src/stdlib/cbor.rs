@@ -31,6 +31,8 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
     match v {
         Value::Nil => Ok(Cb::Null),
         Value::Bool(b) => Ok(Cb::Bool(*b)),
+        // NUM §4: an `Int` encodes as a CBOR integer directly.
+        Value::Int(i) => Ok(Cb::Integer((*i).into())),
         Value::Float(n) => Ok(number_to_cbor(*n)),
         Value::Decimal(d) => Ok(Cb::Text(d.to_string())),
         Value::Str(s) => Ok(Cb::Text(s.to_string())),
@@ -113,8 +115,14 @@ pub(crate) fn from_cbor(cb: &Cb) -> Value {
         // Undefined has no AScript equivalent → nil.
         Cb::Bool(b) => Value::Bool(*b),
         Cb::Integer(i) => {
+            // NUM §4: a CBOR integer decodes to `Int` when it fits `i64`; a value
+            // outside `i64` range is preserved as `Float` (the only lossy edge).
             let n: i128 = (*i).into();
-            Value::Float(n as f64)
+            if n >= i64::MIN as i128 && n <= i64::MAX as i128 {
+                Value::Int(n as i64)
+            } else {
+                Value::Float(n as f64)
+            }
         }
         Cb::Float(f) => Value::Float(*f),
         Cb::Text(s) => Value::Str(s.as_str().into()),

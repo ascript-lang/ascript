@@ -273,7 +273,8 @@ impl Interp {
             Ok(listener) => {
                 let bound = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                 let mut fields = indexmap::IndexMap::new();
-                fields.insert("port".to_string(), Value::Float(bound as f64));
+                // NUM §4: a port is an `Int`.
+                fields.insert("port".to_string(), Value::Int(i64::from(bound)));
                 let handle = self.register_resource(
                     NativeKind::WsListener,
                     fields,

@@ -312,8 +312,9 @@ fn status_fields(status: std::process::ExitStatus) -> (Value, Value, bool) {
     #[cfg(not(unix))]
     let signal: Option<String> = None;
 
+    // NUM §4: an exit code is an `Int`.
     let code_v = match code {
-        Some(c) => Value::Float(c as f64),
+        Some(c) => Value::Int(c as i64),
         None => Value::Nil,
     };
     let signal_v = match signal {
@@ -448,7 +449,9 @@ impl Interp {
         if opts.check && !success {
             let stderr_text = String::from_utf8_lossy(&output.stderr).into_owned();
             let code_desc = match &code {
-                Value::Float(n) => format!("exit code {}", *n as i64),
+                v if v.is_number() => {
+                    format!("exit code {}", v.as_f64().unwrap_or(f64::NAN) as i64)
+                }
                 _ => "a signal".to_string(),
             };
             return Ok(err_pair(format!(
@@ -543,7 +546,7 @@ impl Interp {
         let mut fields = indexmap::IndexMap::new();
         fields.insert(
             "pid".to_string(),
-            pid.map(|p| Value::Float(p as f64)).unwrap_or(Value::Nil),
+            pid.map(|p| Value::Int(p as i64)).unwrap_or(Value::Nil),
         );
         // Stash the child-stream handles so `child.stdin`/`stdout`/`stderr` return them.
         if let Some(h) = stdin_id {
