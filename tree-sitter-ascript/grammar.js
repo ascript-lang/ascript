@@ -689,6 +689,7 @@ module.exports = grammar({
     number: _ => token(choice(
       /0[xX][0-9a-fA-F_]+/,
       /0[bB][01_]+/,
+      /0[oO][0-7_]+/,
       /(\d[\d_]*)?\.\d[\d_]*([eE][+-]?\d+)?/,
       /\d[\d_]*([eE][+-]?\d+)?/,
     )),

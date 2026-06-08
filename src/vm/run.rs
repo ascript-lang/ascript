@@ -675,6 +675,37 @@ impl Vm {
                     fiber.push(v);
                 }
 
+                Op::InstanceOfType => {
+                    // `x instanceof int|float|number|string|bool` (NUM §6). The RHS is
+                    // a reserved scalar type NAME (a string const), pre-resolved at
+                    // compile time — the operand is NOT a value on the stack. Pop the
+                    // subject and run the SAME subtype check the tree-walker uses, so
+                    // the two engines are byte-identical.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("INSTANCE_OF_TYPE name is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let yes = match crate::interp::instanceof_reserved_type(&subject, &name) {
+                        Some(b) => b,
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("INSTANCE_OF_TYPE unknown reserved type name '{name}'"),
+                            ))
+                        }
+                    };
+                    fiber.push(Value::Bool(yes));
+                }
+
                 Op::RangeInclusive => {
                     // Inclusive value-range `a..=b` — eager `array<number>`,
                     // ascending/step-1, byte-identical to the tree-walker's

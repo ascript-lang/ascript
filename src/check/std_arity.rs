@@ -51,6 +51,10 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/math", "pow") => 2,
         // std/task — pipe requires exactly 2 args (generator + event bus).
         ("std/task", "pipe") => 2,
+        // std/string — NUM code-point helpers (fixed required arity).
+        ("std/string", "codepoints") => 1,
+        ("std/string", "from_codepoints") => 1,
+        ("std/string", "code_at") => 2,
         _ => return None,
     };
     Some(n)
@@ -96,6 +100,9 @@ mod tests {
             ("std/math", "sqrt"),
             ("std/math", "pow"),
             ("std/task", "pipe"),
+            ("std/string", "codepoints"),
+            ("std/string", "from_codepoints"),
+            ("std/string", "code_at"),
         ];
         for (module, name) in keys {
             // The entry must actually be in the table.

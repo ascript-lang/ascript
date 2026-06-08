@@ -661,7 +661,7 @@ fn lsp_protocol_end_to_end() {
         "expected `add(a, b)` signature: {sig_resp}"
     );
 
-    // inlayHint over the whole p2 doc -> a type hint (`: number` for total) AND
+    // inlayHint over the whole p2 doc -> a type hint (`: int` for total) AND
     // parameter-name hints (`a:`, `b:`) at the call args.
     client.request(
         8,
@@ -682,9 +682,10 @@ fn lsp_protocol_end_to_end() {
         .iter()
         .filter_map(|h| h["label"].as_str().map(|s| s.to_string()))
         .collect();
+    // NUM §5: `let total = 1` infers the concrete `int` subtype (was `number`).
     assert!(
-        labels.iter().any(|l| l.contains("number")),
-        "expected an inferred-type hint mentioning number: {labels:?}"
+        labels.iter().any(|l| l.contains("int")),
+        "expected an inferred-type hint mentioning int: {labels:?}"
     );
     assert!(
         labels.iter().any(|l| l == "a:") && labels.iter().any(|l| l == "b:"),

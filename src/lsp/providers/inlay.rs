@@ -194,6 +194,8 @@ mod tests {
 
     #[test]
     fn type_hint_on_unannotated_let() {
+        // NUM §5: an integer literal synths the concrete `int` subtype, so the inlay
+        // hint for `let n = 1` is `: int` (was `: number` before the numeric model).
         let src = "let n = 1\n";
         let m = model(src);
         let hints = inlay_hints(&m, full_range(&m));
@@ -203,7 +205,25 @@ mod tests {
             .collect();
         assert!(!type_hints.is_empty(), "expected a type hint, got {hints:?}");
         if let InlayHintLabel::String(s) = &type_hints[0].label {
-            assert!(s.contains("number"), "got {s}");
+            assert!(s.contains("int"), "got {s}");
+        } else {
+            panic!("expected a string label");
+        }
+    }
+
+    #[test]
+    fn type_hint_on_unannotated_float_let() {
+        // A float literal synths `float`.
+        let src = "let n = 1.5\n";
+        let m = model(src);
+        let hints = inlay_hints(&m, full_range(&m));
+        let type_hints: Vec<&InlayHint> = hints
+            .iter()
+            .filter(|h| h.kind == Some(InlayHintKind::TYPE))
+            .collect();
+        assert!(!type_hints.is_empty(), "expected a type hint, got {hints:?}");
+        if let InlayHintLabel::String(s) = &type_hints[0].label {
+            assert!(s.contains("float"), "got {s}");
         } else {
             panic!("expected a string label");
         }

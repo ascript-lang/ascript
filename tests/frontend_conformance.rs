@@ -415,6 +415,24 @@ fn both_frontends_accept_bitwise_and_wrapping_operators() {
     both_accept("let w = a >> b");
 }
 
+/// [NUM §3.1/§6] Octal literals and the reserved-type-name `instanceof` RHS parse
+/// on BOTH front-ends.
+#[test]
+fn both_frontends_accept_octal_and_reserved_instanceof() {
+    // Octal literals (`0o`/`0O`, underscores allowed).
+    both_accept("let oa = 0o17");
+    both_accept("let ob = 0O755");
+    both_accept("let oc = 0o1_7");
+    // `x instanceof int|float|number|string|bool` parses in expression position.
+    both_accept("let w = x instanceof int");
+    both_accept("let y = x instanceof float");
+    both_accept("let z = x instanceof number");
+    both_accept("let s = x instanceof string");
+    both_accept("let b = x instanceof bool");
+    // and still works as a class check.
+    both_accept("class Foo {}\nlet f = x instanceof Foo");
+}
+
 /// [CRITICAL, NUM §3.4] The `1 | 2`-pattern vs `a | b`-value vs `A | B`-type
 /// disambiguation, asserted STRUCTURALLY on BOTH front-ends.
 ///

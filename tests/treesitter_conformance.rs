@@ -166,6 +166,14 @@ fn treesitter_parses_bitwise_and_wrapping_operators() {
         // nested generics: the `>>` splits into two closing `>`
         "let u: future<array<int>> = nil",
         "let v: map<int, array<int>> = #{}",
+        // NUM §3.1: octal literals (`0o`/`0O`).
+        "let oa = 0o17",
+        "let ob = 0O755",
+        "let oc = 0o1_7",
+        // NUM §6: reserved-type-name `instanceof` RHS parses in expression position.
+        "let w = x instanceof int",
+        "let y = x instanceof float",
+        "let z = x instanceof number",
     ] {
         let tree = parser.parse(src.as_bytes(), None).expect("parse");
         assert!(

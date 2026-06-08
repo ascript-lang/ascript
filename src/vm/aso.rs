@@ -112,7 +112,11 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   field-default wire tags grew (binop tags 17..=24 for the bitwise/shift/wrapping
 ///   ops, unop tag 2 for `BitNot`). Old chunks never contained either, so older
 ///   readers must reject a v20 chunk.
-pub const ASO_FORMAT_VERSION: u32 = 20;
+/// - 21: NUM `instanceof int|float|number|string|bool` — one new appended opcode
+///   (`InstanceOfType`, a u16 type-name-const operand; appended at the END of the
+///   enum, so existing opcode byte values are UNCHANGED). Old chunks never contained
+///   it, so older readers must reject a v21 chunk.
+pub const ASO_FORMAT_VERSION: u32 = 21;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.

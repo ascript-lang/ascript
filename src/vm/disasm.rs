@@ -140,7 +140,8 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
         }
         // u16 const-pool index (a destructure key, or the bound-keys array) →
         // show the referenced value.
-        Op::ObjectKey | Op::ObjectRest | Op::MatchHasKey | Op::DefineExport => {
+        Op::ObjectKey | Op::ObjectRest | Op::MatchHasKey | Op::DefineExport
+        | Op::InstanceOfType => {
             let idx = chunk.read_u16(at + 1);
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
         }
@@ -263,6 +264,7 @@ fn op_name(op: Op) -> &'static str {
         Method => "METHOD",
         GetSuper => "GET_SUPER",
         InstanceOf => "INSTANCE_OF",
+        InstanceOfType => "INSTANCE_OF_TYPE",
         Template => "TEMPLATE",
         Await => "AWAIT",
         Yield => "YIELD",

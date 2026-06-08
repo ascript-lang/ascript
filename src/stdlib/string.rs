@@ -29,6 +29,9 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("reverse", bi("string.reverse")),
         ("count", bi("string.count")),
         ("splitN", bi("string.splitN")),
+        ("codepoints", bi("string.codepoints")),
+        ("from_codepoints", bi("string.from_codepoints")),
+        ("code_at", bi("string.code_at")),
     ]
 }
 
@@ -208,6 +211,87 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .map(|p| Value::Str(p.into()))
                 .collect();
             Ok(Value::Array(crate::value::ArrayCell::new(out)))
+        }
+        "codepoints" => {
+            // NUM §1/§4: Unicode scalar values are `int`s (the Go rune model).
+            let s = want_string(&arg(args, 0), span, &ctx("codepoints"))?;
+            let out: Vec<Value> = s.chars().map(|c| Value::Int(c as i64)).collect();
+            Ok(Value::Array(crate::value::ArrayCell::new(out)))
+        }
+        "from_codepoints" => {
+            // Validate each element is a valid Unicode scalar (0..=0x10FFFF, excluding
+            // the surrogate range D800..=DFFF). An invalid scalar is a Tier-2 panic.
+            let arr = want_array(&arg(args, 0), span, &ctx("from_codepoints"))?;
+            let items = arr.borrow();
+            let mut out = String::with_capacity(items.len());
+            for (i, v) in items.iter().enumerate() {
+                let cp = match v.as_int_exact() {
+                    Some(cp) => cp,
+                    None => {
+                        return Err(AsError::at(
+                            format!(
+                                "string.from_codepoints: element {} must be an int code point, got {}",
+                                i,
+                                crate::interp::type_name(v)
+                            ),
+                            span,
+                        )
+                        .into())
+                    }
+                };
+                let scalar = u32::try_from(cp)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .ok_or_else(|| {
+                        Control::from(AsError::at(
+                            format!(
+                                "string.from_codepoints: {} is not a valid Unicode scalar value",
+                                cp
+                            ),
+                            span,
+                        ))
+                    })?;
+                out.push(scalar);
+            }
+            Ok(str_val(out))
+        }
+        "code_at" => {
+            // The Unicode scalar value at char index `i` (an `int`). An out-of-range
+            // index is a Tier-2 panic.
+            let s = want_string(&arg(args, 0), span, &ctx("code_at"))?;
+            let idx_val = arg(args, 1);
+            let idx = match idx_val.as_int_exact() {
+                Some(i) if i >= 0 => i as usize,
+                Some(_) => {
+                    return Err(AsError::at(
+                        "string.code_at: index must be a non-negative integer",
+                        span,
+                    )
+                    .into())
+                }
+                None => {
+                    return Err(AsError::at(
+                        format!(
+                            "string.code_at: index must be an int, got {}",
+                            crate::interp::type_name(&idx_val)
+                        ),
+                        span,
+                    )
+                    .into())
+                }
+            };
+            match s.chars().nth(idx) {
+                Some(c) => Ok(Value::Int(c as i64)),
+                None => Err(AsError::at(
+                    format!(
+                        "string.code_at: index {} out of range (length {})",
+                        idx,
+                        s.chars().count()
+                    ),
+                    span,
+                )
+                .into()),
+            }
         }
         _ => Err(AsError::at(format!("std/string has no function '{}'", func), span).into()),
     }
@@ -451,6 +535,92 @@ mod tests {
         );
         assert!(matches!(
             call("splitN", &[s("a:b"), s(":"), Value::Float(0.0)], sp()),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    #[test]
+    fn codepoints_roundtrip() {
+        let sp = sp();
+        // codepoints → array<int> of Unicode scalar values.
+        let cps = call("codepoints", &[s("Hi")], sp).unwrap();
+        assert_eq!(cps.to_string(), "[72, 105]");
+        // non-ASCII scalar (é U+00E9, 233).
+        let cps2 = call("codepoints", &[s("é")], sp).unwrap();
+        assert_eq!(cps2.to_string(), "[233]");
+        // from_codepoints is the inverse.
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![
+            Value::Int(72),
+            Value::Int(105),
+        ]));
+        assert_eq!(call("from_codepoints", &[arr], sp).unwrap(), s("Hi"));
+        // astral plane (emoji U+1F600).
+        let astral = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(0x1F600)]));
+        assert_eq!(call("from_codepoints", &[astral], sp).unwrap(), s("😀"));
+        // integral floats are accepted as code points.
+        let fl = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(65.0)]));
+        assert_eq!(call("from_codepoints", &[fl], sp).unwrap(), s("A"));
+    }
+
+    #[test]
+    fn from_codepoints_rejects_invalid() {
+        let sp = sp();
+        // Surrogate (U+D800) is not a scalar value.
+        let surr = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(0xD800)]));
+        assert!(matches!(
+            call("from_codepoints", &[surr], sp),
+            Err(Control::Panic(_))
+        ));
+        // Beyond U+10FFFF.
+        let over = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(0x110000)]));
+        assert!(matches!(
+            call("from_codepoints", &[over], sp),
+            Err(Control::Panic(_))
+        ));
+        // Negative.
+        let neg = Value::Array(crate::value::ArrayCell::new(vec![Value::Int(-1)]));
+        assert!(matches!(
+            call("from_codepoints", &[neg], sp),
+            Err(Control::Panic(_))
+        ));
+        // Non-int element.
+        let bad = Value::Array(crate::value::ArrayCell::new(vec![s("x")]));
+        assert!(matches!(
+            call("from_codepoints", &[bad], sp),
+            Err(Control::Panic(_))
+        ));
+        // Non-integral float.
+        let frac = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(65.5)]));
+        assert!(matches!(
+            call("from_codepoints", &[frac], sp),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    #[test]
+    fn code_at_basic_and_bounds() {
+        let sp = sp();
+        assert_eq!(
+            call("code_at", &[s("ABC"), Value::Int(0)], sp).unwrap(),
+            Value::Int(65)
+        );
+        assert_eq!(
+            call("code_at", &[s("ABC"), Value::Int(2)], sp).unwrap(),
+            Value::Int(67)
+        );
+        // out of range → panic.
+        assert!(matches!(
+            call("code_at", &[s("ABC"), Value::Int(3)], sp),
+            Err(Control::Panic(_))
+        ));
+        // negative → panic.
+        assert!(matches!(
+            call("code_at", &[s("ABC"), Value::Int(-1)], sp),
+            Err(Control::Panic(_))
+        ));
+        // non-integral float index → panic.
+        assert!(matches!(
+            call("code_at", &[s("ABC"), Value::Float(1.5)], sp),
             Err(Control::Panic(_))
         ));
     }

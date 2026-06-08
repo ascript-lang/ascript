@@ -31,6 +31,7 @@ const TOKEN_TYPES: &[SemanticTokenType] = &[
     SemanticTokenType::NUMBER,      // 9
     SemanticTokenType::COMMENT,     // 10
     SemanticTokenType::NAMESPACE,   // 11
+    SemanticTokenType::OPERATOR,    // 12
 ];
 
 /// Modifiers, in legend-index order (bitset positions).
@@ -61,6 +62,7 @@ const TYPE_STRING: u32 = 8;
 const TYPE_NUMBER: u32 = 9;
 const TYPE_COMMENT: u32 = 10;
 const TYPE_NAMESPACE: u32 = 11;
+const TYPE_OPERATOR: u32 = 12;
 
 const MOD_DECLARATION: u32 = 1 << 0;
 const MOD_READONLY: u32 = 1 << 1;
@@ -145,7 +147,18 @@ fn classify_one(
         }
         SyntaxKind::Ident => classify_ident(model, t)?,
         k if is_keyword_kind(k) => (TYPE_KEYWORD, 0),
-        _ => return None, // punctuation / operators: not surfaced
+        // NUM bitwise / shift / wrapping operators (`& | ^ << >> ~ +% -% *%`) are
+        // surfaced as OPERATOR tokens so editors can highlight them distinctly.
+        SyntaxKind::Amp
+        | SyntaxKind::Pipe
+        | SyntaxKind::Caret
+        | SyntaxKind::Tilde
+        | SyntaxKind::Shl
+        | SyntaxKind::Shr
+        | SyntaxKind::PlusPercent
+        | SyntaxKind::MinusPercent
+        | SyntaxKind::StarPercent => (TYPE_OPERATOR, 0),
+        _ => return None, // other punctuation / operators: not surfaced
     };
     Some(ClassifiedToken {
         start: t.start,
@@ -416,6 +429,26 @@ mod tests {
             .find(|c| c.start == member_off)
             .unwrap_or_else(|| panic!("no token at member name; got {cs:?}"));
         assert_eq!(tok.token_type, TYPE_PROPERTY, "obj.field → PROPERTY");
+    }
+
+    #[test]
+    fn bitwise_operators_classify_as_operator() {
+        // The NUM bitwise/shift/wrapping operators surface as OPERATOR tokens.
+        let src = "let p = (a & b) | (c << 2) ^ ~d\nlet w = a +% b\n";
+        let m = model(src);
+        let cs = classify(&m);
+        let kinds: Vec<u32> = cs.iter().map(|c| c.token_type).collect();
+        assert!(
+            kinds.contains(&TYPE_OPERATOR),
+            "expected an OPERATOR token for the bitwise ops: {kinds:?}"
+        );
+        // Specifically the `&` token at its offset.
+        let amp_off = src.find('&').unwrap();
+        let tok = cs
+            .iter()
+            .find(|c| c.start == amp_off)
+            .unwrap_or_else(|| panic!("no token at `&`; got {cs:?}"));
+        assert_eq!(tok.token_type, TYPE_OPERATOR, "`&` → OPERATOR");
     }
 
     #[test]

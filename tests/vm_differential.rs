@@ -92,6 +92,31 @@ async fn vm_matches_treewalker_bitwise_and_wrapping() {
 }
 
 #[tokio::test]
+async fn vm_matches_treewalker_instanceof_reserved_types() {
+    // NUM §6: `x instanceof int|float|number|string|bool` must be byte-identical
+    // across the tree-walker and the VM (the VM uses a dedicated `INSTANCE_OF_TYPE`
+    // opcode; the tree-walker intercepts the reserved-name RHS).
+    let cases = [
+        "5 instanceof int",
+        "5 instanceof float",
+        "5 instanceof number",
+        "5.0 instanceof int",
+        "5.0 instanceof float",
+        "5.0 instanceof number",
+        "\"hi\" instanceof string",
+        "true instanceof bool",
+        "5 instanceof string",
+        "\"x\" instanceof int",
+        "(1 + 2) instanceof int",
+        "(1.0 + 2) instanceof float",
+        "(7 / 2) instanceof int",
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
 async fn vm_matches_treewalker_bitwise_panics() {
     // The Tier-2 panics (shift-amount out of range, bitwise-on-float) must be
     // byte-identical across both engines. Run as full programs and compare the

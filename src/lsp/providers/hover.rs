@@ -49,6 +49,18 @@ mod tests {
     }
 
     #[test]
+    fn hover_on_int_typed_let_shows_int() {
+        let src = "let x: int = 1\nprint(x)\n";
+        let m = model(src);
+        let off = src.rfind('x').unwrap();
+        let h = hover(&m, off).expect("hover");
+        let HoverContents::Markup(mk) = h.contents else {
+            panic!()
+        };
+        assert!(mk.value.contains("int"), "got {}", mk.value);
+    }
+
+    #[test]
     fn hover_shows_inferred_return_type() {
         // Hovering `y` (= id(1); id returns number) shows the INFERRED `number`,
         // even though `y` itself is unannotated. (Re-establishes the coverage of the

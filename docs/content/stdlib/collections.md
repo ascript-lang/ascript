@@ -289,6 +289,47 @@ string.splitN("a:b:c:d", ":", 2)   // ["a", "b:c:d"]
 string.splitN("a:b:c:d", ":", 3)   // ["a", "b", "c:d"]
 ```
 
+### string.codepoints
+
+Return the string's Unicode scalar values as an `array<int>` (the Go "rune" model — AScript has no `char` type; a code point is just an `int`).
+
+- `s: string` — the source string
+- Returns: `array` of `int` (one per character)
+
+```ascript
+string.codepoints("Hi")   // [72, 105]
+string.codepoints("é")    // [233]
+```
+
+### string.from_codepoints
+
+Build a string from an array of Unicode scalar values (the inverse of `codepoints`). Each element must be an `int` (an integral `float` is accepted) in `0..=0x10FFFF` and **not** a surrogate (`0xD800..=0xDFFF`).
+
+- `cps: array<int>` — the code points
+- Returns: `string`
+
+```ascript
+string.from_codepoints([72, 105])   // "Hi"
+string.from_codepoints([0x1F600])   // "😀"
+```
+
+> [!TIER2] Panics if any element is not an int or is not a valid Unicode scalar value.
+
+### string.code_at
+
+Return the Unicode scalar value (an `int`) at character index `i`.
+
+- `s: string` — the source string
+- `i: int` — a non-negative character index
+- Returns: `int`
+
+```ascript
+string.code_at("ABC", 0)   // 65
+string.code_at("ABC", 2)   // 67
+```
+
+> [!TIER2] Panics if the index is negative, not an int, or out of range.
+
 ## std/array
 
 Array operations. The callback-taking functions (`map`, `filter`, `reduce`, `sort`) invoke user functions you supply.

@@ -313,6 +313,11 @@ pub enum Op {
     GetSuper,
     /// `inst cls -- bool` — `inst instanceof cls`.
     InstanceOf,
+    /// `INSTANCE_OF_TYPE(u16)` — `inst -- bool`. The RHS is a reserved scalar type
+    /// name (`int`/`float`/`number`/`string`/`bool`, NUM §6) given by `consts[idx]`
+    /// (a string); pops `inst`, pushes whether it is of that subtype. Byte-identical
+    /// to the tree-walker's reserved-type-name `instanceof` interception.
+    InstanceOfType,
 
     // ---- strings ----------------------------------------------------------
     /// `TEMPLATE(u16)` — pop `n` parts, concatenate into a string.
@@ -603,6 +608,7 @@ impl Op {
             x if x == Method as u8 => Method,
             x if x == GetSuper as u8 => GetSuper,
             x if x == InstanceOf as u8 => InstanceOf,
+            x if x == InstanceOfType as u8 => InstanceOfType,
 
             x if x == Template as u8 => Template,
 
@@ -661,8 +667,8 @@ impl Op {
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | ImmutableError | Closure
             | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper
-            | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey
-            | CallMethodSpread | DefineExport | CheckParam => 2,
+            | InstanceOfType | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest
+            | MatchHasKey | CallMethodSpread | DefineExport | CheckParam => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -829,6 +835,7 @@ mod tests {
         Op::Method,
         Op::GetSuper,
         Op::InstanceOf,
+        Op::InstanceOfType,
         Op::Template,
         Op::Await,
         Op::Yield,

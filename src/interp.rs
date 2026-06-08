@@ -3000,6 +3000,21 @@ impl Interp {
                             Ok(l)
                         };
                     }
+                    // `x instanceof int|float|number|string|bool` (NUM §6): the RHS
+                    // is a bare reserved-type-name identifier that must NOT be
+                    // evaluated as a value (it is not a binding). Recognize it BEFORE
+                    // evaluating the RHS and route to the subtype check. Byte-identical
+                    // to the VM, which pre-resolves the name at compile time.
+                    BinOp::InstanceOf => {
+                        if let ExprKind::Ident(name) = &rhs.kind {
+                            if crate::interp::is_reserved_instanceof_type_name(name) {
+                                let l = self.eval_expr(lhs, env).await?;
+                                let yes = crate::interp::instanceof_reserved_type(&l, name)
+                                    .unwrap_or(false);
+                                return Ok(Value::Bool(yes));
+                            }
+                        }
+                    }
                     _ => {}
                 }
 
@@ -5145,6 +5160,31 @@ pub(crate) fn range_pattern_contains(
 /// Eq/Ne (cross-type decimal equality) → Range (eager `array<number>`) → string
 /// concat (`+` on two `Str`) → decimal arithmetic/ordering (either operand a
 /// `Decimal`) → the two-`Number` path → the generic "requires two numbers" error.
+/// If `name` is a reserved scalar type name usable as an `instanceof` RHS (NUM §6),
+/// test whether `lhs` is of that type. Returns `Some(bool)` for a recognized name,
+/// `None` otherwise (so the caller falls back to the class-based `instanceof`).
+///
+/// Shared verbatim by the tree-walker (`ExprKind::Binary { InstanceOf }`) and the
+/// VM (`Op::InstanceOf` with a pre-resolved type-name operand) so the two engines
+/// are byte-identical.
+pub(crate) fn instanceof_reserved_type(lhs: &Value, name: &str) -> Option<bool> {
+    match name {
+        "int" => Some(matches!(lhs, Value::Int(_))),
+        "float" => Some(matches!(lhs, Value::Float(_))),
+        "number" => Some(matches!(lhs, Value::Int(_) | Value::Float(_))),
+        "string" => Some(matches!(lhs, Value::Str(_))),
+        "bool" => Some(matches!(lhs, Value::Bool(_))),
+        _ => None,
+    }
+}
+
+/// Is `name` one of the reserved scalar type names recognized as an `instanceof`
+/// RHS (NUM §6)? Used by both front-ends to decide whether to skip evaluating the
+/// RHS expression and route to [`instanceof_reserved_type`] instead.
+pub(crate) fn is_reserved_instanceof_type_name(name: &str) -> bool {
+    matches!(name, "int" | "float" | "number" | "string" | "bool")
+}
+
 pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Control> {
     // Eq/Ne: cross-type Decimal↔Number comparison before generic `==`.
     match op {

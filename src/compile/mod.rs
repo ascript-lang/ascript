@@ -4435,6 +4435,24 @@ impl Compiler {
             return Ok(());
         }
 
+        // `x instanceof int|float|number|string|bool` (NUM §6): the RHS is a bare
+        // reserved scalar type NAME (a contextual identifier, NOT a binding). Detect
+        // it here and emit `INSTANCE_OF_TYPE name-const` — the subject is the only
+        // stack operand; the type name rides as a const. Byte-identical to the
+        // tree-walker, which intercepts the same RHS shape before evaluating it.
+        if op == SyntaxKind::InstanceofKw {
+            if let Expr::NameRef(name_ref) = &rhs {
+                if let Some(name) = name_ref.ident_token().map(|t| t.text().to_string()) {
+                    if crate::interp::is_reserved_instanceof_type_name(&name) {
+                        self.compile_expr(&lhs)?;
+                        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                        self.chunk.emit_u16(Op::InstanceOfType, idx, span);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         self.compile_expr(&lhs)?;
         self.compile_expr(&rhs)?;
         let bytecode = match op {

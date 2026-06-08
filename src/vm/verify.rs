@@ -314,6 +314,8 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Method => Effect::new(2, 1),
         // INSTANCE_OF: inst cls -- bool.
         InstanceOf => Effect::new(2, 1),
+        // INSTANCE_OF_TYPE: inst -- bool (the type name rides as a const operand).
+        InstanceOfType => Effect::new(1, 1),
         // MAKE_GENERATOR wraps the current frame; no operand-stack change.
         MakeGenerator => Effect::new(0, 0),
 
@@ -440,7 +442,8 @@ fn check_operands(
 
         // ---- name-const (must be a Str) ----
         GetGlobal | DefineGlobal | SetGlobal | ImmutableError | GetProp | SetProp | GetPropOpt
-        | Method | GetSuper | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport => {
+        | Method | GetSuper | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport
+        | InstanceOfType => {
             check_name_const(chunk.read_u16(operand_at) as usize)?
         }
 
