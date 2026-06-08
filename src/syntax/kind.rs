@@ -43,6 +43,8 @@ pub enum SyntaxKind {
     MapExpr,
     MapEntry,
     SpreadElem,
+    /// ADT §3.2: a named call argument `name: expr` (enum-variant construction).
+    NamedArg,
     TemplateExpr,
     OptMemberExpr,
     TryExpr,

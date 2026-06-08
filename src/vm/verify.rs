@@ -239,8 +239,15 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // ---- calls ----
         Call => Effect::new(argc_or_n + 1, 1),
         CallMethod => Effect::new(argc_or_n + 1, 1),
+        // CALL_NAMED: pops the callee + `argc` arg values, pushes 1 result.
+        CallNamed => Effect::new(argc_or_n + 1, 1),
         // dynamic arity collapsed to a single args array on the stack (see note).
         CallSpread | CallMethodSpread => Effect::new(2, 1),
+        // ADT spread+named lockstep builder: each APPEND_*_ARG pops one value/operand,
+        // leaving the two builder arrays it just appended to (net -1). CALL_NAMED_SPREAD
+        // pops the callee + args array + names array, pushes 1 result (net -2).
+        AppendNamedArg | AppendPosArg | AppendSpreadArg => Effect::new(1, 0),
+        CallNamedSpread => Effect::new(3, 1),
         Return => Effect::new(1, 0),
 
         // ---- collections / builders ----
@@ -460,7 +467,7 @@ fn check_operands(
         // ---- name-const (must be a Str) ----
         GetGlobal | DefineGlobal | SetGlobal | ImmutableError | GetProp | SetProp | GetPropOpt
         | Method | GetSuper | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport
-        | InstanceOfType | VariantField | MatchVariantHasField => {
+        | InstanceOfType | VariantField | MatchVariantHasField | AppendNamedArg => {
             check_name_const(chunk.read_u16(operand_at) as usize)?
         }
 
@@ -527,6 +534,9 @@ fn check_operands(
 
         // ---- CALL_METHOD: u16 name-const + u8 argc ----
         CallMethod => check_name_const(chunk.read_u16(operand_at) as usize)?,
+
+        // ---- CALL_NAMED: u16 names-ARRAY const + u8 argc (ADT §3.2) ----
+        CallNamed => check_const(chunk.read_u16(operand_at) as usize)?,
 
         // ---- destructuring element/rest ops: u16 plain const index (ARRAY_*) or
         //      a key array (OBJECT_REST handled above as name-const? no — it is an
@@ -725,8 +735,8 @@ fn jump_target(chunk: &Chunk, operand_at: usize) -> usize {
 fn count_operand(chunk: &Chunk, op: Op, operand_at: usize) -> usize {
     match op {
         Op::Call => chunk.read_u8(operand_at) as usize,
-        // CALL_METHOD: u16 name then u8 argc.
-        Op::CallMethod => chunk.read_u8(operand_at + 2) as usize,
+        // CALL_METHOD / CALL_NAMED: u16 const index then u8 argc.
+        Op::CallMethod | Op::CallNamed => chunk.read_u8(operand_at + 2) as usize,
         Op::NewArray | Op::NewObject | Op::Template => chunk.read_u16(operand_at) as usize,
         _ => 0,
     }

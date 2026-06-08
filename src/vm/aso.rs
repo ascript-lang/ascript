@@ -129,7 +129,13 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   `VariantElem`, `VariantField`, `MatchVariantArity`, `MatchVariantHasField`,
 ///   appended at the END so existing byte values are unchanged). Old readers must
 ///   reject a v23 chunk. (Bumped by reading the NUM-left v22 and adding one.)
-pub const ASO_FORMAT_VERSION: u32 = 23;
+/// - **v24 (ADT named construction):** named call arguments (`Rect(w: 3.0, h: 4.0)`)
+///   for enum-variant construction. New appended opcodes (`CallNamed`, a u16
+///   names-const-array index + u8 argc; plus the spread+named lockstep builder ops
+///   `AppendNamedArg`/`AppendPosArg`/`AppendSpreadArg`/`CallNamedSpread`), appended at
+///   the END so existing byte values are unchanged, plus a new `EL_NAMED` call-arg tag
+///   in the const-folded field-default expr stream. Old readers must reject a v24 chunk.
+pub const ASO_FORMAT_VERSION: u32 = 24;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -289,6 +295,8 @@ const TP_EXPR: u8 = 1;
 // spread elements in array/object/call defaults).
 const EL_ITEM: u8 = 0;
 const EL_SPREAD: u8 = 1;
+// ADT §3.2: a named call argument `name: expr` in a const-folded constructor default.
+const EL_NAMED: u8 = 2;
 
 // ---- upvalue / import tags ---------------------------------------------------
 
@@ -1167,6 +1175,11 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
                         w.u8(EL_SPREAD);
                         write_expr(w, e)?;
                     }
+                    CallArg::Named { name, value } => {
+                        w.u8(EL_NAMED);
+                        w.str(name);
+                        write_expr(w, value)?;
+                    }
                 }
             }
         }
@@ -1409,6 +1422,13 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
                 let a = match r.u8()? {
                     EL_ITEM => CallArg::Pos(read_expr(r)?),
                     EL_SPREAD => CallArg::Spread(read_expr(r)?),
+                    EL_NAMED => {
+                        let name: std::rc::Rc<str> = Rc::from(r.str()?.as_str());
+                        CallArg::Named {
+                            name,
+                            value: read_expr(r)?,
+                        }
+                    }
                     tag => {
                         return Err(AsoError::BadTag {
                             what: "call-arg",
@@ -2169,7 +2189,7 @@ run()
         match Chunk::from_bytes(&stale) {
             Err(AsoError::VersionMismatch { found, expected }) => {
                 assert_eq!(expected, ASO_FORMAT_VERSION);
-                assert_eq!(expected, 23);
+                assert_eq!(expected, 24);
                 assert_ne!(found, ASO_FORMAT_VERSION);
             }
             other => panic!("expected VersionMismatch for a stale CHECK_LOCAL .aso, got {other:?}"),
@@ -2199,6 +2219,58 @@ run()
             run_chunk(original),
             run_chunk(back),
             "output must be identical after the payload-enum .aso round-trip"
+        );
+    }
+
+    #[test]
+    fn adt_named_construction_round_trips() {
+        // ADT §3.2: a program using NAMED variant construction (the CALL_NAMED opcode)
+        // AND a const-folded named-arg constructor default (the EL_NAMED call-arg tag
+        // in the field-default expr stream) survives a write→read round-trip byte-
+        // stably and runs identically.
+        let src = "enum Shape { Circle(radius: float), Rect(w: float, h: float), Point }\n\
+                   class Box { shape: Shape = Shape.Rect(w: 1.0, h: 2.0) }\n\
+                   let r = Shape.Rect(w: 3.0, h: 4.0)\n\
+                   let r2 = Shape.Rect(h: 4.0, w: 3.0)\n\
+                   print(r.value)\n\
+                   print(r == r2)\n\
+                   print(Box().shape.value)\n";
+        let original = compile(src);
+        let bytes = original.to_bytes().expect("serialize named-construction program");
+        let back = Chunk::from_bytes(&bytes).expect("a valid .aso must decode");
+        assert_eq!(
+            disasm(&original),
+            disasm(&back),
+            "named-construction chunk must round-trip byte-stably"
+        );
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(back),
+            "output must be identical after the named-construction .aso round-trip"
+        );
+    }
+
+    #[test]
+    fn adt_named_spread_lockstep_ops_round_trip() {
+        // ADT §3.2: a spread+named MIXED call lowers to the dynamic-arity lockstep
+        // builder ops (APPEND_NAMED_ARG / APPEND_POS_ARG / APPEND_SPREAD_ARG /
+        // CALL_NAMED_SPREAD). The mix is a recoverable runtime error, so the program
+        // catches it with `recover` — proving the new opcodes serialize, decode, and
+        // run byte-stably (the chunk round-trips even though the call itself panics).
+        let src = "enum Shape { Rect(w: float, h: float) }\n\
+                   print(recover(() => Shape.Rect(w: 1.0, ...[2.0])))\n";
+        let original = compile(src);
+        let bytes = original.to_bytes().expect("serialize spread+named program");
+        let back = Chunk::from_bytes(&bytes).expect("a valid .aso must decode");
+        assert_eq!(
+            disasm(&original),
+            disasm(&back),
+            "spread+named lockstep chunk must round-trip byte-stably"
+        );
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(back),
+            "output must be identical after the spread+named .aso round-trip"
         );
     }
 

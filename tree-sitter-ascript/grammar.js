@@ -585,7 +585,18 @@ module.exports = grammar({
       field('function', $._postfix_expression),
       field('arguments', $.arguments),
     )),
-    arguments: $ => seq('(', commaSep(choice($._expression, $.spread_element)), optional(','), ')'),
+    arguments: $ => seq('(', commaSep(choice($.named_argument, $._expression, $.spread_element)), optional(','), ')'),
+
+    // ADT §3.2: a named call argument `name: expr` (enum-variant construction —
+    // `Shape.Rect(w: 3.0, h: 4.0)`). Only meaningful for a variant constructor;
+    // the interpreter rejects a named arg on any other callee. The leading
+    // `identifier ':'` is unambiguous at argument start (a bare `:` cannot
+    // otherwise begin a call argument), so no GLR conflict is needed.
+    named_argument: $ => seq(
+      field('name', $.identifier),
+      ':',
+      field('value', $._expression),
+    ),
 
     // ...expr — spread into an array literal, object literal, or call args
     // (typed-element AST in the interpreter; strict: spreading the wrong

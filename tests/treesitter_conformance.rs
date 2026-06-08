@@ -298,6 +298,16 @@ fn treesitter_parses_adt_payload_enums_and_variant_patterns() {
         "fn f(s) { return match s { Shape.Rect(w: a, h: b) => a, _ => 0 } }",
         // Nested + guard + or-pattern.
         "fn f(s) { return match s { Circle(0.0) => 1, Pair(a, b) if a == b => 2, Circle(_) | Rect(_, _) => 3, _ => 0 } }",
+        // ADT §3.2: named call arguments for variant construction (named_argument node).
+        "let r = Shape.Rect(w: 3.0, h: 4.0)",
+        "let r = Shape.Rect(h: 4.0, w: 3.0)",
+        "let c = Shape.Circle(radius: 2.0)",
+        "let r = Shape.Rect(w: 1.0 + 2.0, h: g(3.0))",
+        "let mk = Shape.Rect\nlet r = mk(w: 1.0, h: 2.0)",
+        // Named args must not disturb positional / spread calls or ternaries.
+        "f(1, 2, 3)",
+        "f(...xs, 1)",
+        "let z = cond ? a : b",
     ] {
         assert!(!parse_has_error(src), "tree-sitter ERROR node in: {src}");
     }

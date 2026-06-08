@@ -105,6 +105,12 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
             let argc = chunk.read_u8(at + 3);
             let _ = write!(line, "{idx:>5} {argc} ; .{}", const_repr(chunk, idx));
         }
+        // u16 names-array const index + u8 argc → show the per-arg field names.
+        Op::CallNamed => {
+            let idx = chunk.read_u16(at + 1);
+            let argc = chunk.read_u8(at + 3);
+            let _ = write!(line, "{idx:>5} {argc} ; named {}", const_repr(chunk, idx));
+        }
         // u16 method-name const index (argc is dynamic — the args arrive as a
         // single runtime array on the stack) → show the method name.
         Op::CallMethodSpread => {
@@ -319,6 +325,11 @@ fn op_name(op: Op) -> &'static str {
         VariantField => "VARIANT_FIELD",
         MatchVariantArity => "MATCH_VARIANT_ARITY",
         MatchVariantHasField => "MATCH_VARIANT_HAS_FIELD",
+        CallNamed => "CALL_NAMED",
+        AppendNamedArg => "APPEND_NAMED_ARG",
+        AppendPosArg => "APPEND_POS_ARG",
+        AppendSpreadArg => "APPEND_SPREAD_ARG",
+        CallNamedSpread => "CALL_NAMED_SPREAD",
     }
 }
 

@@ -469,6 +469,21 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                             CompileError::new("call-default spread (...) missing operand", span)
                         })?;
                         args.push(CallArg::Spread(cst_default_expr(&operand)?));
+                    } else if child.kind() == SyntaxKind::NamedArg {
+                        // ADT §3.2: a named call arg `name: expr` (variant construction).
+                        let name = cst_first_ident(child).ok_or_else(|| {
+                            CompileError::new("named call arg missing field name", span)
+                        })?;
+                        let value = child
+                            .children()
+                            .find_map(|c| Expr::cast(c.clone()))
+                            .ok_or_else(|| {
+                                CompileError::new("named call arg missing value expression", span)
+                            })?;
+                        args.push(CallArg::Named {
+                            name: Rc::from(name.as_str()),
+                            value: cst_default_expr(&value)?,
+                        });
                     } else if let Some(a) = Expr::cast(child.clone()) {
                         args.push(CallArg::Pos(cst_default_expr(&a)?));
                     }
@@ -4266,6 +4281,14 @@ impl Compiler {
                     .text()
                     .to_string();
                 self.compile_chain(&receiver, sink)?;
+                // ADT §3.2: a named-arg method-call link reads the member (the
+                // variant constructor) then `CALL_NAMED`, mirroring the plain
+                // `compile_call` named path.
+                if self.arg_list_has_named(call) {
+                    let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    self.chunk.emit_u16(Op::GetProp, name_idx, span);
+                    return self.compile_named_call(call, span);
+                }
                 self.emit_method_call_on_receiver(call, &name, span)?;
                 Ok(())
             }
@@ -4279,6 +4302,9 @@ impl Compiler {
                     CompileError::new("call expression missing callee", span)
                 })?;
                 self.compile_chain(&callee, sink)?;
+                if self.arg_list_has_named(call) {
+                    return self.compile_named_call(call, span);
+                }
                 if self.arg_list_has_spread(call) {
                     self.compile_spread_args(call, span)?;
                     self.chunk.emit(Op::CallSpread, span);
@@ -4394,6 +4420,19 @@ impl Compiler {
             .expr()
             .ok_or_else(|| CompileError::new("call expression missing callee", span))?;
 
+        // ADT §3.2: a call carrying NAMED arguments (`Shape.Rect(w: 3.0, h: 4.0)`)
+        // is only valid for enum-variant construction. Compile the callee as a
+        // VALUE (a member callee `Shape.Rect` lowers to GET_PROP, which `read_member`
+        // turns into the variant constructor — the SAME value the tree-walker's
+        // `read_member` yields), then `CALL_NAMED`. This bypasses the CALL_METHOD
+        // path (whose argc would miscount the `NamedArg` children), routing
+        // construction through the shared `construct_variant_args`, byte-identical to
+        // the tree-walker's `call_value_named`.
+        if self.arg_list_has_named(call) {
+            self.compile_expr(&callee)?;
+            return self.compile_named_call(call, span);
+        }
+
         // A plain member call `recv.m(args)` lowers to CALL_METHOD, which mirrors
         // the tree-walker's `eval_chain` Member-callee Call arm (schema fluent hook
         // + `read_member` → `call_value`). This is what makes the generator
@@ -4446,6 +4485,124 @@ impl Compiler {
                     .any(|c| c.kind() == SyntaxKind::SpreadElem)
             })
             .unwrap_or(false)
+    }
+
+    /// ADT §3.2: whether a call's argument list contains a named argument
+    /// (`name: expr`, a `NamedArg` child). Drives the `CALL_NAMED` lowering. A named
+    /// arg is ONLY meaningful for an enum-variant constructor call.
+    fn arg_list_has_named(&self, call: &CallExpr) -> bool {
+        call.arg_list()
+            .map(|al| {
+                al.syntax()
+                    .children()
+                    .any(|c| c.kind() == SyntaxKind::NamedArg)
+            })
+            .unwrap_or(false)
+    }
+
+    /// ADT §3.2: lower a call carrying named arguments (`Shape.Rect(w: 3.0, h: 4.0)`).
+    /// The callee is ALREADY on the stack. Each argument's VALUE is compiled in
+    /// source order, then a `CALL_NAMED names, argc` op is emitted carrying a const
+    /// `Value::Array` of per-arg field names (`Str` for a named arg, `Nil` for a
+    /// positional one). Dispatch (variant construction, or the Tier-2 error for any
+    /// other callee) is byte-identical to the tree-walker's `call_value_named`.
+    ///
+    /// A named-arg call that ALSO contains a `...spread` (`Rect(w: 1.0, ...xs)`) has a
+    /// runtime-dynamic arity, so it is lowered through the dynamic-arity lockstep
+    /// builder (`compile_named_spread_call`) rather than the static `CALL_NAMED` path.
+    /// It must NOT be rejected at compile time: the tree-walker reaches such a mix at
+    /// RUNTIME (the spread is positional, the named arg is not → the recoverable
+    /// "arguments must be all named or all positional, not mixed" panic in
+    /// `construct_variant_args`), so a VM compile-time rejection would diverge on
+    /// dead/uncalled code and on `recover()` (Gate 1 byte-identity). Both engines must
+    /// reach the SAME recoverable runtime panic.
+    fn compile_named_call(&mut self, call: &CallExpr, span: Span) -> Result<(), CompileError> {
+        if self.arg_list_has_spread(call) {
+            return self.compile_named_spread_call(call, span);
+        }
+        let mut argc: u8 = 0;
+        let mut names: Vec<Value> = Vec::new();
+        if let Some(arg_list) = call.arg_list() {
+            for child in arg_list.syntax().children() {
+                if child.kind() == SyntaxKind::NamedArg {
+                    let name = cst_first_ident(child).ok_or_else(|| {
+                        CompileError::new("named call arg missing field name", span)
+                    })?;
+                    let value = child
+                        .children()
+                        .find_map(|c| Expr::cast(c.clone()))
+                        .ok_or_else(|| {
+                            CompileError::new("named call arg missing value expression", span)
+                        })?;
+                    self.compile_expr(&value)?;
+                    names.push(Value::Str(Rc::from(name.as_str())));
+                } else if let Some(arg) = Expr::cast(child.clone()) {
+                    self.compile_expr(&arg)?;
+                    names.push(Value::Nil);
+                } else {
+                    continue;
+                }
+                argc = argc
+                    .checked_add(1)
+                    .ok_or_else(|| CompileError::new("too many call arguments (max 255)", span))?;
+            }
+        }
+        let names_idx = self
+            .chunk
+            .add_const(Value::Array(crate::value::ArrayCell::new(names)));
+        self.chunk.emit_u16_u8(Op::CallNamed, names_idx, argc, span);
+        Ok(())
+    }
+
+    /// ADT §3.2: lower a call MIXING a `...spread` with named arguments
+    /// (`Rect(w: 1.0, ...xs)`). The callee is ALREADY on the stack. Builds two parallel
+    /// runtime arrays in source order — the flattened argument VALUES and their
+    /// per-value NAMES (`Str` for a named arg, `Nil` for a positional value, `Nil` once
+    /// per element for a spread) — then `CALL_NAMED_SPREAD` dispatches to
+    /// `construct_variant_args`. This is the SAME runtime path the tree-walker's
+    /// `eval_call_args_named` + `call_value_named` take: each argument expression is
+    /// evaluated left-to-right (preserving side effects + the spread-non-array error),
+    /// and a spread+named mix reaches the recoverable "all named or all positional, not
+    /// mixed" panic at runtime, byte-identical to the tree-walker.
+    fn compile_named_spread_call(
+        &mut self,
+        call: &CallExpr,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        // Layout becomes `[callee, argsArray, namesArray]`.
+        self.chunk.emit_u16(Op::NewArray, 0, span); // argsArray
+        self.chunk.emit_u16(Op::NewArray, 0, span); // namesArray
+        if let Some(arg_list) = call.arg_list() {
+            for child in arg_list.syntax().children() {
+                if child.kind() == SyntaxKind::NamedArg {
+                    let name = cst_first_ident(child).ok_or_else(|| {
+                        CompileError::new("named call arg missing field name", span)
+                    })?;
+                    let value = child
+                        .children()
+                        .find_map(|c| Expr::cast(c.clone()))
+                        .ok_or_else(|| {
+                            CompileError::new("named call arg missing value expression", span)
+                        })?;
+                    self.compile_expr(&value)?;
+                    let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    self.chunk.emit_u16(Op::AppendNamedArg, name_idx, span);
+                } else if let Some(spread) = SpreadElem::cast(child.clone()) {
+                    let operand = spread.expr().ok_or_else(|| {
+                        CompileError::new("call argument spread (...) missing operand", span)
+                    })?;
+                    let op_span = node_code_span(&operand);
+                    self.compile_expr(&operand)?;
+                    self.chunk.emit(Op::AppendSpreadArg, op_span);
+                } else if let Some(arg) = Expr::cast(child.clone()) {
+                    self.compile_expr(&arg)?;
+                    self.chunk.emit(Op::AppendPosArg, span);
+                }
+                // Tokens (`(`, `,`, `)`) and trivia are skipped.
+            }
+        }
+        self.chunk.emit(Op::CallNamedSpread, span);
+        Ok(())
     }
 
     /// Build the flattened call-argument array at runtime onto the stack (leaving a

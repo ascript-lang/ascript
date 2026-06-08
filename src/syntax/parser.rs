@@ -1682,6 +1682,9 @@ fn arg_list(p: &mut Parser) {
     while !p.at(RParen) && !p.at_end() {
         if p.at(DotDotDot) {
             spread_elem(p);
+        } else if p.at(Ident) && p.nth_at(1, Colon) {
+            // ADT §3.2: a named call argument `name: expr` (variant construction).
+            named_arg(p);
         } else {
             with_arrows_allowed(p, expr);
         }
@@ -1697,6 +1700,18 @@ fn arg_list(p: &mut Parser) {
         p.error("expected ')' to close arguments");
     }
     p.complete(m, ArgList);
+}
+
+/// ADT §3.2: a named call argument `name: expr`. The `name :` shape is checked
+/// by the caller (`arg_list`); here we consume the identifier, the `:`, and the
+/// value expression into a `NamedArg` node.
+fn named_arg(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // ident
+    p.bump(); // ':'
+    with_arrows_allowed(p, expr);
+    p.complete(m, NamedArg);
 }
 
 fn match_expr(p: &mut Parser) -> CompletedMarker {

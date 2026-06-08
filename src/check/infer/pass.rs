@@ -933,11 +933,19 @@ impl<'a> Pass<'a> {
 
     fn synth_arg_list(&mut self, arg_list: Option<&ResolvedNode>, env: &mut Env) {
         if let Some(al) = arg_list {
-            for a in al
-                .children()
-                .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
-            {
-                self.synth(a, env);
+            for a in al.children() {
+                if crate::check::rules::is_expr_kind(a.kind()) {
+                    self.synth(a, env);
+                } else if a.kind() == SyntaxKind::NamedArg {
+                    // ADT §3.2: a named call arg `name: value` (variant construction).
+                    // Synthesize the VALUE expression so sub-expression diagnostics
+                    // (e.g. `possibly-nil`) still flow; the field-type check itself is
+                    // a runtime check (gradual-silent here to keep zero false positives).
+                    if let Some(v) = a.children().find(|c| crate::check::rules::is_expr_kind(c.kind()))
+                    {
+                        self.synth(v, env);
+                    }
+                }
             }
         }
     }

@@ -542,6 +542,11 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                         out.push_str("...");
                         write_expr(out, x, PREC_ASSIGN);
                     }
+                    CallArg::Named { name, value } => {
+                        out.push_str(name);
+                        out.push_str(": ");
+                        write_expr(out, value, PREC_ASSIGN);
+                    }
                 }
             }
             out.push(')');

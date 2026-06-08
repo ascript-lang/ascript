@@ -774,13 +774,24 @@ impl Printer<'_> {
         self.out.text("(");
         let items: Vec<&ResolvedNode> = node
             .children()
-            .filter(|c| is_expr_kind(c.kind()) || c.kind() == SpreadElem)
+            .filter(|c| is_expr_kind(c.kind()) || c.kind() == SpreadElem || c.kind() == NamedArg)
             .collect();
         for (i, it) in items.iter().enumerate() {
             if i > 0 {
                 self.out.text(", ");
             }
-            self.expr(it);
+            if it.kind() == NamedArg {
+                // ADT §3.2: `name: value` — render the field name then the value expr.
+                if let Some(name) = first_ident_text(it) {
+                    self.out.text(&name);
+                    self.out.text(": ");
+                }
+                if let Some(v) = it.children().find(|c| is_expr_kind(c.kind())) {
+                    self.expr(v);
+                }
+            } else {
+                self.expr(it);
+            }
         }
         self.out.text(")");
     }

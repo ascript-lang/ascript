@@ -1332,6 +1332,213 @@ impl Vm {
                     }
                 }
 
+                Op::CallNamed => {
+                    // ADT §3.2: a call carrying NAMED arguments. Two operands: a u16
+                    // names-array const index then a u8 argc. The stack is
+                    // `[..., callee, v0, .., v{argc-1}]` (values in source order). The
+                    // names array (`consts[idx]`, length argc) pairs each value with a
+                    // `Str` field name or `Nil` (positional). The only valid callee is
+                    // an enum-variant constructor → `construct_variant_args`, byte-
+                    // identical to the tree-walker's `call_value_named`. AWAIT
+                    // DISCIPLINE: pop values + callee into owned locals first; read the
+                    // names const into an owned `Vec` before the await; hold no `fiber`
+                    // borrow across the suspension point.
+                    let names_idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) as usize;
+                    let names: Vec<Option<Rc<str>>> = match &fiber
+                        .frame()
+                        .closure
+                        .proto
+                        .chunk
+                        .consts[names_idx]
+                    {
+                        Value::Array(a) => a
+                            .borrow()
+                            .iter()
+                            .map(|v| match v {
+                                Value::Str(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CALL_NAMED names operand is not an array: {other:?}"),
+                            ))
+                        }
+                    };
+                    let mut args = vec![Value::Nil; argc];
+                    for slot in args.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let callee = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let result = match callee {
+                        Value::EnumVariant(ev) => {
+                            self.interp
+                                .construct_variant_args(&ev, args, &names, span)
+                                .await?
+                        }
+                        other => {
+                            return Err(Control::Panic(crate::error::AsError::at(
+                                format!(
+                                    "named arguments are only valid for enum-variant \
+                                     construction, not for {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                                span,
+                            )))
+                        }
+                    };
+                    fiber.push(result);
+                }
+
+                Op::AppendNamedArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
+                    // `argsArray` (peek 1) and push the field name `consts[idx]` (a
+                    // `Str`) onto `namesArray` (peek 0).
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => Value::Str(s.clone()),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("APPEND_NAMED_ARG name operand is not a string: {other:?}"),
+                            ))
+                        }
+                    };
+                    let value = fiber.pop();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().push(value);
+                            names.borrow_mut().push(name);
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_NAMED_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendPosArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
+                    // `argsArray` and push `Nil` onto `namesArray` (a positional value).
+                    let value = fiber.pop();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().push(value);
+                            names.borrow_mut().push(Value::Nil);
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_POS_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendSpreadArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, operand]`: pop `operand` (MUST be an
+                    // Array — else the SAME `can only spread an array as call arguments`
+                    // panic the positional path produces), extend `argsArray` with its
+                    // elements and push `Nil` ONCE PER element onto `namesArray`.
+                    let operand = fiber.pop();
+                    let items: Vec<Value> = match operand {
+                        Value::Array(src) => src.borrow().iter().cloned().collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "can only spread an array as call arguments, got {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ))
+                        }
+                    };
+                    let n = items.len();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().extend(items);
+                            names.borrow_mut().extend(std::iter::repeat_n(Value::Nil, n));
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_SPREAD_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                Op::CallNamedSpread => {
+                    // ADT §3.2: the dynamic-arity named call (spread+named). Stack
+                    // `[..., callee, argsArray, namesArray]`. Pop both arrays + the
+                    // callee, then dispatch EXACTLY like CALL_NAMED →
+                    // `construct_variant_args` (byte-identical to the tree-walker's
+                    // `call_value_named`). AWAIT DISCIPLINE: pull args + names into owned
+                    // Vecs before the await; hold no `fiber` borrow across it.
+                    let names: Vec<Option<Rc<str>>> = match fiber.pop() {
+                        Value::Array(a) => a
+                            .borrow()
+                            .iter()
+                            .map(|v| match v {
+                                Value::Str(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CALL_NAMED_SPREAD names is not an array: {other:?}"),
+                            ))
+                        }
+                    };
+                    let args: Vec<Value> = match fiber.pop() {
+                        Value::Array(a) => a.borrow().iter().cloned().collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CALL_NAMED_SPREAD args is not an array: {other:?}"),
+                            ))
+                        }
+                    };
+                    let callee = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let result = match callee {
+                        Value::EnumVariant(ev) => {
+                            self.interp
+                                .construct_variant_args(&ev, args, &names, span)
+                                .await?
+                        }
+                        other => {
+                            return Err(Control::Panic(crate::error::AsError::at(
+                                format!(
+                                    "named arguments are only valid for enum-variant \
+                                     construction, not for {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                                span,
+                            )))
+                        }
+                    };
+                    fiber.push(result);
+                }
+
                 Op::CallMethod => {
                     // A method call `recv.<name>(args)`. Mirrors the tree-walker's
                     // `eval_chain` Call arm for a `Member` callee: the schema

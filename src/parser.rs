@@ -1867,9 +1867,27 @@ impl<'a> Parser<'a> {
                     let mut args = Vec::new();
                     if *self.peek() != Tok::RParen {
                         loop {
+                            let named_arg = match self.peek() {
+                                // ADT §3.2: a named call argument `name: expr`
+                                // (variant construction). Disambiguated by an
+                                // `IDENT :` at argument start — a bare `:` cannot
+                                // otherwise begin a call argument (ternary always
+                                // has a `?` before the `:`).
+                                Tok::Ident(n) if *self.peek_nth(1) == Tok::Colon => {
+                                    Some(std::rc::Rc::<str>::from(n.as_str()))
+                                }
+                                _ => None,
+                            };
                             if *self.peek() == Tok::DotDotDot {
                                 self.advance();
                                 args.push(crate::ast::CallArg::Spread(self.expr()?));
+                            } else if let Some(arg_name) = named_arg {
+                                self.advance(); // ident
+                                self.advance(); // ':'
+                                args.push(crate::ast::CallArg::Named {
+                                    name: arg_name,
+                                    value: self.expr()?,
+                                });
                             } else {
                                 args.push(crate::ast::CallArg::Pos(self.expr()?));
                             }

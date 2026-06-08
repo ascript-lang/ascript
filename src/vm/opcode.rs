@@ -566,6 +566,46 @@ pub enum Op {
     /// and push `true` iff it has a NAMED payload field `consts[const]` (a `Str`).
     /// Mirrors the named-destructure presence check (`map.get(key)` is `Some`).
     MatchVariantHasField,
+    /// `CALL_NAMED(u16 names, u8 argc)` — ADT §3.2: a call carrying NAMED arguments
+    /// (`Shape.Rect(w: 3.0, h: 4.0)`). The callee sits below its `argc` argument
+    /// VALUES on the stack (`[..., callee, v0, .., v{argc-1}]`, in source order);
+    /// `consts[names]` is a `Value::Array` of length `argc` where each element is a
+    /// `Str` field name for a named arg or `Nil` for a positional arg. The only
+    /// valid callee is an enum-variant constructor: the op pops the values + callee
+    /// and routes to `construct_variant_args(ev, values, names, span)` (byte-
+    /// identical to the tree-walker's `call_value_named`); any other callee is the
+    /// same Tier-2 error. Two inline operands: a `u16` names-array const index then
+    /// a `u8` argc.
+    CallNamed,
+    /// `APPEND_NAMED_ARG(u16 name)` — ADT §3.2 (spread+named lockstep builder). Stack
+    /// `[..., argsArray, namesArray, value] -- [..., argsArray, namesArray]`: pop the
+    /// `value`, push it onto `argsArray` (2 below the top) and push `consts[name]` (a
+    /// `Str`) onto `namesArray` (1 below the top). Builds the two parallel arrays a
+    /// NAMED argument contributes one entry to.
+    AppendNamedArg,
+    /// `APPEND_POS_ARG` — ADT §3.2 (spread+named lockstep builder). Stack
+    /// `[..., argsArray, namesArray, value] -- [..., argsArray, namesArray]`: pop the
+    /// `value`, push it onto `argsArray` and push `Nil` onto `namesArray` (a POSITIONAL
+    /// argument: one value, no name).
+    AppendPosArg,
+    /// `APPEND_SPREAD_ARG` — ADT §3.2 (spread+named lockstep builder). Stack
+    /// `[..., argsArray, namesArray, operand] -- [..., argsArray, namesArray]`: pop
+    /// the `operand` (which MUST be an Array, else the same `can only spread an array
+    /// as call arguments` panic the positional path produces), extend `argsArray` with
+    /// its elements and push `Nil` ONCE PER element onto `namesArray` (so the two
+    /// arrays stay the same length). A `...spread` contributes positional values only.
+    AppendSpreadArg,
+    /// `CALL_NAMED_SPREAD` — ADT §3.2: the dynamic-arity counterpart of [`Op::CallNamed`]
+    /// for a call MIXING a `...spread` with named arguments. The flattened argument
+    /// VALUES arrived as one runtime `argsArray` and their parallel per-value names as
+    /// one runtime `namesArray` (`Str` or `Nil`), both built by the
+    /// `APPEND_*_ARG` ops, sitting above the callee: `[..., callee, argsArray,
+    /// namesArray]`. The op pops both arrays + the callee and dispatches EXACTLY like
+    /// [`Op::CallNamed`] → `construct_variant_args` (byte-identical to the tree-walker's
+    /// `call_value_named`). A mixed spread+named call always reaches the recoverable
+    /// runtime "arguments must be all named or all positional, not mixed" panic there
+    /// — never a compile-time rejection. No inline operand (arity is dynamic).
+    CallNamedSpread,
 }
 
 impl Op {
@@ -707,6 +747,11 @@ impl Op {
             x if x == VariantField as u8 => VariantField,
             x if x == MatchVariantArity as u8 => MatchVariantArity,
             x if x == MatchVariantHasField as u8 => MatchVariantHasField,
+            x if x == CallNamed as u8 => CallNamed,
+            x if x == AppendNamedArg as u8 => AppendNamedArg,
+            x if x == AppendPosArg as u8 => AppendPosArg,
+            x if x == AppendSpreadArg as u8 => AppendSpreadArg,
+            x if x == CallNamedSpread as u8 => CallNamedSpread,
 
             _ => return None,
         })
@@ -724,7 +769,7 @@ impl Op {
             | InstanceOfType | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest
             | MatchHasKey | CallMethodSpread | DefineExport | CheckParam | CheckLocal
             | MatchVariant | VariantElem | VariantField | MatchVariantArity
-            | MatchVariantHasField => 2,
+            | MatchVariantHasField | AppendNamedArg => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -735,7 +780,7 @@ impl Op {
             // u16 + u8 operand op.
             // DEFINE_GLOBAL: u16 name-const index + u8 mutability flag (1 = `let`,
             // 0 = immutable `const`/`fn`/`class`/`enum`/`import`).
-            CallMethod | MatchArray | DefineGlobal => 3,
+            CallMethod | MatchArray | DefineGlobal | CallNamed => 3,
 
             // u16 + i16 operand op.
             // JUMP_IF_ARG_SUPPLIED: u16 param-index + i16 forward jump offset.
@@ -773,6 +818,9 @@ impl Op {
             | AppendObject
             | SpreadObject
             | CallSpread
+            | AppendPosArg
+            | AppendSpreadArg
+            | CallNamedSpread
             | GetIndex
             | SetIndex
             | InstanceOf
@@ -934,6 +982,11 @@ mod tests {
         Op::VariantField,
         Op::MatchVariantArity,
         Op::MatchVariantHasField,
+        Op::CallNamed,
+        Op::AppendNamedArg,
+        Op::AppendPosArg,
+        Op::AppendSpreadArg,
+        Op::CallNamedSpread,
     ];
 
     #[test]

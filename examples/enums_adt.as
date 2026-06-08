@@ -21,7 +21,7 @@ fn area(s: Shape): float {
 }
 
 let c = Shape.Circle(2.0)
-let rect = Shape.Rect(3.0, 4.0)
+let rect = Shape.Rect(w: 3.0, h: 4.0)   // multi-field named variant: named args
 let p = Shape.Pair(3, 4)
 let pt = Shape.Point
 
@@ -55,6 +55,6 @@ fn describe(s: Shape): string {
     _ => "other",
   }
 }
-print(describe(Shape.Rect(5.0, 5.0)))   // square
-print(describe(Shape.Rect(3.0, 4.0)))   // rectangle
-print(describe(Shape.Circle(1.0)))      // circle
+print(describe(Shape.Rect(w: 5.0, h: 5.0)))   // square
+print(describe(Shape.Rect(w: 3.0, h: 4.0)))   // rectangle
+print(describe(Shape.Circle(1.0)))            // circle

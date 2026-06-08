@@ -133,12 +133,16 @@ pub struct MapEntry {
     pub value: Expr,
 }
 
-/// A call argument: positional `x` or a spread `...args`.
-/// Spreading a non-array as call args is a runtime panic (strict).
+/// A call argument: positional `x`, a spread `...args`, or a named `name: x`.
+/// Spreading a non-array as call args is a runtime panic (strict). Named args
+/// (ADT §3.2) are accepted in any call's surface but are only MEANINGFUL for an
+/// enum-variant constructor call (`Shape.Rect(w: 3.0, h: 4.0)`); a named arg on
+/// any other callee is a recoverable Tier-2 error.
 #[derive(Debug, Clone)]
 pub enum CallArg {
     Pos(Expr),
     Spread(Expr),
+    Named { name: std::rc::Rc<str>, value: Expr },
 }
 
 /// A type annotation (spec §5). Checked at runtime as a contract.
@@ -691,6 +695,7 @@ impl fmt::Display for ExprKind {
                     match a {
                         CallArg::Pos(x) => write!(f, " {}", x)?,
                         CallArg::Spread(x) => write!(f, " ...{}", x)?,
+                        CallArg::Named { name, value } => write!(f, " {}: {}", name, value)?,
                     }
                 }
                 write!(f, ")")

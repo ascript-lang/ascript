@@ -3662,8 +3662,8 @@ impl Interp {
                     // enum-variant prop, …), and only THEN evaluate the args, so
                     // a member-read error preempts arg evaluation / side effects.
                     let callee_v = self.read_member(&recv, name, object.span)?;
-                    let values = self.eval_call_args(args, env).await?;
-                    let v = self.call_value(callee_v, values, expr.span).await;
+                    let (values, names) = self.eval_call_args_named(args, env).await?;
+                    let v = self.call_value_named(callee_v, values, names, expr.span).await;
                     return Ok((v?, false));
                 }
 
@@ -3671,8 +3671,8 @@ impl Interp {
                 if sc {
                     return Ok((Value::Nil, true));
                 }
-                let values = self.eval_call_args(args, env).await?;
-                let v = self.call_value(callee_v, values, expr.span).await;
+                let (values, names) = self.eval_call_args_named(args, env).await?;
+                let v = self.call_value_named(callee_v, values, names, expr.span).await;
                 Ok((v?, false))
             }
             _ => Ok((self.eval_expr(expr, env).await?, false)),
@@ -3709,9 +3709,101 @@ impl Interp {
                         }
                     }
                 }
+                // A named argument is only meaningful in an enum-variant constructor
+                // call (the `call_value` general paths handle it via
+                // `eval_call_args_named`). On the schema / workflow-ctx / actor /
+                // worker-spawn native-dispatch paths it has no meaning → clean error.
+                crate::ast::CallArg::Named { name, value } => {
+                    return Err(AsError::at(
+                        format!("unexpected named argument '{}:' in this call", name),
+                        value.span,
+                    )
+                    .into());
+                }
             }
         }
         Ok(values)
+    }
+
+    /// ADT §3.2: evaluate call args, returning both the flattened values and a
+    /// parallel list of per-value names (`None` = positional / spread element,
+    /// `Some` = a `name: expr` named argument). Used by the general `call_value`
+    /// dispatch paths so an enum-variant constructor can resolve named fields. A
+    /// spread expands to multiple positional (`None`) entries, exactly as the
+    /// positional `eval_call_args` does.
+    #[async_recursion(?Send)]
+    async fn eval_call_args_named(
+        &self,
+        args: &[crate::ast::CallArg],
+        env: &Environment,
+    ) -> Result<(Vec<Value>, Vec<Option<std::rc::Rc<str>>>), Control> {
+        let mut values = Vec::new();
+        let mut names: Vec<Option<std::rc::Rc<str>>> = Vec::new();
+        for a in args {
+            match a {
+                crate::ast::CallArg::Pos(x) => {
+                    values.push(self.eval_expr(x, env).await?);
+                    names.push(None);
+                }
+                crate::ast::CallArg::Spread(x) => {
+                    let v = self.eval_expr(x, env).await?;
+                    match v {
+                        Value::Array(arr) => {
+                            for item in arr.borrow().iter() {
+                                values.push(item.clone());
+                                names.push(None);
+                            }
+                        }
+                        other => {
+                            return Err(AsError::at(
+                                format!(
+                                    "can only spread an array as call arguments, got {}",
+                                    type_name(&other)
+                                ),
+                                x.span,
+                            )
+                            .into())
+                        }
+                    }
+                }
+                crate::ast::CallArg::Named { name, value } => {
+                    values.push(self.eval_expr(value, env).await?);
+                    names.push(Some(name.clone()));
+                }
+            }
+        }
+        Ok((values, names))
+    }
+
+    /// ADT §3.2: dispatch a call whose arguments MAY include named args. If any arg
+    /// is named, the only valid callee is an enum-variant constructor (named-field
+    /// construction); otherwise it is a clean Tier-2 error. With no named args this
+    /// is byte-identical to the plain `call_value` path.
+    async fn call_value_named(
+        &self,
+        callee: Value,
+        values: Vec<Value>,
+        names: Vec<Option<std::rc::Rc<str>>>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        if names.iter().any(|n| n.is_some()) {
+            match callee {
+                Value::EnumVariant(ev) => {
+                    self.construct_variant_args(&ev, values, &names, span).await
+                }
+                other => Err(AsError::at(
+                    format!(
+                        "named arguments are only valid for enum-variant construction, \
+                         not for {}",
+                        type_name(&other)
+                    ),
+                    span,
+                )
+                .into()),
+            }
+        } else {
+            self.call_value(callee, values, span).await
+        }
     }
 
     // pub(crate): shared with the bytecode VM (`Op::GetProp`/`Op::GetPropOpt`)
@@ -3946,13 +4038,43 @@ impl Interp {
     /// field type (the SAME `coerce_field`/`check_type` path classes use), then builds
     /// a constructed `EnumVariant` (positional → `Cc<ArrayCell>`, named →
     /// `Cc<ObjectCell>`). A non-constructor (unit) variant call is an error.
-    #[async_recursion(?Send)]
     pub(crate) async fn construct_variant(
         &self,
         ev: &std::rc::Rc<crate::value::EnumVariant>,
         args: Vec<Value>,
         span: Span,
     ) -> Result<Value, Control> {
+        // Positional-only entry (the generic `call_value` dispatch, which has no
+        // arg names): every argument is positional.
+        let arg_names: Vec<Option<std::rc::Rc<str>>> = vec![None; args.len()];
+        self.construct_variant_args(ev, args, &arg_names, span).await
+    }
+
+    /// ADT §3.2: the full variant-construction validator, taking a parallel list of
+    /// per-argument names (`None` = positional arg, `Some` = `name: expr`). It
+    /// enforces the spec's named/positional rules:
+    ///
+    /// - A POSITIONAL variant (`Pair(int, int)`) accepts only positional args; a
+    ///   named arg on it is an error.
+    /// - A NAMED variant: named args (`Rect(w: 3.0, h: 4.0)`) construct it
+    ///   order-independently (each declared field must be supplied exactly once —
+    ///   missing / duplicate / unknown → a clean Tier-2 panic). A POSITIONAL call of
+    ///   a named variant is accepted ONLY for the single-field convenience
+    ///   (`Circle(2.0)`); a multi-field named variant called positionally is the
+    ///   spec error `requires named fields (w:, h:)`.
+    /// - Mixing named + positional args in one call is rejected.
+    ///
+    /// Each resolved field is type-checked against its declared type (the same
+    /// `check_type` contract classes/functions use) in declaration order.
+    #[async_recursion(?Send)]
+    pub(crate) async fn construct_variant_args(
+        &self,
+        ev: &std::rc::Rc<crate::value::EnumVariant>,
+        args: Vec<Value>,
+        arg_names: &[Option<std::rc::Rc<str>>],
+        span: Span,
+    ) -> Result<Value, Control> {
+        debug_assert_eq!(args.len(), arg_names.len());
         // A unit / constructed (already-saturated) variant is not callable.
         if !ev.ctor {
             return Err(AsError::at(
@@ -3983,29 +4105,137 @@ impl Interp {
                 span,
             )
         })?;
-        // Arity check.
-        if args.len() != schema.fields.len() {
-            return Err(AsError::at(
-                format!(
-                    "{}.{} expects {} field{}, got {}",
-                    ev.enum_name,
-                    ev.name,
-                    schema.fields.len(),
-                    if schema.fields.len() == 1 { "" } else { "s" },
-                    args.len()
-                ),
-                span,
-            )
-            .into());
-        }
+
+        let has_named = arg_names.iter().any(|n| n.is_some());
+        let all_named = arg_names.iter().all(|n| n.is_some());
+
+        // Reorder the supplied args into DECLARATION order. `ordered[i]` is the value
+        // for `schema.fields[i]`. For named args we resolve by field name (so call
+        // order is irrelevant); for positional args we keep the call order.
+        let ordered: Vec<Value> = if has_named {
+            // A named arg is only valid on a NAMED variant.
+            if !schema.is_named() {
+                return Err(AsError::at(
+                    format!(
+                        "{}.{} is a positional variant and takes positional arguments, \
+                         not named fields",
+                        ev.enum_name, ev.name
+                    ),
+                    span,
+                )
+                .into());
+            }
+            // Mixing named + positional args in one call is rejected.
+            if !all_named {
+                return Err(AsError::at(
+                    format!(
+                        "{}.{}: arguments must be all named or all positional, not mixed",
+                        ev.enum_name, ev.name
+                    ),
+                    span,
+                )
+                .into());
+            }
+            // Map each declared field name → its supplied value, detecting duplicate
+            // and unknown fields. Build in declaration order; a missing field errors.
+            let mut supplied: indexmap::IndexMap<std::rc::Rc<str>, Value> =
+                indexmap::IndexMap::with_capacity(args.len());
+            for (name_opt, val) in arg_names.iter().zip(args.into_iter()) {
+                // `all_named` guarantees `Some`.
+                let Some(n) = name_opt else { continue };
+                // Unknown field?
+                let known = schema
+                    .fields
+                    .iter()
+                    .any(|(fname, _)| fname.as_deref() == Some(n.as_ref()));
+                if !known {
+                    return Err(AsError::at(
+                        format!("{}.{} has no field '{}'", ev.enum_name, ev.name, n),
+                        span,
+                    )
+                    .into());
+                }
+                if supplied.insert(n.clone(), val).is_some() {
+                    return Err(AsError::at(
+                        format!("{}.{}: duplicate field '{}'", ev.enum_name, ev.name, n),
+                        span,
+                    )
+                    .into());
+                }
+            }
+            // Pull each declared field's value in order; a missing field errors.
+            let mut ordered = Vec::with_capacity(schema.fields.len());
+            for (fname, _) in &schema.fields {
+                // A named variant's fields all have `Some` names (parse invariant).
+                let Some(fname) = fname else {
+                    return Err(AsError::at(
+                        format!(
+                            "internal: named variant {}.{} has a positional field",
+                            ev.enum_name, ev.name
+                        ),
+                        span,
+                    )
+                    .into());
+                };
+                match supplied.shift_remove(fname.as_ref()) {
+                    Some(v) => ordered.push(v),
+                    None => {
+                        return Err(AsError::at(
+                            format!(
+                                "{}.{} is missing field '{}'",
+                                ev.enum_name, ev.name, fname
+                            ),
+                            span,
+                        )
+                        .into());
+                    }
+                }
+            }
+            ordered
+        } else {
+            // Fully positional call. A multi-field NAMED variant requires named args.
+            if schema.is_named() && schema.fields.len() > 1 {
+                let field_list = schema
+                    .fields
+                    .iter()
+                    .filter_map(|(n, _)| n.as_ref().map(|n| format!("{}:", n)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AsError::at(
+                    format!(
+                        "{}.{} requires named fields ({})",
+                        ev.enum_name, ev.name, field_list
+                    ),
+                    span,
+                )
+                .into());
+            }
+            // Arity check (positional).
+            if args.len() != schema.fields.len() {
+                return Err(AsError::at(
+                    format!(
+                        "{}.{} expects {} field{}, got {}",
+                        ev.enum_name,
+                        ev.name,
+                        schema.fields.len(),
+                        if schema.fields.len() == 1 { "" } else { "s" },
+                        args.len()
+                    ),
+                    span,
+                )
+                .into());
+            }
+            args
+        };
+
         // Type-check each field against its declared type in declaration order, the
         // SAME `check_type` contract classes/functions use (handles scalars, `T?`,
         // nested containers `array<T>`/`map<K,V>`, and enum-typed recursive fields).
         // A mismatch is the byte-identical recoverable field-path panic. (v1 does not
         // auto-coerce a raw Object into a class-typed payload field — pattern
         // destructuring is the primary path; field types are validated, not rewritten.)
-        let mut coerced: Vec<Value> = Vec::with_capacity(args.len());
-        for ((fname, fty), arg) in schema.fields.iter().zip(args.into_iter()) {
+        let mut coerced: Vec<Value> = Vec::with_capacity(ordered.len());
+        for ((fname, fty), arg) in schema.fields.iter().zip(ordered.into_iter()) {
             let field_label = match fname {
                 Some(n) => format!("{}.{}.{}", ev.enum_name, ev.name, n),
                 None => format!("{}.{}", ev.enum_name, ev.name),
@@ -7687,6 +7917,125 @@ print(bad[1].message)
         let env = global_env();
         interp.exec(&stmts, &env).await.unwrap();
         assert_eq!(interp.output(), "5\nnil\nnil\nboom\n");
+    }
+
+    // ADT §3.2: named-field variant construction. `ENUM_SHAPE` declares a Circle
+    // (single named field), Rect (multi named field), Pair (positional), Point (unit).
+    const ENUM_SHAPE: &str =
+        "enum Shape { Circle(radius: float), Rect(w: float, h: float), Pair(int, int), Point }\n";
+
+    async fn run_shape(body: &str) -> Result<String, AsError> {
+        let src = format!("{ENUM_SHAPE}{body}");
+        let stmts = parse(&lex(&src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        interp
+            .exec(&stmts, &env)
+            .await
+            .map(|_| interp.output())
+            .map_err(panic_of)
+    }
+
+    #[tokio::test]
+    async fn variant_named_construction_is_order_independent() {
+        // Named args construct a multi-field variant regardless of call order, and
+        // two equal-payload constructions are structurally equal.
+        let out = run_shape(
+            "let a = Shape.Rect(w: 3.0, h: 4.0)\n\
+             let b = Shape.Rect(h: 4.0, w: 3.0)\n\
+             print(a.value)\nprint(b.value)\nprint(a == b)\nprint(a.w)\nprint(a.h)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "{w: 3.0, h: 4.0}\n{w: 3.0, h: 4.0}\ntrue\n3.0\n4.0\n");
+    }
+
+    #[tokio::test]
+    async fn variant_single_named_field_accepts_positional_and_named() {
+        // The single-field convenience: `Circle(2.0)` and `Circle(radius: 2.0)` both
+        // construct, and are equal.
+        let out = run_shape(
+            "let p = Shape.Circle(2.0)\nlet n = Shape.Circle(radius: 2.0)\n\
+             print(p.radius)\nprint(n.radius)\nprint(p == n)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "2.0\n2.0\ntrue\n");
+    }
+
+    #[tokio::test]
+    async fn variant_multi_named_positional_is_spec_error() {
+        // A positional call of a multi-field named variant is the spec'd error.
+        let err = run_shape("print(Shape.Rect(3.0, 4.0))").await.unwrap_err();
+        assert_eq!(err.message, "Shape.Rect requires named fields (w:, h:)");
+    }
+
+    #[tokio::test]
+    async fn variant_named_on_positional_variant_errors() {
+        let err = run_shape("print(Shape.Pair(a: 1, b: 2))")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.message,
+            "Shape.Pair is a positional variant and takes positional arguments, not named fields"
+        );
+    }
+
+    #[tokio::test]
+    async fn variant_named_unknown_field_errors() {
+        let err = run_shape("print(Shape.Rect(w: 3.0, z: 4.0))")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "Shape.Rect has no field 'z'");
+    }
+
+    #[tokio::test]
+    async fn variant_named_missing_field_errors() {
+        let err = run_shape("print(Shape.Rect(w: 3.0))").await.unwrap_err();
+        assert_eq!(err.message, "Shape.Rect is missing field 'h'");
+    }
+
+    #[tokio::test]
+    async fn variant_named_duplicate_field_errors() {
+        let err = run_shape("print(Shape.Rect(w: 3.0, w: 4.0))")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "Shape.Rect: duplicate field 'w'");
+    }
+
+    #[tokio::test]
+    async fn variant_named_field_type_is_validated() {
+        let err = run_shape("print(Shape.Rect(w: \"x\", h: 4.0))")
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "Shape.Rect.w: expected float, got string");
+    }
+
+    #[tokio::test]
+    async fn variant_named_first_class_constructor() {
+        // A first-class constructor (`let mk = Shape.Rect`) accepts named args.
+        let out = run_shape(
+            "let mk = Shape.Rect\nlet r = mk(h: 2.0, w: 1.0)\nprint(r.value)",
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "{w: 1.0, h: 2.0}\n");
+    }
+
+    #[tokio::test]
+    async fn named_args_on_non_variant_callee_errors() {
+        // Named args are only valid for variant construction.
+        let src = "fn f(x) { return x }\nprint(f(x: 1))";
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        let err = panic_of(interp.exec(&stmts, &env).await.unwrap_err());
+        assert!(
+            err.message
+                .contains("named arguments are only valid for enum-variant construction"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
