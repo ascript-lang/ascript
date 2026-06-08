@@ -7468,9 +7468,36 @@ async fn iface_instanceof_and_contract_three_way() {
         "interface R { fn read(b): int }\nprint(R)",
         // arity table: defaulted param satisfies arity-1 and arity-2 requirements
         "interface R1 { fn read(b): int }\ninterface R2 { fn read(b, o): int }\nclass D { fn read(b, opts) { return 0 } }\nprint(D() instanceof R1)\nprint(D() instanceof R2)",
+        // a REST class method (min 0, max ∞) satisfies a fixed-arity requirement —
+        // the tw `find_method` arity check and the VM compiled-proto side table must agree
+        "interface R2 { fn read(b, o): int }\nclass V { fn read(...xs) { return 0 } }\nprint(V() instanceof R2)",
+        // a REST requirement demands a variadic method: a rest method conforms, a
+        // fixed-arity one does not (exercises req.has_rest on both engines)
+        "interface RV { fn log(...xs) }\nclass L { fn log(...ys) { return 0 } }\nclass L2 { fn log(a) { return 0 } }\nprint(L() instanceof RV)\nprint(L2() instanceof RV)",
     ];
     for src in cases {
         assert_opt_call_ok_three_way(src).await;
+    }
+}
+
+#[tokio::test]
+async fn iface_contract_and_extends_errors_three_way() {
+    // Interface enforcement + malformed-`extends` must FAIL byte-identically on all three
+    // engines (tree-walker == specialized == generic). Closes the IFACE-review test gaps:
+    // a non-conforming arg to an interface-typed param, a cyclic `extends`, and an
+    // `extends` naming a class / an unknown name.
+    let cases = [
+        // negative interface-typed param contract: NoRead lacks `read` → rejected
+        "interface R { fn read(b): int }\nclass NoRead { fn write(b) { return 0 } }\nfn slurp(r: R) { return 0 }\nprint(slurp(NoRead()))",
+        // cyclic extends → recoverable panic naming the chain (no stack overflow)
+        "interface A extends B {}\ninterface B extends A {}\nclass C {}\nprint(C() instanceof A)",
+        // extends a CLASS, not an interface → clean error
+        "class K {}\ninterface I extends K {}\nclass C { fn m() {} }\nprint(C() instanceof I)",
+        // extends an UNKNOWN name → clean error
+        "interface I extends Nope {}\nclass C {}\nprint(C() instanceof I)",
+    ];
+    for src in cases {
+        assert_opt_call_error_three_way(src).await;
     }
 }
 

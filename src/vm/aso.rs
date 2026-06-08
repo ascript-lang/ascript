@@ -165,6 +165,11 @@ pub enum AsoError {
     /// compiler invariant violation (the pool must hold only literal scalars +
     /// prebuilt enums). Carries a short description of the offending kind.
     NonLiteralConst(&'static str),
+    /// A surface form that is VALID but whose `.aso` serialization is not yet implemented
+    /// was encountered during ENCODING. Unlike `NonLiteralConst` this is NOT a compiler
+    /// bug — it's an intentional, clearly-messaged boundary (e.g. interface programs until
+    /// IFACE Task 9). Carries a user-facing description.
+    Unsupported(&'static str),
     /// A field exceeded the `.aso` wire-format capacity during ENCODING (SP3 §A):
     /// a single string/bytes literal > `u32::MAX` bytes (`what = "byte field"`), or
     /// a serialized collection with > `u32::MAX` entries (`what = "collection"`).
@@ -191,6 +196,9 @@ impl std::fmt::Display for AsoError {
             AsoError::TrailingBytes => write!(f, "trailing bytes after .aso chunk"),
             AsoError::NonLiteralConst(kind) => {
                 write!(f, "non-literal value ({kind}) in constant pool (compiler bug)")
+            }
+            AsoError::Unsupported(what) => {
+                write!(f, "cannot serialize to .aso yet: {what}")
             }
             AsoError::TooLarge { what, .. } => match *what {
                 "byte field" => write!(
@@ -602,7 +610,9 @@ fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
     // `interface_protos` (which would crash `Op::DefineInterface` on load). Empty for
     // every non-interface program (the common case), so `.aso` round-trips unchanged.
     if !c.interface_protos.is_empty() {
-        return Err(AsoError::NonLiteralConst("interface (.aso support lands in IFACE Task 9)"));
+        return Err(AsoError::Unsupported(
+            "programs that declare an interface (lands in IFACE Task 9)",
+        ));
     }
     // imports
     w.len(c.imports.len());

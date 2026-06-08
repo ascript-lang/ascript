@@ -551,13 +551,26 @@ pub struct Interp {
     /// `worker fn` call with no source set raises a clear recoverable panic.
     /// IFACE §5.3: the per-isolate `instanceof Interface` verdict cache. Memoizes the
     /// structural `conforms` result keyed by `(Rc::as_ptr(class) as usize,
-    /// Rc::as_ptr(iface) as usize)`. Stores `usize` keys + a `bool` ONLY — no `Value`,
-    /// no `Rc`, no `Cc` — so it holds nothing alive and the GC never traces it. Sound
-    /// because class/interface descriptors are load-time-immortal within an isolate; a
-    /// pure memo (same answer hot or cold), active in BOTH specialized and generic VM
-    /// modes. A REPL redefinition / a worker isolate keys on fresh pointers + a cold
-    /// cache, so no stale verdict survives.
-    iface_verdict_cache: RefCell<HashMap<(usize, usize), bool>>,
+    /// Rc::as_ptr(iface) as usize)`. Stores `usize` keys + `(generation, bool)` ONLY — no
+    /// `Value`, no `Rc`, no `Cc` — so it holds nothing alive and the GC never traces it; a
+    /// pure memo (same answer hot or cold), active in BOTH specialized and generic VM modes.
+    ///
+    /// **Pointer-reuse soundness (the generation guard).** Class/interface descriptors are
+    /// NOT load-time-immortal: a `class`/`interface` declared inside a fn body or loop mints
+    /// a fresh `Rc` per execution that can drop to refcount 0 when its scope dies, after
+    /// which the allocator may hand the SAME address to a later, DIFFERENT descriptor. A raw
+    /// pointer key would then alias a stale verdict. So each entry records the
+    /// `iface_cache_gen` it was computed under, and `iface_cache_gen` is bumped on every
+    /// runtime class/interface DEFINITION (tree-walker `exec` + VM `Op::Class`/
+    /// `Op::DefineInterface`). A reused address necessarily carries an older generation than
+    /// the define that created the new descriptor, so its entry is treated as a miss and
+    /// recomputed. In the common case (all descriptors defined at load, before any
+    /// `instanceof`) the generation stabilizes early and every verdict stays cached.
+    iface_verdict_cache: RefCell<HashMap<(usize, usize), (u64, bool)>>,
+    /// Monotonic generation bumped on every runtime class/interface definition; guards
+    /// `iface_verdict_cache` against pointer reuse (see its doc). Pure-memo invalidation, so
+    /// it never changes observable behavior — only whether a verdict is recomputed.
+    iface_cache_gen: std::cell::Cell<u64>,
     worker_source: RefCell<Option<Rc<str>>>,
     /// Workers Spec A (.aso path): the raw `.aso` bytes of the entry program, retained
     /// so a `worker fn` dispatch can re-parse them into a top-level
@@ -838,6 +851,7 @@ impl Interp {
             determinism: RefCell::new(None),
             package_resolver: RefCell::new(None),
             iface_verdict_cache: RefCell::new(HashMap::new()),
+            iface_cache_gen: std::cell::Cell::new(0),
             worker_source: RefCell::new(None),
             worker_aso_bytes: RefCell::new(None),
         }
@@ -2904,6 +2918,8 @@ impl Interp {
                     is_worker: *is_worker,
                 }));
                 env.define(name, class, false).map_err(AsError::new)?;
+                // Invalidate any verdict cached against a now-reusable class pointer.
+                self.bump_iface_cache_gen();
                 Ok(Flow::Normal)
             }
             Stmt::Interface {
@@ -2932,6 +2948,8 @@ impl Interp {
                     flat: std::cell::RefCell::new(None),
                 }));
                 env.define(name, def, false).map_err(AsError::new)?;
+                // Invalidate any verdict cached against a now-reusable interface pointer.
+                self.bump_iface_cache_gen();
                 Ok(Flow::Normal)
             }
             Stmt::Export(inner) => {
@@ -5081,8 +5099,14 @@ impl Interp {
             Rc::as_ptr(&class) as usize,
             Rc::as_ptr(iface) as usize,
         );
-        if let Some(&verdict) = self.iface_verdict_cache.borrow().get(&key) {
-            return Ok(verdict);
+        let gen = self.iface_cache_gen.get();
+        // A hit is trusted ONLY when its stored generation still matches: a pointer reused
+        // by a later, different descriptor carries an older generation (the define that
+        // created it bumped the counter) and is treated as a miss. See the field doc.
+        if let Some(&(entry_gen, verdict)) = self.iface_verdict_cache.borrow().get(&key) {
+            if entry_gen == gen {
+                return Ok(verdict);
+            }
         }
         let methods = self.flatten_interface(iface)?;
         // VM classes keep an EMPTY `Class.methods` (their compiled methods live in the
@@ -5106,8 +5130,19 @@ impl Interp {
                 break;
             }
         }
-        self.iface_verdict_cache.borrow_mut().insert(key, verdict);
+        self.iface_verdict_cache
+            .borrow_mut()
+            .insert(key, (gen, verdict));
         Ok(verdict)
+    }
+
+    /// Bump the `instanceof Interface` verdict-cache generation. Called at every runtime
+    /// class/interface DEFINITION so a freed-then-reallocated descriptor at a reused
+    /// address can never read a stale verdict (see the `iface_verdict_cache` field doc).
+    /// Pure-memo invalidation — never changes observable behavior.
+    pub(crate) fn bump_iface_cache_gen(&self) {
+        self.iface_cache_gen
+            .set(self.iface_cache_gen.get().wrapping_add(1));
     }
 
     /// IFACE §4: lazily flatten an interface's transitive required method set (own +
@@ -5121,14 +5156,16 @@ impl Interp {
         &self,
         iface: &Rc<crate::value::InterfaceDef>,
     ) -> Result<Rc<indexmap::IndexMap<String, crate::value::MethodReq>>, Control> {
-        let mut visited: Vec<*const crate::value::InterfaceDef> = Vec::new();
+        let mut visited: Vec<(*const crate::value::InterfaceDef, String)> = Vec::new();
         self.flatten_interface_inner(iface, &mut visited)
     }
 
     fn flatten_interface_inner(
         &self,
         iface: &Rc<crate::value::InterfaceDef>,
-        visited: &mut Vec<*const crate::value::InterfaceDef>,
+        // (identity pointer, name) — the pointer drives cycle detection; the name builds
+        // the chain message WITHOUT an `unsafe` deref of a raw pointer.
+        visited: &mut Vec<(*const crate::value::InterfaceDef, String)>,
     ) -> Result<Rc<indexmap::IndexMap<String, crate::value::MethodReq>>, Control> {
         // Memo hit: return the cached flattened set (borrow dropped immediately).
         if let Some(flat) = iface.flat.borrow().as_ref() {
@@ -5137,11 +5174,8 @@ impl Interp {
         // Cycle guard: re-entering an interface already on the resolution stack is a
         // recoverable Tier-2 panic naming the chain.
         let ptr = Rc::as_ptr(iface);
-        if visited.contains(&ptr) {
-            let mut chain: Vec<String> = visited
-                .iter()
-                .map(|&p| unsafe { (*p).name.clone() })
-                .collect();
+        if visited.iter().any(|(p, _)| *p == ptr) {
+            let mut chain: Vec<String> = visited.iter().map(|(_, n)| n.clone()).collect();
             chain.push(iface.name.clone());
             return Err(AsError::new(format!(
                 "cyclic interface extends: {}",
@@ -5149,7 +5183,7 @@ impl Interp {
             ))
             .into());
         }
-        visited.push(ptr);
+        visited.push((ptr, iface.name.clone()));
         // Resolve each `extends` name, recursively union (base-first, own-wins).
         let mut flat: indexmap::IndexMap<String, crate::value::MethodReq> = indexmap::IndexMap::new();
         for ext_name in &iface.extends {
@@ -6740,11 +6774,13 @@ pub(crate) fn check_call_args(
     args: Vec<Value>,
     span: Span,
     what: &str,
-    // IFACE: the engine's env-aware contract resolution context. `Some` on the
-    // tree-walker (its `Environment` chains to the def env / module globals where
-    // interface/class names resolve); `None` on the VM until Task 6 wires the VM's
-    // user-globals resolution — in which case a `Type::Named` falls to the env-free
-    // `check_type` (exact pre-IFACE behavior, byte-identical for non-interface code).
+    // IFACE: the engine's env-aware contract resolution context. BOTH engines pass
+    // `Some` (tree-walker: its `Environment` chains to the def env / module globals;
+    // VM: `Some(&self.interp, &self.class_env())`, the shared module env where
+    // `Op::DefineInterface`/`Op::Class` register descriptors) so an interface/class
+    // `Type::Named` resolves and enforces conformance. The `Option` is retained for
+    // env-less internal callers; `None` falls to the env-free `check_type` (the exact
+    // pre-IFACE behavior, byte-identical for non-interface code).
     interp: Option<&Interp>,
     env: Option<&Environment>,
 ) -> Result<BoundArgs, Control> {
@@ -6813,10 +6849,10 @@ pub(crate) fn check_call_args(
     for p in &params[..supplied] {
         let a = it.next().unwrap();
         if let Some(ty) = &p.ty {
-            // IFACE: when the engine supplies its resolution env (tree-walker), a
+            // IFACE: when the engine supplies its resolution env (BOTH engines do), a
             // `Type::Named` resolves env-aware (interface → structural `conforms`,
-            // class → nominal); otherwise (VM path until Task 6) the env-free
-            // `check_type` keeps the exact pre-IFACE behavior — byte-identical for
+            // class → nominal); an env-less internal caller falls to the env-free
+            // `check_type`, the exact pre-IFACE behavior — byte-identical for
             // non-interface code.
             let ok = match (interp, env) {
                 (Some(itp), Some(e)) => itp.check_type_env(&a, ty, e)?,
@@ -11048,6 +11084,53 @@ print(n?.m())
     }
 
     #[test]
+    fn iface_verdict_cache_generation_guard_drops_stale_pointer_entries() {
+        // Regression (IFACE review): the verdict cache keys on raw `Rc::as_ptr` values.
+        // A class/interface declared inside a fn/loop is NOT load-time-immortal — it can
+        // be freed and the allocator can hand the SAME address to a later, DIFFERENT
+        // descriptor, which would otherwise read a stale verdict. The generation guard
+        // (bumped on every runtime class/interface DEFINITION) must make a pre-bump entry
+        // a cache MISS so it is recomputed, never trusted. Deterministic (no reliance on
+        // the allocator actually reusing an address): we assert the gen-stamp mechanics.
+        let interp = Interp::new();
+        let env = global_env().child();
+        let reader = iface_def(&env, "Reader", vec![("read", 1)], vec![]);
+        let file = iface_class(
+            &env,
+            "File",
+            vec![("read", iface_method(vec![iface_param("b", false, false)]))],
+            None,
+        );
+        let inst = iface_instance(file.clone());
+        // First check caches the verdict stamped with the current generation.
+        assert!(interp.conforms(&inst, &reader).unwrap());
+        let key = (
+            std::rc::Rc::as_ptr(&file) as usize,
+            std::rc::Rc::as_ptr(&reader) as usize,
+        );
+        let gen0 = interp.iface_cache_gen.get();
+        assert_eq!(
+            interp.iface_verdict_cache.borrow().get(&key),
+            Some(&(gen0, true)),
+            "verdict must be cached stamped with the current generation"
+        );
+        // A runtime define (what a nested `class`/`interface` triggers) bumps the gen,
+        // making the entry recorded under gen0 stale.
+        interp.bump_iface_cache_gen();
+        let gen1 = interp.iface_cache_gen.get();
+        assert_ne!(gen0, gen1, "a definition must bump the generation");
+        // Reading now must MISS on the stale-gen entry, recompute, and re-stamp gen1.
+        // The re-stamp is the observable proof the stale entry was NOT trusted: a broken
+        // guard (gen-blind hit) would leave the entry at gen0.
+        assert!(interp.conforms(&inst, &reader).unwrap());
+        assert_eq!(
+            interp.iface_verdict_cache.borrow().get(&key),
+            Some(&(gen1, true)),
+            "a stale-generation entry must be recomputed and re-stamped, not trusted"
+        );
+    }
+
+    #[test]
     fn conforms_inherited_method_satisfies() {
         let interp = Interp::new();
         let env = global_env().child();
@@ -11064,10 +11147,12 @@ print(n?.m())
         // requirement read(b) arity 1 ; read(b,o) arity 2
         let req1 = iface_def(&env, "R1", vec![("read", 1)], vec![]);
         let req2 = iface_def(&env, "R2", vec![("read", 2)], vec![]);
-        // Build one instance per class and keep them ALIVE for the whole test (the
-        // verdict cache keys on class/iface pointers, which are load-time-immortal in
-        // a real run — §5.3; in a test we must not free a class between checks or its
-        // address can be reused and the cache would collide).
+        // Build one instance per class and keep them ALIVE for the whole test. In a real
+        // run a runtime define bumps `iface_cache_gen` so a reused pointer can't read a
+        // stale verdict (see `iface_verdict_cache_generation_guard_*`); but these helpers
+        // construct descriptors directly WITHOUT going through `exec`/`Op` (no gen bump),
+        // so here we must not free a class between checks or its address could be reused
+        // within a single generation and collide.
         // fn read(b, opts=nil) → min 1 max 2 : satisfies BOTH arity 1 and arity 2
         let i_default = iface_instance(iface_class(&env, "D", vec![("read", iface_method(vec![iface_param("b", false, false), iface_param("opts", true, false)]))], None));
         assert!(interp.conforms(&i_default, &req1).unwrap());

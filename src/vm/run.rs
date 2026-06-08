@@ -3255,6 +3255,9 @@ impl Vm {
                     self.class_methods.borrow_mut().insert(key, method_map);
                     self.class_static_methods.borrow_mut().insert(key, static_map);
                     self.class_defaults.borrow_mut().insert(key, default_map);
+                    // Invalidate any verdict cached against a now-reusable class pointer
+                    // (the Interp cache is shared by both engines). See its field doc.
+                    self.interp.bump_iface_cache_gen();
                     fiber.push(Value::Class(class));
                 }
 
@@ -3292,6 +3295,8 @@ impl Vm {
                     // Push the descriptor; the compiler emitted the matching bind op
                     // (DEFINE_GLOBAL for a top-level interface, SET_LOCAL for a nested
                     // one) immediately after — exactly like Op::Class.
+                    // Invalidate any verdict cached against a now-reusable interface pointer.
+                    self.interp.bump_iface_cache_gen();
                     fiber.push(iface);
                 }
 
