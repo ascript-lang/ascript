@@ -97,6 +97,17 @@ module.exports = grammar({
     // `_primary_expression` (the `=>` is the arm separator) vs shift into a bare
     // `arrow_function` param.
     [$.arrow_function, $._primary_expression],
+    // ----- ADT: variant pattern vs call expression -------------------------
+    // A positional `Circle(r)` reduces to a `call_expression` (semantic recovery),
+    // while a NAMED `Rect(w: ww)` reduces to a `variant_pattern`. Both share the
+    // `<variant-ref> (` prefix until the first field's `key :` (named) or value
+    // (positional) disambiguates; GLR keeps both alive.
+    // A bare `Circle(` reduces to `_primary_expression` (the call callee, → a
+    // positional pattern via semantic recovery) vs `variant_pattern` (named); a
+    // qualified `Shape.Rect(` reduces to `_postfix_expression` (member-call callee)
+    // vs `variant_pattern`. GLR keeps both alive until the first field disambiguates.
+    [$.variant_pattern, $._primary_expression],
+    [$.variant_pattern, $._postfix_expression],
   ],
 
   rules: {
@@ -275,7 +286,17 @@ module.exports = grammar({
     ),
     enum_variant: $ => seq(
       field('name', $.identifier),
-      optional(seq('=', field('value', $._expression))),
+      // ADT: a `= scalar` backing OR a `(…)` payload, never both (the legacy/CST
+      // parsers enforce the XOR; the grammar permits each independently).
+      optional(choice(
+        seq('=', field('value', $._expression)),
+        seq('(', commaSep1($.variant_field), optional(','), ')'),
+      )),
+    ),
+    // ADT: one declared payload field — named `id: T` or positional `T`.
+    variant_field: $ => seq(
+      optional(seq(field('field', $.identifier), ':')),
+      field('type', $._type),
     ),
 
     // ----- Control flow ----------------------------------------------------
@@ -460,8 +481,28 @@ module.exports = grammar({
       $.wildcard_pattern,
       $.array_pattern_match,
       $.object_pattern_match,
+      $.variant_pattern, // ADT: NAMED variant destructure `Rect(w: ww)` (see note)
       $.identifier_pattern,
       $._match_subject, // literal / enum-variant / member / call / RANGE value pattern
+    ),
+    // ADT: a NAMED variant-destructuring pattern — `Rect(w: ww)` / `Circle(radius: 0.0)`
+    // / `Shape.Rect(w: ww)`. POSITIONAL variant patterns (`Circle(r)`, `Pair(a, b)`)
+    // are NOT a dedicated rule: they ride `call_expression` through the `_match_subject`
+    // value-pattern branch (semantic recovery, exactly how the hand parser re-classifies
+    // a parsed call into a variant pattern). Only the named form — whose `key: subpat`
+    // entries are not valid call arguments — needs this node. A declared GLR conflict
+    // with `call_expression` keeps the positional form a call and the named form a
+    // variant_pattern.
+    variant_pattern: $ => seq(
+      field('variant', choice($.identifier, $.member_expression)),
+      '(',
+      commaSep1($.variant_pattern_field),
+      optional(','),
+      ')',
+    ),
+    variant_pattern_field: $ => seq(
+      field('field', $.identifier),
+      optional(seq(':', field('pattern', $._match_pattern_single))),
     ),
     wildcard_pattern: _ => '_',
     // A bare identifier pattern (Option C: compare-if-defined / bind-if-new,

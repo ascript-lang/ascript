@@ -141,7 +141,7 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
         // u16 const-pool index (a destructure key, or the bound-keys array) →
         // show the referenced value.
         Op::ObjectKey | Op::ObjectRest | Op::MatchHasKey | Op::DefineExport
-        | Op::InstanceOfType => {
+        | Op::InstanceOfType | Op::MatchVariant | Op::VariantField | Op::MatchVariantHasField => {
             let idx = chunk.read_u16(at + 1);
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
         }
@@ -314,6 +314,11 @@ fn op_name(op: Op) -> &'static str {
         WrapSub => "WRAP_SUB",
         WrapMul => "WRAP_MUL",
         CheckLocal => "CHECK_LOCAL",
+        MatchVariant => "MATCH_VARIANT",
+        VariantElem => "VARIANT_ELEM",
+        VariantField => "VARIANT_FIELD",
+        MatchVariantArity => "MATCH_VARIANT_ARITY",
+        MatchVariantHasField => "MATCH_VARIANT_HAS_FIELD",
     }
 }
 

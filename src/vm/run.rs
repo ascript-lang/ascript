@@ -2398,6 +2398,142 @@ impl Vm {
                     fiber.push(Value::Bool(ok));
                 }
 
+                Op::MatchVariant => {
+                    // ADT: `subject -- ok:bool`. Pop the subject; push whether it is a
+                    // CONSTRUCTED `EnumVariant` (payload present, not a constructor)
+                    // matching the variant name (and enum name, if the const carries
+                    // one). The const is `[variantName:Str, enumNameOrNil]`. Mirrors the
+                    // head tag-test of the tree-walker's `match_variant_pattern`.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let (want_variant, want_enum) =
+                        match &fiber.frame().closure.proto.chunk.consts[idx] {
+                            Value::Array(a) => {
+                                let b = a.borrow();
+                                let v = match b.first() {
+                                    Some(Value::Str(s)) => s.clone(),
+                                    _ => {
+                                        return Err(self.panic_at(
+                                            fiber,
+                                            fault_ip,
+                                            "MATCH_VARIANT operand[0] is not a string".to_string(),
+                                        ))
+                                    }
+                                };
+                                let e = match b.get(1) {
+                                    Some(Value::Str(s)) => Some(s.clone()),
+                                    _ => None,
+                                };
+                                (v, e)
+                            }
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("MATCH_VARIANT operand is not an array: {other:?}"),
+                                ))
+                            }
+                        };
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::EnumVariant(ev) if ev.payload.is_some() => {
+                            ev.name.as_str() == want_variant.as_ref()
+                                && want_enum
+                                    .as_ref()
+                                    .map(|e| ev.enum_name.as_str() == e.as_ref())
+                                    .unwrap_or(true)
+                        }
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchVariantArity => {
+                    // ADT: `subject -- ok:bool`. Pop the subject; push whether its
+                    // payload has exactly `n` values. Mirrors the positional length
+                    // guard `items.len() != pats.len()`.
+                    let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let subject = fiber.pop();
+                    let len = variant_payload_len(&subject);
+                    fiber.push(Value::Bool(len == Some(n)));
+                }
+
+                Op::MatchVariantHasField => {
+                    // ADT: `subject -- ok:bool`. Pop the subject; push whether it has a
+                    // NAMED payload field `consts[idx]`. Mirrors the named-destructure
+                    // presence check.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("MATCH_VARIANT_HAS_FIELD operand is not a string: {other:?}"),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Named(o)) => {
+                                o.borrow().contains_key(key.as_ref())
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::VariantElem => {
+                    // ADT: `subject -- value`. Pop a constructed variant; push its
+                    // `idx`-th payload value IN DECLARATION ORDER (positional element,
+                    // or named field value in insertion order). Mirrors the tree-walker
+                    // positional destructure.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let subject = fiber.pop();
+                    let v = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Positional(a)) => {
+                                a.borrow().get(idx).cloned().unwrap_or(Value::Nil)
+                            }
+                            Some(crate::value::Payload::Named(o)) => {
+                                o.borrow().get_index(idx).map(|(_, v)| v.clone()).unwrap_or(Value::Nil)
+                            }
+                            None => Value::Nil,
+                        },
+                        _ => Value::Nil,
+                    };
+                    fiber.push(v);
+                }
+
+                Op::VariantField => {
+                    // ADT: `subject -- value`. Pop a constructed variant; push its
+                    // NAMED payload field `consts[idx]` (presence already checked).
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("VARIANT_FIELD operand is not a string: {other:?}"),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let v = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Named(o)) => {
+                                o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                            }
+                            _ => Value::Nil,
+                        },
+                        _ => Value::Nil,
+                    };
+                    fiber.push(v);
+                }
+
                 Op::MatchRange => {
                     // `subject lo hi step -- ok:bool` (step on top). flags bit0 =
                     // inclusive, bit1 = step PRESENT. Pop all four; push whether the
@@ -4348,6 +4484,20 @@ impl Vm {
         self.leave_frame_depth();
         fiber.push(value);
         Ok(None)
+    }
+}
+
+/// ADT: the number of payload values a constructed variant carries (positional →
+/// element count; named → field count), or `None` if `v` is not a constructed
+/// variant. Used by `MATCH_VARIANT_ARITY` (the positional length guard).
+fn variant_payload_len(v: &Value) -> Option<usize> {
+    match v {
+        Value::EnumVariant(ev) => match &ev.payload {
+            Some(crate::value::Payload::Positional(a)) => Some(a.borrow().len()),
+            Some(crate::value::Payload::Named(o)) => Some(o.borrow().len()),
+            None => None,
+        },
+        _ => None,
     }
 }
 

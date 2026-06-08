@@ -349,6 +349,22 @@ fn write_enum_variant(out: &mut String, v: &EnumVariantDecl, level: usize) {
         out.push_str(" = ");
         write_expr(out, value, 0);
     }
+    // ADT: a payload variant renders its declared field list — `Circle(radius: float)`
+    // (named) or `Pair(int, int)` (positional). Mutually exclusive with `= value`.
+    if !v.payload.is_empty() {
+        out.push('(');
+        for (i, field) in v.payload.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            if let Some(name) = &field.name {
+                out.push_str(name);
+                out.push_str(": ");
+            }
+            out.push_str(&render_type(&field.ty));
+        }
+        out.push(')');
+    }
     out.push_str(",\n");
 }
 
@@ -769,6 +785,41 @@ fn write_pattern(out: &mut String, pat: &Pattern) {
             }
             write_pattern_rest(out, rest, !entries.is_empty());
             out.push('}');
+        }
+        Pattern::Variant {
+            enum_name,
+            variant,
+            fields,
+        } => {
+            if let Some(en) = enum_name {
+                out.push_str(en);
+                out.push('.');
+            }
+            out.push_str(variant);
+            out.push('(');
+            match fields {
+                crate::ast::VariantPatFields::Positional(pats) => {
+                    for (i, p) in pats.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        write_pattern(out, p);
+                    }
+                }
+                crate::ast::VariantPatFields::Named(entries) => {
+                    for (i, (k, p)) in entries.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push_str(k);
+                        if let Some(p) = p {
+                            out.push_str(": ");
+                            write_pattern(out, p);
+                        }
+                    }
+                }
+            }
+            out.push(')');
         }
     }
 }

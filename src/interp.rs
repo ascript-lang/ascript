@@ -2760,21 +2760,48 @@ impl Interp {
             }
             Stmt::Enum { name, variants, .. } => {
                 let mut map = indexmap::IndexMap::new();
+                let mut schemas = indexmap::IndexMap::new();
                 for v in variants {
-                    let backing = match &v.value {
-                        Some(e) => self.eval_expr(e, env).await?,
-                        None => Value::Nil,
+                    // ADT: build the per-variant schema (empty for unit/scalar-backed).
+                    let schema = crate::value::VariantSchema {
+                        fields: v
+                            .payload
+                            .iter()
+                            .map(|f| (f.name.clone(), f.ty.clone()))
+                            .collect(),
                     };
-                    let variant = Value::EnumVariant(std::rc::Rc::new(crate::value::EnumVariant {
-                        enum_name: name.clone(),
-                        name: v.name.clone(),
-                        value: backing,
-                    }));
+                    let variant = if schema.has_payload() {
+                        // A payload variant interns as an unsaturated CONSTRUCTOR
+                        // (`ctor: true`); calling it constructs the payload value.
+                        Value::EnumVariant(std::rc::Rc::new(crate::value::EnumVariant {
+                            enum_name: name.clone(),
+                            name: v.name.clone(),
+                            value: Value::Nil,
+                            payload: None,
+                            ctor: true,
+                        def: None,
+                        }))
+                    } else {
+                        let backing = match &v.value {
+                            Some(e) => self.eval_expr(e, env).await?,
+                            None => Value::Nil,
+                        };
+                        Value::EnumVariant(std::rc::Rc::new(crate::value::EnumVariant {
+                            enum_name: name.clone(),
+                            name: v.name.clone(),
+                            value: backing,
+                            payload: None,
+                            ctor: false,
+                        def: None,
+                        }))
+                    };
                     map.insert(v.name.clone(), variant);
+                    schemas.insert(v.name.clone(), schema);
                 }
                 let def = Value::Enum(std::rc::Rc::new(crate::value::EnumDef {
                     name: name.clone(),
                     variants: map,
+                    variant_schemas: schemas,
                 }));
                 env.define(name, def, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
@@ -3428,6 +3455,100 @@ impl Interp {
                 }
                 Ok(true)
             }
+            Pattern::Variant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                self.match_variant_pattern(enum_name, variant, fields, subject, bindings, env)
+                    .await
+            }
+        }
+    }
+
+    /// ADT: match a `Pattern::Variant` against `subject`. Tag-test (the subject must
+    /// be an `EnumVariant` of `variant`, and of `enum_name` when qualified), then
+    /// destructure the payload positionally (by index) or by named field. A subject
+    /// that is not a matching variant is a (non-panic) mismatch. Byte-identical to
+    /// the VM's `compile_variant_pattern` lowering.
+    #[async_recursion(?Send)]
+    async fn match_variant_pattern(
+        &self,
+        enum_name: &Option<Rc<str>>,
+        variant: &Rc<str>,
+        fields: &crate::ast::VariantPatFields,
+        subject: &Value,
+        bindings: &mut Vec<(Rc<str>, Value)>,
+        env: &Environment,
+    ) -> Result<bool, Control> {
+        use crate::ast::VariantPatFields;
+        // The subject must be an EnumVariant whose name == `variant` (and whose
+        // `enum_name` == `enum_name` when the pattern is qualified). A constructor
+        // (`ctor: true`) is not a constructed value and never matches.
+        let ev = match subject {
+            Value::EnumVariant(ev) if !ev.ctor => ev,
+            _ => return Ok(false),
+        };
+        if ev.name.as_str() != variant.as_ref() {
+            return Ok(false);
+        }
+        if let Some(en) = enum_name {
+            if ev.enum_name.as_str() != en.as_ref() {
+                return Ok(false);
+            }
+        }
+        match fields {
+            VariantPatFields::Positional(pats) => {
+                // Snapshot the payload's values IN DECLARATION ORDER (do not hold a
+                // borrow across awaits). A positional pattern binds by position against
+                // EITHER a positional payload OR a named one (named values in
+                // insertion = declaration order) — so `Circle(r)` binds the single
+                // `radius` field, `Rect(w, h)` binds `w`/`h` by position (ADT §3.3). A
+                // unit payload (`None`) cannot match.
+                let items: Vec<Value> = match &ev.payload {
+                    Some(crate::value::Payload::Positional(a)) => {
+                        a.borrow().iter().cloned().collect()
+                    }
+                    Some(crate::value::Payload::Named(o)) => {
+                        o.borrow().values().cloned().collect()
+                    }
+                    None => return Ok(false),
+                };
+                if items.len() != pats.len() {
+                    return Ok(false);
+                }
+                for (p, item) in pats.iter().zip(items.iter()) {
+                    if !self.match_pattern(p, item, bindings, env).await? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            VariantPatFields::Named(entries) => {
+                // Snapshot the named payload's fields. A non-named payload cannot
+                // match a named pattern.
+                let map: indexmap::IndexMap<String, Value> = match &ev.payload {
+                    Some(crate::value::Payload::Named(o)) => o.borrow().clone(),
+                    _ => return Ok(false),
+                };
+                for (key, subpat) in entries {
+                    let field = match map.get(key.as_ref()) {
+                        Some(v) => v.clone(),
+                        None => return Ok(false),
+                    };
+                    match subpat {
+                        // `Rect(w)` shorthand → bind field `w` (mirrors object `{key}`).
+                        None => bindings.push((key.clone(), field)),
+                        // `Rect(w: ww)` → match field `w` against sub-pattern `ww`.
+                        Some(p) => {
+                            if !self.match_pattern(p, &field, bindings, env).await? {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+                Ok(true)
+            }
         }
     }
 
@@ -3604,16 +3725,52 @@ impl Interp {
     ) -> Result<Value, AsError> {
         match obj {
             Value::Object(map) => Ok(map.borrow().get(name).cloned().unwrap_or(Value::Nil)),
-            Value::Enum(e) => e.variants.get(name).cloned().ok_or_else(|| {
-                AsError::at(format!("enum {} has no variant '{}'", e.name, name), span)
-            }),
+            Value::Enum(e) => {
+                let variant = e.variants.get(name).cloned().ok_or_else(|| {
+                    AsError::at(format!("enum {} has no variant '{}'", e.name, name), span)
+                })?;
+                // ADT: reading a PAYLOAD-variant member yields a CONSTRUCTOR carrying a
+                // back-reference to this `EnumDef` (so a first-class `let mk =
+                // Shape.Circle` validates on call). The interned map entry has
+                // `def: None` (no `Rc` cycle); we clone it here with `def: Some`.
+                match &variant {
+                    Value::EnumVariant(ev) if ev.ctor => Ok(Value::EnumVariant(
+                        std::rc::Rc::new(crate::value::EnumVariant {
+                            enum_name: ev.enum_name.clone(),
+                            name: ev.name.clone(),
+                            value: Value::Nil,
+                            payload: None,
+                            ctor: true,
+                            def: Some(e.clone()),
+                        }),
+                    )),
+                    _ => Ok(variant),
+                }
+            }
             Value::EnumVariant(v) => match name {
                 "name" => Ok(Value::Str(v.name.as_str().into())),
-                "value" => Ok(v.value.clone()),
-                other => Err(AsError::at(
-                    format!("enum variant has no property '{}'", other),
-                    span,
-                )),
+                // ADT §3.4: `.value` of a unit/scalar variant is the backing scalar
+                // (unchanged); of a PAYLOAD variant it is the payload-as-data — the
+                // STORED `Cc` Array (positional) / Object (named) handle (stable
+                // identity, no per-access allocation).
+                "value" => match &v.payload {
+                    None => Ok(v.value.clone()),
+                    Some(crate::value::Payload::Positional(a)) => Ok(Value::Array(a.clone())),
+                    Some(crate::value::Payload::Named(o)) => Ok(Value::Object(o.clone())),
+                },
+                // ADT §3.4: named-payload field-access sugar — `c.radius` reads the
+                // named field directly off the payload Object.
+                other => {
+                    if let Some(crate::value::Payload::Named(o)) = &v.payload {
+                        if let Some(fv) = o.borrow().get(other) {
+                            return Ok(fv.clone());
+                        }
+                    }
+                    Err(AsError::at(
+                        format!("enum variant has no property '{}'", other),
+                        span,
+                    ))
+                }
             },
             Value::Instance(inst) => {
                 let b = inst.borrow();
@@ -3753,6 +3910,10 @@ impl Interp {
             Value::GeneratorMethod(g, method) => {
                 self.call_generator_method(&g, method, args, span).await
             }
+            // ADT: calling a payload-variant CONSTRUCTOR (`Shape.Circle(2.0)`)
+            // validates arity + field types and produces a constructed variant.
+            // Calling a UNIT variant is an error.
+            Value::EnumVariant(ev) => self.construct_variant(&ev, args, span).await,
             Value::ClassMethod(c, name) => {
                 // A user `static fn` (SP1 §3) takes precedence over the built-in
                 // `from` only if it exists; we resolved the name at read time, but
@@ -3777,6 +3938,111 @@ impl Interp {
             }
             _ => Err(AsError::at("value is not callable", span).into()),
         }
+    }
+
+    /// ADT: validate + construct a payload-variant call (`Shape.Circle(2.0)`). The
+    /// callee `ev` must be a CONSTRUCTOR (`ctor: true`, carrying its `EnumDef` via
+    /// `def`). Validates arity, coerces + type-checks each arg against the declared
+    /// field type (the SAME `coerce_field`/`check_type` path classes use), then builds
+    /// a constructed `EnumVariant` (positional → `Cc<ArrayCell>`, named →
+    /// `Cc<ObjectCell>`). A non-constructor (unit) variant call is an error.
+    #[async_recursion(?Send)]
+    pub(crate) async fn construct_variant(
+        &self,
+        ev: &std::rc::Rc<crate::value::EnumVariant>,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // A unit / constructed (already-saturated) variant is not callable.
+        if !ev.ctor {
+            return Err(AsError::at(
+                format!(
+                    "{}.{} is a unit variant and takes no payload",
+                    ev.enum_name, ev.name
+                ),
+                span,
+            )
+            .into());
+        }
+        // The constructor must carry its owning `EnumDef` (populated on the read path).
+        let def = ev.def.as_ref().ok_or_else(|| {
+            AsError::at(
+                format!(
+                    "internal: variant constructor {}.{} has no schema (compiler invariant)",
+                    ev.enum_name, ev.name
+                ),
+                span,
+            )
+        })?;
+        let schema = def.variant_schemas.get(ev.name.as_str()).ok_or_else(|| {
+            AsError::at(
+                format!(
+                    "internal: enum {} has no schema for variant '{}'",
+                    ev.enum_name, ev.name
+                ),
+                span,
+            )
+        })?;
+        // Arity check.
+        if args.len() != schema.fields.len() {
+            return Err(AsError::at(
+                format!(
+                    "{}.{} expects {} field{}, got {}",
+                    ev.enum_name,
+                    ev.name,
+                    schema.fields.len(),
+                    if schema.fields.len() == 1 { "" } else { "s" },
+                    args.len()
+                ),
+                span,
+            )
+            .into());
+        }
+        // Type-check each field against its declared type in declaration order, the
+        // SAME `check_type` contract classes/functions use (handles scalars, `T?`,
+        // nested containers `array<T>`/`map<K,V>`, and enum-typed recursive fields).
+        // A mismatch is the byte-identical recoverable field-path panic. (v1 does not
+        // auto-coerce a raw Object into a class-typed payload field — pattern
+        // destructuring is the primary path; field types are validated, not rewritten.)
+        let mut coerced: Vec<Value> = Vec::with_capacity(args.len());
+        for ((fname, fty), arg) in schema.fields.iter().zip(args.into_iter()) {
+            let field_label = match fname {
+                Some(n) => format!("{}.{}.{}", ev.enum_name, ev.name, n),
+                None => format!("{}.{}", ev.enum_name, ev.name),
+            };
+            if !check_type(&arg, fty) {
+                return Err(AsError::at(
+                    format!("{}: expected {}, got {}", field_label, fty, type_name(&arg)),
+                    span,
+                )
+                .into());
+            }
+            coerced.push(arg);
+        }
+        // Build the payload: named → an Object keyed by field name; positional → an
+        // Array. Both behind a `Cc` (the cycle-collected payload container).
+        let payload = if schema.is_named() {
+            let mut map = indexmap::IndexMap::new();
+            for ((fname, _), val) in schema.fields.iter().zip(coerced.into_iter()) {
+                // `is_named()` guarantees every field name is `Some`.
+                if let Some(n) = fname {
+                    map.insert(n.to_string(), val);
+                }
+            }
+            crate::value::Payload::Named(crate::value::ObjectCell::new(map))
+        } else {
+            crate::value::Payload::Positional(crate::value::ArrayCell::new(coerced))
+        };
+        Ok(Value::EnumVariant(std::rc::Rc::new(
+            crate::value::EnumVariant {
+                enum_name: ev.enum_name.clone(),
+                name: ev.name.clone(),
+                value: Value::Nil,
+                payload: Some(payload),
+                ctor: false,
+                def: None,
+            },
+        )))
     }
 
     /// Dispatch a bound generator method. `next(v?)` resumes the body with `v`

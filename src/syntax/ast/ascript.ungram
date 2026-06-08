@@ -52,7 +52,8 @@ BindEntry = key:'ident' ('as' local:'ident')?
 RestBind = '...' 'ident'
 RetType = ':' Type
 EnumDecl = 'enum' 'ident' '{' EnumVariant* '}'
-EnumVariant = 'ident' ('=' Expr)?
+EnumVariant = 'ident' ('=' Expr)? ('(' VariantField* ')')?
+VariantField = ('ident' ':')? Type
 ClassDecl = 'class' 'ident' ('extends' 'ident')? '{' (FieldDecl | MethodDecl)* '}'
 FieldDecl = 'ident' '?'? ':' Type ('=' Expr)?
 MethodDecl = 'static'? 'async'? 'fn' '*'? 'ident' ParamList RetType? Block
@@ -62,7 +63,7 @@ ExportStmt = 'export' Stmt
 MatchExpr = 'match' subject:Expr '{' MatchArm* '}'
 MatchArm = Pat ('|' Pat)* MatchGuard? '=>' body:Expr
 MatchGuard = 'if' Expr
-Pat = WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat
+Pat = WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | VariantPat
 WildcardPat = '_'
 IdentPat = 'ident'
 LiteralPat = Expr
@@ -71,6 +72,8 @@ ArrayPat = '[' (Pat | PatRest)* ']'
 ObjectPat = '{' (ObjPatEntry | PatRest)* '}'
 ObjPatEntry = key:'ident' (':' Pat)?
 PatRest = '...' 'ident'?
+VariantPat = 'ident' ('.' 'ident')? '(' (Pat | VariantPatField)* ')'
+VariantPatField = key:'ident' (':' Pat)?
 Type = NamedType | GenericType | OptionalType | UnionType | TupleType
 NamedType = 'ident'
 GenericType = 'ident' TypeArgs

@@ -553,6 +553,30 @@ impl Printer<'_> {
                 self.out.text(" = ");
                 self.expr(val);
             }
+            // ADT: a payload variant renders its declared field list —
+            // `Circle(radius: float)` (named) / `Pair(int, int)` (positional).
+            let fields: Vec<ResolvedNode> = v
+                .children()
+                .filter(|c| c.kind() == VariantField)
+                .cloned()
+                .collect();
+            if !fields.is_empty() {
+                self.out.text("(");
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        self.out.text(", ");
+                    }
+                    // A named field has an `Ident` token before the type node.
+                    if let Some(fname) = first_ident_text(field) {
+                        self.out.text(&fname);
+                        self.out.text(": ");
+                    }
+                    if let Some(ty) = field.children().find(|c| is_type_kind(c.kind())) {
+                        self.type_ann(ty);
+                    }
+                }
+                self.out.text(")");
+            }
             self.out.text(",");
             self.out.newline();
             self.emit_trailing(v);
@@ -1051,7 +1075,7 @@ fn is_pattern_kind(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
         kind,
-        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat
+        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat | VariantPat
     )
 }
 

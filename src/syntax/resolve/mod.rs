@@ -1121,6 +1121,25 @@ impl Resolver {
                     }
                 }
             }
+            // ADT: a variant pattern binds its positional sub-patterns (each a
+            // pattern child — the leading variant-ref `Ident`/`.` tokens are NOT
+            // pattern nodes, so they are skipped) and its named `VariantPatField`
+            // entries (`w: ww` resolves the sub-pattern; shorthand `w` binds the name).
+            VariantPat => {
+                for sub in pat.children() {
+                    match sub.kind() {
+                        VariantPatField => {
+                            if let Some(subpat) = sub.children().find(|c| is_pattern(c.kind())) {
+                                self.resolve_pattern(subpat);
+                            } else if let Some(name) = ident_text(sub) {
+                                self.declare(&name, BindingKind::PatternBind, sub.text_range());
+                            }
+                        }
+                        k if is_pattern(k) => self.resolve_pattern(sub),
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1209,7 +1228,7 @@ fn is_pattern(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
         kind,
-        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat
+        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat | VariantPat
     )
 }
 

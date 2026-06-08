@@ -59,6 +59,9 @@
 (class_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
 (enum_variant name: (identifier) @constant)
+; ADT: payload field names + a named variant-pattern field.
+(variant_field field: (identifier) @variable.member)
+(variant_pattern_field field: (identifier) @variable.member)
 
 (parameter name: (identifier) @variable.parameter)
 

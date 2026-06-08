@@ -535,6 +535,37 @@ pub enum Op {
     /// `Value`). Appended at the END of the enum so existing opcode byte values are
     /// unchanged (`.aso` version is bumped regardless).
     CheckLocal,
+
+    // ---- ADT: variant-pattern matching ------------------------------------
+    // Appended at the END so existing opcode byte values are unchanged (`.aso`
+    // version is bumped regardless).
+    /// `MATCH_VARIANT(u16 const)` — `subject -- ok:bool`. Pop the subject and push
+    /// `true` iff it is a CONSTRUCTED `EnumVariant` (`payload.is_some()`, not a
+    /// constructor) whose `name` equals `consts[const].0` and — when
+    /// `consts[const].1` is a non-empty `Str` — whose `enum_name` equals it. The
+    /// const is a 2-element `Array` `[variantName:Str, enumNameOrNil]`. Mirrors the
+    /// head tag-test of the tree-walker's `match_variant_pattern` (a non-matching
+    /// subject is a structural mismatch, never a panic).
+    MatchVariant,
+    /// `VARIANT_ELEM(u16 idx)` — `subject -- value`. Pop the subject (a constructed
+    /// `EnumVariant` per `MATCH_VARIANT`) and push its `idx`-th payload value IN
+    /// DECLARATION ORDER (positional → the array element; named → the i-th field's
+    /// value). Mirrors the tree-walker's positional destructure (which reads named
+    /// payload `values()` in declaration order). An out-of-range index or non-variant
+    /// subject is a compiler-invariant panic (the arity guard precedes it).
+    VariantElem,
+    /// `VARIANT_FIELD(u16 const)` — `subject -- value`. Pop the subject and push its
+    /// NAMED payload field `consts[const]` (a `Str`). Used for named variant patterns
+    /// (`Rect(w: ww)`). Mirrors the tree-walker's named destructure `map.get(key)`.
+    VariantField,
+    /// `MATCH_VARIANT_ARITY(u16 n)` — `subject -- ok:bool`. Pop the subject and push
+    /// `true` iff its payload has exactly `n` values. Mirrors the positional
+    /// `items.len() != pats.len()` guard.
+    MatchVariantArity,
+    /// `MATCH_VARIANT_HAS_FIELD(u16 const)` — `subject -- ok:bool`. Pop the subject
+    /// and push `true` iff it has a NAMED payload field `consts[const]` (a `Str`).
+    /// Mirrors the named-destructure presence check (`map.get(key)` is `Some`).
+    MatchVariantHasField,
 }
 
 impl Op {
@@ -671,6 +702,12 @@ impl Op {
 
             x if x == CheckLocal as u8 => CheckLocal,
 
+            x if x == MatchVariant as u8 => MatchVariant,
+            x if x == VariantElem as u8 => VariantElem,
+            x if x == VariantField as u8 => VariantField,
+            x if x == MatchVariantArity as u8 => MatchVariantArity,
+            x if x == MatchVariantHasField as u8 => MatchVariantHasField,
+
             _ => return None,
         })
     }
@@ -685,7 +722,9 @@ impl Op {
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | ImmutableError | Closure
             | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper
             | InstanceOfType | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest
-            | MatchHasKey | CallMethodSpread | DefineExport | CheckParam | CheckLocal => 2,
+            | MatchHasKey | CallMethodSpread | DefineExport | CheckParam | CheckLocal
+            | MatchVariant | VariantElem | VariantField | MatchVariantArity
+            | MatchVariantHasField => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -890,6 +929,11 @@ mod tests {
         Op::WrapSub,
         Op::WrapMul,
         Op::CheckLocal,
+        Op::MatchVariant,
+        Op::VariantElem,
+        Op::VariantField,
+        Op::MatchVariantArity,
+        Op::MatchVariantHasField,
     ];
 
     #[test]

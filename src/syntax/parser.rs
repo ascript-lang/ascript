@@ -87,6 +87,20 @@ impl Parser {
         self.current() == kind
     }
 
+    /// The kind of the non-trivia token `n` positions past the cursor (0 = current).
+    /// Returns `SyntaxKind::Error` past the end. Used for small contextual lookahead.
+    fn nth(&self, n: usize) -> SyntaxKind {
+        match self.nontrivia.get(self.pos + n) {
+            Some(&ti) => self.tokens[ti].kind,
+            None => SyntaxKind::Error,
+        }
+    }
+
+    /// Whether the token `n` positions past the cursor is `kind`.
+    fn nth_at(&self, n: usize, kind: SyntaxKind) -> bool {
+        self.nth(n) == kind
+    }
+
     fn at_end(&self) -> bool {
         self.pos >= self.nontrivia.len()
     }
@@ -1522,9 +1536,31 @@ fn enum_decl(p: &mut Parser) {
         } else {
             p.error("expected variant name");
         }
+        let mut had_backing = false;
+        // ADT: a `Foo = 2(int)` both-form is detected by an LParen consumed WITHIN the
+        // backing expression (a scalar backing is never a call). Record the cursor
+        // before parsing the backing so we can scan the consumed token range.
+        let mut backing_had_lparen = false;
         if p.at(Eq) {
             p.bump();
+            let before = p.pos;
             expr(p);
+            backing_had_lparen = (before..p.pos)
+                .any(|i| p.nontrivia.get(i).map(|&ti| p.tokens[ti].kind) == Some(LParen));
+            had_backing = true;
+        }
+        // ADT: an optional `(…)` payload field list — `Circle(radius: float)` /
+        // `Pair(int, int)`. A variant has EITHER a `= scalar` backing OR a payload,
+        // never both; fields must be uniformly named or positional.
+        if had_backing && (p.at(LParen) || backing_had_lparen) {
+            // Both a backing AND a payload — record the error. Only consume a payload
+            // list when the cursor is actually at `(` (the call-form already ate it).
+            p.error("a variant cannot have both a '= value' backing and a '(…)' payload");
+            if p.at(LParen) {
+                enum_payload_fields(p);
+            }
+        } else if p.at(LParen) {
+            enum_payload_fields(p);
         }
         p.complete(vm, EnumVariant);
         if p.at(Comma) {
@@ -1539,6 +1575,44 @@ fn enum_decl(p: &mut Parser) {
         p.error("expected '}' to close enum");
     }
     p.complete(m, EnumDecl);
+}
+
+/// ADT: parse a variant's `(field, …)` payload list. Each field is `ident : Type`
+/// (named) or a bare `Type` (positional); the list must be uniformly one or the
+/// other. Each field becomes a `VariantField` node. Assumes the cursor is at `(`.
+fn enum_payload_fields(p: &mut Parser) {
+    use SyntaxKind::*;
+    p.bump(); // (
+    // Track the first field's named-ness; a later mismatch is a uniformity error.
+    let mut named: Option<bool> = None;
+    while !p.at(RParen) && !p.at_end() {
+        let fm = p.start();
+        // Named iff `ident` directly followed by `:`.
+        let is_named = p.at(Ident) && p.nth_at(1, Colon);
+        match named {
+            None => named = Some(is_named),
+            Some(prev) if prev != is_named => {
+                p.error("enum variant fields must be all named or all positional");
+            }
+            _ => {}
+        }
+        if is_named {
+            p.bump(); // field name
+            p.bump(); // :
+        }
+        type_ann(p);
+        p.complete(fm, VariantField);
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
+    if p.at(RParen) {
+        p.bump();
+    } else {
+        p.error("expected ')' to close variant payload");
+    }
 }
 
 fn import_stmt(p: &mut Parser) {
@@ -1753,6 +1827,10 @@ fn pattern(p: &mut Parser) -> CompletedMarker {
         }
         LBracket => array_pat(p),
         LBrace => object_pat(p),
+        // ADT: a VARIANT pattern — `Circle(…)` / `Shape.Circle(…)`. Detected as an
+        // `Ident (` or `Ident . Ident (` lead (a variant ref immediately followed by
+        // `(`). The trailing `(` makes it unambiguously a variant destructuring.
+        Ident if is_variant_pattern_lead(p) => variant_pat(p),
         _ => {
             // value / ident / range: parse a primary-ish expression; a trailing
             // `..` / `..=` makes it a RangePat, else LiteralPat.
@@ -1772,6 +1850,72 @@ fn pattern(p: &mut Parser) -> CompletedMarker {
             }
         }
     }
+}
+
+/// ADT: whether the cursor begins a variant pattern — `Ident (` or `Ident . Ident (`.
+fn is_variant_pattern_lead(p: &Parser) -> bool {
+    use SyntaxKind::*;
+    if !p.at(Ident) {
+        return false;
+    }
+    // `Circle(` — bare variant ref + call.
+    if p.nth_at(1, LParen) {
+        return true;
+    }
+    // `Shape.Circle(` — qualified variant ref + call.
+    p.nth_at(1, Dot) && p.nth_at(2, Ident) && p.nth_at(3, LParen)
+}
+
+/// ADT: parse a `VariantPat` — `Name(…)` / `Name.Variant(…)`. The variant ref is the
+/// leading `Ident` (and optional `. Ident`); the paren list holds sub-patterns
+/// (positional) or `VariantPatField` entries (named, decided by the FIRST field's
+/// `ident :` shape). Assumes `is_variant_pattern_lead(p)` is true.
+fn variant_pat(p: &mut Parser) -> CompletedMarker {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // variant or enum ident
+    if p.at(Dot) {
+        p.bump(); // .
+        if p.at(Ident) {
+            p.bump(); // variant ident
+        } else {
+            p.error("expected variant name after '.'");
+        }
+    }
+    // `(` field list.
+    if p.at(LParen) {
+        p.bump();
+        // Named iff the FIRST field is `ident :`.
+        let named = p.at(Ident) && p.nth_at(1, Colon);
+        while !p.at(RParen) && !p.at_end() {
+            if named {
+                let fm = p.start();
+                if p.at(Ident) {
+                    p.bump(); // field name
+                } else {
+                    p.error("expected field name in variant pattern");
+                }
+                if p.at(Colon) {
+                    p.bump();
+                    pattern(p); // sub-pattern
+                }
+                p.complete(fm, VariantPatField);
+            } else {
+                pattern(p);
+            }
+            if p.at(Comma) {
+                p.bump();
+            } else {
+                break;
+            }
+        }
+        if p.at(RParen) {
+            p.bump();
+        } else {
+            p.error("expected ')' to close variant pattern");
+        }
+    }
+    p.complete(m, VariantPat)
 }
 
 fn array_pat(p: &mut Parser) -> CompletedMarker {

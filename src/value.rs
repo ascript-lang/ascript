@@ -293,12 +293,67 @@ pub fn is_frozen_value(v: &Value) -> bool {
 pub struct EnumDef {
     pub name: String,
     pub variants: IndexMap<String, Value>, // each is a Value::EnumVariant
+    /// ADT: per-variant payload schema (field names + declared types). A unit /
+    /// scalar-backed variant has an EMPTY `VariantSchema.fields`; a payload variant
+    /// (positional or named) carries its declared field list. The full ordered
+    /// variant list is `variants.keys()` (== `variant_schemas.keys()`).
+    pub variant_schemas: IndexMap<String, VariantSchema>,
+}
+
+/// ADT §5.1: the declared payload schema of one enum variant. An empty `fields`
+/// vector means a unit / scalar-backed variant (no payload). A field's `name` is
+/// `Some` for a named-field variant (`Circle(radius: float)`), `None` for a
+/// positional one (`Pair(int, int)`). Field types use the NUM model.
+#[derive(Clone)]
+pub struct VariantSchema {
+    pub fields: Vec<(Option<Rc<str>>, crate::ast::Type)>,
+}
+
+impl VariantSchema {
+    /// A payload (non-unit) variant has at least one declared field.
+    pub fn has_payload(&self) -> bool {
+        !self.fields.is_empty()
+    }
+
+    /// `true` iff the fields are named (`Circle(radius: float)`). An empty schema
+    /// (unit) is considered positional/none. Uniformity is guaranteed at parse time
+    /// (all-named XOR all-positional), so checking the first field suffices.
+    pub fn is_named(&self) -> bool {
+        self.fields.first().map(|(n, _)| n.is_some()).unwrap_or(false)
+    }
 }
 
 pub struct EnumVariant {
     pub enum_name: String,
     pub name: String,
-    pub value: Value, // backing value, or Nil
+    pub value: Value, // backing scalar (unit/scalar-backed variant), or Nil
+    /// ADT §5.1: `None` for a unit variant OR an unsaturated constructor; `Some`
+    /// for a CONSTRUCTED payload variant. The cycle-capable part of the value lives
+    /// here (a recursive enum payload can form a cycle), so `Trace` reaches it.
+    pub payload: Option<Payload>,
+    /// ADT §5.1: `true` iff this is an unsaturated payload-variant CONSTRUCTOR
+    /// (`Shape.Circle` referenced but not yet called). Calling it validates the
+    /// payload and yields a constructed variant (`payload: Some, ctor: false`).
+    pub ctor: bool,
+    /// ADT: a back-reference to the owning `EnumDef`, populated ONLY on a constructor
+    /// value RETURNED to user code (so a first-class `let mk = Shape.Circle` can
+    /// validate the payload when called). The INTERNED map entry has `def: None`, so
+    /// `EnumDef → variants → (interned ctor)` never forms an `Rc` cycle. A unit /
+    /// constructed variant also has `def: None`. The constructor stays cheap (one
+    /// extra `Rc` clone, only on the constructor read path).
+    pub def: Option<Rc<EnumDef>>,
+}
+
+/// ADT §5.1: a constructed variant's payload data. The cycle-capable containers are
+/// held behind a `Cc` (the cycle collector ONLY tracks `Cc` nodes — gcmodule's
+/// `Rc<T>: Trace` is acyclic/no-op, so the `Rc<EnumVariant>` wrapper can never be a
+/// cycle node; the payload's `Cc<ArrayCell>`/`Cc<ObjectCell>` IS). Positional reuses
+/// `ArrayCell` (so `.value` returns a stable `Value::Array` handle — ADT §3.4);
+/// named reuses `ObjectCell` (field-access sugar + stable `.value` Object share one
+/// representation). Both are traced by the collector exactly as a free Array/Object.
+pub enum Payload {
+    Positional(Cc<ArrayCell>),
+    Named(Cc<ObjectCell>),
 }
 
 pub struct Method {
@@ -867,7 +922,37 @@ impl PartialEq for Value {
             (Value::NativeMethod(a), Value::NativeMethod(b)) => Rc::ptr_eq(a, b),
             // Enums and their (interned) variants compare by identity.
             (Value::Enum(a), Value::Enum(b)) => Rc::ptr_eq(a, b),
-            (Value::EnumVariant(a), Value::EnumVariant(b)) => Rc::ptr_eq(a, b),
+            // ADT §5.2: unit / constructor variants compare by interned IDENTITY
+            // (byte-identical to pre-ADT). A CONSTRUCTED payload variant compares
+            // STRUCTURALLY: same enum, same variant name, payloads equal element-wise
+            // (positional) or key-wise (named, via the existing Object `PartialEq`).
+            (Value::EnumVariant(a), Value::EnumVariant(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                match (&a.payload, &b.payload) {
+                    // At least one is a payload variant → structural compare. (A
+                    // payload variant is never `==` a unit/constructor of the same
+                    // name: a unit's `payload` is `None`, so the arms below short out.)
+                    (Some(pa), Some(pb)) => {
+                        a.enum_name == b.enum_name
+                            && a.name == b.name
+                            && match (pa, pb) {
+                                (Payload::Positional(xa), Payload::Positional(xb)) => {
+                                    *xa.borrow() == *xb.borrow()
+                                }
+                                (Payload::Named(oa), Payload::Named(ob)) => {
+                                    *oa.borrow() == *ob.borrow()
+                                }
+                                _ => false,
+                            }
+                    }
+                    // Both unit/constructor but distinct `Rc`s → not equal (interned,
+                    // so identity is the only equality; a re-interning failure across
+                    // a worker boundary is handled by §6 re-interning, not here).
+                    _ => false,
+                }
+            }
             // Classes/instances/bound-methods/super compare by identity.
             (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
             (Value::Instance(a), Value::Instance(b)) => crate::gc::cc_ptr_eq(a, b),
@@ -919,7 +1004,10 @@ impl fmt::Debug for Value {
                 m.method
             ),
             Value::Enum(e) => write!(f, "Enum({})", e.name),
-            Value::EnumVariant(v) => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
+            Value::EnumVariant(v) => match &v.payload {
+                None => write!(f, "EnumVariant({}.{})", v.enum_name, v.name),
+                Some(_) => write!(f, "EnumVariant({}.{}(..))", v.enum_name, v.name),
+            },
             Value::Class(c) => write!(f, "Class({})", c.name),
             Value::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
             Value::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
@@ -1057,7 +1145,48 @@ impl Value {
             Value::Native(n) => write!(f, "<native {} #{}>", n.kind.type_name(), n.id),
             Value::NativeMethod(m) => write!(f, "<native method {}>", m.method),
             Value::Enum(e) => write!(f, "<enum {}>", e.name),
-            Value::EnumVariant(v) => write!(f, "{}.{}", v.enum_name, v.name),
+            Value::EnumVariant(v) => match &v.payload {
+                // Unit / scalar-backed / constructor: byte-identical to pre-ADT.
+                None => write!(f, "{}.{}", v.enum_name, v.name),
+                // ADT: a constructed payload variant renders as `Enum.Variant(a, b)`
+                // (positional) or `Enum.Variant(name: v, ...)` (named). Cycle-guarded
+                // via the shared `seen` set (a recursive payload can self-reference).
+                Some(Payload::Positional(a)) => {
+                    let ptr = crate::gc::cc_addr(a);
+                    if seen.contains(&ptr) {
+                        return write!(f, "{}.{}(...)", v.enum_name, v.name);
+                    }
+                    seen.push(ptr);
+                    write!(f, "{}.{}(", v.enum_name, v.name)?;
+                    for (i, it) in a.borrow().iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        it.write_element(f, seen)?;
+                    }
+                    write!(f, ")")?;
+                    seen.pop();
+                    Ok(())
+                }
+                Some(Payload::Named(o)) => {
+                    let ptr = crate::gc::cc_addr(o);
+                    if seen.contains(&ptr) {
+                        return write!(f, "{}.{}(...)", v.enum_name, v.name);
+                    }
+                    seen.push(ptr);
+                    write!(f, "{}.{}(", v.enum_name, v.name)?;
+                    for (i, (k, val)) in o.borrow().iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}: ", k)?;
+                        val.write_element(f, seen)?;
+                    }
+                    write!(f, ")")?;
+                    seen.pop();
+                    Ok(())
+                }
+            },
             Value::Class(c) => write!(f, "<class {}>", c.name),
             Value::Instance(i) => write!(f, "<{} instance>", i.borrow().class.name),
             Value::BoundMethod(b) => write!(f, "<method {}>", b.name),
@@ -1082,6 +1211,119 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ADT Task 1 helpers — construct variant values directly at the value layer.
+    fn unit_variant(en: &str, name: &str, backing: Value) -> Value {
+        Value::EnumVariant(Rc::new(EnumVariant {
+            enum_name: en.to_string(),
+            name: name.to_string(),
+            value: backing,
+            payload: None,
+            ctor: false,
+        def: None,
+        }))
+    }
+    fn pos_variant(en: &str, name: &str, items: Vec<Value>) -> Value {
+        Value::EnumVariant(Rc::new(EnumVariant {
+            enum_name: en.to_string(),
+            name: name.to_string(),
+            value: Value::Nil,
+            payload: Some(Payload::Positional(ArrayCell::new(items))),
+            ctor: false,
+        def: None,
+        }))
+    }
+    fn named_variant(en: &str, name: &str, fields: Vec<(&str, Value)>) -> Value {
+        let mut m = IndexMap::new();
+        for (k, v) in fields {
+            m.insert(k.to_string(), v);
+        }
+        Value::EnumVariant(Rc::new(EnumVariant {
+            enum_name: en.to_string(),
+            name: name.to_string(),
+            value: Value::Nil,
+            payload: Some(Payload::Named(ObjectCell::new(m))),
+            ctor: false,
+        def: None,
+        }))
+    }
+
+    #[test]
+    fn adt_unit_variant_is_byte_identical_to_pre_adt() {
+        // A `payload: None, ctor: false` unit variant: `.value` is the backing scalar
+        // (or Nil), it is truthy, and two DISTINCT `Rc`s of the same name are NOT
+        // equal (identity equality, as pre-ADT — interning makes real uses equal).
+        let red = unit_variant("Color", "Red", Value::Nil);
+        let green = unit_variant("Color", "Green", Value::Int(2));
+        assert!(red.is_truthy());
+        assert!(green.is_truthy());
+        // Distinct allocations of the same unit variant are NOT `==` (identity).
+        let red2 = unit_variant("Color", "Red", Value::Nil);
+        assert_ne!(red, red2);
+        // But cloning the SAME `Rc` is equal (the interned-use case).
+        assert_eq!(red.clone(), red);
+    }
+
+    #[test]
+    fn adt_constructed_variants_compare_structurally() {
+        // Positional: `Pair(3, 4) == Pair(3, 4)`, `!= Pair(3, 5)`.
+        let p1 = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
+        let p2 = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
+        let p3 = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(5)]);
+        assert_eq!(p1, p2);
+        assert_ne!(p1, p3);
+        // Named: `Circle(radius: 2.0) == Circle(radius: 2.0)`, `!= Circle(radius: 3.0)`.
+        let c1 = named_variant("Shape", "Circle", vec![("radius", Value::Float(2.0))]);
+        let c2 = named_variant("Shape", "Circle", vec![("radius", Value::Float(2.0))]);
+        let c3 = named_variant("Shape", "Circle", vec![("radius", Value::Float(3.0))]);
+        assert_eq!(c1, c2);
+        assert_ne!(c1, c3);
+        // A payload variant is never equal to a unit variant of the same name.
+        let unit_circle = unit_variant("Shape", "Circle", Value::Nil);
+        assert_ne!(c1, unit_circle);
+        // Different variant names with equal payload are not equal.
+        let other = pos_variant("Shape", "Other", vec![Value::Int(3), Value::Int(4)]);
+        assert_ne!(p1, other);
+        // Constructed payload variants are truthy.
+        assert!(p1.is_truthy());
+        assert!(c1.is_truthy());
+    }
+
+    #[test]
+    fn adt_constructed_variant_display() {
+        let pair = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
+        assert_eq!(pair.to_string(), "Shape.Pair(3, 4)");
+        let circle = named_variant("Shape", "Circle", vec![("radius", Value::Float(2.0))]);
+        assert_eq!(circle.to_string(), "Shape.Circle(radius: 2.0)");
+        // Unit variant display is unchanged: `Enum.Variant`.
+        let red = unit_variant("Color", "Red", Value::Nil);
+        assert_eq!(red.to_string(), "Color.Red");
+        // Nested string payload quotes the inner string (write_element).
+        let str_v = pos_variant("Json", "Str", vec![Value::Str("hi".into())]);
+        assert_eq!(str_v.to_string(), "Json.Str(\"hi\")");
+    }
+
+    #[test]
+    fn adt_payload_variant_is_not_a_map_key() {
+        // Payload variants are identity-style containers (like Array/Map): NOT
+        // hashable as a `MapKey`. Unit variants were never hashable either (today's
+        // behavior is preserved — both return `None`).
+        let pair = pos_variant("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
+        assert!(MapKey::from_value(&pair).is_none());
+        let red = unit_variant("Color", "Red", Value::Nil);
+        assert!(MapKey::from_value(&red).is_none());
+    }
+
+    #[test]
+    fn adt_type_name_unchanged_for_payload_variant() {
+        // The runtime `type_name` for any EnumVariant stays "enum variant" (the
+        // wildcard arm). Asserted at the interp layer; here we assert the value-layer
+        // Debug differentiates payload vs unit (used in panics/tests only).
+        let red = unit_variant("Color", "Red", Value::Nil);
+        let pair = pos_variant("Shape", "Pair", vec![Value::Int(1), Value::Int(2)]);
+        assert_eq!(format!("{:?}", red), "EnumVariant(Color.Red)");
+        assert_eq!(format!("{:?}", pair), "EnumVariant(Shape.Pair(..))");
+    }
 
     #[test]
     fn displays_values_like_a_script_language() {

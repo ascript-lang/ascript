@@ -417,6 +417,26 @@ pub enum Pattern {
     /// `{key, key2: subpat, ...}` — subject is an Object/Instance with the keys.
     /// Rest as for `Array` but binds remaining keys into a new Object.
     Object(Vec<ObjPatEntry>, Option<Option<std::rc::Rc<str>>>),
+    /// ADT: a variant-destructuring pattern — `Circle(r)`, `Shape.Circle(r)`,
+    /// `Pair(a, b)`, `Rect(w: ww, h: hh)`. Matches when the subject is an
+    /// `EnumVariant` of `variant` (and, if `enum_name` is `Some`, that enum), then
+    /// destructures the payload by position or by field name.
+    Variant {
+        /// `Some` when written qualified (`Shape.Circle(r)`); `None` when bare
+        /// (`Circle(r)`). A bare form matches any enum's variant of that name.
+        enum_name: Option<std::rc::Rc<str>>,
+        variant: std::rc::Rc<str>,
+        fields: VariantPatFields,
+    },
+}
+
+/// ADT: the sub-pattern shape of a `Pattern::Variant`. Positional binds by index
+/// (`Pair(a, b)`); named binds by field, optionally renaming (`Rect(w: ww)` matches
+/// field `w` against sub-pattern `ww`; `Rect(w)` shorthand binds field `w`).
+#[derive(Clone, Debug)]
+pub enum VariantPatFields {
+    Positional(Vec<Pattern>),
+    Named(Vec<(std::rc::Rc<str>, Option<Pattern>)>),
 }
 
 /// One entry in an object pattern. `pat: None` is the shorthand `{key}` which
@@ -500,6 +520,38 @@ impl std::fmt::Display for Pattern {
                 }
                 write!(f, "}}")
             }
+            Pattern::Variant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                if let Some(en) = enum_name {
+                    write!(f, "{}.", en)?;
+                }
+                write!(f, "{}(", variant)?;
+                match fields {
+                    VariantPatFields::Positional(pats) => {
+                        for (i, p) in pats.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{}", p)?;
+                        }
+                    }
+                    VariantPatFields::Named(entries) => {
+                        for (i, (k, p)) in entries.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            match p {
+                                None => write!(f, "{}", k)?,
+                                Some(p) => write!(f, "{}: {}", k, p)?,
+                            }
+                        }
+                    }
+                }
+                write!(f, ")")
+            }
         }
     }
 }
@@ -507,9 +559,24 @@ impl std::fmt::Display for Pattern {
 #[derive(Clone, Debug)]
 pub struct EnumVariantDecl {
     pub name: String,
+    /// Scalar backing (`Red = 2`). MUTUALLY EXCLUSIVE with `payload` (a variant has
+    /// EITHER a `= scalar` backing OR a `(…)` payload, never both — parse error).
     pub value: Option<Expr>,
+    /// ADT: payload fields (`Circle(radius: float)` / `Pair(int, int)`). Empty for a
+    /// unit / scalar-backed variant. A field's `name` is `Some` for a named-field
+    /// variant, `None` for positional; uniformity (all-named XOR all-positional) is
+    /// enforced at parse time.
+    pub payload: Vec<VariantField>,
     /// Span of the variant name (for LSP selection range).
     pub name_span: Span,
+}
+
+/// ADT: one declared payload field of an enum variant. `name` is `Some` for a named
+/// field (`radius: float`), `None` for a positional one (`int`). The type is required.
+#[derive(Clone, Debug)]
+pub struct VariantField {
+    pub name: Option<std::rc::Rc<str>>,
+    pub ty: Type,
 }
 
 #[derive(Clone, Copy, Debug)]
