@@ -16,7 +16,7 @@ fn area(s: Shape): float {
     Circle(r) => 3.14159 * r * r,
     Rect(w, h) => w * h,
     Pair(a, b) => float(a) * float(b),
-    Point => 0.0,
+    Shape.Point => 0.0,
   }
 }
 

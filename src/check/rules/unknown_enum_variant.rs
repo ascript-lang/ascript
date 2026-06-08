@@ -78,7 +78,82 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
             fix: None,
         });
     }
+
+    // ADT §7.2(b): qualified variant PATTERNS `Shape.Nonexist(r)` in match position.
+    // A bare variant pattern (`Nonexist(r)`) has no enum receiver to resolve against
+    // and is NOT covered here (it surfaces via exhaustiveness / the binding-shadow
+    // diagnostic). A payload-constructor CALL `Shape.Nope(…)` already flows through the
+    // `MemberExpr` arm above (its callee is a `MemberExpr`), so it needs no new handling.
+    for vp in tree.descendants().filter(|n| n.kind() == VariantPat) {
+        let Some((enum_ref, variant_name, variant_node)) = qualified_variant_pat(vp) else {
+            continue; // bare (unqualified) variant pattern — skip (conservative)
+        };
+        let Some((decl_range, variants)) = by_name.get(&enum_ref) else {
+            continue; // receiver is not our unique enum
+        };
+        // The enum ref must resolve, via the resolver, to the genuine enum binding.
+        if !resolves_to_enum(&variant_node, enum_ref.as_str(), *decl_range, resolved) {
+            // `resolves_to_enum` consults `resolved.uses` by the node's text_range; for a
+            // VariantPat the enum-ref token is not a `NameRef` use, so fall back to the
+            // unique-binding check (no shadow/reassign), mirroring its tail.
+            if !enum_ref_is_unique_binding(enum_ref.as_str(), *decl_range, resolved) {
+                continue;
+            }
+        }
+        if variants.contains(&variant_name) {
+            continue; // a real variant — correct
+        }
+        out.push(AsDiagnostic {
+            range: code_range(vp),
+            severity: Severity::Warning,
+            code: "unknown-enum-variant".to_string(),
+            message: format!("enum {enum_ref} has no variant '{variant_name}'"),
+            fix: None,
+        });
+    }
     out
+}
+
+/// For a QUALIFIED `VariantPat` (`Shape.Nonexist(…)`), return
+/// `(enum_name, variant_name, variant_pat_node)`. The enum/variant refs are the two
+/// leading `Ident` tokens (before the first `(`), separated by `.`. A BARE variant
+/// pattern (`Circle(…)`, a single leading Ident) returns `None`.
+fn qualified_variant_pat(vp: &ResolvedNode) -> Option<(String, String, ResolvedNode)> {
+    use SyntaxKind::*;
+    let mut idents = Vec::new();
+    for el in vp.children_with_tokens() {
+        if let Some(tok) = el.into_token() {
+            if tok.kind() == LParen {
+                break;
+            }
+            if tok.kind() == Ident {
+                idents.push(tok.text().to_string());
+            }
+        }
+    }
+    if idents.len() >= 2 {
+        Some((idents[0].clone(), idents[1].clone(), vp.clone()))
+    } else {
+        None
+    }
+}
+
+/// Is `name` bound exactly ONCE, as the enum declared at `decl_range`? (The
+/// non-resolver tail of [`resolves_to_enum`], for nodes whose enum-ref token is not a
+/// recorded `NameRef` use — e.g. a `VariantPat`'s leading enum ident.)
+fn enum_ref_is_unique_binding(
+    name: &str,
+    decl_range: cstree::text::TextRange,
+    resolved: &ResolveResult,
+) -> bool {
+    let mut same_name = resolved.bindings.iter().filter(|b| b.name == name);
+    let Some(only) = same_name.next() else {
+        return false;
+    };
+    if same_name.next().is_some() {
+        return false;
+    }
+    only.kind == BindingKind::Enum && only.decl_range == decl_range
 }
 
 /// The declared name of a decl node — its first `Ident` token.
@@ -194,5 +269,38 @@ mod tests {
             .find(|d| d.code == "unknown-enum-variant")
             .unwrap();
         assert_eq!(d.message, "enum Color has no variant 'Reddd'");
+    }
+
+    // ADT §7.2 extensions.
+
+    #[test]
+    fn payload_ctor_call_unknown_variant_flagged() {
+        // `Shape.Nope(1)` — the callee `Shape.Nope` is a MemberExpr, already covered.
+        let src = "enum Shape { Circle, Point }\nlet x = Shape.Nope(1)\nprint(x)";
+        assert_eq!(count(src, "unknown-enum-variant"), 1, "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn qualified_variant_pattern_unknown_flagged() {
+        let src = "enum Shape { Circle, Point }\nfn f(s: Shape): number {\n  return match s {\n    Shape.Nonexist(r) => 1,\n    _ => 2,\n  }\n}\nprint(f(Shape.Circle))";
+        let d = analyze(src)
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code == "unknown-enum-variant");
+        assert!(d.is_some(), "{:?}", analyze(src).diagnostics);
+        assert_eq!(d.unwrap().message, "enum Shape has no variant 'Nonexist'");
+    }
+
+    #[test]
+    fn qualified_variant_pattern_known_not_flagged() {
+        let src = "enum Shape { Circle(radius: float), Point }\nfn f(s: Shape): float {\n  return match s {\n    Shape.Circle(r) => r,\n    Shape.Point => 0.0,\n  }\n}\nprint(f(Shape.Point))";
+        assert!(!has(src, "unknown-enum-variant"), "{:?}", analyze(src).diagnostics);
+    }
+
+    #[test]
+    fn bare_variant_pattern_not_flagged_by_this_rule() {
+        // A BARE `Nonexist(r)` has no enum receiver — NOT covered by this rule.
+        let src = "enum Shape { Circle(radius: float), Point }\nfn f(s: Shape): float {\n  return match s {\n    Circle(r) => r,\n    _ => 0.0,\n  }\n}\nprint(f(Shape.Point))";
+        assert!(!has(src, "unknown-enum-variant"), "{:?}", analyze(src).diagnostics);
     }
 }

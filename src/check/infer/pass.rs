@@ -19,7 +19,7 @@
 use crate::check::diagnostic::{AsDiagnostic, ByteSpan, Severity};
 use crate::check::infer::env::{BindingKey, Env};
 use crate::check::infer::table::Table;
-use crate::check::infer::ty::{CheckTy, Compat3, LitVal};
+use crate::check::infer::ty::{CheckTy, Compat3, EnumId, LitVal};
 use crate::check::rules::{code_range, is_type_kind};
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
@@ -116,6 +116,16 @@ impl<'a> Pass<'a> {
     // ----------------------------------------------------------------- emit ----
 
     fn emit(&mut self, code: &str, range: ByteSpan, message: String) {
+        self.emit_with(code, Severity::Warning, range, message);
+    }
+
+    /// Emit a diagnostic at an explicit DEFAULT severity. The severity recorded here
+    /// is the rule's *default* — `analyze_with_config` still remaps it through the
+    /// lint config (`config.effective(code, severity)`), so e.g. a default-`Error`
+    /// `non-exhaustive-match` can still be relaxed by `--warn`/`--allow`. Most checker
+    /// codes default to `Warning` (use [`Self::emit`]); the exhaustiveness gate is the
+    /// one default-`Error` code (ADT §7.3).
+    fn emit_with(&mut self, code: &str, severity: Severity, range: ByteSpan, message: String) {
         if self.suppress_emit > 0 {
             return; // synthesizing during return inference — the real walk reports.
         }
@@ -124,7 +134,7 @@ impl<'a> Pass<'a> {
         }
         self.out.push(AsDiagnostic {
             range,
-            severity: Severity::Warning,
+            severity,
             code: code.to_string(),
             message,
             fix: None,
@@ -877,6 +887,13 @@ impl<'a> Pass<'a> {
                     return self.fn_return_type(&fn_decl);
                 }
             } else if callee.kind() == MemberExpr {
+                // ADT §7.2: a payload-variant CONSTRUCTION `Shape.Circle(2.0)`. When the
+                // receiver provably resolves to enum `E` and the member is a variant,
+                // synth `EnumVariant(E, V)` (widens to `Enum(E)`), check each provably-
+                // wrong payload arg against the declared field type, and return the type.
+                if let Some(ty) = self.synth_variant_construction(callee, arg_list, env) {
+                    return ty;
+                }
                 // Workers Spec B (Task 8):
                 // (1) `WorkerClass.spawn(args)` → `future<WorkerClass>`.
                 // (2) `handle.method(args)` where handle : WorkerClass → `future<method_ret>`.
@@ -929,6 +946,104 @@ impl<'a> Pass<'a> {
 
         // Not a recognized worker-call pattern.
         None
+    }
+
+    /// ADT §7.2: synthesize a payload-variant construction `E.V(args)`. Returns
+    /// `Some(EnumVariant(E, V))` when `member`'s receiver provably resolves to a known
+    /// enum `E` and `V` is one of its variants; else `None` (fall through to the
+    /// gradual `Any` path). Each positional payload arg is checked against the declared
+    /// field type — only a PROVABLE mismatch emits `type-mismatch` (Gate 5: an
+    /// `Unknown`/`Any` arg stays silent). The args are always synthesized so their own
+    /// sub-diagnostics (e.g. `possibly-nil`) still flow.
+    fn synth_variant_construction(
+        &mut self,
+        member: &ResolvedNode,
+        arg_list: Option<&ResolvedNode>,
+        env: &mut Env,
+    ) -> Option<CheckTy> {
+        let recv = member
+            .children()
+            .find(|c| crate::check::rules::is_expr_kind(c.kind()))?;
+        let variant = member_name(member)?;
+        // The receiver must provably name a known enum. Two routes:
+        //  (a) the receiver is the enum NAME used as a value (`Shape.Circle(…)`) — a
+        //      `NameRef` resolving to the unique enum binding; or
+        //  (b) the receiver is a VARIABLE typed as the enum (rare for construction).
+        // Synth the receiver regardless (so its own sub-diagnostics flow).
+        let recv_synth = self.synth(recv, env);
+        let eid = if recv.kind() == SyntaxKind::NameRef {
+            let name = crate::syntax::resolve::ident_text(recv).unwrap_or_default();
+            self.enum_id_of_ref(recv, &name)
+                .or(match recv_synth.widen() {
+                    CheckTy::Enum(e) => Some(e),
+                    _ => None,
+                })
+        } else {
+            match recv_synth.widen() {
+                CheckTy::Enum(e) => Some(e),
+                _ => None,
+            }
+        }?;
+        // `V` must be a real variant of `E`; otherwise this is NOT a construction we
+        // model (the `unknown-enum-variant` rule reports the bad member separately).
+        let fields = {
+            let ei = self.table.enum_info(eid)?;
+            if !ei.variants.iter().any(|v| v == &variant) {
+                return None;
+            }
+            ei.fields_of(&variant).map(|f| f.to_vec()).unwrap_or_default()
+        };
+
+        // Positional args (named args `w: v` are a runtime-checked surface — synth the
+        // value for sub-diagnostics but do not positionally field-check them).
+        let positional: Vec<ResolvedNode> = arg_list
+            .into_iter()
+            .flat_map(|al| al.children())
+            .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
+            .cloned()
+            .collect();
+        let has_named = arg_list
+            .map(|al| al.children().any(|c| c.kind() == SyntaxKind::NamedArg))
+            .unwrap_or(false);
+        // A spread arg makes the arity/positions unknowable — synth + stay silent.
+        let has_spread = arg_list
+            .map(|al| al.children().any(|c| c.kind() == SyntaxKind::SpreadElem))
+            .unwrap_or(false);
+
+        for (i, arg) in positional.iter().enumerate() {
+            let actual = self.synth(arg, env);
+            // Field-check only when the call is purely positional, un-spread, and the
+            // field has a declared type — and the variant is named/positional with a
+            // matching arity slot. A single-field named variant accepts a positional
+            // arg (the §3.2 convenience), so positional-vs-named is allowed by index.
+            if has_named || has_spread {
+                continue;
+            }
+            let Some(field) = fields.get(i) else { continue };
+            if let Compat3::No = actual.assignable(&field.ty, self.table) {
+                let fname = field
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("field {}", i + 1));
+                let ename = self
+                    .table
+                    .enum_info(eid)
+                    .map(|e| e.name.clone())
+                    .unwrap_or_default();
+                let msg = format!(
+                    "`{ename}.{variant}.{fname}` expects `{}`, found `{}`",
+                    field.ty.display(self.table),
+                    actual.display(self.table)
+                );
+                self.emit("type-mismatch", code_range(arg), msg);
+            }
+        }
+        // Synthesize any named-arg values too (sub-diagnostics flow; field-check is a
+        // runtime concern — gradual-silent here).
+        if has_named {
+            self.synth_arg_list(arg_list, env);
+        }
+        Some(CheckTy::EnumVariant(eid, variant.into()))
     }
 
     fn synth_arg_list(&mut self, arg_list: Option<&ResolvedNode>, env: &mut Env) {
@@ -1027,32 +1142,37 @@ impl<'a> Pass<'a> {
         t.join(&f, self.table)
     }
 
-    /// Synthesize a `match` expression with per-arm subject narrowing (§4 form 3).
-    /// The subject is synthesized once; for each `match`-arm that is a proper child
-    /// of the `MatchExpr`, the subject binding is narrowed per the arm's pattern (a
-    /// `nil` pattern → `Nil`; a non-nil literal/variant pattern → `without_nil`)
-    /// while synthesizing that arm's body. The result is the join of arm-body synths
-    /// (or `Any`). NOTE: the CST front-end nests only the FIRST arm under `MatchExpr`
-    /// (subsequent arms are sibling statements walked by `walk_stmts`); this narrows
-    /// what is reachable and stays silent (Any) on the rest — never a false positive.
+    /// Synthesize a `match` expression with per-arm subject narrowing (§4 form 3 +
+    /// ADT §7.2). The subject is synthesized once; for each `match`-arm the subject
+    /// binding is narrowed per the arm's pattern — a `nil` pattern → `Nil`; a variant
+    /// pattern `Circle(r)` on an enum subject → `EnumVariant(E, "Circle")` (and the
+    /// payload sub-pattern names bound to their declared field types); any other
+    /// concrete pattern → `without_nil`. The result is the join of arm-body synths.
+    /// After the per-arm walk, runs the exhaustiveness analysis (ADT §7.3).
     fn synth_match(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {
         // The subject is the first expression-kind child (a ParenExpr or bare expr).
         let subject = first_expr_child(expr);
-        let subject_key = subject.as_ref().and_then(|s| {
-            let inner = if s.kind() == SyntaxKind::ParenExpr {
+        let subject_inner = subject.as_ref().and_then(|s| {
+            if s.kind() == SyntaxKind::ParenExpr {
                 first_expr_child(s)
             } else {
                 Some(s.clone())
-            }?;
+            }
+        });
+        let subject_key = subject_inner.as_ref().and_then(|inner| {
             if inner.kind() == SyntaxKind::NameRef {
                 self.key_for_use(&inner.text_range())
             } else {
                 None
             }
         });
-        if let Some(s) = &subject {
-            self.synth(s, env);
-        }
+        let subject_ty = subject.as_ref().map(|s| self.synth(s, env)).unwrap_or(CheckTy::Any);
+        // The enum id of the subject, if it provably IS a specific enum (used for both
+        // variant narrowing and the exhaustiveness analysis).
+        let subject_enum = match subject_ty.widen() {
+            CheckTy::Enum(e) => Some(e),
+            _ => None,
+        };
 
         let mut result = CheckTy::Never;
         for arm in expr.children().filter(|c| c.kind() == SyntaxKind::MatchArm) {
@@ -1062,33 +1182,304 @@ impl<'a> Pass<'a> {
                 .filter(|c| crate::check::rules::is_expr_kind(c.kind()))
                 .last()
                 .cloned();
-            // Narrow the subject for this arm per its pattern.
-            let refinement = subject_key.as_ref().and_then(|key| {
-                let pat = arm.children().find(|c| is_pattern_kind(c.kind()))?;
+            let pat = arm.children().find(|c| is_pattern_kind(c.kind()));
+
+            env.push_narrowing();
+            // 1) Subject narrowing per the pattern.
+            if let (Some(key), Some(pat)) = (subject_key.as_ref(), pat.as_ref()) {
                 let cur = env.lookup(key).unwrap_or(CheckTy::Any);
                 if pattern_is_nil(pat) {
-                    Some((key.clone(), cur.only_nil()))
+                    env.narrow(key.clone(), cur.only_nil());
+                } else if let (Some(eid), Some(variant)) =
+                    (subject_enum, variant_pat_name(pat))
+                {
+                    // A variant pattern on an enum subject narrows to that variant.
+                    env.narrow(key.clone(), CheckTy::EnumVariant(eid, variant.into()));
                 } else {
-                    // a concrete non-nil pattern → subject is non-nil in this arm.
-                    Some((key.clone(), cur.without_nil()))
+                    env.narrow(key.clone(), cur.without_nil());
                 }
-            });
-            let arm_ty = if let Some((k, ty)) = refinement {
-                env.push_narrowing();
-                env.narrow(k, ty);
-                let t = body.map(|b| self.synth(&b, env)).unwrap_or(CheckTy::Any);
-                env.pop_narrowing();
-                t
-            } else {
-                body.map(|b| self.synth(&b, env)).unwrap_or(CheckTy::Any)
-            };
+            }
+            // 2) Bind payload sub-pattern names to their declared field types (ADT
+            //    §7.2 — `Circle(r) => …` makes `r: float` in the arm body).
+            if let (Some(eid), Some(pat)) = (subject_enum, pat.as_ref()) {
+                self.bind_variant_payload(pat, eid, env);
+            }
+            let arm_ty = body.map(|b| self.synth(&b, env)).unwrap_or(CheckTy::Any);
+            env.pop_narrowing();
             result = result.join(&arm_ty.widen(), self.table);
         }
+
+        // ADT §7.3 — exhaustiveness analysis (only when the subject provably IS an enum).
+        if let Some(eid) = subject_enum {
+            self.check_exhaustiveness(expr, eid, env);
+        }
+
         if matches!(result, CheckTy::Never) {
             CheckTy::Any
         } else {
             result
         }
+    }
+
+    /// Bind the payload sub-pattern names of a `VariantPat` to their declared field
+    /// types, into the innermost (already-pushed) narrowing scope. Positional fields
+    /// bind by index; named fields (`Rect(w: ww)` / shorthand `Circle(radius)`) bind by
+    /// field name. A sub-pattern that is not a bare `Ident` (a literal, nested pattern,
+    /// or wildcard) binds nothing. Silently no-ops for a non-variant pattern.
+    fn bind_variant_payload(&mut self, pat: &ResolvedNode, eid: EnumId, env: &mut Env) {
+        if pat.kind() != SyntaxKind::VariantPat {
+            return;
+        }
+        let Some(variant) = variant_pat_name(pat) else {
+            return;
+        };
+        let fields = match self.table.enum_info(eid).and_then(|ei| ei.fields_of(&variant)) {
+            Some(f) => f.to_vec(),
+            None => return,
+        };
+        // Named field entries (`VariantPatField`) vs positional sub-patterns.
+        let named: Vec<ResolvedNode> = pat
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::VariantPatField)
+            .cloned()
+            .collect();
+        if !named.is_empty() {
+            for entry in &named {
+                let Some(fname) = crate::syntax::resolve::ident_text(entry) else {
+                    continue;
+                };
+                let Some(field) = fields.iter().find(|f| f.name.as_deref() == Some(&fname)) else {
+                    continue;
+                };
+                // `w: ww` binds `ww`; shorthand `w` binds `w` itself. The bound name is
+                // the LAST NameRef under the entry (a renamed sub-pattern), else the
+                // entry's own field Ident (shorthand).
+                let bind_node = entry
+                    .descendants()
+                    .find(|c| c.kind() == SyntaxKind::NameRef)
+                    .cloned()
+                    .unwrap_or_else(|| entry.clone());
+                self.bind_pattern_name(&bind_node, field.ty.clone(), env);
+            }
+            return;
+        }
+        // Positional sub-patterns bind by index.
+        let subpats: Vec<ResolvedNode> = pat
+            .children()
+            .filter(|c| is_pattern_kind(c.kind()))
+            .cloned()
+            .collect();
+        for (i, sub) in subpats.iter().enumerate() {
+            let Some(field) = fields.get(i) else { continue };
+            // Only a bare `Ident` sub-pattern (a `LiteralPat` wrapping a single
+            // `NameRef`) is a binding; a literal/nested pattern matches, not binds.
+            if let Some(name_ref) = bare_ident_pat_nameref(sub) {
+                self.bind_pattern_name(&name_ref, field.ty.clone(), env);
+            }
+        }
+    }
+
+    /// Bind a pattern's `NameRef` to `ty` in the innermost narrowing scope, keyed by
+    /// the binding the resolver created at this declaration site. Looks up the binding
+    /// whose `decl_range` is this node's range (a pattern binding's decl IS its
+    /// NameRef). A use of this name in the arm body resolves to the same binding key,
+    /// so the overlay narrowing takes effect.
+    fn bind_pattern_name(&mut self, name_ref: &ResolvedNode, ty: CheckTy, env: &mut Env) {
+        let range = name_ref.text_range();
+        let Some(b) = self.resolved.bindings.iter().find(|b| b.decl_range == range) else {
+            return;
+        };
+        let key = if b.is_global {
+            BindingKey::Global(b.name.clone())
+        } else {
+            BindingKey::Local(b.slot)
+        };
+        env.narrow(key, ty);
+    }
+
+    /// ADT §7.3 — exhaustiveness analysis for a `match` whose subject provably IS the
+    /// enum `eid`. Gathers ALL arms of the match (see [`gather_match_arms`] — the CST
+    /// nests every arm under `MatchExpr`, plus a defensive trailing-sibling sweep),
+    /// computes the set of covered variants and whether a catch-all is present, and —
+    /// if a variant is uncovered with no catch-all — emits `non-exhaustive-match`
+    /// (default **Error**) naming the missing variants. Bare-ident patterns that would
+    /// BIND (Option-C) and collide with a variant name additionally emit
+    /// `enum-variant-binding-shadow` (default Warning).
+    fn check_exhaustiveness(&mut self, expr: &ResolvedNode, eid: EnumId, env: &Env) {
+        let _ = env;
+        // The full ordered variant set of the subject enum.
+        let all_variants: Vec<String> = match self.table.enum_info(eid) {
+            Some(ei) if !ei.variants.is_empty() => ei.variants.clone(),
+            // No known variants (an empty/erroneous enum) → nothing to check.
+            _ => return,
+        };
+        let variant_set: std::collections::HashSet<&str> =
+            all_variants.iter().map(|s| s.as_str()).collect();
+
+        let arms = gather_match_arms(expr);
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut has_catch_all = false;
+
+        for arm in &arms {
+            // A guarded arm covers NOTHING on its own (Rust's rule) — the guard may
+            // fail. (If another UNGUARDED arm covers the same variant, that arm marks
+            // it covered; a guarded-only variant therefore stays uncovered.)
+            let guarded = arm.children().any(|c| c.kind() == SyntaxKind::MatchGuard);
+            if guarded {
+                continue;
+            }
+            let Some(pat) = arm.children().find(|c| is_pattern_kind(c.kind())) else {
+                continue;
+            };
+            match self.classify_pattern_coverage(pat, eid, &variant_set) {
+                Coverage::CatchAll => has_catch_all = true,
+                Coverage::Variants(vs) => covered.extend(vs),
+                Coverage::Nothing => {}
+            }
+        }
+
+        if has_catch_all {
+            return; // a catch-all covers every remaining variant
+        }
+        let missing: Vec<&str> = all_variants
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|v| !covered.contains(*v))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let ename = self
+            .table
+            .enum_info(eid)
+            .map(|e| e.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "enum".into());
+        let msg = format!(
+            "match on enum '{ename}' does not cover: {}",
+            missing.join(", ")
+        );
+        // Anchor the diagnostic on the `match` keyword (the MatchExpr's start).
+        let range = match_keyword_range(expr);
+        self.emit_with("non-exhaustive-match", Severity::Error, range, msg);
+    }
+
+    /// Classify what a single (non-guarded) arm pattern covers for enum `eid`.
+    /// Emits `enum-variant-binding-shadow` as a side effect for a would-bind bare ident
+    /// that collides with a variant name.
+    fn classify_pattern_coverage(
+        &mut self,
+        pat: &ResolvedNode,
+        eid: EnumId,
+        variant_set: &std::collections::HashSet<&str>,
+    ) -> Coverage {
+        use SyntaxKind::*;
+        match pat.kind() {
+            WildcardPat => Coverage::CatchAll,
+            OrPat => {
+                // Cover the union of the alternatives; a catch-all alternative makes the
+                // whole or-pattern a catch-all.
+                let mut acc: std::collections::HashSet<String> = Default::default();
+                let mut catch = false;
+                for alt in pat.children().filter(|c| is_pattern_kind(c.kind())) {
+                    match self.classify_pattern_coverage(alt, eid, variant_set) {
+                        Coverage::CatchAll => catch = true,
+                        Coverage::Variants(vs) => acc.extend(vs),
+                        Coverage::Nothing => {}
+                    }
+                }
+                if catch {
+                    Coverage::CatchAll
+                } else if acc.is_empty() {
+                    Coverage::Nothing
+                } else {
+                    Coverage::Variants(acc.into_iter().collect())
+                }
+            }
+            VariantPat => {
+                let Some(v) = variant_pat_name(pat) else {
+                    return Coverage::Nothing;
+                };
+                if !variant_set.contains(v.as_str()) {
+                    return Coverage::Nothing; // not a variant of E (or unknown)
+                }
+                // A value-equality sub-pattern (a literal, e.g. `Circle(2.0)`) means the
+                // arm does NOT fully cover the variant. Cover it only when EVERY payload
+                // sub-pattern is irrefutable (bare-ident bind or wildcard).
+                if variant_pat_is_irrefutable(pat) {
+                    Coverage::Variants(vec![v])
+                } else {
+                    Coverage::Nothing
+                }
+            }
+            LiteralPat | IdentPat => {
+                // A bare ident (`Point`) or a qualified member (`Shape.Point`).
+                if let Some(qualified) = qualified_member_variant(pat) {
+                    // `X.V` — covers V if V is a variant of E (regardless of which enum
+                    // `X` names; the subject is provably E, so a `Foo.V` on a different
+                    // enum simply never matches → contributes nothing if V ∉ E).
+                    return if variant_set.contains(qualified.as_str()) {
+                        Coverage::Variants(vec![qualified])
+                    } else {
+                        Coverage::Nothing
+                    };
+                }
+                if let Some(name_ref) = bare_ident_pat_nameref(pat) {
+                    let name = crate::syntax::resolve::ident_text(&name_ref).unwrap_or_default();
+                    let would_bind = self.pattern_ident_would_bind(&name_ref);
+                    if would_bind {
+                        // Option-C: a would-bind bare ident is a CATCH-ALL (always
+                        // matches). If it collides with a variant name of the known
+                        // subject enum, warn (it binds, it does NOT match `E.<name>`).
+                        if variant_set.contains(name.as_str()) {
+                            let ename = self
+                                .table
+                                .enum_info(eid)
+                                .map(|e| e.name.clone())
+                                .filter(|n| !n.is_empty())
+                                .unwrap_or_else(|| "enum".into());
+                            self.emit_with(
+                                "enum-variant-binding-shadow",
+                                Severity::Warning,
+                                code_range(&name_ref),
+                                format!(
+                                    "`{name}` here binds the subject (it does not match the \
+                                     variant); write `{ename}.{name}` to match the variant"
+                                ),
+                            );
+                        }
+                        Coverage::CatchAll
+                    } else {
+                        // A would-COMPARE bare ident: it compares the subject against
+                        // whatever `name` is bound to. If `name` is a variant of E, it
+                        // covers that variant; otherwise it contributes nothing.
+                        if variant_set.contains(name.as_str()) {
+                            Coverage::Variants(vec![name])
+                        } else {
+                            Coverage::Nothing
+                        }
+                    }
+                } else {
+                    // A literal value (`0`, `"x"`) or some other refutable pattern.
+                    Coverage::Nothing
+                }
+            }
+            // Array/Object/Range patterns never cover an enum variant.
+            _ => Coverage::Nothing,
+        }
+    }
+
+    /// Would a bare-identifier pattern (Option-C) BIND the subject (rather than compare
+    /// against a value in scope)? True iff the resolver created a `PatternBind` binding
+    /// at this NameRef's declaration range (verified empirically — a would-compare ident
+    /// is recorded as a *use*, not a `PatternBind`).
+    fn pattern_ident_would_bind(&self, name_ref: &ResolvedNode) -> bool {
+        use crate::syntax::resolve::types::BindingKind;
+        let range = name_ref.text_range();
+        self.resolved
+            .bindings
+            .iter()
+            .any(|b| b.decl_range == range && b.kind == BindingKind::PatternBind)
     }
 
     fn synth_member(&mut self, expr: &ResolvedNode, env: &mut Env) -> CheckTy {
@@ -1196,6 +1587,31 @@ impl<'a> Pass<'a> {
             self.resolved,
         ) {
             Some(cid)
+        } else {
+            None
+        }
+    }
+
+    /// If `recv` uniquely names a known enum (the enum NAME used as a value — the
+    /// receiver of a variant construction `Shape.Circle(…)`), its [`EnumId`]. Mirrors
+    /// [`Self::callee_class_id`]: requires a single, non-shadowed `Enum` binding that
+    /// the resolver maps this use to.
+    fn enum_id_of_ref(&self, recv: &ResolvedNode, name: &str) -> Option<EnumId> {
+        use crate::syntax::resolve::types::BindingKind;
+        let eid = self.table.enum_id(name)?;
+        let mut same = self.resolved.bindings.iter().filter(|b| b.name == name);
+        let only = same.next()?;
+        if same.next().is_some() || only.kind != BindingKind::Enum {
+            return None;
+        }
+        if crate::check::rules::resolves_to_unique(
+            recv,
+            name,
+            only.decl_range,
+            BindingKind::Enum,
+            self.resolved,
+        ) {
+            Some(eid)
         } else {
             None
         }
@@ -1390,8 +1806,173 @@ fn is_pattern_kind(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
         kind,
-        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat
+        WildcardPat | IdentPat | LiteralPat | RangePat | ArrayPat | ObjectPat | OrPat | VariantPat
     )
+}
+
+/// What a single `match` arm pattern covers, for the exhaustiveness analysis.
+enum Coverage {
+    /// A wildcard / would-bind bare ident — matches every remaining variant.
+    CatchAll,
+    /// Covers exactly these named variants of the subject enum.
+    Variants(Vec<String>),
+    /// Covers no variant (a literal value, an array/object pattern, a refutable
+    /// payload sub-pattern, or a variant of a DIFFERENT enum).
+    Nothing,
+}
+
+/// Gather ALL arms belonging to a `MatchExpr`, in source order. The current CST nests
+/// every arm directly under the `MatchExpr` (verified), so the direct children are the
+/// arms; a DEFENSIVE trailing-sibling sweep also collects any `MatchArm` statements
+/// that immediately follow the `MatchExpr` in its parent block (the historical
+/// first-arm-only nesting the spec warns about — a no-op today, but it keeps the
+/// analysis correct if the CST shape ever regresses). De-duplicated by range.
+fn gather_match_arms(expr: &ResolvedNode) -> Vec<ResolvedNode> {
+    use SyntaxKind::*;
+    let mut arms: Vec<ResolvedNode> = expr
+        .children()
+        .filter(|c| c.kind() == MatchArm)
+        .cloned()
+        .collect();
+    // Defensive: walk forward from the MatchExpr's position in its parent, consuming
+    // consecutive `MatchArm` siblings (the legacy first-arm-only nesting).
+    if let Some(parent) = expr.parent() {
+        let mut seen_match = false;
+        for sib in parent.children() {
+            if sib.text_range() == expr.text_range() {
+                seen_match = true;
+                continue;
+            }
+            if seen_match {
+                if sib.kind() == MatchArm {
+                    if !arms.iter().any(|a| a.text_range() == sib.text_range()) {
+                        arms.push(sib.clone());
+                    }
+                } else {
+                    break; // the contiguous run of sibling arms has ended
+                }
+            }
+        }
+    }
+    arms
+}
+
+/// The byte span of the `match` keyword opening a `MatchExpr` (the diagnostic anchor
+/// for `non-exhaustive-match`). Falls back to the node's full range start.
+fn match_keyword_range(expr: &ResolvedNode) -> ByteSpan {
+    let kw = expr
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::MatchKw);
+    match kw {
+        Some(t) => ByteSpan::from(t.text_range()),
+        None => code_range(expr),
+    }
+}
+
+/// Is every payload sub-pattern of a `VariantPat` IRREFUTABLE (a bare-ident bind, a
+/// wildcard, or a nested all-irrefutable variant/array/object)? A refutable
+/// sub-pattern (a literal value like `Circle(2.0)`, a range, a qualified variant ref)
+/// means the arm does NOT fully cover the variant.
+fn variant_pat_is_irrefutable(pat: &ResolvedNode) -> bool {
+    use SyntaxKind::*;
+    // Named entries: each `VariantPatField` is either shorthand (`w` — irrefutable
+    // bind) or `w: subpat` (recurse on the sub-pattern).
+    let named: Vec<ResolvedNode> = pat
+        .children()
+        .filter(|c| c.kind() == VariantPatField)
+        .cloned()
+        .collect();
+    if !named.is_empty() {
+        return named.iter().all(|entry| {
+            match entry.children().find(|c| is_pattern_kind(c.kind())) {
+                Some(sub) => sub_pattern_is_irrefutable(sub),
+                None => true, // shorthand bind
+            }
+        });
+    }
+    // Positional sub-patterns.
+    pat.children()
+        .filter(|c| is_pattern_kind(c.kind()))
+        .all(sub_pattern_is_irrefutable)
+}
+
+/// Is a single sub-pattern irrefutable (always matches, binding only)?
+fn sub_pattern_is_irrefutable(pat: &ResolvedNode) -> bool {
+    use SyntaxKind::*;
+    match pat.kind() {
+        WildcardPat => true,
+        // A bare ident binds (irrefutable); a qualified `X.V` or a literal value is
+        // refutable.
+        LiteralPat | IdentPat => {
+            bare_ident_pat_nameref(pat).is_some() && qualified_member_variant(pat).is_none()
+        }
+        // Conservatively treat nested array/object/variant/range/or patterns as
+        // refutable (they may not match) — so a nested-pattern arm does not claim full
+        // coverage. (Avoids a false "covered"; never a false positive.)
+        _ => false,
+    }
+}
+
+/// If `pat` is a qualified-member unit pattern (`Shape.Point` — a `LiteralPat`
+/// wrapping a `MemberExpr`), return the trailing member name (`"Point"`). `None` for a
+/// bare ident or any non-member pattern.
+fn qualified_member_variant(pat: &ResolvedNode) -> Option<String> {
+    use SyntaxKind::*;
+    if !matches!(pat.kind(), LiteralPat | IdentPat) {
+        return None;
+    }
+    let inner = pat.children().next()?;
+    if inner.kind() != MemberExpr {
+        return None;
+    }
+    member_name(inner)
+}
+
+/// The variant name of a `VariantPat` (`Circle(r)` → "Circle"; `Shape.Circle(r)` →
+/// "Circle"). The variant ref is the leading `Ident`/`. Ident`; for a qualified ref
+/// the variant is the SECOND ident, for a bare ref the first (and only) one. `None`
+/// for a non-variant pattern.
+fn variant_pat_name(pat: &ResolvedNode) -> Option<String> {
+    use SyntaxKind::*;
+    if pat.kind() != VariantPat {
+        return None;
+    }
+    // The variant-ref idents precede the first `(`. Collect leading Ident tokens that
+    // appear before any `LParen`; the LAST of them is the variant name (qualified
+    // `Shape.Circle` → "Circle"; bare `Circle` → "Circle").
+    let mut idents = Vec::new();
+    for el in pat.children_with_tokens() {
+        if let Some(tok) = el.into_token() {
+            if tok.kind() == LParen {
+                break;
+            }
+            if tok.kind() == Ident {
+                idents.push(tok.text().to_string());
+            }
+        }
+    }
+    idents.pop()
+}
+
+/// If `pat` is a bare-identifier pattern (a `LiteralPat` wrapping a single `NameRef`
+/// with no member access), return that `NameRef`. This is the Option-C bind/compare
+/// form; for payload binding we treat it as a binding name.
+fn bare_ident_pat_nameref(pat: &ResolvedNode) -> Option<ResolvedNode> {
+    use SyntaxKind::*;
+    if !matches!(pat.kind(), LiteralPat | IdentPat) {
+        return None;
+    }
+    let mut children = pat.children();
+    let first = children.next()?;
+    if children.next().is_some() {
+        return None; // more than one child — not a bare ident
+    }
+    if first.kind() == NameRef {
+        Some(first.clone())
+    } else {
+        None
+    }
 }
 
 /// Is this pattern the `nil` literal pattern (`LiteralPat` wrapping `nil`)?

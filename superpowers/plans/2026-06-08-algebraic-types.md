@@ -221,45 +221,46 @@ Pattern>), Named(Vec<(Rc<str>, Option<Pattern>)>)}`; `SyntaxKind::VariantPat`; c
 ## Task 11 — Checker: schema, construction synth, narrowing, `unknown-enum-variant` extension
 **Files:** `src/check/infer/{table,ty,env,pass}.rs`, `src/check/rules/unknown_enum_variant.rs`,
 `src/check/config.rs`. **Tests:** `tests/check.rs`.
-- [ ] `EnumInfo` (`table.rs:29`) gains per-variant arity + field types; extend `enum_variants`
-  (`table.rs:251`) to collect schemas (parsed from the new `EnumVariant` CST payload fields). Construction
-  synth: `Shape.Circle(2.0)` synths `CheckTy::EnumVariant(Shape,"Circle")` (widens to `Enum(Shape)`,
-  `ty.rs:190`); a **provably-wrong** payload arg vs the declared field type → `type-mismatch` (existing
-  code, extended; `Unknown` arg stays silent — Gate 5). Per-variant narrowing in a `Circle(r)=>…` arm:
-  narrow subject to `EnumVariant(Shape,"Circle")` and bind `r` to the field's declared type (reuses
-  `pass.rs` match/instanceof narrowing). **Extend** `unknown_enum_variant::check` to (a) payload-ctor
-  calls `Shape.Nope(…)` and (b) qualified variant patterns `Shape.Nope(r)` (stay conservative — bare
-  patterns are NOT covered). Register `non-exhaustive-match` (default **Error**) +
-  `enum-variant-binding-shadow` (default **Warning**) in `ALL_CODES` (`config.rs:31-50`).
-- [ ] **Gate 5:** `examples/**` emits ZERO `type-*`/`enum-variant-binding-shadow` in BOTH configs.
-  Green; review; commit.
+- [x] `EnumInfo` (`table.rs`) gains per-variant payload `variant_fields` (name + `CheckTy`), lowered in a
+  pass-2b step so a recursive `array<Json>` field forward-references resolve; `EnumInfo::fields_of`.
+  Construction synth: `Shape.Circle(2.0)` synths `CheckTy::EnumVariant(Shape,"Circle")` (widens to
+  `Enum(Shape)`) via `synth_variant_construction` in `synth_call` — the receiver enum is resolved by NAME
+  (`enum_id_of_ref`, since the enum name used as a value is not env-typed) OR by an `Enum`-typed receiver; a
+  **provably-wrong** positional payload arg vs the declared field type → `type-mismatch` (`Unknown`/named/
+  spread args stay silent — Gate 5). Per-variant narrowing in a `Circle(r)=>…` arm: `synth_match` narrows the
+  subject to `EnumVariant(Shape,"Circle")` and `bind_variant_payload` binds `r` (and named/renamed fields)
+  to the declared field type in the arm overlay. **Extended** `unknown_enum_variant::check` to qualified
+  variant patterns `Shape.Nope(r)` (payload-ctor calls already flow through the existing `MemberExpr` arm);
+  bare patterns stay uncovered. Registered `non-exhaustive-match` (default **Error**) +
+  `enum-variant-binding-shadow` (default **Warning**) in `RULE_CODES` (`config.rs`).
+- [x] **Gate 5:** `examples/**` emits ZERO `type-*`/`enum-variant-binding-shadow` in BOTH configs (0/0
+  verified on the full corpus). Green; reviewed.
 
 ## Task 12 — Exhaustiveness analysis: `non-exhaustive-match` (Error) + sibling-arm gather + shadow diag
 **Files:** `src/check/infer/pass.rs`. **Tests:** `tests/check.rs`.
-- [ ] Failing tests (the correctness pillar): a fixture enum with a `match` missing one variant and no `_`
-  → `non-exhaustive-match` **Error** naming the missing variants (the EXERCISED check failure, Gate 9 —
-  not a comment); the passing twin (add the arm OR a `_`) → zero; full coverage / `_` / bare-binding
-  catch-all → no diagnostic; a **guarded-only** arm (`V(x) if …`) does NOT cover `V`; **unknown/`any`
-  subject → silent** (gradual gate); a bare unit variant that would *bind* on a known-enum subject →
-  `enum-variant-binding-shadow` (Warning) **and** counts as a catch-all (mirrors runtime); qualified
-  `Shape.Point` → no warning, counts as covering `Point`. **Explicit zero-diagnostic assertions on
-  `examples/oop.as` and `examples/all_features.as`** (their catch-all `_` is a *sibling* of the
-  `MatchExpr` — the CST-gather regression guard).
-- [ ] New analysis wired after the per-arm `synth_match` (`pass.rs:952`), emitting via an **Error-severity
-  emit path** (the existing `emit` hardcodes `Severity::Warning` `pass.rs:118-128`; add a severity arg or
-  a parallel `emit_error` so `analyze.rs:97` `config.effective("non-exhaustive-match", Error)` carries
-  Error). **Arm gathering (must-fix, the Gate-5 tripwire):** the CST nests only the FIRST arm under
-  `MatchExpr` (`pass.rs:949-951`); `synth_match` iterates only `MatchExpr` children (`:972`). The
-  exhaustiveness pass MUST gather the `MatchArm` under `MatchExpr` **plus** the contiguous trailing run of
-  sibling `MatchArm` statements in the parent block (the way `walk_stmts` `pass.rs:136` reaches them) — walk
-  forward from the `MatchExpr`'s position consuming consecutive `MatchArm` siblings, in source order.
-  **Trigger:** only when the subject resolves to a concrete `CheckTy::Enum(E)`/`EnumVariant(E,_)`; else
-  silent. **Coverage:** an arm covers `V` if it is a variant pattern / unit `V`/`E.V`, OR a catch-all
-  (`_`/bare-binding-`Ident`/catch-all or-alternative); a guarded arm does NOT cover unless an unguarded arm
-  also does (Rust's rule); a value-equality arm (`Circle(2.0)`) does not fully cover. Optional secondary
-  `unreachable-match-arm` (Warning) if shipped.
-- [ ] **Gate 5/9:** zero false positives on `examples/**` (both configs); the missing-variant fixture is a
-  real `cargo run -- check` failure. Green; review; commit.
+- [x] Tests (the correctness pillar) in `tests/check.rs::adt_exhaustiveness`: missing variant + no `_` →
+  `non-exhaustive-match` **Error** naming the missing variants (Gate 9 — also exercised as a real
+  `ascript check` non-zero exit); the passing twin (all variants OR `_`) → zero; full coverage / `_` /
+  bare-binding catch-all → no diagnostic; a **guarded-only** arm does NOT cover (guarded+unguarded does);
+  **unknown/untyped subject → silent**; a bare unit variant that would *bind* on a known-enum subject →
+  `enum-variant-binding-shadow` (Warning) **and** counts as a catch-all; qualified `Shape.Point` → no
+  warning, covers `Point`; a value-equality arm (`Circle(0.0)`) does not fully cover. **Explicit
+  zero-diagnostic assertions on `examples/oop.as` and `examples/all_features.as`.**
+- [x] New `check_exhaustiveness` wired into `synth_match` (runs only when the subject provably IS an enum).
+  Added an **Error-severity** `emit_with` (the old `emit` now delegates at `Warning`); `config.effective`
+  carries the Error default. **Arm gathering — FINDING:** an earlier ADT task (the CST parser rework) already
+  nests EVERY arm directly under `MatchExpr` (empirically verified: `oop.as` `[3]`, `all_features.as`
+  `[3,5,3,3]`, ZERO orphan sibling `MatchArm`). So `expr.children().filter(MatchArm)` already sees all arms;
+  `gather_match_arms` uses that PLUS a defensive trailing-sibling sweep (a no-op today, kept as a guard
+  against any CST regression). **Coverage** per spec: variant pattern / unit `V`/`E.V` / catch-all
+  (`_`/would-bind-`Ident`/catch-all or-alt); guarded arms cover nothing on their own; a refutable payload
+  sub-pattern (`Circle(0.0)`) does not fully cover. Would-bind vs would-compare is decided by whether the
+  resolver created a `PatternBind` at the ident's range (empirically verified). `unreachable-match-arm` not
+  shipped (optional).
+- [x] **Gate 5/9:** ZERO false positives on `examples/**` (both configs, full-corpus count 0/0); the
+  missing-variant fixture is a real `ascript check` Error (exit 1). Green; reviewed. (NOTE: migrated
+  `examples/enums_adt.as` `Point =>` → `Shape.Point =>` — the spec-mandated qualified unit form — so the
+  example is exhaustive AND shadow-clean; runtime output unchanged.)
 
 ## Task 13 — LSP
 **Files:** `src/lsp/providers/*`, `src/lsp/workspace.rs`. **Tests:** `tests/lsp.rs`.
