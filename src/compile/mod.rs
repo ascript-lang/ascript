@@ -21,7 +21,7 @@ use crate::syntax::ast::{
 use crate::syntax::cst::ResolvedNode;
 use crate::syntax::kind::SyntaxKind;
 use crate::syntax::resolve::types::{Resolution, ResolveResult};
-use crate::syntax::{parse_to_tree, resolve::resolve};
+use crate::syntax::{first_syntax_error, parse_to_tree, resolve::resolve};
 use crate::value::Value;
 use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc};
 use crate::vm::opcode::Op;
@@ -723,6 +723,16 @@ fn short_circuit_op(op: SyntaxKind) -> Option<Op> {
 /// front-end runs even though V1 has no locals/globals to bind) → walk the
 /// statements, compiling the trailing expression and emitting `RETURN`.
 pub fn compile_source(src: &str) -> Result<Chunk, CompileError> {
+    // The CST parser is error-RECOVERING: it never aborts, it records a
+    // diagnostic and patches a best-effort tree (e.g. an anonymous `fn(){...}`
+    // EXPRESSION — not a language construct — recovers into a name-less,
+    // top-level `FnDecl`). Compiling that recovered tree would surface a
+    // confusing internal "compiler bug" panic, so reject malformed source up
+    // front with the FIRST syntax error, exactly as the legacy tree-walker
+    // front-end rejects it at its own parser (keeping the two engines aligned).
+    if let Some(err) = first_syntax_error(src) {
+        return Err(CompileError::new(err.message, Span::new(err.start, err.end)));
+    }
     let root = parse_to_tree(src);
     let file = SourceFile::cast(root.clone())
         .ok_or_else(|| CompileError::new("expected a source file", Span::new(0, src.len())))?;

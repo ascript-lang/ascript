@@ -167,6 +167,75 @@ fn run_error_shows_source_caret() {
     assert!(err.contains("undefined variable 'missing'"));
 }
 
+/// An anonymous `fn(){...}` EXPRESSION is not a language feature (the spec's
+/// only anonymous function is the arrow `() => ...`). It must be rejected as a
+/// clean SYNTAX error on BOTH engines — never the legacy "unexpected token Fn"
+/// on the tree-walker while the VM emits a confusing internal
+/// "compiler bug" message (the regression this guards). The arrow equivalent
+/// must keep working.
+#[test]
+fn anon_fn_expression_is_a_syntax_error_on_both_engines() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    // `fn(){...}` in several expression positions: direct call argument, RHS of
+    // a `let`, nested call arg, and an immediately-invoked form.
+    let cases = [
+        "let r = recover(fn() { return 5 })\nprint(r[0])\n",
+        "let f = fn() { return 5 }\nprint(f())\n",
+        "let xs = array.map([1, 2, 3], fn(x) { return x * 2 })\nprint(xs)\n",
+        "let v = (fn() { return 7 })()\nprint(v)\n",
+    ];
+    for src in cases {
+        let file = std::env::temp_dir().join(format!(
+            "ascript_anonfn_{}_{}.as",
+            std::process::id(),
+            src.len()
+        ));
+        std::fs::write(&file, src).unwrap();
+        for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
+            let out = Command::new(bin)
+                .args(&engine_args)
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(
+                !out.status.success(),
+                "expected `{src}` to FAIL on {engine_args:?}, but it succeeded"
+            );
+            let err = String::from_utf8_lossy(&out.stderr);
+            // The defining regression: the VM must NOT surface the internal
+            // "compiler bug" message for this user-syntax mistake.
+            assert!(
+                !err.contains("compiler bug"),
+                "`{src}` on {engine_args:?} leaked an internal compiler-bug error:\n{err}"
+            );
+        }
+    }
+}
+
+/// The arrow equivalent (`() => ...`) — the real anonymous-function syntax — must
+/// keep working as a direct call argument on BOTH engines (the working path we
+/// must not regress).
+#[test]
+fn arrow_in_call_argument_works_on_both_engines() {
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let src = "let r = recover(() => 5)\nprint(r[0])\n";
+    let file = std::env::temp_dir().join(format!("ascript_arrowarg_{}.as", std::process::id()));
+    std::fs::write(&file, src).unwrap();
+    for engine_args in [vec!["run"], vec!["run", "--tree-walker"]] {
+        let out = Command::new(bin)
+            .args(&engine_args)
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "expected `{src}` to succeed on {engine_args:?}: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "5\n");
+    }
+}
+
 #[test]
 fn runs_modules_example() {
     let bin = env!("CARGO_BIN_EXE_ascript");
@@ -2406,7 +2475,7 @@ fn oversubscription_completes_via_queue() {
         import { gather } from "std/task"
         worker fn sq(n) { return n * n }
         let nums = []
-        for n in 1..=20 { array.push(nums, n) }
+        for (n in 1..=20) { array.push(nums, n) }
         let fs = array.map(nums, sq)
         print(math.sum(await gather(fs)))
     "#;
