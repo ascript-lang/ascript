@@ -188,9 +188,13 @@ impl std::ops::Deref for SetCell {
 pub enum MapKey {
     Nil,
     Bool(bool),
+    /// Exact integer key (NUM §3.3). An integral, finite, in-i64-range `Float`
+    /// FOLDS into this variant so `Int(1)` and `Float(1.0)` are the SAME key.
+    Int(i64),
     Num(u64), // canonicalized f64 bits (−0.0→+0.0, all NaNs→one canonical NaN)
     Str(Rc<str>),
-    /// Exact decimal key. Distinct from `Num` — `Decimal("0.1")` ≠ `Num(0.1f64)`.
+    /// Exact decimal key. Distinct from `Num`/`Int` — `Decimal("0.1")` ≠ `Num(0.1f64)`,
+    /// `Decimal("1")` ≠ `Int(1)` (Decimal is exact and opt-in; never folded).
     Decimal(Decimal),
 }
 
@@ -200,15 +204,29 @@ impl MapKey {
         match v {
             Value::Nil => Some(MapKey::Nil),
             Value::Bool(b) => Some(MapKey::Bool(*b)),
-            Value::Number(n) => {
-                let canon = if *n == 0.0 {
-                    0.0f64.to_bits()
-                } else if n.is_nan() {
-                    f64::NAN.to_bits()
+            Value::Int(i) => Some(MapKey::Int(*i)),
+            Value::Float(n) => {
+                // NUM §3.3: an integral, finite, in-i64-range float folds to the same
+                // key as the equal `int` (so `map[1]` and `map[1.0]` collide). Every
+                // other float (fractional, ±inf, NaN) keeps its canonical-bits key —
+                // NaN stays a single canonical bit pattern (storable, but never equal
+                // to a non-NaN under the evaluator's `==`).
+                if n.fract() == 0.0
+                    && n.is_finite()
+                    && *n >= i64::MIN as f64
+                    && *n <= i64::MAX as f64
+                {
+                    Some(MapKey::Int(*n as i64))
                 } else {
-                    n.to_bits()
-                };
-                Some(MapKey::Num(canon))
+                    // Only fractional or non-finite floats reach here (±0.0 folded to
+                    // `Int(0)` above). NaN canonicalizes to one bit pattern.
+                    let canon = if n.is_nan() {
+                        f64::NAN.to_bits()
+                    } else {
+                        n.to_bits()
+                    };
+                    Some(MapKey::Num(canon))
+                }
             }
             Value::Str(s) => Some(MapKey::Str(s.clone())),
             Value::Decimal(d) => Some(MapKey::Decimal(*d)),
@@ -221,7 +239,8 @@ impl MapKey {
         match self {
             MapKey::Nil => Value::Nil,
             MapKey::Bool(b) => Value::Bool(*b),
-            MapKey::Num(bits) => Value::Number(f64::from_bits(*bits)),
+            MapKey::Int(i) => Value::Int(*i),
+            MapKey::Num(bits) => Value::Float(f64::from_bits(*bits)),
             MapKey::Str(s) => Value::Str(s.clone()),
             MapKey::Decimal(d) => Value::Decimal(*d),
         }
@@ -623,10 +642,15 @@ pub struct Function {
 pub enum Value {
     Nil,
     Bool(bool),
-    Number(f64),
+    /// A 64-bit signed integer (NUM §3.1). The exact-arithmetic default subtype of
+    /// `number`; literals without a fractional part or exponent lex to `Int`.
+    Int(i64),
+    /// A 64-bit IEEE-754 float (NUM §3.1). The fractional subtype of `number`;
+    /// literals with a `.` or exponent lex to `Float`. (Formerly `Number(f64)`.)
+    Float(f64),
     /// Exact decimal arithmetic (96-bit scaled integer via `rust_decimal`).
     /// `Copy` — no heap allocation; `Hash + Eq + Ord` via the inner type.
-    /// Participates in operator overloading with `Number` via coercion.
+    /// Participates in operator overloading with `Int`/`Float` via coercion.
     Decimal(Decimal),
     Str(Rc<str>),
     /// A native built-in function, dispatched by name in the interpreter.
@@ -682,11 +706,35 @@ pub enum Value {
 }
 
 impl Value {
-    /// Spec §4: only `nil` and `false` are falsy. Everything else
-    /// (including `0` and `""`) is truthy.
+    /// NUM §3.3 (BREAKING): the resolved falsy set is `nil`, `false`, `Int(0)`,
+    /// a `Float` that is `0.0`/`-0.0`/`NaN`, a `Decimal` equal to zero, and the
+    /// empty string `""`. EVERYTHING else is truthy — including non-empty strings
+    /// and ALL collections/objects/instances even when empty.
     pub fn is_truthy(&self) -> bool {
-        !matches!(self, Value::Nil | Value::Bool(false))
+        match self {
+            Value::Nil => false,
+            Value::Bool(b) => *b,
+            Value::Int(i) => *i != 0,
+            // `0.0 == -0.0` is `true`, so the `!= 0.0` test covers both signed zeros;
+            // NaN is excluded explicitly (`!is_nan()`) → `0.0`/`-0.0`/`NaN` all falsy.
+            Value::Float(f) => *f != 0.0 && !f.is_nan(),
+            Value::Decimal(d) => *d != Decimal::ZERO,
+            Value::Str(s) => !s.is_empty(),
+            _ => true,
+        }
     }
+}
+
+/// Exact `int`-vs-`float` equality (NUM §3.3): `true` iff `i` and `f` denote the
+/// same mathematical value. Avoids the lossy `i as f64` round-trip — a non-finite
+/// or non-integral `f`, or one outside i64 range, is never equal to any `int`; an
+/// integral in-range `f` equals `i` iff `f as i64 == i`.
+fn int_eq_float(i: i64, f: f64) -> bool {
+    f.is_finite()
+        && f.fract() == 0.0
+        && f >= i64::MIN as f64
+        && f <= i64::MAX as f64
+        && f as i64 == i
 }
 
 impl PartialEq for Value {
@@ -694,7 +742,14 @@ impl PartialEq for Value {
         match (self, other) {
             (Value::Nil, Value::Nil) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Int(a), Value::Int(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            // Cross-subtype numeric equality is EXACT (NUM §3.3): an `int` equals a
+            // `float` iff they are mathematically equal — no lossy `i as f64` cast
+            // (which would make `2**53+1 == float(2**53)`). Symmetric.
+            (Value::Int(i), Value::Float(f)) | (Value::Float(f), Value::Int(i)) => {
+                int_eq_float(*i, *f)
+            }
             // Decimal: same-type value equality by the Decimal's own PartialEq.
             // Cross-type Number↔Decimal equality is handled in the evaluator's
             // Eq/Ne path, not here.
@@ -741,7 +796,8 @@ impl fmt::Debug for Value {
         match self {
             Value::Nil => write!(f, "Nil"),
             Value::Bool(b) => write!(f, "Bool({})", b),
-            Value::Number(n) => write!(f, "Number({})", n),
+            Value::Int(i) => write!(f, "Int({})", i),
+            Value::Float(n) => write!(f, "Float({})", n),
             Value::Decimal(d) => write!(f, "Decimal({})", d),
             Value::Str(s) => write!(f, "Str({:?})", s),
             Value::Builtin(name) => write!(f, "Builtin({:?})", name),
@@ -792,8 +848,9 @@ impl Value {
         match self {
             Value::Nil => write!(f, "nil"),
             Value::Bool(b) => write!(f, "{}", b),
+            Value::Int(i) => write!(f, "{}", i),
             // Rust's f64 Display already prints 7.0 as "7" and 2.5 as "2.5".
-            Value::Number(n) => write!(f, "{}", n),
+            Value::Float(n) => write!(f, "{}", n),
             // Decimal: print the canonical string (scale preserved, e.g. "1.50").
             Value::Decimal(d) => write!(f, "{}", d),
             Value::Str(s) => write!(f, "{}", s),
@@ -910,8 +967,8 @@ mod tests {
 
     #[test]
     fn displays_values_like_a_script_language() {
-        assert_eq!(Value::Number(7.0).to_string(), "7");
-        assert_eq!(Value::Number(2.5).to_string(), "2.5");
+        assert_eq!(Value::Float(7.0).to_string(), "7");
+        assert_eq!(Value::Float(2.5).to_string(), "2.5");
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Nil.to_string(), "nil");
         assert_eq!(Value::Str("hi".into()).to_string(), "hi");
@@ -919,19 +976,27 @@ mod tests {
 
     #[test]
     fn truthiness_follows_spec() {
+        // NUM: falsy = nil, false, 0 (int), 0.0/-0.0/NaN (float), 0 decimal, "" (string).
+        // Everything else — incl. non-empty strings and all collections even when empty — is truthy.
         assert!(Value::Bool(true).is_truthy());
-        assert!(Value::Number(0.0).is_truthy());
-        assert!(Value::Str("".into()).is_truthy());
         assert!(!Value::Bool(false).is_truthy());
         assert!(!Value::Nil.is_truthy());
+        assert!(!Value::Int(0).is_truthy());
+        assert!(Value::Int(1).is_truthy());
+        assert!(!Value::Float(0.0).is_truthy());
+        assert!(!Value::Float(-0.0).is_truthy());
+        assert!(!Value::Float(f64::NAN).is_truthy());
+        assert!(Value::Float(0.5).is_truthy());
+        assert!(!Value::Str("".into()).is_truthy());
+        assert!(Value::Str("x".into()).is_truthy());
     }
 
     #[test]
     fn equality_is_structural_and_cross_kind_is_false() {
-        assert_eq!(Value::Number(1.0), Value::Number(1.0));
+        assert_eq!(Value::Float(1.0), Value::Float(1.0));
         assert_eq!(Value::Str("a".into()), Value::Str("a".into()));
-        assert_ne!(Value::Number(1.0), Value::Str("1".into()));
-        assert_ne!(Value::Bool(true), Value::Number(1.0));
+        assert_ne!(Value::Float(1.0), Value::Str("1".into()));
+        assert_ne!(Value::Bool(true), Value::Float(1.0));
     }
 
     #[test]
@@ -953,13 +1018,13 @@ mod tests {
         
 
         let a = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Number(1.0),
+            Value::Float(1.0),
             Value::Str("two".into()),
         ]));
         assert_eq!(a.to_string(), "[1, \"two\"]");
         // identity: a clone of the SAME Rc is equal; a fresh array is not
         assert_eq!(a.clone(), a);
-        let b = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
+        let b = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
         assert_ne!(a, b);
         assert!(a.is_truthy());
     }
@@ -968,13 +1033,13 @@ mod tests {
     fn maps_display_and_compare_by_identity() {
         use indexmap::IndexMap;
         let mut m = IndexMap::new();
-        m.insert(MapKey::Str("a".into()), Value::Number(1.0));
+        m.insert(MapKey::Str("a".into()), Value::Float(1.0));
         m.insert(MapKey::Num(0.0f64.to_bits()), Value::Str("zero".into()));
         let map = Value::Map(crate::value::MapCell::new(m));
         assert_eq!(map.to_string(), "map {\"a\": 1, 0: \"zero\"}");
         assert_eq!(map.clone(), map);
         assert!(map.is_truthy());
-        assert!(MapKey::from_value(&Value::Number(0.0)).is_some());
+        assert!(MapKey::from_value(&Value::Float(0.0)).is_some());
         assert!(
             MapKey::from_value(&Value::Array(crate::value::ArrayCell::new(vec![]))).is_none()
         );
@@ -987,7 +1052,7 @@ mod tests {
         // distinct slots in a Map/Set. This pins the MapKey::Decimal claim directly.
         // (MapKey intentionally has no Debug derive, so compare via bool to avoid
         // requiring it in assert_eq!/assert_ne!.)
-        let num_key = MapKey::from_value(&Value::Number(1.0)).expect("number is hashable");
+        let num_key = MapKey::from_value(&Value::Float(1.0)).expect("number is hashable");
         let dec_key =
             MapKey::from_value(&Value::Decimal(Decimal::from(1))).expect("decimal is hashable");
         assert!(
@@ -999,6 +1064,110 @@ mod tests {
         let b = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
         assert!(a == b);
         assert_eq!(dec_key.to_value(), Value::Decimal(Decimal::from(1)));
+    }
+
+    // ---- NUM Task 1: int subtype, truthiness, MapKey fold, cross-subtype eq ----
+
+    #[test]
+    fn num_type_names_distinguish_int_and_float() {
+        assert_eq!(crate::interp::type_name(&Value::Int(5)), "int");
+        assert_eq!(crate::interp::type_name(&Value::Float(5.0)), "float");
+        // Decimal is its own subtype, unchanged.
+        assert_eq!(
+            crate::interp::type_name(&Value::Decimal(Decimal::from(1))),
+            "decimal"
+        );
+    }
+
+    #[test]
+    fn num_int_displays_without_a_decimal_point() {
+        assert_eq!(Value::Int(5).to_string(), "5");
+        assert_eq!(Value::Int(-42).to_string(), "-42");
+        assert_eq!(Value::Int(0).to_string(), "0");
+        // Debug carries the subtype tag.
+        assert_eq!(format!("{:?}", Value::Int(7)), "Int(7)");
+        assert_eq!(format!("{:?}", Value::Float(7.0)), "Float(7)");
+    }
+
+    #[test]
+    fn num_truthiness_resolved_falsy_set() {
+        // Falsy: nil, false, Int(0), 0.0/-0.0/NaN, 0m, "".
+        assert!(!Value::Nil.is_truthy());
+        assert!(!Value::Bool(false).is_truthy());
+        assert!(!Value::Int(0).is_truthy());
+        assert!(!Value::Float(0.0).is_truthy());
+        assert!(!Value::Float(-0.0).is_truthy());
+        assert!(!Value::Float(f64::NAN).is_truthy());
+        assert!(!Value::Decimal(Decimal::ZERO).is_truthy());
+        assert!(!Value::Str("".into()).is_truthy());
+        // Truthy: any non-zero number, non-empty string, EVERY collection even empty.
+        assert!(Value::Bool(true).is_truthy());
+        assert!(Value::Int(1).is_truthy());
+        assert!(Value::Int(-1).is_truthy());
+        assert!(Value::Float(0.5).is_truthy());
+        assert!(Value::Float(f64::INFINITY).is_truthy());
+        assert!(Value::Decimal(Decimal::from(1)).is_truthy());
+        assert!(Value::Str("x".into()).is_truthy());
+        assert!(Value::Array(crate::value::ArrayCell::new(vec![])).is_truthy());
+        {
+            use indexmap::IndexMap;
+            assert!(Value::Map(crate::value::MapCell::new(IndexMap::new())).is_truthy());
+            assert!(Value::Object(crate::value::ObjectCell::new(IndexMap::new())).is_truthy());
+        }
+    }
+
+    #[test]
+    fn num_mapkey_folds_integral_float_to_int() {
+        // §3.3: an integral, in-range float is the SAME map key as the equal int.
+        let from_int = MapKey::from_value(&Value::Int(1)).expect("int is hashable");
+        let from_float = MapKey::from_value(&Value::Float(1.0)).expect("float is hashable");
+        assert!(from_int == from_float, "Int(1) and Float(1.0) must share a key");
+        // -0.0 folds to Int(0) and equals Int(0)/0.0.
+        let neg_zero = MapKey::from_value(&Value::Float(-0.0)).expect("float is hashable");
+        let pos_zero = MapKey::from_value(&Value::Float(0.0)).expect("float is hashable");
+        let int_zero = MapKey::from_value(&Value::Int(0)).expect("int is hashable");
+        assert!(neg_zero == pos_zero && pos_zero == int_zero);
+        // A fractional float is a distinct (non-Int) key.
+        let frac = MapKey::from_value(&Value::Float(1.5)).expect("float is hashable");
+        assert!(frac != from_int);
+        // Round-trips: Int key -> Value::Int.
+        assert_eq!(from_int.to_value(), Value::Int(1));
+    }
+
+    #[test]
+    fn num_mapkey_nan_carveout() {
+        // §3.3: NaN is excluded from the "a==b ⟺ same key" claim. NaN keys
+        // canonicalize to ONE storable key, but never equal a non-NaN key, and a
+        // NaN float is NOT folded to any Int.
+        let nan1 = MapKey::from_value(&Value::Float(f64::NAN)).expect("nan is hashable");
+        let nan2 = MapKey::from_value(&Value::Float(f64::NAN)).expect("nan is hashable");
+        // Two NaN keys canonicalize identically (storable/retrievable as one key).
+        assert!(nan1 == nan2);
+        // A NaN key never collides with any integer key (incl. 0).
+        let zero = MapKey::from_value(&Value::Int(0)).expect("int is hashable");
+        assert!(nan1 != zero);
+        // The canonical NaN key is a `Num` (float) key, not an `Int` fold.
+        assert!(matches!(nan1, MapKey::Num(_)));
+    }
+
+    #[test]
+    fn num_cross_subtype_equality_is_exact() {
+        // Int(1) == Float(1.0), symmetric.
+        assert_eq!(Value::Int(1), Value::Float(1.0));
+        assert_eq!(Value::Float(1.0), Value::Int(1));
+        assert_eq!(Value::Int(0), Value::Float(-0.0));
+        // Non-integral float is never equal to an int.
+        assert_ne!(Value::Int(2), Value::Float(2.5));
+        assert_ne!(Value::Float(2.5), Value::Int(2));
+        // Exact (not lossy): 2^53+1 as int does NOT equal float(2^53) which rounds.
+        let big = (1i64 << 53) + 1;
+        assert_ne!(Value::Int(big), Value::Float(big as f64));
+        // NaN/inf floats never equal any int.
+        assert_ne!(Value::Int(0), Value::Float(f64::NAN));
+        assert_ne!(Value::Int(0), Value::Float(f64::INFINITY));
+        // Same-subtype equality still holds.
+        assert_eq!(Value::Int(7), Value::Int(7));
+        assert_ne!(Value::Int(7), Value::Int(8));
     }
 
     #[test]
@@ -1070,7 +1239,7 @@ mod tests {
     fn objects_display_and_compare_by_identity() {
         use indexmap::IndexMap;
         let mut m = IndexMap::new();
-        m.insert("a".to_string(), Value::Number(1.0));
+        m.insert("a".to_string(), Value::Float(1.0));
         m.insert("b".to_string(), Value::Str("x".into()));
         let o = Value::Object(ObjectCell::new(m));
         assert_eq!(o.to_string(), "{a: 1, b: \"x\"}");

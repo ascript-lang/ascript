@@ -30,7 +30,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "stringify" => {
             let v = arg(args, 0);
-            let pretty = matches!(args.get(1), Some(Value::Number(n)) if *n > 0.0)
+            let pretty = matches!(args.get(1), Some(Value::Float(n)) if *n > 0.0)
                 || matches!(args.get(1), Some(Value::Bool(true)));
             match from_ascript(&v, &mut Vec::new()) {
                 Ok(jv) => {
@@ -59,7 +59,7 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
     match jv {
         serde_json::Value::Null => Value::Nil,
         serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
+        serde_json::Value::Number(n) => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
         serde_json::Value::String(s) => Value::Str(s.as_str().into()),
         serde_json::Value::Array(a) => Value::Array(crate::value::ArrayCell::new(
             a.iter().map(to_ascript).collect(),
@@ -89,7 +89,7 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
                 .map_err(|_| format!("cannot serialize decimal {} to JSON", d))?;
             Ok(raw)
         }
-        Value::Number(n) => {
+        Value::Float(n) => {
             if !n.is_finite() {
                 return Err(format!("cannot serialize non-finite number {} to JSON", n));
             }
@@ -188,7 +188,7 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
         Value::Bool(b) => J::Bool(*b),
         // Decimal: emit as a JSON number from the canonical string (always finite).
         Value::Decimal(d) => serde_json::from_str::<J>(&d.to_string()).unwrap_or(J::Null),
-        Value::Number(n) => {
+        Value::Float(n) => {
             if !n.is_finite() {
                 return J::Null;
             }
@@ -318,7 +318,7 @@ mod tests {
     fn stringify_and_errors() {
         let obj = {
             let mut m = IndexMap::new();
-            m.insert("n".to_string(), Value::Number(2.0));
+            m.insert("n".to_string(), Value::Float(2.0));
             Value::Object(crate::value::ObjectCell::new(m))
         };
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
@@ -347,7 +347,7 @@ mod tests {
             "\"<function>\""
         );
         assert_eq!(
-            to_json_lossy(&Value::Number(f64::NAN), &mut Vec::new()),
+            to_json_lossy(&Value::Float(f64::NAN), &mut Vec::new()),
             serde_json::Value::Null
         );
     }

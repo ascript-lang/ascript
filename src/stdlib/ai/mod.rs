@@ -189,7 +189,7 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
     // if any, set them on the request + run the in-interpreter tool-use loop.
     let resolved_tools = tools::resolve_tools(interp, &request::get_field(&opts, "tools"), span)?;
     let max_steps = match request::get_field(&opts, "maxSteps") {
-        Value::Number(n) if n >= 1.0 => n as u32,
+        Value::Float(n) if n >= 1.0 => n as u32,
         _ => 5,
     };
 

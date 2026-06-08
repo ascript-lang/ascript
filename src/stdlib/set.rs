@@ -117,7 +117,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "size" => {
             let s = want_set(&arg(args, 0), span, &ctx("size"))?;
             let n = s.borrow().len() as f64;
-            Ok(Value::Number(n))
+            Ok(Value::Float(n))
         }
 
         "values" => {
@@ -192,7 +192,7 @@ mod tests {
         let s = call("new", &[], sp()).unwrap();
         assert_eq!(
             call("size", std::slice::from_ref(&s), sp()).unwrap(),
-            Value::Number(0.0)
+            Value::Float(0.0)
         );
     }
 
@@ -201,14 +201,14 @@ mod tests {
     #[test]
     fn from_deduplicates() {
         let arr = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Number(1.0),
-            Value::Number(1.0),
-            Value::Number(2.0),
+            Value::Float(1.0),
+            Value::Float(1.0),
+            Value::Float(2.0),
         ]));
         let s = call("from", std::slice::from_ref(&arr), sp()).unwrap();
         assert_eq!(
             call("size", std::slice::from_ref(&s), sp()).unwrap(),
-            Value::Number(2.0)
+            Value::Float(2.0)
         );
     }
 
@@ -218,14 +218,14 @@ mod tests {
         let s = call("from", std::slice::from_ref(&arr), sp()).unwrap();
         assert_eq!(
             call("size", std::slice::from_ref(&s), sp()).unwrap(),
-            Value::Number(0.0)
+            Value::Float(0.0)
         );
     }
 
     #[test]
     fn from_non_array_panics() {
         assert!(matches!(
-            call("from", &[Value::Number(5.0)], sp()),
+            call("from", &[Value::Float(5.0)], sp()),
             Err(Control::Panic(_))
         ));
     }
@@ -238,22 +238,22 @@ mod tests {
         // add "hello"
         call("add", &[s.clone(), Value::Str("hello".into())], sp()).unwrap();
         // add 42
-        call("add", &[s.clone(), Value::Number(42.0)], sp()).unwrap();
+        call("add", &[s.clone(), Value::Float(42.0)], sp()).unwrap();
 
         assert_eq!(
             call("size", std::slice::from_ref(&s), sp()).unwrap(),
-            Value::Number(2.0)
+            Value::Float(2.0)
         );
         assert_eq!(
             call("has", &[s.clone(), Value::Str("hello".into())], sp()).unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            call("has", &[s.clone(), Value::Number(42.0)], sp()).unwrap(),
+            call("has", &[s.clone(), Value::Float(42.0)], sp()).unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
-            call("has", &[s.clone(), Value::Number(99.0)], sp()).unwrap(),
+            call("has", &[s.clone(), Value::Float(99.0)], sp()).unwrap(),
             Value::Bool(false)
         );
 
@@ -269,14 +269,14 @@ mod tests {
         );
         assert_eq!(
             call("size", std::slice::from_ref(&s), sp()).unwrap(),
-            Value::Number(1.0)
+            Value::Float(1.0)
         );
     }
 
     #[test]
     fn add_is_chainable() {
         let s = call("new", &[], sp()).unwrap();
-        let s2 = call("add", &[s.clone(), Value::Number(1.0)], sp()).unwrap();
+        let s2 = call("add", &[s.clone(), Value::Float(1.0)], sp()).unwrap();
         // returned value is the SAME set (by identity)
         assert_eq!(s, s2);
     }
@@ -284,11 +284,11 @@ mod tests {
     #[test]
     fn add_duplicate_noop() {
         let s = call("new", &[], sp()).unwrap();
-        call("add", &[s.clone(), Value::Number(1.0)], sp()).unwrap();
-        call("add", &[s.clone(), Value::Number(1.0)], sp()).unwrap();
+        call("add", &[s.clone(), Value::Float(1.0)], sp()).unwrap();
+        call("add", &[s.clone(), Value::Float(1.0)], sp()).unwrap();
         assert_eq!(
             call("size", std::slice::from_ref(&s), sp()).unwrap(),
-            Value::Number(1.0)
+            Value::Float(1.0)
         );
     }
 
@@ -297,9 +297,9 @@ mod tests {
     #[test]
     fn values_insertion_order() {
         let s = call("new", &[], sp()).unwrap();
-        call("add", &[s.clone(), Value::Number(3.0)], sp()).unwrap();
-        call("add", &[s.clone(), Value::Number(1.0)], sp()).unwrap();
-        call("add", &[s.clone(), Value::Number(2.0)], sp()).unwrap();
+        call("add", &[s.clone(), Value::Float(3.0)], sp()).unwrap();
+        call("add", &[s.clone(), Value::Float(1.0)], sp()).unwrap();
+        call("add", &[s.clone(), Value::Float(2.0)], sp()).unwrap();
         let vals = call("values", std::slice::from_ref(&s), sp()).unwrap();
         assert_eq!(vals.to_string(), "[3, 1, 2]");
     }
@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn non_hashable_add_panics() {
         let s = call("new", &[], sp()).unwrap();
-        let bad = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
+        let bad = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
         assert!(matches!(
             call("add", &[s, bad], sp()),
             Err(Control::Panic(_))
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn non_hashable_from_panics() {
         let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Array(
-            crate::value::ArrayCell::new(vec![Value::Number(1.0)]),
+            crate::value::ArrayCell::new(vec![Value::Float(1.0)]),
         )]));
         assert!(matches!(call("from", &[arr], sp()), Err(Control::Panic(_))));
     }
@@ -338,8 +338,8 @@ mod tests {
 
     #[test]
     fn union_combines_and_deduplicates() {
-        let a = mk_set(&[Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]);
-        let b = mk_set(&[Value::Number(2.0), Value::Number(3.0), Value::Number(4.0)]);
+        let a = mk_set(&[Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
+        let b = mk_set(&[Value::Float(2.0), Value::Float(3.0), Value::Float(4.0)]);
         let u = call("union", &[a, b], sp()).unwrap();
         let vals = call("values", std::slice::from_ref(&u), sp()).unwrap();
         assert_eq!(vals.to_string(), "[1, 2, 3, 4]");
@@ -347,8 +347,8 @@ mod tests {
 
     #[test]
     fn intersection_returns_common_elements() {
-        let a = mk_set(&[Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]);
-        let b = mk_set(&[Value::Number(2.0), Value::Number(3.0), Value::Number(4.0)]);
+        let a = mk_set(&[Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
+        let b = mk_set(&[Value::Float(2.0), Value::Float(3.0), Value::Float(4.0)]);
         let inter = call("intersection", &[a, b], sp()).unwrap();
         let vals = call("values", std::slice::from_ref(&inter), sp()).unwrap();
         assert_eq!(vals.to_string(), "[2, 3]");
@@ -356,8 +356,8 @@ mod tests {
 
     #[test]
     fn difference_a_minus_b() {
-        let a = mk_set(&[Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]);
-        let b = mk_set(&[Value::Number(2.0), Value::Number(3.0), Value::Number(4.0)]);
+        let a = mk_set(&[Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
+        let b = mk_set(&[Value::Float(2.0), Value::Float(3.0), Value::Float(4.0)]);
         let diff = call("difference", &[a, b], sp()).unwrap();
         let vals = call("values", std::slice::from_ref(&diff), sp()).unwrap();
         assert_eq!(vals.to_string(), "[1]");
@@ -366,15 +366,15 @@ mod tests {
     #[test]
     fn set_operations_return_new_sets() {
         // union/intersection/difference must NOT mutate the originals
-        let a = mk_set(&[Value::Number(1.0), Value::Number(2.0)]);
-        let b = mk_set(&[Value::Number(2.0), Value::Number(3.0)]);
+        let a = mk_set(&[Value::Float(1.0), Value::Float(2.0)]);
+        let b = mk_set(&[Value::Float(2.0), Value::Float(3.0)]);
         let _u = call("union", &[a.clone(), b.clone()], sp()).unwrap();
         let _i = call("intersection", &[a.clone(), b.clone()], sp()).unwrap();
         let _d = call("difference", &[a.clone(), b.clone()], sp()).unwrap();
         // original a still has exactly 2 elements
         assert_eq!(
             call("size", std::slice::from_ref(&a), sp()).unwrap(),
-            Value::Number(2.0)
+            Value::Float(2.0)
         );
     }
 
@@ -383,11 +383,11 @@ mod tests {
     #[test]
     fn deep_equal_order_independence() {
         // Two sets with the same elements in different insertion order must be deep_equal.
-        let a = mk_set(&[Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]);
-        let b = mk_set(&[Value::Number(3.0), Value::Number(1.0), Value::Number(2.0)]);
+        let a = mk_set(&[Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)]);
+        let b = mk_set(&[Value::Float(3.0), Value::Float(1.0), Value::Float(2.0)]);
         assert!(crate::stdlib::object::deep_equal(&a, &b));
         // But a set with different elements is NOT equal.
-        let c = mk_set(&[Value::Number(1.0), Value::Number(2.0)]);
+        let c = mk_set(&[Value::Float(1.0), Value::Float(2.0)]);
         assert!(!crate::stdlib::object::deep_equal(&a, &c));
     }
 
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn set_display() {
-        let s = mk_set(&[Value::Number(1.0), Value::Str("two".into())]);
+        let s = mk_set(&[Value::Float(1.0), Value::Str("two".into())]);
         // format: set {1, "two"} — mirrors Map's `map {...}` (space before brace).
         assert_eq!(s.to_string(), "set {1, \"two\"}");
     }

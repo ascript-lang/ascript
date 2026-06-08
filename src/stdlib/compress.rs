@@ -191,7 +191,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
 fn opt_level(v: Option<&Value>, span: Span, ctx: &str) -> Result<Option<i64>, Control> {
     match v {
         None | Some(Value::Nil) => Ok(None),
-        Some(Value::Number(n)) => Ok(Some(*n as i64)),
+        Some(Value::Float(n)) => Ok(Some(*n as i64)),
         Some(other) => Err(AsError::at(
             format!(
                 "compress.{} level must be a number, got {}",
@@ -539,7 +539,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "expects bytes or a string")]
     fn gzip_number_is_tier2_panic() {
-        call("gzip", &[Value::Number(42.0)], sp()).unwrap();
+        call("gzip", &[Value::Float(42.0)], sp()).unwrap();
     }
 
     // ── SP5 §5: zstd / brotli / tar ───────────────────────────────────────────
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn zstd_level_arg_roundtrips() {
-        let zc = call("zstdCompress", &[s("level test data"), Value::Number(19.0)], sp()).unwrap();
+        let zc = call("zstdCompress", &[s("level test data"), Value::Float(19.0)], sp()).unwrap();
         let back = ok_value(call("zstdDecompress", std::slice::from_ref(&zc), sp()).unwrap());
         assert_eq!(as_bytes(&back), b"level test data".to_vec());
     }
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be an object")]
     fn tar_create_bad_entry_is_tier2_panic() {
-        let entries = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
+        let entries = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
         call("tarCreate", &[entries], sp()).unwrap();
     }
 

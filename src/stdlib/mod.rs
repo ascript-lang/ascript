@@ -627,10 +627,10 @@ impl Interp {
         // `time::call` keeps its real-clock arms for any direct callers.
         if self.is_deterministic() {
             match func {
-                "now" => return Ok(Value::Number(self.clock_now_ms())),
+                "now" => return Ok(Value::Float(self.clock_now_ms())),
                 "monotonic" => {
                     let real = time::real_monotonic_ms();
-                    return Ok(Value::Number(self.clock_monotonic_ms(real)));
+                    return Ok(Value::Float(self.clock_monotonic_ms(real)));
                 }
                 _ => {}
             }
@@ -697,7 +697,7 @@ impl Interp {
             // Second measurement (delta).
             sys.refresh_cpu_usage();
             let pct = sys.global_cpu_usage() as f64;
-            return Ok(Value::Number(pct.clamp(0.0, 100.0)));
+            return Ok(Value::Float(pct.clamp(0.0, 100.0)));
         }
         os::call(func, args, span)
     }
@@ -711,7 +711,7 @@ pub(crate) fn arg(args: &[Value], i: usize) -> Value {
 
 pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Control> {
     match v {
-        Value::Number(n) => Ok(*n),
+        Value::Float(n) => Ok(*n),
         _ => Err(AsError::at(
             format!(
                 "{} expects a number, got {}",

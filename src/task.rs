@@ -173,17 +173,17 @@ mod tests {
     #[tokio::test]
     async fn resolves_once_and_get_returns_value() {
         let f = SharedFuture::new();
-        f.resolve(Ok(Value::Number(1.0)));
-        assert_eq!(f.get().await.unwrap(), Value::Number(1.0));
-        assert_eq!(f.get().await.unwrap(), Value::Number(1.0));
+        f.resolve(Ok(Value::Float(1.0)));
+        assert_eq!(f.get().await.unwrap(), Value::Float(1.0));
+        assert_eq!(f.get().await.unwrap(), Value::Float(1.0));
     }
 
     #[tokio::test]
     async fn resolve_twice_keeps_first() {
         let f = SharedFuture::new();
-        f.resolve(Ok(Value::Number(1.0)));
-        f.resolve(Ok(Value::Number(2.0)));
-        assert_eq!(f.get().await.unwrap(), Value::Number(1.0));
+        f.resolve(Ok(Value::Float(1.0)));
+        f.resolve(Ok(Value::Float(2.0)));
+        assert_eq!(f.get().await.unwrap(), Value::Float(1.0));
     }
 
     #[tokio::test]
@@ -205,9 +205,9 @@ mod tests {
             .run_until(async move {
                 tokio::task::spawn_local(async move {
                     tokio::task::yield_now().await;
-                    cell.resolve(Ok(Value::Number(99.0)));
+                    cell.resolve(Ok(Value::Float(99.0)));
                 });
-                assert_eq!(f.get().await.unwrap(), Value::Number(99.0));
+                assert_eq!(f.get().await.unwrap(), Value::Float(99.0));
             })
             .await;
     }
@@ -240,7 +240,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     tokio::task::yield_now().await;
                     ran2.set(true);
-                    cell.resolve(Ok(Value::Number(1.0)));
+                    cell.resolve(Ok(Value::Float(1.0)));
                 });
                 f.set_abort(jh.abort_handle());
                 drop(f); // last handle -> abort, before the task's first poll
@@ -267,7 +267,7 @@ mod tests {
                 let jh = tokio::task::spawn_local(async move {
                     tokio::task::yield_now().await;
                     ran2.set(true);
-                    cell.resolve(Ok(Value::Number(7.0)));
+                    cell.resolve(Ok(Value::Float(7.0)));
                 });
                 f.set_abort(jh.abort_handle());
                 f.detach(); // opt out of cancel-on-drop

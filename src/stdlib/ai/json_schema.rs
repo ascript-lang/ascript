@@ -199,10 +199,10 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
         "string" => {
             let mut m = Map::new();
             m.insert("type".to_string(), J::String("string".to_string()));
-            if let Some(Value::Number(n)) = field(schema, "minLength") {
+            if let Some(Value::Float(n)) = field(schema, "minLength") {
                 m.insert("minLength".to_string(), json!(n as i64));
             }
-            if let Some(Value::Number(n)) = field(schema, "maxLength") {
+            if let Some(Value::Float(n)) = field(schema, "maxLength") {
                 m.insert("maxLength".to_string(), json!(n as i64));
             }
             if let Some(Value::Str(p)) = field(schema, "pattern") {
@@ -213,10 +213,10 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
         "number" => {
             let mut m = Map::new();
             m.insert("type".to_string(), J::String("number".to_string()));
-            if let Some(Value::Number(n)) = field(schema, "min") {
+            if let Some(Value::Float(n)) = field(schema, "min") {
                 m.insert("minimum".to_string(), json!(n));
             }
-            if let Some(Value::Number(n)) = field(schema, "max") {
+            if let Some(Value::Float(n)) = field(schema, "max") {
                 m.insert("maximum".to_string(), json!(n));
             }
             J::Object(m)
@@ -304,7 +304,7 @@ fn value_to_json(v: &Value) -> J {
     match v {
         Value::Nil => J::Null,
         Value::Bool(b) => J::Bool(*b),
-        Value::Number(n) => json!(n),
+        Value::Float(n) => json!(n),
         Value::Str(s) => J::String(s.to_string()),
         _ => J::Null,
     }
@@ -431,7 +431,7 @@ mod tests {
         let s = schema_obj(
             "string",
             vec![
-                ("minLength", Value::Number(3.0)),
+                ("minLength", Value::Float(3.0)),
                 ("pattern", Value::Str("^a".into())),
             ],
         );
@@ -445,7 +445,7 @@ mod tests {
     fn schema_number_min_max() {
         let s = schema_obj(
             "number",
-            vec![("min", Value::Number(0.0)), ("max", Value::Number(10.0))],
+            vec![("min", Value::Float(0.0)), ("max", Value::Float(10.0))],
         );
         let js = schema_value_to_json_schema(&s);
         assert_eq!(js["type"], "number");

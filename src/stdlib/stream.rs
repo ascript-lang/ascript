@@ -516,7 +516,7 @@ impl Interp {
                 if more {
                     let v = *cur;
                     *cur += *step;
-                    Ok(Some(Value::Number(v)))
+                    Ok(Some(Value::Float(v)))
                 } else {
                     Ok(None)
                 }
@@ -600,7 +600,7 @@ impl Interp {
                     let idx = *index;
                     *index += 1.0;
                     value = Value::Array(crate::value::ArrayCell::new(vec![
-                        Value::Number(idx),
+                        Value::Float(idx),
                         value,
                     ]));
                 }
@@ -665,7 +665,7 @@ impl Interp {
         while self.pull_next(id, span).await?.is_some() {
             n += 1.0;
         }
-        Ok(Value::Number(n))
+        Ok(Value::Float(n))
     }
 
     /// `stream.find(s, fn)` — first item where `fn(value)` is truthy, else `nil`.

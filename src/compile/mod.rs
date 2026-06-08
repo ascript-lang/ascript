@@ -220,7 +220,7 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     let span = node_span(expr);
     let kind = match expr {
         Expr::Literal(lit) => match literal_const_value(lit)? {
-            Value::Number(n) => ExprKind::Number(n),
+            Value::Float(n) => ExprKind::Number(n),
             Value::Str(s) => ExprKind::Str(s.to_string()),
             Value::Bool(b) => ExprKind::Bool(b),
             Value::Nil => ExprKind::Nil,
@@ -2015,7 +2015,7 @@ impl Compiler {
                     CompileError::new("unary minus has no operand", node_span(un))
                 })?;
                 match self.const_eval_enum_backing(&operand)? {
-                    Value::Number(n) => Ok(Value::Number(-n)),
+                    Value::Float(n) => Ok(Value::Float(-n)),
                     _ => Err(CompileError::new(
                         "enum variant backing value must be a number or string literal",
                         node_span(un),
@@ -2868,7 +2868,7 @@ impl Compiler {
             self.compile_expr(step)?;
             1u8
         } else {
-            let one = self.chunk.add_const(Value::Number(1.0));
+            let one = self.chunk.add_const(Value::Float(1.0));
             self.chunk.emit_u16(Op::Const, one, span);
             0u8
         };
@@ -3006,7 +3006,7 @@ impl Compiler {
         self.chunk.emit_u16(Op::GetLocal, arr_slot, span);
         self.chunk.emit(Op::ArrayLen, span);
         self.chunk.emit_u16(Op::SetLocal, len_slot, span);
-        let zero = self.chunk.add_const(Value::Number(0.0));
+        let zero = self.chunk.add_const(Value::Float(0.0));
         self.chunk.emit_u16(Op::Const, zero, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
@@ -3051,7 +3051,7 @@ impl Compiler {
             self.chunk.patch_jump(site);
         }
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
-        let one = self.chunk.add_const(Value::Number(1.0));
+        let one = self.chunk.add_const(Value::Float(1.0));
         self.chunk.emit_u16(Op::Const, one, span);
         self.chunk.emit(Op::Add, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
@@ -5027,7 +5027,7 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
                 // compiler bug rather than a user error if it ever fires.
                 CompileError::new(format!("malformed number literal {text:?}"), span)
             })?;
-            Value::Number(n)
+            Value::Float(n)
         }
         SyntaxKind::Str => Value::Str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str())),
         SyntaxKind::TrueKw => Value::Bool(true),
@@ -5265,7 +5265,7 @@ mod tests {
 
     async fn eval_number(src: &str) -> f64 {
         match crate::vm_eval_source(src).await.expect("evaluates") {
-            Value::Number(n) => n,
+            Value::Float(n) => n,
             other => panic!("expected Number, got {other:?}"),
         }
     }

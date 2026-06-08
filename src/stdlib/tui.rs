@@ -424,10 +424,10 @@ impl Interp {
             "size" => {
                 let state = self.terminal_mut(id).expect("checked present");
                 let mut map = indexmap::IndexMap::new();
-                map.insert("width".to_string(), Value::Number(state.back.width as f64));
+                map.insert("width".to_string(), Value::Float(state.back.width as f64));
                 map.insert(
                     "height".to_string(),
-                    Value::Number(state.back.height as f64),
+                    Value::Float(state.back.height as f64),
                 );
                 Ok(Value::Object(crate::value::ObjectCell::new(map)))
             }
@@ -786,7 +786,7 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
             )
             .into()
         }),
-        Value::Number(n) => {
+        Value::Float(n) => {
             if *n < 0.0 || n.fract() != 0.0 || *n > 255.0 {
                 return Err(AsError::at(
                     format!(
@@ -814,7 +814,7 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
             }
             let mut parts = [0u8; 3];
             for (i, item) in a.iter().enumerate() {
-                let Value::Number(n) = item else {
+                let Value::Float(n) = item else {
                     return Err(AsError::at(
                         format!("terminal style: '{}' rgb component must be a number", field),
                         span,
@@ -1026,16 +1026,16 @@ pub fn event_to_value(ev: crossterm::event::Event) -> Value {
             };
             make_object(vec![
                 ("type", Value::Str("mouse".into())),
-                ("x", Value::Number(me.column as f64)),
-                ("y", Value::Number(me.row as f64)),
+                ("x", Value::Float(me.column as f64)),
+                ("y", Value::Float(me.row as f64)),
                 ("kind", Value::Str(kind.into())),
                 ("button", button),
             ])
         }
         Event::Resize(w, h) => make_object(vec![
             ("type", Value::Str("resize".into())),
-            ("width", Value::Number(w as f64)),
-            ("height", Value::Number(h as f64)),
+            ("width", Value::Float(w as f64)),
+            ("height", Value::Float(h as f64)),
         ]),
         Event::FocusGained => make_object(vec![
             ("type", Value::Str("focus".into())),
@@ -1069,7 +1069,7 @@ mod tests {
 
     fn arr(items: Vec<f64>) -> Value {
         Value::Array(crate::value::ArrayCell::new(
-            items.into_iter().map(Value::Number).collect(),
+            items.into_iter().map(Value::Float).collect(),
         ))
     }
 
@@ -1120,7 +1120,7 @@ mod tests {
 
     #[test]
     fn parse_style_indexed_number() {
-        let v = obj(vec![("bg", Value::Number(200.0))]);
+        let v = obj(vec![("bg", Value::Float(200.0))]);
         let s = parse_style(&v, Span::new(0, 0)).unwrap();
         assert_eq!(s.bg, Color::Indexed(200));
     }
@@ -1509,7 +1509,7 @@ print("[" + term.dumpRow(0) + "]")
             panic!("not an object")
         };
         match o.borrow().get(key) {
-            Some(Value::Number(n)) => *n,
+            Some(Value::Float(n)) => *n,
             other => panic!("field {} not a number: {:?}", key, other),
         }
     }

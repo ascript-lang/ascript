@@ -907,7 +907,7 @@ mod tests {
     #[test]
     fn const_index_out_of_range_rejected() {
         let mut c = Chunk::new();
-        c.add_const(Value::Number(1.0)); // index 0 is the only valid one
+        c.add_const(Value::Float(1.0)); // index 0 is the only valid one
         c.emit_u16(Op::Const, 5, s()); // index 5 is out of range
         c.emit(Op::Return, s());
         match verify(&c) {
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn name_const_not_string_rejected() {
         let mut c = Chunk::new();
-        let n = c.add_const(Value::Number(1.0)); // a number, not a Str
+        let n = c.add_const(Value::Float(1.0)); // a number, not a Str
         c.emit_u16(Op::GetGlobal, n, s());
         c.emit(Op::Return, s());
         assert!(matches!(
@@ -962,7 +962,7 @@ mod tests {
     fn jump_into_instruction_rejected() {
         let mut c = Chunk::new();
         // CONST (3 bytes) then JUMP whose target lands in the middle of the CONST.
-        let k = c.add_const(Value::Number(1.0));
+        let k = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, k, s()); // bytes 0,1,2
         let site = c.emit_jump(Op::Jump, s()); // op at 3, operand at 4
         c.emit(Op::Return, s());

@@ -118,7 +118,7 @@ pub async fn flush(interp: &Interp, state: &mut TelemetryState) -> Result<(), St
 fn any_value(v: &Value) -> J {
     match v {
         Value::Bool(b) => json!({ "boolValue": b }),
-        Value::Number(n) => {
+        Value::Float(n) => {
             // Integral numbers → intValue (as a string, proto3 64-bit mapping);
             // fractional → doubleValue.
             if n.fract() == 0.0 && n.is_finite() && n.abs() < 9.007_199_254_740_992e15 {

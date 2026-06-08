@@ -537,7 +537,7 @@ fn value_to_response(v: &Value) -> HttpResponse {
         Value::Object(o) => {
             let o = o.borrow();
             let status = match o.get("status") {
-                Some(Value::Number(n)) => *n as u16,
+                Some(Value::Float(n)) => *n as u16,
                 _ => 200,
             };
             let mut headers: Vec<(String, String)> = Vec::new();
@@ -658,7 +658,7 @@ impl Interp {
             // (Runs after any middleware, so middleware still sees unmatched requests.)
             "__not_found" => Ok(Value::Object(crate::value::ObjectCell::new({
                 let mut m = IndexMap::new();
-                m.insert("status".to_string(), Value::Number(404.0));
+                m.insert("status".to_string(), Value::Float(404.0));
                 m.insert("body".to_string(), Value::Str("not found".into()));
                 m
             }))),
@@ -786,7 +786,7 @@ impl Interp {
                             Some(mut s) => s.listener = Some(listener),
                             None => return Ok(err_pair("server.bind: server is closed".into())),
                         }
-                        Ok(make_pair(Value::Number(bound as f64), Value::Nil))
+                        Ok(make_pair(Value::Float(bound as f64), Value::Nil))
                     }
                     Err(e) => Ok(err_pair(format!("server.bind on {} failed: {}", addr, e))),
                 }
@@ -844,22 +844,22 @@ impl Interp {
         let mut max_concurrent = DEFAULT_MAX_CONCURRENT;
         if let Value::Object(o) = arg(args, 0) {
             let o = o.borrow();
-            if let Some(Value::Number(n)) = o.get("maxRequests") {
+            if let Some(Value::Float(n)) = o.get("maxRequests") {
                 if *n >= 0.0 {
                     max_requests = Some(*n as usize);
                 }
             }
-            if let Some(Value::Number(n)) = o.get("maxBodySize") {
+            if let Some(Value::Float(n)) = o.get("maxBodySize") {
                 if *n >= 0.0 {
                     max_body = *n as usize;
                 }
             }
-            if let Some(Value::Number(n)) = o.get("requestTimeout") {
+            if let Some(Value::Float(n)) = o.get("requestTimeout") {
                 if *n > 0.0 {
                     timeout_ms = *n as u64;
                 }
             }
-            if let Some(Value::Number(n)) = o.get("maxConcurrent") {
+            if let Some(Value::Float(n)) = o.get("maxConcurrent") {
                 if *n >= 1.0 {
                     max_concurrent = *n as usize;
                 }

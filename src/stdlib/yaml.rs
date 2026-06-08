@@ -78,7 +78,7 @@ mod tests {
     fn stringify_roundtrip() {
         // Stringify a value and parse it back; data is preserved.
         let mut m = indexmap::IndexMap::new();
-        m.insert("x".to_string(), Value::Number(1.0));
+        m.insert("x".to_string(), Value::Float(1.0));
         let obj = Value::Object(crate::value::ObjectCell::new(m));
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
         assert_eq!(out.to_string(), "[\"x: 1\\n\", nil]");

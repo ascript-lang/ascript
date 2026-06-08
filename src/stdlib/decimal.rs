@@ -49,7 +49,7 @@ pub fn exports() -> Vec<(&'static str, Value)> {
 pub(crate) fn coerce_to_decimal(v: &Value, span: Span) -> Result<Option<Decimal>, Control> {
     match v {
         Value::Decimal(d) => Ok(Some(*d)),
-        Value::Number(n) => {
+        Value::Float(n) => {
             if !n.is_finite() {
                 return Err(
                     AsError::at("cannot convert non-finite number to decimal", span).into(),
@@ -88,7 +88,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         )
                         .into()
                     }),
-                Value::Number(n) => {
+                Value::Float(n) => {
                     if !n.is_finite() {
                         return Err(AsError::at(
                             "decimal.from: cannot convert non-finite number to decimal",
@@ -142,14 +142,14 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         // decimal.toNumber(d) → number  (lossy f64 conversion)
         "toNumber" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("toNumber"))?;
-            Ok(Value::Number(d.to_f64().unwrap_or(f64::NAN)))
+            Ok(Value::Float(d.to_f64().unwrap_or(f64::NAN)))
         }
 
         // decimal.round(d, places=0) → decimal  (half-away-from-zero)
         "round" => {
             let d = want_decimal(&arg(args, 0), span, &ctx("round"))?;
             let places = match args.get(1) {
-                Some(Value::Number(n)) => {
+                Some(Value::Float(n)) => {
                     if n.fract() != 0.0 || !n.is_finite() || *n < 0.0 || *n > 28.0 {
                         return Err(AsError::at(
                             "decimal.round: places must be a non-negative integer (0–28)",
@@ -243,14 +243,14 @@ mod tests {
 
     #[test]
     fn from_integer_number() {
-        let v = call("from", &[Value::Number(3.0)], sp()).unwrap();
+        let v = call("from", &[Value::Float(3.0)], sp()).unwrap();
         assert_eq!(v.to_string(), "3");
     }
 
     #[test]
     fn from_float_number_round_trips() {
         // decimal.from(1.1) must equal decimal.parse("1.1")
-        let via_number = call("from", &[Value::Number(1.1)], sp()).unwrap();
+        let via_number = call("from", &[Value::Float(1.1)], sp()).unwrap();
         let via_string = call("from", &[Value::Str("1.1".into())], sp()).unwrap();
         assert_eq!(
             via_number, via_string,
@@ -270,9 +270,9 @@ mod tests {
 
     #[test]
     fn from_non_finite_panics() {
-        let result = call("from", &[Value::Number(f64::INFINITY)], sp());
+        let result = call("from", &[Value::Float(f64::INFINITY)], sp());
         assert!(matches!(result, Err(crate::interp::Control::Panic(_))));
-        let result2 = call("from", &[Value::Number(f64::NAN)], sp());
+        let result2 = call("from", &[Value::Float(f64::NAN)], sp());
         assert!(matches!(result2, Err(crate::interp::Control::Panic(_))));
     }
 
@@ -312,7 +312,7 @@ mod tests {
     fn to_number_is_lossy() {
         let dec = d("1.5");
         let n = call("toNumber", &[dec], sp()).unwrap();
-        assert_eq!(n, Value::Number(1.5));
+        assert_eq!(n, Value::Float(1.5));
     }
 
     // --- round ---
@@ -329,7 +329,7 @@ mod tests {
     fn round_with_places() {
         // round(1.456, 2) → 1.46
         assert_eq!(
-            call("round", &[d("1.456"), Value::Number(2.0)], sp()).unwrap(),
+            call("round", &[d("1.456"), Value::Float(2.0)], sp()).unwrap(),
             d("1.46")
         );
     }

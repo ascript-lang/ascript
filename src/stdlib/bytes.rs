@@ -87,7 +87,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let arr: Vec<Value> = b
                 .borrow()
                 .iter()
-                .map(|&x| Value::Number(x as f64))
+                .map(|&x| Value::Float(x as f64))
                 .collect();
             Ok(Value::Array(crate::value::ArrayCell::new(arr)))
         }
@@ -100,7 +100,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let out = b
                 .borrow()
                 .get(i as usize)
-                .map(|&x| Value::Number(x as f64))
+                .map(|&x| Value::Float(x as f64))
                 .unwrap_or(Value::Nil);
             Ok(out)
         }
@@ -169,7 +169,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             }
             let raw = u64::from_le_bytes(buf);
             if func == "readUint" {
-                Ok(Value::Number(raw as f64))
+                Ok(Value::Float(raw as f64))
             } else {
                 // sign-extend from the top bit of the n-byte value
                 let bits = 8 * n as u32;
@@ -178,7 +178,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 } else {
                     raw as i64
                 };
-                Ok(Value::Number(signed as f64))
+                Ok(Value::Float(signed as f64))
             }
         }
         "writeUint" | "writeInt" => {
@@ -265,7 +265,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn num(n: f64) -> Value {
-        Value::Number(n)
+        Value::Float(n)
     }
 
     #[test]

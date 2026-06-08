@@ -127,10 +127,10 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| Value::Number(d.as_millis() as f64))
+                        .map(|d| Value::Float(d.as_millis() as f64))
                         .unwrap_or(Value::Nil);
                     let mut m = IndexMap::new();
-                    m.insert("size".to_string(), Value::Number(md.len() as f64));
+                    m.insert("size".to_string(), Value::Float(md.len() as f64));
                     m.insert("isFile".to_string(), Value::Bool(md.is_file()));
                     m.insert("isDir".to_string(), Value::Bool(md.is_dir()));
                     m.insert("modifiedMs".to_string(), modified);
@@ -277,7 +277,7 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
         }
         // maxResults semantics: a value > 0 caps the result count at exactly that
         // many; absent or <= 0 means NO limit (return all matches).
-        if let Some(Value::Number(n)) = o.get("maxResults") {
+        if let Some(Value::Float(n)) = o.get("maxResults") {
             if *n > 0.0 {
                 max_results = Some(*n as usize);
             }
@@ -359,8 +359,8 @@ fn grep(args: &[Value], span: Span) -> Result<Value, Control> {
                 let column = line[..m.start()].chars().count() + 1;
                 let mut entry_obj = IndexMap::new();
                 entry_obj.insert("path".to_string(), Value::Str(path_str.clone().into()));
-                entry_obj.insert("line".to_string(), Value::Number((line_idx + 1) as f64));
-                entry_obj.insert("column".to_string(), Value::Number(column as f64));
+                entry_obj.insert("line".to_string(), Value::Float((line_idx + 1) as f64));
+                entry_obj.insert("column".to_string(), Value::Float(column as f64));
                 entry_obj.insert("text".to_string(), Value::Str(line.into()));
                 matches.push(obj(entry_obj));
             }
@@ -467,10 +467,10 @@ mod tests {
             Value::Object(o) => o.borrow(),
             other => panic!("expected object, got {:?}", other),
         };
-        assert_eq!(o.get("size"), Some(&Value::Number(5.0)));
+        assert_eq!(o.get("size"), Some(&Value::Float(5.0)));
         assert_eq!(o.get("isFile"), Some(&Value::Bool(true)));
         assert_eq!(o.get("isDir"), Some(&Value::Bool(false)));
-        assert!(matches!(o.get("modifiedMs"), Some(Value::Number(_))));
+        assert!(matches!(o.get("modifiedMs"), Some(Value::Float(_))));
         // and a directory
         let st_dir = call("stat", &[s(&path_str(&dir))], sp()).unwrap();
         let od = unwrap_pair_ok(&st_dir);
@@ -644,12 +644,12 @@ mod tests {
             .map(|m| match m {
                 Value::Object(o) => {
                     let o = o.borrow();
-                    let line = if let Some(Value::Number(n)) = o.get("line") {
+                    let line = if let Some(Value::Float(n)) = o.get("line") {
                         *n
                     } else {
                         -1.0
                     };
-                    let col = if let Some(Value::Number(n)) = o.get("column") {
+                    let col = if let Some(Value::Float(n)) = o.get("column") {
                         *n
                     } else {
                         -1.0
@@ -696,11 +696,11 @@ mod tests {
         };
         // maxResults: 2 → exactly 2
         let mut o2 = IndexMap::new();
-        o2.insert("maxResults".to_string(), Value::Number(2.0));
+        o2.insert("maxResults".to_string(), Value::Float(2.0));
         assert_eq!(count(Some(obj(o2))), 2);
         // maxResults: 0 → NO limit (all 4)
         let mut o0 = IndexMap::new();
-        o0.insert("maxResults".to_string(), Value::Number(0.0));
+        o0.insert("maxResults".to_string(), Value::Float(0.0));
         assert_eq!(count(Some(obj(o0))), 4);
         // absent → NO limit (all 4)
         assert_eq!(count(None), 4);
@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn read_non_string_path_is_tier2_panic() {
         assert!(matches!(
-            call("read", &[Value::Number(1.0)], sp()),
+            call("read", &[Value::Float(1.0)], sp()),
             Err(Control::Panic(_))
         ));
     }
@@ -845,7 +845,7 @@ mod tests {
         let dir = temp_dir("write_panic");
         let f = path_str(&dir.join("x.txt"));
         assert!(matches!(
-            call("write", &[s(&f), Value::Number(1.0)], sp()),
+            call("write", &[s(&f), Value::Float(1.0)], sp()),
             Err(Control::Panic(_))
         ));
         std::fs::remove_dir_all(&dir).ok();

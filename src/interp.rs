@@ -2631,7 +2631,7 @@ impl Interp {
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
                 let (lo, hi) = match (start_v, end_v) {
-                    (Value::Number(a), Value::Number(b)) => (a, b),
+                    (Value::Float(a), Value::Float(b)) => (a, b),
                     _ => {
                         return Err(
                             AsError::at("for-range bounds must be numbers", start.span).into()
@@ -2640,7 +2640,7 @@ impl Interp {
                 };
                 let step_v = match step {
                     Some(e) => match self.eval_expr(e, env).await? {
-                        Value::Number(s) => Some(s),
+                        Value::Float(s) => Some(s),
                         _ => {
                             return Err(
                                 AsError::at("for-range step must be a number", e.span).into()
@@ -2656,7 +2656,7 @@ impl Interp {
                 while range_has_next(i, hi, step_n, *inclusive) {
                     let child = env.child();
                     child
-                        .define(var, Value::Number(i), false)
+                        .define(var, Value::Float(i), false)
                         .map_err(AsError::new)?;
                     match self.exec(body, &child).await? {
                         Flow::Break => break,
@@ -2948,7 +2948,7 @@ impl Interp {
         // (return / `?` / panic). A `Cell`, never held across an `.await`.
         let _expr_depth = DepthGuard::enter(&self.expr_depth, EXPR_NEST_LIMIT, expr.span)?;
         match &expr.kind {
-            ExprKind::Number(n) => Ok(Value::Number(*n)),
+            ExprKind::Number(n) => Ok(Value::Float(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Nil => Ok(Value::Nil),
@@ -3185,7 +3185,7 @@ impl Interp {
                 let end_v = self.eval_expr(end, env).await?;
                 let step_v = match step {
                     Some(e) => match self.eval_expr(e, env).await? {
-                        Value::Number(s) => Some(s),
+                        Value::Float(s) => Some(s),
                         _ => return Err(AsError::at("range step must be a number", e.span).into()),
                     },
                     None => None,
@@ -3295,22 +3295,22 @@ impl Interp {
                 // With `step` omitted the membership degenerates to the plain
                 // in-bounds test, so existing no-step patterns are UNCHANGED.
                 let n = match subject {
-                    Value::Number(n) => *n,
+                    Value::Float(n) => *n,
                     _ => return Ok(false),
                 };
                 let lo = match self.eval_expr(start, env).await? {
-                    Value::Number(x) => x,
+                    Value::Float(x) => x,
                     _ => return Ok(false),
                 };
                 let hi = match self.eval_expr(end, env).await? {
-                    Value::Number(x) => x,
+                    Value::Float(x) => x,
                     _ => return Ok(false),
                 };
                 // Resolve the step's `f64` (None when omitted). A non-number step
                 // expression is a Tier-2 type error, mirroring iteration.
                 let step_v = match step {
                     Some(s) => match self.eval_expr(s, env).await? {
-                        Value::Number(x) => Some(x),
+                        Value::Float(x) => Some(x),
                         _ => return Err(AsError::at("range step must be a number", s.span).into()),
                     },
                     None => None,
@@ -4678,7 +4678,7 @@ impl Interp {
                 // exit(code?) — default 0; code must be an integer in 0..=255.
                 let code: i32 = match args.first() {
                     None => 0,
-                    Some(Value::Number(n)) => {
+                    Some(Value::Float(n)) => {
                         let n = *n;
                         if n.fract() != 0.0 || !(0.0..=255.0).contains(&n) {
                             return Err(AsError::at(
@@ -4733,7 +4733,7 @@ impl Interp {
                         .into())
                     }
                 };
-                Ok(Value::Number(n as f64))
+                Ok(Value::Float(n as f64))
             }
             "type" => {
                 let v = args.first().cloned().unwrap_or(Value::Nil);
@@ -4742,7 +4742,7 @@ impl Interp {
             "range" => {
                 let want_num = |i: usize| -> Result<f64, Control> {
                     match args.get(i) {
-                        Some(Value::Number(n)) => Ok(*n),
+                        Some(Value::Float(n)) => Ok(*n),
                         Some(v) => Err(AsError::at(
                             format!("range() expects number arguments, got {}", type_name(v)),
                             span,
@@ -4770,12 +4770,12 @@ impl Interp {
                 let mut i = start;
                 if step > 0.0 {
                     while i < end {
-                        out.push(Value::Number(i));
+                        out.push(Value::Float(i));
                         i += step;
                     }
                 } else {
                     while i > end {
-                        out.push(Value::Number(i));
+                        out.push(Value::Float(i));
                         i += step;
                     }
                 }
@@ -4891,7 +4891,7 @@ pub(crate) fn check_not_frozen(v: &Value, span: Span) -> Result<(), Control> {
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Control> {
     match op {
         UnOp::Neg => match v {
-            Value::Number(n) => Ok(Value::Number(-n)),
+            Value::Float(n) => Ok(Value::Float(-n)),
             Value::Decimal(d) => Ok(Value::Decimal(-d)),
             _ => Err(AsError::at("cannot negate a non-number", span).into()),
         },
@@ -4934,7 +4934,7 @@ pub(crate) fn materialize_range(
 ///     non-zero number"* (no interpolation).
 ///   - `lo != hi` and `sign(s) != sign(hi - lo)` → Tier-2 panic *"step `<s>` moves
 ///     away from end (`<hi>`); range can never progress"*. The `<s>`/`<hi>` are
-///     formatted via `Value::Number` Display (`format_number`) so both engines
+///     formatted via `Value::Float` Display (`format_number`) so both engines
 ///     produce a byte-identical string.
 /// - `step_v == None`: the omitted-step default infers direction from the bounds
 ///   (sequence semantics, spec §3.1): `+1.0` when `hi >= lo`, `-1.0` when
@@ -4953,7 +4953,7 @@ pub(crate) fn resolve_step(
             }
             if lo != hi && (s > 0.0) != (hi > lo) {
                 // `{s}`/`{hi}` MUST match the engines' canonical number formatting
-                // (the `Value::Number` Display path) so the message is byte-identical.
+                // (the `Value::Float` Display path) so the message is byte-identical.
                 return Err(AsError::at(
                     format!(
                         "step {} moves away from end ({}); range can never progress",
@@ -4974,11 +4974,11 @@ pub(crate) fn resolve_step(
     }
 }
 
-/// Format a `Value::Number`'s `f64` exactly as the interpreter/VM display it
+/// Format a `Value::Float`'s `f64` exactly as the interpreter/VM display it
 /// (`impl Display for Value` → `write!("{}", n)`), so a number interpolated into a
 /// range panic message is identical across both engines.
 pub(crate) fn format_number(n: f64) -> String {
-    Value::Number(n).to_string()
+    Value::Float(n).to_string()
 }
 
 /// Materialize a range value `[lo .. hi)` / `[lo ..= hi]` into an eager
@@ -4993,14 +4993,14 @@ pub(crate) fn materialize_range_stepped(
     span: Span,
 ) -> Result<Value, Control> {
     let (lo, hi) = match (l, r) {
-        (Value::Number(a), Value::Number(b)) => (*a, *b),
+        (Value::Float(a), Value::Float(b)) => (*a, *b),
         _ => return Err(AsError::at("range bounds must be numbers", span).into()),
     };
     let step = resolve_step(lo, hi, step_v, span)?;
     let mut items = Vec::new();
     let mut i = lo;
     while range_has_next(i, hi, step, inclusive) {
-        items.push(Value::Number(i));
+        items.push(Value::Float(i));
         i += step;
     }
     Ok(Value::Array(crate::value::ArrayCell::new(items)))
@@ -5171,7 +5171,7 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
     }
 
     let (a, b) = match (&l, &r) {
-        (Value::Number(a), Value::Number(b)) => (*a, *b),
+        (Value::Float(a), Value::Float(b)) => (*a, *b),
         _ => {
             return Err(AsError::at(
                 "operator requires two numbers (or two decimals, or number and decimal)",
@@ -5181,12 +5181,12 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         }
     };
     let result = match op {
-        BinOp::Add => Value::Number(a + b),
-        BinOp::Sub => Value::Number(a - b),
-        BinOp::Mul => Value::Number(a * b),
-        BinOp::Div => Value::Number(a / b),
-        BinOp::Mod => Value::Number(a % b),
-        BinOp::Pow => Value::Number(a.powf(b)),
+        BinOp::Add => Value::Float(a + b),
+        BinOp::Sub => Value::Float(a - b),
+        BinOp::Mul => Value::Float(a * b),
+        BinOp::Div => Value::Float(a / b),
+        BinOp::Mod => Value::Float(a % b),
+        BinOp::Pow => Value::Float(a.powf(b)),
         BinOp::Lt => Value::Bool(a < b),
         BinOp::Le => Value::Bool(a <= b),
         BinOp::Gt => Value::Bool(a > b),
@@ -5217,7 +5217,7 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
         // Decimal vs Decimal: use the inner value's own equality.
         (Value::Decimal(a), Value::Decimal(b)) => Ok(a == b),
         // Decimal vs Number (or vice-versa): coerce the number to decimal.
-        (Value::Decimal(a), Value::Number(n)) | (Value::Number(n), Value::Decimal(a)) => {
+        (Value::Decimal(a), Value::Float(n)) | (Value::Float(n), Value::Decimal(a)) => {
             if !n.is_finite() {
                 // A non-finite float can never equal a finite decimal (lenient
                 // false; the ordering path panics instead — see fn doc comment).
@@ -5236,8 +5236,8 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
 
 fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
     match v {
-        Value::Number(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
-        Value::Number(_) => Err(AsError::at(
+        Value::Float(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
+        Value::Float(_) => Err(AsError::at(
             "array index must be a non-negative integer",
             span,
         )),
@@ -5393,7 +5393,8 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Nil => "nil",
         Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
         Value::Decimal(_) => "decimal",
         Value::Str(_) => "string",
         Value::Builtin(_) | Value::Function(_) | Value::Closure(_) => "function",
@@ -5705,7 +5706,7 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
     use crate::ast::Type;
     match ty {
         Type::Any => true,
-        Type::Number => matches!(value, Value::Number(_)),
+        Type::Number => matches!(value, Value::Float(_)),
         Type::String => matches!(value, Value::Str(_)),
         Type::Bool => matches!(value, Value::Bool(_)),
         Type::Nil => matches!(value, Value::Nil),
@@ -5807,7 +5808,7 @@ mod tests {
         let interp = Interp::new();
         assert!(!interp.telemetry_active());
         assert!(interp
-            .telemetry_span_start("op", vec![("k".into(), Value::Number(1.0))])
+            .telemetry_span_start("op", vec![("k".into(), Value::Float(1.0))])
             .is_none());
         // Setter/event/end on an arbitrary id are safe no-ops when inactive.
         interp.telemetry_span_set(0, "k", Value::Nil);
@@ -6070,7 +6071,7 @@ print(y)
     async fn native_handle_fields_and_methods() {
         let interp = Interp::new();
         let mut fields = indexmap::IndexMap::new();
-        fields.insert("pid".to_string(), Value::Number(42.0));
+        fields.insert("pid".to_string(), Value::Float(42.0));
         let h = interp.register_resource(
             crate::value::NativeKind::ChildProcess,
             fields,
@@ -6079,7 +6080,7 @@ print(y)
         assert_eq!(type_name(&h), "childProcess");
         assert_eq!(
             interp.read_member(&h, "pid", Span::new(0, 0)).unwrap(),
-            Value::Number(42.0)
+            Value::Float(42.0)
         );
         let m = interp.read_member(&h, "wait", Span::new(0, 0)).unwrap();
         assert!(matches!(m, Value::NativeMethod(_)));
@@ -6381,7 +6382,7 @@ print(y)
         // The tree-walker callables still satisfy `: fn`.
         assert!(check_type(&Value::Builtin("len".into()), &Type::Fn));
         // A non-callable still fails the `: fn` contract (behavior preserved).
-        assert!(!check_type(&Value::Number(7.0), &Type::Fn));
+        assert!(!check_type(&Value::Float(7.0), &Type::Fn));
         assert!(!check_type(&Value::Str("x".into()), &Type::Fn));
     }
 
@@ -6826,7 +6827,7 @@ print(bad[1].message)
         assert_eq!(eval_to_value("let x: number? = nil\nx").await, Value::Nil);
         assert_eq!(
             eval_to_value("let x: number? = 7\nx").await,
-            Value::Number(7.0)
+            Value::Float(7.0)
         );
     }
 
@@ -7009,8 +7010,8 @@ print(r[1])
 
     #[tokio::test]
     async fn unwrap_returns_value_on_ok_pair() {
-        assert_eq!(eval_to_value("[42, nil]!").await, Value::Number(42.0));
-        assert_eq!(eval_to_value("Ok(7)!").await, Value::Number(7.0));
+        assert_eq!(eval_to_value("[42, nil]!").await, Value::Float(42.0));
+        assert_eq!(eval_to_value("Ok(7)!").await, Value::Float(7.0));
     }
 
     #[tokio::test]
@@ -7233,7 +7234,7 @@ print(r[1])
     #[tokio::test]
     async fn evaluates_arithmetic_with_precedence() {
         match eval_to_value("1 + 2 * 3").await {
-            Value::Number(n) => assert_eq!(n, 7.0),
+            Value::Float(n) => assert_eq!(n, 7.0),
             other => panic!("expected number, got {:?}", other),
         }
     }
@@ -7286,15 +7287,15 @@ print(r[1])
 
     #[tokio::test]
     async fn exponent_evaluates() {
-        assert_eq!(eval_to_value("2 ** 10").await, Value::Number(1024.0));
+        assert_eq!(eval_to_value("2 ** 10").await, Value::Float(1024.0));
     }
 
     #[tokio::test]
     async fn short_circuit_and_coalesce() {
         assert_eq!(eval_to_value("false && nope").await, Value::Bool(false));
         assert_eq!(eval_to_value("true || nope").await, Value::Bool(true));
-        assert_eq!(eval_to_value("nil ?? 5").await, Value::Number(5.0));
-        assert_eq!(eval_to_value("3 ?? nope").await, Value::Number(3.0));
+        assert_eq!(eval_to_value("nil ?? 5").await, Value::Float(5.0));
+        assert_eq!(eval_to_value("3 ?? nope").await, Value::Float(3.0));
         assert_eq!(eval_to_value("!0").await, Value::Bool(false));
     }
 

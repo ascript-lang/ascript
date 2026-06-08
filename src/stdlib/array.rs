@@ -89,7 +89,7 @@ impl Interp {
                 let item = arg(args, 1);
                 let mut b = arr.borrow_mut();
                 b.push(item);
-                Ok(Value::Number(b.len() as f64))
+                Ok(Value::Float(b.len() as f64))
             }
             "pop" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("pop"))?;
@@ -155,7 +155,7 @@ impl Interp {
                                     )
                                     .await?;
                                 let n = match r {
-                                    Value::Number(n) => n,
+                                    Value::Float(n) => n,
                                     other => {
                                         return Err(AsError::at(
                                             format!(
@@ -204,10 +204,10 @@ impl Interp {
                         .await?
                         .is_truthy()
                     {
-                        return Ok(Value::Number(i as f64));
+                        return Ok(Value::Float(i as f64));
                     }
                 }
-                Ok(Value::Number(-1.0))
+                Ok(Value::Float(-1.0))
             }
             "some" => {
                 let a = want_array(&arg(args, 0), span, &ctx("some"))?;
@@ -243,7 +243,7 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("indexOf"))?;
                 let needle = arg(args, 1);
                 let idx = a.borrow().iter().position(|x| *x == needle);
-                Ok(Value::Number(idx.map(|i| i as f64).unwrap_or(-1.0)))
+                Ok(Value::Float(idx.map(|i| i as f64).unwrap_or(-1.0)))
             }
             "flat" => {
                 let a = want_array(&arg(args, 0), span, &ctx("flat"))?;
@@ -429,11 +429,11 @@ fn flatten_into(items: &[Value], depth: usize, out: &mut Vec<Value>) {
 
 /// Sort a homogeneous number or string array by natural order. Mixed/other kinds → panic.
 fn sort_default(items: &mut [Value], span: Span) -> Result<(), Control> {
-    let all_numbers = items.iter().all(|v| matches!(v, Value::Number(_)));
+    let all_numbers = items.iter().all(|v| matches!(v, Value::Float(_)));
     let all_strings = items.iter().all(|v| matches!(v, Value::Str(_)));
     if all_numbers {
         items.sort_by(|a, b| match (a, b) {
-            (Value::Number(x), Value::Number(y)) => {
+            (Value::Float(x), Value::Float(y)) => {
                 x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
             }
             _ => std::cmp::Ordering::Equal,
@@ -462,7 +462,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn n(x: f64) -> Value {
-        Value::Number(x)
+        Value::Float(x)
     }
     fn arr(xs: Vec<Value>) -> Value {
         Value::Array(crate::value::ArrayCell::new(xs))

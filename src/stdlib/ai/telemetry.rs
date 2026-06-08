@@ -60,13 +60,13 @@ pub(crate) fn open_chat_span(
         ("gen_ai.request.model".into(), s(&resolved.model)),
     ];
     if let Some(t) = gen_opts.temperature {
-        attrs.push(("gen_ai.request.temperature".into(), Value::Number(t)));
+        attrs.push(("gen_ai.request.temperature".into(), Value::Float(t)));
     }
     if let Some(mt) = gen_opts.max_tokens {
-        attrs.push(("gen_ai.request.max_tokens".into(), Value::Number(mt as f64)));
+        attrs.push(("gen_ai.request.max_tokens".into(), Value::Float(mt as f64)));
     }
     if let Some(p) = gen_opts.top_p {
-        attrs.push(("gen_ai.request.top_p".into(), Value::Number(p)));
+        attrs.push(("gen_ai.request.top_p".into(), Value::Float(p)));
     }
     if topts.record_inputs {
         if let Value::Str(p) = super::request::get_field(opts, "prompt") {
@@ -100,10 +100,10 @@ pub(crate) fn close_chat_span(
             interp.telemetry_span_set(id, "gen_ai.response.finish_reasons", s(fr));
         }
         if let Some(it) = n.input_tokens {
-            interp.telemetry_span_set(id, "gen_ai.usage.input_tokens", Value::Number(it as f64));
+            interp.telemetry_span_set(id, "gen_ai.usage.input_tokens", Value::Float(it as f64));
         }
         if let Some(ot) = n.output_tokens {
-            interp.telemetry_span_set(id, "gen_ai.usage.output_tokens", Value::Number(ot as f64));
+            interp.telemetry_span_set(id, "gen_ai.usage.output_tokens", Value::Float(ot as f64));
         }
     }
     let status = if is_error {
@@ -142,7 +142,7 @@ pub(crate) fn close_embed_span(
 ) {
     let Some(id) = span else { return };
     if let Some(it) = input_tokens {
-        interp.telemetry_span_set(id, "gen_ai.usage.input_tokens", Value::Number(it as f64));
+        interp.telemetry_span_set(id, "gen_ai.usage.input_tokens", Value::Float(it as f64));
     }
     interp.telemetry_span_end(
         id,

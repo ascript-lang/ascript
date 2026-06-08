@@ -68,7 +68,7 @@ impl Interp {
         match func {
             "new" => {
                 let cap = match arg(args, 0) {
-                    Value::Number(n) if n.is_finite() && n >= 1.0 => n as usize,
+                    Value::Float(n) if n.is_finite() && n >= 1.0 => n as usize,
                     Value::Nil => {
                         return Err(AsError::at("lru.new requires a capacity (number >= 1)", span)
                             .into())
@@ -182,7 +182,7 @@ impl Interp {
                 });
                 Ok(Value::Nil)
             }
-            "len" => Ok(Value::Number(self.with_resource(id, |r| match r {
+            "len" => Ok(Value::Float(self.with_resource(id, |r| match r {
                 Some(ResourceState::Lru(s)) => s.map.len() as f64,
                 _ => 0.0,
             }))),

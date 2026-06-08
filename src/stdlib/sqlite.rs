@@ -129,7 +129,7 @@ impl Interp {
                 let params = parse_params(args.get(1), span, "connection.exec")?;
                 let conn = self.sqlite_conn(id).expect("checked present");
                 match exec_sql(&conn, &sql, &params) {
-                    Ok(changes) => Ok(make_pair(Value::Number(changes as f64), Value::Nil)),
+                    Ok(changes) => Ok(make_pair(Value::Float(changes as f64), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("connection.exec failed: {}", e))),
                 }
             }
@@ -206,7 +206,7 @@ impl Interp {
                 let params = parse_params(args.first(), span, "statement.run")?;
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
                 match exec_cached(&conn, &sql, &params) {
-                    Ok(changes) => Ok(make_pair(Value::Number(changes as f64), Value::Nil)),
+                    Ok(changes) => Ok(make_pair(Value::Float(changes as f64), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("statement.run failed: {}", e))),
                 }
             }
@@ -242,7 +242,7 @@ fn to_sql(v: &Value, span: Span, ctx: &str) -> Result<SqlValue, Control> {
     Ok(match v {
         Value::Nil => SqlValue::Null,
         Value::Bool(b) => SqlValue::Integer(if *b { 1 } else { 0 }),
-        Value::Number(n) => {
+        Value::Float(n) => {
             if n.fract() == 0.0 && n.is_finite() && n.abs() < 9.2e18 {
                 SqlValue::Integer(*n as i64)
             } else {
@@ -306,8 +306,8 @@ fn parse_params(v: Option<&Value>, span: Span, ctx: &str) -> Result<Params, Cont
 fn from_sql(v: ValueRef<'_>) -> Value {
     match v {
         ValueRef::Null => Value::Nil,
-        ValueRef::Integer(i) => Value::Number(i as f64),
-        ValueRef::Real(r) => Value::Number(r),
+        ValueRef::Integer(i) => Value::Float(i as f64),
+        ValueRef::Real(r) => Value::Float(r),
         ValueRef::Text(t) => Value::Str(String::from_utf8_lossy(t).into_owned().into()),
         ValueRef::Blob(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
     }

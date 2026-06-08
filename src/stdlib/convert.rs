@@ -28,7 +28,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "parseNumber" => {
             let s = want_string(&arg(args, 0), span, &ctx("parseNumber"))?;
             match s.trim().parse::<f64>() {
-                Ok(n) => Ok(make_pair(Value::Number(n), Value::Nil)),
+                Ok(n) => Ok(make_pair(Value::Float(n), Value::Nil)),
                 Err(_) => Ok(make_pair(
                     Value::Nil,
                     make_error(Value::Str(
@@ -49,7 +49,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 );
             }
             match i64::from_str_radix(s.trim(), radix) {
-                Ok(n) => Ok(make_pair(Value::Number(n as f64), Value::Nil)),
+                Ok(n) => Ok(make_pair(Value::Float(n as f64), Value::Nil)),
                 Err(_) => Ok(make_pair(
                     Value::Nil,
                     make_error(Value::Str(
@@ -64,7 +64,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "toNumber" => {
             let v = arg(args, 0);
             let n = match &v {
-                Value::Number(n) => *n,
+                Value::Float(n) => *n,
                 Value::Bool(b) => {
                     if *b {
                         1.0
@@ -94,7 +94,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     .into())
                 }
             };
-            Ok(Value::Number(n))
+            Ok(Value::Float(n))
         }
         "toBool" => Ok(Value::Bool(arg(args, 0).is_truthy())),
         _ => Err(AsError::at(format!("std/convert has no function '{}'", func), span).into()),
@@ -122,13 +122,13 @@ mod tests {
     #[test]
     fn parse_int_radix() {
         assert_eq!(
-            call("parseInt", &[s("ff"), Value::Number(16.0)], sp())
+            call("parseInt", &[s("ff"), Value::Float(16.0)], sp())
                 .unwrap()
                 .to_string(),
             "[255, nil]"
         );
         assert_eq!(
-            call("parseInt", &[s("101"), Value::Number(2.0)], sp())
+            call("parseInt", &[s("101"), Value::Float(2.0)], sp())
                 .unwrap()
                 .to_string(),
             "[5, nil]"
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn parse_int_bad_radix_panics() {
         assert!(matches!(
-            call("parseInt", &[s("1"), Value::Number(99.0)], sp()),
+            call("parseInt", &[s("1"), Value::Float(99.0)], sp()),
             Err(Control::Panic(_))
         ));
     }
@@ -150,19 +150,19 @@ mod tests {
     #[test]
     fn coercions() {
         assert_eq!(
-            call("toString", &[Value::Number(7.0)], sp()).unwrap(),
+            call("toString", &[Value::Float(7.0)], sp()).unwrap(),
             s("7")
         );
         assert_eq!(
             call("toNumber", &[Value::Bool(true)], sp()).unwrap(),
-            Value::Number(1.0)
+            Value::Float(1.0)
         );
         assert_eq!(
             call("toNumber", &[s(" 42 ")], sp()).unwrap(),
-            Value::Number(42.0)
+            Value::Float(42.0)
         );
         assert_eq!(
-            call("toBool", &[Value::Number(0.0)], sp()).unwrap(),
+            call("toBool", &[Value::Float(0.0)], sp()).unwrap(),
             Value::Bool(true)
         );
         assert_eq!(
@@ -205,7 +205,7 @@ mod tests {
         assert!(over.to_string().starts_with("[nil, {message:"));
         // parseNumber on a non-string arg → Tier-2 panic (want_string)
         assert!(matches!(
-            call("parseNumber", &[Value::Number(1.0)], sp),
+            call("parseNumber", &[Value::Float(1.0)], sp),
             Err(Control::Panic(_))
         ));
         // toString on a compound value
@@ -213,7 +213,7 @@ mod tests {
             call(
                 "toString",
                 &[Value::Array(crate::value::ArrayCell::new(
-                    vec![Value::Number(1.0), Value::Number(2.0)]
+                    vec![Value::Float(1.0), Value::Float(2.0)]
                 ))],
                 sp
             )

@@ -689,7 +689,7 @@ impl Chunk {
 fn const_is_dedupable(v: &Value) -> bool {
     matches!(
         v,
-        Value::Nil | Value::Bool(_) | Value::Number(_) | Value::Str(_) | Value::Decimal(_)
+        Value::Nil | Value::Bool(_) | Value::Float(_) | Value::Str(_) | Value::Decimal(_)
     )
 }
 
@@ -701,7 +701,7 @@ fn const_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Nil, Value::Nil) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Number(x), Value::Number(y)) => x.to_bits() == y.to_bits(),
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Decimal(x), Value::Decimal(y)) => x == y,
         _ => false,
@@ -759,15 +759,15 @@ mod tests {
     #[test]
     fn add_const_dedups_primitives() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Number(1.0));
-        let b = c.add_const(Value::Number(1.0));
+        let a = c.add_const(Value::Float(1.0));
+        let b = c.add_const(Value::Float(1.0));
         assert_eq!(a, b, "equal numbers dedup to the same slot");
 
         let s1 = c.add_const(Value::Str(Rc::from("hi")));
         let s2 = c.add_const(Value::Str(Rc::from("hi")));
         assert_eq!(s1, s2, "equal strings dedup");
 
-        let n = c.add_const(Value::Number(2.0));
+        let n = c.add_const(Value::Float(2.0));
         assert_ne!(a, n, "distinct numbers get distinct slots");
 
         let t = c.add_const(Value::Bool(true));
@@ -775,13 +775,13 @@ mod tests {
         assert_ne!(t, f);
 
         // -0.0 and 0.0 are distinct constants (different bit patterns).
-        let pz = c.add_const(Value::Number(0.0));
-        let nz = c.add_const(Value::Number(-0.0));
+        let pz = c.add_const(Value::Float(0.0));
+        let nz = c.add_const(Value::Float(-0.0));
         assert_ne!(pz, nz, "-0.0 and 0.0 are distinct constants");
 
         // NaN constants fold together (bit-pattern dedup).
-        let nan1 = c.add_const(Value::Number(f64::NAN));
-        let nan2 = c.add_const(Value::Number(f64::NAN));
+        let nan1 = c.add_const(Value::Float(f64::NAN));
+        let nan2 = c.add_const(Value::Float(f64::NAN));
         assert_eq!(nan1, nan2, "NaN constants fold together");
     }
 

@@ -593,7 +593,7 @@ impl Interp {
             }
             Some(sem) => {
                 let count = *sem.available.borrow() as f64;
-                Ok(Value::Number(count))
+                Ok(Value::Float(count))
             }
         }
     }

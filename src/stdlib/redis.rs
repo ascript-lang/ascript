@@ -105,7 +105,7 @@ impl Interp {
                 Value::Str(s) => {
                     command.arg(s.as_ref());
                 }
-                Value::Number(n) => {
+                Value::Float(n) => {
                     // Integers as integers; fractions as their text form.
                     if n.fract() == 0.0 && n.is_finite() {
                         command.arg(*n as i64);
@@ -161,7 +161,7 @@ fn redis_to_value(v: &redis::Value) -> Value {
     use std::cell::RefCell;
     match v {
         redis::Value::Nil => Value::Nil,
-        redis::Value::Int(i) => Value::Number(*i as f64),
+        redis::Value::Int(i) => Value::Float(*i as f64),
         redis::Value::BulkString(bytes) => match std::str::from_utf8(bytes) {
             Ok(s) => Value::Str(s.into()),
             Err(_) => Value::Bytes(Rc::new(RefCell::new(bytes.clone()))),
@@ -183,7 +183,7 @@ fn redis_to_value(v: &redis::Value) -> Value {
             }
             Value::Object(crate::value::ObjectCell::new(m))
         }
-        redis::Value::Double(d) => Value::Number(*d),
+        redis::Value::Double(d) => Value::Float(*d),
         redis::Value::Boolean(b) => Value::Bool(*b),
         redis::Value::BigNumber(n) => Value::Str(n.to_string().into()),
         redis::Value::VerbatimString { text, .. } => Value::Str(text.as_str().into()),
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn reply_map_basic_kinds() {
         assert_eq!(redis_to_value(&redis::Value::Nil), Value::Nil);
-        assert_eq!(redis_to_value(&redis::Value::Int(7)), Value::Number(7.0));
+        assert_eq!(redis_to_value(&redis::Value::Int(7)), Value::Float(7.0));
         assert_eq!(redis_to_value(&redis::Value::Okay), Value::Str("OK".into()));
         assert_eq!(
             redis_to_value(&redis::Value::SimpleString("PONG".into())),

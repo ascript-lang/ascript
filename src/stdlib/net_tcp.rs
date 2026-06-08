@@ -147,7 +147,7 @@ impl Interp {
                 // AScript can read `listener.port` — makes `listen(host, 0)` usable.
                 let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                 let mut fields = indexmap::IndexMap::new();
-                fields.insert("port".to_string(), Value::Number(port as f64));
+                fields.insert("port".to_string(), Value::Float(port as f64));
                 let handle = self.register_resource(
                     NativeKind::TcpListener,
                     fields,

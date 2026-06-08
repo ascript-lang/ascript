@@ -29,8 +29,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("ln", bi("math.ln")),
         ("log2", bi("math.log2")),
         ("log10", bi("math.log10")),
-        ("pi", Value::Number(std::f64::consts::PI)),
-        ("e", Value::Number(std::f64::consts::E)),
+        ("pi", Value::Float(std::f64::consts::PI)),
+        ("e", Value::Float(std::f64::consts::E)),
         ("sign", bi("math.sign")),
         ("trunc", bi("math.trunc")),
         ("clamp", bi("math.clamp")),
@@ -85,25 +85,25 @@ pub fn call(
 ) -> Result<Value, Control> {
     let ctx = |f: &str| format!("math.{}", f);
     match func {
-        "abs" => Ok(Value::Number(
+        "abs" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("abs"))?.abs(),
         )),
-        "floor" => Ok(Value::Number(
+        "floor" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("floor"))?.floor(),
         )),
-        "ceil" => Ok(Value::Number(
+        "ceil" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("ceil"))?.ceil(),
         )),
-        "round" => Ok(Value::Number(
+        "round" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("round"))?.round(),
         )),
-        "sqrt" => Ok(Value::Number(
+        "sqrt" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("sqrt"))?.sqrt(),
         )),
         "pow" => {
             let b = want_number(&arg(args, 0), span, &ctx("pow"))?;
             let e = want_number(&arg(args, 1), span, &ctx("pow"))?;
-            Ok(Value::Number(b.powf(e)))
+            Ok(Value::Float(b.powf(e)))
         }
         "min" | "max" => {
             if args.is_empty() {
@@ -123,42 +123,42 @@ pub fn call(
             } else {
                 nums.iter().copied().fold(f64::NEG_INFINITY, f64::max)
             };
-            Ok(Value::Number(acc))
+            Ok(Value::Float(acc))
         }
-        "random" => Ok(Value::Number(next_random(interp))),
-        "sin" => Ok(Value::Number(
+        "random" => Ok(Value::Float(next_random(interp))),
+        "sin" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("sin"))?.sin(),
         )),
-        "cos" => Ok(Value::Number(
+        "cos" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("cos"))?.cos(),
         )),
-        "tan" => Ok(Value::Number(
+        "tan" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("tan"))?.tan(),
         )),
-        "asin" => Ok(Value::Number(
+        "asin" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("asin"))?.asin(),
         )),
-        "acos" => Ok(Value::Number(
+        "acos" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("acos"))?.acos(),
         )),
-        "atan" => Ok(Value::Number(
+        "atan" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("atan"))?.atan(),
         )),
         "atan2" => {
             let y = want_number(&arg(args, 0), span, &ctx("atan2"))?;
             let x = want_number(&arg(args, 1), span, &ctx("atan2"))?;
-            Ok(Value::Number(y.atan2(x)))
+            Ok(Value::Float(y.atan2(x)))
         }
-        "exp" => Ok(Value::Number(
+        "exp" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("exp"))?.exp(),
         )),
-        "ln" => Ok(Value::Number(
+        "ln" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("ln"))?.ln(),
         )),
-        "log2" => Ok(Value::Number(
+        "log2" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("log2"))?.log2(),
         )),
-        "log10" => Ok(Value::Number(
+        "log10" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("log10"))?.log10(),
         )),
         "sign" => {
@@ -172,9 +172,9 @@ pub fn call(
             } else {
                 0.0
             };
-            Ok(Value::Number(r))
+            Ok(Value::Float(r))
         }
-        "trunc" => Ok(Value::Number(
+        "trunc" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("trunc"))?.trunc(),
         )),
         "clamp" => {
@@ -184,12 +184,12 @@ pub fn call(
             if lo > hi {
                 return Err(AsError::at("math.clamp requires lo <= hi", span).into());
             }
-            Ok(Value::Number(x.max(lo).min(hi)))
+            Ok(Value::Float(x.max(lo).min(hi)))
         }
         "hypot" => {
             let x = want_number(&arg(args, 0), span, &ctx("hypot"))?;
             let y = want_number(&arg(args, 1), span, &ctx("hypot"))?;
-            Ok(Value::Number(x.hypot(y)))
+            Ok(Value::Float(x.hypot(y)))
         }
         "gcd" => {
             let a = want_int(
@@ -202,7 +202,7 @@ pub fn call(
                 span,
                 "math.gcd",
             )?;
-            Ok(Value::Number(gcd_i64(a, b) as f64))
+            Ok(Value::Float(gcd_i64(a, b) as f64))
         }
         "lcm" => {
             let a = want_int(
@@ -226,18 +226,18 @@ pub fn call(
                 }
                 abs as i64
             };
-            Ok(Value::Number(r as f64))
+            Ok(Value::Float(r as f64))
         }
         "sum" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx("sum"))?;
-            Ok(Value::Number(xs.iter().sum()))
+            Ok(Value::Float(xs.iter().sum()))
         }
         "mean" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx("mean"))?;
             if xs.is_empty() {
                 return Err(AsError::at("math.mean of empty array", span).into());
             }
-            Ok(Value::Number(xs.iter().sum::<f64>() / xs.len() as f64))
+            Ok(Value::Float(xs.iter().sum::<f64>() / xs.len() as f64))
         }
         "median" => {
             let mut xs = want_number_vec(&arg(args, 0), span, &ctx("median"))?;
@@ -251,7 +251,7 @@ pub fn call(
             } else {
                 (xs[m - 1] + xs[m]) / 2.0
             };
-            Ok(Value::Number(med))
+            Ok(Value::Float(med))
         }
         "variance" | "stddev" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx(func))?;
@@ -274,7 +274,7 @@ pub fn call(
                 xs.len() as f64
             };
             let var = ss / denom;
-            Ok(Value::Number(if func == "stddev" {
+            Ok(Value::Float(if func == "stddev" {
                 var.sqrt()
             } else {
                 var
@@ -296,7 +296,7 @@ pub fn call(
             }
             let span_len = (max - min + 1) as f64;
             let v = min + (next_random(interp) * span_len).floor() as i64;
-            Ok(Value::Number(v as f64))
+            Ok(Value::Float(v as f64))
         }
         "shuffle" => {
             let a = want_array(&arg(args, 0), span, &ctx("shuffle"))?;
@@ -363,7 +363,7 @@ mod tests {
     use super::*;
 
     fn n(x: f64) -> Value {
-        Value::Number(x)
+        Value::Float(x)
     }
 
     fn sp() -> Span {
@@ -394,34 +394,34 @@ mod tests {
     fn basics() {
         let sp = Span::new(0, 0);
         assert_eq!(
-            call("abs", &[Value::Number(-3.0)], sp).unwrap(),
-            Value::Number(3.0)
+            call("abs", &[Value::Float(-3.0)], sp).unwrap(),
+            Value::Float(3.0)
         );
         assert_eq!(
-            call("floor", &[Value::Number(2.9)], sp).unwrap(),
-            Value::Number(2.0)
+            call("floor", &[Value::Float(2.9)], sp).unwrap(),
+            Value::Float(2.0)
         );
         assert_eq!(
-            call("pow", &[Value::Number(2.0), Value::Number(10.0)], sp).unwrap(),
-            Value::Number(1024.0)
+            call("pow", &[Value::Float(2.0), Value::Float(10.0)], sp).unwrap(),
+            Value::Float(1024.0)
         );
         assert_eq!(
             call(
                 "max",
-                &[Value::Number(1.0), Value::Number(9.0), Value::Number(4.0)],
+                &[Value::Float(1.0), Value::Float(9.0), Value::Float(4.0)],
                 sp
             )
             .unwrap(),
-            Value::Number(9.0)
+            Value::Float(9.0)
         );
         assert_eq!(
             call(
                 "min",
-                &[Value::Number(1.0), Value::Number(9.0), Value::Number(4.0)],
+                &[Value::Float(1.0), Value::Float(9.0), Value::Float(4.0)],
                 sp
             )
             .unwrap(),
-            Value::Number(1.0)
+            Value::Float(1.0)
         );
     }
 
@@ -472,10 +472,10 @@ mod tests {
             n(1.25)
         );
         let sv = call("variance", &[a.clone(), Value::Bool(true)], sp()).unwrap();
-        assert!(matches!(sv, Value::Number(x) if (x - 5.0/3.0).abs() < 1e-12));
+        assert!(matches!(sv, Value::Float(x) if (x - 5.0/3.0).abs() < 1e-12));
         // stddev returns sqrt(population variance)
         assert!(
-            matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Number(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
+            matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Float(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
         );
         let empty = Value::Array(crate::value::ArrayCell::new(vec![]));
         assert_eq!(
@@ -503,7 +503,7 @@ mod tests {
     fn math_random_helpers() {
         for _ in 0..100 {
             let r = call("randomInt", &[n(1.0), n(6.0)], sp()).unwrap();
-            if let Value::Number(x) = r {
+            if let Value::Float(x) = r {
                 assert!((1.0..=6.0).contains(&x) && x.fract() == 0.0);
             } else {
                 panic!()
@@ -539,7 +539,7 @@ mod tests {
                 .borrow()
                 .iter()
                 .map(|x| {
-                    if let Value::Number(n) = x {
+                    if let Value::Float(n) = x {
                         *n
                     } else {
                         f64::NAN
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(call("sign", &[n(-3.0)], sp()).unwrap(), n(-1.0));
         assert_eq!(call("sign", &[n(0.0)], sp()).unwrap(), n(0.0));
         assert!(
-            matches!(call("sign", &[n(f64::NAN)], sp()).unwrap(), Value::Number(x) if x.is_nan())
+            matches!(call("sign", &[n(f64::NAN)], sp()).unwrap(), Value::Float(x) if x.is_nan())
         );
         assert_eq!(call("trunc", &[n(3.7)], sp()).unwrap(), n(3.0));
         assert_eq!(

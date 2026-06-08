@@ -45,24 +45,24 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as f64)
                 .unwrap_or(0.0);
-            Ok(Value::Number(ms))
+            Ok(Value::Float(ms))
         }
         "monotonic" => {
             let ms = START.elapsed().as_secs_f64() * 1000.0;
-            Ok(Value::Number(ms))
+            Ok(Value::Float(ms))
         }
-        "millis" => Ok(Value::Number(want_number(
+        "millis" => Ok(Value::Float(want_number(
             &arg(args, 0),
             span,
             &ctx("millis"),
         )?)),
-        "seconds" => Ok(Value::Number(
+        "seconds" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("seconds"))? * 1000.0,
         )),
-        "minutes" => Ok(Value::Number(
+        "minutes" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("minutes"))? * 60_000.0,
         )),
-        "hours" => Ok(Value::Number(
+        "hours" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("hours"))? * 3_600_000.0,
         )),
         "sleep" => unreachable!("time.sleep is dispatched async in call_time"),
@@ -84,7 +84,7 @@ mod tests {
     fn now_is_after_a_known_past_epoch() {
         let v = call("now", &[], sp()).unwrap();
         match v {
-            Value::Number(n) => assert!(n > 1.7e12, "now() = {n}, expected > 1.7e12"),
+            Value::Float(n) => assert!(n > 1.7e12, "now() = {n}, expected > 1.7e12"),
             _ => panic!("now() should return a number"),
         }
     }
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn monotonic_is_non_negative_and_increases() {
         let a = match call("monotonic", &[], sp()).unwrap() {
-            Value::Number(n) => n,
+            Value::Float(n) => n,
             _ => panic!("monotonic() should return a number"),
         };
         assert!(a >= 0.0, "monotonic() = {a}, expected >= 0");
@@ -103,7 +103,7 @@ mod tests {
         }
         std::hint::black_box(acc);
         let b = match call("monotonic", &[], sp()).unwrap() {
-            Value::Number(n) => n,
+            Value::Float(n) => n,
             _ => panic!("monotonic() should return a number"),
         };
         assert!(b >= a, "monotonic must not go backwards: a={a}, b={b}");
@@ -112,20 +112,20 @@ mod tests {
     #[test]
     fn duration_helpers() {
         assert_eq!(
-            call("millis", &[Value::Number(250.0)], sp()).unwrap(),
-            Value::Number(250.0)
+            call("millis", &[Value::Float(250.0)], sp()).unwrap(),
+            Value::Float(250.0)
         );
         assert_eq!(
-            call("seconds", &[Value::Number(2.0)], sp()).unwrap(),
-            Value::Number(2000.0)
+            call("seconds", &[Value::Float(2.0)], sp()).unwrap(),
+            Value::Float(2000.0)
         );
         assert_eq!(
-            call("minutes", &[Value::Number(1.0)], sp()).unwrap(),
-            Value::Number(60_000.0)
+            call("minutes", &[Value::Float(1.0)], sp()).unwrap(),
+            Value::Float(60_000.0)
         );
         assert_eq!(
-            call("hours", &[Value::Number(1.0)], sp()).unwrap(),
-            Value::Number(3_600_000.0)
+            call("hours", &[Value::Float(1.0)], sp()).unwrap(),
+            Value::Float(3_600_000.0)
         );
     }
 

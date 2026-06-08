@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn keys_values_entries() {
-        let o = obj_ref(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        let o = obj_ref(&[("a", Value::Float(1.0)), ("b", Value::Float(2.0))]);
         assert_eq!(
             call("keys", std::slice::from_ref(&o), sp())
                 .unwrap()
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn has_delete_merge() {
-        let o = obj_ref(&[("a", Value::Number(1.0))]);
+        let o = obj_ref(&[("a", Value::Float(1.0))]);
         assert_eq!(
             call("has", &[o.clone(), Value::Str("a".into())], sp()).unwrap(),
             Value::Bool(true)
@@ -424,8 +424,8 @@ mod tests {
         let merged = call(
             "merge",
             &[
-                obj_ref(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]),
-                obj_ref(&[("b", Value::Number(9.0)), ("c", Value::Number(3.0))]),
+                obj_ref(&[("a", Value::Float(1.0)), ("b", Value::Float(2.0))]),
+                obj_ref(&[("b", Value::Float(9.0)), ("c", Value::Float(3.0))]),
             ],
             sp(),
         )
@@ -437,7 +437,7 @@ mod tests {
     fn merge_and_delete_edges() {
         let sp = sp();
         // delete of a non-existent key → false
-        let o = obj_ref(&[("a", Value::Number(1.0))]);
+        let o = obj_ref(&[("a", Value::Float(1.0))]);
         assert_eq!(
             call("delete", &[o, Value::Str("nope".into())], sp).unwrap(),
             Value::Bool(false)
@@ -445,7 +445,7 @@ mod tests {
         // merge with zero args → empty object
         assert_eq!(call("merge", &[], sp).unwrap().to_string(), "{}");
         // merge with one arg → a copy (independent of the input)
-        let src = obj_ref(&[("a", Value::Number(1.0))]);
+        let src = obj_ref(&[("a", Value::Float(1.0))]);
         let copy = call("merge", std::slice::from_ref(&src), sp).unwrap();
         assert_eq!(copy.to_string(), "{a: 1}");
         // mutating the copy via delete does NOT affect the source (independence)
@@ -461,40 +461,40 @@ mod tests {
     #[test]
     fn object_pure() {
         let o = obj(vec![
-            ("a", Value::Number(1.0)),
-            ("b", Value::Number(2.0)),
-            ("c", Value::Number(3.0)),
+            ("a", Value::Float(1.0)),
+            ("b", Value::Float(2.0)),
+            ("c", Value::Float(3.0)),
         ]);
         let keys = arr(vec![s("a"), s("c")]);
         assert_eq!(
             call("pick", &[o.clone(), keys.clone()], sp())
                 .unwrap()
                 .to_string(),
-            obj(vec![("a", Value::Number(1.0)), ("c", Value::Number(3.0))]).to_string()
+            obj(vec![("a", Value::Float(1.0)), ("c", Value::Float(3.0))]).to_string()
         );
         assert_eq!(
             call("omit", &[o.clone(), keys], sp()).unwrap().to_string(),
-            obj(vec![("b", Value::Number(2.0))]).to_string()
+            obj(vec![("b", Value::Float(2.0))]).to_string()
         );
-        let entries = arr(vec![arr(vec![s("x"), Value::Number(9.0)])]);
+        let entries = arr(vec![arr(vec![s("x"), Value::Float(9.0)])]);
         assert_eq!(
             call("fromEntries", std::slice::from_ref(&entries), sp())
                 .unwrap()
                 .to_string(),
-            obj(vec![("x", Value::Number(9.0))]).to_string()
+            obj(vec![("x", Value::Float(9.0))]).to_string()
         );
         // deepEqual: two distinct-but-equal objects
         let o2 = obj(vec![
-            ("a", Value::Number(1.0)),
-            ("b", Value::Number(2.0)),
-            ("c", Value::Number(3.0)),
+            ("a", Value::Float(1.0)),
+            ("b", Value::Float(2.0)),
+            ("c", Value::Float(3.0)),
         ]);
         assert_eq!(
             call("deepEqual", &[o.clone(), o2], sp()).unwrap(),
             Value::Bool(true)
         );
         // deepEqual false on difference
-        let o3 = obj(vec![("a", Value::Number(1.0))]);
+        let o3 = obj(vec![("a", Value::Float(1.0))]);
         assert_eq!(
             call("deepEqual", &[o.clone(), o3], sp()).unwrap(),
             Value::Bool(false)
@@ -508,7 +508,7 @@ mod tests {
         // nested deepEqual + deepClone independence
         let nested = obj(vec![(
             "inner",
-            arr(vec![Value::Number(1.0), Value::Number(2.0)]),
+            arr(vec![Value::Float(1.0), Value::Float(2.0)]),
         )]);
         let nclone = call("deepClone", std::slice::from_ref(&nested), sp()).unwrap();
         assert_eq!(
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn freeze_sets_flag_returns_value_and_isfrozen_tracks() {
-        let o = obj(vec![("a", Value::Number(1.0))]);
+        let o = obj(vec![("a", Value::Float(1.0))]);
         // isFrozen false before
         assert_eq!(
             call("isFrozen", std::slice::from_ref(&o), sp()).unwrap(),
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn freeze_each_container_kind() {
         // array
-        let a = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
+        let a = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
         call("freeze", std::slice::from_ref(&a), sp()).unwrap();
         assert!(crate::value::is_frozen_value(&a));
         assert_eq!(crate::value::frozen_kind(&a), Some("array"));
@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn freeze_noncontainer_is_noop() {
-        let n = Value::Number(5.0);
+        let n = Value::Float(5.0);
         // no-op freeze returns the value unchanged
         assert_eq!(call("freeze", std::slice::from_ref(&n), sp()).unwrap(), n);
         // never reports frozen / kind
@@ -590,7 +590,7 @@ mod tests {
 
     #[test]
     fn freeze_is_idempotent() {
-        let o = obj(vec![("a", Value::Number(1.0))]);
+        let o = obj(vec![("a", Value::Float(1.0))]);
         call("freeze", std::slice::from_ref(&o), sp()).unwrap();
         call("freeze", std::slice::from_ref(&o), sp()).unwrap();
         assert!(crate::value::is_frozen_value(&o));
@@ -598,7 +598,7 @@ mod tests {
 
     #[test]
     fn deep_clone_of_frozen_is_unfrozen() {
-        let o = obj(vec![("a", Value::Number(1.0))]);
+        let o = obj(vec![("a", Value::Float(1.0))]);
         crate::value::freeze_value(&o);
         let mut seen = HashMap::new();
         let c = deep_clone(&o, &mut seen);
@@ -609,14 +609,14 @@ mod tests {
     #[test]
     fn pick_follows_keylist_order() {
         let o = obj(vec![
-            ("a", Value::Number(1.0)),
-            ("b", Value::Number(2.0)),
-            ("c", Value::Number(3.0)),
+            ("a", Value::Float(1.0)),
+            ("b", Value::Float(2.0)),
+            ("c", Value::Float(3.0)),
         ]);
         let keys = arr(vec![s("c"), s("a")]);
         assert_eq!(
             call("pick", &[o, keys], sp()).unwrap().to_string(),
-            obj(vec![("c", Value::Number(3.0)), ("a", Value::Number(1.0))]).to_string()
+            obj(vec![("c", Value::Float(3.0)), ("a", Value::Float(1.0))]).to_string()
         );
     }
 
@@ -634,11 +634,11 @@ mod tests {
     #[tokio::test]
     async fn map_values_routes_and_panics_on_noncallable() {
         let interp = Interp::new();
-        let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        let o = obj(vec![("a", Value::Float(1.0)), ("b", Value::Float(2.0))]);
         // A non-callable callback must produce a Tier-2 panic — proves that
         // call_object routing reaches call_value rather than "unknown function".
         let r = interp
-            .call_object("mapValues", &[o, Value::Number(0.0)], sp())
+            .call_object("mapValues", &[o, Value::Float(0.0)], sp())
             .await;
         assert!(matches!(r, Err(Control::Panic(_))));
     }
@@ -648,7 +648,7 @@ mod tests {
         let interp = Interp::new();
         // callback: (v, k) => v * 2
         let f = val(&interp, "(v, k) => v * 2").await;
-        let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        let o = obj(vec![("a", Value::Float(1.0)), ("b", Value::Float(2.0))]);
         let result = interp
             .call_object("mapValues", &[o, f], sp())
             .await
@@ -661,7 +661,7 @@ mod tests {
         let interp = Interp::new();
         // callback: (v, k) => k — maps every value to its own key name
         let f = val(&interp, "(v, k) => k").await;
-        let o = obj(vec![("x", Value::Number(99.0))]);
+        let o = obj(vec![("x", Value::Float(99.0))]);
         let result = interp
             .call_object("mapValues", &[o, f], sp())
             .await
@@ -684,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn call_object_delegates_pure_fns() {
         let interp = Interp::new();
-        let o = obj(vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        let o = obj(vec![("a", Value::Float(1.0)), ("b", Value::Float(2.0))]);
         // keys/values/entries etc. must still work through call_object
         let keys = interp
             .call_object("keys", std::slice::from_ref(&o), sp())
@@ -744,7 +744,7 @@ let __inst = P()"#,
             .unwrap();
         assert_eq!(
             omitted.to_string(),
-            obj(vec![("age", Value::Number(3.0))]).to_string()
+            obj(vec![("age", Value::Float(3.0))]).to_string()
         );
 
         // mapValues on an instance -> Object with mapped values
@@ -762,13 +762,13 @@ let __inst = P()"#,
         // a non-object/instance still produces a Tier-2 panic
         assert!(matches!(
             interp
-                .call_object("pick", &[Value::Number(1.0), arr(vec![])], sp())
+                .call_object("pick", &[Value::Float(1.0), arr(vec![])], sp())
                 .await,
             Err(Control::Panic(_))
         ));
         assert!(matches!(
             interp
-                .call_object("omit", &[Value::Number(1.0), arr(vec![])], sp())
+                .call_object("omit", &[Value::Float(1.0), arr(vec![])], sp())
                 .await,
             Err(Control::Panic(_))
         ));
@@ -776,7 +776,7 @@ let __inst = P()"#,
             interp
                 .call_object(
                     "mapValues",
-                    &[Value::Number(1.0), val(&interp, "(v) => v").await],
+                    &[Value::Float(1.0), val(&interp, "(v) => v").await],
                     sp()
                 )
                 .await,

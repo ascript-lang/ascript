@@ -94,7 +94,7 @@ mod tests {
         // from_ascript renders integer-valued floats as JSON integers, so TOML
         // should emit `k = 1`, not `k = 1.0`.
         let mut m = indexmap::IndexMap::new();
-        m.insert("k".to_string(), Value::Number(1.0));
+        m.insert("k".to_string(), Value::Float(1.0));
         let obj = Value::Object(crate::value::ObjectCell::new(m));
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
         assert_eq!(out.to_string(), "[\"k = 1\\n\", nil]");
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn stringify_non_table_is_err() {
         // A bare number cannot be represented at the TOML top level → Tier-1 err.
-        let out = call("stringify", &[Value::Number(5.0)], sp()).unwrap();
+        let out = call("stringify", &[Value::Float(5.0)], sp()).unwrap();
         assert!(out.to_string().starts_with("[nil, {message:"));
     }
 }

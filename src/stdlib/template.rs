@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn dotted_path_and_number() {
-        let inner = obj(&[("b", Value::Number(1.0))]);
+        let inner = obj(&[("b", Value::Float(1.0))]);
         let data = obj(&[("a", inner)]);
         let out = call(
             "render",
@@ -198,7 +198,7 @@ mod tests {
 
     #[test]
     fn missing_nested_key_names_the_path() {
-        let data = obj(&[("a", obj(&[("b", Value::Number(1.0))]))]);
+        let data = obj(&[("a", obj(&[("b", Value::Float(1.0))]))]);
         let out = call("render", &[Value::Str("{{a.c}}".into()), data], sp()).unwrap();
         match &out {
             Value::Array(arr) => {

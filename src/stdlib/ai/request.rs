@@ -485,15 +485,15 @@ fn build_binary_part(part: &Value, kind: &str, span: Span) -> Result<ContentPart
 /// Parse the numeric/sampling options from the `opts` object into [`GenOpts`].
 pub(crate) fn parse_gen_opts(opts: &Value) -> GenOpts {
     let mut g = GenOpts::default();
-    if let Value::Number(n) = get_field(opts, "maxTokens") {
+    if let Value::Float(n) = get_field(opts, "maxTokens") {
         if n >= 0.0 {
             g.max_tokens = Some(n as u32);
         }
     }
-    if let Value::Number(n) = get_field(opts, "temperature") {
+    if let Value::Float(n) = get_field(opts, "temperature") {
         g.temperature = Some(n);
     }
-    if let Value::Number(n) = get_field(opts, "topP") {
+    if let Value::Float(n) = get_field(opts, "topP") {
         g.top_p = Some(n);
     }
     g

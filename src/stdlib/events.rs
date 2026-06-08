@@ -126,7 +126,7 @@ impl Interp {
                     }
                     _ => 0,
                 });
-                Ok(Value::Number(removed as f64))
+                Ok(Value::Float(removed as f64))
             }
             "listenerCount" => {
                 let event = want_event(&arg(&args, 0), span, "listenerCount")?;
@@ -136,7 +136,7 @@ impl Interp {
                     }
                     _ => 0,
                 });
-                Ok(Value::Number(n as f64))
+                Ok(Value::Float(n as f64))
             }
             "emit" => {
                 let event = want_event(&arg(&args, 0), span, "emit")?;
@@ -167,7 +167,7 @@ impl Interp {
                         f.get().await?;
                     }
                 }
-                Ok(Value::Number(count as f64))
+                Ok(Value::Float(count as f64))
             }
             other => Err(AsError::at(format!("emitter has no method '{}'", other), span).into()),
         }

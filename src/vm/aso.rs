@@ -498,7 +498,7 @@ fn literal_kind(v: &Value) -> Result<&'static str, &'static str> {
     match v {
         Value::Nil => Ok("nil"),
         Value::Bool(_) => Ok("bool"),
-        Value::Number(_) => Ok("number"),
+        Value::Float(_) => Ok("number"),
         Value::Str(_) => Ok("string"),
         Value::Decimal(_) => Ok("decimal"),
         Value::Enum(_) => Ok("enum"),
@@ -644,7 +644,7 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
             w.u8(TAG_BOOL);
             w.u8(u8::from(*b));
         }
-        Value::Number(n) => {
+        Value::Float(n) => {
             w.u8(TAG_NUMBER);
             w.f64(*n);
         }
@@ -701,7 +701,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
     let v = match tag {
         TAG_NIL => Value::Nil,
         TAG_BOOL => Value::Bool(r.u8()? != 0),
-        TAG_NUMBER => Value::Number(r.f64()?),
+        TAG_NUMBER => Value::Float(r.f64()?),
         TAG_STR => Value::Str(Rc::from(r.str()?.as_str())),
         TAG_DECIMAL => {
             let b = r.take(16)?;
@@ -2077,14 +2077,14 @@ run()
         use rust_decimal::Decimal;
         use std::str::FromStr;
         let mut c = Chunk::new();
-        c.add_const(Value::Number(f64::NAN));
-        c.add_const(Value::Number(-0.0));
-        c.add_const(Value::Number(f64::INFINITY));
+        c.add_const(Value::Float(f64::NAN));
+        c.add_const(Value::Float(-0.0));
+        c.add_const(Value::Float(f64::INFINITY));
         c.add_const(Value::Decimal(Decimal::from_str("1.50").unwrap()));
         let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
-        assert!(matches!(rt.consts[0], Value::Number(n) if n.is_nan()));
-        assert!(matches!(rt.consts[1], Value::Number(n) if n == 0.0 && n.is_sign_negative()));
-        assert!(matches!(rt.consts[2], Value::Number(n) if n.is_infinite()));
+        assert!(matches!(rt.consts[0], Value::Float(n) if n.is_nan()));
+        assert!(matches!(rt.consts[1], Value::Float(n) if n == 0.0 && n.is_sign_negative()));
+        assert!(matches!(rt.consts[2], Value::Float(n) if n.is_infinite()));
         match &rt.consts[3] {
             Value::Decimal(d) => assert_eq!(d.to_string(), "1.50"),
             other => panic!("expected Decimal, got {other:?}"),

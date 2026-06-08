@@ -296,7 +296,7 @@ impl Interp {
                 let (an, bn) = numeric_pair(&a, &b, "approxEq", span)?;
                 let epsilon = match arg(args, 2) {
                     Value::Nil => 1e-9_f64,
-                    Value::Number(n) => n,
+                    Value::Float(n) => n,
                     Value::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
                     v => {
                         return Err(AsError::at(
@@ -440,7 +440,7 @@ fn opt_str(args: &[Value], i: usize) -> Option<String> {
 /// Unwrap both values as numbers; panics with a clear message if either is not.
 fn numeric_pair(a: &Value, b: &Value, func: &str, span: Span) -> Result<(f64, f64), Control> {
     let an = match a {
-        Value::Number(n) => *n,
+        Value::Float(n) => *n,
         Value::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
         _ => {
             return Err(AsError::at(
@@ -455,7 +455,7 @@ fn numeric_pair(a: &Value, b: &Value, func: &str, span: Span) -> Result<(f64, f6
         }
     };
     let bn = match b {
-        Value::Number(n) => *n,
+        Value::Float(n) => *n,
         Value::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
         _ => {
             return Err(AsError::at(

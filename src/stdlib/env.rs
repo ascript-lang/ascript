@@ -92,7 +92,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     }
                 }
             }
-            Ok(make_pair(Value::Number(count as f64), Value::Nil))
+            Ok(make_pair(Value::Float(count as f64), Value::Nil))
         }
         _ => Err(AsError::at(format!("std/env has no function '{}'", func), span).into()),
     }
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn get_non_string_arg_is_tier2_panic() {
-        let err = call("get", &[Value::Number(42.0)], sp());
+        let err = call("get", &[Value::Float(42.0)], sp());
         assert!(matches!(err, Err(Control::Panic(_))));
     }
 
@@ -162,7 +162,7 @@ mod tests {
             other => panic!("loadDotenv should return a pair, got {:?}", other),
         };
         let arr = arr.borrow();
-        assert_eq!(arr[0], Value::Number(2.0));
+        assert_eq!(arr[0], Value::Float(2.0));
         assert_eq!(arr[1], Value::Nil);
         // and the vars are now in the process env
         assert_eq!(

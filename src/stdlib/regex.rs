@@ -95,7 +95,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     obj.insert("text".to_string(), Value::Str(whole.as_str().into()));
                     obj.insert(
                         "index".to_string(),
-                        Value::Number(char_index(&s, whole.start())),
+                        Value::Float(char_index(&s, whole.start())),
                     );
                     obj.insert("groups".to_string(), arr(groups));
                     Ok(Value::Object(crate::value::ObjectCell::new(obj)))

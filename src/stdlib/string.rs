@@ -88,8 +88,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let s = want_string(&arg(args, 0), span, &ctx("find"))?;
             let sub = want_string(&arg(args, 1), span, &ctx("find"))?;
             match s.find(sub.as_ref()) {
-                Some(byte_idx) => Ok(Value::Number(s[..byte_idx].chars().count() as f64)),
-                None => Ok(Value::Number(-1.0)),
+                Some(byte_idx) => Ok(Value::Float(s[..byte_idx].chars().count() as f64)),
+                None => Ok(Value::Float(-1.0)),
             }
         }
         "replace" => {
@@ -191,7 +191,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             } else {
                 s.matches(sub.as_ref()).count()
             };
-            Ok(Value::Number(n as f64))
+            Ok(Value::Float(n as f64))
         }
         "splitN" => {
             let s = want_string(&arg(args, 0), span, &ctx("splitN"))?;
@@ -272,14 +272,14 @@ mod tests {
         assert_eq!(
             call(
                 "slice",
-                &[s("hello"), Value::Number(1.0), Value::Number(4.0)],
+                &[s("hello"), Value::Float(1.0), Value::Float(4.0)],
                 sp()
             )
             .unwrap(),
             s("ell")
         );
         assert_eq!(
-            call("slice", &[s("hello"), Value::Number(-2.0)], sp()).unwrap(),
+            call("slice", &[s("hello"), Value::Float(-2.0)], sp()).unwrap(),
             s("lo")
         );
         assert_eq!(call("trim", &[s("  hi  ")], sp()).unwrap(), s("hi"));
@@ -291,11 +291,11 @@ mod tests {
     fn find_replace_format_pad_repeat() {
         assert_eq!(
             call("find", &[s("hello"), s("ll")], sp()).unwrap(),
-            Value::Number(2.0)
+            Value::Float(2.0)
         );
         assert_eq!(
             call("find", &[s("hello"), s("z")], sp()).unwrap(),
-            Value::Number(-1.0)
+            Value::Float(-1.0)
         );
         // replace = FIRST occurrence only
         assert_eq!(
@@ -312,9 +312,9 @@ mod tests {
                 "format",
                 &[
                     s("{} + {} = {}"),
-                    Value::Number(1.0),
-                    Value::Number(2.0),
-                    Value::Number(3.0)
+                    Value::Float(1.0),
+                    Value::Float(2.0),
+                    Value::Float(3.0)
                 ],
                 sp()
             )
@@ -326,15 +326,15 @@ mod tests {
             s("{literal}")
         );
         assert_eq!(
-            call("padStart", &[s("7"), Value::Number(3.0), s("0")], sp()).unwrap(),
+            call("padStart", &[s("7"), Value::Float(3.0), s("0")], sp()).unwrap(),
             s("007")
         );
         assert_eq!(
-            call("padEnd", &[s("7"), Value::Number(3.0)], sp()).unwrap(),
+            call("padEnd", &[s("7"), Value::Float(3.0)], sp()).unwrap(),
             s("7  ")
         );
         assert_eq!(
-            call("repeat", &[s("ab"), Value::Number(3.0)], sp()).unwrap(),
+            call("repeat", &[s("ab"), Value::Float(3.0)], sp()).unwrap(),
             s("ababab")
         );
     }
@@ -349,14 +349,14 @@ mod tests {
         );
         // padStart when already wide enough returns unchanged
         assert_eq!(
-            call("padStart", &[s("hello"), Value::Number(3.0), s("0")], sp).unwrap(),
+            call("padStart", &[s("hello"), Value::Float(3.0), s("0")], sp).unwrap(),
             s("hello")
         );
         // slice start >= end → empty
         assert_eq!(
             call(
                 "slice",
-                &[s("hello"), Value::Number(4.0), Value::Number(2.0)],
+                &[s("hello"), Value::Float(4.0), Value::Float(2.0)],
                 sp
             )
             .unwrap(),
@@ -373,7 +373,7 @@ mod tests {
         );
         // negative repeat count → panic
         assert!(matches!(
-            call("repeat", &[s("a"), Value::Number(-1.0)], sp),
+            call("repeat", &[s("a"), Value::Float(-1.0)], sp),
             Err(Control::Panic(_))
         ));
         // standalone }} escape
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn misuse_panics() {
         assert!(matches!(
-            call("split", &[Value::Number(1.0), s(",")], sp()),
+            call("split", &[Value::Float(1.0), s(",")], sp()),
             Err(Control::Panic(_))
         ));
         assert!(matches!(
@@ -429,26 +429,26 @@ mod tests {
         assert_eq!(call("reverse", &[s("abc")], sp()).unwrap(), s("cba"));
         assert_eq!(
             call("count", &[s("a.a.a"), s(".")], sp()).unwrap(),
-            Value::Number(2.0)
+            Value::Float(2.0)
         );
         assert_eq!(
             call("count", &[s("abc"), s("")], sp()).unwrap(),
-            Value::Number(0.0)
+            Value::Float(0.0)
         );
         assert_eq!(
-            call("splitN", &[s("a:b:c"), s(":"), Value::Number(2.0)], sp())
+            call("splitN", &[s("a:b:c"), s(":"), Value::Float(2.0)], sp())
                 .unwrap()
                 .to_string(),
             "[\"a\", \"b:c\"]"
         );
         assert_eq!(
-            call("splitN", &[s("a:b:c"), s(":"), Value::Number(1.0)], sp())
+            call("splitN", &[s("a:b:c"), s(":"), Value::Float(1.0)], sp())
                 .unwrap()
                 .to_string(),
             "[\"a:b:c\"]"
         );
         assert!(matches!(
-            call("splitN", &[s("a:b"), s(":"), Value::Number(0.0)], sp()),
+            call("splitN", &[s("a:b"), s(":"), Value::Float(0.0)], sp()),
             Err(Control::Panic(_))
         ));
     }

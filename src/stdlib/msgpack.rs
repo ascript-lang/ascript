@@ -42,7 +42,7 @@ pub(crate) fn to_mp(v: &Value, seen: &mut Vec<usize>) -> Result<Mp, String> {
     match v {
         Value::Nil => Ok(Mp::Nil),
         Value::Bool(b) => Ok(Mp::Boolean(*b)),
-        Value::Number(n) => Ok(number_to_mp(*n)),
+        Value::Float(n) => Ok(number_to_mp(*n)),
         Value::Decimal(d) => Ok(Mp::String(d.to_string().into())),
         Value::Str(s) => Ok(Mp::String(s.to_string().into())),
         Value::Bytes(b) => Ok(Mp::Binary(b.borrow().clone())),
@@ -130,15 +130,15 @@ pub(crate) fn from_mp(mp: &Mp) -> Value {
             // rmpv Integer is i64 or u64; both fit f64 with the usual precision
             // caveat (documented lossy edge for very large integers).
             if let Some(u) = i.as_u64() {
-                Value::Number(u as f64)
+                Value::Float(u as f64)
             } else if let Some(s) = i.as_i64() {
-                Value::Number(s as f64)
+                Value::Float(s as f64)
             } else {
-                Value::Number(f64::NAN)
+                Value::Float(f64::NAN)
             }
         }
-        Mp::F32(f) => Value::Number(*f as f64),
-        Mp::F64(f) => Value::Number(*f),
+        Mp::F32(f) => Value::Float(*f as f64),
+        Mp::F64(f) => Value::Float(*f),
         Mp::String(s) => match s.as_str() {
             Some(st) => Value::Str(st.into()),
             // Non-UTF-8 msgpack string → expose the raw bytes.
@@ -232,9 +232,9 @@ mod tests {
 
     #[test]
     fn roundtrip_primitives() {
-        assert_eq!(roundtrip(Value::Number(42.0)), Value::Number(42.0));
-        assert_eq!(roundtrip(Value::Number(3.5)), Value::Number(3.5));
-        assert_eq!(roundtrip(Value::Number(-7.0)), Value::Number(-7.0));
+        assert_eq!(roundtrip(Value::Float(42.0)), Value::Float(42.0));
+        assert_eq!(roundtrip(Value::Float(3.5)), Value::Float(3.5));
+        assert_eq!(roundtrip(Value::Float(-7.0)), Value::Float(-7.0));
         assert_eq!(roundtrip(Value::Str("hello".into())), Value::Str("hello".into()));
         assert_eq!(roundtrip(Value::Bool(true)), Value::Bool(true));
         assert_eq!(roundtrip(Value::Nil), Value::Nil);
@@ -256,8 +256,8 @@ mod tests {
         m.insert(
             "nums".to_string(),
             Value::Array(crate::value::ArrayCell::new(vec![
-                Value::Number(1.0),
-                Value::Number(2.0),
+                Value::Float(1.0),
+                Value::Float(2.0),
             ])),
         );
         let obj = Value::Object(crate::value::ObjectCell::new(m));
@@ -279,7 +279,7 @@ mod tests {
     fn roundtrip_map_with_number_keys_stays_map() {
         let mut m: IndexMap<crate::value::MapKey, Value> = IndexMap::new();
         m.insert(
-            crate::value::MapKey::from_value(&Value::Number(1.0)).unwrap(),
+            crate::value::MapKey::from_value(&Value::Float(1.0)).unwrap(),
             Value::Str("one".into()),
         );
         let map = Value::Map(crate::value::MapCell::new(m));
@@ -320,7 +320,7 @@ mod tests {
             let b = a.borrow();
             match &b[0] {
                 Value::Object(o) => {
-                    assert_eq!(o.borrow().get("a"), Some(&Value::Number(1.0)))
+                    assert_eq!(o.borrow().get("a"), Some(&Value::Float(1.0)))
                 }
                 other => panic!("expected object, got {:?}", other),
             }

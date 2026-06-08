@@ -141,7 +141,7 @@ pub enum Op {
     /// `a > b` yields `[]`).
     RangeInclusive,
     /// `a b -- a b` (peek-only) — verify the top TWO stack values are both
-    /// `Value::Number`, otherwise raise the Tier-2 panic carried at this op's span.
+    /// `Value::Float`, otherwise raise the Tier-2 panic carried at this op's span.
     /// Used to lower the for-range bounds check eagerly (before the loop) so the
     /// VM reports `for-range bounds must be numbers` at the START bound's span,
     /// byte-identically to the tree-walker's `Stmt::ForRange`. Leaves both operands
@@ -466,8 +466,8 @@ pub enum Op {
     MatchHasKey,
     /// `MATCH_RANGE(u8 flags)` — `subject lo hi step -- ok:bool` (step on top).
     /// `flags` bit0 = inclusive, bit1 = step PRESENT. Pop the four operands and push
-    /// `true` iff the subject is a `Value::Number` `n` matching the range, with `lo`
-    /// and `hi` `Value::Number`s. With step OMITTED (a `nil` placeholder) this is
+    /// `true` iff the subject is a `Value::Float` `n` matching the range, with `lo`
+    /// and `hi` `Value::Float`s. With step OMITTED (a `nil` placeholder) this is
     /// the plain in-bounds test `n >= lo && (n <= hi if inclusive else n < hi)`
     /// (bounds-inferred direction). With step PRESENT it is strided membership
     /// (spec §3.7) anchored at `lo`, via the SHARED `interp::resolve_step` (validates

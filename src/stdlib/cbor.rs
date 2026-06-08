@@ -31,7 +31,7 @@ pub(crate) fn to_cbor(v: &Value, seen: &mut Vec<usize>) -> Result<Cb, String> {
     match v {
         Value::Nil => Ok(Cb::Null),
         Value::Bool(b) => Ok(Cb::Bool(*b)),
-        Value::Number(n) => Ok(number_to_cbor(*n)),
+        Value::Float(n) => Ok(number_to_cbor(*n)),
         Value::Decimal(d) => Ok(Cb::Text(d.to_string())),
         Value::Str(s) => Ok(Cb::Text(s.to_string())),
         Value::Bytes(b) => Ok(Cb::Bytes(b.borrow().clone())),
@@ -114,9 +114,9 @@ pub(crate) fn from_cbor(cb: &Cb) -> Value {
         Cb::Bool(b) => Value::Bool(*b),
         Cb::Integer(i) => {
             let n: i128 = (*i).into();
-            Value::Number(n as f64)
+            Value::Float(n as f64)
         }
-        Cb::Float(f) => Value::Number(*f),
+        Cb::Float(f) => Value::Float(*f),
         Cb::Text(s) => Value::Str(s.as_str().into()),
         Cb::Bytes(b) => Value::Bytes(std::rc::Rc::new(std::cell::RefCell::new(b.clone()))),
         Cb::Array(a) => {
@@ -199,9 +199,9 @@ mod tests {
 
     #[test]
     fn roundtrip_primitives() {
-        assert_eq!(roundtrip(Value::Number(42.0)), Value::Number(42.0));
-        assert_eq!(roundtrip(Value::Number(3.5)), Value::Number(3.5));
-        assert_eq!(roundtrip(Value::Number(-7.0)), Value::Number(-7.0));
+        assert_eq!(roundtrip(Value::Float(42.0)), Value::Float(42.0));
+        assert_eq!(roundtrip(Value::Float(3.5)), Value::Float(3.5));
+        assert_eq!(roundtrip(Value::Float(-7.0)), Value::Float(-7.0));
         assert_eq!(roundtrip(Value::Str("hi".into())), Value::Str("hi".into()));
         assert_eq!(roundtrip(Value::Bool(false)), Value::Bool(false));
         assert_eq!(roundtrip(Value::Nil), Value::Nil);
@@ -222,7 +222,7 @@ mod tests {
         m.insert("ok".to_string(), Value::Bool(true));
         m.insert(
             "xs".to_string(),
-            Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)])),
+            Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)])),
         );
         let obj = Value::Object(crate::value::ObjectCell::new(m));
         match roundtrip(obj) {
@@ -238,7 +238,7 @@ mod tests {
     fn roundtrip_number_keyed_map_stays_map() {
         let mut m: IndexMap<crate::value::MapKey, Value> = IndexMap::new();
         m.insert(
-            crate::value::MapKey::from_value(&Value::Number(7.0)).unwrap(),
+            crate::value::MapKey::from_value(&Value::Float(7.0)).unwrap(),
             Value::Str("seven".into()),
         );
         assert!(matches!(roundtrip(Value::Map(crate::value::MapCell::new(m))), Value::Map(_)));
@@ -271,7 +271,7 @@ mod tests {
         if let Value::Array(a) = pair {
             let b = a.borrow();
             match &b[0] {
-                Value::Object(o) => assert_eq!(o.borrow().get("a"), Some(&Value::Number(1.0))),
+                Value::Object(o) => assert_eq!(o.borrow().get("a"), Some(&Value::Float(1.0))),
                 other => panic!("expected object, got {:?}", other),
             }
         }

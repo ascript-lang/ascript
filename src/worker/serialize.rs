@@ -92,6 +92,9 @@ const TAG_ENUM: u8 = 10;
 const TAG_REGEX: u8 = 11;
 const TAG_INSTANCE: u8 = 12;
 const TAG_REF: u8 = 13;
+/// A 64-bit integer (NUM §3.1). A scalar wire kind, distinct from `TAG_NUMBER`
+/// (float) so an `int` round-trips as an `int` (no lossy float fold).
+const TAG_INT: u8 = 14;
 
 // ---------------------------------------------------------------------------
 // Sendability gate
@@ -110,7 +113,8 @@ fn unsendable_kind(v: &Value) -> Option<(&'static str, Option<&'static str>)> {
     match v {
         Value::Nil
         | Value::Bool(_)
-        | Value::Number(_)
+        | Value::Int(_)
+        | Value::Float(_)
         | Value::Decimal(_)
         | Value::Str(_)
         | Value::Bytes(_)
@@ -384,7 +388,11 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             w.u8(TAG_BOOL);
             w.u8(*b as u8);
         }
-        Value::Number(n) => {
+        Value::Int(i) => {
+            w.u8(TAG_INT);
+            w.u64(*i as u64);
+        }
+        Value::Float(n) => {
             w.u8(TAG_NUMBER);
             w.u64(n.to_bits());
         }
@@ -531,7 +539,8 @@ fn decode_value(
     match tag {
         TAG_NIL => Ok(Value::Nil),
         TAG_BOOL => Ok(Value::Bool(r.u8()? != 0)),
-        TAG_NUMBER => Ok(Value::Number(f64::from_bits(r.u64()?))),
+        TAG_INT => Ok(Value::Int(r.u64()? as i64)),
+        TAG_NUMBER => Ok(Value::Float(f64::from_bits(r.u64()?))),
         TAG_DECIMAL => {
             use rust_decimal::prelude::*;
             let s = r.str()?;
@@ -756,7 +765,7 @@ mod tests {
         Value::Set(SetCell::new(s))
     }
     fn num(n: f64) -> Value {
-        Value::Number(n)
+        Value::Float(n)
     }
     fn str(s: &str) -> Value {
         Value::Str(s.into())
@@ -773,7 +782,7 @@ mod tests {
         for v in [
             Value::Nil,
             Value::Bool(true),
-            Value::Number(3.5),
+            Value::Float(3.5),
             Value::Str("hi".into()),
             Value::Decimal(Decimal::from_str("0.1").unwrap()),
         ] {

@@ -25,7 +25,7 @@
 //! specialized for, and it then performs the EXACT same computation the generic
 //! `apply_binop` would for those kinds:
 //!
-//! - `ArithKind::Number` ⇒ both operands `Value::Number` ⇒ the same `f64`
+//! - `ArithKind::Number` ⇒ both operands `Value::Float` ⇒ the same `f64`
 //!   arithmetic `apply_binop` runs in its final numeric arm.
 //! - `ArithKind::Decimal` ⇒ both operands `Value::Decimal` ⇒ the same
 //!   `rust_decimal` op `apply_binop` runs (Add/Sub/Mul only — see
@@ -47,7 +47,7 @@ pub const WARMUP_THRESHOLD: u16 = 8;
 /// single guarded fast path in the run loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithKind {
-    /// Both operands `Value::Number` ⇒ inline `f64` arithmetic.
+    /// Both operands `Value::Float` ⇒ inline `f64` arithmetic.
     Number,
     /// Both operands `Value::Decimal` ⇒ inline `rust_decimal` arithmetic.
     Decimal,
