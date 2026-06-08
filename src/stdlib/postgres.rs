@@ -147,7 +147,7 @@ impl Interp {
                 let sql = want_string(&arg(&args, 0), span, "connection.exec")?;
                 let params = bind_params(args.get(1), span, "connection.exec")?;
                 match self.pg_run_execute(id, &sql, &params, span).await {
-                    Ok(Ok(n)) => Ok(make_pair(Value::Number(n as f64), Value::Nil)),
+                    Ok(Ok(n)) => Ok(make_pair(Value::Int(n as i64), Value::Nil)),
                     Ok(Err(msg)) => Ok(err_pair(msg)),
                     Err(c) => Err(c),
                 }
@@ -286,7 +286,9 @@ fn value_to_param(v: &Value, span: Span, ctx: &str) -> Result<BoundParam, Contro
     Ok(match v {
         Value::Nil => BoundParam::Null,
         Value::Bool(b) => BoundParam::Bool(*b),
-        Value::Number(n) => {
+        // NUM §4: an `Int` binds directly as a SQL integer.
+        Value::Int(i) => BoundParam::Int(*i),
+        Value::Float(n) => {
             if n.fract() == 0.0 && n.is_finite() && n.abs() < 9.2e18 {
                 BoundParam::Int(*n as i64)
             } else {
@@ -330,10 +332,10 @@ fn column_to_value(row: &tokio_postgres::Row, i: usize, ty: &Type) -> Value {
             .flatten()
             .map(Value::Bool)
             .unwrap_or(Value::Nil),
-        Type::INT2 => opt_num(row.try_get::<_, Option<i16>>(i).ok().flatten().map(|n| n as f64)),
-        Type::INT4 => opt_num(row.try_get::<_, Option<i32>>(i).ok().flatten().map(|n| n as f64)),
-        Type::INT8 => opt_num(row.try_get::<_, Option<i64>>(i).ok().flatten().map(|n| n as f64)),
-        Type::OID => opt_num(row.try_get::<_, Option<u32>>(i).ok().flatten().map(|n| n as f64)),
+        Type::INT2 => opt_int(row.try_get::<_, Option<i16>>(i).ok().flatten().map(|n| n as i64)),
+        Type::INT4 => opt_int(row.try_get::<_, Option<i32>>(i).ok().flatten().map(|n| n as i64)),
+        Type::INT8 => opt_int(row.try_get::<_, Option<i64>>(i).ok().flatten()),
+        Type::OID => opt_int(row.try_get::<_, Option<u32>>(i).ok().flatten().map(|n| n as i64)),
         Type::FLOAT4 => opt_num(row.try_get::<_, Option<f32>>(i).ok().flatten().map(|n| n as f64)),
         Type::FLOAT8 => opt_num(row.try_get::<_, Option<f64>>(i).ok().flatten()),
         // numeric/decimal → text to avoid f64 precision loss.
@@ -341,7 +343,7 @@ fn column_to_value(row: &tokio_postgres::Row, i: usize, ty: &Type) -> Value {
         Type::TEXT | Type::VARCHAR | Type::NAME | Type::BPCHAR | Type::UNKNOWN => {
             opt_str(row.try_get::<_, Option<String>>(i).ok().flatten())
         }
-        Type::CHAR => opt_num(row.try_get::<_, Option<i8>>(i).ok().flatten().map(|n| n as f64)),
+        Type::CHAR => opt_int(row.try_get::<_, Option<i8>>(i).ok().flatten().map(|n| n as i64)),
         Type::BYTEA => row
             .try_get::<_, Option<Vec<u8>>>(i)
             .ok()
@@ -367,7 +369,11 @@ fn column_to_value(row: &tokio_postgres::Row, i: usize, ty: &Type) -> Value {
 }
 
 fn opt_num(n: Option<f64>) -> Value {
-    n.map(Value::Number).unwrap_or(Value::Nil)
+    n.map(Value::Float).unwrap_or(Value::Nil)
+}
+/// NUM §4: an integer SQL column decodes to `Int`.
+fn opt_int(n: Option<i64>) -> Value {
+    n.map(Value::Int).unwrap_or(Value::Nil)
 }
 fn opt_str(s: Option<String>) -> Value {
     s.map(|s| Value::Str(s.into())).unwrap_or(Value::Nil)
@@ -399,8 +405,8 @@ mod tests {
     fn value_to_param_type_map() {
         assert!(matches!(value_to_param(&Value::Nil, sp(), "x").unwrap(), BoundParam::Null));
         assert!(matches!(value_to_param(&Value::Bool(true), sp(), "x").unwrap(), BoundParam::Bool(true)));
-        assert!(matches!(value_to_param(&Value::Number(3.0), sp(), "x").unwrap(), BoundParam::Int(3)));
-        assert!(matches!(value_to_param(&Value::Number(3.5), sp(), "x").unwrap(), BoundParam::Float(_)));
+        assert!(matches!(value_to_param(&Value::Float(3.0), sp(), "x").unwrap(), BoundParam::Int(3)));
+        assert!(matches!(value_to_param(&Value::Float(3.5), sp(), "x").unwrap(), BoundParam::Float(_)));
         assert!(matches!(value_to_param(&Value::Str("hi".into()), sp(), "x").unwrap(), BoundParam::Text(_)));
         // A function value cannot be bound.
         assert!(value_to_param(&Value::Builtin("math.abs".into()), sp(), "x").is_err());
@@ -411,12 +417,12 @@ mod tests {
         assert_eq!(bind_params(None, sp(), "x").unwrap().len(), 0);
         assert_eq!(bind_params(Some(&Value::Nil), sp(), "x").unwrap().len(), 0);
         let arr = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Number(1.0),
+            Value::Float(1.0),
             Value::Str("a".into()),
         ]));
         assert_eq!(bind_params(Some(&arr), sp(), "x").unwrap().len(), 2);
         // A non-array params arg is a Tier-2 error.
-        assert!(bind_params(Some(&Value::Number(1.0)), sp(), "x").is_err());
+        assert!(bind_params(Some(&Value::Float(1.0)), sp(), "x").is_err());
     }
 
     // Dead-port connect → clean Tier-1 err (NOT a panic). Runs under a LocalSet
@@ -508,7 +514,7 @@ mod tests {
                         assert_eq!(rs.len(), 1, "one row expected");
                         if let Value::Object(o) = &rs[0] {
                             let o = o.borrow();
-                            assert_eq!(o.get("id"), Some(&Value::Number(1.0)));
+                            assert_eq!(o.get("id"), Some(&Value::Int(1)));
                             assert_eq!(o.get("name"), Some(&Value::Str("ada".into())));
                         }
                     }

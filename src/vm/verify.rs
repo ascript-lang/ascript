@@ -218,11 +218,12 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Swap => Effect::new(2, 2),
         Rot3 => Effect::new(3, 3),
 
-        // ---- binary arithmetic / comparison / range ----
+        // ---- binary arithmetic / comparison / range / bitwise / shift / wrapping ----
         Add | Sub | Mul | Div | Mod | Pow | Lt | Le | Gt | Ge | Eq | Ne | Range
-        | RangeInclusive => Effect::new(2, 1),
+        | RangeInclusive | BitAnd | BitOr | BitXor | Shl | Shr | WrapAdd | WrapSub
+        | WrapMul => Effect::new(2, 1),
         // ---- unary ----
-        Neg | Not => Effect::new(1, 1),
+        Neg | Not | BitNot => Effect::new(1, 1),
 
         // ---- jumps ----
         // JUMP/LOOP are unconditional, no stack effect. JUMP_IF_* pop the tested value.
@@ -232,6 +233,8 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         // CHECK_PARAM peeks TOS (the default value) and validates it in place.
         JumpIfArgSupplied => Effect::new(0, 0),
         CheckParam => Effect::new(1, 1),
+        // CHECK_LOCAL peeks TOS (the bound initializer) and validates it in place.
+        CheckLocal => Effect::new(1, 1),
 
         // ---- calls ----
         Call => Effect::new(argc_or_n + 1, 1),
@@ -313,6 +316,8 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Method => Effect::new(2, 1),
         // INSTANCE_OF: inst cls -- bool.
         InstanceOf => Effect::new(2, 1),
+        // INSTANCE_OF_TYPE: inst -- bool (the type name rides as a const operand).
+        InstanceOfType => Effect::new(1, 1),
         // MAKE_GENERATOR wraps the current frame; no operand-stack change.
         MakeGenerator => Effect::new(0, 0),
 
@@ -410,6 +415,17 @@ fn check_operands(
         }
         Ok(())
     };
+    let check_type_const = |idx: usize| -> Result<(), VerifyError> {
+        if idx >= chunk.type_consts.len() {
+            return Err(VerifyError::OperandOutOfRange {
+                offset: off,
+                kind: "type-const",
+                index: idx,
+                len: chunk.type_consts.len(),
+            });
+        }
+        Ok(())
+    };
     let check_slot = |idx: usize| -> Result<(), VerifyError> {
         if idx >= chunk.slot_count as usize {
             return Err(VerifyError::OperandOutOfRange {
@@ -439,7 +455,8 @@ fn check_operands(
 
         // ---- name-const (must be a Str) ----
         GetGlobal | DefineGlobal | SetGlobal | ImmutableError | GetProp | SetProp | GetPropOpt
-        | Method | GetSuper | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport => {
+        | Method | GetSuper | ObjectKey | MatchHasKey | CallMethodSpread | DefineExport
+        | InstanceOfType => {
             check_name_const(chunk.read_u16(operand_at) as usize)?
         }
 
@@ -461,6 +478,9 @@ fn check_operands(
 
         // ---- OBJECT_REST: u16 const index naming the bound-keys ARRAY (not a Str) ----
         ObjectRest => check_const(chunk.read_u16(operand_at) as usize)?,
+
+        // ---- CHECK_LOCAL: u16 index into the type-const side-pool ----
+        CheckLocal => check_type_const(chunk.read_u16(operand_at) as usize)?,
 
         // ---- local slot index ----
         GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | CloseUpvalue => {
@@ -907,7 +927,7 @@ mod tests {
     #[test]
     fn const_index_out_of_range_rejected() {
         let mut c = Chunk::new();
-        c.add_const(Value::Number(1.0)); // index 0 is the only valid one
+        c.add_const(Value::Float(1.0)); // index 0 is the only valid one
         c.emit_u16(Op::Const, 5, s()); // index 5 is out of range
         c.emit(Op::Return, s());
         match verify(&c) {
@@ -923,7 +943,7 @@ mod tests {
     #[test]
     fn name_const_not_string_rejected() {
         let mut c = Chunk::new();
-        let n = c.add_const(Value::Number(1.0)); // a number, not a Str
+        let n = c.add_const(Value::Float(1.0)); // a number, not a Str
         c.emit_u16(Op::GetGlobal, n, s());
         c.emit(Op::Return, s());
         assert!(matches!(
@@ -962,7 +982,7 @@ mod tests {
     fn jump_into_instruction_rejected() {
         let mut c = Chunk::new();
         // CONST (3 bytes) then JUMP whose target lands in the middle of the CONST.
-        let k = c.add_const(Value::Number(1.0));
+        let k = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, k, s()); // bytes 0,1,2
         let site = c.emit_jump(Op::Jump, s()); // op at 3, operand at 4
         c.emit(Op::Return, s());

@@ -1489,8 +1489,8 @@ mod tests {
         // The shipped bytecode (entry_aso) deserializes via the .aso reader and
         // runs g(5) -> 15 on a FRESH interp/vm (no access to the original heap).
         let slice = build_slice_for_test(SRC, "g").await;
-        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Number(5.0)]).await;
-        assert_eq!(out.unwrap(), Value::Number(15.0));
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Float(5.0)]).await;
+        assert_eq!(out.unwrap(), Value::Float(15.0));
     }
 
     #[tokio::test]
@@ -1521,8 +1521,8 @@ mod tests {
         let names = slice.dep_names();
         assert!(names.contains("K"), "missing computed const K: {names:?}");
         assert!(names.contains("expensive"), "missing helper: {names:?}");
-        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Number(8.0)]).await;
-        assert_eq!(out.unwrap(), Value::Number(50.0));
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Float(8.0)]).await;
+        assert_eq!(out.unwrap(), Value::Float(50.0));
     }
 
     #[tokio::test]
@@ -1585,8 +1585,8 @@ mod tests {
             "over-shipped absorbed `noisy` into the slice: {names:?}"
         );
         // The slice runs to completion in a fresh isolate (no `set_local` slot panic).
-        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Number(8.0)]).await;
-        assert_eq!(out.unwrap(), Value::Number(50.0));
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Float(8.0)]).await;
+        assert_eq!(out.unwrap(), Value::Float(50.0));
     }
 }
 

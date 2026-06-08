@@ -32,6 +32,15 @@ const BUILTINS: &[&str] = &[
     "print", "len", "type", "assert", "range", "Ok", "Err", "recover", "test", "exit",
 ];
 
+/// The built-in primitive TYPE names offered as completions (TYPE_PARAMETER kind),
+/// so `int`/`float`/`number` (NUM §5) and the other scalars surface where a type
+/// annotation is being written. Offered in the always-on baseline (the completion
+/// context is parser-free and does not yet distinguish type vs value position; an
+/// offered type name in value position is a benign, non-misleading suggestion).
+const TYPE_NAMES: &[&str] = &[
+    "int", "float", "number", "string", "bool", "nil", "any", "object", "bytes", "regex", "error",
+];
+
 /// The known stdlib module paths offered when completing an `import ... from "..."`
 /// string. Hardcoded (rather than derived from `std_module_exports`) so the list is
 /// stable regardless of which cargo features are enabled at build time — editors
@@ -79,12 +88,15 @@ fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
 
 /// The always-offered baseline completions: every keyword + every global builtin.
 fn baseline_completions() -> Vec<CompletionItem> {
-    let mut out = Vec::with_capacity(KEYWORDS.len() + BUILTINS.len());
+    let mut out = Vec::with_capacity(KEYWORDS.len() + BUILTINS.len() + TYPE_NAMES.len());
     for kw in KEYWORDS {
         out.push(item(kw, CompletionItemKind::KEYWORD));
     }
     for b in BUILTINS {
         out.push(item(b, CompletionItemKind::FUNCTION));
+    }
+    for t in TYPE_NAMES {
+        out.push(item(t, CompletionItemKind::TYPE_PARAMETER));
     }
     out
 }
@@ -395,6 +407,20 @@ mod tests {
         assert_eq!(fnkw.kind, Some(CompletionItemKind::KEYWORD));
         let pr = it.iter().find(|i| i.label == "print").unwrap();
         assert_eq!(pr.kind, Some(CompletionItemKind::FUNCTION));
+    }
+
+    #[test]
+    fn completions_baseline_offers_primitive_type_names() {
+        let it = items("let x: \n");
+        let ls = labels(&it);
+        for expected in ["int", "float", "number", "string", "bool"] {
+            assert!(
+                ls.contains(&expected),
+                "baseline should offer type name {expected:?}: {ls:?}"
+            );
+        }
+        let intt = it.iter().find(|i| i.label == "int").unwrap();
+        assert_eq!(intt.kind, Some(CompletionItemKind::TYPE_PARAMETER));
     }
 
     #[test]

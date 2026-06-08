@@ -120,7 +120,7 @@ pub(crate) async fn call_stream_method(
             let mut fields = indexmap::IndexMap::new();
             fields.insert(
                 "__streamId".to_string(),
-                Value::Number(m.receiver.id as f64),
+                Value::Float(m.receiver.id as f64),
             );
             // The adapter shares the resource id: register_resource is NOT used; the
             // adapter handle carries the same id so `next()` resolves the same state.
@@ -321,7 +321,8 @@ fn usage_value(n: &NeutralResponse) -> Value {
 
 fn opt_num(v: Option<i64>) -> Value {
     match v {
-        Some(n) => Value::Number(n as f64),
+        // NUM §4: a token count is an `int`.
+        Some(n) => Value::Int(n),
         None => Value::Nil,
     }
 }

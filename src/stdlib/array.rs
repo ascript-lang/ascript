@@ -89,7 +89,8 @@ impl Interp {
                 let item = arg(args, 1);
                 let mut b = arr.borrow_mut();
                 b.push(item);
-                Ok(Value::Number(b.len() as f64))
+                // NUM §4: the new length is an `Int`.
+                Ok(Value::Int(b.len() as i64))
             }
             "pop" => {
                 let arr = want_array(&arg(args, 0), span, &ctx("pop"))?;
@@ -154,13 +155,13 @@ impl Interp {
                                         span,
                                     )
                                     .await?;
-                                let n = match r {
-                                    Value::Number(n) => n,
-                                    other => {
+                                let n = match r.as_f64() {
+                                    Some(n) => n,
+                                    None => {
                                         return Err(AsError::at(
                                             format!(
                                             "array.sort comparator must return a number, got {}",
-                                            crate::interp::type_name(&other)
+                                            crate::interp::type_name(&r)
                                         ),
                                             span,
                                         )
@@ -204,10 +205,11 @@ impl Interp {
                         .await?
                         .is_truthy()
                     {
-                        return Ok(Value::Number(i as f64));
+                        // NUM §4: an index is an `Int`.
+                        return Ok(Value::Int(i as i64));
                     }
                 }
-                Ok(Value::Number(-1.0))
+                Ok(Value::Int(-1))
             }
             "some" => {
                 let a = want_array(&arg(args, 0), span, &ctx("some"))?;
@@ -243,7 +245,8 @@ impl Interp {
                 let a = want_array(&arg(args, 0), span, &ctx("indexOf"))?;
                 let needle = arg(args, 1);
                 let idx = a.borrow().iter().position(|x| *x == needle);
-                Ok(Value::Number(idx.map(|i| i as f64).unwrap_or(-1.0)))
+                // NUM §4: an index is an `Int`.
+                Ok(Value::Int(idx.map(|i| i as i64).unwrap_or(-1)))
             }
             "flat" => {
                 let a = want_array(&arg(args, 0), span, &ctx("flat"))?;
@@ -429,13 +432,13 @@ fn flatten_into(items: &[Value], depth: usize, out: &mut Vec<Value>) {
 
 /// Sort a homogeneous number or string array by natural order. Mixed/other kinds → panic.
 fn sort_default(items: &mut [Value], span: Span) -> Result<(), Control> {
-    let all_numbers = items.iter().all(|v| matches!(v, Value::Number(_)));
+    // NUM §4: a number array may mix `Int` and `Float`; both count as numbers and
+    // sort by their f64 value (cross-type ordering is well-defined).
+    let all_numbers = items.iter().all(|v| v.is_number());
     let all_strings = items.iter().all(|v| matches!(v, Value::Str(_)));
     if all_numbers {
-        items.sort_by(|a, b| match (a, b) {
-            (Value::Number(x), Value::Number(y)) => {
-                x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal)
-            }
+        items.sort_by(|a, b| match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
             _ => std::cmp::Ordering::Equal,
         });
         Ok(())
@@ -462,7 +465,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn n(x: f64) -> Value {
-        Value::Number(x)
+        Value::Float(x)
     }
     fn arr(xs: Vec<Value>) -> Value {
         Value::Array(crate::value::ArrayCell::new(xs))
@@ -491,7 +494,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(len, n(3.0));
-        assert_eq!(a.to_string(), "[1, 2, 3]");
+        assert_eq!(a.to_string(), "[1.0, 2.0, 3.0]");
     }
 
     #[tokio::test]
@@ -578,7 +581,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[20, 30]"
+            "[20.0, 30.0]"
         );
         assert_eq!(
             interp
@@ -586,7 +589,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[30, 40]"
+            "[30.0, 40.0]"
         );
         // start >= end → empty
         assert_eq!(
@@ -652,7 +655,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[[1, 2], [3, 4], [5]]"
+            "[[1.0, 2.0], [3.0, 4.0], [5.0]]"
         );
         let b = arr(vec![n(10.0), n(20.0)]);
         assert_eq!(
@@ -661,7 +664,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[[1, 10], [2, 20]]"
+            "[[1.0, 10.0], [2.0, 20.0]]"
         );
         assert!(matches!(
             interp.call_array("chunk", &[a.clone(), n(0.0)], sp()).await,
@@ -685,19 +688,19 @@ mod tests {
             map.get(&MapKey::from_value(&Value::Str("odd".into())).unwrap())
                 .unwrap()
                 .to_string(),
-            "[1, 3, 5]"
+            "[1.0, 3.0, 5.0]"
         );
         assert_eq!(
             map.get(&MapKey::from_value(&Value::Str("even".into())).unwrap())
                 .unwrap()
                 .to_string(),
-            "[2, 4]"
+            "[2.0, 4.0]"
         );
         // Full stringification confirms insertion order.
         drop(map);
         assert_eq!(
             result.to_string(),
-            r#"map {"odd": [1, 3, 5], "even": [2, 4]}"#
+            r#"map {"odd": [1.0, 3.0, 5.0], "even": [2.0, 4.0]}"#
         );
     }
 
@@ -724,7 +727,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[[2, 4], [1, 3, 5]]"
+            "[[2.0, 4.0], [1.0, 3.0, 5.0]]"
         );
         // Empty input → two empty partitions.
         assert_eq!(
@@ -747,7 +750,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[3, 2, 2, 1]"
+            "[3.0, 2.0, 2.0, 1.0]"
         );
         assert_eq!(
             interp
@@ -755,7 +758,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[1, 2, 3]"
+            "[1.0, 2.0, 3.0]"
         );
         assert_eq!(
             interp
@@ -784,7 +787,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[1, 2]"
+            "[1.0, 2.0]"
         );
         assert_eq!(
             interp
@@ -792,7 +795,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[2, 3]"
+            "[2.0, 3.0]"
         );
         let nested = arr(vec![arr(vec![n(1.0)]), arr(vec![n(2.0), n(3.0)])]);
         assert_eq!(
@@ -801,7 +804,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[1, 2, 3]"
+            "[1.0, 2.0, 3.0]"
         );
         let b = arr(vec![n(4.0)]);
         assert_eq!(
@@ -810,7 +813,7 @@ mod tests {
                 .await
                 .unwrap()
                 .to_string(),
-            "[1, 4]"
+            "[1.0, 4.0]"
         );
     }
 }

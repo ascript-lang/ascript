@@ -124,6 +124,8 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
             let name = cst_first_ident(node)?;
             Some(match name.as_str() {
                 "number" => Type::Number,
+                "int" => Type::Int,
+                "float" => Type::Float,
                 "string" => Type::String,
                 "bool" => Type::Bool,
                 "any" => Type::Any,
@@ -220,7 +222,8 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     let span = node_span(expr);
     let kind = match expr {
         Expr::Literal(lit) => match literal_const_value(lit)? {
-            Value::Number(n) => ExprKind::Number(n),
+            Value::Int(i) => ExprKind::Int(i),
+            Value::Float(n) => ExprKind::Float(n),
             Value::Str(s) => ExprKind::Str(s.to_string()),
             Value::Bool(b) => ExprKind::Bool(b),
             Value::Nil => ExprKind::Nil,
@@ -249,6 +252,7 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             let op = match un.op() {
                 Some(SyntaxKind::Minus) => UnOp::Neg,
                 Some(SyntaxKind::Bang) => UnOp::Not,
+                Some(SyntaxKind::Tilde) => UnOp::BitNot,
                 other => {
                     return Err(CompileError::new(
                         format!("unsupported unary operator {other:?} in field default"),
@@ -294,6 +298,14 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 SyntaxKind::PipePipe => BinOp::Or,
                 SyntaxKind::QuestionQuestion => BinOp::Coalesce,
                 SyntaxKind::InstanceofKw => BinOp::InstanceOf,
+                SyntaxKind::Amp => BinOp::BitAnd,
+                SyntaxKind::Pipe => BinOp::BitOr,
+                SyntaxKind::Caret => BinOp::BitXor,
+                SyntaxKind::Shl => BinOp::Shl,
+                SyntaxKind::Shr => BinOp::Shr,
+                SyntaxKind::PlusPercent => BinOp::WrapAdd,
+                SyntaxKind::MinusPercent => BinOp::WrapSub,
+                SyntaxKind::StarPercent => BinOp::WrapMul,
                 other => {
                     return Err(CompileError::new(
                         format!("unsupported binary operator {other:?} in field default"),
@@ -2015,7 +2027,7 @@ impl Compiler {
                     CompileError::new("unary minus has no operand", node_span(un))
                 })?;
                 match self.const_eval_enum_backing(&operand)? {
-                    Value::Number(n) => Ok(Value::Number(-n)),
+                    Value::Float(n) => Ok(Value::Float(-n)),
                     _ => Err(CompileError::new(
                         "enum variant backing value must be a number or string literal",
                         node_span(un),
@@ -2868,7 +2880,7 @@ impl Compiler {
             self.compile_expr(step)?;
             1u8
         } else {
-            let one = self.chunk.add_const(Value::Number(1.0));
+            let one = self.chunk.add_const(Value::Float(1.0));
             self.chunk.emit_u16(Op::Const, one, span);
             0u8
         };
@@ -3006,7 +3018,7 @@ impl Compiler {
         self.chunk.emit_u16(Op::GetLocal, arr_slot, span);
         self.chunk.emit(Op::ArrayLen, span);
         self.chunk.emit_u16(Op::SetLocal, len_slot, span);
-        let zero = self.chunk.add_const(Value::Number(0.0));
+        let zero = self.chunk.add_const(Value::Float(0.0));
         self.chunk.emit_u16(Op::Const, zero, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
 
@@ -3051,7 +3063,7 @@ impl Compiler {
             self.chunk.patch_jump(site);
         }
         self.chunk.emit_u16(Op::GetLocal, idx_slot, span);
-        let one = self.chunk.add_const(Value::Number(1.0));
+        let one = self.chunk.add_const(Value::Float(1.0));
         self.chunk.emit_u16(Op::Const, one, span);
         self.chunk.emit(Op::Add, span);
         self.chunk.emit_u16(Op::SetLocal, idx_slot, span);
@@ -3224,12 +3236,21 @@ impl Compiler {
             return self.compile_let_destructure(let_stmt, pat);
         }
 
+        // The declared `: T` contract, if any. Enforced ONLY when there is an
+        // initializer (mirrors the tree-walker's `Stmt::Let`, which leaves an
+        // initializer-less `let x: T` bound to nil unchecked).
+        let ty = self.let_type(let_stmt);
+
         // A DIRECT-child top-level `let`/`const` is a module-scope user-global: emit
-        // `<init>; DEFINE_GLOBAL name` (late-bound) instead of a frame-slot store.
+        // `<init>; [CHECK_LOCAL : T;] DEFINE_GLOBAL name` (late-bound) instead of a
+        // frame-slot store.
         if self.is_global_decl_site(let_stmt.syntax().text_range()) {
             let name = cst_first_ident(let_stmt.syntax()).unwrap_or_default();
             match let_stmt.expr() {
-                Some(init) => self.compile_expr(&init)?,
+                Some(init) => {
+                    self.compile_expr(&init)?;
+                    self.emit_check_local(ty, &init);
+                }
                 None => self.chunk.emit(Op::Nil, span),
             }
             self.emit_define_global(&name, span);
@@ -3239,12 +3260,42 @@ impl Compiler {
         let slot = self.let_slot(let_stmt)?;
 
         match let_stmt.expr() {
-            Some(init) => self.compile_expr(&init)?,
+            Some(init) => {
+                self.compile_expr(&init)?;
+                self.emit_check_local(ty, &init);
+            }
             // `let x` with no initializer binds nil (mirrors the tree-walker).
             None => self.chunk.emit(Op::Nil, span),
         }
         self.emit_set_local(slot, span);
         Ok(())
+    }
+
+    /// The declared `: T` contract on a `let`/`const`, lowered to an [`ast::Type`],
+    /// or `None` when the binding is un-annotated. The type node is a direct child
+    /// of the `LetStmt` (parsed by `type_ann` after the `:`). Reuses the SAME
+    /// `cst_type` lowering the param/return paths use, so the runtime
+    /// `interp::check_type` sees the identical `Type` the tree-walker built.
+    fn let_type(&self, let_stmt: &LetStmt) -> Option<crate::ast::Type> {
+        let_stmt
+            .syntax()
+            .children()
+            .find(|c| is_type_node(c.kind()))
+            .and_then(cst_type)
+    }
+
+    /// Emit `CHECK_LOCAL <type-const>` to contract-check the initializer value on
+    /// TOS (left in place for the following store) against `ty`, when the binding is
+    /// annotated. A no-op when `ty` is `None` (un-annotated → unchanged bytecode).
+    /// The op's span is the initializer EXPRESSION's trivia-trimmed code span, so a
+    /// mismatch panic anchors EXACTLY where the tree-walker's `Stmt::Let` does
+    /// (`value.span`), byte-for-byte.
+    fn emit_check_local(&mut self, ty: Option<crate::ast::Type>, init: &Expr) {
+        if let Some(ty) = ty {
+            let idx = self.chunk.add_type_const(ty);
+            self.chunk
+                .emit_u16(Op::CheckLocal, idx, node_code_span(init));
+        }
     }
 
     /// Whether the declaration at `decl_range` binds a MODULE-SCOPE user-global, per
@@ -4423,6 +4474,24 @@ impl Compiler {
             return Ok(());
         }
 
+        // `x instanceof int|float|number|string|bool` (NUM §6): the RHS is a bare
+        // reserved scalar type NAME (a contextual identifier, NOT a binding). Detect
+        // it here and emit `INSTANCE_OF_TYPE name-const` — the subject is the only
+        // stack operand; the type name rides as a const. Byte-identical to the
+        // tree-walker, which intercepts the same RHS shape before evaluating it.
+        if op == SyntaxKind::InstanceofKw {
+            if let Expr::NameRef(name_ref) = &rhs {
+                if let Some(name) = name_ref.ident_token().map(|t| t.text().to_string()) {
+                    if crate::interp::is_reserved_instanceof_type_name(&name) {
+                        self.compile_expr(&lhs)?;
+                        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                        self.chunk.emit_u16(Op::InstanceOfType, idx, span);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         self.compile_expr(&lhs)?;
         self.compile_expr(&rhs)?;
         let bytecode = match op {
@@ -4442,6 +4511,17 @@ impl Compiler {
             // rhs is a Tier-2 panic anchored at this same trivia-trimmed span as the
             // tree-walker's `apply_binop`, so the message+span are byte-identical.
             SyntaxKind::InstanceofKw => Op::InstanceOf,
+            // Bitwise / shift / wrapping (NUM §3.2). All route through the SAME
+            // shared `apply_binop` at runtime (`binop_of`), so a float operand
+            // raises the byte-identical Tier-2 type panic.
+            SyntaxKind::Amp => Op::BitAnd,
+            SyntaxKind::Pipe => Op::BitOr,
+            SyntaxKind::Caret => Op::BitXor,
+            SyntaxKind::Shl => Op::Shl,
+            SyntaxKind::Shr => Op::Shr,
+            SyntaxKind::PlusPercent => Op::WrapAdd,
+            SyntaxKind::MinusPercent => Op::WrapSub,
+            SyntaxKind::StarPercent => Op::WrapMul,
             // `&&`/`||`/`??` are handled by the short-circuit path above (they
             // never reach this non-short-circuit dispatch).
             other => {
@@ -4758,6 +4838,8 @@ impl Compiler {
         let bytecode = match op {
             SyntaxKind::Minus => Op::Neg,
             SyntaxKind::Bang => Op::Not,
+            // `~` — int bitwise NOT (NUM §3.2). Routes through the shared `apply_unop`.
+            SyntaxKind::Tilde => Op::BitNot,
             other => {
                 return Err(CompileError::new(
                     format!("internal: unexpected unary operator {other:?} (compiler invariant)"),
@@ -5022,12 +5104,43 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
         .ok_or_else(|| CompileError::new("malformed literal (no token text)", span))?;
     let value = match kind {
         SyntaxKind::Number => {
-            let n = parse_number_text(&text).ok_or_else(|| {
-                // The lexer already validated the token, so this is a
-                // compiler bug rather than a user error if it ever fires.
-                CompileError::new(format!("malformed number literal {text:?}"), span)
-            })?;
-            Value::Number(n)
+            // NUM §3.1: the literal's subtype (int vs float) is decided from its
+            // text. An out-of-range integer literal is a user error surfaced as a
+            // `CompileError` (the CST lexer accepts the digit run but does not
+            // range-check); a malformed token is a compiler-invariant bug.
+            use crate::lex_literals::{NumLit, NumLitError};
+            match parse_number_text(&text) {
+                Ok(NumLit::Int(i)) => Value::Int(i),
+                Ok(NumLit::Float(f)) => Value::Float(f),
+                Err(NumLitError::OutOfRange) => {
+                    return Err(CompileError::new(
+                        "integer literal out of range for int (i64)".to_string(),
+                        span,
+                    ))
+                }
+                Err(NumLitError::InvalidDigit) => {
+                    return Err(CompileError::new(
+                        "invalid digit in integer literal".to_string(),
+                        span,
+                    ))
+                }
+                Err(NumLitError::Invalid) => {
+                    // An empty radix body (`0x`, `0xZZ` → token `0x`) reports the
+                    // radix-specific cause, matching the legacy lexer's label so
+                    // both front-ends agree; a non-radix malformed decimal keeps
+                    // the generic message.
+                    let label = match text.as_bytes() {
+                        [b'0', b'x' | b'X', ..] => "invalid hex number literal",
+                        [b'0', b'o' | b'O', ..] => "invalid octal number literal",
+                        [b'0', b'b' | b'B', ..] => "invalid binary number literal",
+                        _ => return Err(CompileError::new(
+                            format!("malformed number literal {text:?}"),
+                            span,
+                        )),
+                    };
+                    return Err(CompileError::new(label.to_string(), span));
+                }
+            }
         }
         SyntaxKind::Str => Value::Str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str())),
         SyntaxKind::TrueKw => Value::Bool(true),
@@ -5264,9 +5377,12 @@ mod tests {
     }
 
     async fn eval_number(src: &str) -> f64 {
-        match crate::vm_eval_source(src).await.expect("evaluates") {
-            Value::Number(n) => n,
-            other => panic!("expected Number, got {other:?}"),
+        // NUM §4: arithmetic over int literals yields `Int`; this helper accepts
+        // BOTH numeric subtypes and returns the f64 value for the assertions.
+        let v = crate::vm_eval_source(src).await.expect("evaluates");
+        match v.as_f64() {
+            Some(n) => n,
+            None => panic!("expected Number, got {v:?}"),
         }
     }
 
@@ -5286,8 +5402,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn division_is_float() {
-        assert_eq!(eval_number("10 / 4").await, 2.5);
+    async fn division_is_int_for_int_operands() {
+        // NUM §3.2: `int / int` truncates toward zero (`10/4 == 2`); a float operand
+        // makes it float division (`10.0/4 == 2.5`).
+        assert_eq!(eval_number("10 / 4").await, 2.0);
+        assert_eq!(eval_number("10.0 / 4").await, 2.5);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5367,6 +5486,22 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn hex_literal_evaluates() {
         assert_eq!(eval_number("0xff").await, 255.0);
+    }
+
+    #[test]
+    fn radix_literal_error_messages_name_the_cause() {
+        // NUM §4: the CST compile path reports the SAME radix-aware causes as the
+        // legacy lexer (frontend agreement). An out-of-base digit → "invalid digit
+        // in integer literal"; an empty radix body → the radix-specific label; an
+        // overflowing literal → "out of range".
+        let msg = |src: &str| compile_source(src).unwrap_err().message;
+        assert_eq!(msg("let a = 0o19"), "invalid digit in integer literal");
+        assert_eq!(msg("let a = 0b12"), "invalid digit in integer literal");
+        assert_eq!(msg("let a = 0xZZ"), "invalid hex number literal");
+        assert_eq!(
+            msg("let a = 99999999999999999999"),
+            "integer literal out of range for int (i64)"
+        );
     }
 
     #[test]

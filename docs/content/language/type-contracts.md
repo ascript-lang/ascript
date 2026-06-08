@@ -38,7 +38,10 @@ scale("3")   // panic: type contract violated: expected number, got string ("3")
 | Type | Accepts |
 |---|---|
 | `any` | anything (also the meaning of an omitted annotation) |
-| `number` | a number |
+| `int` | an integer (`int` subtype) |
+| `float` | a floating-point number (`float` subtype) |
+| `number` | the union `int \| float` (either numeric subtype) |
+| `decimal` | an exact base-10 decimal (not part of `number`) |
 | `string` | a string |
 | `bool` | a boolean |
 | `nil` | nil |

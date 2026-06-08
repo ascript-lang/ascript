@@ -1,0 +1,19 @@
+# exit: none
+=== LEB128 varint codec ===
+  0 -> [0] -> 0  (checksum 84696351)
+  1 -> [1] -> 1  (checksum 67918732)
+  127 -> [127] -> 127  (checksum 4195109838)
+  128 -> [128, 1] -> 128  (checksum 255418810)
+  300 -> [172, 2] -> 300  (checksum 1720882923)
+  16384 -> [128, 128, 1] -> 16384  (checksum 3575258148)
+  3735928559 -> [239, 253, 182, 245, 13] -> 3735928559  (checksum 2019190095)
+  9007199254740992 -> [128, 128, 128, 128, 128, 128, 128, 16] -> 9007199254740992  (checksum 2595491861)
+round-trips all passed
+
+=== Packed stream ===
+stream bytes: [1, 200, 1, 240, 162, 4]
+decoded values: [1, 200, 70000]
+
+=== Malformed input ===
+truncated -> truncated varint
+over-long  -> varint exceeds 64 bits

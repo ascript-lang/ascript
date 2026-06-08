@@ -295,8 +295,8 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             let o = want_object(&arg(args, 0), span, &ctx("formatDate"))?;
             let epoch_ms = {
                 let b = o.borrow();
-                match b.get("epochMs") {
-                    Some(Value::Number(n)) => *n as i64,
+                match b.get("epochMs").and_then(|v| v.as_f64()) {
+                    Some(n) => n as i64,
                     _ => {
                         return Err(AsError::at(
                             "intl.formatDate expects an instant object (with epochMs)",
@@ -363,7 +363,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     AsError::at(format!("intl.compare: {}", e), span).into()
                 })?;
             let ord = collator.compare(&a, &b);
-            Ok(Value::Number(match ord {
+            Ok(Value::Float(match ord {
                 std::cmp::Ordering::Less => -1.0,
                 std::cmp::Ordering::Equal => 0.0,
                 std::cmp::Ordering::Greater => 1.0,
@@ -383,7 +383,7 @@ mod tests {
         Value::Str(x.into())
     }
     fn n(x: f64) -> Value {
-        Value::Number(x)
+        Value::Float(x)
     }
     fn str_of(v: Value) -> String {
         match v {
@@ -452,7 +452,7 @@ mod tests {
         // object (only epochMs is read by formatDate) so this test doesn't
         // depend on the `datetime` feature being enabled.
         let mut o: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-        o.insert("epochMs".into(), Value::Number(1623760200000.0));
+        o.insert("epochMs".into(), Value::Float(1623760200000.0));
         let inst = Value::Object(crate::value::ObjectCell::new(o));
         let us =
             str_of(call("formatDate", &[inst.clone(), s("en-US"), s("medium")], sp()).unwrap());
@@ -470,7 +470,7 @@ mod tests {
         // 2021-03-15T12:00:00Z = 1615809600000 ms (March, to exercise März/mars).
         let inst = || {
             let mut o: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
-            o.insert("epochMs".into(), Value::Number(1615809600000.0));
+            o.insert("epochMs".into(), Value::Float(1615809600000.0));
             Value::Object(crate::value::ObjectCell::new(o))
         };
         let de = str_of(call("formatDate", &[inst(), s("de-DE"), s("long")], sp()).unwrap());
@@ -488,12 +488,12 @@ mod tests {
 
     #[test]
     fn non_finite_number_panics() {
-        let inf = Value::Number(f64::INFINITY);
+        let inf = Value::Float(f64::INFINITY);
         assert!(matches!(
             call("formatNumber", &[inf, s("en-US")], sp()),
             Err(Control::Panic(_))
         ));
-        let nan = Value::Number(f64::NAN);
+        let nan = Value::Float(f64::NAN);
         assert!(matches!(
             call("formatCurrency", &[nan, s("USD"), s("en-US")], sp()),
             Err(Control::Panic(_))

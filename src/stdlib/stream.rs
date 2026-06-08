@@ -65,7 +65,13 @@ pub enum StreamSource {
     /// A materialized array, pulled by an advancing cursor.
     Array { items: Vec<Value>, cursor: usize },
     /// A numeric range `cur, cur+step, ...` while `< end` (step > 0) / `> end` (step < 0).
-    Range { cur: f64, end: f64, step: f64 },
+    Range {
+        cur: f64,
+        end: f64,
+        step: f64,
+        /// NUM §4: emit `Int` elements when both bounds and the step are `Int`.
+        is_int: bool,
+    },
     /// A script generator (`Value::Generator`), pulled via `resume(nil)`.
     Generator(Rc<GeneratorHandle>),
 }
@@ -88,7 +94,8 @@ pub enum Stage {
         buffer: VecDeque<Value>,
     },
     /// wrap each item as `[index, value]`, `index` starting at 0.
-    Enumerate { index: f64 },
+    /// NUM §4: the index is an `int`.
+    Enumerate { index: i64 },
     /// pair each item with the next item pulled from stream `other_id`; ends when
     /// either side ends.
     Zip { other_id: u64 },
@@ -112,10 +119,16 @@ fn clone_source(src: &StreamSource) -> StreamSource {
             items: items.clone(),
             cursor: *cursor,
         },
-        StreamSource::Range { cur, end, step } => StreamSource::Range {
+        StreamSource::Range {
+            cur,
+            end,
+            step,
+            is_int,
+        } => StreamSource::Range {
             cur: *cur,
             end: *end,
             step: *step,
+            is_int: *is_int,
         },
         StreamSource::Generator(g) => StreamSource::Generator(g.clone()),
     }
@@ -289,18 +302,24 @@ impl Interp {
     /// panics. Validation goes through the shared `interp::resolve_step` so the
     /// panic messages are byte-identical to the range *syntax*.
     fn stream_range(&self, args: &[Value], span: Span) -> Result<Value, Control> {
-        let start = want_number(&arg(args, 0), span, "stream.range start")?;
-        let end = want_number(&arg(args, 1), span, "stream.range end")?;
-        let step_opt = match arg(args, 2) {
-            Value::Nil => None,
-            v => Some(want_number(&v, span, "stream.range step")?),
+        let start_v = arg(args, 0);
+        let end_v = arg(args, 1);
+        let start = want_number(&start_v, span, "stream.range start")?;
+        let end = want_number(&end_v, span, "stream.range end")?;
+        let step_arg = arg(args, 2);
+        let (step_opt, step_int) = match &step_arg {
+            Value::Nil => (None, true),
+            v => (Some(want_number(v, span, "stream.range step")?), v.is_int_value()),
         };
         let step = crate::interp::resolve_step(start, end, step_opt, span)?;
+        // NUM §4: int bounds + int step → an Int sequence; a float anywhere → float.
+        let is_int = start_v.is_int_value() && end_v.is_int_value() && step_int;
         Ok(self.register_stream(StreamState {
             source: StreamSource::Range {
                 cur: start,
                 end,
                 step,
+                is_int,
             },
             stages: Vec::new(),
         }))
@@ -362,7 +381,7 @@ impl Interp {
     fn stream_enumerate(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_stream_id(&arg(args, 0), span, "stream.enumerate")?;
         let (source, mut stages) = self.snapshot_stream(id, span, "stream.enumerate")?;
-        stages.push(Stage::Enumerate { index: 0.0 });
+        stages.push(Stage::Enumerate { index: 0 });
         Ok(self.register_stream(StreamState { source, stages }))
     }
 
@@ -507,7 +526,12 @@ impl Interp {
                     Ok(None)
                 }
             }
-            StreamSource::Range { cur, end, step } => {
+            StreamSource::Range {
+                cur,
+                end,
+                step,
+                is_int,
+            } => {
                 let more = if *step > 0.0 {
                     *cur < *end
                 } else {
@@ -516,7 +540,7 @@ impl Interp {
                 if more {
                     let v = *cur;
                     *cur += *step;
-                    Ok(Some(Value::Number(v)))
+                    Ok(Some(crate::interp::range_counter_value(v, *is_int)))
                 } else {
                     Ok(None)
                 }
@@ -598,9 +622,9 @@ impl Interp {
                 }
                 Stage::Enumerate { index } => {
                     let idx = *index;
-                    *index += 1.0;
+                    *index += 1;
                     value = Value::Array(crate::value::ArrayCell::new(vec![
-                        Value::Number(idx),
+                        Value::Int(idx),
                         value,
                     ]));
                 }
@@ -661,11 +685,12 @@ impl Interp {
     /// `stream.count(s)` — number of items the stream produces.
     async fn stream_count(&self, args: &[Value], span: Span) -> Result<Value, Control> {
         let id = require_stream_id(&arg(args, 0), span, "stream.count")?;
-        let mut n = 0.0;
+        // NUM §4: a count is an integer quantity → `Int`.
+        let mut n: i64 = 0;
         while self.pull_next(id, span).await?.is_some() {
-            n += 1.0;
+            n += 1;
         }
-        Ok(Value::Number(n))
+        Ok(Value::Int(n))
     }
 
     /// `stream.find(s, fn)` — first item where `fn(value)` is truthy, else `nil`.
@@ -921,7 +946,7 @@ await collect(range(1, 10, -2))
         let err = result.expect_err("expected mismatch panic");
         assert!(
             format!("{err:?}")
-                .contains("step -2 moves away from end (10); range can never progress"),
+                .contains("step -2.0 moves away from end (10.0); range can never progress"),
             "unexpected error: {err:?}"
         );
     }

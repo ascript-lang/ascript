@@ -49,8 +49,9 @@ fn want_regex(v: &Value, span: Span, ctx: &str) -> Result<Rc<RegexHandle>, Contr
     }
 }
 
-fn char_index(haystack: &str, byte_idx: usize) -> f64 {
-    haystack[..byte_idx].chars().count() as f64
+/// NUM §4: a match's character offset is an `int`.
+fn char_index(haystack: &str, byte_idx: usize) -> i64 {
+    haystack[..byte_idx].chars().count() as i64
 }
 
 pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
@@ -95,7 +96,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                     obj.insert("text".to_string(), Value::Str(whole.as_str().into()));
                     obj.insert(
                         "index".to_string(),
-                        Value::Number(char_index(&s, whole.start())),
+                        Value::Int(char_index(&s, whole.start())),
                     );
                     obj.insert("groups".to_string(), arr(groups));
                     Ok(Value::Object(crate::value::ObjectCell::new(obj)))

@@ -68,7 +68,10 @@ impl Interp {
         match func {
             "new" => {
                 let cap = match arg(args, 0) {
-                    Value::Number(n) if n.is_finite() && n >= 1.0 => n as usize,
+                    // NUM §4: accept BOTH numeric subtypes for the capacity.
+                    ref v if v.as_f64().is_some_and(|n| n.is_finite() && n >= 1.0) => {
+                        v.as_f64().unwrap_or(0.0) as usize
+                    }
                     Value::Nil => {
                         return Err(AsError::at("lru.new requires a capacity (number >= 1)", span)
                             .into())
@@ -182,9 +185,10 @@ impl Interp {
                 });
                 Ok(Value::Nil)
             }
-            "len" => Ok(Value::Number(self.with_resource(id, |r| match r {
-                Some(ResourceState::Lru(s)) => s.map.len() as f64,
-                _ => 0.0,
+            // NUM §4: a count is an `Int`.
+            "len" => Ok(Value::Int(self.with_resource(id, |r| match r {
+                Some(ResourceState::Lru(s)) => s.map.len() as i64,
+                _ => 0,
             }))),
             "keys" => {
                 let keys = self.with_resource(id, |r| match r {

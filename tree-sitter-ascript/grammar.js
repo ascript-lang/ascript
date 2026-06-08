@@ -25,14 +25,17 @@ const PREC = {
   and: 5,
   equality: 6,
   compare: 7,
-  range: 8,
-  add: 9,
-  mul: 10,
-  exp: 11,    // right-associative
-  // (12 intentionally free: postfix ?/! are precedence-less, GLR-resolved)
-  unary: 13,
-  postfix: 14, // call, member, index, optional-member
-  primary: 15,
+  // Bitwise-OR tier (NUM §3.4, Go's binding): `| ^` bind TIGHTER than comparison
+  // but LOOSER than `+ -`/range, so `a | b == c` is `(a|b)==c`.
+  bitor: 8,
+  range: 9,
+  add: 10,   // `+ -` and wrapping `+% -%`
+  mul: 11,   // `* / %`, wrapping `*%`, shifts `<< >>`, bitwise `&`
+  exp: 12,   // right-associative
+  // (13 intentionally free: postfix ?/! are precedence-less, GLR-resolved)
+  unary: 14,
+  postfix: 15, // call, member, index, optional-member
+  primary: 16,
 };
 
 module.exports = grammar({
@@ -340,11 +343,20 @@ module.exports = grammar({
         // `instanceof` is a reserved keyword at the comparison tier (SP2 §1). It is
         // automatically reserved against `identifier` via `word: $ => $.identifier`.
         ['instanceof', PREC.compare],
+        // Bitwise-OR tier (NUM §3.4): `| ^` between compare and range. The `|`
+        // here is bitwise-OR in EXPRESSION position; or-patterns (`or_pattern`)
+        // and union types (`union_type`) are separate rules, so this never
+        // collides with them.
+        ['|', PREC.bitor], ['^', PREC.bitor],
         // NOTE: `..` / `..=` are NOT in this table — a range is its own
         // `range_expression` node (carries `inclusive` + an optional contextual
         // `step`), mirroring the hand-written parser's dedicated `ExprKind::Range`.
-        ['+', PREC.add], ['-', PREC.add],
-        ['*', PREC.mul], ['/', PREC.mul], ['%', PREC.mul],
+        // Additive: `+ -` and the wrapping `+% -%`.
+        ['+', PREC.add], ['-', PREC.add], ['+%', PREC.add], ['-%', PREC.add],
+        // Multiplicative: `* / %`, wrapping `*%`, shifts `<< >>`, bitwise `&`
+        // (Go's binding — shifts/`&` at the multiplicative tier).
+        ['*', PREC.mul], ['/', PREC.mul], ['%', PREC.mul], ['*%', PREC.mul],
+        ['<<', PREC.mul], ['>>', PREC.mul], ['&', PREC.mul],
       ];
       const left = table.map(([op, p]) => prec.left(p, seq(
         field('left', $._expression),
@@ -399,7 +411,7 @@ module.exports = grammar({
     worker_keyword: _ => 'worker',
 
     unary_expression: $ => prec.right(PREC.unary, seq(
-      field('operator', choice('!', '-')),
+      field('operator', choice('!', '-', '~')),
       field('operand', $._expression),
     )),
 
@@ -677,6 +689,7 @@ module.exports = grammar({
     number: _ => token(choice(
       /0[xX][0-9a-fA-F_]+/,
       /0[bB][01_]+/,
+      /0[oO][0-7_]+/,
       /(\d[\d_]*)?\.\d[\d_]*([eE][+-]?\d+)?/,
       /\d[\d_]*([eE][+-]?\d+)?/,
     )),

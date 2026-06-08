@@ -30,9 +30,9 @@
 //!
 //! Params are either a positional array (`?`/`?1`) or a named object whose keys are
 //! the `:name` placeholders (the leading `:` is optional in the key). AScript values
-//! map to SQLite as: Number→i64 (if integral) or f64, Str→text, Bool→int 0/1,
-//! Nil→null, Bytes→blob. SQLite values map back as int/real→Number, text→Str,
-//! blob→Bytes, null→Nil.
+//! map to SQLite as: Int→i64, Float→i64 (if integral) or f64, Str→text, Bool→int 0/1,
+//! Nil→null, Bytes→blob. SQLite values map back as integer→Int, real→Float, text→Str,
+//! blob→Bytes, null→Nil. Row counts (`changes`) are returned as Int.
 
 use super::{arg, bi, want_string};
 use crate::error::AsError;
@@ -129,7 +129,7 @@ impl Interp {
                 let params = parse_params(args.get(1), span, "connection.exec")?;
                 let conn = self.sqlite_conn(id).expect("checked present");
                 match exec_sql(&conn, &sql, &params) {
-                    Ok(changes) => Ok(make_pair(Value::Number(changes as f64), Value::Nil)),
+                    Ok(changes) => Ok(make_pair(Value::Int(changes as i64), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("connection.exec failed: {}", e))),
                 }
             }
@@ -206,7 +206,7 @@ impl Interp {
                 let params = parse_params(args.first(), span, "statement.run")?;
                 let conn = self.sqlite_conn(conn_id).expect("checked present");
                 match exec_cached(&conn, &sql, &params) {
-                    Ok(changes) => Ok(make_pair(Value::Number(changes as f64), Value::Nil)),
+                    Ok(changes) => Ok(make_pair(Value::Int(changes as i64), Value::Nil)),
                     Err(e) => Ok(err_pair(format!("statement.run failed: {}", e))),
                 }
             }
@@ -242,7 +242,9 @@ fn to_sql(v: &Value, span: Span, ctx: &str) -> Result<SqlValue, Control> {
     Ok(match v {
         Value::Nil => SqlValue::Null,
         Value::Bool(b) => SqlValue::Integer(if *b { 1 } else { 0 }),
-        Value::Number(n) => {
+        // NUM §4: an `Int` binds directly as a SQL INTEGER.
+        Value::Int(i) => SqlValue::Integer(*i),
+        Value::Float(n) => {
             if n.fract() == 0.0 && n.is_finite() && n.abs() < 9.2e18 {
                 SqlValue::Integer(*n as i64)
             } else {
@@ -306,8 +308,9 @@ fn parse_params(v: Option<&Value>, span: Span, ctx: &str) -> Result<Params, Cont
 fn from_sql(v: ValueRef<'_>) -> Value {
     match v {
         ValueRef::Null => Value::Nil,
-        ValueRef::Integer(i) => Value::Number(i as f64),
-        ValueRef::Real(r) => Value::Number(r),
+        // NUM §4: a SQLite INTEGER column is an `Int`; a REAL stays a `Float`.
+        ValueRef::Integer(i) => Value::Int(i),
+        ValueRef::Real(r) => Value::Float(r),
         ValueRef::Text(t) => Value::Str(String::from_utf8_lossy(t).into_owned().into()),
         ValueRef::Blob(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
     }
@@ -585,9 +588,10 @@ print(len(row.b))
 print(type(row.n))
 print(row.n)
 "#).await;
+        // NUM §4: an INTEGER column is `int`, a REAL column is `float`.
         assert_eq!(
             out,
-            "nil\nnumber\n42\nnumber\n3.5\nstring\nhi\nbytes\n3\nnil\nnil\n"
+            "nil\nint\n42\nfloat\n3.5\nstring\nhi\nbytes\n3\nnil\nnil\n"
         );
     }
 

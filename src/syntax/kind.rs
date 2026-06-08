@@ -169,6 +169,22 @@ pub enum SyntaxKind {
     QuestionDot,
     #[static_text("|")]
     Pipe,
+    #[static_text("&")]
+    Amp,
+    #[static_text("^")]
+    Caret,
+    #[static_text("~")]
+    Tilde,
+    #[static_text("<<")]
+    Shl,
+    #[static_text(">>")]
+    Shr,
+    #[static_text("+%")]
+    PlusPercent,
+    #[static_text("-%")]
+    MinusPercent,
+    #[static_text("*%")]
+    StarPercent,
     #[static_text("+=")]
     PlusEq,
     #[static_text("-=")]

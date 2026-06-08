@@ -412,15 +412,25 @@ impl<'a> Pass<'a> {
         if lhs.kind() != SyntaxKind::NameRef || rhs.kind() != SyntaxKind::NameRef {
             return Default::default();
         }
-        // RHS must name a known class.
-        let class_name = crate::syntax::resolve::ident_text(rhs).unwrap_or_default();
-        let Some(cid) = self.table.class_id(&class_name) else {
-            return Default::default();
-        };
+        let rhs_name = crate::syntax::resolve::ident_text(rhs).unwrap_or_default();
         let Some(key) = self.key_for_use(&lhs.text_range()) else {
             return Default::default();
         };
         let cur = env.lookup(&key).unwrap_or(CheckTy::Any);
+
+        // `x instanceof int|float|number` (NUM §6): narrow the THEN branch to the
+        // scalar subtype. (`string`/`bool` reuse the existing primitive `CheckTy`s.)
+        // The ELSE refinement is omitted (subtracting a scalar from a `number` is not
+        // generally a single `CheckTy`; stays gradual — never a false positive).
+        if let Some(narrowed) = reserved_type_narrowing(&rhs_name) {
+            let then = vec![(key, narrowed)];
+            return (then, Vec::new());
+        }
+
+        // Otherwise the RHS must name a known class.
+        let Some(cid) = self.table.class_id(&rhs_name) else {
+            return Default::default();
+        };
         let then = vec![(key.clone(), CheckTy::Class(cid))];
         // else: subtract Class(cid) from a class union; otherwise no refinement.
         let else_ref = match &cur {
@@ -702,18 +712,48 @@ impl<'a> Pass<'a> {
                 if is_string(&lt) || is_string(&rt) {
                     CheckTy::String
                 } else if is_number(&lt) && is_number(&rt) {
-                    CheckTy::Number
+                    // NUM §3.2: `int + int : int`, mixed/`float` → `float`.
+                    numeric_result(&lt, &rt)
                 } else {
                     CheckTy::Any
                 }
             }
-            Some(Minus | Star | Slash | Percent | StarStar) => {
+            Some(Minus | Star) => {
                 self.flag_non_numeric(&operands, &[&lt, &rt]);
                 self.flag_possibly_nil_operands(&operands, &[&lt, &rt]);
-                CheckTy::Number
+                numeric_result(&lt, &rt)
+            }
+            Some(Percent | StarStar) => {
+                // `%` follows the additive promotion rule; `**` is `int` for `int**int`
+                // with a non-negative exponent — but a negative-exponent `int**int` is a
+                // `float` (NUM §3.2), so the subtype is not provable. Conservatively:
+                // `int ⊕ int → int` for `%` (remainder), and `Number` (gradual) for `**`
+                // since the exponent sign is not statically known.
+                self.flag_non_numeric(&operands, &[&lt, &rt]);
+                self.flag_possibly_nil_operands(&operands, &[&lt, &rt]);
+                if op == Some(Percent) {
+                    numeric_result(&lt, &rt)
+                } else {
+                    CheckTy::Number
+                }
+            }
+            Some(Slash) => {
+                // NUM §3.2: `int / int : int` (truncating), mixed/`float` → `float`.
+                self.flag_non_numeric(&operands, &[&lt, &rt]);
+                self.flag_possibly_nil_operands(&operands, &[&lt, &rt]);
+                numeric_result(&lt, &rt)
             }
             Some(EqEq | BangEq | Lt | Le | Gt | Ge | InstanceofKw) => CheckTy::Bool,
             Some(AmpAmp | PipePipe) => lt.join(&rt, self.table),
+            // Bitwise / shift / wrapping (NUM §3.2): int-only, always yield `Int`.
+            // A provably non-numeric OR provably-`float` operand is a `type-error`
+            // (those ops reject a float at runtime); a provable `T?` is possibly-nil.
+            Some(Amp | Pipe | Caret | Shl | Shr | PlusPercent | MinusPercent | StarPercent) => {
+                self.flag_non_numeric(&operands, &[&lt, &rt]);
+                self.flag_non_int_bitwise(&operands, &[&lt, &rt]);
+                self.flag_possibly_nil_operands(&operands, &[&lt, &rt]);
+                CheckTy::Int
+            }
             _ => CheckTy::Any,
         }
     }
@@ -729,6 +769,24 @@ impl<'a> Pass<'a> {
             if is_provably_non_number(ty) {
                 let msg = format!(
                     "arithmetic operand is `{}`, not a number",
+                    ty.display(self.table)
+                );
+                self.emit("type-error", code_range(node), msg);
+            }
+        }
+    }
+
+    /// Emit `type-error` for any operand PROVABLY a `float` in a bitwise/shift/
+    /// wrapping op (NUM §3.2 — those ops are int-only and reject a float at runtime).
+    /// Same gradual gate as `flag_non_numeric`: an `Any` operand silences the op.
+    fn flag_non_int_bitwise(&mut self, operands: &[ResolvedNode], types: &[&CheckTy]) {
+        if types.iter().any(|t| matches!(t.widen(), CheckTy::Any)) {
+            return;
+        }
+        for (node, ty) in operands.iter().zip(types.iter()) {
+            if is_provably_float(ty) {
+                let msg = format!(
+                    "bitwise/shift/wrapping op requires `int` operands, got `{}`",
                     ty.display(self.table)
                 );
                 self.emit("type-error", code_range(node), msg);
@@ -760,7 +818,7 @@ impl<'a> Pass<'a> {
             .children_with_tokens()
             .filter_map(|el| el.into_token())
             .map(|t| t.kind())
-            .find(|k| matches!(k, Minus | Bang));
+            .find(|k| matches!(k, Minus | Bang | Tilde));
         let operand = first_expr_child(expr);
         let ot = operand
             .as_ref()
@@ -768,15 +826,35 @@ impl<'a> Pass<'a> {
             .unwrap_or(CheckTy::Any);
         match op {
             Some(Bang) => CheckTy::Bool,
-            Some(Minus) => {
-                if let (Some(node), true) = (&operand, is_provably_non_number(&ot)) {
-                    let msg = format!(
-                        "negation operand is `{}`, not a number",
-                        ot.display(self.table)
-                    );
-                    self.emit("type-error", code_range(node), msg);
+            // `-x` and `~x` both require a number (`~` is int-only); a provably
+            // non-numeric operand is a `type-error`, and for `~` a provable `float`
+            // is also a `type-error` (NUM §3.2 — bitwise-not is int-only).
+            Some(Minus | Tilde) => {
+                let is_not = op == Some(Tilde);
+                if let Some(node) = &operand {
+                    if is_provably_non_number(&ot) {
+                        let what = if is_not { "bitwise-not" } else { "negation" };
+                        let msg =
+                            format!("{what} operand is `{}`, not a number", ot.display(self.table));
+                        self.emit("type-error", code_range(node), msg);
+                    } else if is_not && is_provably_float(&ot) {
+                        let msg = format!(
+                            "bitwise-not requires an `int` operand, got `{}`",
+                            ot.display(self.table)
+                        );
+                        self.emit("type-error", code_range(node), msg);
+                    }
                 }
-                CheckTy::Number
+                // NUM §3.2: `-int : int`, `-float : float`; `~int : int`.
+                if is_not {
+                    CheckTy::Int
+                } else {
+                    match ot.widen() {
+                        CheckTy::Int => CheckTy::Int,
+                        CheckTy::Float => CheckTy::Float,
+                        _ => CheckTy::Number,
+                    }
+                }
             }
             _ => CheckTy::Any,
         }
@@ -1333,8 +1411,19 @@ fn literal_type(node: &ResolvedNode) -> CheckTy {
         .children_with_tokens()
         .filter_map(|el| el.into_token())
         .find(|t| !t.kind().is_trivia());
-    match tok.map(|t| t.kind()) {
-        Some(Number) => CheckTy::Literal(LitVal::Number),
+    match tok.as_ref().map(|t| t.kind()) {
+        Some(Number) => {
+            // NUM §3.1/§5: an integer literal synths the concrete `Int`; a float
+            // literal synths `Float`. Classify by the literal's TEXT (reusing the
+            // shared lexer classifier so the checker agrees with both engines). An
+            // out-of-range/unparseable literal (already a lex error) → gradual `Number`.
+            let text = tok.map(|t| t.text().to_string()).unwrap_or_default();
+            match crate::lex_literals::parse_number_text(text.trim()) {
+                Ok(crate::lex_literals::NumLit::Int(_)) => CheckTy::Int,
+                Ok(crate::lex_literals::NumLit::Float(_)) => CheckTy::Float,
+                Err(_) => CheckTy::Number,
+            }
+        }
         Some(Str) => CheckTy::Literal(LitVal::String),
         Some(TrueKw | FalseKw) => CheckTy::Literal(LitVal::Bool),
         Some(NilKw) => CheckTy::Literal(LitVal::Nil),
@@ -1366,6 +1455,16 @@ fn binary_op(expr: &ResolvedNode) -> Option<SyntaxKind> {
                     | PipePipe
                     | QuestionQuestion
                     | InstanceofKw
+                    // Bitwise / shift / wrapping (NUM §3.2). `Pipe` is bitwise-OR in
+                    // a BinaryExpr (or-patterns/union types are different nodes).
+                    | Amp
+                    | Caret
+                    | Shl
+                    | Shr
+                    | Pipe
+                    | PlusPercent
+                    | MinusPercent
+                    | StarPercent
             )
         })
 }
@@ -1467,7 +1566,42 @@ fn is_string(t: &CheckTy) -> bool {
     matches!(t.widen(), CheckTy::String)
 }
 fn is_number(t: &CheckTy) -> bool {
-    matches!(t.widen(), CheckTy::Number)
+    matches!(t.widen(), CheckTy::Number | CheckTy::Int | CheckTy::Float)
+}
+
+/// Is `t` PROVABLY a `float` (and not `int`/`number`)? Used to flag a bitwise/shift/
+/// wrapping op on a provable float operand (NUM §3.2 — those are int-only).
+fn is_provably_float(t: &CheckTy) -> bool {
+    matches!(t.widen(), CheckTy::Float)
+}
+
+/// The `CheckTy` an `instanceof <name>` guard narrows its subject to in the THEN
+/// branch, for a reserved scalar type name (NUM §6). `None` for a non-reserved name
+/// (the caller then falls back to the class-based narrowing).
+fn reserved_type_narrowing(name: &str) -> Option<CheckTy> {
+    match name {
+        "int" => Some(CheckTy::Int),
+        "float" => Some(CheckTy::Float),
+        "number" => Some(CheckTy::Number),
+        "string" => Some(CheckTy::String),
+        "bool" => Some(CheckTy::Bool),
+        _ => None,
+    }
+}
+
+/// The result type of `+ - * / %` over two known-numeric operands (NUM §3.2 mixing
+/// rule): `Int ⊕ Int → Int`; if EITHER side is a provable `Float`, the result is
+/// `Float`; otherwise (any `Number` involved — subtype not provable) → gradual
+/// `Number`. This NEVER over-commits: a `number`-annotated operand keeps the result
+/// at `Number`, so the gradual gate stays silent.
+fn numeric_result(lt: &CheckTy, rt: &CheckTy) -> CheckTy {
+    use CheckTy::*;
+    match (lt.widen(), rt.widen()) {
+        (Int, Int) => Int,
+        (Float, _) | (_, Float) => Float,
+        // any combination involving a bare `Number` (or unexpected) → gradual
+        _ => Number,
+    }
 }
 
 /// Is `t` PROVABLY not a number? `Any`/`Never`/a union with a numeric member are
@@ -1475,7 +1609,7 @@ fn is_number(t: &CheckTy) -> bool {
 fn is_provably_non_number(t: &CheckTy) -> bool {
     use CheckTy::*;
     match t.widen() {
-        Any | Never | Number => false,
+        Any | Never | Number | Int | Float => false,
         Union(ms) => ms.iter().all(is_provably_non_number),
         String | Bool | Nil | Bytes | Object | Regex | Error | Fn | Array(_) | Map(_, _)
         | Tuple(_) | Result(_) | Future(_) | Class(_) | Enum(_) => true,
@@ -1801,6 +1935,115 @@ mod tests {
         assert!(
             !codes(src).iter().any(|c| c.starts_with("type-")),
             "non-worker Foo.spawn() produced unexpected type-* diagnostics: {:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    // ---- NUM: int/float subtypes in the checker (§3.2, §5) ----
+
+    #[test]
+    fn int_literal_assignable_to_int_and_number() {
+        // An int literal flows into `: int` and `: number` slots cleanly.
+        assert!(!has("let x: int = 5\n", "type-mismatch"));
+        assert!(!has("let x: number = 5\n", "type-mismatch"));
+        // A float literal flows into `: float` and `: number`.
+        assert!(!has("let y: float = 5.0\n", "type-mismatch"));
+        assert!(!has("let y: number = 5.0\n", "type-mismatch"));
+    }
+
+    #[test]
+    fn int_float_provably_distinct_mismatch() {
+        // A float literal into an `: int` slot is provably wrong, and vice-versa.
+        assert!(
+            has("let x: int = 5.0\n", "type-mismatch"),
+            "{:?}",
+            analyze("let x: int = 5.0\n").diagnostics
+        );
+        assert!(
+            has("let y: float = 5\n", "type-mismatch"),
+            "{:?}",
+            analyze("let y: float = 5\n").diagnostics
+        );
+    }
+
+    #[test]
+    fn number_into_subtype_is_gradual_silent() {
+        // A `number`-typed value into an `int` slot is NOT provable → silent (gradual).
+        let src = "fn f(n: number) -> int { return n }\n";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn arithmetic_result_subtypes() {
+        // int + int : int → assignable to int slot, silent.
+        assert!(!has("let x: int = 1 + 2\n", "type-mismatch"));
+        // int / int : int → silent into int slot.
+        assert!(!has("let x: int = 7 / 2\n", "type-mismatch"));
+        // int + float : float → provably NOT an int → mismatch.
+        assert!(
+            has("let x: int = 1 + 2.0\n", "type-mismatch"),
+            "{:?}",
+            analyze("let x: int = 1 + 2.0\n").diagnostics
+        );
+        // float + float : float → fits a float slot silently.
+        assert!(!has("let x: float = 1.0 + 2.0\n", "type-mismatch"));
+    }
+
+    #[test]
+    fn bitwise_on_float_is_type_error() {
+        assert!(has("let x = 1.5 & 2\n", "type-error"));
+        assert!(has("let x = 1 | 2.0\n", "type-error"));
+        assert!(has("let x = 1.0 << 2\n", "type-error"));
+        assert!(has("let x = ~1.5\n", "type-error"));
+        assert!(has("let x = 1.0 +% 2\n", "type-error"));
+    }
+
+    #[test]
+    fn bitwise_on_int_is_silent() {
+        // int operands: no type-error, and the result is int.
+        assert!(!has("let x: int = 1 & 2\n", "type-error"));
+        assert!(!has("let x: int = 1 | 2\n", "type-error"));
+        assert!(!has("let x: int = 1 << 3\n", "type-error"));
+        assert!(!has("let x: int = ~1\n", "type-error"));
+        assert!(!has("let x: int = 1 +% 2\n", "type-error"));
+        // result subtype is int → fits an int slot, no mismatch either.
+        assert!(!has("let x: int = 1 & 2\n", "type-mismatch"));
+    }
+
+    #[test]
+    fn instanceof_int_narrows_then_branch() {
+        // In the THEN branch, `n` (a `number`) is narrowed to `int`, so a bitwise op
+        // on it is silent (int-only ops accept an int).
+        let src = "fn f(n: number) {\n  if (n instanceof int) {\n    let x: int = n & 1\n  }\n}\n";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn instanceof_int_narrowing_silent_no_false_positive() {
+        // The guard must never introduce a false positive (gradual gate).
+        let src = "fn f(n: number) -> int {\n  if (n instanceof int) { return n }\n  return 0\n}\n";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "{:?}",
+            analyze(src).diagnostics
+        );
+    }
+
+    #[test]
+    fn bitwise_on_number_is_gradual_silent() {
+        // A `number`-typed (not provably-float) operand stays silent.
+        let src = "fn f(n: number) { return n & 1 }\n";
+        assert!(
+            !codes(src).iter().any(|c| c.starts_with("type-")),
+            "{:?}",
             analyze(src).diagnostics
         );
     }

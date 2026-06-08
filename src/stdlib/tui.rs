@@ -424,11 +424,9 @@ impl Interp {
             "size" => {
                 let state = self.terminal_mut(id).expect("checked present");
                 let mut map = indexmap::IndexMap::new();
-                map.insert("width".to_string(), Value::Number(state.back.width as f64));
-                map.insert(
-                    "height".to_string(),
-                    Value::Number(state.back.height as f64),
-                );
+                // NUM §4: terminal dimensions are integral → `Int`.
+                map.insert("width".to_string(), Value::Int(state.back.width as i64));
+                map.insert("height".to_string(), Value::Int(state.back.height as i64));
                 Ok(Value::Object(crate::value::ObjectCell::new(map)))
             }
             "clear" => {
@@ -786,18 +784,21 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
             )
             .into()
         }),
-        Value::Number(n) => {
-            if *n < 0.0 || n.fract() != 0.0 || *n > 255.0 {
+        // NUM §4: a color index may be an `Int` or `Float`; both must be an integer
+        // in 0..=255.
+        Value::Int(_) | Value::Float(_) => {
+            let n = v.as_f64().unwrap_or(f64::NAN);
+            if n < 0.0 || n.fract() != 0.0 || n > 255.0 {
                 return Err(AsError::at(
                     format!(
                         "terminal style: '{}' color index must be an integer 0..=255, got {}",
-                        field, n
+                        field, v
                     ),
                     span,
                 )
                 .into());
             }
-            Ok(Color::Indexed(*n as u8))
+            Ok(Color::Indexed(n as u8))
         }
         Value::Array(a) => {
             let a = a.borrow();
@@ -814,24 +815,25 @@ fn parse_color(v: &Value, span: Span, field: &str) -> Result<Color, Control> {
             }
             let mut parts = [0u8; 3];
             for (i, item) in a.iter().enumerate() {
-                let Value::Number(n) = item else {
+                // NUM §4: an rgb component may be an `Int` or `Float`.
+                let Some(n) = item.as_f64() else {
                     return Err(AsError::at(
                         format!("terminal style: '{}' rgb component must be a number", field),
                         span,
                     )
                     .into());
                 };
-                if *n < 0.0 || n.fract() != 0.0 || *n > 255.0 {
+                if n < 0.0 || n.fract() != 0.0 || n > 255.0 {
                     return Err(AsError::at(
                         format!(
                             "terminal style: '{}' rgb component must be an integer 0..=255, got {}",
-                            field, n
+                            field, item
                         ),
                         span,
                     )
                     .into());
                 }
-                parts[i] = *n as u8;
+                parts[i] = n as u8;
             }
             Ok(Color::Rgb(parts[0], parts[1], parts[2]))
         }
@@ -1024,18 +1026,20 @@ pub fn event_to_value(ev: crossterm::event::Event) -> Value {
                 Some(MouseButton::Middle) => Value::Str("middle".into()),
                 None => Value::Nil,
             };
+            // NUM §4: mouse cell coordinates are integral → `Int`.
             make_object(vec![
                 ("type", Value::Str("mouse".into())),
-                ("x", Value::Number(me.column as f64)),
-                ("y", Value::Number(me.row as f64)),
+                ("x", Value::Int(me.column as i64)),
+                ("y", Value::Int(me.row as i64)),
                 ("kind", Value::Str(kind.into())),
                 ("button", button),
             ])
         }
         Event::Resize(w, h) => make_object(vec![
             ("type", Value::Str("resize".into())),
-            ("width", Value::Number(w as f64)),
-            ("height", Value::Number(h as f64)),
+            // NUM §4: terminal dimensions are integral → `Int`.
+            ("width", Value::Int(w as i64)),
+            ("height", Value::Int(h as i64)),
         ]),
         Event::FocusGained => make_object(vec![
             ("type", Value::Str("focus".into())),
@@ -1069,7 +1073,7 @@ mod tests {
 
     fn arr(items: Vec<f64>) -> Value {
         Value::Array(crate::value::ArrayCell::new(
-            items.into_iter().map(Value::Number).collect(),
+            items.into_iter().map(Value::Float).collect(),
         ))
     }
 
@@ -1120,7 +1124,7 @@ mod tests {
 
     #[test]
     fn parse_style_indexed_number() {
-        let v = obj(vec![("bg", Value::Number(200.0))]);
+        let v = obj(vec![("bg", Value::Float(200.0))]);
         let s = parse_style(&v, Span::new(0, 0)).unwrap();
         assert_eq!(s.bg, Color::Indexed(200));
     }
@@ -1216,7 +1220,8 @@ print(type(s.width))
 print(type(s.height))
 "#)
         .await;
-        assert_eq!(out, "true\ntrue\nnumber\nnumber\n");
+        // NUM §4: terminal dimensions are `int`.
+        assert_eq!(out, "true\ntrue\nint\nint\n");
     }
 
     #[tokio::test]
@@ -1508,8 +1513,8 @@ print("[" + term.dumpRow(0) + "]")
         let Value::Object(o) = v else {
             panic!("not an object")
         };
-        match o.borrow().get(key) {
-            Some(Value::Number(n)) => *n,
+        match o.borrow().get(key).map(|v| (v.as_f64(), v.clone())) {
+            Some((Some(n), _)) => n,
             other => panic!("field {} not a number: {:?}", key, other),
         }
     }

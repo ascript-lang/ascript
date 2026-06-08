@@ -274,8 +274,8 @@ mod tests {
     #[test]
     fn cell_get_set_roundtrip_through_the_cell() {
         let fiber = Fiber::new(closure_with_cell_slots(2, vec![1]));
-        fiber.set_local_cell(1, Value::Number(7.0));
-        assert!(matches!(fiber.get_local_cell(1), Value::Number(n) if n == 7.0));
+        fiber.set_local_cell(1, Value::Float(7.0));
+        assert!(matches!(fiber.get_local_cell(1), Value::Float(n) if n == 7.0));
         // The cell access does NOT touch the plain stack slot.
         assert!(matches!(fiber.local(1), Value::Nil));
     }
@@ -295,24 +295,24 @@ mod tests {
     #[test]
     fn push_pop_peek_lifo() {
         let mut fiber = Fiber::new(closure_with_slots(0));
-        fiber.push(Value::Number(1.0));
-        fiber.push(Value::Number(2.0));
-        fiber.push(Value::Number(3.0));
+        fiber.push(Value::Float(1.0));
+        fiber.push(Value::Float(2.0));
+        fiber.push(Value::Float(3.0));
 
-        assert!(matches!(fiber.peek(0), Value::Number(n) if *n == 3.0));
-        assert!(matches!(fiber.peek(1), Value::Number(n) if *n == 2.0));
-        assert!(matches!(fiber.peek(2), Value::Number(n) if *n == 1.0));
+        assert!(matches!(fiber.peek(0), Value::Float(n) if *n == 3.0));
+        assert!(matches!(fiber.peek(1), Value::Float(n) if *n == 2.0));
+        assert!(matches!(fiber.peek(2), Value::Float(n) if *n == 1.0));
 
-        assert!(matches!(fiber.pop(), Value::Number(n) if n == 3.0));
-        assert!(matches!(fiber.pop(), Value::Number(n) if n == 2.0));
-        assert!(matches!(fiber.pop(), Value::Number(n) if n == 1.0));
+        assert!(matches!(fiber.pop(), Value::Float(n) if n == 3.0));
+        assert!(matches!(fiber.pop(), Value::Float(n) if n == 2.0));
+        assert!(matches!(fiber.pop(), Value::Float(n) if n == 1.0));
     }
 
     #[test]
     fn set_local_and_local_roundtrip() {
         let mut fiber = Fiber::new(closure_with_slots(2));
-        fiber.set_local(1, Value::Number(42.0));
-        assert!(matches!(fiber.local(1), Value::Number(n) if *n == 42.0));
+        fiber.set_local(1, Value::Float(42.0));
+        assert!(matches!(fiber.local(1), Value::Float(n) if *n == 42.0));
         assert!(matches!(fiber.local(0), Value::Nil));
     }
 }

@@ -10,7 +10,8 @@ AScript has a small, fixed set of value kinds. `type(v)` returns the kind name a
 |---|---|---|---|
 | Nil | `nil` | `nil` | `nil` |
 | Boolean | `bool` | `true`, `false` | `true` / `false` |
-| Number | `number` | `42`, `3.14`, `1e9`, `0xFF`, `0b1010` | minimal form (`7`, `2.5`) |
+| Int | `int` | `42`, `0xFF`, `0b1010`, `0o17`, `1_000` | `42`, `255` |
+| Float | `float` | `3.14`, `1e9`, `.5` | always a decimal (`5.0`, `2.5`) |
 | String | `string` | `"double"`, `'single'`, `` `template ${x}` `` | the raw text |
 | Array | `array` | `[1, 2, 3]` | `[1, "two"]` |
 | Object | `object` | `{ key: value, "quoted": 1 }` | `{a: 1, b: "x"}` |
@@ -28,25 +29,97 @@ AScript has a small, fixed set of value kinds. `type(v)` returns the kind name a
 
 ## Numbers
 
-There is exactly **one** numeric type. Every literal — decimal, float, exponent, hex (`0xFF`), binary
-(`0b1010`), and digit-grouped (`1_000_000`) — becomes an IEEE-754 64-bit float.
+AScript has a small **numeric tower**: one user concept ("a number") realized as distinct runtime
+subtypes so division can be type-directed and diagnostics stay clear.
+
+| Subtype | `type(v)` | Representation | Literal form |
+|---|---|---|---|
+| `int` | `"int"` | 64-bit signed integer | `5`, `0xFF`, `0b1010`, `0o17`, `1_000` |
+| `float` | `"float"` | IEEE-754 double | `5.0`, `1.5`, `.5`, `1e3` |
+| `decimal` | `"decimal"` | exact base-10 | `decimal.from("0.1")` |
+
+A literal with **no `.` and no exponent** is an `int`; a literal with a `.` or an exponent is a
+`float`. Bases: decimal, hex (`0x`), binary (`0b`), and octal (`0o`); underscores group digits. The
+annotation `number` means the union `int | float` (decimal is exact and opt-in — not part of `number`).
 
 ```ascript
-print(0xFF)       // 255
-print(0b1010)     // 10
-print(1e3)        // 1000
+print(0xFF)       // 255   (int)
+print(0o17)       // 15    (int, octal)
+print(0b1010)     // 10    (int)
 print(1_000_000)  // 1000000
-print(7.0)        // 7   — integer-valued floats print without a fractional part
+print(type(5))    // int
+print(type(5.0))  // float
+```
+
+**Type-directed division.** `int / int` truncates toward zero; any `float` operand makes the whole
+expression a `float`. There is no `//` operator.
+
+```ascript
+print(7 / 2)      // 3     (int / int → int, truncated)
+print(-7 / 2)     // -3    (toward zero)
+print(7.0 / 2)    // 3.5   (a float operand → float division)
+```
+
+**Checked overflow + wrapping operators.** `+ - * **` and unary `-` trap on i64 overflow with a
+recoverable panic. Use the explicit wrapping operators `+%`, `-%`, `*%` for two's-complement modular
+arithmetic (hashing, codecs).
+
+**Bitwise / shift operators** (`& | ^ << >> ~`) are **int-only** (Go-style precedence). Code points
+are `int`s (the Go "rune" model — no `char` type); convert with
+[`string.codepoints`](../stdlib/collections#stringcodepoints) /
+`string.from_codepoints` / `string.code_at`.
+
+```ascript
+let color = (0xAB << 16) | (0xCD << 8) | 0xEF
+print((color >> 8) & 0xFF)   // 205
+```
+
+**Printing.** An `int` prints with no decimal (`5`); a `float` **always** prints with at least one
+fractional digit (`5.0`, `1500.0`, `-0.0`) so the two subtypes are visually distinguishable
+(`inf`/`-inf`/`NaN` are unchanged).
+
+```ascript
+print(5)          // 5
+print(5.0)        // 5.0
+print(10.0 / 2)   // 5.0
+print([1.0, 2.0]) // [1.0, 2.0]
+```
+
+**Conversions.** `int(x)` and `float(x)` convert between the subtypes: `int(5.7)` truncates toward
+zero → `5`; `float(3)` → `3.0`; `int("42")` / `float("3.5")` parse a string and return a Tier-1
+`[value, err]` pair (`int("x")` → `[nil, err]`). An identity conversion (`int` of an `int`, `float` of
+a `float`) is a no-op.
+
+```ascript
+print(int(5.7))     // 5    (truncates toward zero)
+print(float(3))     // 3.0
+print(int("42"))    // [42, nil]
+print(int("x"))     // [nil, {message: ...}]
+```
+
+**Exact cross-subtype comparison.** `1 == 1.0` is `true`, but a large `int` not exactly representable
+as a `float` compares exactly — no precision bug at the `2^53` boundary.
+
+**Reflection / narrowing.** `x instanceof int` / `float` / `number` are runtime type guards (the
+checker narrows `number` to the subtype in the guarded branch):
+
+```ascript
+fn describe(x: number): string {
+  if (x instanceof int) { return "an int" }
+  return "a float"
+}
 ```
 
 ## Truthiness
 
-Only `nil` and `false` are falsy. **Everything else is truthy** — including `0`, `""`, `[]`, and
-`{}`. This is deliberately stricter (and less surprising) than JavaScript.
+The falsy values are `nil`, `false`, `0` (and `0.0`/`-0.0`/`NaN`), `0m` (zero decimal), and the empty
+string `""`. **Everything else is truthy** — and crucially, **collections stay truthy even when empty**
+(`[]`, `{}`, an empty map/set), so an empty-but-valid collection never silently reads as "no result".
 
 ```ascript
-if (0)  { print("zero is truthy") }   // this runs
-if ("") { print("empty is truthy") }  // this runs too
+if (0)  { } else { print("0 is falsy") }       // falsy
+if ("") { } else { print("\"\" is falsy") }    // falsy
+if ([]) { print("[] is truthy") }              // truthy — query emptiness with len([])
 ```
 
 ## Equality

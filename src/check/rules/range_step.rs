@@ -125,7 +125,14 @@ fn literal_number(node: &ResolvedNode) -> Option<f64> {
                 .filter_map(|el| el.into_token())
                 .find(|t| !t.kind().is_trivia())?;
             if tok.kind() == Number {
-                parse_number_text(tok.text())
+                // The rule only needs the magnitude/sign for direction & zero
+                // checks, so collapse the int/float subtype to f64 (NUM §3.1).
+                use crate::lex_literals::NumLit;
+                match parse_number_text(tok.text()) {
+                    Ok(NumLit::Int(i)) => Some(i as f64),
+                    Ok(NumLit::Float(f)) => Some(f),
+                    Err(_) => None,
+                }
             } else {
                 None // a string/bool/nil literal is not a number
             }
@@ -227,7 +234,11 @@ mod tests {
 
     #[test]
     fn mismatch_message_matches_runtime() {
-        // `step -2 moves away from end (10)` — byte-identical to the runtime panic.
+        // The message MUST stay byte-identical to the runtime panic. `resolve_step`
+        // works on `f64` bounds and formats them via `format_number` (the
+        // `Value::Float` Display path), which NUM §4 renders with a decimal — so
+        // both the lint and the runtime print `-2.0`/`10.0`. The differential
+        // (lint == runtime panic) is what this test pins.
         let src = "for (i in 1..10 step -2){}\n";
         let d = analyze(src)
             .diagnostics
@@ -236,7 +247,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             d.message,
-            "step -2 moves away from end (10); range can never progress"
+            "step -2.0 moves away from end (10.0); range can never progress"
         );
     }
 

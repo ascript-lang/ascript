@@ -147,22 +147,22 @@ mod tests {
         let m = call("new", &[], sp()).unwrap();
         call(
             "set",
-            &[m.clone(), Value::Str("a".into()), Value::Number(1.0)],
+            &[m.clone(), Value::Str("a".into()), Value::Float(1.0)],
             sp(),
         )
         .unwrap();
         call(
             "set",
-            &[m.clone(), Value::Number(2.0), Value::Str("two".into())],
+            &[m.clone(), Value::Float(2.0), Value::Str("two".into())],
             sp(),
         )
         .unwrap();
         assert_eq!(
             call("get", &[m.clone(), Value::Str("a".into())], sp()).unwrap(),
-            Value::Number(1.0)
+            Value::Float(1.0)
         );
         assert_eq!(
-            call("get", &[m.clone(), Value::Number(2.0)], sp()).unwrap(),
+            call("get", &[m.clone(), Value::Float(2.0)], sp()).unwrap(),
             Value::Str("two".into())
         );
         assert_eq!(
@@ -195,26 +195,26 @@ mod tests {
         let seed = Value::Array(crate::value::ArrayCell::new(vec![
             Value::Array(crate::value::ArrayCell::new(vec![
                 Value::Str("a".into()),
-                Value::Number(1.0),
+                Value::Float(1.0),
             ])),
             Value::Array(crate::value::ArrayCell::new(vec![
                 Value::Str("b".into()),
-                Value::Number(2.0),
+                Value::Float(2.0),
             ])),
         ]));
         let m = call("new", std::slice::from_ref(&seed), sp).unwrap();
         assert_eq!(
             call("get", &[m.clone(), Value::Str("b".into())], sp).unwrap(),
-            Value::Number(2.0)
+            Value::Float(2.0)
         );
         // non-array seed → panic
         assert!(matches!(
-            call("new", &[Value::Number(5.0)], sp),
+            call("new", &[Value::Float(5.0)], sp),
             Err(Control::Panic(_))
         ));
         // wrong-arity entry → panic
         let bad = Value::Array(crate::value::ArrayCell::new(vec![Value::Array(
-            crate::value::ArrayCell::new(vec![Value::Number(1.0)]),
+            crate::value::ArrayCell::new(vec![Value::Float(1.0)]),
         )]));
         assert!(matches!(call("new", &[bad], sp), Err(Control::Panic(_))));
     }
@@ -226,30 +226,30 @@ mod tests {
         // -0.0 and 0.0 are the same key
         call(
             "set",
-            &[m.clone(), Value::Number(-0.0), Value::Str("z".into())],
+            &[m.clone(), Value::Float(-0.0), Value::Str("z".into())],
             sp,
         )
         .unwrap();
         assert_eq!(
-            call("get", &[m.clone(), Value::Number(0.0)], sp).unwrap(),
+            call("get", &[m.clone(), Value::Float(0.0)], sp).unwrap(),
             Value::Str("z".into())
         );
         // setting NaN twice collapses to one entry
         call(
             "set",
-            &[m.clone(), Value::Number(f64::NAN), Value::Number(1.0)],
+            &[m.clone(), Value::Float(f64::NAN), Value::Float(1.0)],
             sp,
         )
         .unwrap();
         call(
             "set",
-            &[m.clone(), Value::Number(f64::NAN), Value::Number(2.0)],
+            &[m.clone(), Value::Float(f64::NAN), Value::Float(2.0)],
             sp,
         )
         .unwrap();
         assert_eq!(
-            call("get", &[m.clone(), Value::Number(f64::NAN)], sp).unwrap(),
-            Value::Number(2.0)
+            call("get", &[m.clone(), Value::Float(f64::NAN)], sp).unwrap(),
+            Value::Float(2.0)
         );
         // len: keys {0.0, NaN} = 2
         assert_eq!(m, m.clone()); // sanity
@@ -260,7 +260,7 @@ mod tests {
         let m = call("new", &[], sp()).unwrap();
         let bad = Value::Array(crate::value::ArrayCell::new(vec![]));
         assert!(matches!(
-            call("set", &[m, bad, Value::Number(1.0)], sp()),
+            call("set", &[m, bad, Value::Float(1.0)], sp()),
             Err(Control::Panic(_))
         ));
     }

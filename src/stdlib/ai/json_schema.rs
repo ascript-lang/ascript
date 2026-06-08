@@ -104,6 +104,8 @@ fn collect_chain<'a>(class: &'a Class, out: &mut Vec<&'a Class>) {
 fn type_to_json_schema(ty: &Type, resolve_named: &dyn Fn(&str) -> Option<J>) -> (J, bool) {
     match ty {
         Type::Number => (json!({"type": "number"}), true),
+        Type::Int => (json!({"type": "integer"}), true),
+        Type::Float => (json!({"type": "number"}), true),
         Type::String => (json!({"type": "string"}), true),
         Type::Bool => (json!({"type": "boolean"}), true),
         Type::Nil => (json!({"type": "null"}), false),
@@ -199,10 +201,10 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
         "string" => {
             let mut m = Map::new();
             m.insert("type".to_string(), J::String("string".to_string()));
-            if let Some(Value::Number(n)) = field(schema, "minLength") {
+            if let Some(n) = field_num(schema, "minLength") {
                 m.insert("minLength".to_string(), json!(n as i64));
             }
-            if let Some(Value::Number(n)) = field(schema, "maxLength") {
+            if let Some(n) = field_num(schema, "maxLength") {
                 m.insert("maxLength".to_string(), json!(n as i64));
             }
             if let Some(Value::Str(p)) = field(schema, "pattern") {
@@ -213,10 +215,10 @@ pub fn schema_value_to_json_schema(schema: &Value) -> J {
         "number" => {
             let mut m = Map::new();
             m.insert("type".to_string(), J::String("number".to_string()));
-            if let Some(Value::Number(n)) = field(schema, "min") {
+            if let Some(n) = field_num(schema, "min") {
                 m.insert("minimum".to_string(), json!(n));
             }
-            if let Some(Value::Number(n)) = field(schema, "max") {
+            if let Some(n) = field_num(schema, "max") {
                 m.insert("maximum".to_string(), json!(n));
             }
             J::Object(m)
@@ -300,11 +302,18 @@ fn field(v: &Value, key: &str) -> Option<Value> {
     }
 }
 
+/// NUM §4: read a numeric schema constraint as `f64`, accepting `Int` or `Float`.
+fn field_num(v: &Value, key: &str) -> Option<f64> {
+    field(v, key).and_then(|x| x.as_f64())
+}
+
 fn value_to_json(v: &Value) -> J {
     match v {
         Value::Nil => J::Null,
         Value::Bool(b) => J::Bool(*b),
-        Value::Number(n) => json!(n),
+        // NUM §4: an `Int` emits as a JSON integer; a `Float` as a JSON number.
+        Value::Int(i) => json!(i),
+        Value::Float(n) => json!(n),
         Value::Str(s) => J::String(s.to_string()),
         _ => J::Null,
     }
@@ -431,7 +440,7 @@ mod tests {
         let s = schema_obj(
             "string",
             vec![
-                ("minLength", Value::Number(3.0)),
+                ("minLength", Value::Float(3.0)),
                 ("pattern", Value::Str("^a".into())),
             ],
         );
@@ -445,7 +454,7 @@ mod tests {
     fn schema_number_min_max() {
         let s = schema_obj(
             "number",
-            vec![("min", Value::Number(0.0)), ("max", Value::Number(10.0))],
+            vec![("min", Value::Float(0.0)), ("max", Value::Float(10.0))],
         );
         let js = schema_value_to_json_schema(&s);
         assert_eq!(js["type"], "number");

@@ -344,7 +344,8 @@ impl SseState {
         map.insert(
             "retry".to_string(),
             match ev.retry {
-                Some(ms) => Value::Number(ms as f64),
+                // NUM §4: a retry interval (ms) is an integer → `Int`.
+                Some(ms) => Value::Int(ms as i64),
                 None => Value::Nil,
             },
         );
@@ -410,10 +411,8 @@ struct RetryConfig {
 
 /// Read a numeric field from an object, if present and a number.
 fn num_field(o: &IndexMap<String, Value>, key: &str) -> Option<f64> {
-    match o.get(key) {
-        Some(Value::Number(n)) => Some(*n),
-        _ => None,
-    }
+    // NUM §4: accept BOTH numeric subtypes (`Int` and `Float`).
+    o.get(key).and_then(|v| v.as_f64())
 }
 
 /// Read a numeric field strictly: `Ok(Some(n))` if it's a number, `Ok(None)` if
@@ -426,7 +425,8 @@ fn strict_num_field(
     span: Span,
 ) -> Result<Option<f64>, Control> {
     match o.get(key) {
-        Some(Value::Number(n)) => Ok(Some(*n)),
+        // NUM §4: accept BOTH numeric subtypes (`Int` and `Float`).
+        Some(v) if v.is_number() => Ok(v.as_f64().map(Some).unwrap_or(None)),
         Some(Value::Nil) | None => Ok(None),
         Some(other) => Err(AsError::at(
             format!(
@@ -499,13 +499,14 @@ fn parse_retry(opts: &Value, span: Span) -> Result<Option<RetryConfig>, Control>
         Some(Value::Array(a)) => {
             let mut out = Vec::new();
             for v in a.borrow().iter() {
-                match v {
-                    Value::Number(n) => out.push(*n as u16),
-                    other => {
+                // NUM §4: a status code may be an `Int` or `Float`.
+                match v.as_f64() {
+                    Some(n) => out.push(n as u16),
+                    None => {
                         return Err(AsError::at(
                             format!(
                             "net/http retry.retryOn expects an array of numbers, got a {} entry",
-                            crate::interp::type_name(other)
+                            crate::interp::type_name(v)
                         ),
                             span,
                         )
@@ -840,7 +841,7 @@ fn value_to_query_pairs(
 fn scalar_to_string(v: &Value, span: Span, ctx: &str) -> Result<String, Control> {
     match v {
         Value::Str(s) => Ok(s.to_string()),
-        Value::Number(_) | Value::Bool(_) => Ok(v.to_string()),
+        Value::Float(_) | Value::Bool(_) => Ok(v.to_string()),
         Value::Nil => Ok(String::new()),
         other => Err(AsError::at(
             format!(
@@ -1326,7 +1327,8 @@ impl Interp {
     fn http_response_fields(resp: &reqwest::Response) -> IndexMap<String, Value> {
         let status = resp.status();
         let mut fields = IndexMap::new();
-        fields.insert("status".to_string(), Value::Number(status.as_u16() as f64));
+        // NUM §4: an HTTP status code is an `Int`.
+        fields.insert("status".to_string(), Value::Int(i64::from(status.as_u16())));
         fields.insert("ok".to_string(), Value::Bool(status.is_success()));
         fields.insert(
             "version".to_string(),
@@ -1980,7 +1982,8 @@ fn strict_num_field_v(
 ) -> Result<Option<f64>, Control> {
     match opt_field(opts, key) {
         None => Ok(None),
-        Some(Value::Number(n)) => Ok(Some(n)),
+        // NUM §4: accept BOTH numeric subtypes (`Int` and `Float`).
+        Some(ref v) if v.is_number() => Ok(v.as_f64()),
         Some(other) => Err(AsError::at(
             format!(
                 "net/http {} expects a number, got {}",

@@ -30,7 +30,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "stringify" => {
             let v = arg(args, 0);
-            let pretty = matches!(args.get(1), Some(Value::Number(n)) if *n > 0.0)
+            let pretty = matches!(args.get(1), Some(v) if v.as_f64().is_some_and(|n| n > 0.0))
                 || matches!(args.get(1), Some(Value::Bool(true)));
             match from_ascript(&v, &mut Vec::new()) {
                 Ok(jv) => {
@@ -59,7 +59,12 @@ pub(crate) fn to_ascript(jv: &serde_json::Value) -> Value {
     match jv {
         serde_json::Value::Null => Value::Nil,
         serde_json::Value::Bool(b) => Value::Bool(*b),
-        serde_json::Value::Number(n) => Value::Number(n.as_f64().unwrap_or(f64::NAN)),
+        // NUM §4: a JSON integer parses to `Int`; a fractional/exponent number to
+        // `Float`. `as_i64` succeeds only for integers within `i64` range.
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Int(i),
+            None => Value::Float(n.as_f64().unwrap_or(f64::NAN)),
+        },
         serde_json::Value::String(s) => Value::Str(s.as_str().into()),
         serde_json::Value::Array(a) => Value::Array(crate::value::ArrayCell::new(
             a.iter().map(to_ascript).collect(),
@@ -89,22 +94,19 @@ pub(crate) fn from_ascript(v: &Value, seen: &mut Vec<usize>) -> Result<serde_jso
                 .map_err(|_| format!("cannot serialize decimal {} to JSON", d))?;
             Ok(raw)
         }
-        Value::Number(n) => {
+        // NUM §4: an `Int` serializes as a JSON integer directly (no float round-trip).
+        Value::Int(i) => Ok(serde_json::Value::Number(serde_json::Number::from(*i))),
+        Value::Float(n) => {
             if !n.is_finite() {
                 return Err(format!("cannot serialize non-finite number {} to JSON", n));
             }
-            // Match AScript's own number Display: an integer-valued float
-            // serializes as a JSON integer (`1`, not `1.0`). serde_json's
-            // Number::from_f64 always renders a float with a trailing `.0`.
-            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
-                Ok(serde_json::Value::Number(serde_json::Number::from(
-                    *n as i64,
-                )))
-            } else {
-                serde_json::Number::from_f64(*n)
-                    .map(serde_json::Value::Number)
-                    .ok_or_else(|| format!("cannot serialize number {} to JSON", n))
-            }
+            // NUM §4: a `float` ALWAYS serializes as a JSON float (`5.0`, not `5`)
+            // so `parse ∘ stringify` preserves the int/float subtype (a JSON number
+            // with a `.`/`e`/`E` parses back to `float`). serde_json's
+            // `Number::from_f64` renders an integral float with a trailing `.0`.
+            serde_json::Number::from_f64(*n)
+                .map(serde_json::Value::Number)
+                .ok_or_else(|| format!("cannot serialize number {} to JSON", n))
         }
         Value::Str(s) => Ok(serde_json::Value::String(s.to_string())),
         Value::Array(a) => {
@@ -188,17 +190,17 @@ pub(crate) fn to_json_lossy(v: &Value, seen: &mut Vec<usize>) -> serde_json::Val
         Value::Bool(b) => J::Bool(*b),
         // Decimal: emit as a JSON number from the canonical string (always finite).
         Value::Decimal(d) => serde_json::from_str::<J>(&d.to_string()).unwrap_or(J::Null),
-        Value::Number(n) => {
+        // NUM §4: an `Int` serializes as a JSON integer directly.
+        Value::Int(i) => J::Number(serde_json::Number::from(*i)),
+        Value::Float(n) => {
             if !n.is_finite() {
                 return J::Null;
             }
-            if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 {
-                J::Number(serde_json::Number::from(*n as i64))
-            } else {
-                serde_json::Number::from_f64(*n)
-                    .map(J::Number)
-                    .unwrap_or(J::Null)
-            }
+            // NUM §4: a `float` always serializes as a JSON float (`5.0`), matching
+            // `from_ascript`, so the int/float subtype is visible in logs too.
+            serde_json::Number::from_f64(*n)
+                .map(J::Number)
+                .unwrap_or(J::Null)
         }
         Value::Str(s) => J::String(s.to_string()),
         Value::Array(a) => {
@@ -318,14 +320,15 @@ mod tests {
     fn stringify_and_errors() {
         let obj = {
             let mut m = IndexMap::new();
-            m.insert("n".to_string(), Value::Number(2.0));
+            m.insert("n".to_string(), Value::Float(2.0));
             Value::Object(crate::value::ObjectCell::new(m))
         };
         let out = call("stringify", std::slice::from_ref(&obj), sp()).unwrap();
         // out is the pair [resultString, nil]; the result string is the JSON
-        // text `{"n":2}` (integer 2, not 2.0). Inside the pair's array Display
+        // text `{"n":2.0}` — NUM §4: a `float` always serializes with a decimal
+        // so the int/float subtype round-trips. Inside the pair's array Display
         // the string is quoted+escaped, hence the `\"` in the expected text.
-        assert_eq!(out.to_string(), "[\"{\\\"n\\\":2}\", nil]");
+        assert_eq!(out.to_string(), "[\"{\\\"n\\\":2.0}\", nil]");
         // a function is not serializable → [nil, err]
         let f = Value::Builtin("print".into());
         let err = call("stringify", std::slice::from_ref(&f), sp()).unwrap();
@@ -347,7 +350,7 @@ mod tests {
             "\"<function>\""
         );
         assert_eq!(
-            to_json_lossy(&Value::Number(f64::NAN), &mut Vec::new()),
+            to_json_lossy(&Value::Float(f64::NAN), &mut Vec::new()),
             serde_json::Value::Null
         );
     }
@@ -356,5 +359,54 @@ mod tests {
     fn parse_invalid_is_tier1_err() {
         let err = call("parse", &[s("{bad")], sp()).unwrap();
         assert!(err.to_string().starts_with("[nil, {message:"));
+    }
+
+    /// Pull the value (index 0) out of a `[value, err]` Tier-1 pair.
+    fn pair_value(v: &Value) -> Value {
+        match v {
+            Value::Array(a) => a.borrow().first().cloned().unwrap_or(Value::Nil),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn stringify_int_vs_float_subtype_fidelity() {
+        // NUM §4: int → "5"; float → "5.0".
+        let int_out = call("stringify", &[Value::Int(5)], sp()).unwrap();
+        assert_eq!(pair_value(&int_out), Value::Str("5".into()));
+        let float_out = call("stringify", &[Value::Float(5.0)], sp()).unwrap();
+        assert_eq!(pair_value(&float_out), Value::Str("5.0".into()));
+    }
+
+    #[test]
+    fn parse_subtype_by_syntax() {
+        // A JSON number with `.` or `e`/`E` parses to `float`, else `int`.
+        assert_eq!(pair_value(&call("parse", &[s("5")], sp()).unwrap()), Value::Int(5));
+        assert_eq!(
+            pair_value(&call("parse", &[s("5.0")], sp()).unwrap()),
+            Value::Float(5.0)
+        );
+        assert_eq!(
+            pair_value(&call("parse", &[s("5e2")], sp()).unwrap()),
+            Value::Float(500.0)
+        );
+        assert_eq!(
+            pair_value(&call("parse", &[s("-7")], sp()).unwrap()),
+            Value::Int(-7)
+        );
+        // Integral but out of i64 range → float (documented, pending bigint).
+        assert_eq!(
+            pair_value(&call("parse", &[s("100000000000000000000")], sp()).unwrap()),
+            Value::Float(1e20)
+        );
+    }
+
+    #[test]
+    fn parse_then_stringify_preserves_subtype() {
+        for (text, expect) in [("5", "5"), ("5.0", "5.0"), ("3.5", "3.5"), ("5e2", "500.0")] {
+            let parsed = pair_value(&call("parse", &[s(text)], sp()).unwrap());
+            let restr = pair_value(&call("stringify", std::slice::from_ref(&parsed), sp()).unwrap());
+            assert_eq!(restr, Value::Str(expect.into()), "round-trip of {text}");
+        }
     }
 }

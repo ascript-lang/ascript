@@ -132,6 +132,58 @@ fn treesitter_parses_static_methods() {
     }
 }
 
+#[test]
+fn treesitter_parses_bitwise_and_wrapping_operators() {
+    // NUM §3.2/§3.4: bitwise (`& | ^ ~`), shift (`<< >>`), and wrapping
+    // (`+% -% *%`) operators parse. CRITICAL disambiguation (§3.4):
+    //   - `1 | 2` in a match pattern is a TWO-ALTERNATIVE or-pattern (not bitwise);
+    //   - `a | b` in value position is a SINGLE bitwise-or expression;
+    //   - `int | float` in type position is a union type;
+    //   - `a >> b` is a shift, while `future<array<int>>` /
+    //     `map<int, array<int>>` close two nested generics from one `>>`.
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        // bitwise / shift / wrapping in value position
+        "let a = 0xFF & 0b1010",
+        "let b = (1 << 16) | 256",
+        "let c = ~0",
+        "let d = 5 +% 3",
+        "let e = x -% y",
+        "let f = x *% y",
+        "let g = a ^ b",
+        "let h = a >> 1",
+        // Go precedence footguns parse the intuitive way
+        "let i = a & b == c",
+        "let j = a | b == c",
+        // `a | b` in value position is ONE bitwise-or expression
+        "let m = a | b",
+        // or-pattern `1 | 2` stays a pattern (NOT bitwise)
+        r#"let r = match x { 1 | 2 => "a", _ => "b" }"#,
+        // union type stays a union
+        "let t: int | float = 1",
+        // nested generics: the `>>` splits into two closing `>`
+        "let u: future<array<int>> = nil",
+        "let v: map<int, array<int>> = #{}",
+        // NUM §3.1: octal literals (`0o`/`0O`).
+        "let oa = 0o17",
+        "let ob = 0O755",
+        "let oc = 0o1_7",
+        // NUM §6: reserved-type-name `instanceof` RHS parses in expression position.
+        "let w = x instanceof int",
+        "let y = x instanceof float",
+        "let z = x instanceof number",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter error on bitwise/wrapping snippet: {src}\n{}",
+            tree.root_node().to_sexp()
+        );
+    }
+}
+
 fn query_files() -> Vec<PathBuf> {
     // Resolve relative to the crate manifest so the test is cwd-independent.
     let query_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

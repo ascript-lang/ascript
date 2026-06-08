@@ -388,7 +388,7 @@ mod tests {
             while let Some(msg) = rx.recv().await {
                 // Decode the shipped bytes against THIS isolate's own interp, double the
                 // number, and report it back over the `Send` back-channel.
-                if let Ok(Value::Number(n)) =
+                if let Ok(Value::Float(n)) =
                     crate::worker::serialize::decode(&msg, &interp)
                 {
                     let _ = result_tx.send(n * 2.0);
@@ -400,7 +400,7 @@ mod tests {
         .expect("dedicated isolate should spawn");
 
         // Ship a trivial value as bytes; expect the doubled result back.
-        let payload = crate::worker::serialize::encode(&Value::Number(21.0))
+        let payload = crate::worker::serialize::encode(&Value::Float(21.0))
             .expect("encode sendable number");
         handle.tx.send(payload).expect("isolate inbound channel open");
         let got = result_rx

@@ -281,11 +281,28 @@ lines). Token-depth counting keeps `${…}` braces from skewing depth.
   variant + accessors; never hold a `resources` borrow across `.await`.
 
 ### Values (`src/value.rs`)
-`Value` is the runtime tagged union — roughly 16 user-facing kinds: `Nil`, `Bool`, `Number(f64)`, `Decimal`,
-`Str(Rc<str>)`, `Builtin`/`Function`, `Array`, `Object` (insertion-ordered `IndexMap`), `Map`, `Set`,
-`Bytes`, `Regex`, `Native`, `Enum`, `Class`/`Instance`, plus M17's `Future` (identity-equal, backed by
-`SharedFuture`) and `Generator` (identity-equal, consumer-driven). A separate hashable `MapKey` canonicalizes
-numbers (−0.0→+0.0, NaN unified) for `Map` keys.
+`Value` is the runtime tagged union — roughly 16 user-facing kinds: `Nil`, `Bool`, `Int(i64)`,
+`Float(f64)`, `Decimal`, `Str(Rc<str>)`, `Builtin`/`Function`, `Array`, `Object` (insertion-ordered
+`IndexMap`), `Map`, `Set`, `Bytes`, `Regex`, `Native`, `Enum`, `Class`/`Instance`, plus M17's `Future`
+(identity-equal, backed by `SharedFuture`) and `Generator` (identity-equal, consumer-driven). A separate
+hashable `MapKey` canonicalizes numbers (−0.0→+0.0, NaN unified; an integral in-range `Float` folds to the
+equal `Int` key) for `Map` keys.
+
+**Numeric model (NUM, `superpowers/specs/2026-06-08-numeric-model-design.md`).** Two numeric subtypes —
+`Int(i64)` (default for integer literals; `0x`/`0b`/`0o`/underscores) and `Float(f64)` — plus exact
+`Decimal`. Division is type-directed (`int/int` truncates); `+ - * **`/unary-`-` trap on i64 overflow
+(explicit wrapping `+% -% *%`); bitwise/shift (`& | ^ << >> ~`) are int-only (Go precedence); code points
+are `int`s (`string.codepoints`/`from_codepoints`/`code_at`). `number` is the annotation supertype
+`int | float`. `x instanceof int|float|number|string|bool` is a runtime type guard (tree-walker intercepts
+the reserved-name RHS before eval; the VM uses a dedicated `Op::InstanceOfType` with a type-name const —
+byte-identical). Checker `CheckTy::Int`/`Float` (a `number`-typed value into an `int` slot stays gradual →
+silent; only provably-concrete-distinct subtypes diagnose). **Float printing always shows a decimal**
+(`print(5.0)` → `5.0`, `print(5)` → `5`) so the subtypes are visually distinct; `int`-valued `std/math`
+results (e.g. `sqrt`/`sum`/`min`/`gcd`) still carry the `float` subtype and print `3.0` — only `abs`, the
+rounding family (`floor`/`ceil`/`round`/`trunc`), the int-div helpers (`floordiv`/`ceildiv`/`divmod`), and
+the bit helpers return `int`. **Truthiness is the NUM falsy set** (not just `nil`/`false`): `0`/`0.0`/`-0.0`/
+`NaN`/`0m`/`""` are falsy, but **collections/objects/instances stay truthy even when empty** (query empties
+with `len(x)`).
 
 - **Cycle-collecting GC (`src/gc.rs`).** Adopts `gcmodule` (refcounting `Cc<T>` + Bacon–Rajan cycle
   collector) — an unconditional, default-on, CORE dependency (must build under `--no-default-features`).

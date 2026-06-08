@@ -68,7 +68,7 @@ fn make_obj(pairs: &[(&str, Value)]) -> Value {
 pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
     match func {
         // pid() -> number — current process ID
-        "pid" => Ok(Value::Number(std::process::id() as f64)),
+        "pid" => Ok(Value::Float(std::process::id() as f64)),
 
         // platform() -> string — e.g. "macos", "linux", "windows"
         "platform" => Ok(Value::Str(std::env::consts::OS.into())),
@@ -81,7 +81,7 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
             let n = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1);
-            Ok(Value::Number(n as f64))
+            Ok(Value::Float(n as f64))
         }
 
         // hostname() -> string — machine hostname, "unknown" on error
@@ -107,10 +107,10 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             Ok(make_obj(&[
-                ("total", Value::Number(sys.total_memory() as f64)),
-                ("used", Value::Number(sys.used_memory() as f64)),
-                ("free", Value::Number(sys.free_memory() as f64)),
-                ("available", Value::Number(sys.available_memory() as f64)),
+                ("total", Value::Float(sys.total_memory() as f64)),
+                ("used", Value::Float(sys.used_memory() as f64)),
+                ("free", Value::Float(sys.free_memory() as f64)),
+                ("available", Value::Float(sys.available_memory() as f64)),
             ]))
         }
 
@@ -120,9 +120,9 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
             let mut sys = sysinfo::System::new();
             sys.refresh_memory();
             Ok(make_obj(&[
-                ("total", Value::Number(sys.total_swap() as f64)),
-                ("used", Value::Number(sys.used_swap() as f64)),
-                ("free", Value::Number(sys.free_swap() as f64)),
+                ("total", Value::Float(sys.total_swap() as f64)),
+                ("used", Value::Float(sys.used_swap() as f64)),
+                ("free", Value::Float(sys.free_swap() as f64)),
             ]))
         }
 
@@ -131,9 +131,9 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
         "loadAvg" => {
             let la = sysinfo::System::load_average();
             Ok(make_obj(&[
-                ("one", Value::Number(la.one)),
-                ("five", Value::Number(la.five)),
-                ("fifteen", Value::Number(la.fifteen)),
+                ("one", Value::Float(la.one)),
+                ("five", Value::Float(la.five)),
+                ("fifteen", Value::Float(la.fifteen)),
             ]))
         }
 
@@ -152,9 +152,9 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
                             "mount",
                             Value::Str(d.mount_point().to_string_lossy().as_ref().into()),
                         ),
-                        ("total", Value::Number(d.total_space() as f64)),
-                        ("free", Value::Number(d.available_space() as f64)),
-                        ("available", Value::Number(d.available_space() as f64)),
+                        ("total", Value::Float(d.total_space() as f64)),
+                        ("free", Value::Float(d.available_space() as f64)),
+                        ("available", Value::Float(d.available_space() as f64)),
                     ])
                 })
                 .collect();
@@ -163,7 +163,7 @@ pub fn call(func: &str, _args: &[Value], span: Span) -> Result<Value, Control> {
 
         // uptime() -> number  (seconds)
         #[cfg(feature = "sysinfo")]
-        "uptime" => Ok(Value::Number(sysinfo::System::uptime() as f64)),
+        "uptime" => Ok(Value::Float(sysinfo::System::uptime() as f64)),
 
         // networkInterfaces() -> array<{name, addresses: array<string>}>
         // Uses sysinfo::Networks which provides ip_networks() in 0.31.
@@ -236,7 +236,7 @@ mod tests {
     fn pid_is_positive_number() {
         let v = call("pid", &[], sp()).unwrap();
         match v {
-            Value::Number(n) => assert!(n > 0.0, "pid should be > 0, got {}", n),
+            Value::Float(n) => assert!(n > 0.0, "pid should be > 0, got {}", n),
             other => panic!("pid() should return a Number, got {:?}", other),
         }
     }
@@ -263,7 +263,7 @@ mod tests {
     fn cpu_count_is_at_least_one() {
         let v = call("cpuCount", &[], sp()).unwrap();
         match v {
-            Value::Number(n) => assert!(n >= 1.0, "cpuCount should be >= 1, got {}", n),
+            Value::Float(n) => assert!(n >= 1.0, "cpuCount should be >= 1, got {}", n),
             other => panic!("cpuCount() should return a Number, got {:?}", other),
         }
     }
@@ -302,12 +302,12 @@ mod tests {
             Value::Object(o) => {
                 let map = o.borrow();
                 let total = match map.get("total") {
-                    Some(Value::Number(n)) => *n,
+                    Some(Value::Float(n)) => *n,
                     other => panic!("memory().total should be a Number, got {:?}", other),
                 };
                 assert!(total > 0.0, "memory().total should be > 0, got {}", total);
                 let used = match map.get("used") {
-                    Some(Value::Number(n)) => *n,
+                    Some(Value::Float(n)) => *n,
                     other => panic!("memory().used should be a Number, got {:?}", other),
                 };
                 assert!(
@@ -335,7 +335,7 @@ mod tests {
             Value::Object(o) => {
                 let map = o.borrow();
                 let total = match map.get("total") {
-                    Some(Value::Number(n)) => *n,
+                    Some(Value::Float(n)) => *n,
                     other => panic!("swap().total should be a Number, got {:?}", other),
                 };
                 assert!(total >= 0.0, "swap().total should be >= 0, got {}", total);
@@ -355,7 +355,7 @@ mod tests {
                 let map = o.borrow();
                 for key in &["one", "five", "fifteen"] {
                     match map.get(*key) {
-                        Some(Value::Number(n)) => {
+                        Some(Value::Float(n)) => {
                             assert!(*n >= 0.0, "loadAvg().{} should be >= 0, got {}", key, n)
                         }
                         other => panic!("loadAvg().{} should be a Number, got {:?}", key, other),
@@ -399,7 +399,7 @@ mod tests {
     fn uptime_returns_positive_number() {
         let v = call("uptime", &[], sp()).unwrap();
         match v {
-            Value::Number(n) => assert!(n > 0.0, "uptime() should be > 0, got {}", n),
+            Value::Float(n) => assert!(n > 0.0, "uptime() should be > 0, got {}", n),
             other => panic!("uptime() should return a Number, got {:?}", other),
         }
     }
@@ -457,7 +457,8 @@ print(pct <= 100)
         )
         .await
         .expect("cpuUsage program should run");
-        assert_eq!(out, "number\ntrue\ntrue\n", "cpuUsage output: {}", out);
+        // NUM §4: a CPU usage percentage is fractional → `float`.
+        assert_eq!(out, "float\ntrue\ntrue\n", "cpuUsage output: {}", out);
     }
 
     #[cfg(feature = "sysinfo")]

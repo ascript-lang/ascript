@@ -398,7 +398,7 @@ mod tests {
         for v in [
             Value::Nil,
             Value::Bool(true),
-            Value::Number(3.0),
+            Value::Float(3.0),
             Value::Str("hi".into()),
             Value::Builtin("print".into()),
         ] {
@@ -415,7 +415,7 @@ mod tests {
         // and the borrows are taken safely).
         let inner = {
             let mut m = IndexMap::new();
-            m.insert("k".to_string(), Value::Number(1.0));
+            m.insert("k".to_string(), Value::Float(1.0));
             Value::Object(ObjectCell::new(m))
         };
         let arr = Value::Array(crate::value::ArrayCell::new(vec![inner.clone(), Value::Nil]));
@@ -451,14 +451,14 @@ mod tests {
         // ObjectCell / Instance / Closure trace arms exercised directly.
         let cell = ObjectCell::new({
             let mut m = IndexMap::new();
-            m.insert("n".to_string(), Value::Number(2.0));
+            m.insert("n".to_string(), Value::Float(2.0));
             m
         });
         cell.trace(&mut noop); // no panic, borrows safely
 
         let closure_inner = Closure::with_upvalues(
             anon_proto(),
-            vec![Cc::new(RefCell::new(Value::Number(9.0)))],
+            vec![Cc::new(RefCell::new(Value::Float(9.0)))],
         );
         closure_inner.trace(&mut noop); // no panic, traces upvalue cells
     }
@@ -779,7 +779,7 @@ mod tests {
 
         let mut held = Vec::with_capacity(N);
         for i in 0..N {
-            held.push(Value::Array(crate::value::ArrayCell::new(vec![Value::Number(
+            held.push(Value::Array(crate::value::ArrayCell::new(vec![Value::Float(
                 i as f64,
             )])));
         }
@@ -807,7 +807,7 @@ mod tests {
         super::collect(); // reset baseline
                           // A single tiny acyclic allocation is far below the
                           // COLLECT_GROWTH_THRESHOLD, so maybe_collect must skip.
-        let v = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
+        let v = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
         let reclaimed = super::maybe_collect();
         assert_eq!(
             reclaimed, 0,

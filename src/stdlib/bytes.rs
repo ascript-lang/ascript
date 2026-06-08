@@ -84,10 +84,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         }
         "toArray" => {
             let b = want_bytes(&arg(args, 0), span, &ctx("toArray"))?;
+            // NUM §4: a byte (0..=255) is an `Int`.
             let arr: Vec<Value> = b
                 .borrow()
                 .iter()
-                .map(|&x| Value::Number(x as f64))
+                .map(|&x| Value::Int(x as i64))
                 .collect();
             Ok(Value::Array(crate::value::ArrayCell::new(arr)))
         }
@@ -97,10 +98,11 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
             if i < 0.0 || i.fract() != 0.0 {
                 return Ok(Value::Nil);
             }
+            // NUM §4: a byte (0..=255) is an `Int`.
             let out = b
                 .borrow()
                 .get(i as usize)
-                .map(|&x| Value::Number(x as f64))
+                .map(|&x| Value::Int(x as i64))
                 .unwrap_or(Value::Nil);
             Ok(out)
         }
@@ -168,8 +170,9 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 }
             }
             let raw = u64::from_le_bytes(buf);
+            // NUM §4: a read integer is an `Int`.
             if func == "readUint" {
-                Ok(Value::Number(raw as f64))
+                Ok(Value::Int(raw as i64))
             } else {
                 // sign-extend from the top bit of the n-byte value
                 let bits = 8 * n as u32;
@@ -178,7 +181,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
                 } else {
                     raw as i64
                 };
-                Ok(Value::Number(signed as f64))
+                Ok(Value::Int(signed))
             }
         }
         "writeUint" | "writeInt" => {
@@ -265,7 +268,7 @@ mod tests {
         Span::new(0, 0)
     }
     fn num(n: f64) -> Value {
-        Value::Number(n)
+        Value::Float(n)
     }
 
     #[test]

@@ -213,7 +213,20 @@ fn scan_number(chars: &[char], mut i: usize) -> usize {
     }
     if chars[i] == '0' && i + 1 < n && (chars[i + 1] == 'b' || chars[i + 1] == 'B') {
         i += 2;
-        while i < n && (chars[i] == '0' || chars[i] == '1' || chars[i] == '_') {
+        // Scan all ascii digits greedily (not just 0/1): an out-of-base digit
+        // (`0b12`) stays in the SAME token so `parse_number_text` reports
+        // `invalid digit in integer literal` (matches the legacy lexer).
+        while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
+            i += 1;
+        }
+        return i;
+    }
+    // Octal `0o..`/`0O..` (NUM §3.1). Scan the radix body greedily (digit validation
+    // happens in `parse_number_text`, mirroring the hex/binary arms above and the
+    // legacy lexer).
+    if chars[i] == '0' && i + 1 < n && (chars[i + 1] == 'o' || chars[i + 1] == 'O') {
+        i += 2;
+        while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
             i += 1;
         }
         return i;
@@ -274,6 +287,14 @@ fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
             ('/', '=') => Some(SlashEq),
             ('.', '.') => Some(DotDot),
             ('=', '>') => Some(FatArrow),
+            // Bitwise shift + wrapping (NUM §3.2). Longest-match before `<`/`>`/
+            // `+`/`-`/`*`. The lexer always emits `Shr` for `>>`; the type parser
+            // splits a trailing `>>` into two `>` for nested generics.
+            ('<', '<') => Some(Shl),
+            ('>', '>') => Some(Shr),
+            ('+', '%') => Some(PlusPercent),
+            ('-', '%') => Some(MinusPercent),
+            ('*', '%') => Some(StarPercent),
             // `#{` opens a map literal — one token (so `#` alone stays an Error).
             ('#', '{') => Some(HashLBrace),
             _ => None,
@@ -303,6 +324,9 @@ fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
         '<' => Lt,
         '>' => Gt,
         '|' => Pipe,
+        '&' => Amp,
+        '^' => Caret,
+        '~' => Tilde,
         '?' => Question,
         _ => return None,
     };
@@ -576,5 +600,19 @@ mod tests {
             render(&lex("3.14 + 0xFF + 0b1010 + 1_000 + 1e9")),
             "3.14 + 0xFF + 0b1010 + 1_000 + 1e9"
         );
+    }
+
+    #[test]
+    fn octal_literal_is_a_single_number_token() {
+        use SyntaxKind::*;
+        // Regression (NUM §3.1): `0o17` must lex as ONE Number token, not `0` + the
+        // identifier `o17`. The legacy lexer and `parse_number_text` already handle
+        // octal; the CST lexer's `scan_number` must too.
+        assert_eq!(kinds("0o17"), vec![Number]);
+        assert_eq!(kinds("0O755"), vec![Number]);
+        assert_eq!(kinds("0o1_7"), vec![Number]);
+        assert_eq!(render(&lex("0o17 + 0o755")), "0o17 + 0o755");
+        // It must not bleed into a following ident.
+        assert_eq!(kinds("0o17abc"), vec![Number, Ident]);
     }
 }

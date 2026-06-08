@@ -49,8 +49,21 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/math", "sqrt") => 1,
         // std/math — two required numeric args.
         ("std/math", "pow") => 2,
+        // std/math — NUM §4 int → int helpers (fixed required arity).
+        ("std/math", "floordiv") => 2,
+        ("std/math", "divmod") => 2,
+        ("std/math", "ceildiv") => 2,
+        ("std/math", "popcount") => 1,
+        ("std/math", "leading_zeros") => 1,
+        ("std/math", "trailing_zeros") => 1,
+        ("std/math", "rotl") => 2,
+        ("std/math", "rotr") => 2,
         // std/task — pipe requires exactly 2 args (generator + event bus).
         ("std/task", "pipe") => 2,
+        // std/string — NUM code-point helpers (fixed required arity).
+        ("std/string", "codepoints") => 1,
+        ("std/string", "from_codepoints") => 1,
+        ("std/string", "code_at") => 2,
         _ => return None,
     };
     Some(n)
@@ -95,7 +108,18 @@ mod tests {
             ("std/math", "sign"),
             ("std/math", "sqrt"),
             ("std/math", "pow"),
+            ("std/math", "floordiv"),
+            ("std/math", "divmod"),
+            ("std/math", "ceildiv"),
+            ("std/math", "popcount"),
+            ("std/math", "leading_zeros"),
+            ("std/math", "trailing_zeros"),
+            ("std/math", "rotl"),
+            ("std/math", "rotr"),
             ("std/task", "pipe"),
+            ("std/string", "codepoints"),
+            ("std/string", "from_codepoints"),
+            ("std/string", "code_at"),
         ];
         for (module, name) in keys {
             // The entry must actually be in the table.

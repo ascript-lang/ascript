@@ -81,7 +81,10 @@ Serializes an AScript value to a JSON string.
 - `pretty` (boolean or number, optional) — when `true` (or a positive number), emits indented, multi-line output. Defaults to compact output.
 - Returns `[text, err]` — the JSON text, or `nil` plus an error if the value cannot be serialized (e.g. a non-finite number, a function, a non-string map key, or a cyclic structure).
 
-Integer-valued numbers serialize without a trailing `.0` (e.g. `1`, not `1.0`).
+JSON preserves the numeric subtype: an `int` serializes with no decimal (`5`), a `float` always
+serializes with one (`5.0`). `json.parse` mirrors this — a JSON number containing `.` or `e`/`E`
+parses to a `float`, otherwise to an `int` — so `parse ∘ stringify` round-trips the subtype. (An
+integral number outside `int`/`i64` range parses as a `float`, pending `bigint`.)
 
 > [!TIER1] A non-serializable value yields `[nil, err]` rather than panicking.
 
@@ -95,7 +98,7 @@ let [pretty, _] = json.stringify({ n: 2 }, true)
 
 let [out, e] = json.stringify({ f: print })
 // out == nil
-// e   == { message: "cannot serialize a value of type builtin to JSON" }
+// e   == { message: "cannot serialize a value of type function to JSON" }
 ```
 
 ## std/csv

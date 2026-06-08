@@ -172,7 +172,7 @@ pub fn call(
             let bytes = source_bytes(&arg(args, 0), span, &ctx("crc32"))?;
             let mut h = crc32fast::Hasher::new();
             h.update(&bytes);
-            Ok(Value::Number(h.finalize() as f64))
+            Ok(Value::Float(h.finalize() as f64))
         }
         "xxhash" => {
             let bytes = source_bytes(&arg(args, 0), span, &ctx("xxhash"))?;
@@ -245,8 +245,8 @@ mod tests {
 
     #[test]
     fn random_bytes_len_and_distinct() {
-        let a = call("randomBytes", &[Value::Number(16.0)], sp()).unwrap();
-        let b = call("randomBytes", &[Value::Number(16.0)], sp()).unwrap();
+        let a = call("randomBytes", &[Value::Float(16.0)], sp()).unwrap();
+        let b = call("randomBytes", &[Value::Float(16.0)], sp()).unwrap();
         match (&a, &b) {
             (Value::Bytes(ba), Value::Bytes(bb)) => {
                 assert_eq!(ba.borrow().len(), 16);
@@ -261,23 +261,23 @@ mod tests {
     #[test]
     fn random_bytes_bounds_are_tier2() {
         // Negative length is rejected.
-        assert!(call("randomBytes", &[Value::Number(-1.0)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::Float(-1.0)], sp()).is_err());
         // A huge length would saturate `as usize` into an alloc-abort; reject it.
-        assert!(call("randomBytes", &[Value::Number(1e30)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::Float(1e30)], sp()).is_err());
         // Fractional (non-integer) lengths are rejected.
-        assert!(call("randomBytes", &[Value::Number(1.5)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::Float(1.5)], sp()).is_err());
         // Non-finite lengths are rejected.
-        assert!(call("randomBytes", &[Value::Number(f64::NAN)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::Float(f64::NAN)], sp()).is_err());
         // The cap itself is allowed; one past it is not.
-        assert!(call("randomBytes", &[Value::Number(16_777_217.0)], sp()).is_err());
+        assert!(call("randomBytes", &[Value::Float(16_777_217.0)], sp()).is_err());
     }
 
     #[test]
     fn bcrypt_cost_bounds_are_tier2() {
         // bcrypt's valid cost range is 4..=31; out-of-range is a Tier-2 panic.
-        assert!(call("bcryptHash", &[s("pw"), Value::Number(99.0)], sp()).is_err());
-        assert!(call("bcryptHash", &[s("pw"), Value::Number(3.0)], sp()).is_err());
-        assert!(call("bcryptHash", &[s("pw"), Value::Number(4.5)], sp()).is_err());
+        assert!(call("bcryptHash", &[s("pw"), Value::Float(99.0)], sp()).is_err());
+        assert!(call("bcryptHash", &[s("pw"), Value::Float(3.0)], sp()).is_err());
+        assert!(call("bcryptHash", &[s("pw"), Value::Float(4.5)], sp()).is_err());
     }
 
     #[test]
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn bcrypt_custom_cost() {
-        let pair = call("bcryptHash", &[s("pw"), Value::Number(4.0)], sp()).unwrap();
+        let pair = call("bcryptHash", &[s("pw"), Value::Float(4.0)], sp()).unwrap();
         let hash_str = match &pair {
             Value::Array(a) => match &a.borrow()[0] {
                 Value::Str(s) => s.to_string(),
@@ -364,7 +364,7 @@ mod tests {
         let result = call("crc32", &[s("hello")], sp()).unwrap();
         // We'll verify it's the correct CRC-32 value; the exact constant will be
         // confirmed by the implementation (907060870 = 0x3610A686).
-        assert_eq!(result, Value::Number(907060870.0));
+        assert_eq!(result, Value::Float(907060870.0));
         // xxhash returns a 16-char lowercase hex string (xxh64)
         let r = call("xxhash", &[s("hello")], sp()).unwrap();
         if let Value::Str(ref hex_str) = r {
@@ -386,7 +386,7 @@ mod tests {
                 sp()
             )
             .unwrap(),
-            Value::Number(907060870.0)
+            Value::Float(907060870.0)
         );
         // bytes input also works for xxhash
         let r2 = call(
@@ -402,12 +402,12 @@ mod tests {
     #[test]
     fn arg_type_misuse_is_tier2_panic() {
         // A number is not a valid data source → Tier-2 (Control error).
-        assert!(call("sha256", &[Value::Number(42.0)], sp()).is_err());
+        assert!(call("sha256", &[Value::Float(42.0)], sp()).is_err());
         assert!(call("md5", &[Value::Bool(true)], sp()).is_err());
         // hmac with a non-string/bytes key.
-        assert!(call("hmacSha256", &[Value::Number(1.0), s("x")], sp()).is_err());
+        assert!(call("hmacSha256", &[Value::Float(1.0), s("x")], sp()).is_err());
         // The checksum arms reject non-string/bytes input too.
-        assert!(call("crc32", &[Value::Number(1.0)], sp()).is_err());
-        assert!(call("xxhash", &[Value::Number(1.0)], sp()).is_err());
+        assert!(call("crc32", &[Value::Float(1.0)], sp()).is_err());
+        assert!(call("xxhash", &[Value::Float(1.0)], sp()).is_err());
     }
 }

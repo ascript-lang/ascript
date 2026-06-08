@@ -43,7 +43,15 @@ pub enum CheckTy {
     Any,
     /// Internal bottom — the empty type; result of exhaustive narrowing.
     Never,
+    /// The numeric supertype `int | float` (NUM §5). A `: number` annotation, and
+    /// the result of an arithmetic op whose subtype is not provable, are `Number`.
+    /// `Int`/`Float` are its concrete subtypes; `Number` itself is gradual between
+    /// them (assignable to either is `Unknown`, never `No`).
     Number,
+    /// The concrete `int` subtype (NUM §5). An integer literal synths `Int`.
+    Int,
+    /// The concrete `float` subtype (NUM §5). A float literal synths `Float`.
+    Float,
     String,
     Bool,
     Nil,
@@ -97,6 +105,8 @@ impl CheckTy {
                 let name = name.trim();
                 match name {
                     "number" => CheckTy::Number,
+                    "int" => CheckTy::Int,
+                    "float" => CheckTy::Float,
                     "string" => CheckTy::String,
                     "bool" => CheckTy::Bool,
                     "nil" => CheckTy::Nil,
@@ -325,11 +335,41 @@ impl CheckTy {
             };
         }
 
+        // Rule 3a — numeric tower (NUM §5). `Number` is the supertype `int | float`;
+        // `Int`/`Float` are its concrete subtypes. Subtype → supertype is `Yes`;
+        // supertype → a specific subtype is `Unknown` (gradual — a `number` may be
+        // either, so demanding a specific subtype is never *provably* wrong); the two
+        // concrete subtypes are mutually `No` (both provably-concrete-distinct).
+        {
+            let is_numeric = |t: &CheckTy| matches!(t, Number | Int | Float);
+            if is_numeric(self) && is_numeric(dst) {
+                return match (self, dst) {
+                    // reflexive
+                    (Int, Int) | (Float, Float) | (Number, Number) => Compat3::Yes,
+                    // concrete subtype → supertype
+                    (Int, Number) | (Float, Number) => Compat3::Yes,
+                    // supertype → concrete subtype: not provable either way
+                    (Number, Int) | (Number, Float) => Compat3::Unknown,
+                    // distinct concrete subtypes
+                    (Int, Float) | (Float, Int) => Compat3::No,
+                    _ => Compat3::Unknown,
+                };
+            }
+            // A numeric vs a concrete NON-numeric primitive is provably `No`.
+            let concrete_nonnum =
+                |t: &CheckTy| matches!(t, String | Bool | Bytes | Object | Regex | Error | Fn);
+            if (is_numeric(self) && concrete_nonnum(dst))
+                || (concrete_nonnum(self) && is_numeric(dst))
+            {
+                return Compat3::No;
+            }
+        }
+
         // Rule 3 — reflexive / primitive. The concrete primitives.
         let prim = |t: &CheckTy| {
             matches!(
                 t,
-                Number | String | Bool | Bytes | Object | Regex | Error | Fn
+                Number | Int | Float | String | Bool | Bytes | Object | Regex | Error | Fn
             )
         };
         if prim(self) && prim(dst) {
@@ -485,6 +525,8 @@ impl CheckTy {
             Any => "any".into(),
             Never => "never".into(),
             Number => "number".into(),
+            Int => "int".into(),
+            Float => "float".into(),
             String => "string".into(),
             Bool => "bool".into(),
             Nil => "nil".into(),
@@ -557,24 +599,26 @@ fn discriminant_order(t: &CheckTy) -> u32 {
         Any => 0,
         Never => 1,
         Number => 2,
-        String => 3,
-        Bool => 4,
-        Nil => 5,
-        Bytes => 6,
-        Object => 7,
-        Regex => 8,
-        Error => 9,
-        Fn => 10,
-        Array(_) => 11,
-        Map(_, _) => 12,
-        Tuple(_) => 13,
-        Result(_) => 14,
-        Future(_) => 15,
-        Union(_) => 16,
-        Class(_) => 17,
-        Enum(_) => 18,
-        EnumVariant(_, _) => 19,
-        Literal(_) => 20,
+        Int => 3,
+        Float => 4,
+        String => 5,
+        Bool => 6,
+        Nil => 7,
+        Bytes => 8,
+        Object => 9,
+        Regex => 10,
+        Error => 11,
+        Fn => 12,
+        Array(_) => 13,
+        Map(_, _) => 14,
+        Tuple(_) => 15,
+        Result(_) => 16,
+        Future(_) => 17,
+        Union(_) => 18,
+        Class(_) => 19,
+        Enum(_) => 20,
+        EnumVariant(_, _) => 21,
+        Literal(_) => 22,
     }
 }
 

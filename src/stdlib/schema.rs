@@ -219,6 +219,13 @@ fn obj_field(obj: &Value, key: &str) -> Option<Value> {
     }
 }
 
+/// NUM §4: read a numeric constraint field (`min`/`max`/`minLength`/`maxLength`)
+/// as an `f64`, accepting BOTH `Int` and `Float` stored values. A stored `5`
+/// (now an `Int`) must drive the same constraint as a stored `5.0`.
+fn obj_field_num(obj: &Value, key: &str) -> Option<f64> {
+    obj_field(obj, key).and_then(|v| v.as_f64())
+}
+
 // ── Type → schema conversion (used by fromClass) ─────────────────────────────
 
 /// Convert an AScript `Type` annotation to its schema-tagged Object equivalent.
@@ -262,6 +269,8 @@ fn type_to_schema(
     use crate::ast::Type;
     match ty {
         Type::Number => make_schema("number"),
+        Type::Int => make_schema("int"),
+        Type::Float => make_schema("float"),
         Type::String => make_schema("string"),
         Type::Bool => make_schema("bool"),
         Type::Nil => make_schema("nil"),
@@ -464,9 +473,12 @@ impl Interp {
         //   Str("false") → "bool"   : Bool(false)
         let coerced: Option<Value> = if coerce {
             match (kind.as_ref(), value) {
-                ("number", Value::Str(s)) => s.parse::<f64>().ok().map(Value::Number),
-                ("string", Value::Number(n)) => {
-                    Some(Value::Str(Value::Number(*n).to_string().into()))
+                // NUM §4: a parsed-from-string number is a `Float` (it may be
+                // non-integral); a number→string coercion stringifies whichever
+                // numeric subtype it is (`Int` → "5", `Float` → "5.5").
+                ("number", Value::Str(s)) => s.parse::<f64>().ok().map(Value::Float),
+                ("string", n @ (Value::Int(_) | Value::Float(_))) => {
+                    Some(Value::Str(n.to_string().into()))
                 }
                 ("bool", Value::Str(s)) if s.as_ref() == "true" => Some(Value::Bool(true)),
                 ("bool", Value::Str(s)) if s.as_ref() == "false" => Some(Value::Bool(false)),
@@ -495,7 +507,7 @@ impl Interp {
                     Value::Str(s) => {
                         let char_len = s.chars().count();
                         // minLength
-                        if let Some(Value::Number(min)) = obj_field(schema, "minLength") {
+                        if let Some(min) = obj_field_num(schema, "minLength") {
                             if (char_len as f64) < min {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
@@ -507,7 +519,7 @@ impl Interp {
                             }
                         }
                         // maxLength
-                        if let Some(Value::Number(max)) = obj_field(schema, "maxLength") {
+                        if let Some(max) = obj_field_num(schema, "maxLength") {
                             if (char_len as f64) > max {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
@@ -567,29 +579,32 @@ impl Interp {
 
             // ── "number" ──────────────────────────────────────────────────────
             "number" => {
-                match value {
-                    Value::Number(n) => {
+                // NUM §4: the `number` schema accepts BOTH numeric subtypes; bind the
+                // value's `f64` for the min/max constraint comparisons. The displayed
+                // number is the value itself (Int prints `5`, Float `5.0`).
+                match value.as_f64() {
+                    Some(n) => {
                         // min constraint
-                        if let Some(Value::Number(min)) = obj_field(schema, "min") {
-                            if *n < min {
+                        if let Some(min) = obj_field_num(schema, "min") {
+                            if n < min {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
-                                    format!("expected number >= {} (min), got {}", min, n),
+                                    format!("expected number >= {} (min), got {}", min, value),
                                 )));
                             }
                         }
                         // max constraint
-                        if let Some(Value::Number(max)) = obj_field(schema, "max") {
-                            if *n > max {
+                        if let Some(max) = obj_field_num(schema, "max") {
+                            if n > max {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
-                                    format!("expected number <= {} (max), got {}", max, n),
+                                    format!("expected number <= {} (max), got {}", max, value),
                                 )));
                             }
                         }
                         value.clone()
                     }
-                    _ => {
+                    None => {
                         return Err(ParseFail::Mismatch(err_obj(
                             path,
                             format!("expected number, got {}", type_name(value)),
@@ -655,7 +670,7 @@ impl Interp {
                             out.push(v);
                         }
                         // minLength / maxLength on the validated array
-                        if let Some(Value::Number(min)) = obj_field(schema, "minLength") {
+                        if let Some(min) = obj_field_num(schema, "minLength") {
                             if (out.len() as f64) < min {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
@@ -667,7 +682,7 @@ impl Interp {
                                 )));
                             }
                         }
-                        if let Some(Value::Number(max)) = obj_field(schema, "maxLength") {
+                        if let Some(max) = obj_field_num(schema, "maxLength") {
                             if (out.len() as f64) > max {
                                 return Err(ParseFail::Mismatch(err_obj(
                                     path,
@@ -1014,7 +1029,7 @@ impl Interp {
                             }
                         }
                         // minLength / maxLength on the validated array
-                        if let Some(Value::Number(min)) = obj_field(schema, "minLength") {
+                        if let Some(min) = obj_field_num(schema, "minLength") {
                             if (out.len() as f64) < min {
                                 errors.push(err_obj(
                                     path,
@@ -1026,7 +1041,7 @@ impl Interp {
                                 ));
                             }
                         }
-                        if let Some(Value::Number(max)) = obj_field(schema, "maxLength") {
+                        if let Some(max) = obj_field_num(schema, "maxLength") {
                             if (out.len() as f64) > max {
                                 errors.push(err_obj(
                                     path,
@@ -1677,7 +1692,7 @@ mod tests {
         // An object with no __kind, and non-object values, must NOT match.
         let plain = Value::Object(crate::value::ObjectCell::new(IndexMap::new()));
         assert!(!is_schema_value(&plain));
-        assert!(!is_schema_value(&Value::Number(1.0)));
+        assert!(!is_schema_value(&Value::Float(1.0)));
         assert!(!is_schema_value(&Value::Str("string".into())));
         assert!(!is_schema_value(&Value::Nil));
     }
@@ -1730,10 +1745,10 @@ mod tests {
     fn constructor_literal_value() {
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("__kind".to_string(), Value::Str("literal".into()));
-        m.insert("value".to_string(), Value::Number(5.0));
+        m.insert("value".to_string(), Value::Float(5.0));
         let lit = Value::Object(crate::value::ObjectCell::new(m));
         assert_eq!(schema_kind(&lit).as_deref(), Some("literal"));
-        assert_eq!(obj_field(&lit, "value"), Some(Value::Number(5.0)));
+        assert_eq!(obj_field(&lit, "value"), Some(Value::Float(5.0)));
     }
 
     /// Unwrap a `ParseFail::Mismatch` err Object; panic on other variants.
@@ -1760,9 +1775,9 @@ mod tests {
     async fn parse_number_ok() {
         let interp = crate::interp::Interp::new();
         let schema = make_schema("number");
-        let v = Value::Number(42.0);
+        let v = Value::Float(42.0);
         let result = interp.parse_value(&schema, &v, "", false, sp()).await;
-        assert_eq!(result.unwrap(), Value::Number(42.0));
+        assert_eq!(result.unwrap(), Value::Float(42.0));
     }
 
     #[tokio::test]
@@ -1790,10 +1805,10 @@ mod tests {
         let schema = make_schema("any");
         assert_eq!(
             interp
-                .parse_value(&schema, &Value::Number(1.0), "", false, sp())
+                .parse_value(&schema, &Value::Float(1.0), "", false, sp())
                 .await
                 .unwrap(),
-            Value::Number(1.0)
+            Value::Float(1.0)
         );
         assert_eq!(
             interp
@@ -1816,12 +1831,12 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("__kind".to_string(), Value::Str("literal".into()));
-        m.insert("value".to_string(), Value::Number(5.0));
+        m.insert("value".to_string(), Value::Float(5.0));
         let lit = Value::Object(crate::value::ObjectCell::new(m));
         let result = interp
-            .parse_value(&lit, &Value::Number(5.0), "", false, sp())
+            .parse_value(&lit, &Value::Float(5.0), "", false, sp())
             .await;
-        assert_eq!(result.unwrap(), Value::Number(5.0));
+        assert_eq!(result.unwrap(), Value::Float(5.0));
     }
 
     // ── parse_value: failure cases ────────────────────────────────────────────
@@ -1834,7 +1849,7 @@ mod tests {
                                         // Test mismatch: pass a number to a string schema
         let err = mismatch(
             interp
-                .parse_value(&schema, &Value::Number(1.0), "", false, sp())
+                .parse_value(&schema, &Value::Float(1.0), "", false, sp())
                 .await
                 .unwrap_err(),
         );
@@ -1843,7 +1858,8 @@ mod tests {
         match &msg {
             Value::Str(s) => {
                 assert!(s.contains("expected string"), "message was: {}", s);
-                assert!(s.contains("number"), "message was: {}", s);
+                // NUM §4: `type_name(Float)` is now "float".
+                assert!(s.contains("float"), "message was: {}", s);
             }
             _ => panic!("message was not a string: {:?}", msg),
         }
@@ -1879,11 +1895,11 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let mut m: IndexMap<String, Value> = IndexMap::new();
         m.insert("__kind".to_string(), Value::Str("literal".into()));
-        m.insert("value".to_string(), Value::Number(5.0));
+        m.insert("value".to_string(), Value::Float(5.0));
         let lit = Value::Object(crate::value::ObjectCell::new(m));
         let err = mismatch(
             interp
-                .parse_value(&lit, &Value::Number(6.0), "", false, sp())
+                .parse_value(&lit, &Value::Float(6.0), "", false, sp())
                 .await
                 .unwrap_err(),
         );
@@ -1900,7 +1916,7 @@ mod tests {
         // NOT a Mismatch — so 6b recursion can't swallow it as validation error.
         let interp = crate::interp::Interp::new();
         let mut m: IndexMap<String, Value> = IndexMap::new();
-        m.insert("a".to_string(), Value::Number(1.0));
+        m.insert("a".to_string(), Value::Float(1.0));
         let bad = Value::Object(crate::value::ObjectCell::new(m));
         let err = interp
             .parse_value(&bad, &Value::Nil, "", false, sp())
@@ -1976,7 +1992,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let schema = interp.call_schema("nilType", &[], sp()).await.unwrap();
         let pair = interp
-            .call_schema("parse", &[schema, Value::Number(1.0)], sp())
+            .call_schema("parse", &[schema, Value::Float(1.0)], sp())
             .await
             .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
@@ -1993,19 +2009,19 @@ mod tests {
         let lit = {
             let mut m: IndexMap<String, Value> = IndexMap::new();
             m.insert("__kind".to_string(), Value::Str("literal".into()));
-            m.insert("value".to_string(), Value::Number(5.0));
+            m.insert("value".to_string(), Value::Float(5.0));
             Value::Object(crate::value::ObjectCell::new(m))
         };
         // 5 == 5 → ok
         let pair = interp
-            .call_schema("parse", &[lit.clone(), Value::Number(5.0)], sp())
+            .call_schema("parse", &[lit.clone(), Value::Float(5.0)], sp())
             .await
             .unwrap();
-        assert_eq!(ok_val(&pair), Value::Number(5.0));
+        assert_eq!(ok_val(&pair), Value::Float(5.0));
         assert_eq!(err_val(&pair), Value::Nil);
         // 6 != 5 → err
         let pair2 = interp
-            .call_schema("parse", &[lit, Value::Number(6.0)], sp())
+            .call_schema("parse", &[lit, Value::Float(6.0)], sp())
             .await
             .unwrap();
         assert_eq!(ok_val(&pair2), Value::Nil);
@@ -2018,10 +2034,10 @@ mod tests {
         let schema = make_schema("any");
         // number
         let p1 = interp
-            .call_schema("parse", &[schema.clone(), Value::Number(1.0)], sp())
+            .call_schema("parse", &[schema.clone(), Value::Float(1.0)], sp())
             .await
             .unwrap();
-        assert_eq!(ok_val(&p1), Value::Number(1.0));
+        assert_eq!(ok_val(&p1), Value::Float(1.0));
         // string
         let p2 = interp
             .call_schema("parse", &[schema, Value::Str("x".into())], sp())
@@ -2036,19 +2052,19 @@ mod tests {
         // An Object without __kind → Tier-2 panic.
         let bad_obj = {
             let mut m: IndexMap<String, Value> = IndexMap::new();
-            m.insert("a".to_string(), Value::Number(1.0));
+            m.insert("a".to_string(), Value::Float(1.0));
             Value::Object(crate::value::ObjectCell::new(m))
         };
         // Non-Object schema args must ALSO panic (string / number / nil).
         let candidates = [
             bad_obj,
             Value::Str("not a schema".into()),
-            Value::Number(3.0),
+            Value::Float(3.0),
             Value::Nil,
         ];
         for schema in candidates {
             let result = interp
-                .call_schema("parse", &[schema.clone(), Value::Number(1.0)], sp())
+                .call_schema("parse", &[schema.clone(), Value::Float(1.0)], sp())
                 .await;
             assert!(
                 matches!(result, Err(Control::Panic(_))),
@@ -2072,8 +2088,8 @@ mod tests {
             .unwrap();
         // [1, 2] → ok
         let arr = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
+            Value::Float(1.0),
+            Value::Float(2.0),
         ]));
         let pair = interp
             .call_schema("parse", &[arr_schema, arr], sp())
@@ -2092,7 +2108,7 @@ mod tests {
             .unwrap();
         // [1, "x"] → err path "[1]"
         let arr = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Number(1.0),
+            Value::Float(1.0),
             Value::Str("x".into()),
         ]));
         let pair = interp
@@ -2147,7 +2163,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let fields = make_fields_obj(&[("a", make_schema("number")), ("b", make_schema("string"))]);
         let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
-        let value = make_value_obj(&[("a", Value::Number(1.0)), ("b", Value::Str("x".into()))]);
+        let value = make_value_obj(&[("a", Value::Float(1.0)), ("b", Value::Str("x".into()))]);
         let pair = interp
             .call_schema("parse", &[obj_schema, value], sp())
             .await
@@ -2161,7 +2177,7 @@ mod tests {
         let fields = make_fields_obj(&[("a", make_schema("number")), ("b", make_schema("string"))]);
         let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
         // b is a number but schema expects string
-        let value = make_value_obj(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        let value = make_value_obj(&[("a", Value::Float(1.0)), ("b", Value::Float(2.0))]);
         let pair = interp
             .call_schema("parse", &[obj_schema, value], sp())
             .await
@@ -2187,7 +2203,7 @@ mod tests {
             .await
             .unwrap();
         // user.name is a number (bad)
-        let inner_val = make_value_obj(&[("name", Value::Number(42.0))]);
+        let inner_val = make_value_obj(&[("name", Value::Float(42.0))]);
         let value = make_value_obj(&[("user", inner_val)]);
         let pair = interp
             .call_schema("parse", &[outer_schema, value], sp())
@@ -2204,7 +2220,7 @@ mod tests {
         let fields = make_fields_obj(&[("a", make_schema("number"))]);
         let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
         // extra key "b" should be ignored
-        let value = make_value_obj(&[("a", Value::Number(1.0)), ("b", Value::Str("extra".into()))]);
+        let value = make_value_obj(&[("a", Value::Float(1.0)), ("b", Value::Str("extra".into()))]);
         let pair = interp
             .call_schema("parse", &[obj_schema, value], sp())
             .await
@@ -2218,7 +2234,7 @@ mod tests {
         let fields = make_fields_obj(&[("a", make_schema("number"))]);
         let obj_schema = interp.call_schema("object", &[fields], sp()).await.unwrap();
         let pair = interp
-            .call_schema("parse", &[obj_schema, Value::Number(5.0)], sp())
+            .call_schema("parse", &[obj_schema, Value::Float(5.0)], sp())
             .await
             .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
@@ -2241,7 +2257,7 @@ mod tests {
             .await
             .unwrap();
         // a=1 and b=2 (extra) → error
-        let value = make_value_obj(&[("a", Value::Number(1.0)), ("b", Value::Number(2.0))]);
+        let value = make_value_obj(&[("a", Value::Float(1.0)), ("b", Value::Float(2.0))]);
         let pair = interp
             .call_schema("parse", &[strict_schema, value], sp())
             .await
@@ -2267,7 +2283,7 @@ mod tests {
             .call_schema("strict", &[obj_schema], sp())
             .await
             .unwrap();
-        let value = make_value_obj(&[("a", Value::Number(1.0))]);
+        let value = make_value_obj(&[("a", Value::Float(1.0))]);
         let pair = interp
             .call_schema("parse", &[strict_schema, value], sp())
             .await
@@ -2303,10 +2319,10 @@ mod tests {
             .await
             .unwrap();
         let pair = interp
-            .call_schema("parse", &[opt_schema, Value::Number(5.0)], sp())
+            .call_schema("parse", &[opt_schema, Value::Float(5.0)], sp())
             .await
             .unwrap();
-        assert_eq!(ok_val(&pair), Value::Number(5.0));
+        assert_eq!(ok_val(&pair), Value::Float(5.0));
         assert_eq!(err_val(&pair), Value::Nil);
     }
 
@@ -2357,10 +2373,10 @@ mod tests {
         let union_schema = interp.call_schema("union", &[options], sp()).await.unwrap();
         // number 5 matches second option
         let pair = interp
-            .call_schema("parse", &[union_schema, Value::Number(5.0)], sp())
+            .call_schema("parse", &[union_schema, Value::Float(5.0)], sp())
             .await
             .unwrap();
-        assert_eq!(ok_val(&pair), Value::Number(5.0));
+        assert_eq!(ok_val(&pair), Value::Float(5.0));
         assert_eq!(err_val(&pair), Value::Nil);
     }
 
@@ -2420,7 +2436,7 @@ mod tests {
             .await
             .unwrap();
         // Object {"k": 1} → coerced to map at boundary
-        let value = make_value_obj(&[("k", Value::Number(1.0))]);
+        let value = make_value_obj(&[("k", Value::Float(1.0))]);
         let pair = interp
             .call_schema("parse", &[map_schema, value], sp())
             .await
@@ -2455,7 +2471,7 @@ mod tests {
             .call_schema("map", &[make_schema("number"), make_schema("number")], sp())
             .await
             .unwrap();
-        let value = make_value_obj(&[("k", Value::Number(1.0))]);
+        let value = make_value_obj(&[("k", Value::Float(1.0))]);
         let pair = interp
             .call_schema("parse", &[map_schema, value], sp())
             .await
@@ -2487,7 +2503,7 @@ mod tests {
         // First option is a malformed sub-schema (raw object, no __kind); union
         // must NOT swallow it as a mismatch — it must propagate InvalidSchema,
         // which surfaces at the parse boundary as a Tier-2 Control::Panic.
-        let bad_sub = make_value_obj(&[("foo", Value::Number(1.0))]); // no __kind
+        let bad_sub = make_value_obj(&[("foo", Value::Float(1.0))]); // no __kind
         let options = make_array_val(vec![bad_sub, make_schema("number")]);
         let union_schema = interp.call_schema("union", &[options], sp()).await.unwrap();
         let result = interp
@@ -2512,15 +2528,15 @@ mod tests {
         // schema.min(schema.number(), 5.0) — value 10 is >= 5
         let num = make_schema("number");
         let s = interp
-            .call_schema("min", &[num, Value::Number(5.0)], sp())
+            .call_schema("min", &[num, Value::Float(5.0)], sp())
             .await
             .unwrap();
         let pair = interp
-            .call_schema("parse", &[s, Value::Number(10.0)], sp())
+            .call_schema("parse", &[s, Value::Float(10.0)], sp())
             .await
             .unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
-        assert_eq!(ok_val(&pair), Value::Number(10.0));
+        assert_eq!(ok_val(&pair), Value::Float(10.0));
     }
 
     #[tokio::test]
@@ -2528,11 +2544,11 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let num = make_schema("number");
         let s = interp
-            .call_schema("min", &[num, Value::Number(5.0)], sp())
+            .call_schema("min", &[num, Value::Float(5.0)], sp())
             .await
             .unwrap();
         let pair = interp
-            .call_schema("parse", &[s, Value::Number(3.0)], sp())
+            .call_schema("parse", &[s, Value::Float(3.0)], sp())
             .await
             .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
@@ -2553,11 +2569,11 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let num = make_schema("number");
         let s = interp
-            .call_schema("max", &[num, Value::Number(10.0)], sp())
+            .call_schema("max", &[num, Value::Float(10.0)], sp())
             .await
             .unwrap();
         let pair = interp
-            .call_schema("parse", &[s, Value::Number(7.0)], sp())
+            .call_schema("parse", &[s, Value::Float(7.0)], sp())
             .await
             .unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
@@ -2568,11 +2584,11 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let num = make_schema("number");
         let s = interp
-            .call_schema("max", &[num, Value::Number(10.0)], sp())
+            .call_schema("max", &[num, Value::Float(10.0)], sp())
             .await
             .unwrap();
         let pair = interp
-            .call_schema("parse", &[s, Value::Number(15.0)], sp())
+            .call_schema("parse", &[s, Value::Float(15.0)], sp())
             .await
             .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
@@ -2591,7 +2607,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let str_s = make_schema("string");
         let s = interp
-            .call_schema("minLength", &[str_s, Value::Number(3.0)], sp())
+            .call_schema("minLength", &[str_s, Value::Float(3.0)], sp())
             .await
             .unwrap();
         let pair = interp
@@ -2606,7 +2622,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let str_s = make_schema("string");
         let s = interp
-            .call_schema("minLength", &[str_s, Value::Number(5.0)], sp())
+            .call_schema("minLength", &[str_s, Value::Float(5.0)], sp())
             .await
             .unwrap();
         let pair = interp
@@ -2631,7 +2647,7 @@ mod tests {
         let interp = crate::interp::Interp::new();
         let str_s = make_schema("string");
         let s = interp
-            .call_schema("maxLength", &[str_s, Value::Number(3.0)], sp())
+            .call_schema("maxLength", &[str_s, Value::Float(3.0)], sp())
             .await
             .unwrap();
         let pair = interp
@@ -2661,12 +2677,12 @@ mod tests {
             .await
             .unwrap();
         let s = interp
-            .call_schema("minLength", &[arr_s, Value::Number(2.0)], sp())
+            .call_schema("minLength", &[arr_s, Value::Float(2.0)], sp())
             .await
             .unwrap();
         let arr = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Number(1.0),
-            Value::Number(2.0),
+            Value::Float(1.0),
+            Value::Float(2.0),
         ]));
         let pair = interp.call_schema("parse", &[s, arr], sp()).await.unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
@@ -2680,10 +2696,10 @@ mod tests {
             .await
             .unwrap();
         let s = interp
-            .call_schema("minLength", &[arr_s, Value::Number(3.0)], sp())
+            .call_schema("minLength", &[arr_s, Value::Float(3.0)], sp())
             .await
             .unwrap();
-        let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(1.0)]));
+        let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(1.0)]));
         let pair = interp.call_schema("parse", &[s, arr], sp()).await.unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
         let msg = match field(&err_val(&pair), "message") {
@@ -2786,11 +2802,11 @@ mod tests {
             .await
             .unwrap();
         let pair = interp
-            .call_schema("parse", &[s, Value::Number(5.0)], sp())
+            .call_schema("parse", &[s, Value::Float(5.0)], sp())
             .await
             .unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
-        assert_eq!(ok_val(&pair), Value::Number(5.0));
+        assert_eq!(ok_val(&pair), Value::Float(5.0));
     }
 
     #[tokio::test]
@@ -2833,7 +2849,7 @@ mod tests {
             .await
             .unwrap();
         let pair = interp
-            .call_schema("parse", &[s, Value::Number(5.0)], sp())
+            .call_schema("parse", &[s, Value::Float(5.0)], sp())
             .await
             .unwrap();
         assert_eq!(ok_val(&pair), Value::Nil);
@@ -2897,7 +2913,7 @@ mod tests {
             .unwrap();
         // parse should return Err(Control::Panic(...)), not Ok([nil, err])
         let result = interp
-            .call_schema("parse", &[s, Value::Number(5.0)], sp())
+            .call_schema("parse", &[s, Value::Float(5.0)], sp())
             .await;
         assert!(
             matches!(result, Err(Control::Panic(_))),
@@ -2974,7 +2990,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
-        assert_eq!(ok_val(&pair), Value::Number(42.0));
+        assert_eq!(ok_val(&pair), Value::Float(42.0));
     }
 
     #[tokio::test]
@@ -2996,7 +3012,7 @@ mod tests {
         let str_s = make_schema("string");
         let opts = make_options_obj(&[("coerce", Value::Bool(true))]);
         let pair = interp
-            .call_schema("parse", &[str_s, Value::Number(1.5), opts], sp())
+            .call_schema("parse", &[str_s, Value::Float(1.5), opts], sp())
             .await
             .unwrap();
         assert_eq!(err_val(&pair), Value::Nil);
@@ -3090,9 +3106,9 @@ mod tests {
         ]);
         // all three wrong types
         let value = val_obj(&[
-            ("a", Value::Number(1.0)),
+            ("a", Value::Float(1.0)),
             ("b", Value::Str("x".into())),
-            ("c", Value::Number(2.0)),
+            ("c", Value::Float(2.0)),
         ]);
         let pair = interp
             .call_schema("parseAll", &[schema, value], sp())
@@ -3111,7 +3127,7 @@ mod tests {
     async fn parse_all_success_returns_value_nil_errors() {
         let interp = crate::interp::Interp::new();
         let schema = obj_schema(&[("a", make_schema("string")), ("b", make_schema("number"))]);
-        let value = val_obj(&[("a", Value::Str("hi".into())), ("b", Value::Number(2.0))]);
+        let value = val_obj(&[("a", Value::Str("hi".into())), ("b", Value::Float(2.0))]);
         let pair = interp
             .call_schema("parseAll", &[schema, value], sp())
             .await
@@ -3132,11 +3148,11 @@ mod tests {
         let schema = obj_schema(&[("user", user_schema), ("tags", arr_schema)]);
 
         let value = val_obj(&[
-            ("user", val_obj(&[("name", Value::Number(7.0))])),
+            ("user", val_obj(&[("name", Value::Float(7.0))])),
             (
                 "tags",
                 Value::Array(crate::value::ArrayCell::new(vec![
-                    Value::Number(1.0),
+                    Value::Float(1.0),
                     Value::Str("bad".into()),
                 ])),
             ),
@@ -3168,9 +3184,9 @@ mod tests {
             ("c", make_schema("string")),
         ]);
         let value = val_obj(&[
-            ("a", Value::Number(1.0)),
+            ("a", Value::Float(1.0)),
             ("b", Value::Str("x".into())),
-            ("c", Value::Number(2.0)),
+            ("c", Value::Float(2.0)),
         ]);
         let pair = interp
             .call_schema("parse", &[schema, value], sp())
@@ -3194,7 +3210,7 @@ mod tests {
         // object with a field whose schema is a non-schema object (no __kind)
         let bad_field = Value::Object(crate::value::ObjectCell::new(IndexMap::new()));
         let schema = obj_schema(&[("a", bad_field)]);
-        let value = val_obj(&[("a", Value::Number(1.0))]);
+        let value = val_obj(&[("a", Value::Float(1.0))]);
         let res = interp.call_schema("parseAll", &[schema, value], sp()).await;
         assert!(res.is_err(), "malformed nested schema must escalate, not collect");
     }

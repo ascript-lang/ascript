@@ -228,7 +228,7 @@ mod tests {
     }
 
     fn nv(n: f64) -> Value {
-        Value::Number(n)
+        Value::Float(n)
     }
 
     // ---- sgr helper (env-independent) ----

@@ -645,6 +645,16 @@ impl Vm {
                 | Op::Eq
                 | Op::Ne
                 | Op::InstanceOf
+                // Bitwise/shift/wrapping (NUM §3.2) — int-only ops dispatched
+                // through the SAME shared `apply_binop` as everything else.
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::WrapAdd
+                | Op::WrapSub
+                | Op::WrapMul
                 | Op::Range => {
                     // The two operands were pushed lhs-then-rhs, so pop rhs first.
                     // The op's span anchors any Tier-2 panic so the VM's
@@ -663,6 +673,37 @@ impl Vm {
                     // guarded so it can never diverge from the generic result.
                     let v = self.eval_binop_adaptive(fiber, fault_ip, binop, a, b)?;
                     fiber.push(v);
+                }
+
+                Op::InstanceOfType => {
+                    // `x instanceof int|float|number|string|bool` (NUM §6). The RHS is
+                    // a reserved scalar type NAME (a string const), pre-resolved at
+                    // compile time — the operand is NOT a value on the stack. Pop the
+                    // subject and run the SAME subtype check the tree-walker uses, so
+                    // the two engines are byte-identical.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("INSTANCE_OF_TYPE name is not a string constant: {other:?}"),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let yes = match crate::interp::instanceof_reserved_type(&subject, &name) {
+                        Some(b) => b,
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("INSTANCE_OF_TYPE unknown reserved type name '{name}'"),
+                            ))
+                        }
+                    };
+                    fiber.push(Value::Bool(yes));
                 }
 
                 Op::RangeInclusive => {
@@ -689,22 +730,15 @@ impl Vm {
                     let step = fiber.pop();
                     let hi = fiber.pop();
                     let lo = fiber.pop();
-                    let step_v = if present {
-                        match step {
-                            Value::Number(s) => Some(s),
-                            _ => {
-                                return Err(self.panic_at(
-                                    fiber,
-                                    fault_ip,
-                                    "range step must be a number".to_string(),
-                                ))
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                    // The SHARED stepped materializer preserves the step's KIND (an Int
+                    // bounds + Int step range yields Int elements; a Float step or
+                    // Float bound yields Float), so pass the step `Value` through when
+                    // present and `None` for the omitted-default placeholder. Direction,
+                    // validation, and panic messages are byte-identical to the
+                    // tree-walker's value-position `..`/`..=`.
+                    let step_arg = if present { Some(&step) } else { None };
                     let v = crate::interp::materialize_range_stepped(
-                        &lo, &hi, inclusive, step_v, span,
+                        &lo, &hi, inclusive, step_arg, span,
                     )?;
                     fiber.push(v);
                 }
@@ -717,19 +751,27 @@ impl Vm {
                     let present = fiber.frame().closure.proto.chunk.read_u8(operand_at) == 1;
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let step = fiber.pop();
-                    // Peek lo/hi without disturbing them (they stay on the stack).
-                    let hi = match fiber.peek(0) {
-                        Value::Number(n) => *n,
-                        _ => unreachable!("RANGE_RESOLVE_STEP hi must be a number (CHECK_NUMBERS)"),
+                    // Peek lo/hi without disturbing them (they stay on the stack). NUM
+                    // §4: accept Int OR Float bounds; track Int-ness so the resolved
+                    // step (and thus the `Op::Add`-driven counter) stays Int when the
+                    // bounds + step are all Int — byte-identical to the tree-walker's
+                    // `range_counter_value`.
+                    let hi_v = fiber.peek(0);
+                    let hi = match hi_v.as_f64() {
+                        Some(n) => n,
+                        None => unreachable!("RANGE_RESOLVE_STEP hi must be a number (CHECK_NUMBERS)"),
                     };
-                    let lo = match fiber.peek(1) {
-                        Value::Number(n) => *n,
-                        _ => unreachable!("RANGE_RESOLVE_STEP lo must be a number (CHECK_NUMBERS)"),
+                    let hi_int = hi_v.is_int_value();
+                    let lo_v = fiber.peek(1);
+                    let lo = match lo_v.as_f64() {
+                        Some(n) => n,
+                        None => unreachable!("RANGE_RESOLVE_STEP lo must be a number (CHECK_NUMBERS)"),
                     };
-                    let step_v = if present {
-                        match step {
-                            Value::Number(s) => Some(s),
-                            _ => {
+                    let lo_int = lo_v.is_int_value();
+                    let (step_v, step_int) = if present {
+                        match step.as_f64() {
+                            Some(s) => (Some(s), step.is_int_value()),
+                            None => {
                                 return Err(self.panic_at(
                                     fiber,
                                     fault_ip,
@@ -738,10 +780,12 @@ impl Vm {
                             }
                         }
                     } else {
-                        None
+                        // Omitted step is the integral `±1`.
+                        (None, true)
                     };
                     let resolved = crate::interp::resolve_step(lo, hi, step_v, span)?;
-                    fiber.push(Value::Number(resolved));
+                    let yields_int = lo_int && hi_int && step_int;
+                    fiber.push(crate::interp::range_counter_value(resolved, yields_int));
                 }
 
                 Op::RangeHasNext => {
@@ -753,16 +797,16 @@ impl Vm {
                     let step = fiber.pop();
                     let hi = fiber.pop();
                     let i = fiber.pop();
-                    let ok = match (&i, &hi, &step) {
-                        (Value::Number(i), Value::Number(hi), Value::Number(step)) => {
-                            crate::interp::range_has_next(*i, *hi, *step, inclusive)
+                    let ok = match (i.as_f64(), hi.as_f64(), step.as_f64()) {
+                        (Some(i), Some(hi), Some(step)) => {
+                            crate::interp::range_has_next(i, hi, step, inclusive)
                         }
                         _ => unreachable!("RANGE_HAS_NEXT operands must be numbers"),
                     };
                     fiber.push(Value::Bool(ok));
                 }
 
-                Op::Neg | Op::Not => {
+                Op::Neg | Op::Not | Op::BitNot => {
                     let a = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = crate::interp::apply_unop(unop_of(op), a, span)?;
@@ -1489,6 +1533,32 @@ impl Vm {
                     }
                 }
 
+                Op::CheckLocal => {
+                    // Contract-check the just-evaluated initializer (TOS, left in
+                    // place) of an annotated `let`/`const` against its declared type,
+                    // byte-identical to the tree-walker's `Stmt::Let` check (same
+                    // message; span = the initializer EXPRESSION's span, which is this
+                    // op's own span). The operand indexes the chunk's `type_consts`
+                    // side-pool. The compiler emits CHECK_LOCAL only for an annotated
+                    // binding, so a type is always present at this index.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let ty = match fiber.frame().closure.proto.chunk.type_consts.get(idx) {
+                        Some(ty) => ty.clone(),
+                        None => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CHECK_LOCAL type-const index {idx} out of range"),
+                            ))
+                        }
+                    };
+                    let v = fiber.peek(0).clone();
+                    if !crate::interp::check_type(&v, &ty) {
+                        return Err(crate::interp::contract_panic(&ty, &v, span));
+                    }
+                }
+
                 Op::NewArray => {
                     // Pop `n` elements (pushed in source order, so the last
                     // pushed is on top) into a Vec preserving source order, then
@@ -1828,8 +1898,8 @@ impl Vm {
                     // the panic is byte-identical to the tree-walker's
                     // `Stmt::ForRange` ("for-range bounds must be numbers" at
                     // `start.span`).
-                    let end_ok = matches!(fiber.peek(0), Value::Number(_));
-                    let start_ok = matches!(fiber.peek(1), Value::Number(_));
+                    let end_ok = fiber.peek(0).is_number();
+                    let start_ok = fiber.peek(1).is_number();
                     if !(end_ok && start_ok) {
                         return Err(self.panic_at(
                             fiber,
@@ -1880,7 +1950,7 @@ impl Vm {
                     match v {
                         Value::Array(arr) => {
                             let len = arr.borrow().len();
-                            fiber.push(Value::Number(len as f64));
+                            fiber.push(Value::Float(len as f64));
                         }
                         other => {
                             return Err(self.panic_at(
@@ -2345,12 +2415,14 @@ impl Vm {
                     let hi = fiber.pop();
                     let lo = fiber.pop();
                     let subject = fiber.pop();
-                    let ok = match (&subject, &lo, &hi) {
-                        (Value::Number(n), Value::Number(lo), Value::Number(hi)) => {
+                    // NUM §4: a number subject/bound is Int OR Float (exact-on-f64
+                    // membership); a non-number subject/bound is a non-panic mismatch.
+                    let ok = match (subject.as_f64(), lo.as_f64(), hi.as_f64()) {
+                        (Some(n), Some(lo), Some(hi)) => {
                             let step_v = if present {
-                                match step {
-                                    Value::Number(s) => Some(s),
-                                    _ => {
+                                match step.as_f64() {
+                                    Some(s) => Some(s),
+                                    None => {
                                         return Err(self.panic_at(
                                             fiber,
                                             fault_ip,
@@ -2367,9 +2439,9 @@ impl Vm {
                             // no-stride behavior via the raw `Option`.
                             if step_v.is_some() {
                                 let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
-                                crate::interp::resolve_step(*lo, *hi, step_v, span)?;
+                                crate::interp::resolve_step(lo, hi, step_v, span)?;
                             }
-                            crate::interp::range_pattern_contains(*n, *lo, *hi, step_v, inclusive)
+                            crate::interp::range_pattern_contains(n, lo, hi, step_v, inclusive)
                         }
                         _ => false,
                     };
@@ -3777,7 +3849,15 @@ impl Vm {
         // path, on a miss DEOPT and fall to generic.
         if let Some(kind) = cache.specialized() {
             match (kind, &a, &b) {
-                (ArithKind::Number, Value::Number(x), Value::Number(y)) => {
+                (ArithKind::Int, Value::Int(x), Value::Int(y)) => {
+                    // SAME i64 arithmetic + checked-overflow/div-by-zero panics as
+                    // apply_binop's int arm — delegated to the shared `int_binop`
+                    // so the two paths cannot drift (NUM §7). The span is needed
+                    // for the panic message.
+                    let span = chunk.span_at(fault_ip);
+                    return crate::interp::int_binop(op, *x, *y, span);
+                }
+                (ArithKind::Number, Value::Float(x), Value::Float(y)) => {
                     // SAME f64 arithmetic as apply_binop's final numeric arm.
                     return Ok(number_fast(op, *x, *y));
                 }
@@ -3807,7 +3887,8 @@ impl Vm {
         // Not specialized yet: OBSERVE this execution's operand kinds (warmup),
         // then run the generic path (the result is identical regardless of warmup).
         let observed = match (&a, &b) {
-            (Value::Number(_), Value::Number(_)) => Some(ArithKind::Number),
+            (Value::Int(_), Value::Int(_)) => Some(ArithKind::Int),
+            (Value::Float(_), Value::Float(_)) => Some(ArithKind::Number),
             (Value::Decimal(_), Value::Decimal(_)) if ArithCache::decimal_specializable(op) => {
                 Some(ArithKind::Decimal)
             }
@@ -4290,6 +4371,14 @@ fn binop_of(op: Op) -> BinOp {
         Op::Ne => BinOp::Ne,
         Op::Range => BinOp::Range,
         Op::InstanceOf => BinOp::InstanceOf,
+        Op::BitAnd => BinOp::BitAnd,
+        Op::BitOr => BinOp::BitOr,
+        Op::BitXor => BinOp::BitXor,
+        Op::Shl => BinOp::Shl,
+        Op::Shr => BinOp::Shr,
+        Op::WrapAdd => BinOp::WrapAdd,
+        Op::WrapSub => BinOp::WrapSub,
+        Op::WrapMul => BinOp::WrapMul,
         _ => unreachable!("binop_of called with non-binary opcode {op:?}"),
     }
 }
@@ -4302,12 +4391,12 @@ fn binop_of(op: Op) -> BinOp {
 #[inline]
 fn number_fast(op: BinOp, a: f64, b: f64) -> Value {
     match op {
-        BinOp::Add => Value::Number(a + b),
-        BinOp::Sub => Value::Number(a - b),
-        BinOp::Mul => Value::Number(a * b),
-        BinOp::Div => Value::Number(a / b),
-        BinOp::Mod => Value::Number(a % b),
-        BinOp::Pow => Value::Number(a.powf(b)),
+        BinOp::Add => Value::Float(a + b),
+        BinOp::Sub => Value::Float(a - b),
+        BinOp::Mul => Value::Float(a * b),
+        BinOp::Div => Value::Float(a / b),
+        BinOp::Mod => Value::Float(a % b),
+        BinOp::Pow => Value::Float(a.powf(b)),
         _ => unreachable!("number_fast called with non-arithmetic op {op:?}"),
     }
 }
@@ -4333,6 +4422,7 @@ fn unop_of(op: Op) -> UnOp {
     match op {
         Op::Neg => UnOp::Neg,
         Op::Not => UnOp::Not,
+        Op::BitNot => UnOp::BitNot,
         _ => unreachable!("unop_of called with non-unary opcode {op:?}"),
     }
 }
@@ -4376,7 +4466,7 @@ mod tests {
 
     fn expect_number(chunk: Chunk) -> f64 {
         match run_chunk(chunk).expect("run ok") {
-            RunOutcome::Done(Value::Number(n)) => n,
+            RunOutcome::Done(Value::Float(n)) => n,
             other => panic!("expected Done(Number), got {other:?}"),
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
@@ -4401,9 +4491,9 @@ mod tests {
     fn arithmetic_one_plus_two_times_four() {
         // (1 + 2) * 4 == 12
         let mut c = Chunk::new();
-        let k1 = c.add_const(Value::Number(1.0));
-        let k2 = c.add_const(Value::Number(2.0));
-        let k4 = c.add_const(Value::Number(4.0));
+        let k1 = c.add_const(Value::Float(1.0));
+        let k2 = c.add_const(Value::Float(2.0));
+        let k4 = c.add_const(Value::Float(4.0));
         c.emit_u16(Op::Const, k1, s());
         c.emit_u16(Op::Const, k2, s());
         c.emit(Op::Add, s());
@@ -4416,7 +4506,7 @@ mod tests {
     #[test]
     fn negate() {
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Number(5.0));
+        let k = c.add_const(Value::Float(5.0));
         c.emit_u16(Op::Const, k, s());
         c.emit(Op::Neg, s());
         c.emit(Op::Return, s());
@@ -4426,8 +4516,8 @@ mod tests {
     #[test]
     fn modulo() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Number(7.0));
-        let b = c.add_const(Value::Number(3.0));
+        let a = c.add_const(Value::Float(7.0));
+        let b = c.add_const(Value::Float(3.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Mod, s());
@@ -4438,8 +4528,8 @@ mod tests {
     #[test]
     fn power() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Number(2.0));
-        let b = c.add_const(Value::Number(10.0));
+        let a = c.add_const(Value::Float(2.0));
+        let b = c.add_const(Value::Float(10.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Pow, s());
@@ -4450,8 +4540,8 @@ mod tests {
     #[test]
     fn less_than_true() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Number(1.0));
-        let b = c.add_const(Value::Number(2.0));
+        let a = c.add_const(Value::Float(1.0));
+        let b = c.add_const(Value::Float(2.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Lt, s());
@@ -4477,8 +4567,8 @@ mod tests {
     #[test]
     fn eq_numbers() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Number(3.0));
-        let b = c.add_const(Value::Number(3.0));
+        let a = c.add_const(Value::Float(3.0));
+        let b = c.add_const(Value::Float(3.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Eq, s());
@@ -4518,7 +4608,7 @@ mod tests {
     fn add_non_numbers_panics() {
         let mut c = Chunk::new();
         let a = c.add_const(Value::Str(Rc::from("a")));
-        let b = c.add_const(Value::Number(1.0));
+        let b = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, a, s());
         c.emit_u16(Op::Const, b, s());
         c.emit(Op::Add, s());
@@ -4627,7 +4717,7 @@ mod tests {
         // as the tree-walker's `decimal_cross_eq`.
         let mut c = Chunk::new();
         let kd = c.add_const(dec("1"));
-        let kn = c.add_const(Value::Number(1.0));
+        let kn = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, kd, s());
         c.emit_u16(Op::Const, kn, s());
         c.emit(Op::Eq, s());
@@ -4642,8 +4732,8 @@ mod tests {
     fn range_op_builds_half_open_array() {
         // 0 .. 5 → [0, 1, 2, 3, 4].
         let mut c = Chunk::new();
-        let k0 = c.add_const(Value::Number(0.0));
-        let k5 = c.add_const(Value::Number(5.0));
+        let k0 = c.add_const(Value::Float(0.0));
+        let k5 = c.add_const(Value::Float(5.0));
         c.emit_u16(Op::Const, k0, s());
         c.emit_u16(Op::Const, k5, s());
         c.emit(Op::Range, s());
@@ -4654,7 +4744,7 @@ mod tests {
                     .borrow()
                     .iter()
                     .map(|v| match v {
-                        Value::Number(n) => *n,
+                        Value::Float(n) => *n,
                         other => panic!("non-number in range array: {other:?}"),
                     })
                     .collect();
@@ -4668,7 +4758,7 @@ mod tests {
     fn range_op_non_number_bounds_panics() {
         let mut c = Chunk::new();
         let ks = c.add_const(Value::Str(Rc::from("x")));
-        let k5 = c.add_const(Value::Number(5.0));
+        let k5 = c.add_const(Value::Float(5.0));
         c.emit_u16(Op::Const, ks, s());
         c.emit_u16(Op::Const, k5, s());
         c.emit(Op::Range, s());
@@ -4737,13 +4827,13 @@ mod tests {
         let mut c = Chunk::new();
         let name = c.add_const(Value::Str(Rc::from("print")));
         c.emit_u16(Op::GetGlobal, name, s());
-        let k = c.add_const(Value::Number(42.0));
+        let k = c.add_const(Value::Float(42.0));
         c.emit_u16(Op::Const, k, s());
         c.emit_u8(Op::Call, 1, s());
         c.emit(Op::Return, s());
         let (outcome, out) = run_chunk_with_output(c);
         assert!(matches!(outcome, Ok(RunOutcome::Done(_))), "ran ok");
-        assert_eq!(out, "42\n", "print wrote to the shared capture sink");
+        assert_eq!(out, "42.0\n", "print wrote to the shared capture sink");
     }
 
     #[test]
@@ -4802,7 +4892,7 @@ mod tests {
         // `await 5` is identity on a non-future, exactly like the tree-walker's
         // `ExprKind::Await` (`other => Ok(other)`).
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Number(5.0));
+        let k = c.add_const(Value::Float(5.0));
         c.emit_u16(Op::Const, k, s());
         c.emit(Op::Await, s());
         c.emit(Op::Return, s());
@@ -4818,7 +4908,7 @@ mod tests {
         let mut c = Chunk::new();
         c.emit(Op::Nil, s());
         let site = c.emit_jump(Op::Jump, s());
-        let k = c.add_const(Value::Number(999.0));
+        let k = c.add_const(Value::Float(999.0));
         c.emit_u16(Op::Const, k, s()); // skipped
         c.patch_jump(site); // land here, leaving only NIL
         c.emit(Op::Return, s());
@@ -4835,10 +4925,10 @@ mod tests {
         let mut c = Chunk::new();
         c.emit(Op::False, s());
         let site = c.emit_jump(Op::JumpIfFalse, s());
-        let k1 = c.add_const(Value::Number(1.0));
+        let k1 = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, k1, s()); // skipped (would otherwise be the result)
         c.patch_jump(site);
-        let k2 = c.add_const(Value::Number(2.0));
+        let k2 = c.add_const(Value::Float(2.0));
         c.emit_u16(Op::Const, k2, s());
         c.emit(Op::Return, s());
         assert_eq!(expect_number(c), 2.0);
@@ -4850,7 +4940,7 @@ mod tests {
         let mut c = Chunk::new();
         c.emit(Op::False, s());
         let site = c.emit_jump(Op::JumpIfTrue, s());
-        let k7 = c.add_const(Value::Number(7.0));
+        let k7 = c.add_const(Value::Float(7.0));
         c.emit_u16(Op::Const, k7, s()); // executed (no jump)
         c.emit(Op::Return, s());
         c.patch_jump(site); // target is past RETURN; never reached
@@ -4862,13 +4952,13 @@ mod tests {
         // CONST 5 (non-nil) -> JUMP_IF_NOT_NIL pops & jumps over CONST 1; RETURN
         // sees the trailing CONST 2.
         let mut c = Chunk::new();
-        let k5 = c.add_const(Value::Number(5.0));
+        let k5 = c.add_const(Value::Float(5.0));
         c.emit_u16(Op::Const, k5, s());
         let site = c.emit_jump(Op::JumpIfNotNil, s());
-        let k1 = c.add_const(Value::Number(1.0));
+        let k1 = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, k1, s()); // skipped
         c.patch_jump(site);
-        let k2 = c.add_const(Value::Number(2.0));
+        let k2 = c.add_const(Value::Float(2.0));
         c.emit_u16(Op::Const, k2, s());
         c.emit(Op::Return, s());
         assert_eq!(expect_number(c), 2.0);
@@ -4881,7 +4971,7 @@ mod tests {
         // CONST 1; CONST 2; CONST 3; NEW_ARRAY 3 → [1, 2, 3].
         let mut c = Chunk::new();
         for n in [1.0, 2.0, 3.0] {
-            let k = c.add_const(Value::Number(n));
+            let k = c.add_const(Value::Float(n));
             c.emit_u16(Op::Const, k, s());
         }
         c.emit_u16(Op::NewArray, 3, s());
@@ -4892,7 +4982,7 @@ mod tests {
                     .borrow()
                     .iter()
                     .map(|v| match v {
-                        Value::Number(n) => *n,
+                        Value::Float(n) => *n,
                         other => panic!("non-number: {other:?}"),
                     })
                     .collect();
@@ -4909,7 +4999,7 @@ mod tests {
         for (k, v) in [("a", 1.0), ("b", 2.0)] {
             let ki = c.add_const(Value::Str(Rc::from(k)));
             c.emit_u16(Op::Const, ki, s());
-            let vi = c.add_const(Value::Number(v));
+            let vi = c.add_const(Value::Float(v));
             c.emit_u16(Op::Const, vi, s());
         }
         c.emit_u16(Op::NewObject, 2, s());
@@ -4919,8 +5009,8 @@ mod tests {
                 let b = o.borrow();
                 let keys: Vec<&str> = b.keys().map(|k| k.as_str()).collect();
                 assert_eq!(keys, vec!["a", "b"], "keys in insertion order");
-                assert_eq!(b.get("a"), Some(&Value::Number(1.0)));
-                assert_eq!(b.get("b"), Some(&Value::Number(2.0)));
+                assert_eq!(b.get("a"), Some(&Value::Float(1.0)));
+                assert_eq!(b.get("b"), Some(&Value::Float(2.0)));
             }
             other => panic!("expected Done(Object), got {other:?}"),
         }
@@ -4931,11 +5021,11 @@ mod tests {
         // [10, 20, 30]; CONST 1; GET_INDEX → 20.
         let mut c = Chunk::new();
         for n in [10.0, 20.0, 30.0] {
-            let k = c.add_const(Value::Number(n));
+            let k = c.add_const(Value::Float(n));
             c.emit_u16(Op::Const, k, s());
         }
         c.emit_u16(Op::NewArray, 3, s());
-        let i = c.add_const(Value::Number(1.0));
+        let i = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, i, s());
         c.emit(Op::GetIndex, s());
         c.emit(Op::Return, s());
@@ -4945,10 +5035,10 @@ mod tests {
     #[test]
     fn get_index_out_of_bounds_panics() {
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Number(10.0));
+        let k = c.add_const(Value::Float(10.0));
         c.emit_u16(Op::Const, k, s());
         c.emit_u16(Op::NewArray, 1, s());
-        let i = c.add_const(Value::Number(5.0));
+        let i = c.add_const(Value::Float(5.0));
         c.emit_u16(Op::Const, i, s());
         c.emit(Op::GetIndex, s());
         c.emit(Op::Return, s());
@@ -4966,7 +5056,7 @@ mod tests {
         let mut c = Chunk::new();
         let ka = c.add_const(Value::Str(Rc::from("a")));
         c.emit_u16(Op::Const, ka, s());
-        let v1 = c.add_const(Value::Number(1.0));
+        let v1 = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, v1, s());
         c.emit_u16(Op::NewObject, 1, s());
         let kb = c.add_const(Value::Str(Rc::from("b")));
@@ -4985,7 +5075,7 @@ mod tests {
         let mut c = Chunk::new();
         let ka = c.add_const(Value::Str(Rc::from("a")));
         c.emit_u16(Op::Const, ka, s());
-        let v1 = c.add_const(Value::Number(1.0));
+        let v1 = c.add_const(Value::Float(1.0));
         c.emit_u16(Op::Const, v1, s());
         c.emit_u16(Op::NewObject, 1, s());
         let name = c.add_const(Value::Str(Rc::from("a")));
@@ -5067,11 +5157,11 @@ mod tests {
         // per element. `(x) => x * 2` called with 21 → 42.
         let f = compile_closure("(x) => x * 2");
         let got = with_vm(|vm| async move {
-            vm.call_value(f, vec![Value::Number(21.0)], s())
+            vm.call_value(f, vec![Value::Float(21.0)], s())
                 .await
                 .expect("call ok")
         });
-        assert!(matches!(got, Value::Number(n) if n == 42.0), "got {got:?}");
+        assert!(matches!(got, Value::Float(n) if n == 42.0), "got {got:?}");
     }
 
     #[test]
@@ -5083,7 +5173,7 @@ mod tests {
             let mut out = Vec::new();
             for n in [10.0, 20.0, 30.0] {
                 let v = vm
-                    .call_value(f.clone(), vec![Value::Number(n)], s())
+                    .call_value(f.clone(), vec![Value::Float(n)], s())
                     .await
                     .expect("call ok");
                 out.push(v);
@@ -5093,7 +5183,7 @@ mod tests {
         let nums: Vec<f64> = got
             .iter()
             .map(|v| match v {
-                Value::Number(n) => *n,
+                Value::Float(n) => *n,
                 other => panic!("non-number: {other:?}"),
             })
             .collect();
@@ -5109,11 +5199,11 @@ mod tests {
         // top-level `let k` would instead be a module global read via GET_GLOBAL.)
         let f = compile_closure("fn make() {\n let k = 10\n return (x) => x + k\n}\nmake()");
         let got = with_vm(|vm| async move {
-            vm.call_value(f, vec![Value::Number(5.0)], s())
+            vm.call_value(f, vec![Value::Float(5.0)], s())
                 .await
                 .expect("call ok")
         });
-        assert!(matches!(got, Value::Number(n) if n == 15.0), "got {got:?}");
+        assert!(matches!(got, Value::Float(n) if n == 15.0), "got {got:?}");
     }
 
     // ---- V7-T4: structured-concurrency over VM-produced futures -----------
@@ -5204,8 +5294,8 @@ mod tests {
         // structured-concurrency machinery (Part C de-risk; full e2e is V12).
         let f = compile_closure("(n) => n + 1");
         let out = with_vm(|vm| async move {
-            let a = spawn_vm_future(&vm, f.clone(), vec![Value::Number(10.0)]);
-            let b = spawn_vm_future(&vm, f, vec![Value::Number(20.0)]);
+            let a = spawn_vm_future(&vm, f.clone(), vec![Value::Float(10.0)]);
+            let b = spawn_vm_future(&vm, f, vec![Value::Float(20.0)]);
             let arr = Value::Array(crate::value::ArrayCell::new(vec![a, b]));
             vm.interp()
                 .call_task("gather", &[arr], s())
@@ -5218,7 +5308,7 @@ mod tests {
                     .borrow()
                     .iter()
                     .map(|v| match v {
-                        Value::Number(n) => *n,
+                        Value::Float(n) => *n,
                         other => panic!("non-number in gather result: {other:?}"),
                     })
                     .collect();
@@ -5238,14 +5328,14 @@ mod tests {
         // selects over `Value::Future`s and the VM's future drives to completion.
         let f = compile_closure("(n) => n * 2");
         let out = with_vm(|vm| async move {
-            let a = spawn_vm_future(&vm, f, vec![Value::Number(21.0)]);
+            let a = spawn_vm_future(&vm, f, vec![Value::Float(21.0)]);
             let arr = Value::Array(crate::value::ArrayCell::new(vec![a]));
             vm.interp()
                 .call_task("race", &[arr], s())
                 .await
                 .expect("race ok")
         });
-        assert!(matches!(out, Value::Number(n) if n == 42.0), "got {out:?}");
+        assert!(matches!(out, Value::Float(n) if n == 42.0), "got {out:?}");
     }
 
     #[test]
@@ -5255,7 +5345,7 @@ mod tests {
         // `(x) => x[9]` indexes a 1-element array out of bounds at runtime.
         let f = compile_closure("(x) => x[9]");
         let err = with_vm(|vm| async move {
-            let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Number(0.0)]));
+            let arr = Value::Array(crate::value::ArrayCell::new(vec![Value::Float(0.0)]));
             vm.call_value(f, vec![arr], s())
                 .await
                 .expect_err("expected a panic")
@@ -5294,7 +5384,7 @@ mod tests {
             let r = vm
                 .call_value(
                     Value::Builtin(Rc::from("print")),
-                    vec![Value::Number(7.0)],
+                    vec![Value::Float(7.0)],
                     s(),
                 )
                 .await
@@ -5303,7 +5393,7 @@ mod tests {
             assert!(matches!(r, Value::Nil), "print returns nil");
             vm.interp().output()
         });
-        assert_eq!(out, "7\n", "print wrote through the delegated path");
+        assert_eq!(out, "7.0\n", "print wrote through the delegated path");
     }
 
     #[test]
@@ -5312,7 +5402,7 @@ mod tests {
         let mut c = Chunk::new();
         c.emit(Op::Nil, s());
         let site = c.emit_jump(Op::JumpIfNotNil, s());
-        let k9 = c.add_const(Value::Number(9.0));
+        let k9 = c.add_const(Value::Float(9.0));
         c.emit_u16(Op::Const, k9, s()); // executed (no jump)
         c.emit(Op::Return, s());
         c.patch_jump(site); // never reached
@@ -5326,7 +5416,7 @@ mod tests {
     #[test]
     fn propagate_success_yields_value() {
         let mut c = Chunk::new();
-        let pair = c.add_const(crate::interp::make_pair(Value::Number(7.0), Value::Nil));
+        let pair = c.add_const(crate::interp::make_pair(Value::Float(7.0), Value::Nil));
         c.emit_u16(Op::Const, pair, s());
         c.emit(Op::Propagate, s());
         c.emit(Op::Return, s());
@@ -5346,7 +5436,7 @@ mod tests {
         c.emit_u16(Op::Const, pair, s());
         c.emit(Op::Propagate, s());
         // Never reached: PROPAGATE early-returned from the root frame.
-        let k999 = c.add_const(Value::Number(999.0));
+        let k999 = c.add_const(Value::Float(999.0));
         c.emit_u16(Op::Const, k999, s());
         c.emit(Op::Return, s());
         match run_chunk(c).expect("ok") {
@@ -5529,11 +5619,11 @@ mod tests {
                     &fiber,
                     0,
                     BinOp::Add,
-                    Value::Number(i as f64),
-                    Value::Number(1.0),
+                    Value::Float(i as f64),
+                    Value::Float(1.0),
                 )
                 .expect("ok");
-            assert_eq!(v, Value::Number(i as f64 + 1.0));
+            assert_eq!(v, Value::Float(i as f64 + 1.0));
         }
         // The cache MUST still be at its default cold state — the generic path
         // never observes (no warmup candidate, count 0) and never specializes.
@@ -5554,8 +5644,8 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Number(1.0),
-                Value::Number(1.0),
+                Value::Float(1.0),
+                Value::Float(1.0),
             )
             .expect("ok");
         }
@@ -5583,11 +5673,11 @@ mod tests {
                     &fiber,
                     0,
                     BinOp::Add,
-                    Value::Number(i as f64),
-                    Value::Number(1.0),
+                    Value::Float(i as f64),
+                    Value::Float(1.0),
                 )
                 .expect("ok");
-            assert_eq!(v, Value::Number(i as f64 + 1.0));
+            assert_eq!(v, Value::Float(i as f64 + 1.0));
         }
         let cache = fiber.frame().closure.proto.chunk.arith_cache(0);
         assert_eq!(
@@ -5603,11 +5693,11 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Number(40.0),
-                Value::Number(2.0),
+                Value::Float(40.0),
+                Value::Float(2.0),
             )
             .expect("ok");
-        assert_eq!(v, Value::Number(42.0));
+        assert_eq!(v, Value::Float(42.0));
     }
 
     #[test]
@@ -5618,8 +5708,8 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Number(1.0),
-                Value::Number(1.0),
+                Value::Float(1.0),
+                Value::Float(1.0),
             )
             .expect("ok");
         }
@@ -5718,7 +5808,7 @@ mod tests {
         let (vm, fiber) = adaptive_harness(Op::Add);
         for i in 0..(WARMUP_THRESHOLD as usize * 4) {
             let (a, b, want) = if i % 2 == 0 {
-                (Value::Number(2.0), Value::Number(3.0), Value::Number(5.0))
+                (Value::Float(2.0), Value::Float(3.0), Value::Float(5.0))
             } else {
                 (
                     Value::Str("a".into()),
@@ -5755,14 +5845,14 @@ mod tests {
                 &fiber,
                 0,
                 BinOp::Add,
-                Value::Number(1.0),
-                Value::Number(1.0),
+                Value::Float(1.0),
+                Value::Float(1.0),
             )
             .expect("ok");
         }
-        let got = vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Number(1.0), Value::Nil);
+        let got = vm.eval_binop_adaptive(&fiber, 0, BinOp::Add, Value::Float(1.0), Value::Nil);
         let generic =
-            crate::interp::apply_binop(BinOp::Add, Value::Number(1.0), Value::Nil, Span::new(0, 3));
+            crate::interp::apply_binop(BinOp::Add, Value::Float(1.0), Value::Nil, Span::new(0, 3));
         match (got, generic) {
             (Err(Control::Panic(a)), Err(Control::Panic(b))) => {
                 assert_eq!(a.message, b.message);
@@ -5813,7 +5903,7 @@ mod tests {
     #[test]
     fn propagate_non_pair_panics_with_span() {
         let mut c = Chunk::new();
-        let k = c.add_const(Value::Number(5.0));
+        let k = c.add_const(Value::Float(5.0));
         c.emit_u16(Op::Const, k, s());
         let prop_span = Span::new(8, 10);
         c.emit(Op::Propagate, prop_span);

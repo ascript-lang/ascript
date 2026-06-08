@@ -102,7 +102,27 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 /// - 18: the class template gained a `worker class` flag byte (Workers Spec B,
 ///   `Class.is_worker`), written by `write_class` before the field list. Drives
 ///   `ClassName.spawn(args)` actor routing on both engines.
-pub const ASO_FORMAT_VERSION: u32 = 18;
+/// - 19: NUM — the numeric model split `Value::Number(f64)` into the two kinds
+///   `Value::Int(i64)` and `Value::Float(f64)`. The constant pool gained
+///   `TAG_INT`, the field-default expr stream gained `EX_INT`, and the former
+///   `TAG_NUMBER`/`EX_NUMBER` tags now carry `Float` (value-identical bytes).
+/// - 20: NUM bitwise/wrapping operators — nine new appended opcodes (`BitAnd`/
+///   `BitOr`/`BitXor`/`Shl`/`Shr`/`BitNot`/`WrapAdd`/`WrapSub`/`WrapMul`; appended at
+///   the END of the enum, so existing opcode byte values are UNCHANGED) and the
+///   field-default wire tags grew (binop tags 17..=24 for the bitwise/shift/wrapping
+///   ops, unop tag 2 for `BitNot`). Old chunks never contained either, so older
+///   readers must reject a v20 chunk.
+/// - 21: NUM `instanceof int|float|number|string|bool` — one new appended opcode
+///   (`InstanceOfType`, a u16 type-name-const operand; appended at the END of the
+///   enum, so existing opcode byte values are UNCHANGED). Old chunks never contained
+///   it, so older readers must reject a v21 chunk.
+/// - 22: NUM annotated `let`/`const` runtime type contracts — one new appended
+///   opcode (`CheckLocal`, a u16 operand indexing a per-chunk `type_consts`
+///   side-pool; appended at the END of the enum, so existing opcode byte values are
+///   UNCHANGED) plus a new `type_consts` section in each chunk (a length-prefixed
+///   list of `Type`s, written after `imports`). Old chunks had neither, so older
+///   readers must reject a v22 chunk and a v21 reader must reject this one.
+pub const ASO_FORMAT_VERSION: u32 = 22;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -177,10 +197,15 @@ impl std::error::Error for AsoError {}
 
 const TAG_NIL: u8 = 0;
 const TAG_BOOL: u8 = 1;
+/// `Value::Float` (the former `Value::Number`; tag value unchanged so existing
+/// float constants keep the same wire byte — NUM §8 "the `Float` tag is the
+/// former `Number` tag, value-identical").
 const TAG_NUMBER: u8 = 2;
 const TAG_STR: u8 = 3;
 const TAG_DECIMAL: u8 = 4;
 const TAG_ENUM: u8 = 5;
+/// `Value::Int` (NUM §8): a 64-bit signed integer constant. New tag.
+const TAG_INT: u8 = 7;
 /// An `Array` whose elements are themselves literal constants. Emitted by the
 /// compiler for the object-rest bound-key list (`let {a, ...rest} = obj` lowers
 /// to an `Op::ObjectRest` whose operand is a const-pool `Array` of key `Str`s).
@@ -206,9 +231,13 @@ const TY_NAMED: u8 = 12;
 const TY_MAP: u8 = 13;
 const TY_FUTURE: u8 = 14;
 const TY_OPTIONAL: u8 = 15;
+const TY_INT: u8 = 16;
+const TY_FLOAT: u8 = 17;
 
 // ---- field-default expr tags (the subset `cst_default_expr` emits) -----------
 
+/// A `float` literal default (`ExprKind::Float`; the former `ExprKind::Number`
+/// tag, value-identical — NUM §8).
 const EX_NUMBER: u8 = 0;
 const EX_STR: u8 = 1;
 const EX_BOOL: u8 = 2;
@@ -241,6 +270,9 @@ const EX_REPARSE: u8 = 21;
 /// A `#{…}` map literal field default (`ExprKind::Map`, SP2 §3). Followed by a
 /// `len`-prefixed sequence of (key-expr, value-expr) pairs.
 const EX_MAP: u8 = 22;
+/// An `int` literal default (`ExprKind::Int`, NUM §3.1). New tag. The payload is
+/// the i64 stored as u64 bits.
+const EX_INT: u8 = 23;
 
 // Template-part tags (within an `EX_TEMPLATE`).
 const TP_LIT: u8 = 0;
@@ -498,7 +530,8 @@ fn literal_kind(v: &Value) -> Result<&'static str, &'static str> {
     match v {
         Value::Nil => Ok("nil"),
         Value::Bool(_) => Ok("bool"),
-        Value::Number(_) => Ok("number"),
+        Value::Int(_) => Ok("int"),
+        Value::Float(_) => Ok("number"),
         Value::Str(_) => Ok("string"),
         Value::Decimal(_) => Ok("decimal"),
         Value::Enum(_) => Ok("enum"),
@@ -546,6 +579,11 @@ fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
     w.len(c.imports.len());
     for imp in &c.imports {
         write_import(w, imp);
+    }
+    // type_consts (annotated-binding contract types for CHECK_LOCAL; v22+)
+    w.len(c.type_consts.len());
+    for t in &c.type_consts {
+        write_type(w, t);
     }
     // spans
     w.len(c.spans.len());
@@ -600,6 +638,12 @@ fn read_chunk(r: &mut Reader) -> Result<Chunk, AsoError> {
     for _ in 0..n {
         c.imports.push(read_import(r)?);
     }
+    // type_consts (v22+)
+    let n = r.len()?;
+    c.type_consts.reserve(n.min(r.remaining()));
+    for _ in 0..n {
+        c.type_consts.push(read_type(r)?);
+    }
     // spans
     let n = r.len()?;
     c.spans.reserve(n.min(r.remaining()));
@@ -644,7 +688,11 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
             w.u8(TAG_BOOL);
             w.u8(u8::from(*b));
         }
-        Value::Number(n) => {
+        Value::Int(i) => {
+            w.u8(TAG_INT);
+            w.u64(*i as u64);
+        }
+        Value::Float(n) => {
             w.u8(TAG_NUMBER);
             w.f64(*n);
         }
@@ -701,7 +749,8 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
     let v = match tag {
         TAG_NIL => Value::Nil,
         TAG_BOOL => Value::Bool(r.u8()? != 0),
-        TAG_NUMBER => Value::Number(r.f64()?),
+        TAG_INT => Value::Int(r.u64()? as i64),
+        TAG_NUMBER => Value::Float(r.f64()?),
         TAG_STR => Value::Str(Rc::from(r.str()?.as_str())),
         TAG_DECIMAL => {
             let b = r.take(16)?;
@@ -863,6 +912,8 @@ fn read_opt_type(r: &mut Reader) -> Result<Option<Type>, AsoError> {
 fn write_type(w: &mut Writer, t: &Type) {
     match t {
         Type::Number => w.u8(TY_NUMBER),
+        Type::Int => w.u8(TY_INT),
+        Type::Float => w.u8(TY_FLOAT),
         Type::String => w.u8(TY_STRING),
         Type::Bool => w.u8(TY_BOOL),
         Type::Nil => w.u8(TY_NIL),
@@ -914,6 +965,8 @@ fn read_type(r: &mut Reader) -> Result<Type, AsoError> {
     let tag = r.u8()?;
     let t = match tag {
         TY_NUMBER => Type::Number,
+        TY_INT => Type::Int,
+        TY_FLOAT => Type::Float,
         TY_STRING => Type::String,
         TY_BOOL => Type::Bool,
         TY_NIL => Type::Nil,
@@ -955,7 +1008,11 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
     w.usize(e.span.start);
     w.usize(e.span.end);
     match &e.kind {
-        ExprKind::Number(n) => {
+        ExprKind::Int(i) => {
+            w.u8(EX_INT);
+            w.u64(*i as u64);
+        }
+        ExprKind::Float(n) => {
             w.u8(EX_NUMBER);
             w.f64(*n);
         }
@@ -981,6 +1038,7 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
             w.u8(match op {
                 UnOp::Neg => 0,
                 UnOp::Not => 1,
+                UnOp::BitNot => 2,
             });
             write_expr(w, expr)?;
         }
@@ -1148,6 +1206,14 @@ fn binop_tag(op: BinOp) -> u8 {
         BinOp::Coalesce => 14,
         BinOp::Range => 15,
         BinOp::InstanceOf => 16,
+        BinOp::BitAnd => 17,
+        BinOp::BitOr => 18,
+        BinOp::BitXor => 19,
+        BinOp::Shl => 20,
+        BinOp::Shr => 21,
+        BinOp::WrapAdd => 22,
+        BinOp::WrapSub => 23,
+        BinOp::WrapMul => 24,
     }
 }
 
@@ -1171,6 +1237,14 @@ fn binop_from_tag(tag: u8) -> Result<BinOp, AsoError> {
         14 => BinOp::Coalesce,
         15 => BinOp::Range,
         16 => BinOp::InstanceOf,
+        17 => BinOp::BitAnd,
+        18 => BinOp::BitOr,
+        19 => BinOp::BitXor,
+        20 => BinOp::Shl,
+        21 => BinOp::Shr,
+        22 => BinOp::WrapAdd,
+        23 => BinOp::WrapSub,
+        24 => BinOp::WrapMul,
         tag => return Err(AsoError::BadTag { what: "binop", tag }),
     })
 }
@@ -1189,7 +1263,8 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
 /// `EX_REPARSE` source before delegating here for the non-reparse forms.
 fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
     let kind = match tag {
-        EX_NUMBER => ExprKind::Number(r.f64()?),
+        EX_INT => ExprKind::Int(r.u64()? as i64),
+        EX_NUMBER => ExprKind::Float(r.f64()?),
         EX_STR => ExprKind::Str(r.str()?),
         EX_BOOL => ExprKind::Bool(r.u8()? != 0),
         EX_NIL => ExprKind::Nil,
@@ -1199,6 +1274,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
             let op = match r.u8()? {
                 0 => UnOp::Neg,
                 1 => UnOp::Not,
+                2 => UnOp::BitNot,
                 tag => return Err(AsoError::BadTag { what: "unop", tag }),
             };
             ExprKind::Unary {
@@ -1993,6 +2069,58 @@ run()
         }
     }
 
+    /// A chunk containing a `CHECK_LOCAL` op (from an annotated `let`/`const`)
+    /// round-trips through `.aso`: the new opcode AND its `type_consts` side-pool
+    /// entry survive, so the reloaded chunk disassembles identically (the type
+    /// comment proves the `Type` was recovered) and runs to the same output. A
+    /// stale-version copy of those same bytes is rejected, never run.
+    #[test]
+    fn check_local_round_trips_and_stale_version_rejected() {
+        // Two annotated bindings + one un-annotated, to exercise the pool index.
+        let src = "let a: int = 5\nconst b: string = \"hi\"\nlet c = 7\nprint(a)\nprint(b)\nprint(c)\n";
+        let original = compile(src);
+        // The compiler emitted at least one CHECK_LOCAL and populated type_consts.
+        assert!(
+            original.code.contains(&(crate::vm::opcode::Op::CheckLocal as u8)),
+            "expected a CHECK_LOCAL op in the compiled chunk"
+        );
+        assert_eq!(
+            original.type_consts.len(),
+            2,
+            "two annotated bindings → two type-const pool entries"
+        );
+
+        let bytes = original.to_bytes().expect("serialize");
+        let back = Chunk::from_bytes(&bytes).expect("a valid v22 .aso must decode");
+        assert_eq!(
+            back.type_consts.len(),
+            original.type_consts.len(),
+            "type_consts pool must survive the round-trip"
+        );
+        assert_eq!(
+            disasm(&original),
+            disasm(&back),
+            "CHECK_LOCAL + type_consts must round-trip byte-stably"
+        );
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(back),
+            "output must be identical after the .aso round-trip"
+        );
+
+        // A stale-version copy of these very bytes is rejected (never run).
+        let mut stale = bytes.clone();
+        stale[4] = stale[4].wrapping_sub(1); // → v21, the pre-CHECK_LOCAL format
+        match Chunk::from_bytes(&stale) {
+            Err(AsoError::VersionMismatch { found, expected }) => {
+                assert_eq!(expected, ASO_FORMAT_VERSION);
+                assert_eq!(expected, 22);
+                assert_ne!(found, ASO_FORMAT_VERSION);
+            }
+            other => panic!("expected VersionMismatch for a stale CHECK_LOCAL .aso, got {other:?}"),
+        }
+    }
+
     #[test]
     fn bad_magic_detected() {
         let mut bytes = compile("print(1)").to_bytes().expect("serialize");
@@ -2077,18 +2205,39 @@ run()
         use rust_decimal::Decimal;
         use std::str::FromStr;
         let mut c = Chunk::new();
-        c.add_const(Value::Number(f64::NAN));
-        c.add_const(Value::Number(-0.0));
-        c.add_const(Value::Number(f64::INFINITY));
+        c.add_const(Value::Float(f64::NAN));
+        c.add_const(Value::Float(-0.0));
+        c.add_const(Value::Float(f64::INFINITY));
         c.add_const(Value::Decimal(Decimal::from_str("1.50").unwrap()));
         let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
-        assert!(matches!(rt.consts[0], Value::Number(n) if n.is_nan()));
-        assert!(matches!(rt.consts[1], Value::Number(n) if n == 0.0 && n.is_sign_negative()));
-        assert!(matches!(rt.consts[2], Value::Number(n) if n.is_infinite()));
+        assert!(matches!(rt.consts[0], Value::Float(n) if n.is_nan()));
+        assert!(matches!(rt.consts[1], Value::Float(n) if n == 0.0 && n.is_sign_negative()));
+        assert!(matches!(rt.consts[2], Value::Float(n) if n.is_infinite()));
         match &rt.consts[3] {
             Value::Decimal(d) => assert_eq!(d.to_string(), "1.50"),
             other => panic!("expected Decimal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn int_constants_roundtrip() {
+        // NUM §3.3: an `int` const pool entry round-trips exactly through
+        // `TAG_INT`, distinct from a same-magnitude `Float`.
+        let mut c = Chunk::new();
+        c.add_const(Value::Int(0));
+        c.add_const(Value::Int(42));
+        c.add_const(Value::Int(-7));
+        c.add_const(Value::Int(i64::MAX));
+        c.add_const(Value::Int(i64::MIN));
+        c.add_const(Value::Float(42.0));
+        let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
+        assert_eq!(rt.consts[0], Value::Int(0));
+        assert_eq!(rt.consts[1], Value::Int(42));
+        assert_eq!(rt.consts[2], Value::Int(-7));
+        assert_eq!(rt.consts[3], Value::Int(i64::MAX));
+        assert_eq!(rt.consts[4], Value::Int(i64::MIN));
+        // The Float(42.0) entry stays a Float, NOT folded into the Int(42).
+        assert!(matches!(rt.consts[5], Value::Float(n) if n == 42.0));
     }
 
     #[test]

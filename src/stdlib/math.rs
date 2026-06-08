@@ -29,8 +29,8 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("ln", bi("math.ln")),
         ("log2", bi("math.log2")),
         ("log10", bi("math.log10")),
-        ("pi", Value::Number(std::f64::consts::PI)),
-        ("e", Value::Number(std::f64::consts::E)),
+        ("pi", Value::Float(std::f64::consts::PI)),
+        ("e", Value::Float(std::f64::consts::E)),
         ("sign", bi("math.sign")),
         ("trunc", bi("math.trunc")),
         ("clamp", bi("math.clamp")),
@@ -45,6 +45,16 @@ pub fn exports() -> Vec<(&'static str, Value)> {
         ("randomInt", bi("math.randomInt")),
         ("shuffle", bi("math.shuffle")),
         ("choice", bi("math.choice")),
+        // NUM §4: integer-only division helpers (int → int).
+        ("floordiv", bi("math.floordiv")),
+        ("divmod", bi("math.divmod")),
+        ("ceildiv", bi("math.ceildiv")),
+        // NUM §4: bit helpers on i64 (int → int).
+        ("popcount", bi("math.popcount")),
+        ("leading_zeros", bi("math.leading_zeros")),
+        ("trailing_zeros", bi("math.trailing_zeros")),
+        ("rotl", bi("math.rotl")),
+        ("rotr", bi("math.rotr")),
     ]
 }
 
@@ -54,6 +64,91 @@ fn want_int(x: f64, span: Span, ctx: &str) -> Result<i64, Control> {
         return Err(AsError::at(format!("{} requires finite integer values", ctx), span).into());
     }
     Ok(x as i64)
+}
+
+/// NUM §4: convert a finite f64 to an `i64`, rejecting non-finite (`inf`/`nan`)
+/// and out-of-i64-range values with a clean Tier-2 panic — never silently
+/// saturating. Mirrors the strict-bound pattern of the `int()` builtin
+/// (`src/interp.rs`): `i64::MAX as f64` rounds UP to exactly `2^63` (out of
+/// range), so the upper bound must be STRICT (`< -(i64::MIN as f64)`, i.e.
+/// `< 2^63`); the lower bound is exact (`i64::MIN as f64 == -2^63`).
+fn f64_to_int(x: f64, span: Span, ctx: &str) -> Result<i64, Control> {
+    if !x.is_finite() {
+        return Err(AsError::at(
+            format!("{} cannot convert non-finite float to int", ctx),
+            span,
+        )
+        .into());
+    }
+    if x >= i64::MIN as f64 && x < -(i64::MIN as f64) {
+        Ok(x as i64)
+    } else {
+        Err(AsError::at(
+            format!("{} result is out of range for int (i64)", ctx),
+            span,
+        )
+        .into())
+    }
+}
+
+/// NUM §4: `floor`/`ceil`/`round`/`trunc` return an `int`. An `int` input is
+/// already integral and is returned unchanged; a `float` has `round_op` applied
+/// (`.floor()`/`.ceil()`/`.round()`/`.trunc()`) and the integral result is
+/// converted to a checked `int` (non-finite or out-of-range → clean panic).
+fn round_to_int(
+    v: &Value,
+    round_op: fn(f64) -> f64,
+    span: Span,
+    ctx: &str,
+) -> Result<Value, Control> {
+    match v {
+        Value::Int(i) => Ok(Value::Int(*i)),
+        Value::Float(f) => Ok(Value::Int(f64_to_int(round_op(*f), span, ctx)?)),
+        other => Err(AsError::at(
+            format!("{} expects a number, got {}", ctx, crate::interp::type_name(other)),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// NUM §4: require the argument to be a strict `Value::Int` (the int→int
+/// helpers — `floordiv`/`divmod`/`ceildiv` and the bit ops — do not accept a
+/// `float`, since they are exact integer operations). A `float` (or any other
+/// kind) is a Tier-2 panic.
+fn want_int_value(v: &Value, span: Span, ctx: &str) -> Result<i64, Control> {
+    match v {
+        Value::Int(i) => Ok(*i),
+        other => Err(AsError::at(
+            format!("{} expects an int, got {}", ctx, crate::interp::type_name(other)),
+            span,
+        )
+        .into()),
+    }
+}
+
+/// NUM §4: floored integer division `a // b` (distinct from the truncating
+/// language `/`). `b == 0` → clean panic; `a == i64::MIN, b == -1` overflows
+/// (the single i64 division-overflow case) → clean panic.
+fn floordiv_i64(a: i64, b: i64, span: Span, ctx: &str) -> Result<i64, Control> {
+    if b == 0 {
+        return Err(AsError::at(format!("{}: division by zero", ctx), span).into());
+    }
+    // The only overflowing i64 division is `i64::MIN / -1`; reject it cleanly
+    // (a plain `/` or `%` would panic the host). `checked_div`/`checked_rem`
+    // return `None` precisely here.
+    let q = match a.checked_div(b) {
+        Some(q) => q,
+        None => return Err(AsError::at(format!("{}: integer overflow", ctx), span).into()),
+    };
+    let r = a % b; // safe: overflow already excluded above
+    // Truncated quotient `q` is one too high when the (true) remainder is
+    // non-zero and the divisor/remainder signs differ — adjust down to floor.
+    if (r != 0) && ((r < 0) != (b < 0)) {
+        Ok(q - 1)
+    } else {
+        Ok(q)
+    }
 }
 
 fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
@@ -85,25 +180,37 @@ pub fn call(
 ) -> Result<Value, Control> {
     let ctx = |f: &str| format!("math.{}", f);
     match func {
-        "abs" => Ok(Value::Number(
-            want_number(&arg(args, 0), span, &ctx("abs"))?.abs(),
-        )),
-        "floor" => Ok(Value::Number(
-            want_number(&arg(args, 0), span, &ctx("floor"))?.floor(),
-        )),
-        "ceil" => Ok(Value::Number(
-            want_number(&arg(args, 0), span, &ctx("ceil"))?.ceil(),
-        )),
-        "round" => Ok(Value::Number(
-            want_number(&arg(args, 0), span, &ctx("round"))?.round(),
-        )),
-        "sqrt" => Ok(Value::Number(
+        // NUM §4: `abs` is the only SUBTYPE-PRESERVING math fn: `abs(int)->int`
+        // (checked — `abs(i64::MIN)` overflows and is a clean panic, never
+        // wraps), `abs(float)->float`.
+        "abs" => match &arg(args, 0) {
+            Value::Int(i) => match i.checked_abs() {
+                Some(a) => Ok(Value::Int(a)),
+                None => Err(AsError::at(
+                    "math.abs: integer overflow (abs of i64::MIN)",
+                    span,
+                )
+                .into()),
+            },
+            Value::Float(f) => Ok(Value::Float(f.abs())),
+            other => Err(AsError::at(
+                format!("math.abs expects a number, got {}", crate::interp::type_name(other)),
+                span,
+            )
+            .into()),
+        },
+        // NUM §4: rounding fns return an `int`. An `int` input is already
+        // integral and passes through unchanged.
+        "floor" => round_to_int(&arg(args, 0), f64::floor, span, &ctx("floor")),
+        "ceil" => round_to_int(&arg(args, 0), f64::ceil, span, &ctx("ceil")),
+        "round" => round_to_int(&arg(args, 0), f64::round, span, &ctx("round")),
+        "sqrt" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("sqrt"))?.sqrt(),
         )),
         "pow" => {
             let b = want_number(&arg(args, 0), span, &ctx("pow"))?;
             let e = want_number(&arg(args, 1), span, &ctx("pow"))?;
-            Ok(Value::Number(b.powf(e)))
+            Ok(Value::Float(b.powf(e)))
         }
         "min" | "max" => {
             if args.is_empty() {
@@ -123,42 +230,42 @@ pub fn call(
             } else {
                 nums.iter().copied().fold(f64::NEG_INFINITY, f64::max)
             };
-            Ok(Value::Number(acc))
+            Ok(Value::Float(acc))
         }
-        "random" => Ok(Value::Number(next_random(interp))),
-        "sin" => Ok(Value::Number(
+        "random" => Ok(Value::Float(next_random(interp))),
+        "sin" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("sin"))?.sin(),
         )),
-        "cos" => Ok(Value::Number(
+        "cos" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("cos"))?.cos(),
         )),
-        "tan" => Ok(Value::Number(
+        "tan" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("tan"))?.tan(),
         )),
-        "asin" => Ok(Value::Number(
+        "asin" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("asin"))?.asin(),
         )),
-        "acos" => Ok(Value::Number(
+        "acos" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("acos"))?.acos(),
         )),
-        "atan" => Ok(Value::Number(
+        "atan" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("atan"))?.atan(),
         )),
         "atan2" => {
             let y = want_number(&arg(args, 0), span, &ctx("atan2"))?;
             let x = want_number(&arg(args, 1), span, &ctx("atan2"))?;
-            Ok(Value::Number(y.atan2(x)))
+            Ok(Value::Float(y.atan2(x)))
         }
-        "exp" => Ok(Value::Number(
+        "exp" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("exp"))?.exp(),
         )),
-        "ln" => Ok(Value::Number(
+        "ln" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("ln"))?.ln(),
         )),
-        "log2" => Ok(Value::Number(
+        "log2" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("log2"))?.log2(),
         )),
-        "log10" => Ok(Value::Number(
+        "log10" => Ok(Value::Float(
             want_number(&arg(args, 0), span, &ctx("log10"))?.log10(),
         )),
         "sign" => {
@@ -172,11 +279,9 @@ pub fn call(
             } else {
                 0.0
             };
-            Ok(Value::Number(r))
+            Ok(Value::Float(r))
         }
-        "trunc" => Ok(Value::Number(
-            want_number(&arg(args, 0), span, &ctx("trunc"))?.trunc(),
-        )),
+        "trunc" => round_to_int(&arg(args, 0), f64::trunc, span, &ctx("trunc")),
         "clamp" => {
             let x = want_number(&arg(args, 0), span, &ctx("clamp"))?;
             let lo = want_number(&arg(args, 1), span, &ctx("clamp"))?;
@@ -184,12 +289,12 @@ pub fn call(
             if lo > hi {
                 return Err(AsError::at("math.clamp requires lo <= hi", span).into());
             }
-            Ok(Value::Number(x.max(lo).min(hi)))
+            Ok(Value::Float(x.max(lo).min(hi)))
         }
         "hypot" => {
             let x = want_number(&arg(args, 0), span, &ctx("hypot"))?;
             let y = want_number(&arg(args, 1), span, &ctx("hypot"))?;
-            Ok(Value::Number(x.hypot(y)))
+            Ok(Value::Float(x.hypot(y)))
         }
         "gcd" => {
             let a = want_int(
@@ -202,7 +307,7 @@ pub fn call(
                 span,
                 "math.gcd",
             )?;
-            Ok(Value::Number(gcd_i64(a, b) as f64))
+            Ok(Value::Float(gcd_i64(a, b) as f64))
         }
         "lcm" => {
             let a = want_int(
@@ -226,18 +331,18 @@ pub fn call(
                 }
                 abs as i64
             };
-            Ok(Value::Number(r as f64))
+            Ok(Value::Float(r as f64))
         }
         "sum" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx("sum"))?;
-            Ok(Value::Number(xs.iter().sum()))
+            Ok(Value::Float(xs.iter().sum()))
         }
         "mean" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx("mean"))?;
             if xs.is_empty() {
                 return Err(AsError::at("math.mean of empty array", span).into());
             }
-            Ok(Value::Number(xs.iter().sum::<f64>() / xs.len() as f64))
+            Ok(Value::Float(xs.iter().sum::<f64>() / xs.len() as f64))
         }
         "median" => {
             let mut xs = want_number_vec(&arg(args, 0), span, &ctx("median"))?;
@@ -251,7 +356,7 @@ pub fn call(
             } else {
                 (xs[m - 1] + xs[m]) / 2.0
             };
-            Ok(Value::Number(med))
+            Ok(Value::Float(med))
         }
         "variance" | "stddev" => {
             let xs = want_number_vec(&arg(args, 0), span, &ctx(func))?;
@@ -274,7 +379,7 @@ pub fn call(
                 xs.len() as f64
             };
             let var = ss / denom;
-            Ok(Value::Number(if func == "stddev" {
+            Ok(Value::Float(if func == "stddev" {
                 var.sqrt()
             } else {
                 var
@@ -296,7 +401,7 @@ pub fn call(
             }
             let span_len = (max - min + 1) as f64;
             let v = min + (next_random(interp) * span_len).floor() as i64;
-            Ok(Value::Number(v as f64))
+            Ok(Value::Float(v as f64))
         }
         "shuffle" => {
             let a = want_array(&arg(args, 0), span, &ctx("shuffle"))?;
@@ -316,6 +421,78 @@ pub fn call(
             }
             let idx = (next_random(interp) * b.len() as f64).floor() as usize;
             Ok(b[idx.min(b.len() - 1)].clone())
+        }
+        // NUM §4: int → int division helpers. All require strict `int` args;
+        // `b == 0` is a clean Tier-2 panic.
+        "floordiv" => {
+            let a = want_int_value(&arg(args, 0), span, "math.floordiv")?;
+            let b = want_int_value(&arg(args, 1), span, "math.floordiv")?;
+            Ok(Value::Int(floordiv_i64(a, b, span, "math.floordiv")?))
+        }
+        "ceildiv" => {
+            let a = want_int_value(&arg(args, 0), span, "math.ceildiv")?;
+            let b = want_int_value(&arg(args, 1), span, "math.ceildiv")?;
+            // ceil(a/b) == -floor(a / -b) == floor((a + b - sign) / b); compute
+            // via floor of the negated numerator to reuse the checked floor.
+            let neg_floor = floordiv_i64(
+                a.checked_neg().ok_or_else(|| -> Control {
+                    AsError::at("math.ceildiv: integer overflow", span).into()
+                })?,
+                b,
+                span,
+                "math.ceildiv",
+            )?;
+            let q = neg_floor.checked_neg().ok_or_else(|| -> Control {
+                AsError::at("math.ceildiv: integer overflow", span).into()
+            })?;
+            Ok(Value::Int(q))
+        }
+        // `divmod(a, b) -> [q, r]` with q FLOORED and r the matching remainder,
+        // satisfying `a == q*b + r` (r has the sign of the divisor, in `[0, |b|)`
+        // toward the divisor's sign — the floored-division remainder).
+        "divmod" => {
+            let a = want_int_value(&arg(args, 0), span, "math.divmod")?;
+            let b = want_int_value(&arg(args, 1), span, "math.divmod")?;
+            let q = floordiv_i64(a, b, span, "math.divmod")?;
+            // r = a - q*b, computed with checked ops so the identity holds
+            // exactly with no host overflow (the floored q keeps |q*b| <= |a|,
+            // so these cannot overflow, but stay defensive).
+            let qb = q.checked_mul(b).ok_or_else(|| -> Control {
+                AsError::at("math.divmod: integer overflow", span).into()
+            })?;
+            let r = a.checked_sub(qb).ok_or_else(|| -> Control {
+                AsError::at("math.divmod: integer overflow", span).into()
+            })?;
+            Ok(Value::Array(crate::value::ArrayCell::new(vec![
+                Value::Int(q),
+                Value::Int(r),
+            ])))
+        }
+        // NUM §4: bit helpers on the 64-bit i64 representation (int → int).
+        "popcount" => {
+            let x = want_int_value(&arg(args, 0), span, "math.popcount")?;
+            Ok(Value::Int(x.count_ones() as i64))
+        }
+        "leading_zeros" => {
+            let x = want_int_value(&arg(args, 0), span, "math.leading_zeros")?;
+            Ok(Value::Int(x.leading_zeros() as i64))
+        }
+        "trailing_zeros" => {
+            let x = want_int_value(&arg(args, 0), span, "math.trailing_zeros")?;
+            Ok(Value::Int(x.trailing_zeros() as i64))
+        }
+        // Rotations are modulo the 64-bit width (Rust `rotate_left`/`rotate_right`
+        // already reduce the shift mod 64); the count is taken from the low bits
+        // of the second int arg.
+        "rotl" => {
+            let x = want_int_value(&arg(args, 0), span, "math.rotl")?;
+            let n = want_int_value(&arg(args, 1), span, "math.rotl")?;
+            Ok(Value::Int(x.rotate_left(n.rem_euclid(64) as u32)))
+        }
+        "rotr" => {
+            let x = want_int_value(&arg(args, 0), span, "math.rotr")?;
+            let n = want_int_value(&arg(args, 1), span, "math.rotr")?;
+            Ok(Value::Int(x.rotate_right(n.rem_euclid(64) as u32)))
         }
         _ => Err(AsError::at(format!("std/math has no function '{}'", func), span).into()),
     }
@@ -363,7 +540,7 @@ mod tests {
     use super::*;
 
     fn n(x: f64) -> Value {
-        Value::Number(x)
+        Value::Float(x)
     }
 
     fn sp() -> Span {
@@ -393,35 +570,37 @@ mod tests {
     #[test]
     fn basics() {
         let sp = Span::new(0, 0);
+        // NUM §4: abs is subtype-preserving — float in, float out.
         assert_eq!(
-            call("abs", &[Value::Number(-3.0)], sp).unwrap(),
-            Value::Number(3.0)
+            call("abs", &[Value::Float(-3.0)], sp).unwrap(),
+            Value::Float(3.0)
+        );
+        // NUM §4: floor returns an int.
+        assert_eq!(
+            call("floor", &[Value::Float(2.9)], sp).unwrap(),
+            Value::Int(2)
         );
         assert_eq!(
-            call("floor", &[Value::Number(2.9)], sp).unwrap(),
-            Value::Number(2.0)
-        );
-        assert_eq!(
-            call("pow", &[Value::Number(2.0), Value::Number(10.0)], sp).unwrap(),
-            Value::Number(1024.0)
+            call("pow", &[Value::Float(2.0), Value::Float(10.0)], sp).unwrap(),
+            Value::Float(1024.0)
         );
         assert_eq!(
             call(
                 "max",
-                &[Value::Number(1.0), Value::Number(9.0), Value::Number(4.0)],
+                &[Value::Float(1.0), Value::Float(9.0), Value::Float(4.0)],
                 sp
             )
             .unwrap(),
-            Value::Number(9.0)
+            Value::Float(9.0)
         );
         assert_eq!(
             call(
                 "min",
-                &[Value::Number(1.0), Value::Number(9.0), Value::Number(4.0)],
+                &[Value::Float(1.0), Value::Float(9.0), Value::Float(4.0)],
                 sp
             )
             .unwrap(),
-            Value::Number(1.0)
+            Value::Float(1.0)
         );
     }
 
@@ -472,10 +651,10 @@ mod tests {
             n(1.25)
         );
         let sv = call("variance", &[a.clone(), Value::Bool(true)], sp()).unwrap();
-        assert!(matches!(sv, Value::Number(x) if (x - 5.0/3.0).abs() < 1e-12));
+        assert!(matches!(sv, Value::Float(x) if (x - 5.0/3.0).abs() < 1e-12));
         // stddev returns sqrt(population variance)
         assert!(
-            matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Number(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
+            matches!(call("stddev", std::slice::from_ref(&a), sp()).unwrap(), Value::Float(x) if (x - 1.25f64.sqrt()).abs() < 1e-12)
         );
         let empty = Value::Array(crate::value::ArrayCell::new(vec![]));
         assert_eq!(
@@ -503,7 +682,7 @@ mod tests {
     fn math_random_helpers() {
         for _ in 0..100 {
             let r = call("randomInt", &[n(1.0), n(6.0)], sp()).unwrap();
-            if let Value::Number(x) = r {
+            if let Value::Float(x) = r {
                 assert!((1.0..=6.0).contains(&x) && x.fract() == 0.0);
             } else {
                 panic!()
@@ -539,7 +718,7 @@ mod tests {
                 .borrow()
                 .iter()
                 .map(|x| {
-                    if let Value::Number(n) = x {
+                    if let Value::Float(n) = x {
                         *n
                     } else {
                         f64::NAN
@@ -563,9 +742,10 @@ mod tests {
         assert_eq!(call("sign", &[n(-3.0)], sp()).unwrap(), n(-1.0));
         assert_eq!(call("sign", &[n(0.0)], sp()).unwrap(), n(0.0));
         assert!(
-            matches!(call("sign", &[n(f64::NAN)], sp()).unwrap(), Value::Number(x) if x.is_nan())
+            matches!(call("sign", &[n(f64::NAN)], sp()).unwrap(), Value::Float(x) if x.is_nan())
         );
-        assert_eq!(call("trunc", &[n(3.7)], sp()).unwrap(), n(3.0));
+        // NUM §4: trunc returns an int.
+        assert_eq!(call("trunc", &[n(3.7)], sp()).unwrap(), Value::Int(3));
         assert_eq!(
             call("clamp", &[n(5.0), n(0.0), n(3.0)], sp()).unwrap(),
             n(3.0)
@@ -579,6 +759,152 @@ mod tests {
         ));
         assert!(matches!(
             call("gcd", &[n(1.5), n(2.0)], sp()),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    // ---- NUM §4: typed returns -------------------------------------------
+
+    fn i(x: i64) -> Value {
+        Value::Int(x)
+    }
+
+    #[test]
+    fn rounding_returns_int() {
+        // float inputs round to a true int.
+        assert_eq!(call("floor", &[n(3.7)], sp()).unwrap(), i(3));
+        assert_eq!(call("floor", &[n(-3.1)], sp()).unwrap(), i(-4));
+        assert_eq!(call("ceil", &[n(3.1)], sp()).unwrap(), i(4));
+        assert_eq!(call("ceil", &[n(-3.1)], sp()).unwrap(), i(-3));
+        assert_eq!(call("round", &[n(2.5)], sp()).unwrap(), i(3));
+        assert_eq!(call("round", &[n(2.4)], sp()).unwrap(), i(2));
+        assert_eq!(call("trunc", &[n(3.9)], sp()).unwrap(), i(3));
+        assert_eq!(call("trunc", &[n(-3.9)], sp()).unwrap(), i(-3));
+    }
+
+    #[test]
+    fn rounding_passes_int_through_unchanged() {
+        for f in ["floor", "ceil", "round", "trunc"] {
+            assert_eq!(call(f, &[i(7)], sp()).unwrap(), i(7));
+            assert_eq!(call(f, &[i(-7)], sp()).unwrap(), i(-7));
+        }
+    }
+
+    #[test]
+    fn rounding_non_finite_and_out_of_range_panic() {
+        // inf/nan → clean panic, not a silent saturation.
+        assert!(matches!(
+            call("floor", &[n(f64::INFINITY)], sp()),
+            Err(Control::Panic(_))
+        ));
+        assert!(matches!(
+            call("trunc", &[n(f64::NAN)], sp()),
+            Err(Control::Panic(_))
+        ));
+        // 1e30 exceeds i64 range → clean panic, never wraps/saturates.
+        assert!(matches!(
+            call("floor", &[n(1e30)], sp()),
+            Err(Control::Panic(_))
+        ));
+        assert!(matches!(
+            call("ceil", &[n(-1e30)], sp()),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    #[test]
+    fn abs_is_subtype_preserving() {
+        assert_eq!(call("abs", &[i(-5)], sp()).unwrap(), i(5));
+        assert_eq!(call("abs", &[i(5)], sp()).unwrap(), i(5));
+        assert_eq!(call("abs", &[n(-2.5)], sp()).unwrap(), n(2.5));
+        assert_eq!(call("abs", &[n(2.5)], sp()).unwrap(), n(2.5));
+        // abs(i64::MIN) overflows → clean panic, never wraps.
+        assert!(matches!(
+            call("abs", &[i(i64::MIN)], sp()),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    #[test]
+    fn floordiv_floors_toward_neg_inf() {
+        assert_eq!(call("floordiv", &[i(7), i(2)], sp()).unwrap(), i(3));
+        assert_eq!(call("floordiv", &[i(-7), i(2)], sp()).unwrap(), i(-4));
+        assert_eq!(call("floordiv", &[i(7), i(-2)], sp()).unwrap(), i(-4));
+        assert_eq!(call("floordiv", &[i(-7), i(-2)], sp()).unwrap(), i(3));
+        assert_eq!(call("floordiv", &[i(6), i(3)], sp()).unwrap(), i(2));
+        // b == 0 → panic.
+        assert!(matches!(
+            call("floordiv", &[i(1), i(0)], sp()),
+            Err(Control::Panic(_))
+        ));
+        // i64::MIN / -1 overflow → clean panic.
+        assert!(matches!(
+            call("floordiv", &[i(i64::MIN), i(-1)], sp()),
+            Err(Control::Panic(_))
+        ));
+        // float arg → panic (int-only).
+        assert!(matches!(
+            call("floordiv", &[n(7.0), i(2)], sp()),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    #[test]
+    fn ceildiv_rounds_toward_pos_inf() {
+        assert_eq!(call("ceildiv", &[i(7), i(2)], sp()).unwrap(), i(4));
+        assert_eq!(call("ceildiv", &[i(-7), i(2)], sp()).unwrap(), i(-3));
+        assert_eq!(call("ceildiv", &[i(6), i(3)], sp()).unwrap(), i(2));
+        assert_eq!(call("ceildiv", &[i(7), i(-2)], sp()).unwrap(), i(-3));
+        assert!(matches!(
+            call("ceildiv", &[i(1), i(0)], sp()),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    #[test]
+    fn divmod_satisfies_identity() {
+        // divmod returns [q, r] with q floored and a == q*b + r.
+        for (a, b) in [(17i64, 5i64), (-17, 5), (17, -5), (-17, -5), (10, 2), (0, 7)] {
+            let r = call("divmod", &[i(a), i(b)], sp()).unwrap();
+            if let Value::Array(arr) = r {
+                let arr = arr.borrow();
+                assert_eq!(arr.len(), 2);
+                let q = if let Value::Int(q) = arr[0] { q } else { panic!() };
+                let rem = if let Value::Int(r) = arr[1] { r } else { panic!() };
+                assert_eq!(a, q * b + rem, "identity for divmod({a},{b})");
+                // q is floored: matches floordiv.
+                assert_eq!(Value::Int(q), call("floordiv", &[i(a), i(b)], sp()).unwrap());
+            } else {
+                panic!("divmod did not return an array");
+            }
+        }
+        assert!(matches!(
+            call("divmod", &[i(1), i(0)], sp()),
+            Err(Control::Panic(_))
+        ));
+    }
+
+    #[test]
+    fn bit_helpers() {
+        assert_eq!(call("popcount", &[i(255)], sp()).unwrap(), i(8));
+        assert_eq!(call("popcount", &[i(0)], sp()).unwrap(), i(0));
+        assert_eq!(call("popcount", &[i(-1)], sp()).unwrap(), i(64));
+        assert_eq!(call("leading_zeros", &[i(1)], sp()).unwrap(), i(63));
+        assert_eq!(call("leading_zeros", &[i(0)], sp()).unwrap(), i(64));
+        assert_eq!(call("trailing_zeros", &[i(8)], sp()).unwrap(), i(3));
+        assert_eq!(call("trailing_zeros", &[i(0)], sp()).unwrap(), i(64));
+        // rotl/rotr on the 64-bit width.
+        assert_eq!(call("rotl", &[i(1), i(1)], sp()).unwrap(), i(2));
+        assert_eq!(call("rotl", &[i(1), i(64)], sp()).unwrap(), i(1)); // mod 64
+        assert_eq!(
+            call("rotl", &[i(1), i(63)], sp()).unwrap(),
+            i(i64::MIN) // top bit set
+        );
+        assert_eq!(call("rotr", &[i(2), i(1)], sp()).unwrap(), i(1));
+        assert_eq!(call("rotr", &[i(1), i(1)], sp()).unwrap(), i(i64::MIN));
+        // float arg → panic (int-only).
+        assert!(matches!(
+            call("popcount", &[n(255.0)], sp()),
             Err(Control::Panic(_))
         ));
     }

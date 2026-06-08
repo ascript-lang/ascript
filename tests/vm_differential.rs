@@ -62,6 +62,90 @@ async fn vm_matches_treewalker_arithmetic_and_literals() {
 }
 
 #[tokio::test]
+async fn vm_matches_treewalker_bitwise_and_wrapping() {
+    // NUM §3.2: bitwise / shift / wrapping operators must be byte-identical across
+    // the tree-walker and the VM (results AND the precedence shape).
+    let cases = [
+        "0xFF & 0b1010",
+        "12 | 10",
+        "12 ^ 10",
+        "~0",
+        "~5",
+        "1 << 3",
+        "(1 << 16) | 256",
+        "1 >> 0",
+        "256 >> 4",
+        "(0 - 8) >> 1",     // arithmetic sign-extension
+        "(0 - 1) << 1",     // -1 << 1 == -2 (bit-loss, no trap)
+        "1 << 63",          // i64::MIN (defined)
+        "5 +% 3",
+        "5 -% 8",
+        "6 *% 7",
+        "9223372036854775807 +% 1", // wraps to i64::MIN
+        "6 & 2 == 2",               // Go precedence: (6&2)==2
+        "1 | 2 == 3",               // (1|2)==3
+        "1 + 1 << 2",               // 1 + (1<<2)
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_matches_treewalker_instanceof_reserved_types() {
+    // NUM §6: `x instanceof int|float|number|string|bool` must be byte-identical
+    // across the tree-walker and the VM (the VM uses a dedicated `INSTANCE_OF_TYPE`
+    // opcode; the tree-walker intercepts the reserved-name RHS).
+    let cases = [
+        "5 instanceof int",
+        "5 instanceof float",
+        "5 instanceof number",
+        "5.0 instanceof int",
+        "5.0 instanceof float",
+        "5.0 instanceof number",
+        "\"hi\" instanceof string",
+        "true instanceof bool",
+        "5 instanceof string",
+        "\"x\" instanceof int",
+        "(1 + 2) instanceof int",
+        "(1.0 + 2) instanceof float",
+        "(7 / 2) instanceof int",
+    ];
+    for expr in cases {
+        assert_vm_matches_treewalker(expr).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_matches_treewalker_bitwise_panics() {
+    // The Tier-2 panics (shift-amount out of range, bitwise-on-float) must be
+    // byte-identical across both engines. Run as full programs and compare the
+    // captured panic output.
+    for src in [
+        "print(1 << 64)",
+        "print(1 << (0 - 1))",
+        "print(1 & 2.0)",
+        "print(~1.0)",
+        "print(1 +% 2.0)",
+    ] {
+        // Both engines must FAIL with the same panic message (Control::Panic →
+        // AsError). `run_source` / `vm_run_source` surface it as `Err(AsError)`.
+        let tw_err = ascript::run_source(src)
+            .await
+            .expect_err("tree-walker should panic")
+            .to_string();
+        let vm_err = ascript::vm_run_source(src)
+            .await
+            .expect_err("vm should panic")
+            .to_string();
+        assert_eq!(
+            tw_err, vm_err,
+            "panic message diverged for `{src}`\n  tw: {tw_err:?}\n  vm: {vm_err:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn vm_matches_treewalker_number_forms() {
     // Every numeric literal form the lexer accepts must const-fold to the
     // identical f64 the tree-walker produces (byte-identical `print`).
@@ -1580,7 +1664,7 @@ async fn both_engines_step_iteration_agree() {
         ("print(1..10 step 2)", "[1, 3, 5, 7, 9]\n"),
         ("print(1..=10 step 2)", "[1, 3, 5, 7, 9]\n"),
         // float step.
-        ("print(0..=1 step 0.25)", "[0, 0.25, 0.5, 0.75, 1]\n"),
+        ("print(0..=1 step 0.25)", "[0.0, 0.25, 0.5, 0.75, 1.0]\n"),
         // overshoot simply stops.
         ("print(1..10 step 100)", "[1]\n"),
         // Phase 4: omitted-step descending counts down (direction inferred).
@@ -1654,11 +1738,11 @@ async fn both_engines_step_validation_panics_agree() {
         ),
         (
             "for (i in 1..10 step -2) {}",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
         (
             "for (i in 10..1 step 2) {}",
-            "step 2 moves away from end (1); range can never progress",
+            "step 2.0 moves away from end (1.0); range can never progress",
         ),
         // value-position validation panics identically.
         (
@@ -1667,7 +1751,7 @@ async fn both_engines_step_validation_panics_agree() {
         ),
         (
             "print(1..10 step -2)",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
     ] {
         let tw = ascript::run_source(src).await;
@@ -1822,11 +1906,11 @@ async fn both_engines_pattern_step_validation_panics_agree() {
         ),
         (
             "print(match 5 { 1..=10 step -2 => 1, _ => 0 })",
-            "step -2 moves away from end (10); range can never progress",
+            "step -2.0 moves away from end (10.0); range can never progress",
         ),
         (
             "print(match 5 { 10..=1 step 2 => 1, _ => 0 })",
-            "step 2 moves away from end (1); range can never progress",
+            "step 2.0 moves away from end (1.0); range can never progress",
         ),
     ] {
         let tw = ascript::run_source(src).await;
@@ -1914,7 +1998,7 @@ async fn vm_for_of_not_iterable_error_matches_treewalker() {
     for (src, expected) in [
         (
             "for (x of 5) { print(x) }",
-            "value of type number is not iterable",
+            "value of type int is not iterable",
         ),
         (
             "for (x of true) { print(x) }",
@@ -1996,11 +2080,11 @@ async fn vm_for_in_over_non_iterable_value_matches_treewalker() {
     for (src, expected) in [
         (
             "for (i in 5) { print(i) }",
-            "value of type number is not iterable",
+            "value of type int is not iterable",
         ),
         (
             "let n = 5\nfor (i in n) { print(i) }",
-            "value of type number is not iterable",
+            "value of type int is not iterable",
         ),
         (
             "for (i in true) { print(i) }",
@@ -7254,4 +7338,50 @@ async fn worker_examples_all_modes_byte_identical() {
          tree-walker + specialized VM + generic VM + .aso",
         worker_examples.len()
     );
+}
+
+// ----- NUM: annotated `let`/`const` runtime type contracts (CHECK_LOCAL) -------
+// A `: T` annotation on a `let`/`const` binding is a runtime contract on the
+// initializer value, byte-identical to the tree-walker's `Stmt::Let` check (same
+// `type contract violated: expected {ty}, got {name} ({value})` message, same span
+// = the init EXPRESSION's span). Before CHECK_LOCAL the VM silently bound the
+// mismatched value; these regressions trip if that divergence ever returns.
+
+#[tokio::test]
+async fn vm_let_contract_mismatch_matches_treewalker() {
+    // Each MUST panic byte-identically on tree-walker == specialized-VM == generic-VM.
+    let cases = [
+        "let x: int = 5.0\nprint(x)\n",
+        "let x: float = 5\nprint(x)\n",
+        "let s: string = 5\nprint(s)\n",
+        "const c: int = 2.5\nprint(c)\n",
+        // module-global path AND slot-local (inside a fn body) path.
+        "fn f() {\n  let y: int = 1.5\n  return y\n}\nprint(f())\n",
+        "fn g() {\n  const k: string = 7\n  return k\n}\nprint(g())\n",
+    ];
+    for src in cases {
+        assert_opt_call_error_three_way(src).await;
+    }
+}
+
+#[tokio::test]
+async fn vm_let_contract_ok_matches_treewalker() {
+    // Well-typed annotated bindings must run identically (no spurious panic) and
+    // print the value the same way on all three engines.
+    let cases = [
+        "let x: int = 5\nprint(x)\n",
+        "let x: number = 5\nprint(x)\n",
+        "let x: number = 5.0\nprint(x)\n",
+        "const c: int = 2\nprint(c)\n",
+        "let s: string = \"hi\"\nprint(s)\n",
+        // int is a subtype of number; float is a subtype of number.
+        "let n: number = 5\nlet f: float = 5.0\nprint(n + f)\n",
+        // slot-local path inside a fn body.
+        "fn f() {\n  let y: int = 5\n  return y\n}\nprint(f())\n",
+        // optional / nil-bearing annotation accepts nil.
+        "let m: int? = nil\nprint(m)\n",
+    ];
+    for src in cases {
+        assert_opt_call_ok_three_way(src).await;
+    }
 }

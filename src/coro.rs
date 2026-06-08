@@ -526,7 +526,7 @@ mod tests {
         let body: BodyFuture = Box::pin(async move {
             for v in vals {
                 let g = current_generator().expect("inside a generator");
-                g.yield_(Value::Number(v)).await;
+                g.yield_(Value::Float(v)).await;
             }
             Ok(Value::Nil)
         });
@@ -539,15 +539,15 @@ mod tests {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
             assert_eq!(
                 g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(1.0))
+                Some(Value::Float(1.0))
             );
             assert_eq!(
                 g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(2.0))
+                Some(Value::Float(2.0))
             );
             assert_eq!(
                 g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(3.0))
+                Some(Value::Float(3.0))
             );
             assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
             // Idempotent: still None after done.
@@ -573,21 +573,21 @@ mod tests {
             let seen2 = seen.clone();
             let body: BodyFuture = Box::pin(async move {
                 let g = current_generator().unwrap();
-                let a = g.yield_(Value::Number(10.0)).await;
+                let a = g.yield_(Value::Float(10.0)).await;
                 seen2.borrow_mut().push(a);
                 let g = current_generator().unwrap();
-                let b = g.yield_(Value::Number(20.0)).await;
+                let b = g.yield_(Value::Float(20.0)).await;
                 seen2.borrow_mut().push(b);
                 Ok(Value::Nil)
             });
             let g = Rc::new(GeneratorHandle::new(body));
             assert_eq!(
                 g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(10.0))
+                Some(Value::Float(10.0))
             );
             assert_eq!(
                 g.resume(Value::Str("first".into())).await.unwrap(),
-                Some(Value::Number(20.0))
+                Some(Value::Float(20.0))
             );
             assert_eq!(g.resume(Value::Str("second".into())).await.unwrap(), None);
             let s = seen.borrow();
@@ -626,7 +626,7 @@ mod tests {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
             assert_eq!(
                 g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(1.0))
+                Some(Value::Float(1.0))
             );
             drop(g);
         })
@@ -638,13 +638,13 @@ mod tests {
         on_localset(async {
             let body: BodyFuture = Box::pin(async move {
                 let g = current_generator().unwrap();
-                g.yield_(Value::Number(1.0)).await;
+                g.yield_(Value::Float(1.0)).await;
                 Err(Control::Panic(AsError::new("boom")))
             });
             let g = Rc::new(GeneratorHandle::new(body));
             assert_eq!(
                 g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(1.0))
+                Some(Value::Float(1.0))
             );
             match g.resume(Value::Nil).await {
                 Err(Control::Panic(e)) => assert_eq!(e.message, "boom"),
@@ -662,7 +662,7 @@ mod tests {
             let g = make_gen(vec![1.0, 2.0, 3.0]);
             assert_eq!(
                 g.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(1.0))
+                Some(Value::Float(1.0))
             );
             g.close();
             assert_eq!(g.resume(Value::Nil).await.unwrap(), None);
@@ -679,20 +679,20 @@ mod tests {
             let inner = make_gen(vec![1.0, 2.0]);
             let inner_for_body = inner.clone();
             let outer_body: BodyFuture = Box::pin(async move {
-                while let Some(Value::Number(n)) = inner_for_body.resume(Value::Nil).await? {
+                while let Some(Value::Float(n)) = inner_for_body.resume(Value::Nil).await? {
                     let g = current_generator().unwrap();
-                    g.yield_(Value::Number(n * 2.0)).await;
+                    g.yield_(Value::Float(n * 2.0)).await;
                 }
                 Ok(Value::Nil)
             });
             let outer = Rc::new(GeneratorHandle::new(outer_body));
             assert_eq!(
                 outer.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(2.0))
+                Some(Value::Float(2.0))
             );
             assert_eq!(
                 outer.resume(Value::Nil).await.unwrap(),
-                Some(Value::Number(4.0))
+                Some(Value::Float(4.0))
             );
             assert_eq!(outer.resume(Value::Nil).await.unwrap(), None);
             // The stack is balanced after all polling.

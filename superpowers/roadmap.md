@@ -296,6 +296,42 @@ differential coverage (tree-walker == specialized-VM == generic-VM == `.aso`, bo
 Docs: `docs/content/language/workers.md`. (Known separate bug, out of scope:
 `recover(fn(){...})` fails — use the arrow form `recover(() => ...)`.)
 
+## NUM — numeric model & integers ✅ COMPLETE (2026-06)
+
+The keystone of the "serious general-purpose language" campaign:
+`specs/2026-06-08-numeric-model-design.md`. Replaces the single `Value::Number(f64)` with a real
+numeric tower — CORE, both engines byte-identical. **Deliberately breaking** (no pre-1.0 compat goal),
+with the whole example/golden corpus *migrated*, not trimmed.
+
+1. **`int` (i64) + `float` (f64)** — `Value::Number(f64)` renamed `Value::Float`; new `Value::Int(i64)`.
+   Integer literals (no `.`/exponent) are `int`; fractional/exponent literals are `float`. New **octal
+   `0o`** alongside `0x`/`0b`/`_` groups; an i64-overflowing literal is a parse-time error. `number` is
+   the annotation **union `int | float`** (no value's `type` is `"number"`); `decimal` stays exact/opt-in.
+2. **Type-directed division (no `//`)** — `int/int` truncates toward zero (`7/2==3`, `-7/2==-3`); any
+   `float` operand promotes to `float` (`7.0/2==3.5`). `/ 0` and `% 0` on ints are Tier-2 panics.
+3. **Checked overflow + wrapping** — `+ - * **` and unary `-` trap on i64 overflow (recoverable Tier-2
+   panic); explicit two's-complement `+% -% *%` are the escape hatch (hashing/codecs/self-hosting).
+4. **Bitwise/shift `& | ^ << >> ~`** — int-only at **Go precedence** (`a & b == c` ⇒ `(a&b)==c`); the
+   `bitor` tier is bypassed by the pattern/type parsers so or-patterns/unions are unaffected; `>>` splits
+   in type-argument position (`future<array<int>>`). Out-of-range shift amount panics; bit-loss does not.
+5. **Truthiness (campaign-wide, NUM owns the `is_truthy` edit)** — falsy set is now `nil`, `false`,
+   `0`/`0.0`/`-0.0`/`NaN`, `0m`, `""`; **collections/objects/instances stay truthy even when empty**.
+6. **Exact cross-subtype comparison** (`1 == 1.0`, no lossy promotion past 2^53) + `MapKey::Int` folding
+   (an integral in-range float key folds to the equal int key; NaN/decimal carve-outs preserved).
+7. **Code points are `int`s** (Go "rune" model, no `char` type) — `string.codepoints`/`from_codepoints`/
+   `code_at`. **Float printing always shows a decimal** (`5.0`). `int()`/`float()` conversions;
+   `x instanceof int|float|number` runtime type guards (+ checker narrowing).
+8. **Stdlib:** `std/math` floor/ceil/round/trunc → `int`, `abs` subtype-preserving, new `floordiv`/
+   `divmod`/`ceildiv` + bit helpers (`popcount`/`leading_zeros`/`trailing_zeros`/`rotl`/`rotr`); the rest
+   of `math` still computes in float and returns `float`. `json` round-trips the int/float subtype by
+   syntax. Array indices / string offsets / range bounds / `for` counters are `int`.
+
+Both type systems (`Type::Int`/`Float`, `CheckTy::Int`/`Float` with gradual gate held — `examples/**`
+emits zero `type-*` in both configs); `.aso` constant pool gains an `Int` kind (`ASO_FORMAT_VERSION`
+bumped); worker airlock + adaptive-arithmetic (`ArithKind::Int`) integration; tree-sitter regen +
+editor pins; full corpus migration. All-modes differential (tree-walker == specialized-VM == generic-VM
+== `.aso`, both feature configs). Docs: `docs/content/language/values-types.md#numbers`.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

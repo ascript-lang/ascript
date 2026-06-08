@@ -130,7 +130,8 @@ pub enum SpanStatus {
 /// The bare (unqualified) builtin names installed in every program's global env.
 /// Shared with the checker (`undefined-variable`) so they cannot drift.
 pub const BUILTIN_NAMES: &[&str] = &[
-    "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit",
+    "print", "Ok", "Err", "assert", "recover", "test", "len", "type", "range", "exit", "int",
+    "float",
 ];
 
 pub fn global_env() -> Environment {
@@ -2630,33 +2631,43 @@ impl Interp {
                 // a bare descending range counts DOWN (`for (i in 10..7)` → 10 9 8).
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
-                let (lo, hi) = match (start_v, end_v) {
-                    (Value::Number(a), Value::Number(b)) => (a, b),
+                // NUM §4: int bounds → an Int sequence (the loop var is `Int`); a
+                // float bound → a float sequence. Both kinds are accepted; the
+                // direction/validation math runs on f64 via the SHARED `resolve_step`.
+                let (lo, hi, bounds_int) = match (start_v.as_f64(), end_v.as_f64()) {
+                    (Some(a), Some(b)) => {
+                        (a, b, start_v.is_int_value() && end_v.is_int_value())
+                    }
                     _ => {
                         return Err(
                             AsError::at("for-range bounds must be numbers", start.span).into()
                         )
                     }
                 };
-                let step_v = match step {
-                    Some(e) => match self.eval_expr(e, env).await? {
-                        Value::Number(s) => Some(s),
-                        _ => {
-                            return Err(
-                                AsError::at("for-range step must be a number", e.span).into()
-                            )
+                let (step_v, step_int) = match step {
+                    Some(e) => {
+                        let sv = self.eval_expr(e, env).await?;
+                        match sv.as_f64() {
+                            Some(s) => (Some(s), sv.is_int_value()),
+                            None => {
+                                return Err(
+                                    AsError::at("for-range step must be a number", e.span).into()
+                                )
+                            }
                         }
-                    },
-                    None => None,
+                    }
+                    // Omitted step is the integral `±1`, so it never forces float.
+                    None => (None, true),
                 };
                 // Validation panic anchored at the START bound's span (matching the
                 // bounds panic above and the VM's range-setup op).
                 let step_n = resolve_step(lo, hi, step_v, start.span)?;
+                let yields_int = bounds_int && step_int;
                 let mut i = lo;
                 while range_has_next(i, hi, step_n, *inclusive) {
                     let child = env.child();
                     child
-                        .define(var, Value::Number(i), false)
+                        .define(var, range_counter_value(i, yields_int), false)
                         .map_err(AsError::new)?;
                     match self.exec(body, &child).await? {
                         Flow::Break => break,
@@ -2948,7 +2959,8 @@ impl Interp {
         // (return / `?` / panic). A `Cell`, never held across an `.await`.
         let _expr_depth = DepthGuard::enter(&self.expr_depth, EXPR_NEST_LIMIT, expr.span)?;
         match &expr.kind {
-            ExprKind::Number(n) => Ok(Value::Number(*n)),
+            ExprKind::Int(i) => Ok(Value::Int(*i)),
+            ExprKind::Float(n) => Ok(Value::Float(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Nil => Ok(Value::Nil),
@@ -2988,6 +3000,21 @@ impl Interp {
                         } else {
                             Ok(l)
                         };
+                    }
+                    // `x instanceof int|float|number|string|bool` (NUM §6): the RHS
+                    // is a bare reserved-type-name identifier that must NOT be
+                    // evaluated as a value (it is not a binding). Recognize it BEFORE
+                    // evaluating the RHS and route to the subtype check. Byte-identical
+                    // to the VM, which pre-resolves the name at compile time.
+                    BinOp::InstanceOf => {
+                        if let ExprKind::Ident(name) = &rhs.kind {
+                            if crate::interp::is_reserved_instanceof_type_name(name) {
+                                let l = self.eval_expr(lhs, env).await?;
+                                let yes = crate::interp::instanceof_reserved_type(&l, name)
+                                    .unwrap_or(false);
+                                return Ok(Value::Bool(yes));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -3184,13 +3211,16 @@ impl Interp {
                 let start_v = self.eval_expr(start, env).await?;
                 let end_v = self.eval_expr(end, env).await?;
                 let step_v = match step {
-                    Some(e) => match self.eval_expr(e, env).await? {
-                        Value::Number(s) => Some(s),
-                        _ => return Err(AsError::at("range step must be a number", e.span).into()),
-                    },
+                    Some(e) => Some(self.eval_expr(e, env).await?),
                     None => None,
                 };
-                materialize_range_stepped(&start_v, &end_v, *inclusive, step_v, expr.span)
+                materialize_range_stepped(
+                    &start_v,
+                    &end_v,
+                    *inclusive,
+                    step_v.as_ref(),
+                    expr.span,
+                )
             }
             ExprKind::Paren(inner) => self.eval_expr(inner, env).await,
             ExprKind::Try(inner) => {
@@ -3294,24 +3324,26 @@ impl Interp {
                 // then `range_pattern_contains` tests in-bounds + on-the-stride.
                 // With `step` omitted the membership degenerates to the plain
                 // in-bounds test, so existing no-step patterns are UNCHANGED.
-                let n = match subject {
-                    Value::Number(n) => *n,
-                    _ => return Ok(false),
+                // NUM §4: a number subject/bound is Int OR Float; a non-number is a
+                // (non-panic) mismatch. The membership math is exact-on-f64.
+                let n = match subject.as_f64() {
+                    Some(n) => n,
+                    None => return Ok(false),
                 };
-                let lo = match self.eval_expr(start, env).await? {
-                    Value::Number(x) => x,
-                    _ => return Ok(false),
+                let lo = match self.eval_expr(start, env).await?.as_f64() {
+                    Some(x) => x,
+                    None => return Ok(false),
                 };
-                let hi = match self.eval_expr(end, env).await? {
-                    Value::Number(x) => x,
-                    _ => return Ok(false),
+                let hi = match self.eval_expr(end, env).await?.as_f64() {
+                    Some(x) => x,
+                    None => return Ok(false),
                 };
                 // Resolve the step's `f64` (None when omitted). A non-number step
                 // expression is a Tier-2 type error, mirroring iteration.
                 let step_v = match step {
-                    Some(s) => match self.eval_expr(s, env).await? {
-                        Value::Number(x) => Some(x),
-                        _ => return Err(AsError::at("range step must be a number", s.span).into()),
+                    Some(s) => match self.eval_expr(s, env).await?.as_f64() {
+                        Some(x) => Some(x),
+                        None => return Err(AsError::at("range step must be a number", s.span).into()),
                     },
                     None => None,
                 };
@@ -4678,8 +4710,10 @@ impl Interp {
                 // exit(code?) — default 0; code must be an integer in 0..=255.
                 let code: i32 = match args.first() {
                     None => 0,
-                    Some(Value::Number(n)) => {
-                        let n = *n;
+                    // NUM §4: accept BOTH numeric subtypes; the code must be an
+                    // integer in 0..=255 either way.
+                    Some(v) if v.is_number() => {
+                        let n = v.as_f64().unwrap_or(f64::NAN);
                         if n.fract() != 0.0 || !(0.0..=255.0).contains(&n) {
                             return Err(AsError::at(
                                 format!("exit code must be an integer in 0..=255, got {}", n),
@@ -4733,28 +4767,119 @@ impl Interp {
                         .into())
                     }
                 };
-                Ok(Value::Number(n as f64))
+                // NUM §4: a length/count is an `Int`.
+                Ok(Value::Int(n as i64))
             }
             "type" => {
                 let v = args.first().cloned().unwrap_or(Value::Nil);
                 Ok(Value::Str(type_name(&v).into()))
             }
+            // NUM §4: `int(x)` conversion.
+            //   float → int, truncated TOWARD ZERO (a non-finite float is a Tier-2 panic);
+            //   int    → identity;
+            //   string → parse, returning a Tier-1 `[int, err]` pair (bad input is a value,
+            //            not a bug);
+            //   bool   → 0/1 (matching `convert.toNumber`'s bool coercion).
+            "int" => {
+                let v = args.first().cloned().unwrap_or(Value::Nil);
+                match &v {
+                    Value::Int(_) => Ok(v),
+                    Value::Float(f) => {
+                        if !f.is_finite() {
+                            return Err(AsError::at(
+                                format!("cannot convert non-finite float {} to int", format_number(*f)),
+                                span,
+                            )
+                            .into());
+                        }
+                        let t = f.trunc();
+                        // `i64::MAX as f64` rounds UP to 2^63 (= 9223372036854775808.0),
+                        // which is OUT of i64 range, so a `<=` bound would admit 2^63 and
+                        // `as i64` would silently saturate to i64::MAX. Use a STRICT upper
+                        // bound: `-(i64::MIN as f64)` is exactly 2^63, and `<` excludes it
+                        // while still admitting the largest representable in-range float
+                        // (2^63 − 2048). The lower bound is exact (`i64::MIN as f64` == −2^63).
+                        if t >= i64::MIN as f64 && t < -(i64::MIN as f64) {
+                            Ok(Value::Int(t as i64))
+                        } else {
+                            Err(AsError::at(
+                                format!("float {} is out of range for int (i64)", format_number(*f)),
+                                span,
+                            )
+                            .into())
+                        }
+                    }
+                    Value::Bool(b) => Ok(Value::Int(if *b { 1 } else { 0 })),
+                    Value::Str(s) => match s.trim().parse::<i64>() {
+                        Ok(n) => Ok(make_pair(Value::Int(n), Value::Nil)),
+                        Err(_) => Ok(make_pair(
+                            Value::Nil,
+                            make_error(Value::Str(
+                                format!("cannot parse '{}' as an int", s).into(),
+                            )),
+                        )),
+                    },
+                    other => Err(AsError::at(
+                        format!("int() cannot convert {}", type_name(other)),
+                        span,
+                    )
+                    .into()),
+                }
+            }
+            // NUM §4: `float(x)` conversion.
+            //   int    → exact f64;
+            //   float  → identity;
+            //   string → parse, returning a Tier-1 `[float, err]` pair;
+            //   bool   → 0.0/1.0.
+            "float" => {
+                let v = args.first().cloned().unwrap_or(Value::Nil);
+                match &v {
+                    Value::Float(_) => Ok(v),
+                    Value::Int(i) => Ok(Value::Float(*i as f64)),
+                    Value::Bool(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
+                    Value::Str(s) => match s.trim().parse::<f64>() {
+                        Ok(n) => Ok(make_pair(Value::Float(n), Value::Nil)),
+                        Err(_) => Ok(make_pair(
+                            Value::Nil,
+                            make_error(Value::Str(
+                                format!("cannot parse '{}' as a float", s).into(),
+                            )),
+                        )),
+                    },
+                    other => Err(AsError::at(
+                        format!("float() cannot convert {}", type_name(other)),
+                        span,
+                    )
+                    .into()),
+                }
+            }
             "range" => {
-                let want_num = |i: usize| -> Result<f64, Control> {
+                // NUM §4: `range(..)` accepts Int OR Float args and, like the
+                // language `a..b` value-range, yields an Int array when EVERY
+                // provided argument is an Int (a float arg makes the whole sequence
+                // float). A missing arg defaults to `Int(0)`/`Int(1)`, which keeps
+                // the all-int case integral.
+                let want_num = |i: usize, default: f64| -> Result<(f64, bool), Control> {
                     match args.get(i) {
-                        Some(Value::Number(n)) => Ok(*n),
-                        Some(v) => Err(AsError::at(
-                            format!("range() expects number arguments, got {}", type_name(v)),
-                            span,
-                        )
-                        .into()),
-                        None => Ok(0.0),
+                        Some(v) => match v.as_f64() {
+                            Some(n) => Ok((n, v.is_int_value())),
+                            None => Err(AsError::at(
+                                format!(
+                                    "range() expects number arguments, got {}",
+                                    type_name(v)
+                                ),
+                                span,
+                            )
+                            .into()),
+                        },
+                        // An omitted bound/step is the integral default.
+                        None => Ok((default, true)),
                     }
                 };
-                let (start, end, step) = match args.len() {
-                    1 => (0.0, want_num(0)?, 1.0),
-                    2 => (want_num(0)?, want_num(1)?, 1.0),
-                    3 => (want_num(0)?, want_num(1)?, want_num(2)?),
+                let ((start, s_int), (end, e_int), (step, k_int)) = match args.len() {
+                    1 => ((0.0, true), want_num(0, 0.0)?, (1.0, true)),
+                    2 => (want_num(0, 0.0)?, want_num(1, 0.0)?, (1.0, true)),
+                    3 => (want_num(0, 0.0)?, want_num(1, 0.0)?, want_num(2, 1.0)?),
                     n => {
                         return Err(AsError::at(
                             format!("range() expects 1 to 3 arguments, got {}", n),
@@ -4766,16 +4891,17 @@ impl Interp {
                 if step == 0.0 {
                     return Err(AsError::at("range() step must not be zero", span).into());
                 }
+                let yields_int = s_int && e_int && k_int;
                 let mut out = Vec::new();
                 let mut i = start;
                 if step > 0.0 {
                     while i < end {
-                        out.push(Value::Number(i));
+                        out.push(range_counter_value(i, yields_int));
                         i += step;
                     }
                 } else {
                     while i > end {
-                        out.push(Value::Number(i));
+                        out.push(range_counter_value(i, yields_int));
                         i += step;
                     }
                 }
@@ -4891,11 +5017,25 @@ pub(crate) fn check_not_frozen(v: &Value, span: Span) -> Result<(), Control> {
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Control> {
     match op {
         UnOp::Neg => match v {
-            Value::Number(n) => Ok(Value::Number(-n)),
+            // `-int` is checked: `-i64::MIN` overflows → Tier-2 panic (NUM §3.2).
+            Value::Int(i) => match i.checked_neg() {
+                Some(n) => Ok(Value::Int(n)),
+                None => Err(AsError::at("integer overflow in '-'", span).into()),
+            },
+            Value::Float(n) => Ok(Value::Float(-n)),
             Value::Decimal(d) => Ok(Value::Decimal(-d)),
             _ => Err(AsError::at("cannot negate a non-number", span).into()),
         },
         UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
+        // `~x` — int bitwise NOT (NUM §3.2). Int-only: a float (or any non-int)
+        // operand is a Tier-2 panic.
+        UnOp::BitNot => match v {
+            Value::Int(i) => Ok(Value::Int(!i)),
+            Value::Float(_) => {
+                Err(AsError::at("bitwise op requires int operands, got float", span).into())
+            }
+            _ => Err(AsError::at("cannot apply ~ to a non-int", span).into()),
+        },
     }
 }
 
@@ -4934,7 +5074,7 @@ pub(crate) fn materialize_range(
 ///     non-zero number"* (no interpolation).
 ///   - `lo != hi` and `sign(s) != sign(hi - lo)` → Tier-2 panic *"step `<s>` moves
 ///     away from end (`<hi>`); range can never progress"*. The `<s>`/`<hi>` are
-///     formatted via `Value::Number` Display (`format_number`) so both engines
+///     formatted via `Value::Float` Display (`format_number`) so both engines
 ///     produce a byte-identical string.
 /// - `step_v == None`: the omitted-step default infers direction from the bounds
 ///   (sequence semantics, spec §3.1): `+1.0` when `hi >= lo`, `-1.0` when
@@ -4953,7 +5093,7 @@ pub(crate) fn resolve_step(
             }
             if lo != hi && (s > 0.0) != (hi > lo) {
                 // `{s}`/`{hi}` MUST match the engines' canonical number formatting
-                // (the `Value::Number` Display path) so the message is byte-identical.
+                // (the `Value::Float` Display path) so the message is byte-identical.
                 return Err(AsError::at(
                     format!(
                         "step {} moves away from end ({}); range can never progress",
@@ -4974,11 +5114,27 @@ pub(crate) fn resolve_step(
     }
 }
 
-/// Format a `Value::Number`'s `f64` exactly as the interpreter/VM display it
+/// Format a `Value::Float`'s `f64` exactly as the interpreter/VM display it
 /// (`impl Display for Value` → `write!("{}", n)`), so a number interpolated into a
 /// range panic message is identical across both engines.
 pub(crate) fn format_number(n: f64) -> String {
-    Value::Number(n).to_string()
+    Value::Float(n).to_string()
+}
+
+/// NUM §4: produce a range loop counter `Value`. When `yields_int` is true the
+/// f64 counter `i` is converted to a `Value::Int` (an integral in-range range step
+/// always lands the counter on an exact integer within `i64` range, so this is
+/// lossless); a counter that is somehow non-integral or out of `i64` range falls
+/// back to `Value::Float` rather than producing a wrong int. Otherwise the counter
+/// stays a `Value::Float`. This is the SINGLE shared decision so the tree-walker
+/// and the VM (which seeds Int slots when the bounds+step are Int) agree.
+pub(crate) fn range_counter_value(i: f64, yields_int: bool) -> Value {
+    if yields_int {
+        if let Some(n) = (Value::Float(i)).as_int_exact() {
+            return Value::Int(n);
+        }
+    }
+    Value::Float(i)
 }
 
 /// Materialize a range value `[lo .. hi)` / `[lo ..= hi]` into an eager
@@ -4989,19 +5145,30 @@ pub(crate) fn materialize_range_stepped(
     l: &Value,
     r: &Value,
     inclusive: bool,
-    step_v: Option<f64>,
+    step: Option<&Value>,
     span: Span,
 ) -> Result<Value, Control> {
-    let (lo, hi) = match (l, r) {
-        (Value::Number(a), Value::Number(b)) => (*a, *b),
+    let (lo, hi, bounds_int) = match (l.as_f64(), r.as_f64()) {
+        (Some(a), Some(b)) => (a, b, l.is_int_value() && r.is_int_value()),
         _ => return Err(AsError::at("range bounds must be numbers", span).into()),
     };
-    let step = resolve_step(lo, hi, step_v, span)?;
+    // The step (when present) must be a number; its KIND is preserved so an Int
+    // materialized range requires Int bounds AND an Int step (`0..10 step 2` → Int,
+    // `0..10 step 2.0` → Float). An omitted step is the integral `±1`.
+    let (step_v, step_int) = match step {
+        Some(sv) => match sv.as_f64() {
+            Some(s) => (Some(s), sv.is_int_value()),
+            None => return Err(AsError::at("range step must be a number", span).into()),
+        },
+        None => (None, true),
+    };
+    let resolved = resolve_step(lo, hi, step_v, span)?;
+    let yields_int = bounds_int && step_int;
     let mut items = Vec::new();
     let mut i = lo;
-    while range_has_next(i, hi, step, inclusive) {
-        items.push(Value::Number(i));
-        i += step;
+    while range_has_next(i, hi, resolved, inclusive) {
+        items.push(range_counter_value(i, yields_int));
+        i += resolved;
     }
     Ok(Value::Array(crate::value::ArrayCell::new(items)))
 }
@@ -5073,6 +5240,31 @@ pub(crate) fn range_pattern_contains(
 /// Eq/Ne (cross-type decimal equality) → Range (eager `array<number>`) → string
 /// concat (`+` on two `Str`) → decimal arithmetic/ordering (either operand a
 /// `Decimal`) → the two-`Number` path → the generic "requires two numbers" error.
+/// If `name` is a reserved scalar type name usable as an `instanceof` RHS (NUM §6),
+/// test whether `lhs` is of that type. Returns `Some(bool)` for a recognized name,
+/// `None` otherwise (so the caller falls back to the class-based `instanceof`).
+///
+/// Shared verbatim by the tree-walker (`ExprKind::Binary { InstanceOf }`) and the
+/// VM (`Op::InstanceOf` with a pre-resolved type-name operand) so the two engines
+/// are byte-identical.
+pub(crate) fn instanceof_reserved_type(lhs: &Value, name: &str) -> Option<bool> {
+    match name {
+        "int" => Some(matches!(lhs, Value::Int(_))),
+        "float" => Some(matches!(lhs, Value::Float(_))),
+        "number" => Some(matches!(lhs, Value::Int(_) | Value::Float(_))),
+        "string" => Some(matches!(lhs, Value::Str(_))),
+        "bool" => Some(matches!(lhs, Value::Bool(_))),
+        _ => None,
+    }
+}
+
+/// Is `name` one of the reserved scalar type names recognized as an `instanceof`
+/// RHS (NUM §6)? Used by both front-ends to decide whether to skip evaluating the
+/// RHS expression and route to [`instanceof_reserved_type`] instead.
+pub(crate) fn is_reserved_instanceof_type_name(name: &str) -> bool {
+    matches!(name, "int" | "float" | "number" | "string" | "bool")
+}
+
 pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<Value, Control> {
     // Eq/Ne: cross-type Decimal↔Number comparison before generic `==`.
     match op {
@@ -5157,6 +5349,18 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
                     )
                     .into())
                 }
+                // Bitwise/shift/wrapping (NUM §3.2) are int-ONLY — not defined for
+                // decimal. A Tier-2 panic, consistent with the float-operand rejection.
+                BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::WrapAdd
+                | BinOp::WrapSub
+                | BinOp::WrapMul => {
+                    return Err(AsError::at(int_only_float_msg(op), span).into())
+                }
                 BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
                     unreachable!("handled above")
                 }
@@ -5170,35 +5374,237 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         // "operator requires two numbers or decimals" error.
     }
 
-    let (a, b) = match (&l, &r) {
-        (Value::Number(a), Value::Number(b)) => (*a, *b),
-        _ => {
-            return Err(AsError::at(
-                "operator requires two numbers (or two decimals, or number and decimal)",
-                span,
-            )
-            .into())
+    // Int-only operators (NUM §3.2): bitwise (`& | ^`), shift (`<< >>`), and
+    // wrapping (`+% -% *%`) reject a `float` operand BEFORE the promoting numeric
+    // dispatch — a float can never participate. A float operand → the Tier-2 type
+    // panic (`bitwise op requires int operands, got float` / the wrapping/shift
+    // equivalents). This runs ahead of the `(Int,Float)`/`(Float,_)` arms so those
+    // never see an int-only op. A non-number operand falls through to the generic
+    // "operator requires two numbers" error below.
+    if is_int_only_binop(op)
+        && (matches!(l, Value::Float(_)) || matches!(r, Value::Float(_)))
+    {
+        return Err(AsError::at(int_only_float_msg(op), span).into());
+    }
+
+    // Type-directed numeric dispatch (NUM §3.2):
+    //  - Int ⊕ Int      → the checked/truncating int table (`int_binop`).
+    //  - Int ⊕ Float    → promote the int to f64, result is Float (ordering exact).
+    //  - Float ⊕ Float  → the IEEE float path.
+    // Comparison across {Int,Float} is EXACT (no lossy cast) per NUM §3.3.
+    match (&l, &r) {
+        (Value::Int(a), Value::Int(b)) => int_binop(op, *a, *b, span),
+        // Mixed int/float: arithmetic promotes the int to float; ordering stays
+        // exact (compare i64 against f64 without precision loss).
+        (Value::Int(i), Value::Float(f)) => mixed_binop(op, *i, *f, false),
+        (Value::Float(f), Value::Int(i)) => mixed_binop(op, *i, *f, true),
+        (Value::Float(a), Value::Float(b)) => Ok(float_binop(op, *a, *b)),
+        _ => Err(AsError::at(
+            "operator requires two numbers (or two decimals, or number and decimal)",
+            span,
+        )
+        .into()),
+    }
+}
+
+/// `true` for the int-ONLY binary operators (NUM §3.2): bitwise (`& | ^`), shift
+/// (`<< >>`), and wrapping (`+% -% *%`). These reject a `float` operand outright —
+/// promotion never applies. Shared by `apply_binop`'s pre-dispatch guard.
+fn is_int_only_binop(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+    )
+}
+
+/// The Tier-2 panic message when an int-only operator (NUM §3.2) sees a `float`
+/// operand. Bitwise/shift use the spec's `bitwise op requires int operands, got
+/// float`; wrapping uses the parallel wrapping message. Shared by both engines so
+/// the diagnostic is byte-identical.
+fn int_only_float_msg(op: BinOp) -> String {
+    match op {
+        BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+            "wrapping op requires int operands, got float".to_string()
         }
-    };
+        _ => "bitwise op requires int operands, got float".to_string(),
+    }
+}
+
+/// `int ⊕ int` arithmetic and comparison (NUM §3.2/§3.3). This is the SINGLE
+/// source of truth shared by the tree-walker and (via the generic `apply_binop`
+/// fallback) the VM; the VM's specialized `ArithKind::Int` fast path MUST be
+/// byte-identical to it, including which inputs panic.
+///
+/// Arithmetic overflow / division-or-remainder-by-zero are recoverable Tier-2
+/// panics raised through the same `AsError::at(..).into()` path every other
+/// `apply_binop` panic uses.
+pub(crate) fn int_binop(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Control> {
+    let overflow =
+        |o: &str| -> Control { AsError::at(format!("integer overflow in '{o}'"), span).into() };
     let result = match op {
-        BinOp::Add => Value::Number(a + b),
-        BinOp::Sub => Value::Number(a - b),
-        BinOp::Mul => Value::Number(a * b),
-        BinOp::Div => Value::Number(a / b),
-        BinOp::Mod => Value::Number(a % b),
-        BinOp::Pow => Value::Number(a.powf(b)),
+        BinOp::Add => Value::Int(a.checked_add(b).ok_or_else(|| overflow("+"))?),
+        BinOp::Sub => Value::Int(a.checked_sub(b).ok_or_else(|| overflow("-"))?),
+        BinOp::Mul => Value::Int(a.checked_mul(b).ok_or_else(|| overflow("*"))?),
+        BinOp::Div => {
+            if b == 0 {
+                return Err(AsError::at("integer division by zero", span).into());
+            }
+            // `checked_div` is `None` only for `i64::MIN / -1` (overflow). Truncates
+            // toward zero (NUM §3.2): `7/2==3`, `-7/2==-3`.
+            Value::Int(a.checked_div(b).ok_or_else(|| overflow("/"))?)
+        }
+        BinOp::Mod => {
+            if b == 0 {
+                return Err(AsError::at("integer remainder by zero", span).into());
+            }
+            // `checked_rem` is `None` only for `i64::MIN % -1` (overflow). Sign
+            // follows the dividend (`-7 % 2 == -1`).
+            Value::Int(a.checked_rem(b).ok_or_else(|| overflow("%"))?)
+        }
+        BinOp::Pow => int_pow(a, b, span)?,
+        // Comparison: int vs int is trivially exact.
         BinOp::Lt => Value::Bool(a < b),
         BinOp::Le => Value::Bool(a <= b),
         BinOp::Gt => Value::Bool(a > b),
         BinOp::Ge => Value::Bool(a >= b),
+        // Bitwise (NUM §3.2): int two's-complement. Never overflow-trap.
+        BinOp::BitAnd => Value::Int(a & b),
+        BinOp::BitOr => Value::Int(a | b),
+        BinOp::BitXor => Value::Int(a ^ b),
+        // Shifts (NUM §3.2): the rhs is the shift AMOUNT. `checked_shl`/`checked_shr`
+        // return `None` ONLY when the amount is out of range (`< 0` or `>= 64`) —
+        // bit-loss (e.g. `1 << 63 == i64::MIN`, `-1 << 1 == -2`) is a defined result,
+        // not an overflow. `>>` is arithmetic (sign-extending) since `a` is `i64`.
+        BinOp::Shl => Value::Int(int_shift(a, b, true, span)?),
+        BinOp::Shr => Value::Int(int_shift(a, b, false, span)?),
+        // Wrapping (NUM §3.2): two's-complement, never panic.
+        BinOp::WrapAdd => Value::Int(a.wrapping_add(b)),
+        BinOp::WrapSub => Value::Int(a.wrapping_sub(b)),
+        BinOp::WrapMul => Value::Int(a.wrapping_mul(b)),
         BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
-            unreachable!("handled above")
+            unreachable!("handled above apply_binop's numeric dispatch")
         }
         BinOp::And | BinOp::Or | BinOp::Coalesce => {
             unreachable!("short-circuit ops are not dispatched through apply_binop")
         }
     };
     Ok(result)
+}
+
+/// `int << amount` / `int >> amount` (NUM §3.2). The single source of truth shared
+/// by the tree-walker and the VM. The shift AMOUNT (`b`) must be `0..64`; an amount
+/// `< 0` or `>= 64` is a recoverable Tier-2 panic (`shift amount out of range: <n>`),
+/// matching `i64::checked_shl`/`checked_shr` semantics. Bit-loss does NOT trap:
+/// `1 << 63 == i64::MIN`, `-1 << 1 == -2`. `>>` is arithmetic (sign-extending)
+/// because `a` is a signed `i64`.
+pub(crate) fn int_shift(a: i64, b: i64, left: bool, span: Span) -> Result<i64, Control> {
+    // The amount must be a valid `u32` in `0..64`; `b < 0` (a negative amount) and
+    // `b >= 64` both fail the `u32::try_from` + `checked_sh*` guard.
+    let amount = u32::try_from(b).ok().filter(|n| *n < 64);
+    let shifted = amount.and_then(|n| if left { a.checked_shl(n) } else { a.checked_shr(n) });
+    match shifted {
+        Some(v) => Ok(v),
+        None => Err(AsError::at(format!("shift amount out of range: {b}"), span).into()),
+    }
+}
+
+/// `int ** int` (NUM §3.2): a non-negative exponent ≤ `u32::MAX` uses
+/// `i64::checked_pow` (overflow → panic); a negative exponent or an exponent
+/// `> u32::MAX` computes as `float` via `powf` (the result is defined, never a
+/// truncated-exponent wrong int).
+fn int_pow(base: i64, exp: i64, span: Span) -> Result<Value, Control> {
+    if (0..=i64::from(u32::MAX)).contains(&exp) {
+        match base.checked_pow(exp as u32) {
+            Some(v) => Ok(Value::Int(v)),
+            None => Err(AsError::at("integer overflow in '**'", span).into()),
+        }
+    } else {
+        // Negative exponent OR exponent > u32::MAX → float result.
+        Ok(Value::Float((base as f64).powf(exp as f64)))
+    }
+}
+
+/// `float ⊕ float` arithmetic and comparison (the IEEE path; unchanged from the
+/// pre-NUM behavior). Never panics — IEEE handles `/0`, `NaN`, `inf`.
+fn float_binop(op: BinOp, a: f64, b: f64) -> Value {
+    match op {
+        BinOp::Add => Value::Float(a + b),
+        BinOp::Sub => Value::Float(a - b),
+        BinOp::Mul => Value::Float(a * b),
+        BinOp::Div => Value::Float(a / b),
+        BinOp::Mod => Value::Float(a % b),
+        BinOp::Pow => Value::Float(a.powf(b)),
+        BinOp::Lt => Value::Bool(a < b),
+        BinOp::Le => Value::Bool(a <= b),
+        BinOp::Gt => Value::Bool(a > b),
+        BinOp::Ge => Value::Bool(a >= b),
+        BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
+            unreachable!("handled above apply_binop's numeric dispatch")
+        }
+        // Int-only ops (bitwise/shift/wrapping) never reach the float path: a float
+        // operand is rejected by `apply_binop`'s int-only guard before dispatch.
+        BinOp::BitAnd
+        | BinOp::BitOr
+        | BinOp::BitXor
+        | BinOp::Shl
+        | BinOp::Shr
+        | BinOp::WrapAdd
+        | BinOp::WrapSub
+        | BinOp::WrapMul => {
+            unreachable!("int-only op rejected before the float path (apply_binop guard)")
+        }
+        BinOp::And | BinOp::Or | BinOp::Coalesce => {
+            unreachable!("short-circuit ops are not dispatched through apply_binop")
+        }
+    }
+}
+
+/// Mixed `int`/`float` (NUM §3.2/§3.3). For arithmetic, the int is promoted to
+/// f64 and the float path runs (result is Float). For ORDERING, the comparison is
+/// EXACT (no lossy `i as f64`): `int_cmp_float` compares the i64 against the f64
+/// without precision loss. `int_first` is `true` when the float was the left
+/// operand (so the operand order — and thus `<`/`>` direction — is preserved).
+fn mixed_binop(op: BinOp, i: i64, f: f64, float_first: bool) -> Result<Value, Control> {
+    use std::cmp::Ordering;
+    // Exact ordering for the comparison operators. `ord` is the ordering of the
+    // INT relative to the FLOAT; flip it when the float was the left operand.
+    let cmp = |want_lt: bool, want_eq: bool, want_gt: bool| -> Value {
+        match crate::value::int_cmp_float(i, f) {
+            None => Value::Bool(false), // NaN is unordered: every `<`,`<=`,`>`,`>=` is false.
+            Some(mut ord) => {
+                if float_first {
+                    ord = ord.reverse();
+                }
+                let hit = match ord {
+                    Ordering::Less => want_lt,
+                    Ordering::Equal => want_eq,
+                    Ordering::Greater => want_gt,
+                };
+                Value::Bool(hit)
+            }
+        }
+    };
+    match op {
+        BinOp::Lt => Ok(cmp(true, false, false)),
+        BinOp::Le => Ok(cmp(true, true, false)),
+        BinOp::Gt => Ok(cmp(false, false, true)),
+        BinOp::Ge => Ok(cmp(false, true, true)),
+        // Arithmetic: promote int → float, preserving operand order. The
+        // resulting `float_binop` cannot reach its `unreachable!` arms — Eq/Ne/
+        // Range/InstanceOf and the short-circuit ops are handled before the
+        // numeric dispatch, and the comparison ops are handled above.
+        _ => {
+            let (a, b) = if float_first { (f, i as f64) } else { (i as f64, f) };
+            Ok(float_binop(op, a, b))
+        }
+    }
 }
 
 /// Validate that a value is a usable array index (a non-negative integer).
@@ -5216,8 +5622,12 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
     match (l, r) {
         // Decimal vs Decimal: use the inner value's own equality.
         (Value::Decimal(a), Value::Decimal(b)) => Ok(a == b),
-        // Decimal vs Number (or vice-versa): coerce the number to decimal.
-        (Value::Decimal(a), Value::Number(n)) | (Value::Number(n), Value::Decimal(a)) => {
+        // NUM §4: Decimal vs Int — the int converts EXACTLY.
+        (Value::Decimal(a), Value::Int(i)) | (Value::Int(i), Value::Decimal(a)) => {
+            Ok(*a == rust_decimal::Decimal::from(*i))
+        }
+        // Decimal vs Float (or vice-versa): coerce the number to decimal.
+        (Value::Decimal(a), Value::Float(n)) | (Value::Float(n), Value::Decimal(a)) => {
             if !n.is_finite() {
                 // A non-finite float can never equal a finite decimal (lenient
                 // false; the ordering path panics instead — see fn doc comment).
@@ -5235,12 +5645,33 @@ fn decimal_cross_eq(l: &Value, r: &Value, span: Span) -> Result<bool, Control> {
 }
 
 fn array_index(v: &Value, span: Span) -> Result<usize, AsError> {
+    // NUM §4: `Int` is the common (and canonical) index. A `Float` index is accepted
+    // only when it is exactly integral (e.g. `arr[2.0]`); a non-integral float is the
+    // Tier-2 panic `array index must be an int, got float`. Any number must be
+    // non-negative; a non-number is `array index must be a number`.
     match v {
-        Value::Number(n) if n.fract() == 0.0 && *n >= 0.0 => Ok(*n as usize),
-        Value::Number(_) => Err(AsError::at(
-            "array index must be a non-negative integer",
-            span,
-        )),
+        Value::Int(i) => {
+            if *i >= 0 {
+                Ok(*i as usize)
+            } else {
+                Err(AsError::at(
+                    "array index must be a non-negative integer",
+                    span,
+                ))
+            }
+        }
+        Value::Float(n) => {
+            if n.fract() != 0.0 {
+                Err(AsError::at("array index must be an int, got float", span))
+            } else if *n >= 0.0 {
+                Ok(*n as usize)
+            } else {
+                Err(AsError::at(
+                    "array index must be a non-negative integer",
+                    span,
+                ))
+            }
+        }
         _ => Err(AsError::at("array index must be a number", span)),
     }
 }
@@ -5393,7 +5824,8 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
     match v {
         Value::Nil => "nil",
         Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
+        Value::Int(_) => "int",
+        Value::Float(_) => "float",
         Value::Decimal(_) => "decimal",
         Value::Str(_) => "string",
         Value::Builtin(_) | Value::Function(_) | Value::Closure(_) => "function",
@@ -5705,7 +6137,11 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
     use crate::ast::Type;
     match ty {
         Type::Any => true,
-        Type::Number => matches!(value, Value::Number(_)),
+        // NUM §4/§5: `number` is the union `int | float`; `int`/`float` accept only
+        // their own subtype.
+        Type::Number => value.is_number(),
+        Type::Int => matches!(value, Value::Int(_)),
+        Type::Float => matches!(value, Value::Float(_)),
         Type::String => matches!(value, Value::Str(_)),
         Type::Bool => matches!(value, Value::Bool(_)),
         Type::Nil => matches!(value, Value::Nil),
@@ -5807,7 +6243,7 @@ mod tests {
         let interp = Interp::new();
         assert!(!interp.telemetry_active());
         assert!(interp
-            .telemetry_span_start("op", vec![("k".into(), Value::Number(1.0))])
+            .telemetry_span_start("op", vec![("k".into(), Value::Float(1.0))])
             .is_none());
         // Setter/event/end on an arbitrary id are safe no-ops when inactive.
         interp.telemetry_span_set(0, "k", Value::Nil);
@@ -6070,7 +6506,7 @@ print(y)
     async fn native_handle_fields_and_methods() {
         let interp = Interp::new();
         let mut fields = indexmap::IndexMap::new();
-        fields.insert("pid".to_string(), Value::Number(42.0));
+        fields.insert("pid".to_string(), Value::Float(42.0));
         let h = interp.register_resource(
             crate::value::NativeKind::ChildProcess,
             fields,
@@ -6079,7 +6515,7 @@ print(y)
         assert_eq!(type_name(&h), "childProcess");
         assert_eq!(
             interp.read_member(&h, "pid", Span::new(0, 0)).unwrap(),
-            Value::Number(42.0)
+            Value::Float(42.0)
         );
         let m = interp.read_member(&h, "wait", Span::new(0, 0)).unwrap();
         assert!(matches!(m, Value::NativeMethod(_)));
@@ -6116,8 +6552,9 @@ print(y)
             run("let a = [1]\nprint(len(a) > 5 ? a[99] : \"safe\")").await,
             "safe\n"
         );
-        // Only nil/false are falsy: 0 and "" are truthy conditions.
-        assert_eq!(run("print(0 ? \"t\" : \"f\")").await, "t\n");
+        // NUM §3.3 (BREAKING): 0 and "" are now FALSY; a non-zero number is truthy.
+        assert_eq!(run("print(0 ? \"t\" : \"f\")").await, "f\n");
+        assert_eq!(run("print(1 ? \"t\" : \"f\")").await, "t\n");
         assert_eq!(run("print(nil ? \"t\" : \"f\")").await, "f\n");
     }
 
@@ -6318,9 +6755,11 @@ print(y)
 
     #[tokio::test]
     async fn number_literals_hex_binary_scientific_underscore() {
+        // NUM §4: `1e3` is a `float` (exponent ⇒ float) and prints `1000.0`; the
+        // hex/binary/underscore int literals print with no decimal.
         assert_eq!(
             run("print(0xFF)\nprint(0b1010)\nprint(1e3)\nprint(1_000)\nprint(0xFF_FF)").await,
-            "255\n10\n1000\n1000\n65535\n"
+            "255\n10\n1000.0\n1000\n65535\n"
         );
     }
 
@@ -6347,10 +6786,90 @@ print(y)
             "message was {:?}",
             err.message
         );
+        // NUM §4: `type_name(5)` is now `"int"`.
         assert_eq!(
             err.message,
-            "type contract violated: expected future<number>, got number (5)"
+            "type contract violated: expected future<number>, got int (5)"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn int_float_conversion_builtins() {
+        // NUM §4: `int(x)` / `float(x)` conversion builtins.
+        // float → int truncates toward zero.
+        assert_eq!(run("print(int(5.7))").await, "5\n");
+        assert_eq!(run("print(int(-5.7))").await, "-5\n");
+        assert_eq!(run("print(int(5.0))").await, "5\n");
+        // int → int identity; type stays int.
+        assert_eq!(run("print(int(5))").await, "5\n");
+        assert_eq!(run("print(type(int(5.7)))").await, "int\n");
+        // float(int) → exact f64, prints with a decimal.
+        assert_eq!(run("print(float(3))").await, "3.0\n");
+        assert_eq!(run("print(type(float(3)))").await, "float\n");
+        // float → float identity.
+        assert_eq!(run("print(float(2.5))").await, "2.5\n");
+        // string parse returns a Tier-1 [value, err] pair.
+        assert_eq!(run("print(int(\"42\"))").await, "[42, nil]\n");
+        assert_eq!(run("print(type(int(\"42\")[0]))").await, "int\n");
+        assert_eq!(run("print(float(\"3.5\"))").await, "[3.5, nil]\n");
+        assert_eq!(run("print(type(float(\"3.5\")[0]))").await, "float\n");
+        // bad string parse → [nil, err].
+        let out = run("let r = int(\"x\")\nprint(r[0])\nprint(r[1] != nil)").await;
+        assert_eq!(out, "nil\ntrue\n");
+        let out = run("let r = float(\"nope\")\nprint(r[0])\nprint(r[1] != nil)").await;
+        assert_eq!(out, "nil\ntrue\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn int_conversion_out_of_range_boundary() {
+        // Regression: `i64::MAX as f64` rounds UP to 2^63, so a `<=` bound would admit
+        // the out-of-range value 2^63 and `as i64` would silently saturate to i64::MAX.
+        // The strict bound must REJECT 2^63 with a clean out-of-range error...
+        let out = run("print(recover(() => int(9223372036854775808.0))[1] != nil)").await;
+        assert_eq!(out, "true\n", "int(2^63) must error, not silently saturate");
+        // ...while still ADMITTING the largest representable in-range float (2^63 − 2048).
+        assert_eq!(
+            run("print(int(9223372036854773760.0))").await,
+            "9223372036854773760\n"
+        );
+        // i64::MIN is exactly representable and in range.
+        assert_eq!(
+            run("print(int(-9223372036854775808.0))").await,
+            "-9223372036854775808\n"
+        );
+        // non-finite → clean error, never a 0/garbage cast.
+        let inf = run("print(recover(() => int(1.0 / 0.0))[1] != nil)").await;
+        assert_eq!(inf, "true\n");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn int_float_names_still_work_as_types_and_instanceof() {
+        // The new `int`/`float` builtins must not break the reserved type names.
+        // Call position:
+        assert_eq!(run("print(int(7.9))").await, "7\n");
+        // instanceof:
+        assert_eq!(run("print(5 instanceof int)").await, "true\n");
+        assert_eq!(run("print(5 instanceof float)").await, "false\n");
+        assert_eq!(run("print(5.0 instanceof float)").await, "true\n");
+        // annotation (runtime contract):
+        assert_eq!(run("let x: int = 5\nprint(x)").await, "5\n");
+        assert_eq!(run("let y: float = 2.5\nprint(y)").await, "2.5\n");
+    }
+
+    #[test]
+    fn check_type_int_float_number_contracts() {
+        use crate::ast::Type;
+        // NUM §5: `int` accepts only Int, `float` only Float, `number` both. This is
+        // the runtime contract enforced on class fields / params / returns. Regression
+        // for the bug where `int`/`float` parsed as Type::Named and `class C { x: int }`
+        // panicked "expected int, got int".
+        assert!(check_type(&Value::Int(5), &Type::Int));
+        assert!(!check_type(&Value::Float(5.0), &Type::Int));
+        assert!(check_type(&Value::Float(2.5), &Type::Float));
+        assert!(!check_type(&Value::Int(5), &Type::Float));
+        assert!(check_type(&Value::Int(5), &Type::Number));
+        assert!(check_type(&Value::Float(2.5), &Type::Number));
+        assert!(!check_type(&Value::Str("x".into()), &Type::Int));
     }
 
     #[test]
@@ -6381,7 +6900,7 @@ print(y)
         // The tree-walker callables still satisfy `: fn`.
         assert!(check_type(&Value::Builtin("len".into()), &Type::Fn));
         // A non-callable still fails the `: fn` contract (behavior preserved).
-        assert!(!check_type(&Value::Number(7.0), &Type::Fn));
+        assert!(!check_type(&Value::Float(7.0), &Type::Fn));
         assert!(!check_type(&Value::Str("x".into()), &Type::Fn));
     }
 
@@ -6430,7 +6949,9 @@ print(y)
         assert_eq!(run("print(len([1,2,3]))").await, "3\n");
         assert_eq!(run("print(len(\"hello\"))").await, "5\n");
         assert_eq!(run("print(len({a:1, b:2}))").await, "2\n");
-        assert_eq!(run("print(type(1))").await, "number\n");
+        // NUM §4: an int literal is `"int"`; a float literal is `"float"`.
+        assert_eq!(run("print(type(1))").await, "int\n");
+        assert_eq!(run("print(type(1.5))").await, "float\n");
         assert_eq!(run("print(type(\"x\"))").await, "string\n");
         assert_eq!(run("print(type([1]))").await, "array\n");
         assert_eq!(run("print(type(nil))").await, "nil\n");
@@ -6485,7 +7006,7 @@ print(y)
         // the next accumulation exceeds 1 and is excluded. Accumulation drift is expected.
         assert_eq!(
             run("print(range(0, 1, 0.3))").await,
-            "[0, 0.3, 0.6, 0.8999999999999999]\n"
+            "[0.0, 0.3, 0.6, 0.8999999999999999]\n"
         );
     }
 
@@ -6826,7 +7347,7 @@ print(bad[1].message)
         assert_eq!(eval_to_value("let x: number? = nil\nx").await, Value::Nil);
         assert_eq!(
             eval_to_value("let x: number? = 7\nx").await,
-            Value::Number(7.0)
+            Value::Float(7.0)
         );
     }
 
@@ -7009,8 +7530,8 @@ print(r[1])
 
     #[tokio::test]
     async fn unwrap_returns_value_on_ok_pair() {
-        assert_eq!(eval_to_value("[42, nil]!").await, Value::Number(42.0));
-        assert_eq!(eval_to_value("Ok(7)!").await, Value::Number(7.0));
+        assert_eq!(eval_to_value("[42, nil]!").await, Value::Float(42.0));
+        assert_eq!(eval_to_value("Ok(7)!").await, Value::Float(7.0));
     }
 
     #[tokio::test]
@@ -7232,9 +7753,10 @@ print(r[1])
 
     #[tokio::test]
     async fn evaluates_arithmetic_with_precedence() {
+        // NUM §4: int-literal arithmetic yields `Int`.
         match eval_to_value("1 + 2 * 3").await {
-            Value::Number(n) => assert_eq!(n, 7.0),
-            other => panic!("expected number, got {:?}", other),
+            Value::Int(n) => assert_eq!(n, 7),
+            other => panic!("expected int, got {:?}", other),
         }
     }
 
@@ -7286,16 +7808,18 @@ print(r[1])
 
     #[tokio::test]
     async fn exponent_evaluates() {
-        assert_eq!(eval_to_value("2 ** 10").await, Value::Number(1024.0));
+        assert_eq!(eval_to_value("2 ** 10").await, Value::Float(1024.0));
     }
 
     #[tokio::test]
     async fn short_circuit_and_coalesce() {
         assert_eq!(eval_to_value("false && nope").await, Value::Bool(false));
         assert_eq!(eval_to_value("true || nope").await, Value::Bool(true));
-        assert_eq!(eval_to_value("nil ?? 5").await, Value::Number(5.0));
-        assert_eq!(eval_to_value("3 ?? nope").await, Value::Number(3.0));
-        assert_eq!(eval_to_value("!0").await, Value::Bool(false));
+        // NUM §4: int literals yield `Int`.
+        assert_eq!(eval_to_value("nil ?? 5").await, Value::Int(5));
+        assert_eq!(eval_to_value("3 ?? nope").await, Value::Int(3));
+        // NUM §3.3: `0` is falsy, so `!0` is `true`.
+        assert_eq!(eval_to_value("!0").await, Value::Bool(true));
     }
 
     #[tokio::test]
@@ -7796,8 +8320,10 @@ print(r[1])
 
     #[tokio::test]
     async fn imports_std_math() {
+        // NUM §4: `math.abs(-5)` is subtype-preserving — an `int` in, an `int`
+        // out (prints `5`, not `5.0`); `math.pow` stays `float`.
         let out = run("import * as math from \"std/math\"\nprint(math.abs(-5))\nprint(math.pow(2, 8))\nprint(math.pi > 3.14)").await;
-        assert_eq!(out, "5\n256\ntrue\n");
+        assert_eq!(out, "5\n256.0\ntrue\n");
     }
 
     #[tokio::test]
@@ -7835,9 +8361,10 @@ print(r[1])
                    print(convert.parseInt(\"ff\", 16)[0])\n\
                    print(convert.toString(123))\n\
                    print(convert.toBool(0))";
+        // NUM §3.3: `convert.toBool(0)` is now `false` (0 is falsy).
         assert_eq!(
             run(src).await,
-            "42\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\ntrue\n"
+            "42.0\nnil\nnil\ncannot parse 'nope' as a number\n255\n123\nfalse\n"
         );
     }
 
@@ -7869,6 +8396,7 @@ print(r[1])
 
     #[tokio::test]
     async fn std_array_map_pointfree() {
+        // NUM §4: `math.abs` is subtype-preserving — int elements stay int.
         let src = "import * as array from \"std/array\"\nimport * as math from \"std/math\"\nprint(array.map([-1, -2, 3], math.abs))";
         assert_eq!(run(src).await, "[1, 2, 3]\n");
     }
@@ -7916,7 +8444,7 @@ print(r[1])
         let out =
             run("import { sqrt, max } from \"std/math\"\nprint(sqrt(144))\nprint(max(3, 7, 2))")
                 .await;
-        assert_eq!(out, "12\n7\n");
+        assert_eq!(out, "12.0\n7.0\n");
     }
 
     #[tokio::test]
@@ -7927,6 +8455,7 @@ print(r[1])
 
     #[tokio::test]
     async fn std_module_import_is_cached() {
+        // NUM §4: `floor` returns an `int` (`3`), and `abs(int)` stays `int` (`2`).
         let out = run("import * as m1 from \"std/math\"\nimport { abs } from \"std/math\"\nprint(m1.floor(3.7))\nprint(abs(-2))").await;
         assert_eq!(out, "3\n2\n");
     }
@@ -7934,7 +8463,7 @@ print(r[1])
     #[tokio::test]
     async fn std_time_now_and_durations() {
         let out = run("import * as time from \"std/time\"\nprint(time.seconds(2))\nprint(time.now() > 1700000000000)").await;
-        assert_eq!(out, "2000\ntrue\n");
+        assert_eq!(out, "2000.0\ntrue\n");
     }
 
     #[tokio::test]
@@ -8372,7 +8901,7 @@ print(t[0])   // 1 — the async body ran once on the leading edge
                    let later = date.addDays(d, 10)\n\
                    print(later.day)\n\
                    print(date.diffMs(later, d))";
-        assert_eq!(run(src).await, "2021\n6\n2021/06/15\n25\n864000000\n");
+        assert_eq!(run(src).await, "2021.0\n6.0\n2021/06/15\n25.0\n864000000.0\n");
     }
 
     #[cfg(feature = "intl")]
@@ -8386,7 +8915,7 @@ print(t[0])   // 1 — the async body ran once on the leading edge
                    print(intl.compare(\"apple\", \"banana\", \"en\"))";
         assert_eq!(
             run(src).await,
-            "1,234,567\n1.234.567\nİSTANBUL\nISTANBUL\n-1\n"
+            "1,234,567\n1.234.567\nİSTANBUL\nISTANBUL\n-1.0\n"
         );
     }
 
@@ -8595,16 +9124,25 @@ let _ = decimal.from(1) % decimal.from(0)
     }
 
     #[tokio::test]
-    async fn decimal_is_truthy_regardless_of_zero() {
-        // spec §4: only nil and false are falsy — Decimal(0) is truthy.
+    async fn decimal_zero_is_falsy() {
+        // NUM §3.3 (BREAKING): a Decimal equal to zero is FALSY (the falsy set is
+        // nil, false, Int(0), a zero/NaN Float, a zero Decimal, and "").
         // Use `if (z)` since AScript requires parens around the condition.
-        let out = run(r#"
+        let zero = run(r#"
 import * as decimal from "std/decimal"
 let z = decimal.from("0")
 if (z) { print("truthy") } else { print("falsy") }
 "#)
         .await;
-        assert_eq!(out.trim(), "truthy");
+        assert_eq!(zero.trim(), "falsy");
+        // A non-zero Decimal is truthy.
+        let nonzero = run(r#"
+import * as decimal from "std/decimal"
+let z = decimal.from("0.5")
+if (z) { print("truthy") } else { print("falsy") }
+"#)
+        .await;
+        assert_eq!(nonzero.trim(), "truthy");
     }
 
     #[tokio::test]
@@ -8958,7 +9496,8 @@ import * as math from "std/math"
 print(math.abs(-5))
 print(math.max(1, 2, 3))
 "#;
-        assert_eq!(run(src).await, "5\n3\n");
+        // NUM §4: `abs(int)` is int (`5`); `max` is unchanged float (`3.0`).
+        assert_eq!(run(src).await, "5\n3.0\n");
     }
 
     /// Instance method call still dispatches the bound method.
@@ -9144,5 +9683,275 @@ print(n?.m())
             interp.classify_specifier("other"),
             SpecifierKind::UnknownPackage("other".into())
         );
+    }
+
+    // ---- NUM §3.2/§3.3: int/float arithmetic, comparison, panics --------------
+
+    /// Evaluate a single expression, returning the Value or the propagated
+    /// `Control` (so a Tier-2 panic can be asserted on). Uses the tree-walker
+    /// directly — `apply_binop`/`apply_unop` are the shared source of truth, so
+    /// the VM path is byte-identical by construction.
+    async fn try_eval(src: &str) -> Result<Value, Control> {
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        let (last, rest) = stmts.split_last().expect("at least one statement");
+        interp.exec(rest, &env).await?;
+        match last {
+            Stmt::Expr(e) => interp.eval_expr(e, &env).await,
+            _ => panic!("last statement must be an expression"),
+        }
+    }
+
+    async fn eval_num(src: &str) -> Value {
+        try_eval(src).await.expect("expected a value, got a panic")
+    }
+
+    async fn eval_panic_msg(src: &str) -> String {
+        match try_eval(src).await {
+            Ok(v) => panic!("expected a panic, got value {v:?}"),
+            Err(Control::Panic(e)) => e.message,
+            Err(other) => panic!("expected a Panic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn int_literals_eval_to_int() {
+        assert_eq!(eval_num("5").await, Value::Int(5));
+        assert_eq!(eval_num("0xFF").await, Value::Int(255));
+        assert_eq!(eval_num("0b1010").await, Value::Int(10));
+        assert_eq!(eval_num("0o17").await, Value::Int(15));
+        assert_eq!(eval_num("1_000").await, Value::Int(1000));
+    }
+
+    #[tokio::test]
+    async fn float_literals_eval_to_float() {
+        assert_eq!(eval_num("5.0").await, Value::Float(5.0));
+        assert_eq!(eval_num("1.5").await, Value::Float(1.5));
+        assert_eq!(eval_num("1e3").await, Value::Float(1000.0));
+    }
+
+    #[tokio::test]
+    async fn int_add_sub_mul_are_int() {
+        assert_eq!(eval_num("2 + 3").await, Value::Int(5));
+        assert_eq!(eval_num("7 - 10").await, Value::Int(-3));
+        assert_eq!(eval_num("6 * 7").await, Value::Int(42));
+    }
+
+    #[tokio::test]
+    async fn int_div_truncates_toward_zero() {
+        assert_eq!(eval_num("7 / 2").await, Value::Int(3));
+        assert_eq!(eval_num("-7 / 2").await, Value::Int(-3));
+        assert_eq!(eval_num("1 / 2").await, Value::Int(0));
+    }
+
+    #[tokio::test]
+    async fn int_mod_sign_follows_dividend() {
+        assert_eq!(eval_num("7 % 2").await, Value::Int(1));
+        assert_eq!(eval_num("-7 % 2").await, Value::Int(-1));
+    }
+
+    #[tokio::test]
+    async fn int_pow_int_and_negative_exponent() {
+        assert_eq!(eval_num("2 ** 10").await, Value::Int(1024));
+        assert_eq!(eval_num("0 ** 0").await, Value::Int(1));
+        assert_eq!(eval_num("(0 - 2) ** 3").await, Value::Int(-8));
+        assert_eq!(eval_num("2 ** 4").await, Value::Int(16));
+        // Negative exponent → float.
+        assert_eq!(eval_num("2 ** (0 - 1)").await, Value::Float(0.5));
+    }
+
+    #[tokio::test]
+    async fn int_division_and_remainder_by_zero_panic() {
+        assert_eq!(eval_panic_msg("1 / 0").await, "integer division by zero");
+        assert_eq!(eval_panic_msg("1 % 0").await, "integer remainder by zero");
+    }
+
+    #[tokio::test]
+    async fn int_overflow_panics() {
+        // 2**62 + 2**62 overflows i64 on '+'.
+        assert_eq!(
+            eval_panic_msg("4611686018427387904 + 4611686018427387904").await,
+            "integer overflow in '+'"
+        );
+        // i64::MAX * 2 overflows on '*'.
+        assert_eq!(
+            eval_panic_msg("9223372036854775807 * 2").await,
+            "integer overflow in '*'"
+        );
+        // 2**63 overflows on '**'.
+        assert_eq!(eval_panic_msg("2 ** 63").await, "integer overflow in '**'");
+    }
+
+    #[tokio::test]
+    async fn int_min_div_neg_one_overflows() {
+        // i64::MIN is -9223372036854775808; -9223372036854775808 / -1 overflows.
+        // Build i64::MIN as -(i64::MAX) - 1 to avoid an out-of-range literal.
+        let src = "(0 - 9223372036854775807 - 1) / (0 - 1)";
+        assert_eq!(eval_panic_msg(src).await, "integer overflow in '/'");
+    }
+
+    #[tokio::test]
+    async fn unary_neg_of_int_min_overflows() {
+        let src = "0 - 9223372036854775807 - 1"; // i64::MIN
+        assert_eq!(eval_num(src).await, Value::Int(i64::MIN));
+        assert_eq!(
+            eval_panic_msg("-(0 - 9223372036854775807 - 1)").await,
+            "integer overflow in '-'"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_int_float_promotes_to_float() {
+        assert_eq!(eval_num("1 + 1.0").await, Value::Float(2.0));
+        assert_eq!(eval_num("1.0 + 1").await, Value::Float(2.0));
+        assert_eq!(eval_num("7.0 / 2").await, Value::Float(3.5));
+        assert_eq!(eval_num("2 * 1.5").await, Value::Float(3.0));
+    }
+
+    #[tokio::test]
+    async fn exact_cross_subtype_equality() {
+        assert_eq!(eval_num("1 == 1.0").await, Value::Bool(true));
+        assert_eq!(eval_num("1 != 1.0").await, Value::Bool(false));
+        // Near 2^53, an int not exactly representable as f64 is NOT equal to the
+        // rounded float: 9007199254740993 (2^53+1) vs 9007199254740992.0 (2^53).
+        assert_eq!(
+            eval_num("9007199254740993 == 9007199254740992.0").await,
+            Value::Bool(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_cross_subtype_ordering() {
+        assert_eq!(eval_num("2 < 2.5").await, Value::Bool(true));
+        assert_eq!(eval_num("2.5 > 2").await, Value::Bool(true));
+        assert_eq!(eval_num("3 <= 3.0").await, Value::Bool(true));
+        assert_eq!(eval_num("3 >= 3.0").await, Value::Bool(true));
+        // Exact boundary: 2^53+1 > 2^53.0 (the int is strictly greater).
+        assert_eq!(
+            eval_num("9007199254740993 > 9007199254740992.0").await,
+            Value::Bool(true)
+        );
+        // NaN comparisons are all false.
+        assert_eq!(eval_num("1 < (0.0 / 0.0)").await, Value::Bool(false));
+        assert_eq!(eval_num("1 > (0.0 / 0.0)").await, Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn int_int_comparison_is_int_typed() {
+        assert_eq!(eval_num("1 < 2").await, Value::Bool(true));
+        assert_eq!(eval_num("2 == 2").await, Value::Bool(true));
+        assert_eq!(eval_num("3 >= 4").await, Value::Bool(false));
+    }
+
+    // ---- NUM §3.2 bitwise / shift / wrapping operators --------------------
+
+    #[tokio::test]
+    async fn bitwise_and_or_xor() {
+        assert_eq!(eval_num("0xFF & 0b1010").await, Value::Int(10));
+        assert_eq!(eval_num("12 & 10").await, Value::Int(8));
+        assert_eq!(eval_num("12 | 10").await, Value::Int(14));
+        assert_eq!(eval_num("12 ^ 10").await, Value::Int(6));
+        // `|` in value position is bitwise-OR (not an or-pattern).
+        assert_eq!(eval_num("1 | 2").await, Value::Int(3));
+    }
+
+    #[tokio::test]
+    async fn bitwise_not() {
+        assert_eq!(eval_num("~0").await, Value::Int(-1));
+        assert_eq!(eval_num("~5").await, Value::Int(-6));
+    }
+
+    #[tokio::test]
+    async fn shifts_and_arithmetic_sign_extension() {
+        assert_eq!(eval_num("1 << 3").await, Value::Int(8));
+        assert_eq!(eval_num("(1 << 16) | 256").await, Value::Int(65792));
+        assert_eq!(eval_num("1 >> 0").await, Value::Int(1));
+        // `>>` is arithmetic (sign-extending): -8 >> 1 == -4.
+        assert_eq!(eval_num("(0 - 8) >> 1").await, Value::Int(-4));
+        // -1 << 1 == -2 (bit-loss into the sign bit does NOT trap).
+        assert_eq!(eval_num("(0 - 1) << 1").await, Value::Int(-2));
+    }
+
+    #[tokio::test]
+    async fn shift_boundaries() {
+        // 1 << 63 == i64::MIN (top bit set), a DEFINED result — not an overflow.
+        assert_eq!(eval_num("1 << 63").await, Value::Int(i64::MIN));
+        // 1 << 64 → amount >= 64 → panic.
+        assert_eq!(eval_panic_msg("1 << 64").await, "shift amount out of range: 64");
+        // A negative shift amount panics.
+        assert_eq!(
+            eval_panic_msg("1 << (0 - 1)").await,
+            "shift amount out of range: -1"
+        );
+        assert_eq!(eval_panic_msg("1 >> 64").await, "shift amount out of range: 64");
+    }
+
+    #[tokio::test]
+    async fn wrapping_never_panics() {
+        assert_eq!(eval_num("5 +% 3").await, Value::Int(8));
+        assert_eq!(eval_num("5 -% 8").await, Value::Int(-3));
+        assert_eq!(eval_num("6 *% 7").await, Value::Int(42));
+        // i64::MAX +% 1 wraps to i64::MIN (vs the checked `+` which panics).
+        assert_eq!(
+            eval_num("9223372036854775807 +% 1").await,
+            Value::Int(i64::MIN)
+        );
+        // i64::MAX * 2 wraps with `*%` (the checked `*` overflows).
+        assert_eq!(
+            eval_num("9223372036854775807 *% 2").await,
+            Value::Int(-2)
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_vs_wrapping_overflow() {
+        // The checked `+`/`*` panic where the wrapping `+%`/`*%` do not.
+        assert_eq!(
+            eval_panic_msg("9223372036854775807 + 1").await,
+            "integer overflow in '+'"
+        );
+        assert_eq!(
+            eval_num("9223372036854775807 +% 1").await,
+            Value::Int(i64::MIN)
+        );
+    }
+
+    #[tokio::test]
+    async fn bitwise_on_float_is_type_error() {
+        assert_eq!(
+            eval_panic_msg("1 & 2.0").await,
+            "bitwise op requires int operands, got float"
+        );
+        assert_eq!(
+            eval_panic_msg("1.0 | 2").await,
+            "bitwise op requires int operands, got float"
+        );
+        assert_eq!(
+            eval_panic_msg("1 << 2.0").await,
+            "bitwise op requires int operands, got float"
+        );
+        assert_eq!(
+            eval_panic_msg("~1.0").await,
+            "bitwise op requires int operands, got float"
+        );
+        // Wrapping is int-only too.
+        assert_eq!(
+            eval_panic_msg("1 +% 2.0").await,
+            "wrapping op requires int operands, got float"
+        );
+    }
+
+    #[tokio::test]
+    async fn go_precedence_bitwise_vs_comparison_and_arithmetic() {
+        // `a & b == c` parses as `(a & b) == c` (Go's binding). 6 & 2 == 2 → 2 == 2 → true.
+        assert_eq!(eval_num("6 & 2 == 2").await, Value::Bool(true));
+        // `a | b == c` parses as `(a | b) == c`. 1 | 2 == 3 → 3 == 3 → true.
+        assert_eq!(eval_num("1 | 2 == 3").await, Value::Bool(true));
+        // `+ -` bind TIGHTER than `|`: `1 | 2 + 1` is `1 | (2+1)` = 1|3 = 3.
+        assert_eq!(eval_num("1 | 2 + 1").await, Value::Int(3));
+        // `<<`/`&` bind at the multiplicative tier (tighter than `+ -`):
+        // `1 + 1 << 2` is `1 + (1<<2)` = 1 + 4 = 5.
+        assert_eq!(eval_num("1 + 1 << 2").await, Value::Int(5));
     }
 }

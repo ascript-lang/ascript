@@ -1,9 +1,17 @@
 //! Hand-written lexer. Produces tokens with char-offset spans.
 
 use crate::error::AsError;
-use crate::lex_literals::{escape_char, parse_number_text};
+use crate::lex_literals::{escape_char, parse_number_text, NumLit};
 use crate::span::Span;
 use crate::token::{Tok, Token};
+
+/// Map a parsed numeric-literal subtype to its token (NUM §3.1).
+fn num_lit_token(lit: NumLit) -> Tok {
+    match lit {
+        NumLit::Int(i) => Tok::Int(i),
+        NumLit::Float(f) => Tok::Float(f),
+    }
+}
 
 /// Lexer error message raised when a quoted string scan runs off the end of
 /// input. Shared with `repl::is_unterminated_at_eof` so the message and the
@@ -103,6 +111,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '%' {
+                    // `+%` — wrapping add (NUM §3.2).
+                    tokens.push(Token {
+                        tok: Tok::PlusPercent,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
                 } else {
                     tokens.push(Token {
                         tok: Tok::Plus,
@@ -115,6 +130,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token {
                         tok: Tok::MinusEq,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '%' {
+                    // `-%` — wrapping subtract (NUM §3.2).
+                    tokens.push(Token {
+                        tok: Tok::MinusPercent,
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
@@ -136,6 +158,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token {
                         tok: Tok::StarEq,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '%' {
+                    // `*%` — wrapping multiply (NUM §3.2).
+                    tokens.push(Token {
+                        tok: Tok::StarPercent,
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
@@ -190,6 +219,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '<' {
+                    // `<<` — left shift (NUM §3.2). Longest-match before `<`.
+                    tokens.push(Token {
+                        tok: Tok::Shl,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
                 } else {
                     tokens.push(Token {
                         tok: Tok::Lt,
@@ -202,6 +238,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token {
                         tok: Tok::Ge,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    // `>>` — right shift (NUM §3.2). The lexer always emits a single
+                    // `Shr`; the TYPE parser splits a trailing `>>` into two closing
+                    // `>` (the Rust/Java/C# nested-generics technique).
+                    tokens.push(Token {
+                        tok: Tok::Shr,
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
@@ -221,11 +266,29 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     });
                     i += 2;
                 } else {
-                    return Err(AsError::at(
-                        "unexpected character '&'",
-                        Span::new(start, start + 1),
-                    ));
+                    // `&` — bitwise AND (NUM §3.2). `&&` matched above (longest-match).
+                    tokens.push(Token {
+                        tok: Tok::Amp,
+                        span: Span::new(start, start + 1),
+                    });
+                    i += 1;
                 }
+            }
+            '^' => {
+                // `^` — bitwise XOR (NUM §3.2).
+                tokens.push(Token {
+                    tok: Tok::Caret,
+                    span: Span::new(start, start + 1),
+                });
+                i += 1;
+            }
+            '~' => {
+                // `~` — unary bitwise NOT (NUM §3.2).
+                tokens.push(Token {
+                    tok: Tok::Tilde,
+                    span: Span::new(start, start + 1),
+                });
+                i += 1;
             }
             '|' => {
                 if i + 1 < chars.len() && chars[i + 1] == '|' {
@@ -428,30 +491,39 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 // (A bare `0`, `0.5`, `0e1` fall through to the decimal scan.)
                 if chars[i] == '0'
                     && i + 1 < chars.len()
-                    && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B')
+                    && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B' | 'o' | 'O')
                 {
                     let radix_char = chars[i + 1];
+                    // Scan the radix body GREEDILY (all ascii digits for octal/
+                    // binary, all hexdigits for hex) so an out-of-base digit
+                    // (`0o19`, `0b12`) is part of the SAME token and reaches
+                    // `parse_number_text`, which reports `invalid digit in integer
+                    // literal` rather than silently splitting the token. This
+                    // matches the CST lexer (`src/syntax/lexer.rs` `scan_number`)
+                    // so both front-ends agree (frontend conformance).
                     let is_digit: fn(char) -> bool = match radix_char {
-                        'x' | 'X' => |d| d.is_ascii_hexdigit(),
-                        _ => |d| d == '0' || d == '1',
+                        'x' | 'X' => |d: char| d.is_ascii_hexdigit(),
+                        _ => |d: char| d.is_ascii_digit(),
                     };
                     j = i + 2;
                     while j < chars.len() && (is_digit(chars[j]) || chars[j] == '_') {
                         j += 1;
                     }
                     let span = Span::new(i, j);
-                    let label = if matches!(radix_char, 'x' | 'X') {
-                        "invalid hex number literal"
-                    } else {
-                        "invalid binary number literal"
+                    let label = match radix_char {
+                        'x' | 'X' => "invalid hex number literal",
+                        'o' | 'O' => "invalid octal number literal",
+                        _ => "invalid binary number literal",
                     };
-                    // Pass the full token text (incl. `0x`/`0b` prefix) to the
+                    // Pass the full token text (incl. `0x`/`0b`/`0o` prefix) to the
                     // shared parser; it strips underscores and dispatches on the
-                    // prefix. An empty/invalid radix body yields `None`.
+                    // prefix. Radix literals are always `int`; an empty body is
+                    // `Invalid`, an i64 overflow is `OutOfRange` (NUM §3.1).
                     let text: String = chars[i..j].iter().collect();
-                    let n = parse_number_text(&text).ok_or_else(|| AsError::at(label, span))?;
+                    let lit = parse_number_text(&text)
+                        .map_err(|e| AsError::at(e.message(label), span))?;
                     tokens.push(Token {
-                        tok: Tok::Number(n),
+                        tok: num_lit_token(lit),
                         span,
                     });
                     i = j;
@@ -491,10 +563,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     }
                     let span = Span::new(i, j);
                     let text: String = chars[i..j].iter().collect();
-                    let n = parse_number_text(&text)
-                        .ok_or_else(|| AsError::at("invalid number", span))?;
+                    let lit = parse_number_text(&text)
+                        .map_err(|e| AsError::at(e.message("invalid number"), span))?;
                     tokens.push(Token {
-                        tok: Tok::Number(n),
+                        tok: num_lit_token(lit),
                         span,
                     });
                     i = j;
@@ -612,11 +684,11 @@ mod tests {
         assert_eq!(
             kinds("1 + 2 * 3"),
             vec![
-                Tok::Number(1.0),
+                Tok::Int(1),
                 Tok::Plus,
-                Tok::Number(2.0),
+                Tok::Int(2),
                 Tok::Star,
-                Tok::Number(3.0),
+                Tok::Int(3),
                 Tok::Eof,
             ]
         );
@@ -669,6 +741,69 @@ mod tests {
                 Tok::Gt,
                 Tok::Ident("c".into()),
                 Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_bitwise_and_wrapping_operators() {
+        // NUM §3.2: the new operator tokens, with longest-match disambiguation.
+        assert_eq!(
+            kinds("a & b ^ c ~ d << e >> f +% g -% h *% i"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Amp,
+                Tok::Ident("b".into()),
+                Tok::Caret,
+                Tok::Ident("c".into()),
+                Tok::Tilde,
+                Tok::Ident("d".into()),
+                Tok::Shl,
+                Tok::Ident("e".into()),
+                Tok::Shr,
+                Tok::Ident("f".into()),
+                Tok::PlusPercent,
+                Tok::Ident("g".into()),
+                Tok::MinusPercent,
+                Tok::Ident("h".into()),
+                Tok::StarPercent,
+                Tok::Ident("i".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn longest_match_keeps_logical_and_bitwise_distinct() {
+        // `&&`/`||` stay the logical tokens; a lone `&`/`|` are bitwise. `<<`/`>>`
+        // win over `<`/`>`; `+%`/`*%` win over `+`/`*`.
+        assert_eq!(kinds("&&"), vec![Tok::AmpAmp, Tok::Eof]);
+        assert_eq!(kinds("&"), vec![Tok::Amp, Tok::Eof]);
+        assert_eq!(kinds("||"), vec![Tok::PipePipe, Tok::Eof]);
+        assert_eq!(kinds("|"), vec![Tok::Pipe, Tok::Eof]);
+        assert_eq!(kinds("<<"), vec![Tok::Shl, Tok::Eof]);
+        assert_eq!(kinds("<"), vec![Tok::Lt, Tok::Eof]);
+        assert_eq!(kinds(">>"), vec![Tok::Shr, Tok::Eof]);
+        assert_eq!(kinds("+%"), vec![Tok::PlusPercent, Tok::Eof]);
+        assert_eq!(kinds("+"), vec![Tok::Plus, Tok::Eof]);
+        // `&` followed by `&` (with no space) is still `&&`, not two `&`.
+        assert_eq!(
+            kinds("a&&b"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::AmpAmp,
+                Tok::Ident("b".into()),
+                Tok::Eof
+            ]
+        );
+        // `a&b` (no space) is bitwise-AND.
+        assert_eq!(
+            kinds("a&b"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Amp,
+                Tok::Ident("b".into()),
+                Tok::Eof
             ]
         );
     }
@@ -834,20 +969,20 @@ mod tests {
     fn skips_line_comments() {
         assert_eq!(
             kinds("1 // ignored\n+ 2"),
-            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]
+            vec![Tok::Int(1), Tok::Plus, Tok::Int(2), Tok::Eof]
         );
         // line comment to EOF (no trailing newline) is fine
-        assert_eq!(kinds("42 // trailing"), vec![Tok::Number(42.0), Tok::Eof]);
+        assert_eq!(kinds("42 // trailing"), vec![Tok::Int(42), Tok::Eof]);
     }
 
     #[test]
     fn skips_block_comments() {
         assert_eq!(
             kinds("1 /* a * b / c */ + 2"),
-            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]
+            vec![Tok::Int(1), Tok::Plus, Tok::Int(2), Tok::Eof]
         );
         // block comment spanning constructs
-        assert_eq!(kinds("/* x */ 7"), vec![Tok::Number(7.0), Tok::Eof]);
+        assert_eq!(kinds("/* x */ 7"), vec![Tok::Int(7), Tok::Eof]);
     }
 
     #[test]
@@ -880,38 +1015,56 @@ mod tests {
 
     #[test]
     fn lexes_hex_literals() {
-        assert_eq!(kinds("0xFF"), vec![Tok::Number(255.0), Tok::Eof]);
-        assert_eq!(kinds("0xFF_FF"), vec![Tok::Number(65535.0), Tok::Eof]);
+        assert_eq!(kinds("0xFF"), vec![Tok::Int(255), Tok::Eof]);
+        assert_eq!(kinds("0xFF_FF"), vec![Tok::Int(65535), Tok::Eof]);
     }
 
     #[test]
     fn lexes_binary_literals() {
-        assert_eq!(kinds("0b1010"), vec![Tok::Number(10.0), Tok::Eof]);
+        assert_eq!(kinds("0b1010"), vec![Tok::Int(10), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_octal_literals() {
+        assert_eq!(kinds("0o17"), vec![Tok::Int(15), Tok::Eof]);
+        assert_eq!(kinds("0O17"), vec![Tok::Int(15), Tok::Eof]);
     }
 
     #[test]
     fn lexes_scientific_literals() {
-        assert_eq!(kinds("1e9"), vec![Tok::Number(1e9), Tok::Eof]);
-        assert_eq!(kinds("1.5e-3"), vec![Tok::Number(0.0015), Tok::Eof]);
+        // An exponent makes the literal a float even when integral.
+        assert_eq!(kinds("1e9"), vec![Tok::Float(1e9), Tok::Eof]);
+        assert_eq!(kinds("1.5e-3"), vec![Tok::Float(0.0015), Tok::Eof]);
     }
 
     #[test]
     fn lexes_underscore_separators() {
-        assert_eq!(kinds("1_000"), vec![Tok::Number(1000.0), Tok::Eof]);
+        assert_eq!(kinds("1_000"), vec![Tok::Int(1000), Tok::Eof]);
     }
 
     #[test]
     fn lexes_plain_decimals_and_floats() {
-        assert_eq!(kinds("255"), vec![Tok::Number(255.0), Tok::Eof]);
-        assert_eq!(kinds("2.5"), vec![Tok::Number(2.5), Tok::Eof]);
+        assert_eq!(kinds("255"), vec![Tok::Int(255), Tok::Eof]);
+        assert_eq!(kinds("2.5"), vec![Tok::Float(2.5), Tok::Eof]);
+    }
+
+    #[test]
+    fn integer_literal_overflow_is_a_lex_error() {
+        let err = lex("9223372036854775808").unwrap_err();
+        assert!(
+            err.message
+                .contains("integer literal out of range for int (i64)"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
     fn range_operator_not_consumed_as_float() {
-        // `0..5` must lex as Number(0), DotDot, Number(5) — not `0.` float.
+        // `0..5` must lex as Int(0), DotDot, Int(5) — not `0.` float.
         assert_eq!(
             kinds("0..5"),
-            vec![Tok::Number(0.0), Tok::DotDot, Tok::Number(5.0), Tok::Eof]
+            vec![Tok::Int(0), Tok::DotDot, Tok::Int(5), Tok::Eof]
         );
     }
 
@@ -945,7 +1098,21 @@ mod tests {
 
     #[test]
     fn invalid_binary_literal_errors() {
+        // NUM §4: the binary radix body is scanned GREEDILY, so `0b2`'s out-of-base
+        // digit `2` is part of the token and reported as an invalid digit (a more
+        // precise cause than the old empty-body "invalid binary number literal").
         let err = lex("0b2").unwrap_err();
-        assert!(err.message.contains("invalid binary number literal"));
+        assert!(
+            err.message.contains("invalid digit in integer literal"),
+            "message was {:?}",
+            err.message
+        );
+        // `0o19` (out-of-base octal digit `9`) likewise reports invalid digit.
+        let err = lex("0o19").unwrap_err();
+        assert!(
+            err.message.contains("invalid digit in integer literal"),
+            "message was {:?}",
+            err.message
+        );
     }
 }

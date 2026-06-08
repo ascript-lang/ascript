@@ -4,7 +4,10 @@ use crate::span::Span;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
-    Number(f64),
+    /// An integer literal (NUM §3.1): no `.`, no exponent.
+    Int(i64),
+    /// A float literal (NUM §3.1): has a `.` or an exponent.
+    Float(f64),
     Str(String),
     Ident(String),
     Plus,
@@ -69,6 +72,23 @@ pub enum Tok {
     TemplateEnd(String),    // }...`     — text after the last interpolation
     Question,
     Pipe,
+    /// `&` — bitwise AND (NUM §3.2). `&&` lexes as [`Tok::AmpAmp`] (longest-match).
+    Amp,
+    /// `^` — bitwise XOR (NUM §3.2).
+    Caret,
+    /// `~` — unary bitwise NOT (NUM §3.2).
+    Tilde,
+    /// `<<` — left shift (NUM §3.2).
+    Shl,
+    /// `>>` — arithmetic right shift (NUM §3.2). In type-argument position the
+    /// type parser splits a trailing `>>` into two closing `>`.
+    Shr,
+    /// `+%` — wrapping add (NUM §3.2).
+    PlusPercent,
+    /// `-%` — wrapping subtract (NUM §3.2).
+    MinusPercent,
+    /// `*%` — wrapping multiply (NUM §3.2).
+    StarPercent,
     Enum,
     Match,
     Class,

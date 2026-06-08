@@ -394,6 +394,164 @@ fn worker_stays_contextual_not_reserved_for_class() {
     both_accept("worker(1)");
 }
 
+/// NUM §3.4 — both front-ends accept the bitwise / shift / wrapping operators and
+/// agree on the Go-style precedence. PARSE-acceptance baseline (the structural
+/// disambiguation is asserted in the dedicated tests below).
+#[test]
+fn both_frontends_accept_bitwise_and_wrapping_operators() {
+    both_accept("let a = 0xFF & 0b1010");
+    both_accept("let b = (1 << 16) | 256");
+    both_accept("let c = ~0");
+    both_accept("let d = 5 +% 3");
+    both_accept("let e = x -% y");
+    both_accept("let f = x *% y");
+    both_accept("let g = a ^ b >> 1");
+    both_accept("let h = a & b == c");
+    both_accept("let i = a | b == c");
+    // Nested generics: a single `>>` closes two type-argument lists.
+    both_accept("let u: future<array<int>> = nil");
+    both_accept("let v: map<int, array<int>> = #{}");
+    // A shift in expression position is NOT a nested generic.
+    both_accept("let w = a >> b");
+}
+
+/// [NUM §3.1/§6] Octal literals and the reserved-type-name `instanceof` RHS parse
+/// on BOTH front-ends.
+#[test]
+fn both_frontends_accept_octal_and_reserved_instanceof() {
+    // Octal literals (`0o`/`0O`, underscores allowed).
+    both_accept("let oa = 0o17");
+    both_accept("let ob = 0O755");
+    both_accept("let oc = 0o1_7");
+    // `x instanceof int|float|number|string|bool` parses in expression position.
+    both_accept("let w = x instanceof int");
+    both_accept("let y = x instanceof float");
+    both_accept("let z = x instanceof number");
+    both_accept("let s = x instanceof string");
+    both_accept("let b = x instanceof bool");
+    // and still works as a class check.
+    both_accept("class Foo {}\nlet f = x instanceof Foo");
+}
+
+/// [CRITICAL, NUM §3.4] The `1 | 2`-pattern vs `a | b`-value vs `A | B`-type
+/// disambiguation, asserted STRUCTURALLY on BOTH front-ends.
+///
+/// (1) `match x { 1 | 2 => … }` is a single arm with a TWO-alternative pattern
+///     (legacy `MatchArm.patterns.len() == 2`; CST an `OrPat` with two children) —
+///     NOT a bitwise `1 | 2`.
+/// (2) value-position `a | b` is ONE bitwise-or expression (legacy `BinOp::BitOr`;
+///     CST a single `BinaryExpr`) — NOT a pattern.
+/// (3) type-position `int | float` is a `UnionType`.
+#[test]
+fn pipe_disambiguates_pattern_vs_value_vs_type_on_both_frontends() {
+    use ascript::ast::{BinOp, ExprKind, Stmt};
+    use ascript::syntax::kind::SyntaxKind;
+
+    // ---- (1) or-pattern `1 | 2` is a two-alternative pattern, not bitwise -----
+    let pat_src = r#"let r = match x { 1 | 2 => "a", _ => "b" }"#;
+    both_accept(pat_src);
+    // Legacy: the first arm's pattern list has two alternatives.
+    let toks = ascript::lexer::lex(pat_src).unwrap();
+    let stmts = ascript::parser::parse(&toks).unwrap();
+    let arms = match &stmts[0] {
+        Stmt::Let { value: Some(e), .. } => match &e.kind {
+            ExprKind::Match { arms, .. } => arms,
+            other => panic!("expected ExprKind::Match, got {other:?}"),
+        },
+        other => panic!("expected Stmt::Let with a match initializer, got {other:?}"),
+    };
+    assert_eq!(
+        arms[0].patterns.len(),
+        2,
+        "legacy: `1 | 2` must be a TWO-alternative or-pattern, not a bitwise expr"
+    );
+    // CST: there is an OrPat node with two child patterns.
+    let tree = ascript::syntax::parse_to_tree(pat_src);
+    let or_pat = tree
+        .descendants()
+        .find(|n| n.kind() == SyntaxKind::OrPat)
+        .expect("CST: `1 | 2` must produce an OrPat node");
+    let alt_count = or_pat
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::LiteralPat)
+        .count();
+    assert_eq!(alt_count, 2, "CST OrPat must have two LiteralPat children");
+
+    // ---- (2) value-position `a | b` is ONE bitwise-or expression --------------
+    let val_src = "let m = a | b";
+    both_accept(val_src);
+    // Legacy: the initializer is a single `BinOp::BitOr`.
+    let toks = ascript::lexer::lex(val_src).unwrap();
+    let stmts = ascript::parser::parse(&toks).unwrap();
+    match &stmts[0] {
+        Stmt::Let { value: Some(e), .. } => match &e.kind {
+            ExprKind::Binary { op: BinOp::BitOr, .. } => {}
+            other => panic!("legacy: expected a BinOp::BitOr binary, got {other:?}"),
+        },
+        other => panic!("expected Stmt::Let with an initializer, got {other:?}"),
+    }
+    // CST: exactly one BinaryExpr whose operator token is `Pipe`, and NO OrPat.
+    let tree = ascript::syntax::parse_to_tree(val_src);
+    assert!(
+        tree.descendants().all(|n| n.kind() != SyntaxKind::OrPat),
+        "CST: value-position `a | b` must NOT be an or-pattern"
+    );
+    let has_pipe_binary = tree
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::BinaryExpr)
+        .any(|bin| {
+            bin.children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .any(|t| t.kind() == SyntaxKind::Pipe)
+        });
+    assert!(
+        has_pipe_binary,
+        "CST: value-position `a | b` must be a BinaryExpr with a `Pipe` operator"
+    );
+
+    // ---- (3) type-position `int | float` is a UnionType -----------------------
+    let ty_src = "let t: int | float = 1";
+    both_accept(ty_src);
+    let tree = ascript::syntax::parse_to_tree(ty_src);
+    assert!(
+        tree.descendants()
+            .any(|n| n.kind() == SyntaxKind::UnionType),
+        "CST: `int | float` in type position must be a UnionType"
+    );
+}
+
+/// `a & b == c` and `a | b == c` parse with Go's binding `(a&b)==c` / `(a|b)==c`
+/// on BOTH front-ends (the structural shape, not just acceptance). Legacy: the
+/// top-level operator is `==` (Eq) whose left operand is the bitwise op.
+#[test]
+fn go_bitwise_precedence_agrees_on_both_frontends() {
+    use ascript::ast::{BinOp, ExprKind, Stmt};
+
+    for (src, inner) in [
+        ("let r = a & b == c", BinOp::BitAnd),
+        ("let r = a | b == c", BinOp::BitOr),
+    ] {
+        both_accept(src);
+        let toks = ascript::lexer::lex(src).unwrap();
+        let stmts = ascript::parser::parse(&toks).unwrap();
+        match &stmts[0] {
+            Stmt::Let { value: Some(e), .. } => match &e.kind {
+                // Top operator is `==`; its LEFT operand is the bitwise op.
+                ExprKind::Binary { op: BinOp::Eq, lhs, .. } => match &lhs.kind {
+                    ExprKind::Binary { op, .. } => assert!(
+                        matches!((op, inner),
+                            (BinOp::BitAnd, BinOp::BitAnd) | (BinOp::BitOr, BinOp::BitOr)),
+                        "left operand of `==` must be the bitwise op for {src:?}"
+                    ),
+                    other => panic!("expected a bitwise binary on the left of `==`, got {other:?}"),
+                },
+                other => panic!("expected top-level `==` for {src:?}, got {other:?}"),
+            },
+            other => panic!("expected Stmt::Let, got {other:?}"),
+        }
+    }
+}
+
 /// A plain (non-worker) class still parses cleanly — no regression.
 #[test]
 fn both_frontends_accept_plain_class_unchanged() {

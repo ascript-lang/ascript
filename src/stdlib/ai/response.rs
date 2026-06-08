@@ -136,7 +136,8 @@ fn usage_object(n: &NeutralResponse) -> Value {
 
 fn opt_num(v: Option<i64>) -> Value {
     match v {
-        Some(n) => Value::Number(n as f64),
+        // NUM §4: a token count is an `int`.
+        Some(n) => Value::Int(n),
         None => Value::Nil,
     }
 }
@@ -167,7 +168,8 @@ pub(crate) fn embed_object(resp: &genai::embed::EmbedResponse, many: bool) -> Va
     usage.insert(
         "inputTokens".to_string(),
         match resp.usage.prompt_tokens {
-            Some(n) => Value::Number(n as f64),
+            // NUM §4: a token count is an `int`.
+            Some(n) => Value::Int(n as i64),
             None => Value::Nil,
         },
     );
@@ -180,7 +182,7 @@ pub(crate) fn embed_object(resp: &genai::embed::EmbedResponse, many: bool) -> Va
 
 fn vector_value(v: &[f32]) -> Value {
     Value::Array(crate::value::ArrayCell::new(
-        v.iter().map(|f| Value::Number(*f as f64)).collect(),
+        v.iter().map(|f| Value::Float(*f as f64)).collect(),
     ))
 }
 
@@ -190,7 +192,8 @@ pub(crate) fn error_to_value(err: &genai::Error) -> Value {
     let (message, status) = describe_error(err);
     map.insert("message".to_string(), Value::Str(message.into()));
     if let Some(s) = status {
-        map.insert("status".to_string(), Value::Number(s as f64));
+        // NUM §4: an HTTP status code is an `Int`.
+        map.insert("status".to_string(), Value::Int(i64::from(s)));
     }
     Value::Object(crate::value::ObjectCell::new(map))
 }

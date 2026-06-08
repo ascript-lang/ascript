@@ -188,8 +188,9 @@ async fn generate(interp: &Interp, args: &[Value], span: Span) -> Result<Value, 
     // Tools: resolve the `tools:` map (an unknown/malformed tool → Tier-2 panic) and,
     // if any, set them on the request + run the in-interpreter tool-use loop.
     let resolved_tools = tools::resolve_tools(interp, &request::get_field(&opts, "tools"), span)?;
-    let max_steps = match request::get_field(&opts, "maxSteps") {
-        Value::Number(n) if n >= 1.0 => n as u32,
+    // NUM §4: accept BOTH numeric subtypes for `maxSteps`.
+    let max_steps = match request::get_field(&opts, "maxSteps").as_f64() {
+        Some(n) if n >= 1.0 => n as u32,
         _ => 5,
     };
 

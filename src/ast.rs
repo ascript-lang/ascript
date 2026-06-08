@@ -12,7 +12,11 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
-    Number(f64),
+    /// An integer literal (NUM §3.1): a digit sequence with no `.` and no
+    /// exponent (decimal / `0x` / `0b` / `0o`, underscores allowed).
+    Int(i64),
+    /// A float literal (NUM §3.1): contains a `.` or an exponent.
+    Float(f64),
     Str(String),
     Bool(bool),
     Nil,
@@ -140,7 +144,12 @@ pub enum CallArg {
 /// A type annotation (spec §5). Checked at runtime as a contract.
 #[derive(Clone, Debug)]
 pub enum Type {
+    /// `number` — the union `int | float`; accepts either numeric subtype.
     Number,
+    /// `int` (NUM) — accepts only `Value::Int`.
+    Int,
+    /// `float` (NUM) — accepts only `Value::Float`.
+    Float,
     String,
     Bool,
     Nil,
@@ -194,6 +203,8 @@ impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Type::Number => write!(f, "number"),
+            Type::Int => write!(f, "int"),
+            Type::Float => write!(f, "float"),
             Type::String => write!(f, "string"),
             Type::Bool => write!(f, "bool"),
             Type::Nil => write!(f, "nil"),
@@ -520,12 +531,31 @@ pub enum BinOp {
     Coalesce,
     Range,
     InstanceOf,
+    /// `&` — int bitwise AND (NUM §3.2). A float operand is a Tier-2 panic.
+    BitAnd,
+    /// `|` — int bitwise OR (NUM §3.2). In value position only; in pattern/type
+    /// position `|` is an or-pattern / union (the parsers route around this tier).
+    BitOr,
+    /// `^` — int bitwise XOR (NUM §3.2).
+    BitXor,
+    /// `<<` — int left shift (NUM §3.2). Shift amount `< 0` or `>= 64` panics.
+    Shl,
+    /// `>>` — int arithmetic (sign-extending) right shift (NUM §3.2).
+    Shr,
+    /// `+%` — int two's-complement wrapping add (NUM §3.2). Never panics.
+    WrapAdd,
+    /// `-%` — int two's-complement wrapping subtract (NUM §3.2). Never panics.
+    WrapSub,
+    /// `*%` — int two's-complement wrapping multiply (NUM §3.2). Never panics.
+    WrapMul,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum UnOp {
     Neg,
     Not,
+    /// `~` — int bitwise NOT (NUM §3.2). A float operand is a Tier-2 panic.
+    BitNot,
 }
 
 impl fmt::Display for BinOp {
@@ -548,6 +578,14 @@ impl fmt::Display for BinOp {
             BinOp::Coalesce => "??",
             BinOp::Range => "..",
             BinOp::InstanceOf => "instanceof",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::WrapAdd => "+%",
+            BinOp::WrapSub => "-%",
+            BinOp::WrapMul => "*%",
         };
         write!(f, "{}", s)
     }
@@ -558,6 +596,7 @@ impl fmt::Display for UnOp {
         match self {
             UnOp::Neg => write!(f, "-"),
             UnOp::Not => write!(f, "!"),
+            UnOp::BitNot => write!(f, "~"),
         }
     }
 }
@@ -571,7 +610,8 @@ impl fmt::Display for Expr {
 impl fmt::Display for ExprKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExprKind::Number(n) => write!(f, "{}", n),
+            ExprKind::Int(n) => write!(f, "{}", n),
+            ExprKind::Float(n) => write!(f, "{}", n),
             ExprKind::Str(s) => write!(f, "{:?}", s),
             ExprKind::Bool(b) => write!(f, "{}", b),
             ExprKind::Nil => write!(f, "nil"),
@@ -664,7 +704,7 @@ mod tests {
 
     fn num(n: f64) -> Box<Expr> {
         Box::new(Expr {
-            kind: ExprKind::Number(n),
+            kind: ExprKind::Float(n),
             span: Span::new(0, 0),
         })
     }

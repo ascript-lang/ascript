@@ -211,7 +211,7 @@ fn generate_provider_http_4xx_is_tier1_with_status() {
         "#,
         vec![ai_mock::Fixture::json_status(400, &fixture("openai/error_400.json"))],
     );
-    assert_eq!(out, "status=number\n400\n");
+    assert_eq!(out, "status=int\n400\n");
 }
 
 #[test]
@@ -338,7 +338,7 @@ fn embed_error_is_tier1() {
         "#,
         vec![ai_mock::Fixture::json_status(429, r#"{"error":{"message":"rate limited"}}"#)],
     );
-    assert_eq!(out, "status=number\n");
+    assert_eq!(out, "status=int\n");
 }
 
 // ===========================================================================
@@ -575,7 +575,7 @@ fn stream_connection_error_is_tier1_on_next() {
         "#,
         vec![ai_mock::Fixture::json_status(500, r#"{"error":{"message":"server error"}}"#)],
     );
-    assert_eq!(out, "next status=number\n");
+    assert_eq!(out, "next status=int\n");
 }
 
 // ===========================================================================

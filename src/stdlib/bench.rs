@@ -85,16 +85,17 @@ impl Interp {
         };
 
         let mut obj = IndexMap::new();
-        obj.insert("iterations".to_string(), Value::Number(iterations as f64));
-        obj.insert("totalMs".to_string(), Value::Number(total_ms));
-        obj.insert("avgMs".to_string(), Value::Number(avg_ms));
+        // NUM §4: an iteration count is an `int`; timings stay `float`.
+        obj.insert("iterations".to_string(), Value::Int(iterations as i64));
+        obj.insert("totalMs".to_string(), Value::Float(total_ms));
+        obj.insert("avgMs".to_string(), Value::Float(avg_ms));
         // Cap opsPerSec at a very large but representable number if infinite.
         let ops = if ops_per_sec.is_infinite() {
             1e15_f64
         } else {
             ops_per_sec
         };
-        obj.insert("opsPerSec".to_string(), Value::Number(ops));
+        obj.insert("opsPerSec".to_string(), Value::Float(ops));
         Ok(Value::Object(crate::value::ObjectCell::new(obj)))
     }
 
@@ -129,14 +130,8 @@ impl Interp {
             let stats = self.bench_measure(&measure_args, span).await?;
             if let Value::Object(o) = &stats {
                 let o = o.borrow();
-                let avg_ms = match o.get("avgMs") {
-                    Some(Value::Number(n)) => *n,
-                    _ => 0.0,
-                };
-                let ops = match o.get("opsPerSec") {
-                    Some(Value::Number(n)) => *n,
-                    _ => 0.0,
-                };
+                let avg_ms = o.get("avgMs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let ops = o.get("opsPerSec").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 results.push((name.clone(), avg_ms, ops));
             }
         }
@@ -149,8 +144,8 @@ impl Interp {
             .map(|(name, avg_ms, ops_per_sec)| {
                 let mut obj = IndexMap::new();
                 obj.insert("name".to_string(), Value::Str(name.into()));
-                obj.insert("avgMs".to_string(), Value::Number(avg_ms));
-                obj.insert("opsPerSec".to_string(), Value::Number(ops_per_sec));
+                obj.insert("avgMs".to_string(), Value::Float(avg_ms));
+                obj.insert("opsPerSec".to_string(), Value::Float(ops_per_sec));
                 Value::Object(crate::value::ObjectCell::new(obj))
             })
             .collect();

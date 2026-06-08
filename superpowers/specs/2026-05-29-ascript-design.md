@@ -83,14 +83,20 @@ Design priorities, in strict order:
 - **Keywords:** `let const fn return if else while for of in match async await
   class extends super self enum import export nil true false`.
 - **Literals:**
-  - Numbers: `42`, `3.14`, `1e9`, `0xFF`, `0b1010` (all become one `number` type).
+  - Integers: `42`, `0xFF`, `0b1010`, `0o17`, `1_000` (no `.`/exponent → `int`, an `i64`).
+  - Floats: `3.14`, `1e9`, `.5` (a `.` or exponent → `float`, an `f64`).
   - Strings: `"double"`, `'single'`, and template strings `` `hi ${name}` ``.
   - Booleans: `true`, `false`.
   - Nil: `nil`.
   - Array: `[1, 2, 3]`.
   - Object: `{ key: value, "quoted": 1 }`.
-- **Operators:** `+ - * / % ** == != < <= > >= && || ! ?? ?. = += -= *= /=`
+- **Operators:** `+ - * / % ** == != < <= > >= && || ! ?? ?. = += -= *= /=`,
+  the wrapping arithmetic `+% -% *%`, the bitwise/shift set `& | ^ << >> ~`,
   plus the Result-propagation postfix `?` (§6) and the range operator `..`.
+  Numerics follow the NUM model (`superpowers/specs/2026-06-08-numeric-model-design.md`):
+  division is type-directed (`int/int` truncates → `7/2==3`; any `float` operand → `float`,
+  no `//` operator), `+ - * **`/unary-`-` trap on i64 overflow (wrapping ops are the escape
+  hatch), and `& | ^ << >> ~` are int-only at Go precedence (`a & b == c` is `(a&b)==c`).
 
 Every token carries a **source span** (byte offsets + line/col). Spans flow through
 the AST into runtime values where useful, so diagnostics (§10) can point at exact
@@ -174,13 +180,15 @@ a non-array as call args) is a Tier-2 panic (§6). There is no array↔object co
 
 ## 4. Value Model
 
-AScript has **eight value kinds**:
+AScript's core value kinds (the numeric tower below splits the former single `number` into
+`int`/`float`, with exact `decimal` opt-in):
 
 | Kind | Description | Mutability |
 |---|---|---|
 | `nil` | absence of a value | — |
 | `bool` | `true` / `false` | immutable |
-| `number` | IEEE-754 float64 (one numeric type) | immutable |
+| `int` | 64-bit signed integer (`i64`) — the default for integer literals | immutable |
+| `float` | IEEE-754 float64 — the default for fractional/exponent literals | immutable |
 | `string` | immutable UTF-8 text | immutable |
 | `array` | ordered list, `[...]` | mutable, shared by reference |
 | `object` | string-keyed record, `{...}` | mutable, shared by reference |
@@ -188,6 +196,20 @@ AScript has **eight value kinds**:
 | `function` | closure (incl. async fns and methods) | immutable |
 
 Class instances are `object` values **tagged** with their class (§8).
+
+**Numeric tower (NUM, `superpowers/specs/2026-06-08-numeric-model-design.md`).** "A number" is
+realized as two runtime subtypes — `int` (`i64`) and `float` (`f64`) — plus the exact opt-in
+`decimal`. The annotation `number` is the **union `int | float`** (no value's `type` is `"number"`;
+`decimal` is not part of it). Division is **type-directed** (`int/int` truncates toward zero —
+`7/2==3`, `-7/2==-3`; any `float` operand promotes the result to `float` — `7.0/2==3.5`; there is
+**no `//` operator**). `+ - * **` and unary `-` **trap on i64 overflow** (a recoverable Tier-2 panic),
+with explicit two's-complement wrapping operators `+% -% *%` for hashing/codecs. Bitwise/shift
+`& | ^ << >> ~` are **int-only** at **Go precedence** (so `a & b == c` parses as `(a&b)==c`).
+Comparison/equality are **exact across subtypes** (`1 == 1.0` is `true`; a large `int` past `2^53`
+compares exactly, no lossy promotion). Code points are `int`s (the Go "rune" model — no `char` type;
+`string.codepoints`/`from_codepoints`/`code_at`). **Printing:** an `int` shows no decimal (`5`); a
+`float` always shows at least one fractional digit (`5.0`) so the subtypes are visually distinct.
+`int(x)`/`float(x)` convert; `x instanceof int|float|number` is a runtime type guard.
 
 **Map literals — `#{ keyExpr: valueExpr, … }`** build a `map` directly (no `std/map`
 import). Unlike object literals, the part before `:` is an **expression evaluated to a
@@ -198,14 +220,17 @@ map literal (`#{ ...m }`) is not supported (a clean parse error). See §8.3.
 
 **Reference semantics:** `array`, `object`, `map`, and class instances are heap
 values shared by reference (assignment copies the handle, not the contents).
-`nil`, `bool`, `number`, `string` are value-semantic.
+`nil`, `bool`, `int`, `float`, `string` are value-semantic.
 
-**Truthiness:** only `nil` and `false` are falsy. `0`, `""`, `[]`, `{}` are truthy
-(closer to Lua than JS — fewer surprises).
+**Truthiness (NUM):** the falsy set is `nil`, `false`, `0` (`int`), `0.0`/`-0.0`/`NaN` (`float`),
+`0m` (zero `decimal`), and `""` (empty string). **Everything else is truthy — including empty
+collections** (`[]`, `{}`, an empty map/set/object/instance) so a valid-but-empty container never
+silently reads as "no result"; query emptiness explicitly with `len(x)`. So `if (count)` means
+non-zero and `if (name)` means non-empty string, but `if (items)` is `true` for an empty array.
 
-**Equality:** `==` is structural for `string`/`number`/`bool`/`nil`; identity-based
-for `array`/`object`/`map`/`function`. No implicit type coercion across kinds
-(`1 == "1"` is `false`).
+**Equality:** `==` is structural for `string`/`int`/`float`/`bool`/`nil` (and **exact across the
+numeric subtypes** — `1 == 1.0` is `true`); identity-based for `array`/`object`/`map`/`function`.
+No implicit type coercion across kinds (`1 == "1"` is `false`).
 
 **Safe access operators:** reading a field of `nil` or indexing out of bounds with
 `[]` *panics* (Tier 2, §6). Two operators opt into safe, nil-returning access
@@ -240,7 +265,8 @@ const ids: array<number> = [1, 2, 3]
 **Type grammar:**
 
 ```
-type := "number" | "string" | "bool" | "nil" | "any" | "fn"
+type := "int" | "float" | "number" | "decimal"   // number = int | float
+      | "string" | "bool" | "nil" | "any" | "fn"
       | "array" "<" type ">"
       | "map" "<" type "," type ">"
       | "object"
@@ -1310,7 +1336,8 @@ Ctrl-C cancels a partial buffer; Ctrl-D ends the session.
 enum Value {
     Nil,
     Bool(bool),
-    Number(f64),
+    Int(i64),                      // NUM: integer literals / indices / code points
+    Float(f64),                    // NUM: fractional / exponent literals (was Number)
     Str(Rc<str>),
     Array(Rc<RefCell<Vec<Value>>>),
     Object(Rc<RefCell<Object>>),   // Object carries optional class tag

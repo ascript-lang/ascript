@@ -140,9 +140,22 @@ pub fn disasm_at(chunk: &Chunk, offset: &mut usize) -> String {
         }
         // u16 const-pool index (a destructure key, or the bound-keys array) →
         // show the referenced value.
-        Op::ObjectKey | Op::ObjectRest | Op::MatchHasKey | Op::DefineExport => {
+        Op::ObjectKey | Op::ObjectRest | Op::MatchHasKey | Op::DefineExport
+        | Op::InstanceOfType => {
             let idx = chunk.read_u16(at + 1);
             let _ = write!(line, "{idx:>5} ; {}", const_repr(chunk, idx));
+        }
+        // u16 type-const side-pool index → show the declared contract type.
+        Op::CheckLocal => {
+            let idx = chunk.read_u16(at + 1);
+            match chunk.type_consts.get(idx as usize) {
+                Some(ty) => {
+                    let _ = write!(line, "{idx:>5} ; : {ty}");
+                }
+                None => {
+                    let _ = write!(line, "{idx:>5} ; ?? type {idx}");
+                }
+            }
         }
         // u16 expected length + u8 exact-match flag (1 = exact, 0 = >=).
         Op::MatchArray => {
@@ -263,6 +276,7 @@ fn op_name(op: Op) -> &'static str {
         Method => "METHOD",
         GetSuper => "GET_SUPER",
         InstanceOf => "INSTANCE_OF",
+        InstanceOfType => "INSTANCE_OF_TYPE",
         Template => "TEMPLATE",
         Await => "AWAIT",
         Yield => "YIELD",
@@ -290,6 +304,16 @@ fn op_name(op: Op) -> &'static str {
         MatchRange => "MATCH_RANGE",
         MatchNoArm => "MATCH_NO_ARM",
         DefineExport => "DEFINE_EXPORT",
+        BitAnd => "BIT_AND",
+        BitOr => "BIT_OR",
+        BitXor => "BIT_XOR",
+        Shl => "SHL",
+        Shr => "SHR",
+        BitNot => "BIT_NOT",
+        WrapAdd => "WRAP_ADD",
+        WrapSub => "WRAP_SUB",
+        WrapMul => "WRAP_MUL",
+        CheckLocal => "CHECK_LOCAL",
     }
 }
 
@@ -308,8 +332,8 @@ mod tests {
     #[test]
     fn disasm_const_add_return() {
         let mut c = Chunk::new();
-        let a = c.add_const(Value::Number(1.0));
-        let b = c.add_const(Value::Number(2.0));
+        let a = c.add_const(Value::Float(1.0));
+        let b = c.add_const(Value::Float(2.0));
         assert_eq!((a, b), (0, 1));
         c.emit_u16(Op::Const, a, s()); // offset 0, 3 bytes
         c.emit_u16(Op::Const, b, s()); // offset 3, 3 bytes
@@ -326,8 +350,9 @@ mod tests {
         assert!(lines[3].starts_with("0006 "), "got {:?}", lines[3]);
         assert!(lines[4].starts_with("0007 "), "got {:?}", lines[4]);
 
-        assert!(lines[1].contains("CONST") && lines[1].ends_with("; 1"));
-        assert!(lines[2].contains("CONST") && lines[2].ends_with("; 2"));
+        // NUM §4: a `float` const renders with a decimal in the disasm comment.
+        assert!(lines[1].contains("CONST") && lines[1].ends_with("; 1.0"));
+        assert!(lines[2].contains("CONST") && lines[2].ends_with("; 2.0"));
         assert!(lines[3].contains("ADD"));
         assert!(lines[4].contains("RETURN"));
     }
@@ -420,7 +445,7 @@ mod tests {
     #[test]
     fn disasm_at_advances_offset() {
         let mut c = Chunk::new();
-        let i = c.add_const(Value::Number(7.0));
+        let i = c.add_const(Value::Float(7.0));
         c.emit_u16(Op::Const, i, s()); // 3 bytes
         c.emit(Op::Pop, s()); // 1 byte
 

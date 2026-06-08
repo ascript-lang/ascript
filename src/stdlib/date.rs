@@ -41,20 +41,20 @@ fn make_instant(epoch_ms: i64) -> Value {
         .single()
         .unwrap_or_else(|| Utc.timestamp_millis_opt(0).unwrap());
     let mut o: IndexMap<String, Value> = IndexMap::new();
-    o.insert("epochMs".into(), Value::Number(epoch_ms as f64));
-    o.insert("year".into(), Value::Number(dt.year() as f64));
-    o.insert("month".into(), Value::Number(dt.month() as f64));
-    o.insert("day".into(), Value::Number(dt.day() as f64));
-    o.insert("hour".into(), Value::Number(dt.hour() as f64));
-    o.insert("minute".into(), Value::Number(dt.minute() as f64));
-    o.insert("second".into(), Value::Number(dt.second() as f64));
+    o.insert("epochMs".into(), Value::Float(epoch_ms as f64));
+    o.insert("year".into(), Value::Float(dt.year() as f64));
+    o.insert("month".into(), Value::Float(dt.month() as f64));
+    o.insert("day".into(), Value::Float(dt.day() as f64));
+    o.insert("hour".into(), Value::Float(dt.hour() as f64));
+    o.insert("minute".into(), Value::Float(dt.minute() as f64));
+    o.insert("second".into(), Value::Float(dt.second() as f64));
     o.insert(
         "millisecond".into(),
-        Value::Number(dt.timestamp_subsec_millis() as f64),
+        Value::Float(dt.timestamp_subsec_millis() as f64),
     );
     o.insert(
         "weekday".into(),
-        Value::Number(dt.weekday().num_days_from_sunday() as f64),
+        Value::Float(dt.weekday().num_days_from_sunday() as f64),
     );
     o.insert("iso".into(), Value::Str(dt.to_rfc3339().into()));
     Value::Object(crate::value::ObjectCell::new(o))
@@ -64,8 +64,8 @@ fn make_instant(epoch_ms: i64) -> Value {
 fn instant_epoch(v: &Value, span: Span, ctx: &str) -> Result<i64, Control> {
     let o = want_object(v, span, ctx)?;
     let b = o.borrow();
-    match b.get("epochMs") {
-        Some(Value::Number(n)) => Ok(*n as i64),
+    match b.get("epochMs").and_then(|v| v.as_f64()) {
+        Some(n) => Ok(n as i64),
         _ => Err(AsError::at(
             format!(
                 "{} expects an instant object (with epochMs), got an object without it",
@@ -168,7 +168,7 @@ pub fn call(func: &str, args: &[Value], span: Span) -> Result<Value, Control> {
         "diffMs" => {
             let a = instant_epoch(&arg(args, 0), span, &ctx("diffMs"))?;
             let b = instant_epoch(&arg(args, 1), span, &ctx("diffMs"))?;
-            Ok(Value::Number((a - b) as f64))
+            Ok(Value::Float((a - b) as f64))
         }
         _ => Err(AsError::at(format!("std/date has no function '{}'", func), span).into()),
     }
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn from_epoch_components_and_iso() {
         // 2021-01-01T00:00:00Z = 1609459200000 ms
-        let inst = call("fromEpochMs", &[Value::Number(1609459200000.0)], sp()).unwrap();
+        let inst = call("fromEpochMs", &[Value::Float(1609459200000.0)], sp()).unwrap();
         let txt = inst.to_string();
         assert!(txt.contains("year: 2021"), "{txt}");
         assert!(txt.contains("month: 1"), "{txt}");
@@ -247,10 +247,10 @@ mod tests {
 
     #[test]
     fn arithmetic_and_diff() {
-        let base = call("fromEpochMs", &[Value::Number(1609459200000.0)], sp()).unwrap();
-        let plus1 = call("addDays", &[base.clone(), Value::Number(1.0)], sp()).unwrap();
+        let base = call("fromEpochMs", &[Value::Float(1609459200000.0)], sp()).unwrap();
+        let plus1 = call("addDays", &[base.clone(), Value::Float(1.0)], sp()).unwrap();
         let d = call("diffMs", &[plus1, base], sp()).unwrap();
-        assert_eq!(d, Value::Number(86_400_000.0)); // one day in ms
+        assert_eq!(d, Value::Float(86_400_000.0)); // one day in ms
     }
 
     #[test]
@@ -259,7 +259,7 @@ mod tests {
         let jan31 = call("parse", &[s("2021-01-31T00:00:00Z")], sp()).unwrap();
         if let Value::Array(a) = &jan31 {
             let inst = a.borrow()[0].clone();
-            let feb = call("addMonths", &[inst, Value::Number(1.0)], sp()).unwrap();
+            let feb = call("addMonths", &[inst, Value::Float(1.0)], sp()).unwrap();
             assert!(feb.to_string().contains("month: 2"));
             assert!(feb.to_string().contains("day: 28"));
         } else {
@@ -270,11 +270,11 @@ mod tests {
     #[test]
     fn tz_offset_shifts_display() {
         // 2021-01-01T00:00:00Z formatted at +120 min → 02:00; at -300 → prev day 19:00
-        let inst = call("fromEpochMs", &[Value::Number(1609459200000.0)], sp()).unwrap();
+        let inst = call("fromEpochMs", &[Value::Float(1609459200000.0)], sp()).unwrap();
         assert_eq!(
             call(
                 "format",
-                &[inst.clone(), s("%Y-%m-%d %H:%M"), Value::Number(120.0)],
+                &[inst.clone(), s("%Y-%m-%d %H:%M"), Value::Float(120.0)],
                 sp()
             )
             .unwrap(),
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(
             call(
                 "format",
-                &[inst, s("%Y-%m-%d %H:%M"), Value::Number(-300.0)],
+                &[inst, s("%Y-%m-%d %H:%M"), Value::Float(-300.0)],
                 sp()
             )
             .unwrap(),
@@ -297,9 +297,9 @@ mod tests {
         let leap = call("parse", &[s("2020-01-31T00:00:00Z")], sp()).unwrap();
         if let Value::Array(a) = &leap {
             let inst = a.borrow()[0].clone();
-            let feb = call("addMonths", &[inst.clone(), Value::Number(1.0)], sp()).unwrap();
+            let feb = call("addMonths", &[inst.clone(), Value::Float(1.0)], sp()).unwrap();
             assert!(feb.to_string().contains("month: 2") && feb.to_string().contains("day: 29"));
-            let dec = call("addMonths", &[inst, Value::Number(-1.0)], sp()).unwrap(); // Jan 31 2020 - 1mo → Dec 31 2019
+            let dec = call("addMonths", &[inst, Value::Float(-1.0)], sp()).unwrap(); // Jan 31 2020 - 1mo → Dec 31 2019
             assert!(
                 dec.to_string().contains("year: 2019")
                     && dec.to_string().contains("month: 12")
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn from_epoch_out_of_range_panics() {
         assert!(matches!(
-            call("fromEpochMs", &[Value::Number(9.0e18)], sp()),
+            call("fromEpochMs", &[Value::Float(9.0e18)], sp()),
             Err(Control::Panic(_))
         ));
     }

@@ -472,8 +472,8 @@ impl Interp {
         // args[0] is the receiver ctx (pushed by the hook); the user args follow.
         let user = &args[1..];
         match name {
-            "now" => Ok(Value::Number(self.clock_now_ms())),
-            "random" => Ok(Value::Number(self.next_seeded_f64().unwrap_or(0.0))),
+            "now" => Ok(Value::Float(self.clock_now_ms())),
+            "random" => Ok(Value::Float(self.next_seeded_f64().unwrap_or(0.0))),
             "uuid" => {
                 let mut bytes = [0u8; 16];
                 self.fill_seeded_bytes(&mut bytes);
@@ -482,10 +482,7 @@ impl Interp {
                 Ok(Value::Str(uuid::Uuid::from_bytes(bytes).to_string().into()))
             }
             "sleep" => {
-                let ms = match user.first() {
-                    Some(Value::Number(n)) => *n,
-                    _ => 0.0,
-                };
+                let ms = user.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
                 // Durable timer: advance the virtual clock + record a TimerSet; no
                 // real delay. On resume the recorded TimerSet is consumed and the
                 // clock fast-forwards.

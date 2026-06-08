@@ -20,8 +20,8 @@ Expr =
   | RangeExpr
 Literal = 'number' | 'string' | 'true' | 'false' | 'nil'
 NameRef = 'ident'
-UnaryExpr = op:('-' | '!') Expr
-BinaryExpr = lhs:Expr op:('+'|'-'|'*'|'/'|'%'|'**'|'=='|'!='|'<'|'<='|'>'|'>='|'&&'|'||'|'??'|'instanceof') rhs:Expr
+UnaryExpr = op:('-' | '!' | '~') Expr
+BinaryExpr = lhs:Expr op:('+'|'-'|'*'|'/'|'%'|'**'|'=='|'!='|'<'|'<='|'>'|'>='|'&&'|'||'|'??'|'instanceof'|'&'|'|'|'^'|'<<'|'>>'|'+%'|'-%'|'*%') rhs:Expr
 ParenExpr = '(' Expr ')'
 CallExpr = Expr ArgList
 ArgList = '(' Expr* ')'

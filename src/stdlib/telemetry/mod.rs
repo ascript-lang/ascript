@@ -744,7 +744,7 @@ telemetry.init({ service: "hook-test", exporters: [ telemetry.otlp({ endpoint: "
         let id = interp
             .telemetry_span_start("chat openai:gpt-4.1", vec![("gen_ai.system".into(), Value::Str("openai".into()))])
             .expect("active → Some id");
-        interp.telemetry_span_set(id, "gen_ai.usage.input_tokens", Value::Number(12.0));
+        interp.telemetry_span_set(id, "gen_ai.usage.input_tokens", Value::Float(12.0));
         interp.telemetry_span_event(id, "first-token", vec![]);
         interp.telemetry_span_end(id, SpanStatus::Ok);
         // The span is buffered (capture is empty until flush, but the pipeline

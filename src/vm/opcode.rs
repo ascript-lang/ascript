@@ -141,7 +141,7 @@ pub enum Op {
     /// `a > b` yields `[]`).
     RangeInclusive,
     /// `a b -- a b` (peek-only) — verify the top TWO stack values are both
-    /// `Value::Number`, otherwise raise the Tier-2 panic carried at this op's span.
+    /// `Value::Float`, otherwise raise the Tier-2 panic carried at this op's span.
     /// Used to lower the for-range bounds check eagerly (before the loop) so the
     /// VM reports `for-range bounds must be numbers` at the START bound's span,
     /// byte-identically to the tree-walker's `Stmt::ForRange`. Leaves both operands
@@ -313,6 +313,11 @@ pub enum Op {
     GetSuper,
     /// `inst cls -- bool` — `inst instanceof cls`.
     InstanceOf,
+    /// `INSTANCE_OF_TYPE(u16)` — `inst -- bool`. The RHS is a reserved scalar type
+    /// name (`int`/`float`/`number`/`string`/`bool`, NUM §6) given by `consts[idx]`
+    /// (a string); pops `inst`, pushes whether it is of that subtype. Byte-identical
+    /// to the tree-walker's reserved-type-name `instanceof` interception.
+    InstanceOfType,
 
     // ---- strings ----------------------------------------------------------
     /// `TEMPLATE(u16)` — pop `n` parts, concatenate into a string.
@@ -466,8 +471,8 @@ pub enum Op {
     MatchHasKey,
     /// `MATCH_RANGE(u8 flags)` — `subject lo hi step -- ok:bool` (step on top).
     /// `flags` bit0 = inclusive, bit1 = step PRESENT. Pop the four operands and push
-    /// `true` iff the subject is a `Value::Number` `n` matching the range, with `lo`
-    /// and `hi` `Value::Number`s. With step OMITTED (a `nil` placeholder) this is
+    /// `true` iff the subject is a `Value::Float` `n` matching the range, with `lo`
+    /// and `hi` `Value::Float`s. With step OMITTED (a `nil` placeholder) this is
     /// the plain in-bounds test `n >= lo && (n <= hi if inclusive else n < hi)`
     /// (bounds-inferred direction). With step PRESENT it is strided membership
     /// (spec §3.7) anchored at `lo`, via the SHARED `interp::resolve_step` (validates
@@ -491,6 +496,45 @@ pub enum Op {
     /// chunk is the entry program (not an imported module) the recorded exports are
     /// simply unused, exactly as the tree-walker discards a main program's exports.
     DefineExport,
+
+    // ---- bitwise / shift / wrapping (NUM §3.2) ----------------------------
+    // All int-only. They route through the SAME shared `apply_binop`/`apply_unop`
+    // as the tree-walker (`binop_of`/`unop_of`), so a float operand raises the
+    // byte-identical Tier-2 type panic. Appended at the end of the enum so existing
+    // opcode byte values are unchanged (`.aso` version is bumped regardless).
+    /// `a b -- (a & b)` — int bitwise AND.
+    BitAnd,
+    /// `a b -- (a | b)` — int bitwise OR.
+    BitOr,
+    /// `a b -- (a ^ b)` — int bitwise XOR.
+    BitXor,
+    /// `a b -- (a << b)` — int left shift (amount out of range → panic).
+    Shl,
+    /// `a b -- (a >> b)` — int arithmetic right shift (amount out of range → panic).
+    Shr,
+    /// `a -- (~a)` — int bitwise NOT.
+    BitNot,
+    /// `a b -- (a +% b)` — int wrapping add (never panics).
+    WrapAdd,
+    /// `a b -- (a -% b)` — int wrapping subtract (never panics).
+    WrapSub,
+    /// `a b -- (a *% b)` — int wrapping multiply (never panics).
+    WrapMul,
+
+    // ---- annotated local/const binding contract (NUM) ---------------------
+    /// `CHECK_LOCAL(u16 type_const)` — contract-check the value on TOS (the just-
+    /// evaluated initializer of an annotated `let`/`const`) against the declared
+    /// type `chunk.type_consts[type_const]`. Peeks TOS (leaves it in place for the
+    /// following store). A mismatch is the byte-identical recoverable Tier-2 panic
+    /// the tree-walker's `Stmt::Let` raises (`type contract violated: expected {ty},
+    /// got {name} ({value})`, anchored at the initializer EXPRESSION's span — the op's
+    /// own span). The compiler emits it ONLY for an annotated binding (`let x: T = …`
+    /// / `const x: T = …`), for BOTH the module-global and slot-local store paths; an
+    /// un-annotated binding emits nothing. Operand indexes the per-chunk
+    /// `type_consts` side-pool (NOT the `Value` const pool — a `Type` is not a
+    /// `Value`). Appended at the END of the enum so existing opcode byte values are
+    /// unchanged (`.aso` version is bumped regardless).
+    CheckLocal,
 }
 
 impl Op {
@@ -579,6 +623,7 @@ impl Op {
             x if x == Method as u8 => Method,
             x if x == GetSuper as u8 => GetSuper,
             x if x == InstanceOf as u8 => InstanceOf,
+            x if x == InstanceOfType as u8 => InstanceOfType,
 
             x if x == Template as u8 => Template,
 
@@ -614,6 +659,18 @@ impl Op {
 
             x if x == DefineExport as u8 => DefineExport,
 
+            x if x == BitAnd as u8 => BitAnd,
+            x if x == BitOr as u8 => BitOr,
+            x if x == BitXor as u8 => BitXor,
+            x if x == Shl as u8 => Shl,
+            x if x == Shr as u8 => Shr,
+            x if x == BitNot as u8 => BitNot,
+            x if x == WrapAdd as u8 => WrapAdd,
+            x if x == WrapSub as u8 => WrapSub,
+            x if x == WrapMul as u8 => WrapMul,
+
+            x if x == CheckLocal as u8 => CheckLocal,
+
             _ => return None,
         })
     }
@@ -627,8 +684,8 @@ impl Op {
             Const | GetLocal | SetLocal | GetLocalCell | SetLocalCell | FreshCell | GetUpvalue
             | SetUpvalue | CloseUpvalue | GetGlobal | SetGlobal | ImmutableError | Closure
             | NewArray | NewObject | GetProp | SetProp | GetPropOpt | Class | Method | GetSuper
-            | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest | MatchHasKey
-            | CallMethodSpread | DefineExport | CheckParam => 2,
+            | InstanceOfType | Template | Import | ArrayElem | ObjectKey | ArrayRest | ObjectRest
+            | MatchHasKey | CallMethodSpread | DefineExport | CheckParam | CheckLocal => 2,
 
             // i16-operand (jump) ops.
             Jump | JumpIfFalse | JumpIfTrue | JumpIfNotNil | Loop => 2,
@@ -695,7 +752,16 @@ impl Op {
             | MatchObject
             | NewMap
             | MapEntry
-            | MatchNoArm => 0,
+            | MatchNoArm
+            | BitAnd
+            | BitOr
+            | BitXor
+            | Shl
+            | Shr
+            | BitNot
+            | WrapAdd
+            | WrapSub
+            | WrapMul => 0,
         }
     }
 
@@ -786,6 +852,7 @@ mod tests {
         Op::Method,
         Op::GetSuper,
         Op::InstanceOf,
+        Op::InstanceOfType,
         Op::Template,
         Op::Await,
         Op::Yield,
@@ -813,6 +880,16 @@ mod tests {
         Op::MatchRange,
         Op::MatchNoArm,
         Op::DefineExport,
+        Op::BitAnd,
+        Op::BitOr,
+        Op::BitXor,
+        Op::Shl,
+        Op::Shr,
+        Op::BitNot,
+        Op::WrapAdd,
+        Op::WrapSub,
+        Op::WrapMul,
+        Op::CheckLocal,
     ];
 
     #[test]

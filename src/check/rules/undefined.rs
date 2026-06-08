@@ -12,6 +12,32 @@ fn is_allowed_global(name: &str) -> bool {
     name == "self" || name == "super" || crate::interp::BUILTIN_NAMES.contains(&name)
 }
 
+/// Is this `NameRef` the RIGHT-hand operand of an `instanceof` binary expression?
+/// (i.e. the `int` in `x instanceof int`). Such a NameRef is a reserved type-name
+/// RHS, recognized at the operator site rather than as a value binding (NUM §6).
+fn is_instanceof_rhs(node: &ResolvedNode) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != SyntaxKind::BinaryExpr {
+        return false;
+    }
+    // The parent must carry an `instanceof` operator token.
+    let has_instanceof = parent
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .any(|t| t.kind() == SyntaxKind::InstanceofKw);
+    if !has_instanceof {
+        return false;
+    }
+    // This NameRef must be the SECOND (right) expression operand of the binop.
+    let mut expr_children = parent
+        .children()
+        .filter(|c| crate::check::rules::is_expr_kind(c.kind()));
+    let _lhs = expr_children.next();
+    matches!(expr_children.next(), Some(rhs) if rhs.text_range() == node.text_range())
+}
+
 pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<AsDiagnostic> {
     let mut out = Vec::new();
     // Hoistable declarations (fn/class/enum) are visible before their textual
@@ -40,6 +66,13 @@ pub fn check(tree: &ResolvedNode, resolved: &ResolveResult, _src: &str) -> Vec<A
         .filter(|n| n.kind() == SyntaxKind::NameRef)
     {
         if let Some(Resolution::Global(name)) = resolved.uses.get(&n.text_range()) {
+            // NUM §6: `x instanceof int|float|number|string|bool` — the RHS is a
+            // reserved scalar TYPE NAME, not a value binding. The resolver still
+            // classifies it as a `Global` use, so exempt it explicitly (both engines
+            // recognize it at the operator site, never looking up a binding).
+            if crate::interp::is_reserved_instanceof_type_name(name) && is_instanceof_rhs(n) {
+                continue;
+            }
             if !is_allowed_global(name) && !hoisted.contains(name.as_str()) {
                 out.push(AsDiagnostic {
                     range: crate::check::rules::code_range(n),
@@ -69,6 +102,26 @@ mod tests {
     #[test]
     fn flags_genuinely_undefined() {
         assert!(codes("print(nope)\n").contains(&"undefined-variable".to_string()));
+    }
+
+    #[test]
+    fn does_not_flag_reserved_instanceof_rhs() {
+        // NUM §6: `x instanceof int|float|number|string|bool` — the reserved type
+        // name on the RHS must NOT be flagged as an undefined variable.
+        for name in ["int", "float", "number", "string", "bool"] {
+            let src = format!("let x = 1\nprint(x instanceof {name})\n");
+            assert!(
+                !codes(&src).contains(&"undefined-variable".to_string()),
+                "`instanceof {name}` should not flag undefined-variable: {:?}",
+                codes(&src)
+            );
+        }
+        // But a NON-reserved bare name used like a value IS still flagged.
+        assert!(codes("print(nope)\n").contains(&"undefined-variable".to_string()));
+        // NUM §4: `int`/`float` are now real conversion BUILTINS, so using `int` as
+        // an ordinary value (e.g. `print(int)`) is NOT undefined — it is the builtin.
+        assert!(!codes("print(int)\n").contains(&"undefined-variable".to_string()));
+        assert!(!codes("print(float)\n").contains(&"undefined-variable".to_string()));
     }
 
     #[test]
