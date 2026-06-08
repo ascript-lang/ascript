@@ -323,7 +323,12 @@ The full ordered variant list (`variant_schemas.keys()`) is what the exhaustiven
   constructed variant as data; identity would make every construction a distinct object (a footgun).
 - **Map keys / hashing:** constructed variants with payloads are **not** hashable as `MapKey` in v1
   (like `Array`/`Map`/`Set` — identity-only containers; a payload variant used as a Map key is the same
-  Tier-2 panic those produce). Unit variants remain hashable exactly as today (by interned identity).
+  Tier-2 panic those produce). **Correction (2026-06-09 review):** an earlier draft claimed unit
+  variants "remain hashable exactly as today." That baseline was wrong — `MapKey` never had an
+  enum-variant kind, so `Value::Enum`/`EnumVariant` was *never* Map-key-hashable pre-ADT either. v1
+  keeps that: ALL enum-variant values (`MapKey::from_value` `_ => None`, `src/value.rs`) are non-hashable
+  as Map keys. This is not a regression. A future additive `MapKey::EnumVariant` (§ "Hashable structural
+  payload variants") could make unit + structurally-immutable payload variants hashable.
   (Hashable structural payload keys are a possible additive future, deferred — §10.)
 
 ### 5.3 GC `Trace` (the load-bearing invariant)
@@ -427,6 +432,15 @@ identity-equal" is **scoped to within-isolate** (§5.2). The chosen cross-isolat
   `Class.from` and typed-parse use, `CLAUDE.md` "Nullable `T?` + typed class fields"): each payload arg
   is checked against its declared field `Type`; a mismatch is the byte-identical recoverable field-path
   panic. This is a **runtime** check on both engines (no `init`, like `validate_into`).
+
+> **Implementation deviation (recorded 2026-06-09, holistic review).** v1 construction validates each
+> payload field with `check_type` (validate-only), **not** the full `validate_into` coercion path
+> (`src/interp.rs:4234-4251`). The difference is narrow but real: a payload field typed as a *class*
+> does NOT auto-coerce a raw Object → Instance, and nested-class **defaulting** does not apply inside a
+> payload — pattern destructuring is the primary consumption path, so payload fields are *validated, not
+> rewritten*. Scalar/`T?`/container type-checking and the exact panic messages are identical to the
+> `validate_into` path. Recorded here per the campaign's no-silent-deferral rule; full `validate_into`
+> coercion for class-typed payload fields is a TYPE-era follow-up, not a v1 gap.
 
 ### 7.2 Static checker (`src/check/infer/`) — types + narrowing
 

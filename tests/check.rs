@@ -679,3 +679,216 @@ fn checker_accepts_worker_generator_fn() {
         "worker fn* must not be flagged as an invalid modifier combo; output: {combined}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// ADT — exhaustiveness, variant narrowing, binding-shadow, construction synth.
+// (Library-level checker tests via `ascript::check::analyze`.)
+// ---------------------------------------------------------------------------
+mod adt_exhaustiveness {
+    use ascript::check::{analyze, Severity};
+
+    fn diags(src: &str) -> Vec<ascript::check::AsDiagnostic> {
+        analyze(src).diagnostics
+    }
+    fn find<'a>(
+        ds: &'a [ascript::check::AsDiagnostic],
+        code: &str,
+    ) -> Option<&'a ascript::check::AsDiagnostic> {
+        ds.iter().find(|d| d.code == code)
+    }
+    fn has(src: &str, code: &str) -> bool {
+        diags(src).iter().any(|d| d.code == code)
+    }
+
+    const SHAPE: &str =
+        "enum Shape { Circle(radius: float), Rect(w: float, h: float), Pair(int, int), Point }\n";
+
+    #[test]
+    fn non_exhaustive_missing_variant_is_error_naming_it() {
+        // A match missing `Point` (and `Pair`) with NO catch-all.
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    Rect(w, h) => w,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        let ds = diags(&src);
+        let d = find(&ds, "non-exhaustive-match")
+            .unwrap_or_else(|| panic!("expected non-exhaustive-match, got {ds:?}"));
+        assert_eq!(d.severity, Severity::Error, "must default to Error");
+        assert!(d.message.contains("Shape"), "msg: {}", d.message);
+        assert!(d.message.contains("Pair"), "must name missing Pair: {}", d.message);
+        assert!(d.message.contains("Point"), "must name missing Point: {}", d.message);
+    }
+
+    #[test]
+    fn exhaustive_all_variants_is_clean() {
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    Rect(w, h) => w,\n    Pair(a, b) => float(a),\n    Shape.Point => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(!has(&src, "non-exhaustive-match"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn wildcard_catch_all_is_exhaustive() {
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    _ => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(!has(&src, "non-exhaustive-match"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn bare_binding_catch_all_is_exhaustive() {
+        // A bare ident that is NOT a variant binds (Option-C) → catch-all.
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    other => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(!has(&src, "non-exhaustive-match"), "{:?}", diags(&src));
+        // `other` is not a variant name → no shadow warning.
+        assert!(!has(&src, "enum-variant-binding-shadow"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn guarded_only_arm_does_not_cover() {
+        // `Point` is covered only by a GUARDED arm → still non-exhaustive.
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    Rect(w, h) => w,\n    Pair(a, b) => float(a),\n    Shape.Point if true => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        let ds = diags(&src);
+        let d = find(&ds, "non-exhaustive-match")
+            .unwrap_or_else(|| panic!("guarded-only must not cover; got {ds:?}"));
+        assert!(d.message.contains("Point"), "msg: {}", d.message);
+    }
+
+    #[test]
+    fn guarded_plus_unguarded_covers() {
+        // A guarded arm AND an unguarded arm for the same variant → covered.
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    Rect(w, h) => w,\n    Pair(a, b) => float(a),\n    Shape.Point if false => 9.0,\n    Shape.Point => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(!has(&src, "non-exhaustive-match"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn unknown_subject_is_silent() {
+        // The subject `v` has no enum type (untyped param) → gradual silent.
+        let src = format!(
+            "{SHAPE}fn f(v): float {{\n  return match v {{\n    Circle(r) => r,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(!has(&src, "non-exhaustive-match"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn binding_shadow_fires_on_bare_known_variant() {
+        // A bare `Point` (a variant of Shape) would BIND → shadow warning + catch-all.
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    Point => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        let ds = diags(&src);
+        let d = find(&ds, "enum-variant-binding-shadow")
+            .unwrap_or_else(|| panic!("expected binding-shadow, got {ds:?}"));
+        assert_eq!(d.severity, Severity::Warning);
+        assert!(d.message.contains("Shape.Point"), "suggest qualified: {}", d.message);
+        // The bare bind is a catch-all, so the match is NOT flagged non-exhaustive.
+        assert!(!has(&src, "non-exhaustive-match"), "{:?}", ds);
+    }
+
+    #[test]
+    fn qualified_unit_no_shadow_and_covers() {
+        // `Shape.Point` qualified → no shadow warning, counts as covering Point.
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    Rect(w, h) => w,\n    Pair(a, b) => float(a),\n    Shape.Point => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(!has(&src, "enum-variant-binding-shadow"), "{:?}", diags(&src));
+        assert!(!has(&src, "non-exhaustive-match"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn value_equality_arm_does_not_fully_cover() {
+        // `Circle(0.0)` is a value-equality sub-pattern → does NOT fully cover Circle.
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(0.0) => 1.0,\n    Rect(w, h) => w,\n    Pair(a, b) => float(a),\n    Shape.Point => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        let ds = diags(&src);
+        let d = find(&ds, "non-exhaustive-match")
+            .unwrap_or_else(|| panic!("value-eq must not cover Circle; got {ds:?}"));
+        assert!(d.message.contains("Circle"), "msg: {}", d.message);
+    }
+
+    #[test]
+    fn unknown_variant_in_pattern_and_ctor() {
+        // Constructor call + qualified pattern with a non-existent variant.
+        let ctor = format!("{SHAPE}let x = Shape.Nope(1)\nprint(x)\n");
+        assert!(has(&ctor, "unknown-enum-variant"), "{:?}", diags(&ctor));
+        let pat = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Shape.Nonexist(r) => r,\n    _ => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(has(&pat, "unknown-enum-variant"), "{:?}", diags(&pat));
+    }
+
+    #[test]
+    fn variant_narrowing_binds_field_type() {
+        // In `Circle(r) => …`, `r` is `float`; passing it to a `string` param is a
+        // provable mismatch — proving the payload sub-pattern was typed `float`.
+        let src = format!(
+            "{SHAPE}fn needsStr(x: string): string {{ return x }}\nfn f(s: Shape): string {{\n  return match s {{\n    Circle(r) => needsStr(r),\n    _ => \"x\",\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(has(&src, "type-mismatch"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn variant_narrowing_correct_use_is_clean() {
+        // `Circle(r) => r` where `r: float` and the fn returns `float` — no mismatch.
+        let src = format!(
+            "{SHAPE}fn f(s: Shape): float {{\n  return match s {{\n    Circle(r) => r,\n    _ => 0.0,\n  }}\n}}\nprint(f(Shape.Point))\n"
+        );
+        assert!(!has(&src, "type-mismatch"), "{:?}", diags(&src));
+        assert!(!has(&src, "type-error"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn construction_wrong_arg_type_is_mismatch() {
+        // `Shape.Pair("x", 4)` — first positional field is `int`, a string is provably wrong.
+        let src = format!("{SHAPE}let p = Shape.Pair(\"x\", 4)\nprint(p)\n");
+        assert!(has(&src, "type-mismatch"), "{:?}", diags(&src));
+    }
+
+    #[test]
+    fn construction_correct_is_clean() {
+        let src = format!(
+            "{SHAPE}let a = Shape.Pair(3, 4)\nlet b = Shape.Circle(2.0)\nprint(a)\nprint(b)\n"
+        );
+        assert!(!has(&src, "type-mismatch"), "{:?}", diags(&src));
+    }
+
+    // The CST-sibling-gather regression guard: oop.as and all_features.as both rely on
+    // a trailing `_` arm; if arm-gathering is wrong, they flood with non-exhaustive.
+    #[test]
+    fn oop_example_has_zero_exhaustiveness_diagnostics() {
+        let src = std::fs::read_to_string("examples/oop.as").unwrap();
+        for code in ["non-exhaustive-match", "enum-variant-binding-shadow"] {
+            assert!(
+                !has(&src, code),
+                "examples/oop.as emitted {code}: {:?}",
+                diags(&src)
+            );
+        }
+    }
+
+    #[test]
+    fn all_features_example_has_zero_exhaustiveness_diagnostics() {
+        let src = std::fs::read_to_string("examples/all_features.as").unwrap();
+        for code in ["non-exhaustive-match", "enum-variant-binding-shadow"] {
+            assert!(
+                !has(&src, code),
+                "examples/all_features.as emitted {code}: {:?}",
+                diags(&src)
+            );
+        }
+    }
+
+    #[test]
+    fn enums_adt_example_clean() {
+        let src = std::fs::read_to_string("examples/enums_adt.as").unwrap();
+        for code in ["non-exhaustive-match", "enum-variant-binding-shadow", "type-mismatch", "type-error"] {
+            assert!(!has(&src, code), "examples/enums_adt.as emitted {code}: {:?}", diags(&src));
+        }
+    }
+}

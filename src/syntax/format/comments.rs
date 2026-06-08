@@ -60,6 +60,25 @@ fn attachable_of(node: &ResolvedNode) -> Option<ResolvedNode> {
     None
 }
 
+/// The attachable NODE sibling immediately preceding `tok` (a separator like `,`),
+/// if any. Used so a same-line trailing comment after a list item's separator
+/// (`Red, // …`) attaches to the ITEM, not the enclosing container.
+fn prev_attachable_sibling(tok: &crate::syntax::cst::ResolvedToken) -> Option<ResolvedNode> {
+    let mut prev = tok.prev_sibling_or_token();
+    while let Some(el) = prev {
+        if let Some(node) = el.as_node() {
+            if is_attachable(node.kind()) {
+                return Some((*node).clone());
+            }
+            // A non-attachable node sibling (unlikely for a separator) → stop.
+            return None;
+        }
+        // Skip trivia/whitespace tokens between the item and its separator.
+        prev = el.prev_sibling_or_token();
+    }
+    None
+}
+
 /// Build the comment attachment map for `root`.
 pub fn attach(root: &ResolvedNode) -> CommentMap {
     use SyntaxKind::*;
@@ -134,8 +153,18 @@ pub fn attach(root: &ResolvedNode) -> CommentMap {
                         pending.clear();
                     }
                 }
-                // Record which attachable node this content token belongs to.
-                last_attachable = attachable_of(tok.parent());
+                // Record which attachable node this content token belongs to. A
+                // trailing SEPARATOR (`,`/`;`) is a sibling of the item it follows
+                // (e.g. an enum-variant `,` is a child of `EnumDecl`, not the
+                // `EnumVariant`), so naively its attachable ancestor is the CONTAINER,
+                // and a same-line trailing comment after `Red,` would wrongly attach to
+                // the enum (then print on the `}` line). Prefer the immediately-
+                // preceding attachable SIBLING so the comment stays on the item's line.
+                last_attachable = if matches!(tok.kind(), Comma | Semicolon) {
+                    prev_attachable_sibling(tok).or_else(|| attachable_of(tok.parent()))
+                } else {
+                    attachable_of(tok.parent())
+                };
                 newlines_since_content = 0;
             }
         }
@@ -178,6 +207,38 @@ mod tests {
         assert_eq!(
             map.trailing.get(&s.text_range()).map(|t| t.as_str()),
             Some("// tail")
+        );
+    }
+
+    #[test]
+    fn trailing_comment_after_variant_separator_attaches_to_the_variant() {
+        // Regression: a `// …` after `Red,` must attach to the `EnumVariant(Red)`,
+        // not the enclosing `EnumDecl` (otherwise the printer drops it onto the `}`
+        // line). The `,` is a child of `EnumDecl`, so the fix prefers the preceding
+        // attachable SIBLING. Both unit and payload variants are covered.
+        let root = parse_to_tree("enum E {\n  Red, // r\n  Pair(int, int), // p\n}\n");
+        let map = attach(&root);
+        let enum_decl = first_stmt(&root);
+        let variants: Vec<ResolvedNode> = enum_decl
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::EnumVariant)
+            .cloned()
+            .collect();
+        assert_eq!(variants.len(), 2);
+        assert_eq!(
+            map.trailing.get(&variants[0].text_range()).map(|t| t.as_str()),
+            Some("// r"),
+            "comment after `Red,` attaches to the Red variant"
+        );
+        assert_eq!(
+            map.trailing.get(&variants[1].text_range()).map(|t| t.as_str()),
+            Some("// p"),
+            "comment after `Pair(int, int),` attaches to the Pair variant"
+        );
+        // It must NOT have leaked onto the enum itself.
+        assert!(
+            !map.trailing.contains_key(&enum_decl.text_range()),
+            "no trailing comment should attach to the EnumDecl container"
         );
     }
 

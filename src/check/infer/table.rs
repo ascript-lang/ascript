@@ -24,11 +24,32 @@ pub struct ClassInfo {
     pub is_worker: bool,
 }
 
-/// An enum entry: name and variant names.
+/// One payload field of an enum variant (ADT §5.1). `name` is `Some` for a named
+/// field (`Circle(radius: float)`), `None` for a positional field (`Pair(int, int)`).
+#[derive(Debug, Clone)]
+pub struct VariantFieldInfo {
+    pub name: Option<String>,
+    pub ty: CheckTy,
+}
+
+/// An enum entry: name, ordered variant names, and per-variant payload schemas.
+///
+/// `variants` and `variant_fields` are index-parallel: `variant_fields[i]` is the
+/// (possibly empty) payload field list of `variants[i]`. A unit/scalar variant has
+/// an empty field list; a payload variant has one entry per declared field.
 #[derive(Debug, Clone, Default)]
 pub struct EnumInfo {
     pub name: String,
     pub variants: Vec<String>,
+    pub variant_fields: Vec<Vec<VariantFieldInfo>>,
+}
+
+impl EnumInfo {
+    /// The declared payload fields of `variant`, if it exists.
+    pub fn fields_of(&self, variant: &str) -> Option<&[VariantFieldInfo]> {
+        let i = self.variants.iter().position(|v| v == variant)?;
+        self.variant_fields.get(i).map(|v| v.as_slice())
+    }
 }
 
 /// The class/enum symbol table, built once per `analyze` call.
@@ -70,15 +91,35 @@ impl Table {
                     let name = enum_name(node).unwrap_or_default();
                     let id = t.enums.len();
                     let variants = enum_variants(node);
+                    let variant_fields = vec![Vec::new(); variants.len()];
                     t.enums.push(EnumInfo {
                         name: name.clone(),
                         variants,
+                        variant_fields,
                     });
                     if !name.is_empty() {
                         t.enum_by_name.insert(name, id);
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Pass 2b — lower per-variant payload field types (a field type may forward-
+        // reference a class/enum declared later, so this runs after pass 1 registered
+        // every name). Index-parallel to the enum's `variants`.
+        let mut enum_idx = 0usize;
+        for node in tree.descendants() {
+            if node.kind() != EnumDecl {
+                continue;
+            }
+            let id = enum_idx;
+            enum_idx += 1;
+            let fields = variant_field_schemas(node, &t);
+            // Guard length parity (a malformed variant could desync — keep the
+            // already-sized empty vector rather than panic).
+            if fields.len() == t.enums[id].variants.len() {
+                t.enums[id].variant_fields = fields;
             }
         }
 
@@ -255,6 +296,52 @@ fn enum_variants(node: &ResolvedNode) -> Vec<String> {
         .collect()
 }
 
+/// The per-variant payload field schemas of an `EnumDecl`, index-parallel to
+/// [`enum_variants`]. Each `EnumVariant` child contributes its `VariantField`
+/// children (a named field has an `Ident` then a type; a positional field is a bare
+/// type). A unit/scalar variant has no `VariantField` children → an empty list.
+fn variant_field_schemas(node: &ResolvedNode, table: &Table) -> Vec<Vec<VariantFieldInfo>> {
+    use SyntaxKind::*;
+    node.children()
+        .filter(|c| c.kind() == EnumVariant)
+        .map(|variant| {
+            variant
+                .children()
+                .filter(|c| c.kind() == VariantField)
+                .map(|f| {
+                    // A named field's name is the `VariantField`'s leading `Ident`
+                    // token (positional fields have none — their first token is the
+                    // type). Distinguish by whether an `Ident` precedes a `Colon`.
+                    let name = variant_field_name(f);
+                    let ty = f
+                        .children()
+                        .find(|c| crate::check::rules::is_type_kind(c.kind()))
+                        .map(|t| CheckTy::from_type_node(t, table))
+                        .unwrap_or(CheckTy::Any);
+                    VariantFieldInfo { name, ty }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The field name of a `VariantField` if it is NAMED (`radius: float`): the leading
+/// `Ident` token that is immediately followed (ignoring trivia) by a `Colon`. A
+/// positional field (`int`) — whose type may itself start with an `Ident` such as a
+/// class name — has no such `Ident :` lead and returns `None`.
+fn variant_field_name(field: &ResolvedNode) -> Option<String> {
+    use SyntaxKind::*;
+    let toks: Vec<_> = field
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .filter(|t| !t.kind().is_trivia())
+        .collect();
+    match (toks.first(), toks.get(1)) {
+        (Some(a), Some(b)) if a.kind() == Ident && b.kind() == Colon => Some(a.text().to_string()),
+        _ => None,
+    }
+}
+
 /// Lower a field's declared type annotation to [`CheckTy`] (`Any` if unannotated).
 fn field_type(member: &ResolvedNode, table: &Table) -> CheckTy {
     member
@@ -341,6 +428,43 @@ mod tests {
         let id = t.enum_id("Color").unwrap();
         let ei = t.enum_info(id).unwrap();
         assert_eq!(ei.variants, vec!["Red", "Green", "Blue"]);
+    }
+
+    #[test]
+    fn variant_payload_schemas_recorded() {
+        let t = build("enum Shape { Circle(radius: float), Rect(w: float, h: float), Pair(int, int), Point }");
+        let id = t.enum_id("Shape").unwrap();
+        let ei = t.enum_info(id).unwrap();
+        assert_eq!(ei.variants, vec!["Circle", "Rect", "Pair", "Point"]);
+        // Circle: one named float field.
+        let circle = ei.fields_of("Circle").unwrap();
+        assert_eq!(circle.len(), 1);
+        assert_eq!(circle[0].name.as_deref(), Some("radius"));
+        assert_eq!(circle[0].ty, CheckTy::Float);
+        // Rect: two named float fields.
+        let rect = ei.fields_of("Rect").unwrap();
+        assert_eq!(rect.len(), 2);
+        assert_eq!(rect[0].name.as_deref(), Some("w"));
+        assert_eq!(rect[1].name.as_deref(), Some("h"));
+        // Pair: two positional int fields (no names).
+        let pair = ei.fields_of("Pair").unwrap();
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0].name, None);
+        assert_eq!(pair[0].ty, CheckTy::Int);
+        // Point: unit variant, no fields.
+        assert_eq!(ei.fields_of("Point").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn variant_payload_field_can_reference_enum() {
+        // A recursive payload (`array<Json>`) forward-references the enum itself.
+        let t = build("enum Json { Null, Arr(items: array<Json>) }");
+        let id = t.enum_id("Json").unwrap();
+        let ei = t.enum_info(id).unwrap();
+        let arr = ei.fields_of("Arr").unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].name.as_deref(), Some("items"));
+        assert_eq!(arr[0].ty, CheckTy::Array(Box::new(CheckTy::Enum(id))));
     }
 
     #[test]

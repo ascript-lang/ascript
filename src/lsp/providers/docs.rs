@@ -82,13 +82,112 @@ pub fn keyword_doc(kind: SyntaxKind) -> Option<&'static str> {
     Some(s)
 }
 
-/// Documentation for an identifier: a global builtin (static table), else a
-/// top-level declaration in the model, else `None`.
+/// Documentation for an identifier: a global builtin (static table), else an enum
+/// variant's payload signature, else a top-level declaration in the model, else
+/// `None`.
 fn ident_doc(name: &str, model: &SemanticModel) -> Option<String> {
     if let Some(b) = builtin_doc(name) {
         return Some(b.to_string());
     }
+    if let Some(v) = variant_doc(name, model) {
+        return Some(v);
+    }
     decl_doc(name, model)
+}
+
+/// ADT: if `name` is an enum variant declared in this file, render its payload
+/// signature — `Shape.Circle(radius: float)` (named), `Shape.Pair(int, int)`
+/// (positional), or `Shape.Point` (unit). Used by hover on a variant name (in a
+/// `Shape.Circle` member access, a variant decl, or a variant pattern). The first
+/// matching variant (in source order) wins, mirroring the conservative
+/// single-enum-receiver rule the checker uses.
+pub fn variant_doc(name: &str, model: &SemanticModel) -> Option<String> {
+    for enum_decl in enum_decls(model) {
+        let enum_name = crate::syntax::resolve::ident_text(&enum_decl)?;
+        for variant in enum_decl
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::EnumVariant)
+        {
+            let vname = match crate::syntax::resolve::ident_text(variant) {
+                Some(n) => n,
+                None => continue,
+            };
+            if vname != name {
+                continue;
+            }
+            return Some(render_variant_signature(&enum_name, &vname, variant));
+        }
+    }
+    None
+}
+
+/// All `EnumDecl` nodes in the model (top-level, unwrapping a leading `export`).
+fn enum_decls(model: &SemanticModel) -> Vec<crate::syntax::cst::ResolvedNode> {
+    let mut out = Vec::new();
+    for child in model.tree.children() {
+        let decl = if child.kind() == SyntaxKind::ExportStmt {
+            match child.children().next() {
+                Some(d) => d,
+                None => continue,
+            }
+        } else {
+            child
+        };
+        if decl.kind() == SyntaxKind::EnumDecl {
+            out.push(decl.clone());
+        }
+    }
+    out
+}
+
+/// Render `EnumName.Variant(field: type, …)` from an `EnumVariant` CST node. A unit
+/// variant renders just `EnumName.Variant`; a scalar-backed unit renders the same
+/// (the backing is not part of the payload signature).
+fn render_variant_signature(
+    enum_name: &str,
+    variant: &str,
+    node: &crate::syntax::cst::ResolvedNode,
+) -> String {
+    let fields: Vec<crate::syntax::cst::ResolvedNode> = node
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::VariantField)
+        .cloned()
+        .collect();
+    let mut sig = format!("{enum_name}.{variant}");
+    if !fields.is_empty() {
+        sig.push('(');
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                sig.push_str(", ");
+            }
+            // A named field has an `Ident` token before the type node.
+            if let Some(fname) = crate::syntax::resolve::ident_text(field) {
+                sig.push_str(&fname);
+                sig.push_str(": ");
+            }
+            if let Some(ty) = field.children().find(|c| is_type_node(c.kind())) {
+                sig.push_str(ty.text().to_string().trim());
+            }
+        }
+        sig.push(')');
+    }
+    let shape = if fields.is_empty() {
+        "unit variant"
+    } else if fields.iter().any(|f| crate::syntax::resolve::ident_text(f).is_some()) {
+        "named-payload variant"
+    } else {
+        "positional-payload variant"
+    };
+    format!("```ascript\n{sig}\n```\n{shape} of enum `{enum_name}`.")
+}
+
+/// True if `kind` is a type-annotation CST node (the field's declared type).
+fn is_type_node(kind: SyntaxKind) -> bool {
+    use SyntaxKind::*;
+    matches!(
+        kind,
+        NamedType | GenericType | OptionalType | UnionType | TupleType
+    )
 }
 
 /// Signature + one-line doc for a global builtin function, if `name` is one.
@@ -235,6 +334,39 @@ mod tests {
         let m = model("let x = 1\n");
         // Byte 3 is the space between `let` and `x`.
         assert!(doc_at(&m, 3).is_none());
+    }
+
+    #[test]
+    fn doc_at_variant_shows_payload_signature() {
+        // ADT Task 13: hover on a payload variant name shows its declared signature.
+        let src = "enum Shape {\n  Circle(radius: float),\n  Rect(w: float, h: float),\n  Pair(int, int),\n  Point,\n}\nlet c = Shape.Circle(2.0)\n";
+        let m = model(src);
+        // Hover on `Circle` at the use site `Shape.Circle`.
+        let off = m.text.rfind("Circle").unwrap();
+        let doc = doc_at(&m, off).expect("hover on Circle");
+        assert!(
+            doc.contains("Shape.Circle(radius: float)"),
+            "named single-field sig: {doc}"
+        );
+        assert!(doc.contains("named-payload variant"), "shape label: {doc}");
+        // Positional variant.
+        let off = m.text.find("Pair").unwrap();
+        let doc = doc_at(&m, off).expect("hover on Pair");
+        assert!(doc.contains("Shape.Pair(int, int)"), "positional sig: {doc}");
+        assert!(doc.contains("positional-payload variant"), "shape: {doc}");
+        // Multi-field named variant.
+        let off = m.text.find("Rect").unwrap();
+        let doc = doc_at(&m, off).expect("hover on Rect");
+        assert!(
+            doc.contains("Shape.Rect(w: float, h: float)"),
+            "multi named sig: {doc}"
+        );
+        // Unit variant.
+        let off = m.text.find("Point").unwrap();
+        let doc = doc_at(&m, off).expect("hover on Point");
+        assert!(doc.contains("Shape.Point"), "unit sig: {doc}");
+        assert!(doc.contains("unit variant"), "unit label: {doc}");
+        assert!(!doc.contains("Shape.Point("), "unit has no parens: {doc}");
     }
 
     #[test]

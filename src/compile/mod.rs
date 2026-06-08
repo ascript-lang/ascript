@@ -469,6 +469,21 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                             CompileError::new("call-default spread (...) missing operand", span)
                         })?;
                         args.push(CallArg::Spread(cst_default_expr(&operand)?));
+                    } else if child.kind() == SyntaxKind::NamedArg {
+                        // ADT §3.2: a named call arg `name: expr` (variant construction).
+                        let name = cst_first_ident(child).ok_or_else(|| {
+                            CompileError::new("named call arg missing field name", span)
+                        })?;
+                        let value = child
+                            .children()
+                            .find_map(|c| Expr::cast(c.clone()))
+                            .ok_or_else(|| {
+                                CompileError::new("named call arg missing value expression", span)
+                            })?;
+                        args.push(CallArg::Named {
+                            name: Rc::from(name.as_str()),
+                            value: cst_default_expr(&value)?,
+                        });
                     } else if let Some(a) = Expr::cast(child.clone()) {
                         args.push(CallArg::Pos(cst_default_expr(&a)?));
                     }
@@ -1970,27 +1985,64 @@ impl Compiler {
         // constant: the spec restricts an enum variant's backing to a number/string
         // literal (`enum Status { Ok = 200 }`), so we const-evaluate it here.
         let mut variants = indexmap::IndexMap::new();
+        let mut schemas = indexmap::IndexMap::new();
         for variant in enum_decl.enum_variants() {
             let v_span = node_span(&variant);
             let v_name = variant
                 .ident_token()
                 .map(|t| t.text().to_string())
                 .ok_or_else(|| CompileError::new("enum variant has no name", v_span))?;
-            let backing = match variant.expr() {
-                Some(expr) => self.const_eval_enum_backing(&expr)?,
-                None => Value::Nil,
+            // ADT: build the per-variant payload schema (empty for unit/scalar-backed).
+            let mut fields: Vec<(Option<Rc<str>>, crate::ast::Type)> = Vec::new();
+            for field in variant.variant_fields() {
+                let fty = field
+                    .r#type()
+                    .and_then(|t| cst_type(t.syntax()))
+                    .ok_or_else(|| {
+                        CompileError::new(
+                            format!("enum variant field in '{v_name}' has no type"),
+                            v_span,
+                        )
+                    })?;
+                let fname = field.ident_token().map(|t| Rc::from(t.text()));
+                fields.push((fname, fty));
+            }
+            let schema = crate::value::VariantSchema {
+                fields: fields.clone(),
             };
-            let value = Value::EnumVariant(Rc::new(crate::value::EnumVariant {
-                enum_name: name.clone(),
-                name: v_name.clone(),
-                value: backing,
-            }));
-            variants.insert(v_name, value);
+            // A payload variant interns as a CONSTRUCTOR (`ctor: true`); a
+            // unit/scalar-backed variant keeps its const backing (byte-identical).
+            let value = if schema.has_payload() {
+                Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+                    enum_name: name.clone(),
+                    name: v_name.clone(),
+                    value: Value::Nil,
+                    payload: None,
+                    ctor: true,
+                    def: None,
+                }))
+            } else {
+                let backing = match variant.expr() {
+                    Some(expr) => self.const_eval_enum_backing(&expr)?,
+                    None => Value::Nil,
+                };
+                Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+                    enum_name: name.clone(),
+                    name: v_name.clone(),
+                    value: backing,
+                    payload: None,
+                    ctor: false,
+                    def: None,
+                }))
+            };
+            variants.insert(v_name.clone(), value);
+            schemas.insert(v_name, schema);
         }
 
         let def = Value::Enum(Rc::new(crate::value::EnumDef {
             name: name.clone(),
             variants,
+            variant_schemas: schemas,
         }));
         let cp_idx = self.chunk.add_const(def);
         self.chunk.emit_u16(Op::Const, cp_idx, span);
@@ -3660,6 +3712,7 @@ impl Compiler {
             RangePat => self.compile_range_pattern(pat, subj_temp, span, fail_sites),
             ArrayPat => self.compile_array_pattern(pat, subj_temp, span, fail_sites),
             ObjectPat => self.compile_object_pattern(pat, subj_temp, span, fail_sites),
+            VariantPat => self.compile_variant_pattern(pat, subj_temp, span, fail_sites),
             other => Err(CompileError::new(
                 format!("internal: unexpected match pattern kind {other:?} (compiler invariant)"),
                 range_span(pat),
@@ -3907,6 +3960,112 @@ impl Compiler {
         Ok(())
     }
 
+    /// ADT: a `VariantPat` `Circle(r)` / `Shape.Circle(r)` / `Rect(w: ww)`. Mirrors
+    /// the tree-walker's `match_variant_pattern` byte-for-byte: a tag-test
+    /// (`MATCH_VARIANT`), then — positional → arity guard (`MATCH_VARIANT_ARITY`) +
+    /// per-index destructure (`VARIANT_ELEM`); named → per-field presence guard
+    /// (`MATCH_VARIANT_HAS_FIELD`) + field read (`VARIANT_FIELD`) or shorthand bind.
+    fn compile_variant_pattern(
+        &mut self,
+        pat: &ResolvedNode,
+        subj_temp: u16,
+        span: Span,
+        fail_sites: &mut Vec<usize>,
+    ) -> Result<(), CompileError> {
+        use SyntaxKind::*;
+        // Variant ref: the Ident token(s). `Ident . Ident` is qualified (enum.variant);
+        // a single `Ident` is the bare variant. (Tokens are in source order.)
+        let idents: Vec<String> = pat
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .filter(|t| t.kind() == Ident)
+            .map(|t| t.text().to_string())
+            .collect();
+        let (enum_name, variant) = match idents.as_slice() {
+            [v] => (None, v.clone()),
+            [e, v] => (Some(e.clone()), v.clone()),
+            _ => {
+                return Err(CompileError::new(
+                    "variant pattern has no variant name",
+                    range_span(pat),
+                ))
+            }
+        };
+        // Tag-test const: `[variantName, enumNameOrNil]`.
+        let tag = Value::Array(crate::value::ArrayCell::new(vec![
+            Value::Str(Rc::from(variant.as_str())),
+            match &enum_name {
+                Some(e) => Value::Str(Rc::from(e.as_str())),
+                None => Value::Nil,
+            },
+        ]));
+        let tag_idx = self.chunk.add_const(tag);
+        self.emit_get_local_temp(subj_temp, span);
+        self.chunk.emit_u16(Op::MatchVariant, tag_idx, span);
+        fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+
+        // Named entries (`Rect(w: ww)` / shorthand `Rect(w)`) vs positional sub-patterns.
+        let named: Vec<ResolvedNode> = pat
+            .children()
+            .filter(|c| c.kind() == VariantPatField)
+            .cloned()
+            .collect();
+        if !named.is_empty() {
+            for entry in &named {
+                let key = entry
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .find(|t| t.kind() == Ident)
+                    .map(|t| t.text().to_string())
+                    .ok_or_else(|| {
+                        CompileError::new("variant field entry has no name", range_span(entry))
+                    })?;
+                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                // Presence test.
+                self.emit_get_local_temp(subj_temp, span);
+                self.chunk.emit_u16(Op::MatchVariantHasField, key_idx, span);
+                fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+                // `w: subpat` tests the field; shorthand `w` binds it.
+                if let Some(subpat) = entry.children().find(|c| is_pattern_kind(c.kind())) {
+                    let val_temp = self.alloc_temp()?;
+                    self.emit_get_local_temp(subj_temp, span);
+                    self.chunk.emit_u16(Op::VariantField, key_idx, span);
+                    self.chunk.emit_u16(Op::SetLocal, val_temp, span);
+                    self.compile_pattern_test(subpat, val_temp, span, fail_sites)?;
+                } else {
+                    let slot = self.pattern_bind_slot(entry, range_span(entry))?;
+                    self.emit_get_local_temp(subj_temp, span);
+                    self.chunk.emit_u16(Op::VariantField, key_idx, span);
+                    self.emit_set_local(slot, span);
+                }
+            }
+        } else {
+            // Positional sub-patterns (each a pattern child). Arity guard first.
+            let pats: Vec<ResolvedNode> = pat
+                .children()
+                .filter(|c| is_pattern_kind(c.kind()))
+                .cloned()
+                .collect();
+            let arity = u16::try_from(pats.len()).map_err(|_| {
+                CompileError::new("variant pattern has too many fields", range_span(pat))
+            })?;
+            self.emit_get_local_temp(subj_temp, span);
+            self.chunk.emit_u16(Op::MatchVariantArity, arity, span);
+            fail_sites.push(self.chunk.emit_jump(Op::JumpIfFalse, span));
+            for (i, sub) in pats.iter().enumerate() {
+                let i = u16::try_from(i).map_err(|_| {
+                    CompileError::new("variant pattern index exceeds 65535", range_span(pat))
+                })?;
+                let elem_temp = self.alloc_temp()?;
+                self.emit_get_local_temp(subj_temp, span);
+                self.chunk.emit_u16(Op::VariantElem, i, span);
+                self.chunk.emit_u16(Op::SetLocal, elem_temp, span);
+                self.compile_pattern_test(sub, elem_temp, span, fail_sites)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Load a SCRATCH temp slot (`alloc_temp`). Temps are never resolver cell slots,
     /// so they are always plain `GET_LOCAL` (never the cell variant).
     fn emit_get_local_temp(&mut self, slot: u16, span: Span) {
@@ -4122,6 +4281,14 @@ impl Compiler {
                     .text()
                     .to_string();
                 self.compile_chain(&receiver, sink)?;
+                // ADT §3.2: a named-arg method-call link reads the member (the
+                // variant constructor) then `CALL_NAMED`, mirroring the plain
+                // `compile_call` named path.
+                if self.arg_list_has_named(call) {
+                    let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    self.chunk.emit_u16(Op::GetProp, name_idx, span);
+                    return self.compile_named_call(call, span);
+                }
                 self.emit_method_call_on_receiver(call, &name, span)?;
                 Ok(())
             }
@@ -4135,6 +4302,9 @@ impl Compiler {
                     CompileError::new("call expression missing callee", span)
                 })?;
                 self.compile_chain(&callee, sink)?;
+                if self.arg_list_has_named(call) {
+                    return self.compile_named_call(call, span);
+                }
                 if self.arg_list_has_spread(call) {
                     self.compile_spread_args(call, span)?;
                     self.chunk.emit(Op::CallSpread, span);
@@ -4250,6 +4420,19 @@ impl Compiler {
             .expr()
             .ok_or_else(|| CompileError::new("call expression missing callee", span))?;
 
+        // ADT §3.2: a call carrying NAMED arguments (`Shape.Rect(w: 3.0, h: 4.0)`)
+        // is only valid for enum-variant construction. Compile the callee as a
+        // VALUE (a member callee `Shape.Rect` lowers to GET_PROP, which `read_member`
+        // turns into the variant constructor — the SAME value the tree-walker's
+        // `read_member` yields), then `CALL_NAMED`. This bypasses the CALL_METHOD
+        // path (whose argc would miscount the `NamedArg` children), routing
+        // construction through the shared `construct_variant_args`, byte-identical to
+        // the tree-walker's `call_value_named`.
+        if self.arg_list_has_named(call) {
+            self.compile_expr(&callee)?;
+            return self.compile_named_call(call, span);
+        }
+
         // A plain member call `recv.m(args)` lowers to CALL_METHOD, which mirrors
         // the tree-walker's `eval_chain` Member-callee Call arm (schema fluent hook
         // + `read_member` → `call_value`). This is what makes the generator
@@ -4302,6 +4485,124 @@ impl Compiler {
                     .any(|c| c.kind() == SyntaxKind::SpreadElem)
             })
             .unwrap_or(false)
+    }
+
+    /// ADT §3.2: whether a call's argument list contains a named argument
+    /// (`name: expr`, a `NamedArg` child). Drives the `CALL_NAMED` lowering. A named
+    /// arg is ONLY meaningful for an enum-variant constructor call.
+    fn arg_list_has_named(&self, call: &CallExpr) -> bool {
+        call.arg_list()
+            .map(|al| {
+                al.syntax()
+                    .children()
+                    .any(|c| c.kind() == SyntaxKind::NamedArg)
+            })
+            .unwrap_or(false)
+    }
+
+    /// ADT §3.2: lower a call carrying named arguments (`Shape.Rect(w: 3.0, h: 4.0)`).
+    /// The callee is ALREADY on the stack. Each argument's VALUE is compiled in
+    /// source order, then a `CALL_NAMED names, argc` op is emitted carrying a const
+    /// `Value::Array` of per-arg field names (`Str` for a named arg, `Nil` for a
+    /// positional one). Dispatch (variant construction, or the Tier-2 error for any
+    /// other callee) is byte-identical to the tree-walker's `call_value_named`.
+    ///
+    /// A named-arg call that ALSO contains a `...spread` (`Rect(w: 1.0, ...xs)`) has a
+    /// runtime-dynamic arity, so it is lowered through the dynamic-arity lockstep
+    /// builder (`compile_named_spread_call`) rather than the static `CALL_NAMED` path.
+    /// It must NOT be rejected at compile time: the tree-walker reaches such a mix at
+    /// RUNTIME (the spread is positional, the named arg is not → the recoverable
+    /// "arguments must be all named or all positional, not mixed" panic in
+    /// `construct_variant_args`), so a VM compile-time rejection would diverge on
+    /// dead/uncalled code and on `recover()` (Gate 1 byte-identity). Both engines must
+    /// reach the SAME recoverable runtime panic.
+    fn compile_named_call(&mut self, call: &CallExpr, span: Span) -> Result<(), CompileError> {
+        if self.arg_list_has_spread(call) {
+            return self.compile_named_spread_call(call, span);
+        }
+        let mut argc: u8 = 0;
+        let mut names: Vec<Value> = Vec::new();
+        if let Some(arg_list) = call.arg_list() {
+            for child in arg_list.syntax().children() {
+                if child.kind() == SyntaxKind::NamedArg {
+                    let name = cst_first_ident(child).ok_or_else(|| {
+                        CompileError::new("named call arg missing field name", span)
+                    })?;
+                    let value = child
+                        .children()
+                        .find_map(|c| Expr::cast(c.clone()))
+                        .ok_or_else(|| {
+                            CompileError::new("named call arg missing value expression", span)
+                        })?;
+                    self.compile_expr(&value)?;
+                    names.push(Value::Str(Rc::from(name.as_str())));
+                } else if let Some(arg) = Expr::cast(child.clone()) {
+                    self.compile_expr(&arg)?;
+                    names.push(Value::Nil);
+                } else {
+                    continue;
+                }
+                argc = argc
+                    .checked_add(1)
+                    .ok_or_else(|| CompileError::new("too many call arguments (max 255)", span))?;
+            }
+        }
+        let names_idx = self
+            .chunk
+            .add_const(Value::Array(crate::value::ArrayCell::new(names)));
+        self.chunk.emit_u16_u8(Op::CallNamed, names_idx, argc, span);
+        Ok(())
+    }
+
+    /// ADT §3.2: lower a call MIXING a `...spread` with named arguments
+    /// (`Rect(w: 1.0, ...xs)`). The callee is ALREADY on the stack. Builds two parallel
+    /// runtime arrays in source order — the flattened argument VALUES and their
+    /// per-value NAMES (`Str` for a named arg, `Nil` for a positional value, `Nil` once
+    /// per element for a spread) — then `CALL_NAMED_SPREAD` dispatches to
+    /// `construct_variant_args`. This is the SAME runtime path the tree-walker's
+    /// `eval_call_args_named` + `call_value_named` take: each argument expression is
+    /// evaluated left-to-right (preserving side effects + the spread-non-array error),
+    /// and a spread+named mix reaches the recoverable "all named or all positional, not
+    /// mixed" panic at runtime, byte-identical to the tree-walker.
+    fn compile_named_spread_call(
+        &mut self,
+        call: &CallExpr,
+        span: Span,
+    ) -> Result<(), CompileError> {
+        // Layout becomes `[callee, argsArray, namesArray]`.
+        self.chunk.emit_u16(Op::NewArray, 0, span); // argsArray
+        self.chunk.emit_u16(Op::NewArray, 0, span); // namesArray
+        if let Some(arg_list) = call.arg_list() {
+            for child in arg_list.syntax().children() {
+                if child.kind() == SyntaxKind::NamedArg {
+                    let name = cst_first_ident(child).ok_or_else(|| {
+                        CompileError::new("named call arg missing field name", span)
+                    })?;
+                    let value = child
+                        .children()
+                        .find_map(|c| Expr::cast(c.clone()))
+                        .ok_or_else(|| {
+                            CompileError::new("named call arg missing value expression", span)
+                        })?;
+                    self.compile_expr(&value)?;
+                    let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    self.chunk.emit_u16(Op::AppendNamedArg, name_idx, span);
+                } else if let Some(spread) = SpreadElem::cast(child.clone()) {
+                    let operand = spread.expr().ok_or_else(|| {
+                        CompileError::new("call argument spread (...) missing operand", span)
+                    })?;
+                    let op_span = node_code_span(&operand);
+                    self.compile_expr(&operand)?;
+                    self.chunk.emit(Op::AppendSpreadArg, op_span);
+                } else if let Some(arg) = Expr::cast(child.clone()) {
+                    self.compile_expr(&arg)?;
+                    self.chunk.emit(Op::AppendPosArg, span);
+                }
+                // Tokens (`(`, `,`, `)`) and trivia are skipped.
+            }
+        }
+        self.chunk.emit(Op::CallNamedSpread, span);
+        Ok(())
     }
 
     /// Build the flattened call-argument array at runtime onto the stack (leaving a
@@ -5021,7 +5322,7 @@ fn is_pattern_kind(kind: SyntaxKind) -> bool {
     use SyntaxKind::*;
     matches!(
         kind,
-        WildcardPat | LiteralPat | RangePat | ArrayPat | ObjectPat
+        WildcardPat | LiteralPat | RangePat | ArrayPat | ObjectPat | VariantPat
     )
 }
 

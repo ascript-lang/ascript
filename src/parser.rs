@@ -320,9 +320,30 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
+            // ADT: a variant has EITHER a `= scalar` backing OR a `(…)` payload, never
+            // both. The two ways this surfaces:
+            //  - `Foo = 2 (int)` — a `(` trails the backing expr (separate tokens).
+            //  - `Foo = 2(int)`  — the backing expr parsed AS a call (the `(` was
+            //    swallowed). A scalar backing is never a call, so a `Call` backing is
+            //    the both-form. (Enum backings are scalar literals/consts per spec.)
+            let backing_is_call =
+                matches!(&value, Some(e) if matches!(e.kind, ExprKind::Call { .. }));
+            let payload = if *self.peek() == Tok::LParen || backing_is_call {
+                if value.is_some() {
+                    return Err(AsError::at(
+                        "a variant cannot have both a '= value' backing and a '(…)' payload"
+                            .to_string(),
+                        self.span(),
+                    ));
+                }
+                self.enum_payload_fields()?
+            } else {
+                Vec::new()
+            };
             variants.push(crate::ast::EnumVariantDecl {
                 name: vname,
                 value,
+                payload,
                 name_span: vname_span,
             });
             if *self.peek() == Tok::Comma {
@@ -339,6 +360,70 @@ impl<'a> Parser<'a> {
             span,
             name_span,
         })
+    }
+
+    /// ADT: parse a variant's `(field, field, …)` payload list. Each field is either
+    /// named (`id: T`) or positional (`T`); the list must be UNIFORMLY one or the
+    /// other (mixing is a parse error). A field type is REQUIRED. Assumes the current
+    /// token is `(`.
+    fn enum_payload_fields(&mut self) -> Result<Vec<crate::ast::VariantField>, AsError> {
+        use crate::ast::VariantField;
+        self.eat(&Tok::LParen)?;
+        let mut fields: Vec<VariantField> = Vec::new();
+        // `named` is decided by the FIRST field; subsequent fields must match.
+        let mut named: Option<bool> = None;
+        if *self.peek() != Tok::RParen {
+            loop {
+                let field_start = self.span();
+                // A named field is `ident : Type`; a positional field is a bare Type.
+                // Disambiguate by peeking for `ident` followed by `:`.
+                let is_named = matches!(self.peek(), Tok::Ident(_))
+                    && matches!(self.peek_nth(1), Tok::Colon);
+                match named {
+                    None => named = Some(is_named),
+                    Some(prev) if prev != is_named => {
+                        return Err(AsError::at(
+                            "enum variant fields must be all named or all positional".to_string(),
+                            field_start,
+                        ));
+                    }
+                    _ => {}
+                }
+                let name = if is_named {
+                    let n = match self.advance() {
+                        Tok::Ident(n) => n,
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected field name, found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    };
+                    self.eat(&Tok::Colon)?;
+                    Some(std::rc::Rc::from(n.as_str()))
+                } else {
+                    None
+                };
+                let ty = self.parse_type()?;
+                fields.push(VariantField { name, ty });
+                if *self.peek() == Tok::Comma {
+                    self.advance();
+                    if *self.peek() == Tok::RParen {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        if fields.is_empty() {
+            return Err(AsError::at(
+                "an enum variant payload must declare at least one field".to_string(),
+                self.tokens[self.pos - 1].span,
+            ));
+        }
+        Ok(fields)
     }
 
     fn class_decl(&mut self) -> Result<Stmt, AsError> {
@@ -1479,6 +1564,14 @@ impl<'a> Parser<'a> {
             self.eat(&Tok::RBrace)?;
             return Ok(Pattern::Object(entries, rest));
         }
+        // ADT: a VARIANT pattern — `Circle(…)` / `Shape.Circle(…)`. Detected as an
+        // `Ident` (optionally `Ident.Ident`) IMMEDIATELY followed by `(`. The trailing
+        // `(` makes this unambiguously a variant destructuring (never an Option-C bare
+        // ident, never a range bound). A bare/qualified UNIT pattern (no parens) flows
+        // through the value-expr path below UNCHANGED.
+        if let Some(pat) = self.try_variant_pattern()? {
+            return Ok(pat);
+        }
         // Otherwise parse a value-expression and classify it. NUM §3.4: a match
         // pattern enters at `range()` — the tier JUST BELOW the new `bitor()` — so a
         // bare `|` between patterns is NEVER swallowed by the value-parser and stays
@@ -1509,6 +1602,119 @@ impl<'a> Parser<'a> {
             return Ok(Pattern::Ident(name.as_str().into()));
         }
         Ok(Pattern::Value(Box::new(start)))
+    }
+
+    /// ADT: try to parse a VARIANT pattern (`Circle(…)` / `Shape.Circle(…)`). Returns
+    /// `Some(pat)` if the cursor is at `Ident (` or `Ident . Ident (` (a variant ref
+    /// followed by `(`); `None` otherwise (leaving the cursor untouched so the caller
+    /// falls back to value-expr classification). Inside the parens, fields are either
+    /// positional sub-patterns (`Pair(a, b)`) or named (`Rect(w: ww)` / `Rect(w)`);
+    /// the form is decided by the FIRST field (`ident :` ⇒ named).
+    fn try_variant_pattern(&mut self) -> Result<Option<crate::ast::Pattern>, AsError> {
+        use crate::ast::{Pattern, VariantPatFields};
+        // Probe the shape WITHOUT consuming, so a non-match leaves the cursor for the
+        // value-expr path. Two accepted lead shapes: `Ident (` or `Ident . Ident (`.
+        let (enum_name, variant): (Option<std::rc::Rc<str>>, std::rc::Rc<str>) = match self.peek() {
+            Tok::Ident(a) => {
+                if matches!(self.peek_nth(1), Tok::LParen) {
+                    let v: std::rc::Rc<str> = a.as_str().into();
+                    self.advance(); // variant ident
+                    (None, v)
+                } else if matches!(self.peek_nth(1), Tok::Dot) {
+                    // `Ident . Ident (` — qualified variant ref.
+                    let is_qualified = matches!(self.peek_nth(2), Tok::Ident(_))
+                        && matches!(self.peek_nth(3), Tok::LParen);
+                    if !is_qualified {
+                        return Ok(None);
+                    }
+                    let en: std::rc::Rc<str> = a.as_str().into();
+                    self.advance(); // enum ident
+                    self.advance(); // `.`
+                    let v: std::rc::Rc<str> = match self.advance() {
+                        Tok::Ident(n) => n.as_str().into(),
+                        // Unreachable given the peek above, but stay total.
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected variant name, found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    };
+                    (Some(en), v)
+                } else {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        };
+        // Now at `(`. Parse the field sub-patterns.
+        self.eat(&Tok::LParen)?;
+        let mut positional: Vec<Pattern> = Vec::new();
+        let mut named: Vec<(std::rc::Rc<str>, Option<Pattern>)> = Vec::new();
+        // `is_named` decided by the first field: `ident :` ⇒ named. A bare `ident`
+        // with no `:` in a named-context is a shorthand bind (`Rect(w)`); but the
+        // FIRST field decides positional-vs-named, so a leading bare ident is
+        // positional (binds by index) unless followed by `:`.
+        let mut mode: Option<bool> = None; // Some(true) = named
+        if *self.peek() != Tok::RParen {
+            loop {
+                let field_named = matches!(self.peek(), Tok::Ident(_))
+                    && matches!(self.peek_nth(1), Tok::Colon);
+                match mode {
+                    None => mode = Some(field_named),
+                    // A named field (`field_named`) appearing in POSITIONAL mode
+                    // (`!prev`) is a mix error. (A named-mode shorthand `Rect(w)` —
+                    // `prev && !field_named` — is allowed and handled below.)
+                    Some(prev) if !prev && field_named => {
+                        return Err(AsError::at(
+                            "variant pattern fields must be all positional or all named".to_string(),
+                            self.span(),
+                        ));
+                    }
+                    _ => {}
+                }
+                if matches!(mode, Some(true)) {
+                    // Named field: `name` or `name: subpat`.
+                    let key: std::rc::Rc<str> = match self.advance() {
+                        Tok::Ident(n) => n.as_str().into(),
+                        other => {
+                            return Err(AsError::at(
+                                format!("expected field name in variant pattern, found {:?}", other),
+                                self.tokens[self.pos - 1].span,
+                            ))
+                        }
+                    };
+                    let subpat = if *self.peek() == Tok::Colon {
+                        self.advance();
+                        Some(self.parse_pattern()?)
+                    } else {
+                        None
+                    };
+                    named.push((key, subpat));
+                } else {
+                    positional.push(self.parse_pattern()?);
+                }
+                if *self.peek() == Tok::Comma {
+                    self.advance();
+                    if *self.peek() == Tok::RParen {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        self.eat(&Tok::RParen)?;
+        let fields = if matches!(mode, Some(true)) {
+            VariantPatFields::Named(named)
+        } else {
+            VariantPatFields::Positional(positional)
+        };
+        Ok(Some(Pattern::Variant {
+            enum_name,
+            variant,
+            fields,
+        }))
     }
 
     /// Parse a trailing rest in an array/object pattern: assumes the current token
@@ -1661,9 +1867,27 @@ impl<'a> Parser<'a> {
                     let mut args = Vec::new();
                     if *self.peek() != Tok::RParen {
                         loop {
+                            let named_arg = match self.peek() {
+                                // ADT §3.2: a named call argument `name: expr`
+                                // (variant construction). Disambiguated by an
+                                // `IDENT :` at argument start — a bare `:` cannot
+                                // otherwise begin a call argument (ternary always
+                                // has a `?` before the `:`).
+                                Tok::Ident(n) if *self.peek_nth(1) == Tok::Colon => {
+                                    Some(std::rc::Rc::<str>::from(n.as_str()))
+                                }
+                                _ => None,
+                            };
                             if *self.peek() == Tok::DotDotDot {
                                 self.advance();
                                 args.push(crate::ast::CallArg::Spread(self.expr()?));
+                            } else if let Some(arg_name) = named_arg {
+                                self.advance(); // ident
+                                self.advance(); // ':'
+                                args.push(crate::ast::CallArg::Named {
+                                    name: arg_name,
+                                    value: self.expr()?,
+                                });
                             } else {
                                 args.push(crate::ast::CallArg::Pos(self.expr()?));
                             }
@@ -2577,5 +2801,132 @@ mod tests {
             !out.contains(';'),
             "formatter should not emit semicolons: {out}"
         );
+    }
+
+    // ─────────────────────────── ADT (Task 3) ───────────────────────────
+
+    fn parse_src(src: &str) -> Result<Vec<Stmt>, AsError> {
+        parse(&lex(src).unwrap())
+    }
+
+    #[test]
+    fn adt_enum_payload_variants_parse() {
+        let src = "enum Shape { Circle(radius: float), Rect(w: float, h: float), Pair(int, int), Point }";
+        let stmts = parse_src(src).expect("payload enum parses");
+        match &stmts[0] {
+            Stmt::Enum { variants, .. } => {
+                assert_eq!(variants.len(), 4);
+                // Circle: one named field `radius: float`.
+                assert_eq!(variants[0].payload.len(), 1);
+                assert_eq!(variants[0].payload[0].name.as_deref(), Some("radius"));
+                // Rect: two named fields.
+                assert_eq!(variants[1].payload.len(), 2);
+                assert_eq!(variants[1].payload[1].name.as_deref(), Some("h"));
+                // Pair: two positional fields (name = None).
+                assert_eq!(variants[2].payload.len(), 2);
+                assert!(variants[2].payload[0].name.is_none());
+                // Point: unit (no payload, no backing).
+                assert!(variants[3].payload.is_empty());
+                assert!(variants[3].value.is_none());
+            }
+            o => panic!("expected Enum, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn adt_mixed_named_positional_is_a_parse_error() {
+        let err = parse_src("enum E { Pair(int, h: float) }").unwrap_err();
+        assert!(
+            err.message.contains("all named or all positional"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn adt_backing_and_payload_is_a_parse_error() {
+        let err = parse_src("enum E { Foo = 2(int) }").unwrap_err();
+        assert!(
+            err.message
+                .contains("cannot have both a '= value' backing and a '(…)' payload"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn adt_variant_patterns_parse() {
+        use crate::ast::{Pattern, VariantPatFields};
+        fn first_arm_pattern(src: &str) -> Pattern {
+            let stmts = parse_src(src).expect("match parses");
+            // Find the match expression and its first arm.
+            fn find(stmts: &[Stmt]) -> Option<Pattern> {
+                for s in stmts {
+                    if let Stmt::Expr(e) = s {
+                        if let ExprKind::Match { arms, .. } = &e.kind {
+                            return Some(arms[0].patterns[0].clone());
+                        }
+                    }
+                }
+                None
+            }
+            find(&stmts).expect("found a match arm")
+        }
+        // Positional bind.
+        match first_arm_pattern("match s { Circle(r) => 1 }") {
+            Pattern::Variant {
+                enum_name,
+                variant,
+                fields,
+            } => {
+                assert!(enum_name.is_none());
+                assert_eq!(&*variant, "Circle");
+                match fields {
+                    VariantPatFields::Positional(p) => assert_eq!(p.len(), 1),
+                    _ => panic!("expected positional"),
+                }
+            }
+            o => panic!("expected Variant, got {o}"),
+        }
+        // Qualified, multi-positional.
+        match first_arm_pattern("match s { Shape.Pair(a, b) => 1 }") {
+            Pattern::Variant {
+                enum_name, fields, ..
+            } => {
+                assert_eq!(enum_name.as_deref(), Some("Shape"));
+                match fields {
+                    VariantPatFields::Positional(p) => assert_eq!(p.len(), 2),
+                    _ => panic!("expected positional"),
+                }
+            }
+            o => panic!("expected Variant, got {o}"),
+        }
+        // Named with rename.
+        match first_arm_pattern("match s { Rect(w: ww, h: hh) => 1 }") {
+            Pattern::Variant { fields, .. } => match fields {
+                VariantPatFields::Named(entries) => {
+                    assert_eq!(entries.len(), 2);
+                    assert_eq!(&*entries[0].0, "w");
+                    assert!(entries[0].1.is_some());
+                }
+                _ => panic!("expected named"),
+            },
+            o => panic!("expected Variant, got {o}"),
+        }
+        // Named shorthand.
+        match first_arm_pattern("match s { Circle(radius) => 1 }") {
+            Pattern::Variant { fields, .. } => {
+                // `radius` with no colon → positional in the FIRST-field rule, since
+                // there is no `:`. This is the documented convenience: a single bare
+                // field binds positionally. (Named shorthand needs `field:` somewhere.)
+                assert!(matches!(fields, VariantPatFields::Positional(_)));
+            }
+            o => panic!("expected Variant, got {o}"),
+        }
+        // Bare unit pattern (no parens) stays an Ident pattern (Option-C).
+        assert!(matches!(
+            first_arm_pattern("match s { Point => 1 }"),
+            Pattern::Ident(_)
+        ));
     }
 }

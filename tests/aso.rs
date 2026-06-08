@@ -179,6 +179,34 @@ fn build_then_run_aso_matches_instanceof() {
 }
 
 #[test]
+fn build_then_run_aso_matches_adt_payload_enum() {
+    // ADT: a payload-carrying enum — positional + named + unit variants, construction,
+    // structural equality, `.value` reflection, and a variant-destructuring `match`
+    // (positional bind + qualified unit) — round-trips through the `.aso` (per-variant
+    // schema + constructed payload constants) and runs byte-identically to the
+    // tree-walker. This is the `.aso` leg of the four-mode ADT differential.
+    let dir = unique_dir("adt");
+    write(
+        &dir,
+        "a.as",
+        "enum Shape {\n  Circle(radius: float),\n  Pair(int, int),\n  Point,\n}\n\
+         fn area(s: Shape): float {\n  return match s {\n    Circle(r) => r * r,\n    \
+         Pair(a, b) => float(a * b),\n    Shape.Point => 0.0,\n  }\n}\n\
+         let c = Shape.Circle(2.0)\nlet p = Shape.Pair(3, 4)\n\
+         print(area(c))\nprint(area(p))\nprint(area(Shape.Point))\n\
+         print(c == Shape.Circle(2.0))\nprint(c.value)\nprint(p.value)\n",
+    );
+    build(&dir, "a.as");
+    assert!(dir.join("a.aso").exists(), "a.aso should exist");
+
+    let (aso_out, aso_code) = run(&dir, &["run", "a.aso"]);
+    let (as_out, as_code) = run(&dir, &["run", "--tree-walker", "a.as"]);
+    assert_eq!(aso_out, "4.0\n12.0\n0.0\ntrue\n{radius: 2.0}\n[3, 4]\n");
+    assert_eq!(aso_out, as_out, "aso stdout must match tree-walker");
+    assert_eq!(aso_code, as_code);
+}
+
+#[test]
 fn build_then_run_aso_matches_default_params() {
     // SP2 §2: a function with default parameters — including a default that
     // references an EARLIER param and one composing with a rest param — compiles

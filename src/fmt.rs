@@ -349,6 +349,22 @@ fn write_enum_variant(out: &mut String, v: &EnumVariantDecl, level: usize) {
         out.push_str(" = ");
         write_expr(out, value, 0);
     }
+    // ADT: a payload variant renders its declared field list — `Circle(radius: float)`
+    // (named) or `Pair(int, int)` (positional). Mutually exclusive with `= value`.
+    if !v.payload.is_empty() {
+        out.push('(');
+        for (i, field) in v.payload.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            if let Some(name) = &field.name {
+                out.push_str(name);
+                out.push_str(": ");
+            }
+            out.push_str(&render_type(&field.ty));
+        }
+        out.push(')');
+    }
     out.push_str(",\n");
 }
 
@@ -525,6 +541,11 @@ fn write_expr_inner(out: &mut String, e: &Expr) {
                     CallArg::Spread(x) => {
                         out.push_str("...");
                         write_expr(out, x, PREC_ASSIGN);
+                    }
+                    CallArg::Named { name, value } => {
+                        out.push_str(name);
+                        out.push_str(": ");
+                        write_expr(out, value, PREC_ASSIGN);
                     }
                 }
             }
@@ -770,6 +791,41 @@ fn write_pattern(out: &mut String, pat: &Pattern) {
             write_pattern_rest(out, rest, !entries.is_empty());
             out.push('}');
         }
+        Pattern::Variant {
+            enum_name,
+            variant,
+            fields,
+        } => {
+            if let Some(en) = enum_name {
+                out.push_str(en);
+                out.push('.');
+            }
+            out.push_str(variant);
+            out.push('(');
+            match fields {
+                crate::ast::VariantPatFields::Positional(pats) => {
+                    for (i, p) in pats.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        write_pattern(out, p);
+                    }
+                }
+                crate::ast::VariantPatFields::Named(entries) => {
+                    for (i, (k, p)) in entries.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push_str(k);
+                        if let Some(p) = p {
+                            out.push_str(": ");
+                            write_pattern(out, p);
+                        }
+                    }
+                }
+            }
+            out.push(')');
+        }
     }
 }
 
@@ -941,6 +997,35 @@ mod tests {
         }
         // a single explicit paren group renders as exactly one set
         assert_eq!(format_source("(a + b) * c").unwrap(), "(a + b) * c\n");
+    }
+
+    #[test]
+    fn fmt_adt_payload_enums_and_variant_patterns() {
+        // ADT Task 10: the legacy formatter renders payload variant DECLARATIONS
+        // (`Circle(radius: float)` named, `Pair(int, int)` positional, unit `Point`)
+        // and `Pattern::Variant` (positional `Pair(a, b)`, named-renamed
+        // `Rect(w: ww, h: hh)`, qualified unit `Shape.Point`, nested guards)
+        // canonically, and is idempotent.
+        let src = "enum Shape{Circle(radius:float),Rect(w:float,h:float),Pair(int,int),Point}\n\
+fn area(s:Shape):float{return match s{Circle(r)=>3.14159*r*r,Rect(w:ww,h:hh)=>ww*hh,Pair(a,b)=>float(a)*float(b),Shape.Point=>0.0}}";
+        let out = format_source(src).unwrap();
+        // Declarations canonicalize spacing.
+        assert!(out.contains("Circle(radius: float),"), "named decl: {out}");
+        assert!(out.contains("Rect(w: float, h: float),"), "multi named decl: {out}");
+        assert!(out.contains("Pair(int, int),"), "positional decl: {out}");
+        assert!(out.contains("\n  Point,\n"), "unit decl: {out}");
+        // Variant patterns canonicalize internal spacing.
+        assert!(out.contains("Circle(r) =>"), "positional bind pat: {out}");
+        assert!(out.contains("Rect(w: ww, h: hh) =>"), "named renamed pat: {out}");
+        assert!(out.contains("Pair(a, b) =>"), "positional pat: {out}");
+        assert!(out.contains("Shape.Point =>"), "qualified unit pat: {out}");
+        // Idempotent and reparses.
+        let twice = format_source(&out).unwrap();
+        assert_eq!(out, twice, "fmt must be idempotent: {out}");
+        assert!(
+            crate::parser::parse(&crate::lexer::lex(&out).unwrap()).is_ok(),
+            "formatted ADT output must reparse: {out}"
+        );
     }
 
     #[test]

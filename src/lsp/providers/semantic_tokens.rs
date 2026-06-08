@@ -464,6 +464,33 @@ mod tests {
             .unwrap_or_else(|| panic!("no token at Color.Red member; got {cs:?}"));
         assert_eq!(tok.token_type, TYPE_ENUM_MEMBER, "Color.Red → ENUM_MEMBER");
     }
+
+    #[test]
+    fn adt_variant_constructor_classifies_as_enum_member() {
+        // ADT Task 13: a payload variant CONSTRUCTOR `Shape.Circle(2.0)` is a member
+        // access whose receiver resolves to an enum → ENUM_MEMBER (same path as a
+        // unit variant; the trailing call does not change the member classification).
+        let src = "enum Shape {\n  Circle(radius: float),\n  Point,\n}\nlet c = Shape.Circle(2.0)\nlet p = Shape.Point\n";
+        let m = model(src);
+        let cs = classify(&m);
+        // `Circle` in the constructor call.
+        let circle_off = src.rfind("Circle").unwrap();
+        let tok = cs
+            .iter()
+            .find(|c| c.start == circle_off)
+            .unwrap_or_else(|| panic!("no token at Shape.Circle member; got {cs:?}"));
+        assert_eq!(
+            tok.token_type, TYPE_ENUM_MEMBER,
+            "Shape.Circle(..) → ENUM_MEMBER"
+        );
+        // The unit `Point` member, too.
+        let point_off = src.rfind("Point").unwrap();
+        let tok = cs
+            .iter()
+            .find(|c| c.start == point_off)
+            .unwrap_or_else(|| panic!("no token at Shape.Point member; got {cs:?}"));
+        assert_eq!(tok.token_type, TYPE_ENUM_MEMBER, "Shape.Point → ENUM_MEMBER");
+    }
 }
 
 #[cfg(test)]

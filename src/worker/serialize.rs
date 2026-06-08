@@ -16,6 +16,9 @@
 //!     8  Map         container-id (u32) + len + (keyValue, value)*  (key is a tagged value)
 //!     9  Set         container-id (u32) + len + (keyValue)*         (each a tagged value)
 //!    10  EnumVariant enum_name(str) + variant_name(str) + backing value
+//!                    + payload_tag(u8): 0 unit, 1 positional (an Array value),
+//!                      2 named (an Object value). Unit variants re-intern far-side;
+//!                      payload variants rebuild a fresh constructed variant (ADT §6).
 //!    11  Regex       source(str)
 //!    12  Instance    container-id (u32) + class_name(str) + field-count + (name, value)*
 //!    13  Ref         container-id (u32) — a back-reference to an already-emitted container
@@ -231,6 +234,37 @@ fn check_inner(
             path.push_str(".value");
             check_inner(&ev.value, path, seen)?;
             path.truncate(len);
+            // ADT §6: a payload's values must be sendable too; the path threads
+            // through the payload (`arg[0].payload.items[2]` / `.payload.<field>`).
+            // The payload `Cc` participates in the visited-ref set (cycle-safe).
+            match &ev.payload {
+                Some(crate::value::Payload::Positional(a)) => {
+                    let id = crate::gc::cc_addr(a);
+                    if seen.insert(id, ()).is_some() {
+                        return Ok(());
+                    }
+                    for (i, val) in a.borrow().iter().enumerate() {
+                        let len = path.len();
+                        path.push_str(&format!(".payload.items[{i}]"));
+                        check_inner(val, path, seen)?;
+                        path.truncate(len);
+                    }
+                }
+                Some(crate::value::Payload::Named(o)) => {
+                    let id = crate::gc::cc_addr(o);
+                    if seen.insert(id, ()).is_some() {
+                        return Ok(());
+                    }
+                    for (k, val) in o.borrow().iter() {
+                        let len = path.len();
+                        path.push_str(".payload");
+                        push_member(path, k);
+                        check_inner(val, path, seen)?;
+                        path.truncate(len);
+                    }
+                }
+                None => {}
+            }
         }
         // Scalars / leaf containers: nothing to recurse.
         _ => {}
@@ -476,6 +510,21 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             w.str(&ev.enum_name);
             w.str(&ev.name);
             encode_value(&ev.value, w, ids);
+            // ADT §6: the payload tag — 0 (unit, old format), 1 (positional), 2
+            // (named). The payload's `Cc` container is encoded as an ordinary
+            // Array/Object so it participates in the visited-ref table (a recursive
+            // payload that contains itself serializes once + refers by id).
+            match &ev.payload {
+                None => w.u8(0),
+                Some(crate::value::Payload::Positional(a)) => {
+                    w.u8(1);
+                    encode_value(&Value::Array(a.clone()), w, ids);
+                }
+                Some(crate::value::Payload::Named(o)) => {
+                    w.u8(2);
+                    encode_value(&Value::Object(o.clone()), w, ids);
+                }
+            }
         }
         #[cfg(feature = "data")]
         Value::Regex(r) => {
@@ -630,13 +679,87 @@ fn decode_value(
             let enum_name = r.str()?;
             let name = r.str()?;
             let backing = decode_value(r, table, interp)?;
-            Ok(Value::EnumVariant(std::rc::Rc::new(
-                crate::value::EnumVariant {
-                    enum_name,
-                    name,
-                    value: backing,
-                },
-            )))
+            // ADT §6: the payload tag — 0 (unit), 1 (positional), 2 (named).
+            let payload_tag = r.u8()?;
+            match payload_tag {
+                0 => {
+                    // A UNIT variant: re-intern against the far-side `EnumDef` so it is
+                    // identity-equal to the receiver isolate's own interned constant
+                    // (`received == Shape.Point` is `true` within the receiver). The
+                    // enum ships as a value const via the global-name fixpoint
+                    // (`dispatch.rs`), so it is a global here. Best-effort: if the
+                    // far-side `EnumDef` is absent, fall back to a fresh `Rc` (today's
+                    // behavior — pinned by the round-trip test).
+                    if let Some(interned) = reintern_unit_variant(interp, &enum_name, &name) {
+                        return Ok(interned);
+                    }
+                    Ok(Value::EnumVariant(std::rc::Rc::new(
+                        crate::value::EnumVariant {
+                            enum_name,
+                            name,
+                            value: backing,
+                            payload: None,
+                            ctor: false,
+                            def: None,
+                        },
+                    )))
+                }
+                1 => {
+                    // POSITIONAL payload: decode the Array (cycle-safe via the ref
+                    // table) and rebuild a constructed variant. Compares STRUCTURALLY,
+                    // so a fresh allocation is correct (no re-interning needed).
+                    let arr = decode_value(r, table, interp)?;
+                    let cell = match arr {
+                        Value::Array(a) => a,
+                        _ => {
+                            return Err(SendError {
+                                kind: "decode",
+                                path: "<enum-payload>".to_string(),
+                                hint: None,
+                            })
+                        }
+                    };
+                    Ok(Value::EnumVariant(std::rc::Rc::new(
+                        crate::value::EnumVariant {
+                            enum_name,
+                            name,
+                            value: Value::Nil,
+                            payload: Some(crate::value::Payload::Positional(cell)),
+                            ctor: false,
+                            def: None,
+                        },
+                    )))
+                }
+                2 => {
+                    // NAMED payload: decode the Object and rebuild a constructed variant.
+                    let obj = decode_value(r, table, interp)?;
+                    let cell = match obj {
+                        Value::Object(o) => o,
+                        _ => {
+                            return Err(SendError {
+                                kind: "decode",
+                                path: "<enum-payload>".to_string(),
+                                hint: None,
+                            })
+                        }
+                    };
+                    Ok(Value::EnumVariant(std::rc::Rc::new(
+                        crate::value::EnumVariant {
+                            enum_name,
+                            name,
+                            value: Value::Nil,
+                            payload: Some(crate::value::Payload::Named(cell)),
+                            ctor: false,
+                            def: None,
+                        },
+                    )))
+                }
+                other => Err(SendError {
+                    kind: "decode",
+                    path: format!("<enum-payload-tag {other}>"),
+                    hint: None,
+                }),
+            }
         }
         #[cfg(feature = "data")]
         TAG_REGEX => {
@@ -701,6 +824,21 @@ fn register(table: &mut Vec<Value>, id: usize, v: Value) -> Result<(), SendError
     }
     table.push(v);
     Ok(())
+}
+
+/// ADT §6: re-intern a UNIT variant against the far-side `EnumDef`. Looks up
+/// `enum_name` as a global on the receiver isolate (the enum ships as a value const
+/// via the global-name fixpoint), then returns THAT isolate's interned variant
+/// constant — so a received unit variant is identity-equal to the receiver's own
+/// `Enum.Variant` literal. Returns `None` (best-effort fallback to a fresh `Rc`) if
+/// the far-side `EnumDef` or the variant is absent.
+fn reintern_unit_variant(interp: &Interp, enum_name: &str, name: &str) -> Option<Value> {
+    // The receiver isolate runs on the VM, so the enum const is a VM user-global.
+    let vm = interp.vm()?;
+    match vm.user_global(enum_name) {
+        Some(Value::Enum(def)) => def.variants.get(name).cloned(),
+        _ => None,
+    }
 }
 
 /// Reconstruct the `Rc<Class>` for an instance by name. A decoded `Instance` always
@@ -907,6 +1045,9 @@ mod tests {
             enum_name: "Color".to_string(),
             name: "Green".to_string(),
             value: num(1.0),
+            payload: None,
+            ctor: false,
+        def: None,
         }));
         let back = rt(&v);
         assert_eq!(format!("{back}"), format!("{v}"));
@@ -916,6 +1057,117 @@ mod tests {
         } else {
             panic!("expected enum variant");
         }
+    }
+
+    // ─────────────────────────── ADT (Task 9) ───────────────────────────
+
+    fn pos_var(en: &str, name: &str, items: Vec<Value>) -> Value {
+        Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+            enum_name: en.to_string(),
+            name: name.to_string(),
+            value: Value::Nil,
+            payload: Some(crate::value::Payload::Positional(
+                crate::value::ArrayCell::new(items),
+            )),
+            ctor: false,
+            def: None,
+        }))
+    }
+    fn named_var(en: &str, name: &str, fields: Vec<(&str, Value)>) -> Value {
+        let mut m = IndexMap::new();
+        for (k, v) in fields {
+            m.insert(k.to_string(), v);
+        }
+        Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+            enum_name: en.to_string(),
+            name: name.to_string(),
+            value: Value::Nil,
+            payload: Some(crate::value::Payload::Named(crate::value::ObjectCell::new(m))),
+            ctor: false,
+            def: None,
+        }))
+    }
+
+    #[test]
+    fn adt_positional_payload_roundtrips_structurally() {
+        let v = pos_var("Shape", "Pair", vec![Value::Int(3), Value::Int(4)]);
+        let back = rt(&v);
+        // Structural equality holds after the round-trip (fresh allocation, same data).
+        assert_eq!(back, v);
+        assert_eq!(format!("{back}"), "Shape.Pair(3, 4)");
+    }
+
+    #[test]
+    fn adt_named_payload_roundtrips_structurally() {
+        let v = named_var("Shape", "Circle", vec![("radius", Value::Float(2.0))]);
+        let back = rt(&v);
+        assert_eq!(back, v);
+        assert_eq!(format!("{back}"), "Shape.Circle(radius: 2.0)");
+    }
+
+    #[test]
+    fn adt_payload_variant_nested_in_object_and_map() {
+        // A payload variant nested as an Object field and a Map value round-trips.
+        let circle = named_var("Shape", "Circle", vec![("radius", Value::Float(1.5))]);
+        let mut obj = IndexMap::new();
+        obj.insert("shape".to_string(), circle.clone());
+        let o = Value::Object(crate::value::ObjectCell::new(obj));
+        let back = rt(&o);
+        // Objects are identity-equal containers, so compare the nested variant (which
+        // IS structural). The decoded object must hold an equal `Circle(radius: 1.5)`.
+        if let Value::Object(ob) = &back {
+            let inner = ob.borrow().get("shape").cloned().expect("shape field");
+            assert_eq!(inner, circle);
+        } else {
+            panic!("expected an object");
+        }
+    }
+
+    #[test]
+    fn adt_cyclic_recursive_payload_roundtrips() {
+        // arr = []; v = Json.Arr([arr]); arr.push(v) → a cycle through the payload.
+        // The encoder's visited-ref table must serialize it once and refer by id.
+        let arr = crate::value::ArrayCell::new(Vec::new());
+        let v = Value::EnumVariant(Rc::new(crate::value::EnumVariant {
+            enum_name: "Json".to_string(),
+            name: "Arr".to_string(),
+            value: Value::Nil,
+            payload: Some(crate::value::Payload::Positional(arr.clone())),
+            ctor: false,
+            def: None,
+        }));
+        arr.borrow_mut().push(v.clone());
+        // Encoding must terminate (cycle handled) and decode to a live cyclic value.
+        let bytes = encode(&v).expect("cyclic payload encodes");
+        let interp = Interp::new();
+        let back = decode(&bytes, &interp).expect("cyclic payload decodes");
+        // The decoded variant carries a positional payload whose first element is the
+        // variant itself (structural identity → the back-edge is present).
+        if let Value::EnumVariant(ev) = &back {
+            match &ev.payload {
+                Some(crate::value::Payload::Positional(a)) => {
+                    assert_eq!(a.borrow().len(), 1);
+                }
+                _ => panic!("expected a positional payload"),
+            }
+        } else {
+            panic!("expected an enum variant");
+        }
+    }
+
+    #[test]
+    fn adt_non_sendable_payload_is_a_path_error() {
+        // A payload holding a non-sendable kind (a function) is the recoverable
+        // path-error, with the path threaded through the payload.
+        let nonsend = Value::Builtin("print".into());
+        let v = pos_var("E", "V", vec![Value::Int(1), nonsend]);
+        let err = check_sendable(&v).expect_err("a function payload is not sendable");
+        assert_eq!(err.kind, "function");
+        assert!(
+            err.path.contains(".payload.items[1]"),
+            "path should thread through the payload, got: {}",
+            err.path
+        );
     }
 
     #[cfg(feature = "data")]

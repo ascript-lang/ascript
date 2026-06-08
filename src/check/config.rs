@@ -41,6 +41,9 @@ pub const RULE_CODES: &[&str] = &[
     "invalid-propagate",
     "unresolved-import",
     "unknown-enum-variant",
+    // ADT — algebraic enums + exhaustive match.
+    "non-exhaustive-match",
+    "enum-variant-binding-shadow",
     "duplicate-member",
     "super-misuse",
     "field-default-type",

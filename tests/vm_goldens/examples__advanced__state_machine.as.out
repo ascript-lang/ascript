@@ -1,0 +1,9 @@
+# exit: none
+running 80x24
+running 80x24
+running 100x40
+stopped
+stopped
+nil
+Event.KeyPress: expected int, got string
+Event.Resize requires named fields (w:, h:)

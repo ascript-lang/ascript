@@ -568,3 +568,58 @@ fn both_frontends_accept_plain_class_unchanged() {
         other => panic!("expected Stmt::Class, got {other:?}"),
     }
 }
+
+// ─────────────────────────────── ADT (Task 4) ───────────────────────────────
+
+/// Differential: BOTH front-ends must REJECT `src` (parse error / Error node).
+fn both_reject(src: &str) {
+    legacy_rejects(src);
+    cst_rejects(src);
+}
+
+#[test]
+fn both_frontends_accept_payload_enums() {
+    both_accept("enum Shape { Circle(radius: float), Rect(w: float, h: float), Pair(int, int), Point }");
+    both_accept("enum Status { Active, Inactive = 0, Pending = 1 }");
+    both_accept("enum Json { Null, Bool(value: bool), Num(value: float), Arr(items: array<Json>) }");
+    both_accept("enum E { Opt(x: int?) }");
+}
+
+#[test]
+fn both_frontends_accept_variant_patterns() {
+    // Positional (call-recovery on both front-ends).
+    both_accept("fn f(s) { return match s { Circle(r) => r, Pair(a, b) => a, Point => 0 } }");
+    both_accept("fn f(s) { return match s { Shape.Circle(r) => r, _ => 0 } }");
+    // Named (variant_pattern node).
+    both_accept("fn f(s) { return match s { Rect(w: ww, h: hh) => ww, _ => 0 } }");
+    both_accept("fn f(s) { return match s { Shape.Rect(w: a, h: b) => a, _ => 0 } }");
+    // Nested literal + guard + or-pattern.
+    both_accept("fn f(s) { return match s { Circle(0.0) => 1, Pair(a, b) if a == b => 2, Circle(_) | Rect(_, _) => 3, _ => 0 } }");
+}
+
+#[test]
+fn both_frontends_accept_named_variant_construction() {
+    // ADT §3.2: named call arguments (`Shape.Rect(w: 3.0, h: 4.0)`) parse on BOTH
+    // front-ends — qualified and bare, single- and multi-field, order-independent,
+    // and first-class (`mk(w: 1.0, h: 2.0)`).
+    both_accept("let r = Shape.Rect(w: 3.0, h: 4.0)");
+    both_accept("let r = Shape.Rect(h: 4.0, w: 3.0)");
+    both_accept("let c = Shape.Circle(radius: 2.0)");
+    both_accept("let c = Shape.Circle(2.0)");
+    both_accept("let mk = Shape.Rect\nlet r = mk(w: 1.0, h: 2.0)");
+    // A named arg whose value is itself an expression (nested construction).
+    both_accept("let r = Shape.Rect(w: 1.0 + 2.0, h: f(3.0))");
+    // Named args do not interfere with ordinary positional / spread calls.
+    both_accept("f(1, 2, 3)");
+    both_accept("f(...xs, 1)");
+    // A bare `x: y` is a named arg only at argument position — a ternary still parses.
+    both_accept("let z = cond ? a : b");
+}
+
+#[test]
+fn both_frontends_reject_mixed_and_both_payload_variants() {
+    // Mixed named+positional fields in one variant.
+    both_reject("enum E { Pair(int, h: float) }");
+    // Both a `= scalar` backing AND a `(…)` payload.
+    both_reject("enum E { Foo = 2(int) }");
+}

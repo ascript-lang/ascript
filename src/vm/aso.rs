@@ -122,7 +122,22 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   UNCHANGED) plus a new `type_consts` section in each chunk (a length-prefixed
 ///   list of `Type`s, written after `imports`). Old chunks had neither, so older
 ///   readers must reject a v22 chunk and a v21 reader must reject this one.
-pub const ASO_FORMAT_VERSION: u32 = 22;
+///
+/// - **v23 (ADT):** algebraic enums. The enum constant layout gains a per-variant
+///   payload SCHEMA (field names + types). NOTE: only enum *definitions* + schemas are
+///   pooled — a *constructed* payload-variant value is runtime-only and is rejected as
+///   a literal const (`NonLiteralConst`); the reader always reads `payload: None` for a
+///   pooled variant. Five new pattern opcodes (`MatchVariant`,
+///   `VariantElem`, `VariantField`, `MatchVariantArity`, `MatchVariantHasField`,
+///   appended at the END so existing byte values are unchanged). Old readers must
+///   reject a v23 chunk. (Bumped by reading the NUM-left v22 and adding one.)
+/// - **v24 (ADT named construction):** named call arguments (`Rect(w: 3.0, h: 4.0)`)
+///   for enum-variant construction. New appended opcodes (`CallNamed`, a u16
+///   names-const-array index + u8 argc; plus the spread+named lockstep builder ops
+///   `AppendNamedArg`/`AppendPosArg`/`AppendSpreadArg`/`CallNamedSpread`), appended at
+///   the END so existing byte values are unchanged, plus a new `EL_NAMED` call-arg tag
+///   in the const-folded field-default expr stream. Old readers must reject a v24 chunk.
+pub const ASO_FORMAT_VERSION: u32 = 24;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -282,6 +297,8 @@ const TP_EXPR: u8 = 1;
 // spread elements in array/object/call defaults).
 const EL_ITEM: u8 = 0;
 const EL_SPREAD: u8 = 1;
+// ADT §3.2: a named call argument `name: expr` in a const-folded constructor default.
+const EL_NAMED: u8 = 2;
 
 // ---- upvalue / import tags ---------------------------------------------------
 
@@ -710,18 +727,37 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
             w.len(e.variants.len());
             for (vname, variant) in &e.variants {
                 w.str(vname);
-                // Each variant is a Value::EnumVariant; serialize its fields.
+                // Each variant is a Value::EnumVariant; serialize its fields plus the
+                // ADT `ctor` flag (a payload-variant CONSTRUCTOR re-decodes as `ctor`).
                 match variant {
                     Value::EnumVariant(ev) => {
                         w.str(&ev.enum_name);
                         w.str(&ev.name);
                         write_value(w, &ev.value)?;
+                        w.u8(u8::from(ev.ctor));
                     }
                     other => {
                         return Err(AsoError::NonLiteralConst(
                             literal_kind(other).err().unwrap_or("enum-variant-payload"),
                         ))
                     }
+                }
+            }
+            // ADT: the per-variant payload schemas (field names + declared types).
+            w.len(e.variant_schemas.len());
+            for (vname, schema) in &e.variant_schemas {
+                w.str(vname);
+                w.len(schema.fields.len());
+                for (fname, fty) in &schema.fields {
+                    // A named field writes `1 + name`; positional writes `0`.
+                    match fname {
+                        Some(n) => {
+                            w.u8(1);
+                            w.str(n);
+                        }
+                        None => w.u8(0),
+                    }
+                    write_type(w, fty);
                 }
             }
         }
@@ -767,16 +803,45 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
                 let enum_name = r.str()?;
                 let vname = r.str()?;
                 let backing = read_value(r)?;
+                let ctor = r.u8()? != 0;
                 variants.insert(
                     key,
                     Value::EnumVariant(Rc::new(crate::value::EnumVariant {
                         enum_name,
                         name: vname,
                         value: backing,
+                        payload: None,
+                        ctor,
+                        def: None,
                     })),
                 );
             }
-            Value::Enum(Rc::new(crate::value::EnumDef { name, variants }))
+            // ADT: the per-variant payload schemas. Clamp every length `reserve`/
+            // `with_capacity` with `.min(r.remaining())` (the P0 unclamped-alloc guard).
+            let sn = r.len()?;
+            let mut variant_schemas =
+                indexmap::IndexMap::with_capacity(sn.min(r.remaining()));
+            for _ in 0..sn {
+                let vname = r.str()?;
+                let fn_count = r.len()?;
+                let mut fields: Vec<(Option<Rc<str>>, Type)> =
+                    Vec::with_capacity(fn_count.min(r.remaining()));
+                for _ in 0..fn_count {
+                    let fname = if r.u8()? != 0 {
+                        Some(Rc::from(r.str()?.as_str()))
+                    } else {
+                        None
+                    };
+                    let fty = read_type(r)?;
+                    fields.push((fname, fty));
+                }
+                variant_schemas.insert(vname, crate::value::VariantSchema { fields });
+            }
+            Value::Enum(Rc::new(crate::value::EnumDef {
+                name,
+                variants,
+                variant_schemas,
+            }))
         }
         TAG_ARRAY => {
             let n = r.len()?;
@@ -1112,6 +1177,11 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
                         w.u8(EL_SPREAD);
                         write_expr(w, e)?;
                     }
+                    CallArg::Named { name, value } => {
+                        w.u8(EL_NAMED);
+                        w.str(name);
+                        write_expr(w, value)?;
+                    }
                 }
             }
         }
@@ -1354,6 +1424,13 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
                 let a = match r.u8()? {
                     EL_ITEM => CallArg::Pos(read_expr(r)?),
                     EL_SPREAD => CallArg::Spread(read_expr(r)?),
+                    EL_NAMED => {
+                        let name: std::rc::Rc<str> = Rc::from(r.str()?.as_str());
+                        CallArg::Named {
+                            name,
+                            value: read_expr(r)?,
+                        }
+                    }
                     tag => {
                         return Err(AsoError::BadTag {
                             what: "call-arg",
@@ -2114,11 +2191,89 @@ run()
         match Chunk::from_bytes(&stale) {
             Err(AsoError::VersionMismatch { found, expected }) => {
                 assert_eq!(expected, ASO_FORMAT_VERSION);
-                assert_eq!(expected, 22);
+                assert_eq!(expected, 24);
                 assert_ne!(found, ASO_FORMAT_VERSION);
             }
             other => panic!("expected VersionMismatch for a stale CHECK_LOCAL .aso, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn adt_payload_enum_round_trips() {
+        // ADT Task 8: a payload enum's const (variant schemas + ctor flags) survives
+        // a write→read round-trip, and the constructed/matched program output is
+        // identical before and after.
+        let src = "enum Shape { Circle(radius: float), Rect(w: float, h: float), Pair(int, int), Point }\n\
+                   let c = Shape.Circle(2.0)\n\
+                   let p = Shape.Pair(3, 4)\n\
+                   print(c.radius)\n\
+                   print(p.value)\n\
+                   print(match c { Circle(r) => r, _ => 0.0 })\n";
+        let original = compile(src);
+        let bytes = original.to_bytes().expect("serialize payload enum");
+        let back = Chunk::from_bytes(&bytes).expect("a valid v23 .aso must decode");
+        assert_eq!(
+            disasm(&original),
+            disasm(&back),
+            "payload-enum chunk must round-trip byte-stably"
+        );
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(back),
+            "output must be identical after the payload-enum .aso round-trip"
+        );
+    }
+
+    #[test]
+    fn adt_named_construction_round_trips() {
+        // ADT §3.2: a program using NAMED variant construction (the CALL_NAMED opcode)
+        // AND a const-folded named-arg constructor default (the EL_NAMED call-arg tag
+        // in the field-default expr stream) survives a write→read round-trip byte-
+        // stably and runs identically.
+        let src = "enum Shape { Circle(radius: float), Rect(w: float, h: float), Point }\n\
+                   class Box { shape: Shape = Shape.Rect(w: 1.0, h: 2.0) }\n\
+                   let r = Shape.Rect(w: 3.0, h: 4.0)\n\
+                   let r2 = Shape.Rect(h: 4.0, w: 3.0)\n\
+                   print(r.value)\n\
+                   print(r == r2)\n\
+                   print(Box().shape.value)\n";
+        let original = compile(src);
+        let bytes = original.to_bytes().expect("serialize named-construction program");
+        let back = Chunk::from_bytes(&bytes).expect("a valid .aso must decode");
+        assert_eq!(
+            disasm(&original),
+            disasm(&back),
+            "named-construction chunk must round-trip byte-stably"
+        );
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(back),
+            "output must be identical after the named-construction .aso round-trip"
+        );
+    }
+
+    #[test]
+    fn adt_named_spread_lockstep_ops_round_trip() {
+        // ADT §3.2: a spread+named MIXED call lowers to the dynamic-arity lockstep
+        // builder ops (APPEND_NAMED_ARG / APPEND_POS_ARG / APPEND_SPREAD_ARG /
+        // CALL_NAMED_SPREAD). The mix is a recoverable runtime error, so the program
+        // catches it with `recover` — proving the new opcodes serialize, decode, and
+        // run byte-stably (the chunk round-trips even though the call itself panics).
+        let src = "enum Shape { Rect(w: float, h: float) }\n\
+                   print(recover(() => Shape.Rect(w: 1.0, ...[2.0])))\n";
+        let original = compile(src);
+        let bytes = original.to_bytes().expect("serialize spread+named program");
+        let back = Chunk::from_bytes(&bytes).expect("a valid .aso must decode");
+        assert_eq!(
+            disasm(&original),
+            disasm(&back),
+            "spread+named lockstep chunk must round-trip byte-stably"
+        );
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(back),
+            "output must be identical after the spread+named .aso round-trip"
+        );
     }
 
     #[test]

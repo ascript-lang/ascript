@@ -86,6 +86,52 @@ fn item(label: &str, kind: CompletionItemKind) -> CompletionItem {
     }
 }
 
+/// ADT: a completion item for an enum variant offered after `Enum.`. A unit variant
+/// is a plain `ENUM_MEMBER` insert (`Point`); a payload variant gets a `detail`
+/// showing its signature (`(radius: float)`) and a SNIPPET insert with one tab-stop
+/// per field placeholder (`Circle(${1:radius})`), so the call form is pre-filled.
+fn variant_completion_item(
+    variant: &str,
+    info: &crate::check::infer::table::EnumInfo,
+    table: &crate::check::infer::table::Table,
+) -> CompletionItem {
+    let mut ci = item(variant, CompletionItemKind::ENUM_MEMBER);
+    let fields = info.fields_of(variant).unwrap_or(&[]);
+    if fields.is_empty() {
+        // Unit/scalar variant — a bare reference, no payload.
+        return ci;
+    }
+    // Signature detail, e.g. `(radius: float)` or `(int, int)`.
+    let sig: Vec<String> = fields
+        .iter()
+        .map(|f| match &f.name {
+            Some(n) => format!("{n}: {}", f.ty.display(table)),
+            None => f.ty.display(table),
+        })
+        .collect();
+    ci.detail = Some(format!("({})", sig.join(", ")));
+    // Snippet insert with a placeholder per field. A MULTI-field named variant MUST
+    // be constructed with named args — the engine rejects a positional call
+    // (`interp.rs`: `is_named() && fields.len() > 1` → "requires named fields"), so the
+    // snippet emits the `name: <type>` call form, otherwise tab-completing it would
+    // lead straight into a runtime error. Single-field named (`Circle(radius)`) and
+    // positional variants accept positional args, so they keep the bare placeholder
+    // (field name as label for named, type for positional).
+    let named_call = fields.len() > 1 && fields.iter().all(|f| f.name.is_some());
+    let placeholders: Vec<String> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match &f.name {
+            Some(n) if named_call => format!("{n}: ${{{}:{}}}", i + 1, f.ty.display(table)),
+            Some(n) => format!("${{{}:{}}}", i + 1, n),
+            None => format!("${{{}:{}}}", i + 1, f.ty.display(table)),
+        })
+        .collect();
+    ci.insert_text = Some(format!("{variant}({})", placeholders.join(", ")));
+    ci.insert_text_format = Some(InsertTextFormat::SNIPPET);
+    ci
+}
+
 /// The always-offered baseline completions: every keyword + every global builtin.
 fn baseline_completions() -> Vec<CompletionItem> {
     let mut out = Vec::with_capacity(KEYWORDS.len() + BUILTINS.len() + TYPE_NAMES.len());
@@ -229,7 +275,7 @@ pub fn completions(model: &SemanticModel, offset: usize) -> Vec<CompletionItem> 
                 return info
                     .variants
                     .iter()
-                    .map(|v| item(v, CompletionItemKind::ENUM_MEMBER))
+                    .map(|v| variant_completion_item(v, info, &table))
                     .collect();
             }
         }
@@ -579,6 +625,40 @@ mod tests {
         let pls: Vec<&str> = pl.iter().map(|i| i.label.as_str()).collect();
         assert!(pls.contains(&"x"), "class field: {pls:?}");
         assert!(pls.contains(&"dist"), "class method: {pls:?}");
+    }
+
+    #[test]
+    fn member_access_offers_adt_payload_variants_with_signatures() {
+        // ADT Task 13: after `Shape.`, payload variants are offered with a signature
+        // `detail` and a snippet insert carrying field placeholders; the unit variant
+        // is a plain reference.
+        let src = "enum Shape {\n  Circle(radius: float),\n  Rect(w: float, h: float),\n  Pair(int, int),\n  Point,\n}\nShape.\n";
+        let model = SemanticModel::build(src.to_string(), None, &crate::check::LintConfig::default());
+        let off = src.rfind("Shape.\n").unwrap() + "Shape.".len();
+        let items = completions(&model, off);
+        let find = |label: &str| items.iter().find(|i| i.label == label).cloned();
+
+        let circle = find("Circle").expect("Circle offered");
+        assert_eq!(circle.detail.as_deref(), Some("(radius: float)"));
+        assert_eq!(circle.insert_text.as_deref(), Some("Circle(${1:radius})"));
+        assert_eq!(circle.insert_text_format, Some(InsertTextFormat::SNIPPET));
+
+        // A MULTI-field named variant must be CALLED with named args (the engine
+        // rejects a positional call), so the snippet emits the `name: <type>` form —
+        // a positional `Rect(${1:w}, ${2:h})` would tab-complete straight into a
+        // runtime "requires named fields" error. Single-field named `Circle` and the
+        // positional `Pair` accept positional args, so they keep bare placeholders.
+        let rect = find("Rect").expect("Rect offered");
+        assert_eq!(rect.detail.as_deref(), Some("(w: float, h: float)"));
+        assert_eq!(rect.insert_text.as_deref(), Some("Rect(w: ${1:float}, h: ${2:float})"));
+
+        let pair = find("Pair").expect("Pair offered");
+        assert_eq!(pair.detail.as_deref(), Some("(int, int)"));
+        assert_eq!(pair.insert_text.as_deref(), Some("Pair(${1:int}, ${2:int})"));
+
+        let point = find("Point").expect("Point offered");
+        assert!(point.detail.is_none(), "unit variant has no signature detail");
+        assert!(point.insert_text.is_none(), "unit variant is a plain insert");
     }
 
     #[test]

@@ -43,6 +43,8 @@ pub enum SyntaxKind {
     MapExpr,
     MapEntry,
     SpreadElem,
+    /// ADT §3.2: a named call argument `name: expr` (enum-variant construction).
+    NamedArg,
     TemplateExpr,
     OptMemberExpr,
     TryExpr,
@@ -58,6 +60,9 @@ pub enum SyntaxKind {
     ContinueStmt,
     EnumDecl,
     EnumVariant,
+    /// ADT: one declared payload field of an enum variant (`radius: float` /
+    /// positional `int`). Children: an optional name `Ident` + `:`, then a type node.
+    VariantField,
     ClassDecl,
     FieldDecl,
     MethodDecl,
@@ -82,6 +87,12 @@ pub enum SyntaxKind {
     ObjPatEntry,
     OrPat,
     PatRest,
+    /// ADT: a variant-destructuring pattern (`Circle(r)` / `Shape.Circle(r)` /
+    /// `Rect(w: ww)`). Children: the variant-ref (name or member) + a paren list of
+    /// sub-patterns (positional) or `VariantPatField` entries (named).
+    VariantPat,
+    /// ADT: one named field entry of a `VariantPat` (`w: ww` or shorthand `w`).
+    VariantPatField,
     // types
     NamedType,
     GenericType,

@@ -31,8 +31,14 @@
 //!   traced: the GC must never reach into a native resource, because those rely
 //!   on deterministic `Drop` to reclaim fds. Tracing them would risk the
 //!   collector deferring/altering that drop.
-//! - **`Regex`/`Enum`/`EnumVariant`/`Class`** are immutable / acyclic in
-//!   practice and likewise stay on `Rc`.
+//! - **`Regex`/`Enum`/`Class`** are immutable / acyclic in practice and stay on
+//!   `Rc`.
+//! - **`EnumVariant`** keeps its `Rc` WRAPPER (ADT §5.3 — unit-variant construction
+//!   is registration-free, identity-preserving), but a `Some(payload)` is TRACED
+//!   into: a payload can hold cycle-capable containers (a recursive enum like
+//!   `Json::Arr(array<Json>)` can self-reference), so `EnumVariant::trace` reaches
+//!   the payload's values. A unit variant (`payload: None`) traces only its scalar
+//!   backing — no cyclic edge.
 //! - **`Future`/`Generator`** own spawned-task / coroutine state behind their
 //!   own handles (`task.rs` / `coro.rs`); they are identity-equal opaque
 //!   handles, not `Value` containers, so they are no-op here.
@@ -190,6 +196,14 @@ impl Trace for Value {
             Value::Set(s) => s.trace(tracer),
             Value::Instance(i) => i.trace(tracer),
             Value::Closure(c) => c.trace(tracer),
+            // ADT §5.3: the `EnumVariant` WRAPPER stays on `Rc` (unit-variant
+            // construction is registration-free), but a `Some(payload)` can hold
+            // cycle-capable containers (a recursive enum like `Json::Arr(array<Json>)`
+            // self-references), so the collector must reach the payload's values.
+            // NOTE: `Rc<T>: Trace` is gcmodule's ACYCLIC no-op (it does NOT delegate
+            // to `T::trace`), so we deref to call `EnumVariant::trace` explicitly,
+            // reaching the payload's `Cc` container (the actual cycle node).
+            Value::EnumVariant(v) => (**v).trace(tracer),
             // NOTE on `Function`: a tree-walker `Function` captures an
             // `Environment` (its own `Rc<RefCell<Scope>>` graph), which is NOT
             // one of the cycle-capable Value containers migrated in V13-T2 (see
@@ -223,6 +237,30 @@ impl Trace for ObjectCell {
         // is safe). `shape: Cell<u32>` and `frozen: Cell<bool>` are acyclic.
         if let Ok(map) = self.map.try_borrow() {
             trace_index_map(&map, tracer);
+        }
+    }
+
+    fn is_type_tracked() -> bool {
+        true
+    }
+}
+
+/// ADT §5.3: `EnumVariant` keeps its `Rc` wrapper, but the cycle-capable PAYLOAD
+/// must be traced (a recursive enum payload can self-reference). The backing
+/// `value` scalar is also traced for uniformity (it is acyclic in practice). A
+/// unit variant has `payload: None` → only the scalar is visited (no cyclic edge).
+impl Trace for crate::value::EnumVariant {
+    fn trace(&self, tracer: &mut Tracer) {
+        use crate::value::Payload;
+        self.value.trace(tracer);
+        // The payload's `Cc` container is the cycle-capable node: tracing it lets
+        // the collector reach (and reclaim) a recursive enum payload. (A plain `Rc`
+        // or `Vec` here would be INVISIBLE to the collector — gcmodule only tracks
+        // `Cc` nodes — so the payload MUST be `Cc`-managed, as it is.)
+        match &self.payload {
+            Some(Payload::Positional(a)) => a.trace(tracer),
+            Some(Payload::Named(o)) => o.trace(tracer),
+            None => {}
         }
     }
 
@@ -504,6 +542,43 @@ mod tests {
         assert_eq!(
             after, before,
             "tracked-object count must return to baseline after reclaiming the cycle"
+        );
+    }
+
+    #[test]
+    fn adt_collect_reclaims_a_recursive_enum_payload_cycle() {
+        // ADT §5.3: a payload-carrying `EnumVariant` whose positional payload holds
+        // an array that contains the variant itself forms a cycle THROUGH the payload
+        // (`Json::Arr([self])`). The new `EnumVariant::trace` must reach the payload's
+        // values, or the cycle leaks. This guards that `Trace` edge.
+        super::collect();
+        let before = gcmodule::count_thread_tracked();
+
+        // arr = []; v = Json.Arr([arr-payload]); arr.push(v)  → arr ⇄ v cycle.
+        let arr = crate::value::ArrayCell::new(Vec::new());
+        let v = Value::EnumVariant(std::rc::Rc::new(crate::value::EnumVariant {
+            enum_name: "Json".to_string(),
+            name: "Arr".to_string(),
+            value: Value::Nil,
+            payload: Some(crate::value::Payload::Positional(
+                crate::value::ArrayCell::new(vec![Value::Array(arr.clone())]),
+            )),
+            ctor: false,
+            def: None,
+        }));
+        arr.borrow_mut().push(v.clone());
+        drop(v);
+        drop(arr);
+
+        let reclaimed = super::collect();
+        assert!(
+            reclaimed >= 1,
+            "cycle collection must reclaim the recursive enum payload (got {reclaimed})"
+        );
+        let after = gcmodule::count_thread_tracked();
+        assert_eq!(
+            after, before,
+            "tracked-object count must return to baseline after reclaiming the enum-payload cycle"
         );
     }
 

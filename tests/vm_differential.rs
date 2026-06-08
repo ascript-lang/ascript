@@ -4759,6 +4759,69 @@ async fn vm_match_no_arm_panics_identically() {
 }
 
 #[tokio::test]
+async fn vm_adt_named_variant_construction() {
+    // ADT §3.2: named-field variant construction must be byte-identical on the
+    // tree-walker and the VM (the VM routes through the new CALL_NAMED opcode →
+    // `construct_variant_args`; the tree-walker through `call_value_named`).
+    let enum_decl =
+        "enum Shape { Circle(radius: float), Rect(w: float, h: float), Pair(int, int), Point }\n";
+    let bodies = [
+        // Order-independent named construction + structural equality.
+        "let a = Shape.Rect(w: 3.0, h: 4.0)\nlet b = Shape.Rect(h: 4.0, w: 3.0)\n\
+         print(a.value); print(b.value); print(a == b); print(a.w); print(a.h)",
+        // Single named field: positional convenience and named both work + equal.
+        "print(Shape.Circle(2.0).radius); print(Shape.Circle(radius: 2.0).radius); \
+         print(Shape.Circle(2.0) == Shape.Circle(radius: 2.0))",
+        // First-class constructor accepts named args.
+        "let mk = Shape.Rect\nprint(mk(h: 2.0, w: 1.0).value)",
+        // Positional variant still positional-only.
+        "print(Shape.Pair(3, 4).value)",
+        // Error parity: multi-named called positionally.
+        "print(Shape.Rect(3.0, 4.0))",
+        // Error parity: unknown / missing / duplicate / named-on-positional.
+        "print(Shape.Rect(w: 1.0, z: 2.0))",
+        "print(Shape.Rect(w: 1.0))",
+        "print(Shape.Rect(w: 1.0, w: 2.0))",
+        "print(Shape.Pair(a: 1, b: 2))",
+        // Error parity: named field type mismatch.
+        "print(Shape.Rect(w: \"x\", h: 2.0))",
+        // Error parity (Gate 1 byte-identity, reviewer finding): MIXED spread + named
+        // args reach the SAME runtime "all named or all positional, not mixed" panic
+        // on BOTH engines — it must NOT be a VM compile-time rejection (the tree-walker
+        // reaches it at runtime, so it must be recoverable + dead-code-safe).
+        "print(Shape.Rect(w: 1.0, ...[2.0]))",
+        "print(Shape.Rect(...[1.0], h: 2.0))",
+        // A non-array spread mixed with a named arg: the spread error wins (it is
+        // evaluated during arg collection, before the mixed/validate check).
+        "print(Shape.Rect(w: 1.0, ...5))",
+        // `recover()` catches the mixed-args panic identically on both engines.
+        "print(recover(() => Shape.Rect(w: 1.0, ...[2.0])))",
+        // DEAD/uncalled code with spread+named must COMPILE and run fine on BOTH
+        // engines (it is never executed, so no panic) — proving the VM does not
+        // reject it at compile time.
+        "fn dead() { return Shape.Rect(w: 1.0, ...[2.0]) }\nprint(\"alive\")",
+    ];
+    for body in bodies {
+        let src = format!("{enum_decl}{body}");
+        assert_vm_match_parity(&src).await;
+        // Also assert the generic (no-specialize) VM agrees.
+        let generic = ascript::vm_run_source_generic(&src).await;
+        let special = ascript::vm_run_source(&src).await;
+        match (generic, special) {
+            (Ok((g, gc)), Ok((s, sc))) => {
+                assert_eq!(g, s, "generic vs specialized stdout diverged for `{src}`");
+                assert_eq!(gc, sc, "generic vs specialized exit diverged for `{src}`");
+            }
+            (Err(g), Err(s)) => assert_eq!(
+                g.message, s.message,
+                "generic vs specialized panic diverged for `{src}`"
+            ),
+            (g, s) => panic!("generic/specialized shape diverged for `{src}`\n g:{g:?}\n s:{s:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn vm_match_enum_variant_patterns() {
     // Enum-variant patterns are `LiteralPat`s holding a member expr (`Shape.Circle`)
     // → a value compare against the resolved variant value.

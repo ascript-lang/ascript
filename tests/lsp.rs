@@ -1333,6 +1333,89 @@ fn lsp_offers_worker_completion() {
     let _ = client.wait_for_exit(Duration::from_secs(10));
 }
 
+/// ADT Task 13: end-to-end LSP for payload enums — hover on a payload variant
+/// shows its declared signature, and completion after `Shape.` offers the variants
+/// (the payload variant with a snippet insert + signature detail).
+#[test]
+fn lsp_adt_variant_hover_and_completion() {
+    let overall = Instant::now() + Duration::from_secs(60);
+    let mut client = LspClient::spawn();
+    client.request(
+        1,
+        "initialize",
+        json!({ "processId": null, "rootUri": null, "capabilities": {} }),
+    );
+    let _ = client.read_response(1, overall);
+    client.notify("initialized", json!({}));
+
+    let uri = "ascript-test://adt.as";
+    // line 0: enum Shape {
+    // line 1:   Circle(radius: float),
+    // line 2:   Point,
+    // line 3: }
+    // line 4: Shape.
+    let text = "enum Shape {\n  Circle(radius: float),\n  Point,\n}\nShape.\n";
+    client.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": { "uri": uri, "languageId": "ascript", "version": 1, "text": text }
+        }),
+    );
+    let _ = client.read_notification("textDocument/publishDiagnostics", overall);
+
+    // Hover on `Circle` in the declaration (line 1, char 2).
+    client.request(
+        2,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 1, "character": 2 }
+        }),
+    );
+    let hover_resp = client.read_response(2, overall);
+    let content = hover_resp["result"]["contents"]["value"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        content.contains("Shape.Circle(radius: float)"),
+        "variant hover must show the payload signature; got: {content:?}"
+    );
+
+    // Completion after `Shape.` (line 4, char 6 — just past the dot).
+    client.request(
+        3,
+        "textDocument/completion",
+        json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 4, "character": 6 }
+        }),
+    );
+    let comp_resp = client.read_response(3, overall);
+    let items = comp_resp["result"]
+        .as_array()
+        .expect("completion array result");
+    let circle = items
+        .iter()
+        .find(|i| i["label"].as_str() == Some("Circle"))
+        .expect("Circle variant offered after Shape.");
+    assert_eq!(
+        circle["detail"].as_str(),
+        Some("(radius: float)"),
+        "payload variant completion carries a signature detail; got: {circle}"
+    );
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(
+        labels.contains(&"Point"),
+        "unit variant Point must be offered; got: {labels:?}"
+    );
+
+    client.request_no_params(99, "shutdown");
+    let _ = client.read_response(99, overall);
+    client.notify_no_params("exit");
+    client.close_stdin();
+    let _ = client.wait_for_exit(Duration::from_secs(10));
+}
+
 /// Task 12 Step 1c: hovering the name of a `worker fn` declaration (or a call
 /// to it) mentions "worker" and "future" in the hover response, reflecting that
 /// calls return `future<T>`.

@@ -1332,6 +1332,213 @@ impl Vm {
                     }
                 }
 
+                Op::CallNamed => {
+                    // ADT §3.2: a call carrying NAMED arguments. Two operands: a u16
+                    // names-array const index then a u8 argc. The stack is
+                    // `[..., callee, v0, .., v{argc-1}]` (values in source order). The
+                    // names array (`consts[idx]`, length argc) pairs each value with a
+                    // `Str` field name or `Nil` (positional). The only valid callee is
+                    // an enum-variant constructor → `construct_variant_args`, byte-
+                    // identical to the tree-walker's `call_value_named`. AWAIT
+                    // DISCIPLINE: pop values + callee into owned locals first; read the
+                    // names const into an owned `Vec` before the await; hold no `fiber`
+                    // borrow across the suspension point.
+                    let names_idx =
+                        fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let argc = fiber.frame().closure.proto.chunk.read_u8(operand_at + 2) as usize;
+                    let names: Vec<Option<Rc<str>>> = match &fiber
+                        .frame()
+                        .closure
+                        .proto
+                        .chunk
+                        .consts[names_idx]
+                    {
+                        Value::Array(a) => a
+                            .borrow()
+                            .iter()
+                            .map(|v| match v {
+                                Value::Str(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CALL_NAMED names operand is not an array: {other:?}"),
+                            ))
+                        }
+                    };
+                    let mut args = vec![Value::Nil; argc];
+                    for slot in args.iter_mut().rev() {
+                        *slot = fiber.pop();
+                    }
+                    let callee = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let result = match callee {
+                        Value::EnumVariant(ev) => {
+                            self.interp
+                                .construct_variant_args(&ev, args, &names, span)
+                                .await?
+                        }
+                        other => {
+                            return Err(Control::Panic(crate::error::AsError::at(
+                                format!(
+                                    "named arguments are only valid for enum-variant \
+                                     construction, not for {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                                span,
+                            )))
+                        }
+                    };
+                    fiber.push(result);
+                }
+
+                Op::AppendNamedArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
+                    // `argsArray` (peek 1) and push the field name `consts[idx]` (a
+                    // `Str`) onto `namesArray` (peek 0).
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let name = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => Value::Str(s.clone()),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("APPEND_NAMED_ARG name operand is not a string: {other:?}"),
+                            ))
+                        }
+                    };
+                    let value = fiber.pop();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().push(value);
+                            names.borrow_mut().push(name);
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_NAMED_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendPosArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, value]`: pop `value`, push it onto
+                    // `argsArray` and push `Nil` onto `namesArray` (a positional value).
+                    let value = fiber.pop();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().push(value);
+                            names.borrow_mut().push(Value::Nil);
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_POS_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                Op::AppendSpreadArg => {
+                    // ADT §3.2 (spread+named lockstep builder). Stack
+                    // `[..., argsArray, namesArray, operand]`: pop `operand` (MUST be an
+                    // Array — else the SAME `can only spread an array as call arguments`
+                    // panic the positional path produces), extend `argsArray` with its
+                    // elements and push `Nil` ONCE PER element onto `namesArray`.
+                    let operand = fiber.pop();
+                    let items: Vec<Value> = match operand {
+                        Value::Array(src) => src.borrow().iter().cloned().collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!(
+                                    "can only spread an array as call arguments, got {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                            ))
+                        }
+                    };
+                    let n = items.len();
+                    match (fiber.peek(1), fiber.peek(0)) {
+                        (Value::Array(args), Value::Array(names)) => {
+                            args.borrow_mut().extend(items);
+                            names.borrow_mut().extend(std::iter::repeat_n(Value::Nil, n));
+                        }
+                        _ => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                "APPEND_SPREAD_ARG builder targets are not both arrays".to_string(),
+                            ))
+                        }
+                    }
+                }
+
+                Op::CallNamedSpread => {
+                    // ADT §3.2: the dynamic-arity named call (spread+named). Stack
+                    // `[..., callee, argsArray, namesArray]`. Pop both arrays + the
+                    // callee, then dispatch EXACTLY like CALL_NAMED →
+                    // `construct_variant_args` (byte-identical to the tree-walker's
+                    // `call_value_named`). AWAIT DISCIPLINE: pull args + names into owned
+                    // Vecs before the await; hold no `fiber` borrow across it.
+                    let names: Vec<Option<Rc<str>>> = match fiber.pop() {
+                        Value::Array(a) => a
+                            .borrow()
+                            .iter()
+                            .map(|v| match v {
+                                Value::Str(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CALL_NAMED_SPREAD names is not an array: {other:?}"),
+                            ))
+                        }
+                    };
+                    let args: Vec<Value> = match fiber.pop() {
+                        Value::Array(a) => a.borrow().iter().cloned().collect(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("CALL_NAMED_SPREAD args is not an array: {other:?}"),
+                            ))
+                        }
+                    };
+                    let callee = fiber.pop();
+                    let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
+                    let result = match callee {
+                        Value::EnumVariant(ev) => {
+                            self.interp
+                                .construct_variant_args(&ev, args, &names, span)
+                                .await?
+                        }
+                        other => {
+                            return Err(Control::Panic(crate::error::AsError::at(
+                                format!(
+                                    "named arguments are only valid for enum-variant \
+                                     construction, not for {}",
+                                    crate::interp::type_name(&other)
+                                ),
+                                span,
+                            )))
+                        }
+                    };
+                    fiber.push(result);
+                }
+
                 Op::CallMethod => {
                     // A method call `recv.<name>(args)`. Mirrors the tree-walker's
                     // `eval_chain` Call arm for a `Member` callee: the schema
@@ -2396,6 +2603,142 @@ impl Vm {
                         _ => false,
                     };
                     fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchVariant => {
+                    // ADT: `subject -- ok:bool`. Pop the subject; push whether it is a
+                    // CONSTRUCTED `EnumVariant` (payload present, not a constructor)
+                    // matching the variant name (and enum name, if the const carries
+                    // one). The const is `[variantName:Str, enumNameOrNil]`. Mirrors the
+                    // head tag-test of the tree-walker's `match_variant_pattern`.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let (want_variant, want_enum) =
+                        match &fiber.frame().closure.proto.chunk.consts[idx] {
+                            Value::Array(a) => {
+                                let b = a.borrow();
+                                let v = match b.first() {
+                                    Some(Value::Str(s)) => s.clone(),
+                                    _ => {
+                                        return Err(self.panic_at(
+                                            fiber,
+                                            fault_ip,
+                                            "MATCH_VARIANT operand[0] is not a string".to_string(),
+                                        ))
+                                    }
+                                };
+                                let e = match b.get(1) {
+                                    Some(Value::Str(s)) => Some(s.clone()),
+                                    _ => None,
+                                };
+                                (v, e)
+                            }
+                            other => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!("MATCH_VARIANT operand is not an array: {other:?}"),
+                                ))
+                            }
+                        };
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::EnumVariant(ev) if ev.payload.is_some() => {
+                            ev.name.as_str() == want_variant.as_ref()
+                                && want_enum
+                                    .as_ref()
+                                    .map(|e| ev.enum_name.as_str() == e.as_ref())
+                                    .unwrap_or(true)
+                        }
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::MatchVariantArity => {
+                    // ADT: `subject -- ok:bool`. Pop the subject; push whether its
+                    // payload has exactly `n` values. Mirrors the positional length
+                    // guard `items.len() != pats.len()`.
+                    let n = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let subject = fiber.pop();
+                    let len = variant_payload_len(&subject);
+                    fiber.push(Value::Bool(len == Some(n)));
+                }
+
+                Op::MatchVariantHasField => {
+                    // ADT: `subject -- ok:bool`. Pop the subject; push whether it has a
+                    // NAMED payload field `consts[idx]`. Mirrors the named-destructure
+                    // presence check.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("MATCH_VARIANT_HAS_FIELD operand is not a string: {other:?}"),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let ok = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Named(o)) => {
+                                o.borrow().contains_key(key.as_ref())
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    fiber.push(Value::Bool(ok));
+                }
+
+                Op::VariantElem => {
+                    // ADT: `subject -- value`. Pop a constructed variant; push its
+                    // `idx`-th payload value IN DECLARATION ORDER (positional element,
+                    // or named field value in insertion order). Mirrors the tree-walker
+                    // positional destructure.
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let subject = fiber.pop();
+                    let v = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Positional(a)) => {
+                                a.borrow().get(idx).cloned().unwrap_or(Value::Nil)
+                            }
+                            Some(crate::value::Payload::Named(o)) => {
+                                o.borrow().get_index(idx).map(|(_, v)| v.clone()).unwrap_or(Value::Nil)
+                            }
+                            None => Value::Nil,
+                        },
+                        _ => Value::Nil,
+                    };
+                    fiber.push(v);
+                }
+
+                Op::VariantField => {
+                    // ADT: `subject -- value`. Pop a constructed variant; push its
+                    // NAMED payload field `consts[idx]` (presence already checked).
+                    let idx = fiber.frame().closure.proto.chunk.read_u16(operand_at) as usize;
+                    let key = match &fiber.frame().closure.proto.chunk.consts[idx] {
+                        Value::Str(s) => s.clone(),
+                        other => {
+                            return Err(self.panic_at(
+                                fiber,
+                                fault_ip,
+                                format!("VARIANT_FIELD operand is not a string: {other:?}"),
+                            ))
+                        }
+                    };
+                    let subject = fiber.pop();
+                    let v = match &subject {
+                        Value::EnumVariant(ev) => match &ev.payload {
+                            Some(crate::value::Payload::Named(o)) => {
+                                o.borrow().get(key.as_ref()).cloned().unwrap_or(Value::Nil)
+                            }
+                            _ => Value::Nil,
+                        },
+                        _ => Value::Nil,
+                    };
+                    fiber.push(v);
                 }
 
                 Op::MatchRange => {
@@ -4348,6 +4691,20 @@ impl Vm {
         self.leave_frame_depth();
         fiber.push(value);
         Ok(None)
+    }
+}
+
+/// ADT: the number of payload values a constructed variant carries (positional →
+/// element count; named → field count), or `None` if `v` is not a constructed
+/// variant. Used by `MATCH_VARIANT_ARITY` (the positional length guard).
+fn variant_payload_len(v: &Value) -> Option<usize> {
+    match v {
+        Value::EnumVariant(ev) => match &ev.payload {
+            Some(crate::value::Payload::Positional(a)) => Some(a.borrow().len()),
+            Some(crate::value::Payload::Named(o)) => Some(o.borrow().len()),
+            None => None,
+        },
+        _ => None,
     }
 }
 

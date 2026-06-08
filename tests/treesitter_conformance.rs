@@ -281,6 +281,39 @@ fn treesitter_parses_worker_class_and_worker_generator() {
 }
 
 #[test]
+fn treesitter_parses_adt_payload_enums_and_variant_patterns() {
+    // ADT (Task 5): payload variant declarations (named/positional) and variant
+    // destructuring patterns (positional via call-recovery, named via variant_pattern)
+    // must parse without an ERROR node on the tree-sitter grammar.
+    for src in [
+        // Payload declarations.
+        "enum Shape { Circle(radius: float), Rect(w: float, h: float), Pair(int, int), Point }",
+        "enum Status { Active, Inactive = 0, Pending = 1 }",
+        "enum Json { Null, Bool(value: bool), Arr(items: array<Json>) }",
+        // Positional variant patterns (ride call_expression).
+        "fn f(s) { return match s { Circle(r) => r, Pair(a, b) => a, Point => 0 } }",
+        "fn f(s) { return match s { Shape.Circle(r) => r, _ => 0 } }",
+        // Named variant patterns (variant_pattern node).
+        "fn f(s) { return match s { Rect(w: ww, h: hh) => ww, _ => 0 } }",
+        "fn f(s) { return match s { Shape.Rect(w: a, h: b) => a, _ => 0 } }",
+        // Nested + guard + or-pattern.
+        "fn f(s) { return match s { Circle(0.0) => 1, Pair(a, b) if a == b => 2, Circle(_) | Rect(_, _) => 3, _ => 0 } }",
+        // ADT §3.2: named call arguments for variant construction (named_argument node).
+        "let r = Shape.Rect(w: 3.0, h: 4.0)",
+        "let r = Shape.Rect(h: 4.0, w: 3.0)",
+        "let c = Shape.Circle(radius: 2.0)",
+        "let r = Shape.Rect(w: 1.0 + 2.0, h: g(3.0))",
+        "let mk = Shape.Rect\nlet r = mk(w: 1.0, h: 2.0)",
+        // Named args must not disturb positional / spread calls or ternaries.
+        "f(1, 2, 3)",
+        "f(...xs, 1)",
+        "let z = cond ? a : b",
+    ] {
+        assert!(!parse_has_error(src), "tree-sitter ERROR node in: {src}");
+    }
+}
+
+#[test]
 fn interpreter_parser_accepts_all_examples() {
     let mut failures = Vec::new();
     for path in example_files() {
