@@ -43,7 +43,7 @@ use crate::ast::{
 use crate::span::Span;
 use crate::syntax::resolve::types::UpvalueDescriptor;
 use crate::value::{Class, FieldSchema, Value};
-use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc};
+use crate::vm::chunk::{Chunk, ClassProto, FnProto, ImportDesc, InterfaceProto};
 use std::rc::Rc;
 
 /// The `.aso` file magic: `ASO\0`.
@@ -137,7 +137,15 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   `AppendNamedArg`/`AppendPosArg`/`AppendSpreadArg`/`CallNamedSpread`), appended at
 ///   the END so existing byte values are unchanged, plus a new `EL_NAMED` call-arg tag
 ///   in the const-folded field-default expr stream. Old readers must reject a v24 chunk.
-pub const ASO_FORMAT_VERSION: u32 = 24;
+/// - **v25 (IFACE):** structural interfaces. Each chunk gained an `interface_protos`
+///   section (a length-prefixed list of `InterfaceProto`s — name + own method
+///   requirements `(name, arity, has_rest)` + `extends` parent NAMES, the UNFLATTENED
+///   form; flatten stays lazy at load) written after `class_protos`, plus one appended
+///   opcode (`DefineInterface`, a u16 `interface_protos` index; appended at the END so
+///   existing byte values are unchanged). A non-interface program writes a `len(0)`
+///   prefix, so its layout is otherwise identical to v24. Old readers must reject a v25
+///   chunk. (Bumped by reading the ADT-left v24 and adding one.)
+pub const ASO_FORMAT_VERSION: u32 = 25;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -165,11 +173,6 @@ pub enum AsoError {
     /// compiler invariant violation (the pool must hold only literal scalars +
     /// prebuilt enums). Carries a short description of the offending kind.
     NonLiteralConst(&'static str),
-    /// A surface form that is VALID but whose `.aso` serialization is not yet implemented
-    /// was encountered during ENCODING. Unlike `NonLiteralConst` this is NOT a compiler
-    /// bug — it's an intentional, clearly-messaged boundary (e.g. interface programs until
-    /// IFACE Task 9). Carries a user-facing description.
-    Unsupported(&'static str),
     /// A field exceeded the `.aso` wire-format capacity during ENCODING (SP3 §A):
     /// a single string/bytes literal > `u32::MAX` bytes (`what = "byte field"`), or
     /// a serialized collection with > `u32::MAX` entries (`what = "collection"`).
@@ -196,9 +199,6 @@ impl std::fmt::Display for AsoError {
             AsoError::TrailingBytes => write!(f, "trailing bytes after .aso chunk"),
             AsoError::NonLiteralConst(kind) => {
                 write!(f, "non-literal value ({kind}) in constant pool (compiler bug)")
-            }
-            AsoError::Unsupported(what) => {
-                write!(f, "cannot serialize to .aso yet: {what}")
             }
             AsoError::TooLarge { what, .. } => match *what {
                 "byte field" => write!(
@@ -604,15 +604,14 @@ fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
     for cp in &c.class_protos {
         write_class_proto(w, cp)?;
     }
-    // IFACE: interface descriptors are NOT yet serialized to `.aso` (Task 9 adds the
-    // Interface constant + version bump). Until then a program that declares an
-    // interface is rejected with a CLEAN error here rather than silently dropping the
-    // `interface_protos` (which would crash `Op::DefineInterface` on load). Empty for
-    // every non-interface program (the common case), so `.aso` round-trips unchanged.
-    if !c.interface_protos.is_empty() {
-        return Err(AsoError::Unsupported(
-            "programs that declare an interface (lands in IFACE Task 9)",
-        ));
+    // IFACE: interface descriptors (`Op::DefineInterface` operands). Serialize the
+    // UNFLATTENED form — name + own method requirements + `extends` NAMES; the
+    // transitive flatten stays lazy at load (the `extends` targets reload as
+    // module-globals). Empty for every non-interface program, so a non-interface
+    // `.aso` is byte-identical to v24's layout (a `len(0)` prefix).
+    w.len(c.interface_protos.len());
+    for ip in &c.interface_protos {
+        write_interface_proto(w, ip);
     }
     // imports
     w.len(c.imports.len());
@@ -670,6 +669,12 @@ fn read_chunk(r: &mut Reader) -> Result<Chunk, AsoError> {
     c.class_protos.reserve(n.min(r.remaining()));
     for _ in 0..n {
         c.class_protos.push(Rc::new(read_class_proto(r)?));
+    }
+    // interface_protos (IFACE, v25+)
+    let n = r.len()?;
+    c.interface_protos.reserve(n.min(r.remaining()));
+    for _ in 0..n {
+        c.interface_protos.push(Rc::new(read_interface_proto(r)?));
     }
     // imports
     let n = r.len()?;
@@ -1609,6 +1614,53 @@ fn read_class_proto(r: &mut Reader) -> Result<ClassProto, AsoError> {
     })
 }
 
+// ---- InterfaceProto (IFACE, v25+) --------------------------------------------
+
+/// Serialize an `InterfaceProto` (an `Op::DefineInterface` operand): the UNFLATTENED
+/// descriptor — `name`, own method requirements `(name, arity, has_rest)`, and the
+/// `extends` parent NAMES. The transitive flatten is rebuilt lazily on load (the
+/// `extends` targets reload as their own module-globals), so nothing is pre-resolved
+/// here. No `Value` edges, so it never recurses into `write_value`.
+fn write_interface_proto(w: &mut Writer, ip: &InterfaceProto) {
+    w.str(&ip.name);
+    w.len(ip.methods.len());
+    for (name, arity, has_rest) in &ip.methods {
+        w.str(name);
+        w.usize(*arity);
+        w.u8(u8::from(*has_rest));
+    }
+    w.len(ip.extends.len());
+    for parent in &ip.extends {
+        w.str(parent);
+    }
+}
+
+/// Decode an `InterfaceProto`. Every attacker-controlled count clamps its preallocation
+/// to the bytes that remain (`n.min(r.remaining())`, the SP3 unbounded-`reserve` guard),
+/// so a truncated/malformed interface constant yields a clean `AsoError` (a short read
+/// inside the loop), never a panic or an OOM `with_capacity`.
+fn read_interface_proto(r: &mut Reader) -> Result<InterfaceProto, AsoError> {
+    let name = r.str()?;
+    let n = r.len()?;
+    let mut methods: Vec<(String, usize, bool)> = Vec::with_capacity(n.min(r.remaining()));
+    for _ in 0..n {
+        let mname = r.str()?;
+        let arity = r.usize()?;
+        let has_rest = r.u8()? != 0;
+        methods.push((mname, arity, has_rest));
+    }
+    let n = r.len()?;
+    let mut extends: Vec<String> = Vec::with_capacity(n.min(r.remaining()));
+    for _ in 0..n {
+        extends.push(r.str()?);
+    }
+    Ok(InterfaceProto {
+        name,
+        methods,
+        extends,
+    })
+}
+
 fn write_class(
     w: &mut Writer,
     c: &Class,
@@ -2209,11 +2261,10 @@ run()
 
         // A stale-version copy of these very bytes is rejected (never run).
         let mut stale = bytes.clone();
-        stale[4] = stale[4].wrapping_sub(1); // → v21, the pre-CHECK_LOCAL format
+        stale[4] = stale[4].wrapping_sub(1); // one format version older than the current build
         match Chunk::from_bytes(&stale) {
             Err(AsoError::VersionMismatch { found, expected }) => {
                 assert_eq!(expected, ASO_FORMAT_VERSION);
-                assert_eq!(expected, 24);
                 assert_ne!(found, ASO_FORMAT_VERSION);
             }
             other => panic!("expected VersionMismatch for a stale CHECK_LOCAL .aso, got {other:?}"),
@@ -2311,6 +2362,73 @@ run()
             Chunk::from_bytes(&[0, 1]),
             Err(AsoError::Truncated)
         ));
+    }
+
+    #[test]
+    fn interface_program_round_trips() {
+        // IFACE (Task 9): a program declaring interfaces (incl. `extends` composition)
+        // and using `instanceof Interface` round-trips through the .aso writer/reader
+        // byte-stably and produces identical output before and after.
+        let src = "interface Reader { fn read(b): int }\n\
+                   interface Writer { fn write(b): int }\n\
+                   interface ReadWriter extends Reader, Writer {}\n\
+                   class Conn {\n\
+                     fn read(b) { return 1 }\n\
+                     fn write(b) { return 1 }\n\
+                   }\n\
+                   let c = Conn()\n\
+                   print(c instanceof Reader)\n\
+                   print(c instanceof ReadWriter)\n\
+                   print(5 instanceof Reader)\n";
+        let original = compile(src);
+        let bytes = original.to_bytes().expect("serialize interface program");
+        let back = Chunk::from_bytes(&bytes).expect("a valid v25 .aso must decode");
+        assert_eq!(
+            disasm(&original),
+            disasm(&back),
+            "interface chunk must round-trip byte-stably"
+        );
+        assert_eq!(
+            run_chunk(original),
+            run_chunk(back),
+            "output must be identical after the interface .aso round-trip"
+        );
+    }
+
+    #[test]
+    fn malformed_interface_proto_clamps_and_errors() {
+        // IFACE Gate 0 (SP3 hardening): a malformed/truncated interface constant — an
+        // attacker-controlled method-count far larger than the bytes that remain — must
+        // return a clean `AsoError` (a short read), NEVER panic or OOM via an unbounded
+        // `with_capacity`. We craft the `write_interface_proto` byte layout by hand and
+        // hand it to the reader directly.
+        // Layout: str(name) = u32 len + bytes; then len(methods) = u32; then methods…
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // name length = 1
+        buf.push(b'R'); // name = "R"
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // method count = ~4 billion
+        // …and then NOTHING (the stream ends). The clamp makes the preallocation
+        // bounded by `remaining()` (0) and the per-element loop hits a short read.
+        let mut r = Reader::new(&buf);
+        let result = read_interface_proto(&mut r);
+        assert!(
+            matches!(result, Err(AsoError::Truncated) | Err(AsoError::Overflow)),
+            "a malformed interface proto must be a clean error, got {result:?}"
+        );
+
+        // A huge `extends` count after a valid (empty) method set must also clamp.
+        let mut buf2: Vec<u8> = Vec::new();
+        buf2.extend_from_slice(&1u32.to_le_bytes()); // name length = 1
+        buf2.push(b'R');
+        buf2.extend_from_slice(&0u32.to_le_bytes()); // 0 methods
+        buf2.extend_from_slice(&u32::MAX.to_le_bytes()); // extends count = ~4 billion
+        // …stream ends.
+        let mut r2 = Reader::new(&buf2);
+        let result2 = read_interface_proto(&mut r2);
+        assert!(
+            matches!(result2, Err(AsoError::Truncated) | Err(AsoError::Overflow)),
+            "a malformed extends list must be a clean error, got {result2:?}"
+        );
     }
 
     #[test]

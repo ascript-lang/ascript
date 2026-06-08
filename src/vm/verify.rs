@@ -74,6 +74,9 @@ pub enum VerifyError {
     /// Control flow can fall off the end of the code stream (no terminating
     /// `RETURN`/`JUMP`/… at the tail of a reachable path).
     FallsOffEnd { offset: usize },
+    /// An `Op::DefineInterface` references an `InterfaceProto` whose method-requirement
+    /// set is malformed (an empty or duplicate requirement name). `what` describes it.
+    BadInterface { offset: usize, what: &'static str },
 }
 
 impl std::fmt::Display for VerifyError {
@@ -129,6 +132,9 @@ impl std::fmt::Display for VerifyError {
                     f,
                     "control flow falls off the end of code (last op at {offset})"
                 )
+            }
+            VerifyError::BadInterface { offset, what } => {
+                write!(f, "{what} at offset {offset}")
             }
         }
     }
@@ -489,6 +495,37 @@ fn check_operands(
                     index: idx,
                     len: chunk.class_protos.len(),
                 });
+            }
+        }
+
+        // ---- DEFINE_INTERFACE: u16 interface-proto-table index (IFACE) ----
+        DefineInterface => {
+            let idx = chunk.read_u16(operand_at) as usize;
+            let proto = chunk.interface_protos.get(idx).ok_or(
+                VerifyError::OperandOutOfRange {
+                    offset: off,
+                    kind: "interface_proto",
+                    index: idx,
+                    len: chunk.interface_protos.len(),
+                },
+            )?;
+            // Method-set well-formedness: every requirement name non-empty and unique
+            // (a malformed `.aso` with a duplicate/blank requirement is rejected before
+            // it can build a corrupt descriptor at `Op::DefineInterface`).
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (mname, _, _) in &proto.methods {
+                if mname.is_empty() {
+                    return Err(VerifyError::BadInterface {
+                        offset: off,
+                        what: "an interface method requirement has an empty name",
+                    });
+                }
+                if !seen.insert(mname.as_str()) {
+                    return Err(VerifyError::BadInterface {
+                        offset: off,
+                        what: "an interface declares a duplicate method requirement",
+                    });
+                }
             }
         }
 
