@@ -1273,8 +1273,8 @@ fn resolve_worker_top_chunk(
 
 /// Build the `worker class` slice for `class_name`, resolving the top-level chunk
 /// from either retained source (run-from-source) or the stored `.aso` bytes
-/// (`ascript run x.aso`). Mirrors [`build_class_slice_from_source`] but adds the
-/// `.aso`-mode fallback (Plan A Task 15 mechanism extended to actor spawn).
+/// (`ascript run x.aso`) via [`resolve_worker_top_chunk`] — the `.aso`-mode
+/// fallback (Plan A Task 15 mechanism extended to actor spawn).
 pub fn build_class_slice_for_interp(
     interp: &crate::interp::Interp,
     class_name: &str,
