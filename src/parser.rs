@@ -458,6 +458,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // IFACE: optional `implements I1, I2` clause (Task 4 fills the parse).
+        let implements: Vec<String> = Vec::new();
         self.eat(&Tok::LBrace)?;
         let mut fields = Vec::new();
         let mut methods = Vec::new();
@@ -591,6 +593,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Class {
             name,
             superclass,
+            implements,
             fields,
             methods,
             is_worker,

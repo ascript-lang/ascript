@@ -2906,6 +2906,34 @@ impl Interp {
                 env.define(name, class, false).map_err(AsError::new)?;
                 Ok(Flow::Normal)
             }
+            Stmt::Interface {
+                name,
+                extends,
+                methods,
+                ..
+            } => {
+                // IFACE §4: build the descriptor holding own_methods + extends NAMES
+                // only (no flatten — interfaces forward-reference as late-bound
+                // module-globals; flatten happens lazily on first conformance check).
+                let mut own_methods = indexmap::IndexMap::new();
+                for m in methods {
+                    let arity = m.params.iter().filter(|p| !p.rest).count();
+                    let has_rest = m.params.iter().any(|p| p.rest);
+                    own_methods.insert(
+                        m.name.clone(),
+                        crate::value::MethodReq { arity, has_rest },
+                    );
+                }
+                let def = Value::Interface(std::rc::Rc::new(crate::value::InterfaceDef {
+                    name: name.clone(),
+                    own_methods,
+                    extends: extends.clone(),
+                    def_env: env.clone(),
+                    flat: std::cell::RefCell::new(None),
+                }));
+                env.define(name, def, false).map_err(AsError::new)?;
+                Ok(Flow::Normal)
+            }
             Stmt::Export(inner) => {
                 let flow = self.exec_stmt(inner, env).await?;
                 for name in exported_names(inner) {

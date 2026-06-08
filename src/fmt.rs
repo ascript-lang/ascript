@@ -286,6 +286,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
         Stmt::Class {
             name,
             superclass,
+            implements,
             fields,
             methods,
             is_worker,
@@ -301,12 +302,37 @@ fn write_stmt(out: &mut String, stmt: &Stmt, level: usize) {
                 out.push_str(" extends ");
                 out.push_str(sup);
             }
+            // IFACE: canonical order is `extends Super implements A, B` (after extends).
+            if !implements.is_empty() {
+                out.push_str(" implements ");
+                out.push_str(&implements.join(", "));
+            }
             out.push_str(" {\n");
             for fd in fields {
                 write_field(out, fd, level + 1);
             }
             for m in methods {
                 write_method(out, m, level + 1);
+            }
+            indent(out, level);
+            out.push_str("}\n");
+        }
+        Stmt::Interface {
+            name,
+            extends,
+            methods,
+            ..
+        } => {
+            indent(out, level);
+            out.push_str("interface ");
+            out.push_str(name);
+            if !extends.is_empty() {
+                out.push_str(" extends ");
+                out.push_str(&extends.join(", "));
+            }
+            out.push_str(" {\n");
+            for m in methods {
+                write_method_req(out, m, level + 1);
             }
             indent(out, level);
             out.push_str("}\n");
@@ -401,6 +427,19 @@ fn write_method(out: &mut String, m: &MethodDecl, level: usize) {
     }
     out.push(' ');
     write_block(out, &m.body, level);
+    out.push('\n');
+}
+
+/// IFACE: render one interface method REQUIREMENT — a signature with NO body.
+fn write_method_req(out: &mut String, m: &crate::ast::MethodReqNode, level: usize) {
+    indent(out, level);
+    out.push_str("fn ");
+    out.push_str(&m.name);
+    write_params(out, &m.params);
+    if let Some(ret) = &m.ret {
+        out.push_str(" -> ");
+        out.push_str(&render_type(ret));
+    }
     out.push('\n');
 }
 
@@ -918,6 +957,72 @@ fn escape_template_lit(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- IFACE Task 3: Stmt::Interface + Class.implements AST + render ----
+
+    fn p(name: &str, rest: bool) -> crate::ast::Param {
+        crate::ast::Param {
+            name: name.to_string(),
+            ty: None,
+            name_span: crate::span::Span::new(0, 0),
+            rest,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn renders_interface_decl() {
+        let stmt = Stmt::Interface {
+            name: "Reader".to_string(),
+            type_params: vec![],
+            extends: vec![],
+            methods: vec![crate::ast::MethodReqNode {
+                name: "read".to_string(),
+                params: vec![p("b", false)],
+                ret: Some(Type::Int),
+                span: crate::span::Span::new(0, 0),
+                name_span: crate::span::Span::new(0, 0),
+            }],
+            span: crate::span::Span::new(0, 0),
+            name_span: crate::span::Span::new(0, 0),
+        };
+        let mut out = String::new();
+        write_stmt(&mut out, &stmt, 0);
+        assert_eq!(out, "interface Reader {\n  fn read(b) -> int\n}\n");
+    }
+
+    #[test]
+    fn renders_interface_extends_composition() {
+        let stmt = Stmt::Interface {
+            name: "ReadWriter".to_string(),
+            type_params: vec![],
+            extends: vec!["Reader".to_string(), "Writer".to_string()],
+            methods: vec![],
+            span: crate::span::Span::new(0, 0),
+            name_span: crate::span::Span::new(0, 0),
+        };
+        let mut out = String::new();
+        write_stmt(&mut out, &stmt, 0);
+        assert_eq!(out, "interface ReadWriter extends Reader, Writer {\n}\n");
+    }
+
+    #[test]
+    fn renders_class_implements_clause() {
+        let stmt = Stmt::Class {
+            name: "Socket".to_string(),
+            superclass: Some("Base".to_string()),
+            implements: vec!["Reader".to_string(), "Writer".to_string()],
+            fields: vec![],
+            methods: vec![],
+            is_worker: false,
+            span: crate::span::Span::new(0, 0),
+            name_span: crate::span::Span::new(0, 0),
+        };
+        let mut out = String::new();
+        write_stmt(&mut out, &stmt, 0);
+        // canonical order: extends then implements, before the body
+        assert_eq!(out, "class Socket extends Base implements Reader, Writer {\n}\n");
+    }
 
     #[test]
     fn formats_and_is_idempotent() {
