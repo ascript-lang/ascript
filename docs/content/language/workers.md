@@ -75,8 +75,9 @@ await main()
 ```
 
 > Note the division of labor: `array.map`/`task.gather`/`math.sum` run on the **caller**
-> thread; the `worker fn` body itself uses only pure arithmetic. Worker bodies cannot call
-> imported stdlib modules — see [Worker-body limitations](#worker-body-limitations) below.
+> thread. A `worker fn` body **may** also call imported stdlib modules directly (e.g.
+> `math.max(...)`) — the code slice ships the top-level imports into the isolate. See
+> [Worker-body limitations](#worker-body-limitations) below for what is and isn't shipped.
 
 ### `static worker fn`
 
@@ -116,7 +117,9 @@ first call; steady-state per-call overhead is ~60–250 ms depending on payload 
 Worker functions run in an isolated scope, so the compiler enforces these capture rules:
 
 - **Allowed:** function parameters; other top-level `worker fn` and regular `fn` definitions
-  (shipped transitively); top-level `const` bindings with literal initializers (copied by value).
+  (shipped transitively); top-level `const`/`enum` bindings (literal consts copied by value,
+  computed consts re-run on the isolate); top-level `class` definitions a worker constructs or
+  returns; and top-level `import`s (shipped wholesale, re-run on the isolate).
 - **Not allowed:** capturing a mutable outer `let`, or reading or writing a top-level mutable
   global. Violations are `worker-capture` **compile errors** — caught before the program runs.
 
@@ -376,58 +379,55 @@ separate `worker fn*` for streaming.
 
 ## Worker-body limitations
 
-A worker body runs in a fresh isolate that receives only a **code slice** — the top-level `fn`
-and literal-`const` definitions it transitively references. Three things this does *not* include:
+A worker body runs in a fresh isolate that receives only a **code slice** — the transitive
+top-level dependency closure of the worker entry. The closure ships, automatically:
 
-1. **No stdlib module imports inside the worker body.** The code slice does not ship `import`
-   bindings. Calling `math.sum(...)`, `array.sort(...)`, or `json.parse(...)` *inside* a worker
-   body fails at runtime with `undefined variable`. Only bare builtins (`len`, `print`, `assert`,
-   `Ok`, `Err`, …) and your own top-level helper `fn`s are available. The idiom: do the
-   stdlib-dependent work on the caller side, pass only data into the worker, and write any
-   in-worker computation as a pure top-level `fn`.
+- **top-level `fn`s** it (transitively) calls;
+- **top-level `import`s** (shipped wholesale, so `math.max(...)`, `array.sort(...)`,
+  `json.parse(...)` work *inside* the worker body — std imports are side-effect-free, a file
+  import re-runs its module on the isolate);
+- **`enum`s and literal `const`s** (copied by value);
+- **computed-initializer `const`s** (`const K = expensive()`) — the initializer is re-run on the
+  isolate, so the worker sees the recomputed value;
+- **`class`es** a worker constructs or returns (the full class + its superclass chain), so a
+  worker fn can `return Point(3, 4)` and the instance round-trips back via structured clone.
 
-   ```ascript
-   import * as math from "std/math"
-   import * as array from "std/array"
-   import * as task from "std/task"
+```ascript
+import * as math from "std/math"
+import * as task from "std/task"
 
-   // Pure arithmetic helper — no stdlib imports; shipped transitively.
-   fn lcg(state: number): number {
-     return (state * 1103515245 + 12345) % 2147483648
-   }
+class Stats {
+  n: number
+  mean: number
+  fn init(n, mean) { self.n = n; self.mean = mean }
+}
 
-   worker fn countHits(seed: number): number {
-     let state = seed
-     let hits = 0
-     let i = 0
-     while (i < 1000) {
-       state = lcg(state)              // ✓ top-level fn, shipped transitively
-       let x = state / 2147483648.0
-       state = lcg(state)
-       let y = state / 2147483648.0
-       if (x * x + y * y <= 1.0) { hits = hits + 1 }
-       i = i + 1
-     }
-     return hits
-   }
+worker fn summarize(xs: array<number>): Stats {
+  let total = math.sum(xs)            // ✓ imported stdlib module — shipped
+  return Stats(len(xs), total / len(xs))  // ✓ class constructed in the isolate
+}
 
-   fn main() {
-     let futures = array.map([1, 2, 3, 4, 5, 6, 7, 8], countHits)
-     let hitCounts = await task.gather(futures)
-     print(math.sum(hitCounts))        // stdlib work on the caller side
-   }
+fn main() {
+  let s = await summarize([2, 4, 6, 8])
+  print(s.mean)                       // 5
+}
 
-   await main()
-   ```
+await main()
+```
 
-2. **Computed-initializer consts and `class`/`enum` deps are not shipped.** Only top-level
-   `const` bindings whose initializer is a literal (number, string, bool, nil, or a literal
-   array/object of those) are copied into the isolate. A `const` initialized from a function
-   call, and any `class`/`enum` definition a worker body references directly, fails loudly at
-   runtime with `undefined variable`. Reconstruct class instances on the caller side.
+What is still **not** shipped:
+
+1. **Mutable shared state.** A worker body cannot capture an outer mutable `let` or read/write a
+   mutable top-level global — those are `worker-capture` compile errors. Workers are
+   shared-nothing: pass data in, return data out.
+
+2. **Non-top-level deps.** A `class`/`fn` nested inside another function whose members capture an
+   enclosing local cannot be shipped. Keep worker-referenced classes and helpers at the top
+   level.
 
 3. **Handles are not sendable.** Generator handles and actor proxy handles cannot be passed
-   across the boundary. Pass plain data (snapshots) instead.
+   across the boundary. Pass plain data (snapshots) instead. (Returned class instances carry
+   their fields, but not their methods — reconstruct behavior on the caller side if needed.)
 
 ---
 

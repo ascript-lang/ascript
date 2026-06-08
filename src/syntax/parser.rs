@@ -941,6 +941,26 @@ fn primary(p: &mut Parser) -> CompletedMarker {
             p.complete(m, TemplateExpr)
         }
         TemplateStart => template_expr(p),
+        // `fn` (and `async fn` / `fn*`) in EXPRESSION position is not a language
+        // construct — AScript's only anonymous function is the arrow `() => …`.
+        // A statement-level `fn name(…) {…}` is dispatched in `stmt` and never
+        // reaches here, so this arm only fires for an expression-position `fn`
+        // (e.g. `recover(fn() {…})`). Emit a clear, targeted error and consume
+        // the `fn` token so recovery does not re-parse it as a name-less
+        // top-level declaration (which would crash the compiler).
+        FnKw => {
+            let m = p.start();
+            p.error("anonymous `fn` expressions are not supported; use an arrow `() => …`");
+            p.bump(); // consume `fn`
+            p.complete(m, Error)
+        }
+        AsyncKw if is_async_fn(p) => {
+            let m = p.start();
+            p.error("anonymous `async fn` expressions are not supported; use an arrow `async () => …`");
+            p.bump(); // consume `async`
+            p.bump(); // consume `fn`
+            p.complete(m, Error)
+        }
         _ => {
             let m = p.start();
             p.error("expected expression");

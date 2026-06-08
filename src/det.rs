@@ -336,11 +336,20 @@ impl DeterminismContext {
     /// Returns the recorded outcome WITHOUT crossing the isolate boundary, or `None`
     /// when the recorded stream is exhausted (the caller then falls through to a real
     /// boundary crossing + a Record append, mirroring the clock/RNG seams). A recorded
-    /// event of a different kind is a replay mismatch → `None` (fall through), keeping
-    /// the workflow-level detector as the authoritative non-determinism guard.
-    pub fn replay_actor_call(&mut self, _method: &str) -> Option<BoundaryOutcome> {
+    /// event of a different kind — OR a method-name mismatch — is a replay mismatch →
+    /// `None` (fall through without consuming the event), detecting a divergent replay
+    /// (different method order) at the earliest possible point. The cursor is left
+    /// unmoved so the fall-through path can re-record from the correct position.
+    pub fn replay_actor_call(&mut self, method: &str) -> Option<BoundaryOutcome> {
         match self.peek_event() {
-            Some(DetEvent::ActorCall { result, panic, .. }) => {
+            Some(DetEvent::ActorCall { method: recorded_method, result, panic }) => {
+                if recorded_method != method {
+                    // Method-name mismatch: the caller is replaying a different method
+                    // than was recorded at this cursor position. Signal divergence by
+                    // returning None (cursor stays unmoved — fall through to real call +
+                    // Record append).
+                    return None;
+                }
                 self.cursor += 1;
                 Some(match panic {
                     Some(msg) => BoundaryOutcome::Panic(msg),
@@ -568,5 +577,34 @@ mod tests {
         let mut fresh = SeededRng::new(5);
         assert_eq!(r1, fresh.next_f64());
         assert_eq!(r1, r0);
+    }
+
+    /// A method-name mismatch during replay is detected immediately: `replay_actor_call`
+    /// returns `None` without consuming the event (cursor unmoved), so the fall-through
+    /// path can make a real call and re-record at the correct position. This catches a
+    /// divergent replay (different method call order) at the earliest possible point
+    /// rather than silently returning a recorded result for the wrong method.
+    #[test]
+    fn replay_actor_call_method_name_mismatch_is_detected() {
+        let mut rec = DeterminismContext::record(42, 0.0);
+        rec.record_actor_call("get_count", &BoundaryOutcome::Bytes(vec![7]));
+        let events = rec.events.clone();
+
+        let mut rep = DeterminismContext::replay(42, 0.0, events);
+        // Replay with the WRONG method name → None (cursor stays at 0).
+        assert_eq!(
+            rep.replay_actor_call("increment"),
+            None,
+            "method-name mismatch must return None (divergence detected)"
+        );
+        assert_eq!(rep.cursor, 0, "cursor must be unmoved on a mismatch");
+
+        // Replay with the CORRECT method name still works (event was not consumed).
+        assert_eq!(
+            rep.replay_actor_call("get_count"),
+            Some(BoundaryOutcome::Bytes(vec![7])),
+            "correct method must still find the event"
+        );
+        assert_eq!(rep.cursor, 1, "cursor must advance after a successful match");
     }
 }

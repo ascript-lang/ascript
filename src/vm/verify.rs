@@ -703,6 +703,25 @@ fn count_operand(chunk: &Chunk, op: Op, operand_at: usize) -> usize {
     }
 }
 
+/// The NET operand-stack delta (`pushes - pops`) of the instruction `op` at
+/// `operand_at` in `chunk`, decoding its inline count operand and handling the
+/// `Op::Class` special case (whose pop count comes from its class-proto). This is the
+/// SAME authoritative table [`verify_stack_balance`] uses; it is exposed so other
+/// passes (e.g. the worker code-slice builder, which tracks top-level stack depth to
+/// bound a computed-`const` initializer to its own statement) reuse one source of
+/// truth rather than re-deriving stack effects.
+pub(crate) fn op_stack_delta(chunk: &Chunk, op: Op, operand_at: usize) -> isize {
+    if op == Op::Class {
+        // CLASS pops n_defaults + n_methods (+1 superclass), pushes the class.
+        if let Some(cp) = chunk.class_protos.get(chunk.read_u16(operand_at) as usize) {
+            let pops = cp.default_fields.len() + cp.method_names.len() + usize::from(cp.has_super);
+            return 1 - pops as isize;
+        }
+        return 0;
+    }
+    stack_effect(op, count_operand(chunk, op, operand_at)).net()
+}
+
 /// Push a jump-target successor onto the worklist, validating it lands on a
 /// boundary (defence-in-depth; pass 2 already checked jumps).
 fn push_succ(

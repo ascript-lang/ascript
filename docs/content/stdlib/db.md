@@ -6,7 +6,7 @@ AScript ships three database clients: the **embedded `std/sqlite`** (a bundled S
 no system library required), and async network clients for two of the most common backing
 stores — **PostgreSQL** (`std/postgres`) and **Redis** (`std/redis`). The network clients
 follow the **native-resource** pattern — `connect` returns an opaque handle and every
-operation is a method on it — and run on AScript's single-threaded async runtime, so every
+operation is a method on it — and run on AScript's single-threaded per-isolate async runtime, so every
 network operation is `await`ed. SQLite is embedded and synchronous: its calls are *not* awaited.
 
 > [!TIER1] Connection and command methods return `[value, err]`. A bad URL,

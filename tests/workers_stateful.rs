@@ -754,3 +754,326 @@ await main()
 
     let _ = std::fs::remove_file(&log_file);
 }
+
+// ---------------------------------------------------------------------------
+// Worker-FUNCTION code-slice follow-ups (fix/workers-followups): a `worker fn`
+// body may now use (1) top-level stdlib imports, (2) top-level classes/enums it
+// constructs/returns, and (3) computed-initializer top-level consts. All must run
+// byte-identically on BOTH engines and survive `.aso` build→run.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_fn_uses_stdlib_import() {
+    // A `worker fn` body that calls an imported stdlib module fn (`math.max`).
+    let src = r#"
+import * as math from "std/math"
+worker fn mx(a: number, b: number, c: number): number {
+  return math.max(a, b, c)
+}
+async fn main() {
+  print(await mx(3, 9, 5))
+}
+await main()
+"#;
+    assert_both_engines("import_math", src, "9\n");
+}
+
+#[test]
+fn worker_fn_uses_transitive_import_via_helper() {
+    // The import is used by a top-level helper fn the worker calls transitively.
+    let src = r#"
+import * as array from "std/array"
+fn firstSorted(xs: array<number>): number {
+  let s = array.sort(xs)
+  return s[0]
+}
+worker fn minOf(xs: array<number>): number {
+  return firstSorted(xs)
+}
+async fn main() {
+  print(await minOf([5, 2, 9, 1, 7]))
+}
+await main()
+"#;
+    assert_both_engines("import_transitive", src, "1\n");
+}
+
+#[test]
+fn worker_fn_constructs_and_returns_class() {
+    // A `worker fn` constructs a top-level class instance and returns it; the
+    // instance round-trips back via structured-clone (field access on the caller).
+    let src = r#"
+class Point {
+  x: number
+  y: number
+  fn init(x, y) { self.x = x; self.y = y }
+}
+worker fn mk(a: number, b: number): Point {
+  return Point(a, b)
+}
+async fn main() {
+  let p = await mk(3, 4)
+  print(p.x + p.y)
+}
+await main()
+"#;
+    assert_both_engines("class_return", src, "7\n");
+}
+
+#[test]
+fn worker_fn_class_with_superclass() {
+    // A worker fn constructs a subclass; the superclass chain must ship too.
+    let src = r#"
+class Shape {
+  kind: string
+  fn init(k) { self.kind = k }
+}
+class Circle extends Shape {
+  r: number
+  fn init(r) { super.init("circle"); self.r = r }
+}
+worker fn mkCircle(r: number): Circle {
+  return Circle(r)
+}
+async fn main() {
+  let c = await mkCircle(5)
+  print(c.kind)
+  print(c.r)
+}
+await main()
+"#;
+    assert_both_engines("class_super", src, "circle\n5\n");
+}
+
+#[test]
+fn worker_fn_uses_enum() {
+    // A worker fn reads a top-level enum variant (enums already ship as const values,
+    // but assert it stays working alongside the new import/class shipping).
+    let src = r#"
+enum Color { Red, Green, Blue }
+worker fn pick(): Color { return Color.Green }
+async fn main() {
+  print(await pick())
+}
+await main()
+"#;
+    assert_both_engines("enum_use", src, "Color.Green\n");
+}
+
+#[test]
+fn worker_fn_uses_computed_const() {
+    // A worker fn references a top-level `const` whose initializer is a computed
+    // expression (a function call), not a literal. The initializer code ships into
+    // the slice and is recomputed on the isolate.
+    let src = r#"
+fn expensive(): number { return 21 * 2 }
+const K = expensive()
+worker fn rd(n: number): number { return K + n }
+async fn main() {
+  print(await rd(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_uses_import() {
+    // A computed const whose initializer itself uses an imported stdlib module.
+    let src = r#"
+import * as math from "std/math"
+const M = math.max(10, 20, 15)
+worker fn rd(n: number): number { return M + n }
+async fn main() {
+  print(await rd(5))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_import", src, "25\n");
+}
+
+#[test]
+fn aso_mode_worker_fn_import_class_const() {
+    // The combined import + class + computed-const slice must survive build→run .aso
+    // (the slice is rebuilt from the stored `.aso` bytes, no source on the Interp).
+    let src = r#"
+import * as math from "std/math"
+class Box {
+  v: number
+  fn init(v) { self.v = v }
+}
+fn base(): number { return math.max(1, 7, 3) }
+const K = base()
+worker fn make(n: number): Box {
+  return Box(K + n)
+}
+async fn main() {
+  let b = await make(10)
+  print(b.v)
+}
+await main()
+"#;
+    let (ok, out, err) = build_then_run_aso("fn_import_class_const", src);
+    assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "17\n", "[.aso run] stdout mismatch (stderr={err:?})");
+}
+
+#[test]
+fn worker_fn_computed_const_with_internal_jumps() {
+    // A computed-const initializer containing ternary expressions (internal relative
+    // jumps) — proves jump displacements survive the contiguous range copy into the
+    // worker code slice.
+    let src = r#"
+fn pick(b: bool): number { return b ? 100 : 200 }
+const K = pick(true) + (5 > 3 ? 1 : 2)
+worker fn rd(n: number): number { return K + n }
+async fn main() {
+  print(await rd(0))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_jumps", src, "101\n");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a computed-const slice range must be EXACTLY the const's own
+// initializer — never absorb a preceding non-defining statement (a `for`/`while`
+// loop, a bare expression statement, or an `if`). Absorbing a loop shipped its
+// backward `Loop` + `GET_LOCAL` into the fragment whose top-level slot_count was too
+// small → a hard `set_local slot out of bounds` isolate panic; absorbing a stack-
+// neutral statement over-shipped + re-ran its side effects on the isolate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_fn_computed_const_after_for_loop() {
+    let src = r#"
+fn expensive(): number { return 42 }
+for (i in 0..3) { i + 1 }
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_after_for", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_after_while_loop() {
+    let src = r#"
+fn expensive(): number { return 42 }
+let w = 0
+while (w < 3) { w = w + 1 }
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_after_while", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_after_expr_statement() {
+    // A bare expression statement (`"ignored" + "me"`) before the const must not be
+    // absorbed. (A pure expr keeps the program output to just the worker result.)
+    let src = r#"
+fn expensive(): number { return 42 }
+"ignored" + "me"
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_after_expr", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_after_if() {
+    let src = r#"
+fn expensive(): number { return 42 }
+if (1 < 2) { let z = 99 }
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_after_if", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_does_not_reship_absorbed_side_effect() {
+    // `noisy()` is a bare call statement BEFORE the computed const. It must NOT be
+    // absorbed into K's slice range — so `NOISY-RAN` prints EXACTLY ONCE (caller
+    // side), not a second time when the isolate runs the slice.
+    let src = r#"
+fn noisy(): number { print("NOISY-RAN"); return 0 }
+fn expensive(): number { return 42 }
+noisy()
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_no_reship", src, "NOISY-RAN\n50\n");
+}
+
+#[test]
+fn aso_mode_worker_fn_computed_const_after_loop() {
+    // The bounded-range fix must also survive build->run `.aso` (the slice is rebuilt
+    // from stored `.aso` bytes, and `load_slice` does NOT run the verifier — so an
+    // over-wide range would crash here too).
+    let src = r#"
+fn expensive(): number { return 42 }
+for (i in 0..3) { i + 1 }
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    let (ok, out, err) = build_then_run_aso("computed_const_after_loop", src);
+    assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "50\n", "[.aso run] stdout mismatch (stderr={err:?})");
+}
+
+#[test]
+fn worker_fn_computed_const_ternary_initializer() {
+    // A computed-const whose OWN initializer is a top-level ternary (its condition is
+    // consumed by an internal conditional jump, transiently emptying the stack). The
+    // range must still cover the whole initializer, NOT cut off at the ternary arm.
+    let src = r#"
+const K = (5 > 3) ? 41 : 99
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(1))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_ternary", src, "42\n");
+}
+
+#[test]
+fn worker_fn_computed_const_short_circuit_initializer() {
+    // A computed-const whose initializer is a short-circuit `&&` (also an internal
+    // conditional jump).
+    let src = r#"
+fn truthy(): number { return 7 }
+const K = truthy() && 42
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_short_circuit", src, "50\n");
+}
