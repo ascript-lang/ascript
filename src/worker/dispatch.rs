@@ -24,24 +24,37 @@
 //!
 //! ## What gets shipped — and what is left late-bound
 //!
-//! The closure ships top-level FUNCTIONS and LITERAL-initializer `const`s
-//! (transitively). A referenced name that this builder cannot classify as a
-//! shippable definition — a `const` with a COMPUTED initializer, a `class`/`enum`/
-//! `import` binding, or a plain builtin — is NOT an error here: it is simply left as
-//! a late-bound `GET_GLOBAL` reference in the shipped bytecode. On the far isolate
-//! that reference resolves against the isolate's own globals (builtins are present
-//! there) or, if the name is genuinely absent, raises the STANDARD recoverable
-//! `undefined variable '<name>'` runtime panic at the call site — exactly as any
-//! unbound reference would. So `build_code_slice` returns `Ok` with a slice that
-//! omits such a name; the failure (if any) surfaces LATER, loudly, at isolate
-//! runtime — never as a wrong or silently-partial result.
+//! The closure ships, transitively, every top-level binding a `worker fn` body
+//! references:
 //!
-//! TODO(Task 8 / Spec B): two follow-ups make computed-const / class deps work for
-//! workers that need them: (1) dispatch-time structured-clone of computed-`const`
-//! VALUES into the isolate (the plan's "consts structured-clone'd at dispatch", §4),
-//! so a worker reading a computed top-level const sees its value; (2) shipping
-//! `class`/`enum` definitions for worker fns that construct or return class
-//! instances. Until then those deps stay late-bound as described above.
+//!   - **FUNCTIONS** — re-`CLOSURE`d from their `FnProto`.
+//!   - **`enum`s and literal-initializer `const`s** — copied by VALUE.
+//!   - **COMPUTED-initializer `const`s** — the initializer's instruction range is
+//!     copied (pool-remapped) into the fragment and RE-RUN on the isolate, which
+//!     recomputes the value (`copy_code_range` / `TopDef::ComputedConst`). The helper
+//!     fn / imported module the initializer uses is itself pulled into the closure.
+//!   - **`class`es** — the full class (superclass chain + method table + field
+//!     defaults) is shipped via the SAME `emit_class_recursive` machinery the actor
+//!     class-slice uses, so a worker fn can construct / return a class instance.
+//!   - **Top-level `import`s** — ALL top-level imports are shipped wholesale via
+//!     `emit_top_imports` (the actor path's mechanism), so a worker body can call
+//!     `math.max(...)`, `array.sort(...)`, `json.parse(...)`, etc. (std imports are
+//!     side-effect-free; a file import re-runs its module on the isolate — the
+//!     shared-nothing analog of a fresh process).
+//!
+//! A referenced name that is none of the above (a plain builtin, or a genuinely
+//! unbound name) is left as a late-bound `GET_GLOBAL`: on the far isolate it resolves
+//! against the isolate's own globals/builtins, or — if truly absent — raises the
+//! STANDARD recoverable `undefined variable '<name>'` panic at the call site, exactly
+//! as any unbound reference would. So `build_code_slice` returns `Ok` with the slice;
+//! a genuine miss surfaces LATER, loudly, at isolate runtime — never a wrong or
+//! silently-partial result.
+//!
+//! Remaining non-goal: a NON-top-level dep (a `class`/`fn` nested inside another
+//! function whose members capture an enclosing local via an upvalue) is not shippable
+//! — the `worker-capture` checker rejects such captures up front, and the actor
+//! class-slice path reports a recoverable build-time panic for a captured class
+//! member.
 
 use crate::interp::Control;
 use crate::span::Span;
@@ -53,34 +66,53 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-/// A resolved top-level binding the closure can ship: either a `fn` (its compiled
-/// prototype) or a `const`/`let` whose initializer is a single literal-producing op.
+/// A resolved top-level binding the closure can ship.
 #[derive(Clone)]
 enum TopDef {
     /// A top-level `fn` — ships as its `FnProto` (re-`CLOSURE`d in the fragment).
     Fn(Rc<FnProto>),
     /// A top-level `const`/`let` bound to a literal value — ships as that value.
     Const(Value),
+    /// A top-level `const`/`let` whose initializer is a COMPUTED expression (a call,
+    /// an arithmetic expression, an imported-module member access, …). The value
+    /// cannot be precomputed at slice-build time, so the initializer's instruction
+    /// byte-range `[start, end)` in the original top-level `code` is copied verbatim
+    /// into the fragment (with pool indices remapped) and RE-RUN on the isolate, which
+    /// recomputes the value there. The range covers the value-producing ops only — the
+    /// trailing `DEFINE_GLOBAL` is re-emitted by the closure walk. Any `GET_GLOBAL` in
+    /// the range is part of the transitive dependency closure (e.g. the helper fn the
+    /// initializer calls, or an imported module name).
+    ComputedConst { start: usize, end: usize },
+    /// A top-level `class` — ships via [`emit_class_recursive`] (full method table +
+    /// superclass chain), the SAME machinery the actor class-slice uses. A worker fn
+    /// that constructs/returns a class instance pulls the class definition in here.
+    Class,
 }
 
 /// Scan a program's top-level [`Chunk`] code stream and build a map from each
-/// DIRECT-child top-level global NAME to the definition it binds. A binding is a
-/// `<value-producing op>; DEFINE_GLOBAL name` pair; we look at the op IMMEDIATELY
-/// preceding each `DEFINE_GLOBAL` to classify it:
-///   - `CLOSURE idx`  → a top-level `fn`  → [`TopDef::Fn`] (`protos[idx]`).
-///   - `CONST idx`    → a literal const   → [`TopDef::Const`] (`consts[idx]`).
-///   - `NIL/TRUE/FALSE` → a literal const → [`TopDef::Const`].
+/// DIRECT-child top-level global NAME to the definition it binds. Each non-import
+/// top-level binding compiles to a value-producing instruction RUN ending in
+/// `DEFINE_GLOBAL name`; the run since the previous statement boundary is the
+/// initializer. We classify each binding by inspecting that run:
+///   - `CLOSURE idx; DEFINE_GLOBAL`      → a top-level `fn`     → [`TopDef::Fn`].
+///   - `CONST idx; DEFINE_GLOBAL`        → a literal const      → [`TopDef::Const`]
+///     (a `Value::Enum` const lands here too — enums ship as a value).
+///   - `NIL/TRUE/FALSE; DEFINE_GLOBAL`   → a literal const      → [`TopDef::Const`].
+///   - a run ending in `CLASS; DEFINE_GLOBAL` → a `class`       → [`TopDef::Class`]
+///     (shipped via [`emit_class_recursive`], not from this map's range).
+///   - ANY OTHER value-producing run     → a computed const/let → [`TopDef::ComputedConst`]
+///     (the run's byte-range is copied + re-run on the isolate).
 ///
-/// Any other producer (a top-level `const` whose initializer is a computed
-/// expression, or a `class`/`enum`/`import` binding) is left OUT of the map: it is
-/// not a simple shippable closure member. A worker fn that references such a name
-/// is reported by [`build_code_slice`] as an unsupported dependency (never silently
-/// dropped — see the conventions in CLAUDE.md). The common cases (top-level helper
-/// fns + literal consts) are covered exactly.
+/// `import` bindings are NOT in this map (they are shipped wholesale by
+/// [`emit_top_imports`]). The range tracked for a computed const is the
+/// value-producing portion `[start, define_ip)` — i.e. everything since the previous
+/// statement boundary, excluding the trailing `DEFINE_GLOBAL`.
 fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
     let mut defs: HashMap<Rc<str>, TopDef> = HashMap::new();
-    // Track the (op, operand-as-u16) of the previous instruction so a DEFINE_GLOBAL
-    // can classify what produced the value it binds.
+    // `stmt_start` is the ip of the first value-producing op of the current top-level
+    // statement (right after the previous statement's terminator: a DEFINE_GLOBAL or
+    // an IMPORT). The previous instruction `(op, operand)` classifies a simple binding.
+    let mut stmt_start = 0usize;
     let mut prev: Option<(Op, u16)> = None;
     let mut ip = 0usize;
     while ip < top.code.len() {
@@ -88,19 +120,21 @@ fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
             break;
         };
         let width = op.operand_width();
-        // The leading u16 operand (CONST/CLOSURE/DEFINE_GLOBAL all lead with a u16).
-        let operand_u16 = if width >= 2 {
-            top.read_u16(ip + 1)
-        } else {
-            0
-        };
-        if op == Op::DefineGlobal {
-            // The name is consts[operand_u16] (a Str); the producer is `prev`.
-            if let Some(Value::Str(name)) = top.consts.get(operand_u16 as usize) {
-                if let Some(def) = prev.and_then(|(pop, parg)| classify_producer(top, pop, parg)) {
+        let operand_u16 = if width >= 2 { top.read_u16(ip + 1) } else { 0 };
+        match op {
+            Op::DefineGlobal => {
+                if let Some(Value::Str(name)) = top.consts.get(operand_u16 as usize) {
+                    let def = classify_binding(top, prev, stmt_start, ip);
                     defs.entry(name.clone()).or_insert(def);
                 }
+                // The DEFINE_GLOBAL terminates this statement; the next starts after it.
+                stmt_start = ip + 1 + width;
             }
+            Op::Import => {
+                // An import is its own statement (shipped via emit_top_imports).
+                stmt_start = ip + 1 + width;
+            }
+            _ => {}
         }
         prev = Some((op, operand_u16));
         ip += 1 + width;
@@ -108,16 +142,42 @@ fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
     defs
 }
 
-/// Classify the value-producing instruction that precedes a `DEFINE_GLOBAL` into a
-/// shippable [`TopDef`], or `None` if it is not a simple fn/literal-const binding.
-fn classify_producer(top: &Chunk, op: Op, operand: u16) -> Option<TopDef> {
-    match op {
-        Op::Closure => top.protos.get(operand as usize).cloned().map(TopDef::Fn),
-        Op::Const => top.consts.get(operand as usize).cloned().map(TopDef::Const),
-        Op::Nil => Some(TopDef::Const(Value::Nil)),
-        Op::True => Some(TopDef::Const(Value::Bool(true))),
-        Op::False => Some(TopDef::Const(Value::Bool(false))),
-        _ => None,
+/// Classify the binding terminated by the `DEFINE_GLOBAL` at `define_ip`, given the
+/// value-producing run `[stmt_start, define_ip)` and the immediately-`prev`ious op.
+fn classify_binding(
+    top: &Chunk,
+    prev: Option<(Op, u16)>,
+    stmt_start: usize,
+    define_ip: usize,
+) -> TopDef {
+    match prev {
+        // A single-op literal/fn/class producer immediately before the DEFINE_GLOBAL.
+        Some((Op::Closure, operand)) if stmt_start == define_ip.saturating_sub(3) => {
+            if let Some(p) = top.protos.get(operand as usize) {
+                return TopDef::Fn(p.clone());
+            }
+            TopDef::ComputedConst { start: stmt_start, end: define_ip }
+        }
+        Some((Op::Const, operand)) if stmt_start == define_ip.saturating_sub(3) => {
+            if let Some(v) = top.consts.get(operand as usize) {
+                return TopDef::Const(v.clone());
+            }
+            TopDef::ComputedConst { start: stmt_start, end: define_ip }
+        }
+        Some((Op::Nil, _)) if stmt_start == define_ip.saturating_sub(1) => {
+            TopDef::Const(Value::Nil)
+        }
+        Some((Op::True, _)) if stmt_start == define_ip.saturating_sub(1) => {
+            TopDef::Const(Value::Bool(true))
+        }
+        Some((Op::False, _)) if stmt_start == define_ip.saturating_sub(1) => {
+            TopDef::Const(Value::Bool(false))
+        }
+        // A run ending in `CLASS` is a `class` declaration — shipped via the class
+        // machinery, not from this map's range.
+        Some((Op::Class, _)) => TopDef::Class,
+        // Anything else is a computed-initializer binding: ship its instruction range.
+        _ => TopDef::ComputedConst { start: stmt_start, end: define_ip },
     }
 }
 
@@ -147,6 +207,93 @@ fn collect_get_global_names(chunk: &Chunk, out: &mut Vec<Rc<str>>) {
     }
 }
 
+/// Collect every `GET_GLOBAL` name in the top-level instruction byte-range
+/// `[start, end)` of `top.code` (a computed-const initializer), recursing into any
+/// `CLOSURE`'d nested proto the range references. These are the computed const's
+/// transitive top-level dependencies (the helper fn it calls, an imported module
+/// name, another const it reads, …) — fed into the same closure fixpoint.
+fn collect_range_refs(top: &Chunk, start: usize, end: usize, out: &mut Vec<Rc<str>>) {
+    let mut ip = start;
+    while ip < end {
+        let Some(op) = Op::from_u8(top.code[ip]) else {
+            break;
+        };
+        let width = op.operand_width();
+        match op {
+            Op::GetGlobal => {
+                let idx = top.read_u16(ip + 1) as usize;
+                if let Some(Value::Str(name)) = top.consts.get(idx) {
+                    out.push(name.clone());
+                }
+            }
+            Op::Closure => {
+                // A nested closure literal inside the initializer (e.g. a lambda) —
+                // its body's GET_GLOBALs are part of the closure too.
+                let idx = top.read_u16(ip + 1) as usize;
+                if let Some(proto) = top.protos.get(idx) {
+                    collect_get_global_names(&proto.chunk, out);
+                }
+            }
+            _ => {}
+        }
+        ip += 1 + width;
+    }
+}
+
+/// Collect the outgoing top-level references of a single resolved [`TopDef`] `name`
+/// into `out` — the names the closure must pull in next. A `fn` contributes its
+/// proto body's `GET_GLOBAL`s; a computed const contributes its initializer range's;
+/// a `class` contributes its method/default bodies' (via [`locate_class_group`]); a
+/// literal const contributes nothing.
+fn collect_def_refs(top: &Chunk, def: &TopDef, name: &str, out: &mut Vec<Rc<str>>) {
+    match def {
+        TopDef::Fn(proto) => collect_get_global_names(&proto.chunk, out),
+        TopDef::ComputedConst { start, end } => collect_range_refs(top, *start, *end, out),
+        TopDef::Class => {
+            // Pull the class's method/default bodies' refs (and its superclass names).
+            if let Ok((members, _cp)) = locate_class_group(top, name) {
+                for m in &members {
+                    match m {
+                        GroupMember::SuperGlobal(sup) => out.push(sup.clone()),
+                        GroupMember::Closure(proto) => {
+                            collect_get_global_names(&proto.chunk, out)
+                        }
+                    }
+                }
+            }
+        }
+        TopDef::Const(_) => {}
+    }
+}
+
+/// Compute the transitive top-level dependency closure of `roots` over `defs`,
+/// returning the set of included NAMES. Shared by the worker-fn slice and the actor
+/// class slice so both ship the same closure semantics (fns + literal consts +
+/// computed consts + classes, transitively).
+fn compute_closure(
+    top: &Chunk,
+    defs: &HashMap<Rc<str>, TopDef>,
+    roots: Vec<Rc<str>>,
+) -> HashSet<Rc<str>> {
+    let mut seen: HashSet<Rc<str>> = HashSet::new();
+    let mut work: Vec<Rc<str>> = roots;
+    while let Some(name) = work.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(def) = defs.get(name.as_ref()) {
+            let mut refs = Vec::new();
+            collect_def_refs(top, def, &name, &mut refs);
+            for r in refs {
+                if !seen.contains(&r) {
+                    work.push(r);
+                }
+            }
+        }
+    }
+    seen
+}
+
 /// A stable identity hash for a worker entry: its `class_name` (if any) + its
 /// function name. Used to key the per-isolate code-slice cache so a repeatedly
 /// dispatched worker ships its bytecode at most once per isolate.
@@ -169,25 +316,27 @@ fn entry_fn_id(name: &str, class_name: Option<&str>) -> u64 {
 /// dependency closure (see the module docs) and materializes it as a fresh
 /// "module fragment" top-level chunk serialized via the `.aso` writer:
 ///
-/// The fragment, when loaded and run on a FRESH `Vm`, emits — for each closure
-/// member in a deterministic order — its define (a literal `const` → `CONST;
-/// DEFINE_GLOBAL`, a `fn` → `CLOSURE; DEFINE_GLOBAL`) and finally the entry fn's
-/// own define, then `NIL; RETURN`. Running it defines exactly the closure's globals
-/// (and the entry) and NOTHING else from the original module — so the isolate can
-/// then fetch and call the entry with zero access to the original heap.
+/// The fragment, when loaded and run on a FRESH `Vm`, emits, in order: every
+/// top-level `import`; each referenced `class` (superclass-first); then each fn /
+/// literal-const / computed-const dep in source order (a literal `const` → `CONST;
+/// DEFINE_GLOBAL`, a `fn` → `CLOSURE; DEFINE_GLOBAL`, a computed const → its
+/// initializer instruction range + `DEFINE_GLOBAL`); and finally the entry fn's own
+/// define, then `NIL; RETURN`. Running it defines exactly the closure's globals (and
+/// the entry) and NOTHING else from the original module — so the isolate can fetch and
+/// call the entry with zero access to the original heap. See the module docs for the
+/// full "what gets shipped" list.
 ///
-/// `class_name` is `Some` for a `static worker fn` (Task 8 binds the class); for a
-/// free `worker fn` it is `None`.
+/// `class_name` is `Some` for a `static worker fn` (binds the class); for a free
+/// `worker fn` it is `None`.
 ///
-/// Returns a recoverable `Control::Panic` ONLY when the entry itself is missing or
-/// is not a top-level function. A referenced DEPENDENCY that cannot be classified as
-/// a shippable def (a computed-initializer `const`, a `class`/`enum`/`import`, or a
-/// builtin) is NOT a build-time error: this returns `Ok` with a slice that omits the
-/// name, leaving it as a late-bound `GET_GLOBAL` reference. On the far isolate that
-/// reference resolves against the isolate's own globals/builtins or, if genuinely
-/// absent, raises the standard recoverable `undefined variable '<name>'` panic at
-/// run time (see the module-level docs). It is never a wrong or silently-partial
-/// result — an unsatisfiable dependency fails loudly at isolate runtime.
+/// Returns a recoverable `Control::Panic` ONLY when the entry itself is missing or is
+/// not a top-level function (or a class member captures an enclosing local — see
+/// `locate_class_group`). A referenced name that is neither a shippable def nor a
+/// builtin is NOT a build-time error: this returns `Ok` with a slice that omits it,
+/// leaving a late-bound `GET_GLOBAL` that resolves against the isolate's own
+/// globals/builtins or raises the standard recoverable `undefined variable '<name>'`
+/// panic at run time. It is never a wrong or silently-partial result — an
+/// unsatisfiable dependency fails loudly at isolate runtime.
 pub fn build_code_slice(
     top: &Chunk,
     entry_name: &str,
@@ -512,8 +661,12 @@ fn emit_top_imports(top: &Chunk, frag: &mut Chunk, span: Span) {
     }
 }
 
-/// Emit the transitive top-level fn/const dependency closure of `roots` into `frag`
-/// (same fixpoint + source-order emit as `materialize_slice`, minus the entry).
+/// Emit the transitive top-level fn / literal-const / computed-const dependency
+/// closure of `roots` into `frag`, in original source order (used by the actor
+/// class-slice for the dep closure of all method bodies). Shares the
+/// [`compute_closure`] fixpoint with `materialize_slice`. Classes referenced by a
+/// method body are emitted by the class slice's own `emit_class_recursive` walk, not
+/// here (so a `TopDef::Class` in the closure is skipped at this emit site).
 fn emit_dep_closure(
     top: &Chunk,
     defs: &HashMap<Rc<str>, TopDef>,
@@ -521,50 +674,103 @@ fn emit_dep_closure(
     frag: &mut Chunk,
     span: Span,
 ) -> Result<(), Control> {
-    let mut seen: HashSet<Rc<str>> = HashSet::new();
-    let mut included: HashSet<Rc<str>> = HashSet::new();
-    let mut work: Vec<Rc<str>> = roots.to_vec();
-    while let Some(name) = work.pop() {
-        if !seen.insert(name.clone()) {
+    let included = compute_closure(top, defs, roots.to_vec());
+    for name in source_order_define_names(top) {
+        if !included.contains(&name) {
             continue;
         }
-        included.insert(name.clone());
-        if let Some(TopDef::Fn(proto)) = defs.get(name.as_ref()) {
-            let mut refs = Vec::new();
-            collect_get_global_names(&proto.chunk, &mut refs);
-            for r in refs {
-                if !seen.contains(&r) {
-                    work.push(r);
-                }
+        match defs.get(name.as_ref()) {
+            Some(TopDef::Const(v)) => {
+                emit_const_load(frag, v.clone(), span);
+                let name_idx = frag.add_const(Value::Str(name.clone()));
+                frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
+            Some(TopDef::Fn(proto)) => {
+                let proto_idx = frag.add_proto(proto.clone());
+                frag.emit_u16(Op::Closure, proto_idx, span);
+                let name_idx = frag.add_const(Value::Str(name.clone()));
+                frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
+            }
+            Some(TopDef::ComputedConst { start, end }) => {
+                copy_code_range(frag, top, *start, *end, span);
+                let name_idx = frag.add_const(Value::Str(name.clone()));
+                frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
+            }
+            Some(TopDef::Class) | None => {}
         }
     }
-    // Emit in original source (DEFINE_GLOBAL) order.
-    let mut ip = 0usize;
-    while ip < top.code.len() {
+    Ok(())
+}
+
+/// Copy the top-level instruction byte-range `[start, end)` of `top.code` verbatim
+/// into `frag`, remapping every pool-indexing operand (const/name-const/proto/
+/// class-proto/import) into `frag`'s own pools. JUMP displacements are RELATIVE, so a
+/// contiguous range copy preserves them (a computed-const initializer's jumps —
+/// ternary, short-circuit `&&`/`||` — target within the range). Used to ship a
+/// computed-`const` initializer (`TopDef::ComputedConst`) so the isolate RE-RUNS it
+/// and recomputes the value. The op→pool classification mirrors `verify::check_operands`
+/// (the authoritative table); a leading-u16 op not naming a pool (slots, upvalues,
+/// counts, jump targets, zero-operand ops) is copied byte-for-byte unchanged.
+fn copy_code_range(frag: &mut Chunk, top: &Chunk, start: usize, end: usize, span: Span) {
+    let mut ip = start;
+    while ip < end {
         let Some(op) = Op::from_u8(top.code[ip]) else {
             break;
         };
         let width = op.operand_width();
-        if op == Op::DefineGlobal {
-            let idx = top.read_u16(ip + 1) as usize;
-            if let Some(Value::Str(name)) = top.consts.get(idx) {
-                if included.contains(name) && defs.contains_key(name.as_ref()) {
-                    match defs.get(name.as_ref()).expect("included ⊆ defs") {
-                        TopDef::Const(v) => emit_const_load(frag, v.clone(), span),
-                        TopDef::Fn(proto) => {
-                            let proto_idx = frag.add_proto(proto.clone());
-                            frag.emit_u16(Op::Closure, proto_idx, span);
-                        }
-                    }
-                    let name_idx = frag.add_const(Value::Str(name.clone()));
-                    frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
-                }
+        match op {
+            // ---- const pool (value or name-const) leading u16 ----
+            // Width-2 forms re-emit as a plain u16; the width-3 forms (CALL_METHOD =
+            // name+argc, DEFINE_GLOBAL = name+mutability) carry a trailing u8 to copy.
+            Op::Const
+            | Op::GetGlobal
+            | Op::SetGlobal
+            | Op::ImmutableError
+            | Op::GetProp
+            | Op::SetProp
+            | Op::GetPropOpt
+            | Op::Method
+            | Op::GetSuper
+            | Op::ObjectKey
+            | Op::MatchHasKey
+            | Op::CallMethodSpread
+            | Op::DefineExport
+            | Op::ObjectRest => {
+                let v = top.consts[top.read_u16(ip + 1) as usize].clone();
+                let new_idx = frag.add_const(v);
+                frag.emit_u16(op, new_idx, span);
+            }
+            Op::DefineGlobal | Op::CallMethod => {
+                // u16 const index + trailing u8 (mutability flag / argc).
+                let v = top.consts[top.read_u16(ip + 1) as usize].clone();
+                let new_idx = frag.add_const(v);
+                let trailing = top.read_u8(ip + 3);
+                frag.emit_u16_u8(op, new_idx, trailing, span);
+            }
+            Op::Closure => {
+                let p = top.protos[top.read_u16(ip + 1) as usize].clone();
+                let new_idx = frag.add_proto(p);
+                frag.emit_u16(op, new_idx, span);
+            }
+            Op::Class => {
+                let cp = top.class_protos[top.read_u16(ip + 1) as usize].clone();
+                let new_idx = frag.add_class_proto(cp);
+                frag.emit_u16(op, new_idx, span);
+            }
+            Op::Import => {
+                let desc = top.imports[top.read_u16(ip + 1) as usize].clone();
+                let new_idx = frag.add_import(desc);
+                frag.emit_u16(op, new_idx, span);
+            }
+            // ---- no pool reference: copy the op + its operand bytes verbatim ----
+            // (slots, upvalues, jump displacements — RELATIVE, preserved by a
+            // contiguous copy — and counts/argc on zero-pool ops.)
+            _ => {
+                frag.emit_raw(op, &top.code[ip + 1..ip + 1 + width], span);
             }
         }
         ip += 1 + width;
     }
-    Ok(())
 }
 
 /// Append `src`'s definition instructions (everything before its trailing
@@ -715,82 +921,83 @@ fn materialize_slice(
     class_name: Option<Rc<str>>,
     emit_entry: bool,
 ) -> Result<WorkerCodeSlice, Control> {
-    // Fixpoint over names: seed with the entry proto's own GET_GLOBAL refs, then pull
-    // in every referenced top-level fn/const, recursing into newly-added fns. `seen`
-    // de-dups; `order` is unused beyond membership (the emit walk reuses source order).
-    let mut seen: HashSet<Rc<str>> = HashSet::new();
-    let mut included: HashSet<Rc<str>> = HashSet::new();
-    let mut work: Vec<Rc<str>> = Vec::new();
-
-    // Seed from the entry proto's references (for a top-level entry this also re-adds
-    // the entry's own deps; the entry name itself is handled via the source walk /
-    // emit_entry).
-    {
-        let mut refs = Vec::new();
-        collect_get_global_names(&entry_proto.chunk, &mut refs);
-        for r in refs {
-            work.push(r);
-        }
-    }
-    // For a top-level entry, also include the entry NAME so the source walk emits it.
+    // Seed the transitive closure with the entry proto's GET_GLOBAL refs (and, for a
+    // top-level entry, the entry NAME so the source walk emits it). `compute_closure`
+    // pulls in every referenced top-level fn, literal/computed const, and class.
+    let mut roots: Vec<Rc<str>> = Vec::new();
+    collect_get_global_names(&entry_proto.chunk, &mut roots);
     if !emit_entry {
-        work.push(Rc::from(entry_name));
+        roots.push(Rc::from(entry_name));
     }
+    let included = compute_closure(top, defs, roots);
 
-    while let Some(name) = work.pop() {
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        included.insert(name.clone());
-        if let Some(TopDef::Fn(proto)) = defs.get(name.as_ref()) {
-            let mut refs = Vec::new();
-            collect_get_global_names(&proto.chunk, &mut refs);
-            for r in refs {
-                if !seen.contains(&r) {
-                    work.push(r);
-                }
-            }
-        }
-    }
-
+    let span = Span::new(0, 0);
     let mut frag = Chunk::new();
     frag.name = Some("<worker-slice>".to_string());
 
-    // Walk the original DEFINE_GLOBAL order so dep members emit in source order.
-    let mut emit_order: Vec<Rc<str>> = Vec::new();
-    let mut ip = 0usize;
-    while ip < top.code.len() {
-        let Some(op) = Op::from_u8(top.code[ip]) else {
-            break;
-        };
-        let width = op.operand_width();
-        if op == Op::DefineGlobal {
-            let idx = top.read_u16(ip + 1) as usize;
-            if let Some(Value::Str(name)) = top.consts.get(idx) {
-                if included.contains(name) && defs.contains_key(name.as_ref()) {
-                    emit_order.push(name.clone());
-                }
+    // 1) Top-level imports first (so a body/initializer GET_GLOBAL of an imported
+    //    module name resolves on the isolate). Same machinery as the actor path.
+    emit_top_imports(top, &mut frag, span);
+
+    // 2) Classes (with superclass chains) the closure references — emitted before the
+    //    fn/const deps so a computed-const initializer that constructs a class finds
+    //    it defined. `emit_class_recursive` de-dups and orders superclasses first.
+    let mut emitted_classes: HashSet<String> = HashSet::new();
+    let mut class_method_refs: Vec<Rc<str>> = Vec::new();
+    {
+        // Emit classes into their own fragment, then splice (the class fragment uses
+        // fresh pool indices remapped by `append_chunk_defs`).
+        let mut class_frag = Chunk::new();
+        class_frag.name = Some("<worker-slice-classes>".to_string());
+        for name in source_order_define_names(top) {
+            if included.contains(&name) && matches!(defs.get(name.as_ref()), Some(TopDef::Class)) {
+                emit_class_recursive(
+                    top,
+                    &name,
+                    &mut class_frag,
+                    &mut emitted_classes,
+                    &mut class_method_refs,
+                    span,
+                )?;
             }
         }
-        ip += 1 + width;
+        append_chunk_defs(&mut frag, &class_frag);
     }
 
-    let span = Span::new(0, 0);
-    for name in &emit_order {
-        match defs.get(name.as_ref()).expect("emit_order ⊆ defs") {
-            TopDef::Const(v) => {
+    // 3) The fn / literal-const / computed-const deps, in original source order. (A
+    //    class's method bodies reference top-level fns/consts via late-bound
+    //    GET_GLOBAL, so emitting these after the classes is fine — the references
+    //    resolve at call time, not class-definition time.)
+    for name in source_order_define_names(top) {
+        if !included.contains(&name) {
+            continue;
+        }
+        match defs.get(name.as_ref()) {
+            Some(TopDef::Const(v)) => {
                 emit_const_load(&mut frag, v.clone(), span);
+                let name_idx = frag.add_const(Value::Str(name.clone()));
+                frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
-            TopDef::Fn(proto) => {
+            Some(TopDef::Fn(proto)) => {
                 let proto_idx = frag.add_proto(proto.clone());
                 frag.emit_u16(Op::Closure, proto_idx, span);
+                let name_idx = frag.add_const(Value::Str(name.clone()));
+                frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
             }
+            Some(TopDef::ComputedConst { start, end }) => {
+                // Copy the initializer instruction range verbatim (pool-remapped), then
+                // bind the result with DEFINE_GLOBAL. The range excludes the trailing
+                // DEFINE_GLOBAL, so emit it here.
+                copy_code_range(&mut frag, top, *start, *end, span);
+                let name_idx = frag.add_const(Value::Str(name.clone()));
+                frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
+            }
+            // Classes were emitted in step 2; anything else is left late-bound.
+            Some(TopDef::Class) | None => {}
         }
-        let name_idx = frag.add_const(Value::Str(name.clone()));
-        frag.emit_u16_u8(Op::DefineGlobal, name_idx, 0, span);
     }
 
-    // For a static method, the entry has no top-level DEFINE_GLOBAL; emit it last.
+    // 4) For a static method, the entry has no top-level DEFINE_GLOBAL; emit it last.
     if emit_entry {
         let proto_idx = frag.add_proto(entry_proto.clone());
         frag.emit_u16(Op::Closure, proto_idx, span);
@@ -818,6 +1025,28 @@ fn materialize_slice(
         class_name,
         entry_name: Rc::from(entry_name),
     })
+}
+
+/// Collect every top-level `DEFINE_GLOBAL` NAME in original source order. The emit
+/// walks reuse this so closure members materialize in declaration order (a dep that
+/// reads an earlier dep sees it already defined).
+fn source_order_define_names(top: &Chunk) -> Vec<Rc<str>> {
+    let mut names = Vec::new();
+    let mut ip = 0usize;
+    while ip < top.code.len() {
+        let Some(op) = Op::from_u8(top.code[ip]) else {
+            break;
+        };
+        let width = op.operand_width();
+        if op == Op::DefineGlobal {
+            let idx = top.read_u16(ip + 1) as usize;
+            if let Some(Value::Str(name)) = top.consts.get(idx) {
+                names.push(name.clone());
+            }
+        }
+        ip += 1 + width;
+    }
+    names
 }
 
 /// Build a [`WorkerCodeSlice`] for the worker entry named `entry_name` by recompiling
@@ -1079,5 +1308,58 @@ mod tests {
         let names = slice.dep_names();
         assert!(names.contains("K"));
         assert!(!names.contains("UNUSED"), "shipped unused const: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn slice_ships_computed_const_and_recomputes_it() {
+        // A computed-initializer const (`K = expensive()`) is shipped as its
+        // initializer CODE + the helper it calls, recomputed on the fresh isolate.
+        let src = "
+            fn expensive() { return 21 * 2 }
+            const K = expensive()
+            worker fn g(n) { return K + n }
+        ";
+        let slice = build_slice_for_test(src, "g").await;
+        let names = slice.dep_names();
+        assert!(names.contains("K"), "missing computed const K: {names:?}");
+        assert!(names.contains("expensive"), "missing helper: {names:?}");
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Number(8.0)]).await;
+        assert_eq!(out.unwrap(), Value::Number(50.0));
+    }
+
+    #[tokio::test]
+    async fn slice_excludes_unreferenced_computed_const() {
+        // A computed const the worker never references is not shipped.
+        let src = "
+            fn expensive() { return 99 }
+            const UNUSED = expensive()
+            worker fn g(n) { return n + 1 }
+        ";
+        let slice = build_slice_for_test(src, "g").await;
+        let names = slice.dep_names();
+        assert!(!names.contains("UNUSED"), "shipped unused computed const: {names:?}");
+        assert!(!names.contains("expensive"), "shipped unreachable helper: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn slice_ships_referenced_class_and_superclass() {
+        // A worker fn constructing a subclass ships the class + its superclass chain.
+        let src = "
+            class Shape {
+                kind: string
+                fn init(k) { self.kind = k }
+            }
+            class Circle extends Shape {
+                r: number
+                fn init(r) { super.init(\"c\"); self.r = r }
+            }
+            class Unused { fn init() {} }
+            worker fn g(r) { return Circle(r) }
+        ";
+        let slice = build_slice_for_test(src, "g").await;
+        let names = slice.dep_names();
+        assert!(names.contains("Circle"), "missing Circle: {names:?}");
+        assert!(names.contains("Shape"), "missing superclass Shape: {names:?}");
+        assert!(!names.contains("Unused"), "shipped unrelated class: {names:?}");
     }
 }

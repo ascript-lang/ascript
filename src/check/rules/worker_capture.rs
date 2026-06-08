@@ -12,10 +12,14 @@
 //! Workers run in a SEPARATE ISOLATE (a fresh `Interp` on a worker thread). Any
 //! outer mutable `let` would be a DIFFERENT copy at dispatch time, so reading it
 //! silently gives the wrong value; writing to it is even more broken because the
-//! write is invisible to the caller. Only top-level `const` bindings (which are
-//! value-copied at dispatch) and top-level `fn` declarations (function values,
-//! also copied) are safe to capture. Params of the worker fn itself are local
-//! (in-frame) and always safe.
+//! write is invisible to the caller. Immutable top-level bindings are safe to
+//! reference: the worker code-slice builder (`worker::dispatch`) ships them into the
+//! isolate — top-level `fn`s, `enum`s and literal `const`s (value-copied), `class`es
+//! (full definition), top-level `import`s (re-run on the isolate), and computed
+//! `const`s (their initializer is re-run on the isolate). Params of the worker fn
+//! itself are local (in-frame) and always safe. So this rule flags ONLY the unsafe
+//! captures (an outer mutable `let`, or a write to any shared global), never an
+//! immutable top-level reference.
 //!
 //! Rule logic (deliberately conservative — zero false positives):
 //!

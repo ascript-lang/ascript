@@ -375,6 +375,17 @@ impl Chunk {
         self.code.push(op as u8);
     }
 
+    /// Emit `op` followed by its operand bytes copied VERBATIM from `operand_bytes`.
+    /// Used by the worker code-slice builder to relocate an instruction whose operand
+    /// carries no pool index (a local slot, an upvalue index, a RELATIVE jump
+    /// displacement, or a count) — those bytes are position-independent under a
+    /// contiguous range copy, so they are reproduced unchanged.
+    pub fn emit_raw(&mut self, op: Op, operand_bytes: &[u8], span: Span) {
+        self.record_span(span);
+        self.code.push(op as u8);
+        self.code.extend_from_slice(operand_bytes);
+    }
+
     /// Emit an op with a `u16` little-endian operand.
     pub fn emit_u16(&mut self, op: Op, operand: u16, span: Span) {
         self.record_span(span);
