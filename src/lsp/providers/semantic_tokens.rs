@@ -262,7 +262,9 @@ fn type_for_binding_kind(k: BindingKind) -> u32 {
     match k {
         BindingKind::Param => TYPE_PARAMETER,
         BindingKind::Fn => TYPE_FUNCTION,
-        BindingKind::Class => TYPE_CLASS,
+        // IFACE: an interface name is a TYPE; color it like a class for now (a
+        // dedicated TYPE_INTERFACE / keyword tokens land with the full LSP pass).
+        BindingKind::Class | BindingKind::Interface => TYPE_CLASS,
         BindingKind::Enum => TYPE_ENUM,
         BindingKind::Import => TYPE_NAMESPACE,
         BindingKind::Let | BindingKind::Const | BindingKind::PatternBind | BindingKind::LoopVar => {

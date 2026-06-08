@@ -497,8 +497,12 @@ impl Chunk {
         let mut w = Writer::new();
         w.buf.extend_from_slice(&ASO_MAGIC);
         w.u32(ASO_FORMAT_VERSION);
-        write_chunk(&mut w, self)
-            .expect("constant pool must be literals-only (compiler invariant)");
+        // The const pool is a compiler invariant (literals-only), so a
+        // `NonLiteralConst` from the const path would be a compiler bug — but IFACE
+        // also returns `NonLiteralConst` to cleanly reject an interface program (whose
+        // `.aso` serialization lands in Task 9). Propagate the error so `ascript build`
+        // surfaces it as a clean diagnostic instead of panicking.
+        write_chunk(&mut w, self)?;
         // SP3 §A: surface a wire-format capacity overflow as a clean typed error.
         if let Some(e) = w.overflow {
             return Err(e);
@@ -591,6 +595,14 @@ fn write_chunk(w: &mut Writer, c: &Chunk) -> Result<(), AsoError> {
     w.len(c.class_protos.len());
     for cp in &c.class_protos {
         write_class_proto(w, cp)?;
+    }
+    // IFACE: interface descriptors are NOT yet serialized to `.aso` (Task 9 adds the
+    // Interface constant + version bump). Until then a program that declares an
+    // interface is rejected with a CLEAN error here rather than silently dropping the
+    // `interface_protos` (which would crash `Op::DefineInterface` on load). Empty for
+    // every non-interface program (the common case), so `.aso` round-trips unchanged.
+    if !c.interface_protos.is_empty() {
+        return Err(AsoError::NonLiteralConst("interface (.aso support lands in IFACE Task 9)"));
     }
     // imports
     w.len(c.imports.len());

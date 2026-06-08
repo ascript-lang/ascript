@@ -274,6 +274,7 @@ fn stmt(p: &mut Parser) {
         }
         EnumKw => enum_decl(p),
         ClassKw => class_decl(p),
+        InterfaceKw => interface_decl(p),
         ImportKw => import_stmt(p),
         ExportKw => export_stmt(p),
         _ => expr_stmt(p),
@@ -1407,6 +1408,13 @@ fn class_decl(p: &mut Parser) {
             p.error("expected superclass name after 'extends'");
         }
     }
+    // IFACE: optional `implements I1, I2` clause (after `extends`, before the body).
+    if p.at_kw("implements") {
+        let im = p.start();
+        p.bump(); // implements
+        iface_name_list(p);
+        p.complete(im, ImplementsClause);
+    }
     if p.at(LBrace) {
         p.bump();
     } else {
@@ -1432,6 +1440,109 @@ fn class_decl(p: &mut Parser) {
         p.error("expected '}' to close class");
     }
     p.complete(m, ClassDecl);
+}
+
+/// IFACE §3: `interface Name [extends A, B] { (fn name(params)[: ret])* }`. Each
+/// requirement is a plain instance-method signature with NO body; modifiers
+/// (`async`/`fn*`/`static`/`worker`) are rejected. `extends`/`implements` are
+/// contextual. Mirrors `class_decl`.
+fn interface_decl(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // interface
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected interface name");
+    }
+    if p.at_kw("extends") {
+        let em = p.start();
+        p.bump(); // extends
+        iface_name_list(p);
+        p.complete(em, ExtendsList);
+    }
+    if p.at(LBrace) {
+        p.bump();
+    } else {
+        p.error("expected '{' for interface body");
+    }
+    while !p.at(RBrace) && !p.at_end() {
+        let before = p.pos;
+        // `;` is an optional separator between requirements (class-body rule).
+        if p.at(Semicolon) {
+            p.bump();
+            continue;
+        }
+        // Reject method modifiers on a requirement (v1).
+        if p.at(AsyncKw) {
+            p.error("an interface method requirement may not be 'async'");
+            p.bump();
+        } else if at_static_method(p) {
+            p.error("an interface method requirement may not be 'static'");
+            p.bump();
+        } else if at_worker_modifier(p) {
+            p.error("an interface method requirement may not be 'worker'");
+            p.bump();
+        } else if p.at(FnKw) {
+            method_req(p);
+        } else {
+            p.error("expected a method requirement (fn ...)");
+            p.bump();
+        }
+        if p.pos == before {
+            p.bump();
+        }
+    }
+    if p.at(RBrace) {
+        p.bump();
+    } else {
+        p.error("expected '}' to close interface");
+    }
+    p.complete(m, InterfaceDecl);
+}
+
+/// IFACE §3: one interface method requirement — `fn name(params) [: ret]`, no body.
+fn method_req(p: &mut Parser) {
+    use SyntaxKind::*;
+    let m = p.start();
+    p.bump(); // fn
+    if p.at(Star) {
+        p.error("an interface method requirement may not be a generator ('fn*')");
+        p.bump();
+    }
+    if p.at(Ident) {
+        p.bump();
+    } else {
+        p.error("expected method name");
+    }
+    if p.at(LParen) {
+        param_list(p);
+    } else {
+        p.error("expected '(' after method name");
+    }
+    if p.at(Colon) {
+        ret_type(p);
+    }
+    p.complete(m, MethodReq);
+}
+
+/// IFACE: a comma-separated list of interface names (the body of `extends`/
+/// `implements`). The introducing contextual keyword is consumed by the caller.
+fn iface_name_list(p: &mut Parser) {
+    use SyntaxKind::*;
+    loop {
+        if p.at(Ident) {
+            p.bump();
+        } else {
+            p.error("expected an interface name");
+            break;
+        }
+        if p.at(Comma) {
+            p.bump();
+        } else {
+            break;
+        }
+    }
 }
 
 fn field_decl(p: &mut Parser) {

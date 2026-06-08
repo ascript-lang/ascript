@@ -7448,3 +7448,39 @@ async fn vm_let_contract_ok_matches_treewalker() {
         assert_opt_call_ok_three_way(src).await;
     }
 }
+
+// ---- IFACE Task 6: interfaces byte-identical across tree-walker / spec / generic ----
+
+#[tokio::test]
+async fn iface_instanceof_and_contract_three_way() {
+    let cases = [
+        // structural instanceof: conforming, non-conforming, non-instance
+        "interface R { fn read(b): int }\nclass File { fn read(b) { return 0 } }\nclass NoRead { fn write(b) { return 0 } }\nprint(File() instanceof R)\nprint(NoRead() instanceof R)\nprint(5 instanceof R)",
+        // inherited method satisfies
+        "interface R { fn read(b): int }\nclass Base { fn read(b) { return 1 } }\nclass Sub extends Base {}\nprint(Sub() instanceof R)",
+        // composition via extends (transitive union)
+        "interface Reader { fn read(b): int }\ninterface Writer { fn write(b): int }\ninterface RW extends Reader, Writer {}\nclass Sock { fn read(b) { return 1 } fn write(b) { return 2 } }\nclass OnlyR { fn read(b) { return 1 } }\nprint(Sock() instanceof RW)\nprint(OnlyR() instanceof RW)",
+        // interface-typed param contract accepts a conforming arg
+        "interface R { fn read(b): int }\nclass File { fn read(b) { return 7 } }\nfn slurp(r: R) { return r.read(0) }\nprint(slurp(File()))",
+        // a class instanceof still nominal (unchanged)
+        "class A {}\nclass B extends A {}\nprint(B() instanceof A)\nprint(A() instanceof B)",
+        // printing an interface value
+        "interface R { fn read(b): int }\nprint(R)",
+        // arity table: defaulted param satisfies arity-1 and arity-2 requirements
+        "interface R1 { fn read(b): int }\ninterface R2 { fn read(b, o): int }\nclass D { fn read(b, opts) { return 0 } }\nprint(D() instanceof R1)\nprint(D() instanceof R2)",
+    ];
+    for src in cases {
+        assert_opt_call_ok_three_way(src).await;
+    }
+}
+
+#[tokio::test]
+async fn iface_instanceof_bad_rhs_three_way() {
+    // `x instanceof <a number value>` panics identically on all three engines.
+    let cases = [
+        "let n = 5\nlet x = 3\nx instanceof n",
+    ];
+    for src in cases {
+        assert_opt_call_error_three_way(src).await;
+    }
+}

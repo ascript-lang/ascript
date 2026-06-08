@@ -623,3 +623,26 @@ fn both_frontends_reject_mixed_and_both_payload_variants() {
     // Both a `= scalar` backing AND a `(…)` payload.
     both_reject("enum E { Foo = 2(int) }");
 }
+
+// ---- IFACE Task 6: interface declarations parse on BOTH front-ends ----
+
+#[test]
+fn both_frontends_accept_interface_declarations() {
+    both_accept("interface Empty {}");
+    both_accept("interface Reader { fn read(b): int }");
+    both_accept("interface RW { fn read(b): int; fn write(b): int }");
+    both_accept("interface RW {\n fn read(b)\n fn write(b)\n}");
+    both_accept("interface RW extends Reader, Writer {}");
+    both_accept("export interface R { fn read(b): int }");
+    // A class with an `implements` clause (with and without `extends`).
+    both_accept("class C extends Super implements A, B { fn read(b) { return 0 } }");
+    both_accept("class C implements A { fn read(b) {} }");
+}
+
+#[test]
+fn both_frontends_reject_interface_modifiers_on_requirement() {
+    both_reject("interface R { async fn read(b) }");
+    both_reject("interface R { static fn read(b) }");
+    both_reject("interface R { worker fn read(b) }");
+    both_reject("interface R { fn* read(b) }");
+}

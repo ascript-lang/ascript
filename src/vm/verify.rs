@@ -273,6 +273,9 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Propagate => Effect::new(1, 1),
         Unwrap => Effect::new(1, 1),
         Import => Effect::new(0, 0),
+        // IFACE: DEFINE_INTERFACE builds the descriptor and PUSHES it (the compiler
+        // emits the matching DEFINE_GLOBAL/SET_LOCAL bind op after) — net +1, like CLASS.
+        DefineInterface => Effect::new(0, 1),
         // DEFINE_EXPORT pops the exported value and records it in the module map.
         DefineExport => Effect::new(1, 0),
 

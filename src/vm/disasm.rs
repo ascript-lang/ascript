@@ -279,6 +279,7 @@ fn op_name(op: Op) -> &'static str {
         SetProp => "SET_PROP",
         GetPropOpt => "GET_PROP_OPT",
         Class => "CLASS",
+        DefineInterface => "DEFINE_INTERFACE",
         Method => "METHOD",
         GetSuper => "GET_SUPER",
         InstanceOf => "INSTANCE_OF",

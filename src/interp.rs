@@ -5085,14 +5085,25 @@ impl Interp {
             return Ok(verdict);
         }
         let methods = self.flatten_interface(iface)?;
+        // VM classes keep an EMPTY `Class.methods` (their compiled methods live in the
+        // VM's per-class side table keyed by `Rc::as_ptr`), so for a VM-registered class
+        // the method-presence/arity check routes through the VM; a tree-walker class
+        // uses the shared `find_method`. Cached out of the borrow so we never hold a VM
+        // borrow across the loop.
+        let vm = self.vm();
         let mut verdict = true;
         for (name, req) in methods.iter() {
-            match crate::value::find_method(&class, name) {
-                Some((method, _)) if arity_compatible(&method, req) => {}
-                _ => {
-                    verdict = false;
-                    break;
-                }
+            // Prefer the VM side table when the class is VM-registered.
+            let satisfied = vm
+                .as_ref()
+                .and_then(|vm| vm.class_method_satisfies(&class, name, req))
+                .unwrap_or_else(|| match crate::value::find_method(&class, name) {
+                    Some((method, _)) => arity_compatible(&method, req),
+                    None => false,
+                });
+            if !satisfied {
+                verdict = false;
+                break;
             }
         }
         self.iface_verdict_cache.borrow_mut().insert(key, verdict);
@@ -7016,13 +7027,22 @@ pub(crate) fn arity_compatible(
     method: &crate::value::Method,
     req: &crate::value::MethodReq,
 ) -> bool {
-    let has_rest = method.params.iter().any(|p| p.rest);
+    arity_compatible_params(&method.params, req)
+}
+
+/// The param-slice core of [`arity_compatible`], shared by the tree-walker (a
+/// `value::Method`) and the VM (a compiled `FnProto`'s params) so the two engines'
+/// conformance verdicts cannot drift.
+pub(crate) fn arity_compatible_params(
+    params: &[crate::ast::Param],
+    req: &crate::value::MethodReq,
+) -> bool {
+    let has_rest = params.iter().any(|p| p.rest);
     // A rest requirement needs a variadic method (only place `req.has_rest` matters).
     if req.has_rest && !has_rest {
         return false;
     }
-    let min_required = method
-        .params
+    let min_required = params
         .iter()
         .filter(|p| !p.rest && p.default.is_none())
         .count();
@@ -7033,7 +7053,7 @@ pub(crate) fn arity_compatible(
         // Unbounded max — a rest param absorbs surplus args.
         return true;
     }
-    let declared_max = method.params.iter().filter(|p| !p.rest).count();
+    let declared_max = params.iter().filter(|p| !p.rest).count();
     req.arity <= declared_max
 }
 

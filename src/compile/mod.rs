@@ -875,6 +875,7 @@ fn stmt_node(stmt: &Stmt) -> &ResolvedNode {
         Stmt::ContinueStmt(n) => n.syntax(),
         Stmt::EnumDecl(n) => n.syntax(),
         Stmt::ClassDecl(n) => n.syntax(),
+        Stmt::InterfaceDecl(n) => n.syntax(),
         Stmt::ImportStmt(n) => n.syntax(),
         Stmt::ExportStmt(n) => n.syntax(),
     }
@@ -1364,6 +1365,7 @@ impl Compiler {
             Stmt::FnDecl(fn_decl) => self.compile_fn_decl(fn_decl),
             Stmt::ReturnStmt(ret) => self.compile_return(ret),
             Stmt::ClassDecl(class_decl) => self.compile_class(class_decl),
+            Stmt::InterfaceDecl(iface_decl) => self.compile_interface(iface_decl),
             Stmt::EnumDecl(enum_decl) => self.compile_enum(enum_decl),
             Stmt::ImportStmt(import_stmt) => self.compile_import(import_stmt),
             Stmt::ExportStmt(export_stmt) => self.compile_export(export_stmt),
@@ -1933,6 +1935,108 @@ impl Compiler {
             self.emit_set_local(slot, span);
         }
         Ok(())
+    }
+
+    /// IFACE: lower an `interface` declaration to an `InterfaceProto` const +
+    /// `Op::DefineInterface`. The proto carries only DATA (name + own method
+    /// requirements + `extends` names); `def_env` is supplied by the VM at runtime
+    /// (the shared class/module env), so siblings/forward refs resolve lazily.
+    fn compile_interface(
+        &mut self,
+        iface_decl: &crate::syntax::ast::InterfaceDecl,
+    ) -> Result<(), CompileError> {
+        use crate::syntax::kind::SyntaxKind as K;
+        let span = node_span(iface_decl);
+        let node = iface_decl.syntax();
+        let name = cst_first_ident(node)
+            .ok_or_else(|| CompileError::new("interface declaration has no name", span))?;
+
+        // `extends` names: the idents inside the `ExtendsList` child node, SKIPPING the
+        // leading contextual `extends` keyword (it lexes as an `Ident`).
+        let extends: Vec<String> = node
+            .children()
+            .find(|c| c.kind() == K::ExtendsList)
+            .map(|el| {
+                el.children_with_tokens()
+                    .filter_map(|t| t.into_token())
+                    .filter(|t| t.kind() == K::Ident)
+                    .map(|t| t.text().to_string())
+                    .skip(1) // the leading contextual `extends` keyword (lexes as Ident)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Method requirements: each `MethodReq` child → (name, arity, has_rest).
+        let mut methods: Vec<(String, usize, bool)> = Vec::new();
+        for req in node.children().filter(|c| c.kind() == K::MethodReq) {
+            let mname = cst_first_ident(req)
+                .ok_or_else(|| CompileError::new("interface method has no name", span))?;
+            let params: Vec<crate::syntax::cst::ResolvedNode> = req
+                .children()
+                .find(|c| c.kind() == K::ParamList)
+                .map(|pl| {
+                    pl.children()
+                        .filter(|c| c.kind() == K::Param)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let has_rest = params
+                .last()
+                .map(|p| {
+                    p.children_with_tokens()
+                        .filter_map(|el| el.into_token())
+                        .any(|t| t.kind() == K::DotDotDot)
+                })
+                .unwrap_or(false);
+            let arity = if has_rest {
+                params.len().saturating_sub(1)
+            } else {
+                params.len()
+            };
+            methods.push((mname, arity, has_rest));
+        }
+
+        let proto = Rc::new(crate::vm::chunk::InterfaceProto {
+            name: name.clone(),
+            methods,
+            extends,
+        });
+        let idx = self.chunk.add_interface_proto(proto);
+        self.chunk.emit_u16(Op::DefineInterface, idx, span);
+        // Bind the pushed descriptor: a DIRECT-child top-level interface is a
+        // module-scope user-global (DEFINE_GLOBAL); a nested one binds to its frame
+        // slot (SET_LOCAL). Mirrors `compile_class`.
+        if self.is_global_decl_site(node.text_range()) {
+            self.emit_define_global(&name, span);
+        } else {
+            let slot = self.interface_decl_slot(iface_decl)?;
+            self.emit_set_local(slot, span);
+        }
+        Ok(())
+    }
+
+    /// IFACE: the enclosing-frame local slot for a nested `interface Name`. Mirrors
+    /// `class_decl_slot` (the resolver records a binding keyed by the node's range).
+    fn interface_decl_slot(
+        &self,
+        iface_decl: &crate::syntax::ast::InterfaceDecl,
+    ) -> Result<u16, CompileError> {
+        let span = node_span(iface_decl);
+        let decl_range: TextRange = iface_decl.syntax().text_range();
+        let binding = self
+            .resolved
+            .bindings
+            .iter()
+            .find(|b| b.decl_range == decl_range)
+            .ok_or_else(|| {
+                CompileError::new(
+                    "interface declaration has no resolver binding (compiler bug)",
+                    span,
+                )
+            })?;
+        u16::try_from(binding.slot)
+            .map_err(|_| CompileError::new("local slot index exceeds 65535", span))
     }
 
     /// The enclosing-frame local slot for a `class Name` declaration. The resolver

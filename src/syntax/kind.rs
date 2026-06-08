@@ -66,6 +66,14 @@ pub enum SyntaxKind {
     ClassDecl,
     FieldDecl,
     MethodDecl,
+    // IFACE: structural interface declaration + its parts.
+    InterfaceDecl,
+    /// One method REQUIREMENT in an interface body (signature, no block).
+    MethodReq,
+    /// The `extends A, B` interface-composition list.
+    ExtendsList,
+    /// The `implements A, B` clause on a class.
+    ImplementsClause,
     ImportStmt,
     ExportStmt,
     ImportList,
@@ -252,6 +260,8 @@ pub enum SyntaxKind {
     MatchKw,
     #[static_text("class")]
     ClassKw,
+    #[static_text("interface")]
+    InterfaceKw,
     #[static_text("import")]
     ImportKw,
     #[static_text("export")]
@@ -341,6 +351,10 @@ mod tests {
             SyntaxKind::ClassDecl,
             SyntaxKind::FieldDecl,
             SyntaxKind::MethodDecl,
+            SyntaxKind::InterfaceDecl,
+            SyntaxKind::MethodReq,
+            SyntaxKind::ExtendsList,
+            SyntaxKind::ImplementsClause,
             SyntaxKind::ImportStmt,
             SyntaxKind::ExportStmt,
             SyntaxKind::ImportList,

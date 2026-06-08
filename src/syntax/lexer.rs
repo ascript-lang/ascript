@@ -413,6 +413,7 @@ fn keyword_kind(s: &str) -> Option<SyntaxKind> {
         "enum" => EnumKw,
         "match" => MatchKw,
         "class" => ClassKw,
+        "interface" => InterfaceKw,
         "import" => ImportKw,
         "export" => ExportKw,
         "async" => AsyncKw,
