@@ -934,3 +934,146 @@ await main()
 "#;
     assert_both_engines("computed_const_jumps", src, "101\n");
 }
+
+// ---------------------------------------------------------------------------
+// Regression: a computed-const slice range must be EXACTLY the const's own
+// initializer — never absorb a preceding non-defining statement (a `for`/`while`
+// loop, a bare expression statement, or an `if`). Absorbing a loop shipped its
+// backward `Loop` + `GET_LOCAL` into the fragment whose top-level slot_count was too
+// small → a hard `set_local slot out of bounds` isolate panic; absorbing a stack-
+// neutral statement over-shipped + re-ran its side effects on the isolate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn worker_fn_computed_const_after_for_loop() {
+    let src = r#"
+fn expensive(): number { return 42 }
+for (i in 0..3) { i + 1 }
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_after_for", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_after_while_loop() {
+    let src = r#"
+fn expensive(): number { return 42 }
+let w = 0
+while (w < 3) { w = w + 1 }
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_after_while", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_after_expr_statement() {
+    // A bare expression statement (`"ignored" + "me"`) before the const must not be
+    // absorbed. (A pure expr keeps the program output to just the worker result.)
+    let src = r#"
+fn expensive(): number { return 42 }
+"ignored" + "me"
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_after_expr", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_after_if() {
+    let src = r#"
+fn expensive(): number { return 42 }
+if (1 < 2) { let z = 99 }
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_after_if", src, "50\n");
+}
+
+#[test]
+fn worker_fn_computed_const_does_not_reship_absorbed_side_effect() {
+    // `noisy()` is a bare call statement BEFORE the computed const. It must NOT be
+    // absorbed into K's slice range — so `NOISY-RAN` prints EXACTLY ONCE (caller
+    // side), not a second time when the isolate runs the slice.
+    let src = r#"
+fn noisy(): number { print("NOISY-RAN"); return 0 }
+fn expensive(): number { return 42 }
+noisy()
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_no_reship", src, "NOISY-RAN\n50\n");
+}
+
+#[test]
+fn aso_mode_worker_fn_computed_const_after_loop() {
+    // The bounded-range fix must also survive build->run `.aso` (the slice is rebuilt
+    // from stored `.aso` bytes, and `load_slice` does NOT run the verifier — so an
+    // over-wide range would crash here too).
+    let src = r#"
+fn expensive(): number { return 42 }
+for (i in 0..3) { i + 1 }
+const K = expensive()
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    let (ok, out, err) = build_then_run_aso("computed_const_after_loop", src);
+    assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "50\n", "[.aso run] stdout mismatch (stderr={err:?})");
+}
+
+#[test]
+fn worker_fn_computed_const_ternary_initializer() {
+    // A computed-const whose OWN initializer is a top-level ternary (its condition is
+    // consumed by an internal conditional jump, transiently emptying the stack). The
+    // range must still cover the whole initializer, NOT cut off at the ternary arm.
+    let src = r#"
+const K = (5 > 3) ? 41 : 99
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(1))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_ternary", src, "42\n");
+}
+
+#[test]
+fn worker_fn_computed_const_short_circuit_initializer() {
+    // A computed-const whose initializer is a short-circuit `&&` (also an internal
+    // conditional jump).
+    let src = r#"
+fn truthy(): number { return 7 }
+const K = truthy() && 42
+worker fn g(n: number): number { return K + n }
+async fn main() {
+  print(await g(8))
+}
+await main()
+"#;
+    assert_both_engines("computed_const_short_circuit", src, "50\n");
+}

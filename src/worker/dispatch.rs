@@ -104,15 +104,17 @@ enum TopDef {
 ///     (the run's byte-range is copied + re-run on the isolate).
 ///
 /// `import` bindings are NOT in this map (they are shipped wholesale by
-/// [`emit_top_imports`]). The range tracked for a computed const is the
-/// value-producing portion `[start, define_ip)` — i.e. everything since the previous
-/// statement boundary, excluding the trailing `DEFINE_GLOBAL`.
+/// [`emit_top_imports`]). For a computed const the tracked range `[start, define_ip)`
+/// is EXACTLY its own initializer — the run since the most recent top-level STATEMENT
+/// boundary (NOT merely since the last define/import: a preceding bare expression,
+/// `for`, `while`, or `if` statement must NOT be absorbed into the const's range). The
+/// boundaries come from [`top_level_statement_starts`] (a CFG-aware top-level pass).
 fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
     let mut defs: HashMap<Rc<str>, TopDef> = HashMap::new();
-    // `stmt_start` is the ip of the first value-producing op of the current top-level
-    // statement (right after the previous statement's terminator: a DEFINE_GLOBAL or
-    // an IMPORT). The previous instruction `(op, operand)` classifies a simple binding.
-    let mut stmt_start = 0usize;
+    // The offsets at which a fresh top-level statement BEGINS (sorted ascending). A
+    // computed const's initializer starts at the greatest boundary `<= define_ip`.
+    let starts = top_level_statement_starts(top);
+
     let mut prev: Option<(Op, u16)> = None;
     let mut ip = 0usize;
     while ip < top.code.len() {
@@ -121,25 +123,130 @@ fn top_level_defs(top: &Chunk) -> HashMap<Rc<str>, TopDef> {
         };
         let width = op.operand_width();
         let operand_u16 = if width >= 2 { top.read_u16(ip + 1) } else { 0 };
-        match op {
-            Op::DefineGlobal => {
-                if let Some(Value::Str(name)) = top.consts.get(operand_u16 as usize) {
-                    let def = classify_binding(top, prev, stmt_start, ip);
-                    defs.entry(name.clone()).or_insert(def);
-                }
-                // The DEFINE_GLOBAL terminates this statement; the next starts after it.
-                stmt_start = ip + 1 + width;
+
+        if op == Op::DefineGlobal {
+            if let Some(Value::Str(name)) = top.consts.get(operand_u16 as usize) {
+                // The initializer starts at the last statement boundary at-or-before
+                // this DEFINE_GLOBAL (the start of THIS binding's own statement).
+                let stmt_start = starts
+                    .iter()
+                    .copied()
+                    .take_while(|&s| s <= ip)
+                    .last()
+                    .unwrap_or(0);
+                let def = classify_binding(top, prev, stmt_start, ip);
+                defs.entry(name.clone()).or_insert(def);
             }
-            Op::Import => {
-                // An import is its own statement (shipped via emit_top_imports).
-                stmt_start = ip + 1 + width;
-            }
-            _ => {}
         }
+
         prev = Some((op, operand_u16));
         ip += 1 + width;
     }
     defs
+}
+
+/// Compute the byte-offsets at which each TOP-LEVEL statement begins, in ascending
+/// order. Used to bound a computed-`const` initializer to exactly its own statement
+/// (so a preceding bare-expr / `for` / `while` / `if`, OR the nested statements inside
+/// such a control structure, are never absorbed into the const's shipped range).
+///
+/// ## Algorithm — depth-0 fall-through offsets NOT enclosed by any jump span
+///
+/// Every top-level statement is stack-NEUTRAL, so the CFG-accurate operand-stack ENTRY
+/// depth is 0 at each top-level statement boundary. We compute that depth with a
+/// worklist join (the naive LINEAR scan is wrong across branches — `a ? b : c` would
+/// double-count both arms), reusing the verifier's authoritative per-op delta
+/// ([`crate::vm::verify::op_stack_delta`]) and jump decoding.
+///
+/// Depth 0 alone is NOT sufficient: a control structure contains nested balanced
+/// statements (a `for` body's `i + 1; POP` returns to depth 0 INSIDE the loop), and a
+/// ternary's arms start at depth 0. The distinguishing fact: a statement INTERIOR to a
+/// control structure is ENCLOSED by that structure's jump — strictly inside `(lo, hi)`
+/// of any jump span, or the TARGET of a backward `Loop` (the loop header). So a
+/// statement LEADER is: offset 0, OR a reachable depth-0 offset enclosed by NO jump
+/// span. (A loop-EXIT offset is the FORWARD target of the loop's exit `JUMP_IF_FALSE`,
+/// so it sits outside every span and is correctly a leader; the merge point of a
+/// ternary carries the partial value at depth ≥ 1, so the depth-0 filter excludes it
+/// without any extra "predecessor is a jump" rule — which would wrongly drop the
+/// loop exit, whose physical predecessor is the back-edge `Loop`.)
+fn top_level_statement_starts(top: &Chunk) -> Vec<usize> {
+    // Decode all top-level instruction offsets + an offset->index map.
+    let mut offsets: Vec<usize> = Vec::new();
+    let mut ip = 0usize;
+    while ip < top.code.len() {
+        let Some(op) = Op::from_u8(top.code[ip]) else {
+            break;
+        };
+        offsets.push(ip);
+        ip += 1 + op.operand_width();
+    }
+    let index_of: HashMap<usize, usize> = offsets.iter().enumerate().map(|(i, &o)| (o, i)).collect();
+
+    // CFG-accurate entry depth at each instruction (None = unreached); plus the jump
+    // SPANS. Each span is `(lo, hi, target_interior)`: an offset is control-structure
+    // interior if it lies strictly inside `(lo, hi)`, OR equals the jump TARGET when
+    // that target is interior. A BACKWARD jump (`Loop`) targets the loop HEADER, which
+    // IS interior (the loop's condition/body), so its target is interior. A FORWARD
+    // jump targets the merge/exit, which is the NEXT statement's leader (NOT interior).
+    let mut entry: Vec<Option<isize>> = vec![None; offsets.len()];
+    let mut spans: Vec<(usize, usize, Option<usize>)> = Vec::new();
+    let mut work: Vec<(usize, isize)> = vec![(0, 0)];
+    while let Some((i, d)) = work.pop() {
+        if entry[i].is_some() {
+            continue;
+        }
+        entry[i] = Some(d);
+        let off = offsets[i];
+        let op = Op::from_u8(top.code[off]).expect("decoded above");
+        let exit = d + crate::vm::verify::op_stack_delta(top, op, off + 1);
+        let is_uncond = matches!(op, Op::Jump | Op::Loop);
+        let is_cond = matches!(op, Op::JumpIfFalse | Op::JumpIfTrue | Op::JumpIfNotNil);
+        if !is_uncond && !matches!(op, Op::Return | Op::Yield) {
+            if let Some(&ni) = index_of.get(&(off + 1 + op.operand_width())) {
+                work.push((ni, exit));
+            }
+        }
+        if is_uncond || is_cond {
+            // Jump operand is an i16 displacement from the byte after the operand.
+            let disp = top.read_i16(off + 1) as isize;
+            let target = (off + 1 + 2) as isize + disp;
+            if target >= 0 {
+                let t = target as usize;
+                let backward = t < off; // a `Loop` back-edge to the loop header.
+                let interior_target = if backward { Some(t) } else { None };
+                spans.push((off.min(t), off.max(t), interior_target));
+                if let Some(&ti) = index_of.get(&t) {
+                    work.push((ti, exit));
+                }
+            }
+        }
+    }
+    let enclosed = |o: usize| {
+        spans
+            .iter()
+            .any(|&(lo, hi, tgt)| (lo < o && o < hi) || tgt == Some(o))
+    };
+
+    // A statement LEADER is offset 0, or any reachable DEPTH-0 offset NOT enclosed by a
+    // jump span. Enclosure already excludes control-structure interiors AND a ternary/
+    // short-circuit's arm starts; the depth-0 filter excludes an expression's interior
+    // merge points (which carry the partial value, depth ≥ 1). No "previous op is a
+    // jump" rule is needed — a loop-EXIT leader's physical predecessor IS the back-edge
+    // `Loop`, so such a rule would wrongly drop it.
+    let mut starts: Vec<usize> = Vec::new();
+    for (i, &off) in offsets.iter().enumerate() {
+        if i == 0 {
+            starts.push(off); // the program's first statement.
+            continue;
+        }
+        if enclosed(off) {
+            continue; // interior to a loop/conditional → not a top-level boundary.
+        }
+        if entry[i] == Some(0) {
+            starts.push(off);
+        }
+    }
+    starts
 }
 
 /// Classify the binding terminated by the `DEFINE_GLOBAL` at `define_ip`, given the
@@ -704,13 +811,24 @@ fn emit_dep_closure(
 
 /// Copy the top-level instruction byte-range `[start, end)` of `top.code` verbatim
 /// into `frag`, remapping every pool-indexing operand (const/name-const/proto/
-/// class-proto/import) into `frag`'s own pools. JUMP displacements are RELATIVE, so a
-/// contiguous range copy preserves them (a computed-const initializer's jumps —
-/// ternary, short-circuit `&&`/`||` — target within the range). Used to ship a
-/// computed-`const` initializer (`TopDef::ComputedConst`) so the isolate RE-RUNS it
-/// and recomputes the value. The op→pool classification mirrors `verify::check_operands`
-/// (the authoritative table); a leading-u16 op not naming a pool (slots, upvalues,
-/// counts, jump targets, zero-operand ops) is copied byte-for-byte unchanged.
+/// class-proto/import) into `frag`'s own pools. Used to ship a computed-`const`
+/// initializer (`TopDef::ComputedConst`) so the isolate RE-RUNS it and recomputes the
+/// value.
+///
+/// JUMP/`Loop` displacements are RELATIVE (measured from the byte after the operand),
+/// so copying the WHOLE range contiguously at the same relative positions preserves
+/// them: a computed-const initializer is one self-contained expression whose only
+/// jumps — ternary `?:` and short-circuit `&&`/`||` — target WITHIN its own range, so
+/// no displacement escapes the copied span. (The bounded-range invariant is enforced
+/// upstream by `top_level_defs`, which sets the range to exactly the const's own
+/// statement.)
+///
+/// The op→pool classification below mirrors `verify::check_operands` (the
+/// authoritative operand table). A leading-u16 op that names NO pool — local/upvalue
+/// slots, jump displacements, and inline counts/argc — is copied byte-for-byte
+/// unchanged. The catch-all `debug_assert!`s (via `op_indexes_pool`) that no
+/// pool-indexing op slips through unremapped, so a FUTURE opcode that adds a pool
+/// index fails loudly here instead of silently shipping a stale index.
 fn copy_code_range(frag: &mut Chunk, top: &Chunk, start: usize, end: usize, span: Span) {
     let mut ip = start;
     while ip < end {
@@ -766,11 +884,52 @@ fn copy_code_range(frag: &mut Chunk, top: &Chunk, start: usize, end: usize, span
             // (slots, upvalues, jump displacements — RELATIVE, preserved by a
             // contiguous copy — and counts/argc on zero-pool ops.)
             _ => {
+                // Fail-loud: any op that DOES carry a pool index must have a remap arm
+                // above. If this trips, an opcode added a pool operand without a
+                // matching `copy_code_range` arm — the verbatim copy would ship a stale
+                // index. Keep this in sync with `verify::check_operands`.
+                debug_assert!(
+                    !op_indexes_pool(op),
+                    "copy_code_range: pool-indexing op {op:?} reached the verbatim \
+                     catch-all — add a remap arm (see verify::check_operands)"
+                );
                 frag.emit_raw(op, &top.code[ip + 1..ip + 1 + width], span);
             }
         }
         ip += 1 + width;
     }
+}
+
+/// Whether `op`'s leading u16 operand indexes one of the chunk's POOLS (const /
+/// proto / class-proto / import) and therefore MUST be remapped when relocated into a
+/// fresh chunk. This is the exact set of pool-indexing ops in `verify::check_operands`
+/// (the authoritative operand table); [`copy_code_range`] uses it as a fail-loud guard
+/// so a future pool-carrying opcode cannot be silently copied with a stale index.
+fn op_indexes_pool(op: Op) -> bool {
+    matches!(
+        op,
+        // const pool (value or name-const)
+        Op::Const
+            | Op::GetGlobal
+            | Op::DefineGlobal
+            | Op::SetGlobal
+            | Op::ImmutableError
+            | Op::GetProp
+            | Op::SetProp
+            | Op::GetPropOpt
+            | Op::Method
+            | Op::GetSuper
+            | Op::ObjectKey
+            | Op::MatchHasKey
+            | Op::CallMethodSpread
+            | Op::DefineExport
+            | Op::ObjectRest
+            | Op::CallMethod
+            // proto / class-proto / import pools
+            | Op::Closure
+            | Op::Class
+            | Op::Import
+    )
 }
 
 /// Append `src`'s definition instructions (everything before its trailing
@@ -1362,4 +1521,35 @@ mod tests {
         assert!(names.contains("Shape"), "missing superclass Shape: {names:?}");
         assert!(!names.contains("Unused"), "shipped unrelated class: {names:?}");
     }
+
+    #[tokio::test]
+    async fn computed_const_range_is_bounded_to_its_own_initializer() {
+        // A `for` loop and a bare call statement precede the computed const. The
+        // const's slice range must be EXACTLY `expensive()` — NOT absorb the loop
+        // (which would ship a backward Loop + GET_LOCAL and crash the isolate) nor the
+        // `noisy()` call (which would over-ship `noisy` into the closure). The slice
+        // must run cleanly in a fresh isolate AND not pull in `noisy`.
+        let src = "
+            fn noisy() { return 7 }
+            fn expensive() { return 42 }
+            noisy()
+            for (i in 0..3) { i + 1 }
+            const K = expensive()
+            worker fn g(n) { return K + n }
+        ";
+        let slice = build_slice_for_test(src, "g").await;
+        let names = slice.dep_names();
+        assert!(names.contains("K"), "missing K: {names:?}");
+        assert!(names.contains("expensive"), "missing expensive: {names:?}");
+        assert!(
+            !names.contains("noisy"),
+            "over-shipped absorbed `noisy` into the slice: {names:?}"
+        );
+        // The slice runs to completion in a fresh isolate (no `set_local` slot panic).
+        let out = run_slice_in_fresh_isolate(&slice, "g", vec![Value::Number(8.0)]).await;
+        assert_eq!(out.unwrap(), Value::Number(50.0));
+    }
 }
+
+
+
