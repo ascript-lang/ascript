@@ -392,6 +392,16 @@ impl<'a> Reader<'a> {
     fn len(&mut self) -> Result<usize, AsoError> {
         usize::try_from(self.u32()?).map_err(|_| AsoError::Overflow)
     }
+    /// Bytes left unread — the hard ceiling on any length-driven pre-allocation.
+    /// A declared element count larger than this cannot possibly be satisfied (every
+    /// element is ≥ 1 byte), so clamping `reserve`/`with_capacity` to `remaining()`
+    /// turns an attacker-controlled length into a bounded allocation; the per-element
+    /// decode loop then reports the short read as a clean `Truncated` error instead of
+    /// the process aborting on a multi-gigabyte allocation. The real (unclamped) count
+    /// still drives the loop, so a well-formed stream is unaffected.
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
     fn bytes(&mut self) -> Result<&'a [u8], AsoError> {
         let n = self.len()?;
         self.take(n)
@@ -568,31 +578,31 @@ fn read_chunk(r: &mut Reader) -> Result<Chunk, AsoError> {
     c.code = r.bytes()?.to_vec();
     // consts
     let n = r.len()?;
-    c.consts.reserve(n);
+    c.consts.reserve(n.min(r.remaining()));
     for _ in 0..n {
         c.consts.push(read_value(r)?);
     }
     // protos
     let n = r.len()?;
-    c.protos.reserve(n);
+    c.protos.reserve(n.min(r.remaining()));
     for _ in 0..n {
         c.protos.push(Rc::new(read_proto(r)?));
     }
     // class_protos
     let n = r.len()?;
-    c.class_protos.reserve(n);
+    c.class_protos.reserve(n.min(r.remaining()));
     for _ in 0..n {
         c.class_protos.push(Rc::new(read_class_proto(r)?));
     }
     // imports
     let n = r.len()?;
-    c.imports.reserve(n);
+    c.imports.reserve(n.min(r.remaining()));
     for _ in 0..n {
         c.imports.push(read_import(r)?);
     }
     // spans
     let n = r.len()?;
-    c.spans.reserve(n);
+    c.spans.reserve(n.min(r.remaining()));
     for _ in 0..n {
         let off = r.usize()?;
         let start = r.usize()?;
@@ -601,13 +611,13 @@ fn read_chunk(r: &mut Reader) -> Result<Chunk, AsoError> {
     }
     // upvalues
     let n = r.len()?;
-    c.upvalues.reserve(n);
+    c.upvalues.reserve(n.min(r.remaining()));
     for _ in 0..n {
         c.upvalues.push(read_upvalue(r)?);
     }
     // cell_slots
     let n = r.len()?;
-    c.cell_slots.reserve(n);
+    c.cell_slots.reserve(n.min(r.remaining()));
     for _ in 0..n {
         c.cell_slots.push(r.u32()?);
     }
@@ -702,7 +712,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
         TAG_ENUM => {
             let name = r.str()?;
             let n = r.len()?;
-            let mut variants = indexmap::IndexMap::with_capacity(n);
+            let mut variants = indexmap::IndexMap::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 let key = r.str()?;
                 let enum_name = r.str()?;
@@ -721,7 +731,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
         }
         TAG_ARRAY => {
             let n = r.len()?;
-            let mut elems = Vec::with_capacity(n);
+            let mut elems = Vec::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 elems.push(read_value(r)?);
             }
@@ -766,7 +776,7 @@ fn read_proto(r: &mut Reader) -> Result<FnProto, AsoError> {
     let is_worker = flags & 8 != 0;
     let has_owning_class = flags & 16 != 0;
     let n = r.len()?;
-    let mut params = Vec::with_capacity(n);
+    let mut params = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
         params.push(read_param(r)?);
     }
@@ -915,7 +925,7 @@ fn read_type(r: &mut Reader) -> Result<Type, AsoError> {
         TY_RESULT => Type::Result(Box::new(read_type(r)?)),
         TY_TUPLE => {
             let n = r.len()?;
-            let mut ts = Vec::with_capacity(n);
+            let mut ts = Vec::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 ts.push(read_type(r)?);
             }
@@ -1198,7 +1208,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
         }
         EX_ARRAY => {
             let n = r.len()?;
-            let mut elems = Vec::with_capacity(n);
+            let mut elems = Vec::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 let el = match r.u8()? {
                     EL_ITEM => ArrayElem::Item(read_expr(r)?),
@@ -1216,7 +1226,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
         }
         EX_OBJECT => {
             let n = r.len()?;
-            let mut entries = Vec::with_capacity(n);
+            let mut entries = Vec::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 let ent = match r.u8()? {
                     EL_ITEM => {
@@ -1237,7 +1247,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
         }
         EX_MAP => {
             let n = r.len()?;
-            let mut entries = Vec::with_capacity(n);
+            let mut entries = Vec::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 let key = read_expr(r)?;
                 let value = read_expr(r)?;
@@ -1263,7 +1273,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
         EX_CALL => {
             let callee = Box::new(read_expr(r)?);
             let n = r.len()?;
-            let mut args = Vec::with_capacity(n);
+            let mut args = Vec::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 let a = match r.u8()? {
                     EL_ITEM => CallArg::Pos(read_expr(r)?),
@@ -1293,7 +1303,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
         }
         EX_TEMPLATE => {
             let n = r.len()?;
-            let mut parts = Vec::with_capacity(n);
+            let mut parts = Vec::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 let part = match r.u8()? {
                     TP_LIT => TemplatePart::Lit(r.str()?),
@@ -1384,25 +1394,25 @@ fn write_class_proto(w: &mut Writer, cp: &ClassProto) -> Result<(), AsoError> {
 fn read_class_proto(r: &mut Reader) -> Result<ClassProto, AsoError> {
     let (class, default_sources) = read_class(r)?;
     let n = r.len()?;
-    let mut default_fields = Vec::with_capacity(n);
+    let mut default_fields = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
         default_fields.push(r.str()?);
     }
     let n = r.len()?;
-    let mut method_names = Vec::with_capacity(n);
+    let mut method_names = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
         method_names.push(r.str()?);
     }
     let n = r.len()?;
-    let mut static_method_names = Vec::with_capacity(n);
+    let mut static_method_names = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
         static_method_names.push(r.str()?);
     }
     let n = r.len()?;
-    let mut default_captures = Vec::with_capacity(n);
+    let mut default_captures = Vec::with_capacity(n.min(r.remaining()));
     for _ in 0..n {
         let m = r.len()?;
-        let mut caps = Vec::with_capacity(m);
+        let mut caps = Vec::with_capacity(m.min(r.remaining()));
         for _ in 0..m {
             let name = r.str()?;
             let idx = r.u16()?;
@@ -1484,7 +1494,7 @@ fn read_class(r: &mut Reader) -> Result<(Class, Vec<(String, String)>), AsoError
     let name = r.str()?;
     let is_worker = r.u8()? != 0;
     let n = r.len()?;
-    let mut fields = indexmap::IndexMap::with_capacity(n);
+    let mut fields = indexmap::IndexMap::with_capacity(n.min(r.remaining()));
     let mut sources: Vec<(String, String)> = Vec::new();
     for _ in 0..n {
         let fname = r.str()?;
@@ -1582,7 +1592,7 @@ fn read_import(r: &mut Reader) -> Result<ImportDesc, AsoError> {
         IMP_NAMED => {
             let source = r.str()?;
             let n = r.len()?;
-            let mut names = Vec::with_capacity(n);
+            let mut names = Vec::with_capacity(n.min(r.remaining()));
             for _ in 0..n {
                 let name = r.str()?;
                 let slot = r.u16()?;
@@ -1650,6 +1660,37 @@ fn read_upvalue(r: &mut Reader) -> Result<UpvalueDescriptor, AsoError> {
 mod tests {
     use super::*;
     use crate::vm::disasm::disasm;
+
+    /// P0 (security): a crafted `.aso` that declares a gigantic element count over a
+    /// short buffer must return a clean `Err`, NOT pre-allocate gigabytes and abort the
+    /// process. Pre-fix, `read_chunk`'s `c.consts.reserve(u32::MAX)` allocated ~137 GB
+    /// (≈4.3e9 × size_of::<Value>) → the allocator returns null → Rust aborts. The
+    /// `remaining()` clamp bounds the pre-allocation; the per-element loop then reports
+    /// the short read as `Truncated`. Removing the clamp re-aborts this test — that is
+    /// the regression guard.
+    #[test]
+    fn reader_clamps_bomb_length_no_abort() {
+        // code length = 0 (u32 LE), then a bomb const-pool count = u32::MAX (u32 LE).
+        let buf = [0u8, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut r = Reader::new(&buf);
+        assert!(
+            matches!(read_chunk(&mut r), Err(AsoError::Truncated)),
+            "a bomb length must decode to a clean Truncated error, never an abort"
+        );
+    }
+
+    /// The clamp must not change behavior for a well-formed stream: a genuine large
+    /// (but in-bounds) count still decodes fully. Guards against the clamp truncating
+    /// valid data.
+    #[test]
+    fn reader_clamp_preserves_valid_decode() {
+        // A real round-trip through a chunk with a non-trivial const pool proves the
+        // clamp is a no-op when remaining() >= n.
+        let original = compile("let xs = [1, 2, 3, 4, 5]; print(xs)");
+        let bytes = original.to_bytes().expect("serialize");
+        let back = Chunk::from_bytes(&bytes).expect("a valid .aso must still decode");
+        assert_eq!(disasm(&original), disasm(&back), "valid decode unchanged by clamp");
+    }
 
     /// Compile `src` to a top-level chunk via the real compiler.
     fn compile(src: &str) -> Chunk {
