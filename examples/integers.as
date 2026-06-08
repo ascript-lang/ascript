@@ -7,6 +7,7 @@
 
 import { codepoints, from_codepoints, code_at } from "std/string"
 import { map } from "std/array"
+import { popcount, leading_zeros, trailing_zeros, rotl, rotr } from "std/math"
 
 // ---- Literals: every base + underscores ------------------------------------
 let dec = 1_000_000          // decimal with digit separators
@@ -47,6 +48,13 @@ print(channel(color, 16))    // 171  (0xAB)
 print(channel(color, 8))     // 205  (0xCD)
 print(channel(color, 0))     // 239  (0xEF)
 print(~0)                    // -1   (bitwise NOT)
+
+// ---- Bit helpers (std/math, operating on the 64-bit i64 width) -------------
+print(popcount(0xFF))        // 8    (set bits in 0b1111_1111)
+print(leading_zeros(1))      // 63   (a single low bit in a 64-bit word)
+print(trailing_zeros(8))     // 3    (0b1000 has 3 trailing zeros)
+print(rotl(1, 1))            // 2    (rotate-left by 1)
+print(rotr(2, 1))            // 1    (rotate-right by 1)
 
 // ---- Code points are ints (the Go rune model — no char type) ---------------
 let pts = codepoints("hi")           // [104, 105]

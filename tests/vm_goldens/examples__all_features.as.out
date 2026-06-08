@@ -36,7 +36,7 @@ optional type: 4 -1
 generator for-await: [1, 2, 3, 4]
 generator next: 1 2 3
 async: 42 [2, 4, 6]
-math: 7.0 9.0 3.0
+math: 7 9.0 3
 array: [10, 20, 30] 10
 json: {"k":1,"list":[true,null]}
 forward-ref const: 42

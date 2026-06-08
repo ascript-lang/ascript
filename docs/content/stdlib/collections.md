@@ -998,43 +998,54 @@ import * as math from "std/math"
 
 ### math.abs
 
-Absolute value.
+Absolute value. **Subtype-preserving** — the only `std/math` function that
+returns the same numeric subtype it was given: `abs(int) -> int`,
+`abs(float) -> float`. `abs` of `i64::MIN` (the one int with no positive
+counterpart) is a checked-overflow panic, never a silent wrap.
 
 - `x: number`
-- Returns: `number`
+- Returns: `int` if `x` is an `int`, otherwise `float`
 
 ```ascript
-math.abs(-3)   // 3
+math.abs(-3)     // 3    (int → int)
+math.abs(-2.5)   // 2.5  (float → float)
 ```
 
 ### math.floor
 
-Round down toward negative infinity.
+Round down toward negative infinity. **Returns an `int`** (NUM §4): a `float` is
+rounded and converted to an exact `int`; an `int` argument is already integral
+and is returned unchanged. A non-finite (`inf`/`nan`) or out-of-`i64`-range
+result is a Tier-2 panic (never a silent saturation).
 
 - `x: number`
-- Returns: `number`
+- Returns: `int`
 
 ```ascript
-math.floor(2.9)   // 2
+math.floor(2.9)    // 2
+math.floor(-3.1)   // -4
 ```
 
 ### math.ceil
 
-Round up toward positive infinity.
+Round up toward positive infinity. **Returns an `int`** (same int-conversion
+rules and panics as `math.floor`).
 
 - `x: number`
-- Returns: `number`
+- Returns: `int`
 
 ```ascript
-math.ceil(2.1)   // 3
+math.ceil(2.1)    // 3
+math.ceil(-3.1)   // -3
 ```
 
 ### math.round
 
-Round to the nearest integer (halves round away from zero).
+Round to the nearest integer (halves round away from zero). **Returns an `int`**
+(same int-conversion rules and panics as `math.floor`).
 
 - `x: number`
-- Returns: `number`
+- Returns: `int`
 
 ```ascript
 math.round(2.5)   // 3
@@ -1251,10 +1262,11 @@ math.sign(3)    // 1
 
 ### math.trunc
 
-Truncate toward zero (drop the fractional part).
+Truncate toward zero (drop the fractional part). **Returns an `int`** (same
+int-conversion rules and panics as `math.floor`).
 
 - `x: number`
-- Returns: `number`
+- Returns: `int`
 
 ```ascript
 math.trunc(3.9)    // 3
@@ -1426,6 +1438,110 @@ math.choice(["rock", "paper", "scissors"])   // e.g. "paper"
 ```
 
 > **Tip — `min`/`max` with arrays:** `math.min` and `math.max` are variadic (positional arguments), not array-taking. To find the min or max of an array use spread: `math.min(...arr)`, `math.max(...arr)`.
+
+### Integer division helpers (`int → int`)
+
+These complement the language's truncating `/` (which rounds toward zero). All
+require `int` arguments — a `float` is a Tier-2 panic — and `b == 0` is a clean
+Tier-2 panic.
+
+#### math.floordiv
+
+Floored integer division: the quotient rounded toward negative infinity (unlike
+`/`, which truncates toward zero).
+
+- `a: int`, `b: int` (`b != 0`)
+- Returns: `int`
+
+```ascript
+math.floordiv(7, 2)    // 3
+math.floordiv(-7, 2)   // -4   (floors; `-7 / 2` truncates to -3)
+```
+
+#### math.ceildiv
+
+Ceiling integer division: the quotient rounded toward positive infinity.
+
+- `a: int`, `b: int` (`b != 0`)
+- Returns: `int`
+
+```ascript
+math.ceildiv(7, 2)    // 4
+math.ceildiv(-7, 2)   // -3
+```
+
+#### math.divmod
+
+Combined floored quotient and matching remainder as a two-element array
+`[q, r]`, satisfying `a == q*b + r` with `q` floored.
+
+- `a: int`, `b: int` (`b != 0`)
+- Returns: `[int, int]`
+
+```ascript
+math.divmod(17, 5)    // [3, 2]    (17 == 3*5 + 2)
+math.divmod(-17, 5)   // [-4, 3]   (-17 == -4*5 + 3)
+```
+
+### Bit helpers (`int → int`, on the 64-bit `i64` width)
+
+All require `int` arguments. Rotations operate on the full 64-bit width and take
+their count modulo 64.
+
+#### math.popcount
+
+The number of set (one) bits.
+
+- `x: int`
+- Returns: `int`
+
+```ascript
+math.popcount(0xFF)   // 8
+```
+
+#### math.leading_zeros
+
+The number of leading zero bits in the 64-bit representation.
+
+- `x: int`
+- Returns: `int`
+
+```ascript
+math.leading_zeros(1)   // 63
+```
+
+#### math.trailing_zeros
+
+The number of trailing zero bits in the 64-bit representation.
+
+- `x: int`
+- Returns: `int`
+
+```ascript
+math.trailing_zeros(8)   // 3
+```
+
+#### math.rotl
+
+Rotate the 64-bit value left by `n` bits (count taken modulo 64).
+
+- `x: int`, `n: int`
+- Returns: `int`
+
+```ascript
+math.rotl(1, 1)   // 2
+```
+
+#### math.rotr
+
+Rotate the 64-bit value right by `n` bits (count taken modulo 64).
+
+- `x: int`, `n: int`
+- Returns: `int`
+
+```ascript
+math.rotr(2, 1)   // 1
+```
 
 ## std/convert
 

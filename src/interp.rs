@@ -8320,8 +8320,10 @@ print(r[1])
 
     #[tokio::test]
     async fn imports_std_math() {
+        // NUM §4: `math.abs(-5)` is subtype-preserving — an `int` in, an `int`
+        // out (prints `5`, not `5.0`); `math.pow` stays `float`.
         let out = run("import * as math from \"std/math\"\nprint(math.abs(-5))\nprint(math.pow(2, 8))\nprint(math.pi > 3.14)").await;
-        assert_eq!(out, "5.0\n256.0\ntrue\n");
+        assert_eq!(out, "5\n256.0\ntrue\n");
     }
 
     #[tokio::test]
@@ -8394,8 +8396,9 @@ print(r[1])
 
     #[tokio::test]
     async fn std_array_map_pointfree() {
+        // NUM §4: `math.abs` is subtype-preserving — int elements stay int.
         let src = "import * as array from \"std/array\"\nimport * as math from \"std/math\"\nprint(array.map([-1, -2, 3], math.abs))";
-        assert_eq!(run(src).await, "[1.0, 2.0, 3.0]\n");
+        assert_eq!(run(src).await, "[1, 2, 3]\n");
     }
 
     #[tokio::test]
@@ -8452,8 +8455,9 @@ print(r[1])
 
     #[tokio::test]
     async fn std_module_import_is_cached() {
+        // NUM §4: `floor` returns an `int` (`3`), and `abs(int)` stays `int` (`2`).
         let out = run("import * as m1 from \"std/math\"\nimport { abs } from \"std/math\"\nprint(m1.floor(3.7))\nprint(abs(-2))").await;
-        assert_eq!(out, "3.0\n2.0\n");
+        assert_eq!(out, "3\n2\n");
     }
 
     #[tokio::test]
@@ -9492,7 +9496,8 @@ import * as math from "std/math"
 print(math.abs(-5))
 print(math.max(1, 2, 3))
 "#;
-        assert_eq!(run(src).await, "5.0\n3.0\n");
+        // NUM §4: `abs(int)` is int (`5`); `max` is unchanged float (`3.0`).
+        assert_eq!(run(src).await, "5\n3.0\n");
     }
 
     /// Instance method call still dispatches the bound method.

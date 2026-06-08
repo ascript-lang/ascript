@@ -41,9 +41,10 @@ fn main() {
   let totalHits = math.sum(hitCounts)
   let total = len(seeds) * 50000
   let piEst = 4.0 * totalHits / total
-  // Round to 4 decimal places for a stable, deterministic string.
-  let piRounded = math.round(piEst * 10000) / 10000
-  print(`pi estimate: ${piRounded}`)   // pi estimate: 3.1502
+  // Round to 4 decimal places for a stable, deterministic string. `math.round`
+  // returns an `int` (NUM §4), so divide by a `float` to keep real division.
+  let piRounded = math.round(piEst * 10000) / 10000.0
+  print(`pi estimate: ${piRounded}`)   // pi estimate: 3.1418
 }
 
 await main()
