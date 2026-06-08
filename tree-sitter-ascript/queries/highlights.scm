@@ -23,6 +23,7 @@
   "async" "await"
   "class" "extends"
   "enum"
+  "interface" "implements"
   "import" "export" "from" "as"
 ] @keyword
 
@@ -58,6 +59,8 @@
 (method_definition name: (identifier) @function.method)
 (class_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
+(interface_declaration name: (identifier) @type)
+(method_requirement name: (identifier) @function.method)
 (enum_variant name: (identifier) @constant)
 ; ADT: payload field names + a named variant-pattern field.
 (variant_field field: (identifier) @variable.member)

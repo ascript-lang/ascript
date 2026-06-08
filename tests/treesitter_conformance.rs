@@ -314,6 +314,41 @@ fn treesitter_parses_adt_payload_enums_and_variant_patterns() {
 }
 
 #[test]
+fn treesitter_parses_interface_decls_and_implements() {
+    // IFACE (Task 7): structural interface declarations (0/1/N method
+    // requirements, `extends` composition, `;`-separated requirements) and the
+    // class `implements` clause must parse without an ERROR node.
+    let lang = language();
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).expect("set_language");
+    for src in [
+        // 0 / 1 / N requirements (return annotation is `: T`, like fns).
+        "interface Empty {}",
+        "interface Reader { fn read(b: bytes): int }",
+        "interface RW { fn read(b: bytes): int\n fn write(b: bytes): int }",
+        // `;`-separated requirements (skip_semicolons rule).
+        "interface R { fn read(b): int; fn close(); }",
+        "interface R { ;; fn read(b): int; }",
+        // `extends` composition (single + multiple).
+        "interface ReadWriter extends Reader, Writer {}",
+        "interface Closer extends Reader { fn close() }",
+        // Untyped params + no return annotation.
+        "interface Sink { fn write(b) }",
+        // `implements` on a class (with and without `extends`).
+        "class File implements Reader { fn read(b) { return 0 } }",
+        "class Socket extends Base implements Reader, Writer { fn read(b) { return 0 } fn write(b) { return 0 } }",
+        // export interface.
+        "export interface Reader { fn read(b): int }",
+    ] {
+        let tree = parser.parse(src.as_bytes(), None).expect("parse");
+        assert!(
+            !tree.root_node().has_error(),
+            "tree-sitter ERROR node in: {src}"
+        );
+    }
+}
+
+#[test]
 fn interpreter_parser_accepts_all_examples() {
     let mut failures = Vec::new();
     for path in example_files() {
