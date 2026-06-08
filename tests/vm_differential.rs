@@ -871,6 +871,20 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/typed_api.as",
         SkipReason::Nondeterministic,
     ),
+    // `http_client.as` makes live HTTP calls to `http://127.0.0.1:8787`, the
+    // companion `http_server.as` (which is NOT running under tests — it is itself
+    // skipped as `LongRunningServer`). With the server absent, every call fails with
+    // a connection-refused / timeout error whose message and retry timing are
+    // non-deterministic across runs (OS errno text, elapsed-ms counters). The two
+    // separate tree-walker and VM oracle runs therefore produce differing byte
+    // sequences — it is not a VM divergence; the VM is byte-identical in the
+    // deterministic portion. Covered end-to-end by the CLI suite when the server
+    // is available; excluded here because the two-run stdout-equality oracle cannot
+    // match live-network output.
+    (
+        "examples/advanced/http_client.as",
+        SkipReason::Nondeterministic,
+    ),
     // ---- Mutates a fixed shared /tmp tree (races across parallel oracles) ------
     ("examples/system.as", SkipReason::SharedExternalState),
     (

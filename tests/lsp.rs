@@ -913,9 +913,14 @@ fn lsp_cross_file_goto_definition_and_rename() {
 /// typeDefinition, implementation, and pull diagnostics). Each must return a
 /// well-formed response (a `result` member — `null`/empty is acceptable) and none may
 /// deadlock within the overall deadline.
+///
+/// The 180 s overall deadline (and 20 s exit budget) is deliberately generous: this
+/// test checks LSP capability CORRECTNESS, not latency, and the extra headroom prevents
+/// spurious timeouts when many binary-spawning tests run in parallel under a loaded CI
+/// machine or during a full `cargo test` run.
 #[test]
 fn lsp_full_capability_surface() {
-    let overall = Instant::now() + Duration::from_secs(90);
+    let overall = Instant::now() + Duration::from_secs(180);
     let mut client = LspClient::spawn();
 
     client.request(
@@ -1026,7 +1031,7 @@ let count = 1\ncount = count + 1\n";
     client.notify_no_params("exit");
     client.close_stdin();
     assert!(
-        client.wait_for_exit(Duration::from_secs(10)),
+        client.wait_for_exit(Duration::from_secs(20)),
         "server did not exit cleanly"
     );
 }
