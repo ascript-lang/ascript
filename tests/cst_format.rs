@@ -196,6 +196,36 @@ fn formats_fn_type_idempotently() {
 }
 
 #[test]
+fn formats_adt_payload_enums_and_variant_patterns() {
+    // ADT Task 10 (CST formatter): payload variant DECLARATIONS canonicalize their
+    // field-list spacing (`Circle(radius: float)`, `Pair(int, int)`, unit `Point`);
+    // variant PATTERNS re-emit compactly via the pattern's source text (the same
+    // behavior every match pattern uses in the CST formatter — `{a,b}`, `[x,y]`).
+    // The whole thing must be idempotent and reparse cleanly.
+    let src = "enum Shape{Circle(radius:float),Rect(w:float,h:float),Pair(int,int),Point}\n\
+fn area(s:Shape):float{return match s{Circle(r)=>3.14159*r*r,Rect(w: ww, h: hh)=>ww*hh,Pair(a, b)=>float(a)*float(b),Shape.Point=>0.0}}\n";
+    let want = "enum Shape {\n  \
+Circle(radius: float),\n  \
+Rect(w: float, h: float),\n  \
+Pair(int, int),\n  \
+Point,\n}\n\
+fn area(s: Shape): float {\n  \
+return match s {\n    \
+Circle(r) => 3.14159 * r * r,\n    \
+Rect(w: ww, h: hh) => ww * hh,\n    \
+Pair(a, b) => float(a) * float(b),\n    \
+Shape.Point => 0.0,\n  }\n}\n";
+    let once = ascript::syntax::format_tree(src);
+    assert_eq!(once, want, "unexpected ADT format");
+    let twice = ascript::syntax::format_tree(&once);
+    assert_eq!(once, twice, "ADT format not idempotent");
+    assert!(
+        ascript::syntax::parser::parse(&once).errors.is_empty(),
+        "formatted ADT output does not reparse: {once:?}"
+    );
+}
+
+#[test]
 fn formatted_corpus_reparses_without_errors() {
     let mut failures = Vec::new();
     for path in corpus() {

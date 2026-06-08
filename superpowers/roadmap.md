@@ -332,6 +332,46 @@ bumped); worker airlock + adaptive-arithmetic (`ArithKind::Int`) integration; tr
 editor pins; full corpus migration. All-modes differential (tree-walker == specialized-VM == generic-VM
 == `.aso`, both feature configs). Docs: `docs/content/language/values-types.md#numbers`.
 
+## ADT — algebraic enums & exhaustive match ✅ COMPLETE (2026-06)
+
+`specs/2026-06-08-algebraic-types-design.md` (depends on NUM — variant field types use `int`/`float`).
+Makes enums **algebraic** (variants carry typed payloads) and `match` over an enum subject
+**exhaustiveness-checked**. CORE, both engines byte-identical; **deliberately breaking** (enum surface
+redesign + a blocking `non-exhaustive-match` Error), corpus migrated not trimmed.
+
+1. **Payload-carrying variants** — `EnumVariant` gains `payload: Option<Payload>` + `ctor: bool`
+   (`Payload::{Positional(Vec<Value>), Named(Cc<ObjectCell>)}`); `Value::EnumVariant(Rc<EnumVariant>)`
+   wrapper UNCHANGED (unit variants stay interned/`Rc`-cheap, identity-equal). Variant is unit
+   (`Point`/`Red = 2`), positional (`Pair(int, int)`), or named (`Circle(radius: float)`) — uniformly
+   named XOR positional, field type required, backing XOR payload. Constructed variants compare
+   **structurally**; `MapKey` rejects them (identity-container rule).
+2. **Construction** — a payload variant is a first-class **constructor** (`Shape.Circle`, callable,
+   arity + field-type validated via `validate_into`); multi-field named variants require named args
+   (`Shape.Rect(w:, h:)`), single named field accepts a positional call. `.value` reflects the payload
+   (Object named / **stable** Array positional); `c.radius` field sugar.
+3. **`Pattern::Variant`** — destructuring (positional by index / named by field, rename, nested,
+   guarded, or-patterns) across both parsers + tree-sitter (positional rides `call_expression` via
+   semantic recovery; named/nested = a `VariantPat`/`variant_pattern` node) + interp + VM
+   (`compile_pattern_test`) + fmt + ast Display.
+4. **Exhaustiveness (the correctness half)** — a STATIC analysis in `src/check/infer/pass.rs`:
+   `non-exhaustive-match` (default **Error**, gradual-silent on an unproven subject, gathers the full
+   sibling-arm chain) + per-variant narrowing + construction synth. Runtime `MatchNoArm` backstop
+   UNCHANGED. Bare unit patterns shadow-bind (Option C) → `enum-variant-binding-shadow` (Warning); the
+   spec rule is to write unit variants QUALIFIED. `unknown-enum-variant` extended to ctor calls +
+   qualified patterns.
+5. **Serialization** — `.aso` per-variant schema + constructed-payload constants
+   (`ASO_FORMAT_VERSION` = 24); worker airlock tag-10 payload wire format + **far-side unit-variant
+   re-interning** (cross-isolate `==` correctness) + cyclic-payload reference table.
+6. **Tooling + corpus** — formatter (decls + variant patterns, idempotent); LSP (variant-signature
+   hover, `Shape.`-variant completion with field-placeholder snippets, ENUM_MEMBER semantic tokens);
+   REPL cross-line payload-enum sessions; examples `examples/enums_adt.as` +
+   `examples/advanced/{json_adt,state_machine,typed_errors}.as` (recursive + state-machine + typed
+   errors), four-mode byte-identical (tree-walker == specialized == generic == `.aso`). Gate 5 held:
+   `examples/**` emits zero `non-exhaustive-match`/`enum-variant-binding-shadow`/`type-*` in both
+   configs. Docs: `docs/content/language/classes-enums.md` (Algebraic enums + variant patterns +
+   exhaustiveness). Generic enums (`enum Box<T>`) deferred to TYPE; the representation admits it
+   additively.
+
 ## Working notes (carry forward across compaction)
 
 - Single crate `ascript` (lib + bin); modules mirror future crate split (deferred

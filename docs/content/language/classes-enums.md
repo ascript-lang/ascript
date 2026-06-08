@@ -271,25 +271,26 @@ print(Animal() instanceof Dog) // false — but not the other way around
 
 ## Enums
 
-Enums are **simple named variants** — no payloads, no methods. A variant may carry an optional
-backing value (a number or string).
+An enum is a **closed sum of named variants**. A variant is one of three shapes: a **unit** variant
+(payload-less, optionally with a backing number/string), a **positional-payload** variant, or a
+**named-payload** variant.
 
 ```ascript
-enum Color  { Red, Green, Blue }                    // opaque variants
-enum Status { Ok = 200, NotFound = 404, Err = 500 } // number-backed
-enum Mode   { Read = "r", Write = "w" }             // string-backed
+enum Color  { Red, Green, Blue }                    // unit variants
+enum Status { Ok = 200, NotFound = 404, Err = 500 } // number-backed units
+enum Mode   { Read = "r", Write = "w" }             // string-backed units
 ```
 
-Access a variant with `Enum.Variant`. Each variant exposes its `.name` and `.value`:
+Access a unit variant with `Enum.Variant`. Each exposes its `.name` and `.value`:
 
 ```ascript
 print(Status.NotFound)         // Status.NotFound
 print(Status.NotFound.value)   // 404
 print(Status.NotFound.name)    // NotFound
-print(Color.Red.value)         // nil — opaque variants have no backing value
+print(Color.Red.value)         // nil — a bare unit variant has no backing value
 ```
 
-Variants are interned singletons, so identity comparison just works. A variant never equals a
+Unit variants are interned singletons, so identity comparison just works. A variant never equals a
 variant of another enum, nor its own raw backing value:
 
 ```ascript
@@ -297,8 +298,120 @@ Color.Red == Color.Red    // true
 Status.Ok == 200          // false — a variant is not its backing number
 ```
 
-> [!NOTE] Enums intentionally carry no per-variant data or behaviour. When you need that — a tagged
-> union with typed payloads, or variant-specific methods — model it with a class hierarchy instead.
+### Algebraic enums — variants with typed payloads
+
+A variant can carry **typed data**. Fields are either all **named** (`Circle(radius: float)`) or
+all **positional** (`Pair(int, int)`) — mixing the two in one variant is a parse error. A field type
+is required.
+
+```ascript
+enum Shape {
+  Circle(radius: float),      // named payload (single field)
+  Rect(w: float, h: float),   // named payload (multiple fields)
+  Pair(int, int),             // positional payload
+  Point,                      // unit variant (payload-less)
+}
+```
+
+A payload variant is a **constructor**: referencing `Shape.Circle` without calling it yields a
+first-class callable value; calling it validates the payload (arity + field types, the same engine
+`Class.from` uses) and produces a constructed variant.
+
+```ascript
+let c = Shape.Circle(2.0)
+print(c)          // Shape.Circle(radius: 2.0)
+print(c.name)     // Circle
+print(c.value)    // {radius: 2.0} — named payload reflects as an Object
+print(c.radius)   // 2.0 — named fields are also readable directly
+
+let p = Shape.Pair(3, 4)
+print(p)          // Shape.Pair(3, 4)
+print(p.value)    // [3, 4] — positional payload reflects as an Array
+```
+
+A **multi-field named** variant must be constructed with named arguments (`Shape.Rect(w: 3.0, h:
+4.0)`); a single named field also accepts a bare positional call (`Shape.Circle(2.0)`). A wrong
+payload is a recoverable error naming the field path:
+
+```ascript
+let bad = recover(() => Shape.Circle("x"))
+print(bad[1].message)   // Shape.Circle.radius: expected float, got string
+```
+
+Because a constructor is an ordinary value, it composes — e.g. as the mapping function over an array:
+
+```ascript
+import * as array from "std/array"
+let circles = array.map([1.0, 2.0, 3.0], Shape.Circle)
+print(circles[1].radius)   // 2.0
+```
+
+Unlike unit variants (identity-equal), **constructed payload variants compare structurally** — equal
+enum, equal variant name, equal payload:
+
+```ascript
+print(Shape.Circle(2.0) == Shape.Circle(2.0))   // true
+print(Shape.Circle(2.0) == Shape.Circle(3.0))   // false
+```
+
+> [!NOTE] A payload that holds an Array/Object compares that container by AScript's container rule
+> (by identity), so two `Pair`-of-distinct-arrays are not equal even with equal elements; scalar
+> payloads compare by value.
+
+### Recursive enums
+
+A variant payload may reference the enum itself, so enums model trees directly:
+
+```ascript
+import * as array from "std/array"
+import * as string from "std/string"
+
+enum Json {
+  Null,
+  Bool(value: bool),
+  Num(value: float),
+  Str(value: string),
+  Arr(items: array<Json>),    // recursive — payload references the enum itself
+}
+
+fn render(j: Json): string {
+  return match j {
+    Json.Null => "null",
+    Bool(b) => `${b}`,
+    Num(n) => `${n}`,
+    Str(s) => `"${s}"`,
+    Arr(xs) => "[" + string.join(array.map(xs, render), ",") + "]",
+  }
+}
+
+print(render(Json.Arr([Json.Num(1.0), Json.Bool(true), Json.Str("hi")])))
+// [1.0,true,"hi"]
+```
+
+Recursive payloads can form cycles; they are cycle-collected like any other container.
+
+### Typed errors
+
+A `Result` in AScript is the `[value, err]` pair. With algebraic enums the **error slot becomes a
+typed sum** — strictly better than a bare string. `?` / `!` are unchanged (they inspect the pair
+*shape*, not the error's kind), and the caller `match`es the error enum **exhaustively** (see below)
+so no error case is silently dropped:
+
+```ascript
+enum DbError { NotFound(key: string), Timeout(ms: int), Conn(detail: string) }
+
+fn explain(e: DbError): string {
+  return match e {
+    NotFound(key) => `no such key: ${key}`,
+    Timeout(ms) => `timed out after ${ms}ms`,
+    Conn(detail) => `connection failed: ${detail}`,
+  }
+}
+
+print(explain(DbError.NotFound("ada")))   // no such key: ada
+```
+
+See `examples/advanced/typed_errors.as` for the full `[value, err]` + `?` flow.
 
 ## Match
 
@@ -491,3 +604,63 @@ print(describe(Color.Green))   // cool
 
 Because a variant name like `Color.Red` is a member-access expression, it is always a **value
 pattern** (evaluated and compared with `==`), regardless of Option C.
+
+#### Variant patterns — destructuring payloads
+
+A payload variant is matched with a **variant pattern** that destructures its payload — positional
+by index, named by field (with optional rename), and freely nested or guarded:
+
+```ascript
+fn area(s: Shape): float {
+  return match s {
+    Circle(r) => 3.14159 * r * r,         // positional bind of the single field
+    Rect(w: ww, h: hh) if ww == hh => ww * ww,  // named + rename + guard
+    Rect(w, h) => w * h,                  // positional bind of both fields
+    Pair(a, b) => float(a) * float(b),
+    Shape.Point => 0.0,                   // unit variant — written QUALIFIED (see below)
+  }
+}
+
+print(area(Shape.Rect(w: 3.0, h: 4.0)))   // 12.0
+```
+
+`Circle(r)` and `Shape.Circle(r)` are both accepted for a payload pattern (the trailing `(…)` makes
+it unambiguously a variant pattern). Inside the arm, the narrowed field types are known (`r: float`).
+
+#### Exhaustiveness — a missing variant is a compile error
+
+When the subject is statically known to be a specific enum, `match` must handle **every** variant —
+by naming each one or by a catch-all (`_`, or a bare binding identifier). A missing case with no
+catch-all is a **blocking** `non-exhaustive-match` error:
+
+```ascript
+enum Light { Red, Yellow, Green }
+fn go(l: Light): string {
+  return match l {
+    Light.Red => "stop",
+    Light.Green => "go",
+    // error: match on enum 'Light' does not cover: Yellow
+  }
+}
+```
+
+A guarded-only arm does not count as covering its variant (the guard may fail). When the subject's
+enum type can't be proven (gradual / untyped), the check stays silent. The runtime still panics on an
+uncovered value as a dynamic backstop.
+
+#### The bare-unit footgun — qualify unit variants
+
+A **bare** unit-variant pattern (`Red =>`, no parens) collides with an Option-C binding identifier:
+the runtime *binds* the subject to `Red` (a catch-all) rather than matching `Light.Red`. The checker
+flags this as `enum-variant-binding-shadow`:
+
+```ascript
+match l {
+  Red => "stop",        // warning: `Red` here BINDS the subject; write `Light.Red`
+  Light.Green => "go",
+}
+```
+
+The fix is to write unit variants **qualified** (`Light.Red`, `Shape.Point`) in an
+exhaustiveness-relevant `match` — which is why every unit variant in the examples above is qualified.
+Payload patterns (`Circle(r)`) and the qualified forms are never ambiguous.

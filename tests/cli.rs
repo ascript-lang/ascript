@@ -482,6 +482,54 @@ fn repl_vm_const_reassignment_across_lines_errors_and_keeps_value() {
 }
 
 #[test]
+fn repl_adt_payload_enum_persists_construct_match_value() {
+    // ADT Task 14: a payload enum declared across lines (the `{ … }` buffers via the
+    // delimiter-depth `is_incomplete`) persists in the session scope; construction,
+    // a `match` (multi-line, buffered too), and `.value` reflection all work on a
+    // LATER, separately-compiled line. Byte-identical on the VM and the tree-walker.
+    let session = "\
+enum Shape {
+  Circle(radius: float),
+  Pair(int, int),
+  Point,
+}
+let c = Shape.Circle(2.0)
+let p = Shape.Pair(3, 4)
+c.radius
+p.value
+match c {
+  Circle(r) => r * 2.0,
+  Pair(a, b) => float(a + b),
+  Shape.Point => 0.0,
+}
+c == Shape.Circle(2.0)
+";
+    let (vm_out, vm_err) = run_repl_session(session, false);
+    let (tw_out, tw_err) = run_repl_session(session, true);
+    // `c.radius` → 2.0; `p.value` → [3, 4]; match → 4.0; equality → true.
+    for (out, err, eng) in [(&vm_out, &vm_err, "VM"), (&tw_out, &tw_err, "TW")] {
+        assert!(
+            out.contains("2.0"),
+            "{eng}: c.radius should print 2.0; out={out:?} err={err:?}"
+        );
+        assert!(
+            out.contains("[3, 4]"),
+            "{eng}: p.value should print [3, 4]; out={out:?} err={err:?}"
+        );
+        assert!(
+            out.contains("4.0"),
+            "{eng}: match should yield 4.0; out={out:?} err={err:?}"
+        );
+        assert!(
+            out.contains("true"),
+            "{eng}: structural equality should print true; out={out:?} err={err:?}"
+        );
+    }
+    // The two engines produce byte-identical session output.
+    assert_eq!(vm_out, tw_out, "VM/TW REPL output must match for ADT session");
+}
+
+#[test]
 fn repl_vm_fn_and_class_reassignment_across_lines_error() {
     // fn / class names are immutable top-level bindings: reassigning one on a later
     // REPL line errors on BOTH engines (cross-chunk runtime check).

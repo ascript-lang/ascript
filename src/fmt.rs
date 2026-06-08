@@ -1000,6 +1000,35 @@ mod tests {
     }
 
     #[test]
+    fn fmt_adt_payload_enums_and_variant_patterns() {
+        // ADT Task 10: the legacy formatter renders payload variant DECLARATIONS
+        // (`Circle(radius: float)` named, `Pair(int, int)` positional, unit `Point`)
+        // and `Pattern::Variant` (positional `Pair(a, b)`, named-renamed
+        // `Rect(w: ww, h: hh)`, qualified unit `Shape.Point`, nested guards)
+        // canonically, and is idempotent.
+        let src = "enum Shape{Circle(radius:float),Rect(w:float,h:float),Pair(int,int),Point}\n\
+fn area(s:Shape):float{return match s{Circle(r)=>3.14159*r*r,Rect(w:ww,h:hh)=>ww*hh,Pair(a,b)=>float(a)*float(b),Shape.Point=>0.0}}";
+        let out = format_source(src).unwrap();
+        // Declarations canonicalize spacing.
+        assert!(out.contains("Circle(radius: float),"), "named decl: {out}");
+        assert!(out.contains("Rect(w: float, h: float),"), "multi named decl: {out}");
+        assert!(out.contains("Pair(int, int),"), "positional decl: {out}");
+        assert!(out.contains("\n  Point,\n"), "unit decl: {out}");
+        // Variant patterns canonicalize internal spacing.
+        assert!(out.contains("Circle(r) =>"), "positional bind pat: {out}");
+        assert!(out.contains("Rect(w: ww, h: hh) =>"), "named renamed pat: {out}");
+        assert!(out.contains("Pair(a, b) =>"), "positional pat: {out}");
+        assert!(out.contains("Shape.Point =>"), "qualified unit pat: {out}");
+        // Idempotent and reparses.
+        let twice = format_source(&out).unwrap();
+        assert_eq!(out, twice, "fmt must be idempotent: {out}");
+        assert!(
+            crate::parser::parse(&crate::lexer::lex(&out).unwrap()).is_ok(),
+            "formatted ADT output must reparse: {out}"
+        );
+    }
+
+    #[test]
     fn fmt_spread_roundtrips() {
         // Arrays and calls round-trip exactly; object literals canonicalize to
         // the spaced `{ ... }` form (matching all other object output).

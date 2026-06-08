@@ -115,8 +115,21 @@ Terse per-feature notes (the non-obvious bits; read the cited file for the rest)
   `has_rest` fast path in `run_body`; array/object rest patterns collect the tail/leftover keys.
 - **Match pattern extensions.** `MatchArm { patterns: Vec<Pattern>, guard: Option<Expr> }`. `Pattern` =
   `Wildcard`, `Ident`, `Value`, `Range{start,end,inclusive}`, `Array(_, rest)`, `Object(_, rest)` where rest
-  is `None`/`Some(None)` (`...`)/`Some(Some(name))`. **Option C:** a bare `Ident` already defined in scope is
-  compared (`==`); an undefined one binds the subject. Object shorthand `{key}` is always a bind.
+  is `None`/`Some(None)` (`...`)/`Some(Some(name))`, plus ADT's `Variant{enum_name: Option<Rc<str>>, variant,
+  fields: VariantPatFields::{Positional(Vec<Pattern>) | Named(Vec<(Rc<str>, Option<Pattern>)>)}}`. **Option C:**
+  a bare `Ident` already defined in scope is compared (`==`); an undefined one binds the subject. Object
+  shorthand `{key}` is always a bind.
+- **Algebraic enums (ADT).** A variant is unit (`Point` / `Red = 2`), positional-payload (`Pair(int, int)`),
+  or named-payload (`Circle(radius: float)`) — uniformly named XOR positional, field type required, never both
+  a `= backing` and a `(…)` payload. A payload variant is a first-class **constructor** (`Shape.Circle`,
+  `ctor:true`); calling it validates arity + field types via `validate_into` → a constructed `EnumVariant`
+  (`payload: Some`, structural `==`). `.value` reflects the payload (Object named / stable Array positional);
+  named fields read directly (`c.radius`). **Exhaustiveness is STATIC** (`src/check/infer/pass.rs`,
+  `non-exhaustive-match` default **Error**, gradual-silent on an unproven subject) — the runtime `MatchNoArm`
+  backstop is unchanged. Bare unit patterns shadow-bind (Option C); the checker emits
+  `enum-variant-binding-shadow` (Warning) — write unit variants QUALIFIED (`Shape.Point`) in
+  exhaustiveness-relevant matches. Examples: `examples/enums_adt.as`, `examples/advanced/{json_adt,
+  state_machine,typed_errors}.as`.
 - **`std/log`** — leveled (`debug/info/warn/error`) structured logging, `Interp`-stateful, routed via
   `self.call_log`; stderr (Live) or capture buffer (tests). Serializes via `json::to_json_lossy` (never
   panics). Object args merge as fields; a thunk first-arg defers message work past the level filter; default
@@ -308,7 +321,11 @@ with `len(x)`).
   collector) — an unconditional, default-on, CORE dependency (must build under `--no-default-features`).
   **Invariant:** native-resource handles and acyclic/immutable handles STAY on `Rc` with no-op `Trace` — the
   GC must never trace into a native resource (they rely on deterministic `Drop` to reclaim fds). When adding
-  a cycle-capable `Value` container, mirror it in `Value::trace`.
+  a cycle-capable `Value` container, mirror it in `Value::trace`. **ADT exception:** the
+  `Value::EnumVariant(Rc<EnumVariant>)` WRAPPER stays on `Rc` (unit variants are interned, registration-free),
+  but a `Some(payload)` IS traced — its `Payload::Positional(Vec<Value>)` / `Payload::Named(Cc<ObjectCell>)`
+  can hold cycle-capable containers (e.g. a recursive `Json.Arr(items)`), so `EnumVariant` is in the
+  `Value::trace` set and the `gc.rs` doc-comment no longer lists it under "immutable/acyclic … stay on Rc".
 - **Object/instance SHAPES (hidden classes).** `Value::Object` is `Rc<ObjectCell { map, shape: Cell<u32> }>`
   carrying a shape id beside the entry map; `Instance` has `shape_id`. A shape identifies an ordered
   key-layout; the per-`Vm` `ShapeRegistry` (`src/vm/shape.rs`) assigns ids via a memoized transition tree.
