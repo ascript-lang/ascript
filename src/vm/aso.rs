@@ -106,7 +106,13 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 ///   `Value::Int(i64)` and `Value::Float(f64)`. The constant pool gained
 ///   `TAG_INT`, the field-default expr stream gained `EX_INT`, and the former
 ///   `TAG_NUMBER`/`EX_NUMBER` tags now carry `Float` (value-identical bytes).
-pub const ASO_FORMAT_VERSION: u32 = 19;
+/// - 20: NUM bitwise/wrapping operators — nine new appended opcodes (`BitAnd`/
+///   `BitOr`/`BitXor`/`Shl`/`Shr`/`BitNot`/`WrapAdd`/`WrapSub`/`WrapMul`; appended at
+///   the END of the enum, so existing opcode byte values are UNCHANGED) and the
+///   field-default wire tags grew (binop tags 17..=24 for the bitwise/shift/wrapping
+///   ops, unop tag 2 for `BitNot`). Old chunks never contained either, so older
+///   readers must reject a v20 chunk.
+pub const ASO_FORMAT_VERSION: u32 = 20;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -1005,6 +1011,7 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
             w.u8(match op {
                 UnOp::Neg => 0,
                 UnOp::Not => 1,
+                UnOp::BitNot => 2,
             });
             write_expr(w, expr)?;
         }
@@ -1172,6 +1179,14 @@ fn binop_tag(op: BinOp) -> u8 {
         BinOp::Coalesce => 14,
         BinOp::Range => 15,
         BinOp::InstanceOf => 16,
+        BinOp::BitAnd => 17,
+        BinOp::BitOr => 18,
+        BinOp::BitXor => 19,
+        BinOp::Shl => 20,
+        BinOp::Shr => 21,
+        BinOp::WrapAdd => 22,
+        BinOp::WrapSub => 23,
+        BinOp::WrapMul => 24,
     }
 }
 
@@ -1195,6 +1210,14 @@ fn binop_from_tag(tag: u8) -> Result<BinOp, AsoError> {
         14 => BinOp::Coalesce,
         15 => BinOp::Range,
         16 => BinOp::InstanceOf,
+        17 => BinOp::BitAnd,
+        18 => BinOp::BitOr,
+        19 => BinOp::BitXor,
+        20 => BinOp::Shl,
+        21 => BinOp::Shr,
+        22 => BinOp::WrapAdd,
+        23 => BinOp::WrapSub,
+        24 => BinOp::WrapMul,
         tag => return Err(AsoError::BadTag { what: "binop", tag }),
     })
 }
@@ -1224,6 +1247,7 @@ fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
             let op = match r.u8()? {
                 0 => UnOp::Neg,
                 1 => UnOp::Not,
+                2 => UnOp::BitNot,
                 tag => return Err(AsoError::BadTag { what: "unop", tag }),
             };
             ExprKind::Unary {

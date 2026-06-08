@@ -123,6 +123,45 @@ impl Parser {
         }
     }
 
+    /// In type-argument position, the lexer's single `>>` (`Shr`) token must close
+    /// TWO nested generics (e.g. `future<array<int>>`). This splits the `Shr` at the
+    /// cursor in place into two `Gt` tokens — text `">"` each, so the lossless
+    /// render is unchanged — by inserting a fresh `Gt` `LexToken` right after it and
+    /// retagging the original as `Gt` with text `">"`. The `nontrivia` index vector
+    /// (and every later raw-token index) is shifted by one to keep the parser cursor
+    /// and the tree builder's positional token pairing consistent. A no-op when the
+    /// cursor is not on a `Shr`. Returns `true` if a split happened.
+    ///
+    /// This is the Rust/Java/C# nested-generics technique; the legacy parser does
+    /// the same via a `pending_gt` counter (the two front-ends must agree).
+    fn split_shr_for_type(&mut self) -> bool {
+        if self.current() != SyntaxKind::Shr {
+            return false;
+        }
+        let Some(&ti) = self.nontrivia.get(self.pos) else {
+            return false;
+        };
+        // Retag the original `>>` raw token as a single `>` and insert a second `>`.
+        self.tokens[ti].kind = SyntaxKind::Gt;
+        self.tokens[ti].text = ">".to_string();
+        self.tokens.insert(
+            ti + 1,
+            LexToken {
+                kind: SyntaxKind::Gt,
+                text: ">".to_string(),
+            },
+        );
+        // Every raw-token index AT OR AFTER the inserted slot shifts by one.
+        for idx in self.nontrivia.iter_mut() {
+            if *idx > ti {
+                *idx += 1;
+            }
+        }
+        // The new `>` is a non-trivia token immediately after the current one.
+        self.nontrivia.insert(self.pos + 1, ti + 1);
+        true
+    }
+
     fn complete(&mut self, mut m: Marker, kind: SyntaxKind) -> CompletedMarker {
         m.completed = true;
         if let Event::Start { kind: slot, .. } = &mut self.events[m.pos] {
@@ -702,8 +741,17 @@ fn infix_binding_power(kind: SyntaxKind) -> Option<(u8, u8)> {
         AmpAmp => (5, 6),
         EqEq | BangEq => (7, 8),
         Lt | Le | Gt | Ge | InstanceofKw => (9, 10),
-        Plus | Minus => (11, 12),
-        Star | Slash | Percent => (13, 14),
+        // Bitwise-or tier (NUM §3.4, Go's binding): `| ^` bind TIGHTER than
+        // comparison/equality but LOOSER than `+ -`, so `a | b == c` is `(a|b)==c`
+        // and `a | b + c` is `a | (b + c)`. The value-position Pratt is the ONLY
+        // place `Pipe` is an infix operator — patterns/types never enter `expr_bp`,
+        // so or-patterns (`1 | 2`) and union types (`A | B`) are unaffected.
+        Pipe | Caret => (10, 11),
+        // Additive: `+ -` and the wrapping `+% -%` are peers.
+        Plus | Minus | PlusPercent | MinusPercent => (11, 12),
+        // Multiplicative band: `* / %`, the wrapping `*%`, and the shifts `<< >>`
+        // plus bitwise `&` all bind here (Go's table). Left-assoc peers.
+        Star | Slash | Percent | StarPercent | Shl | Shr | Amp => (13, 14),
         StarStar => (18, 17), // right-assoc
         _ => return None,
     })
@@ -762,6 +810,7 @@ fn can_start_expr(p: &Parser) -> bool {
             | HashLBrace
             | Minus
             | Bang
+            | Tilde
             | TemplateStr
             | TemplateStart
             | AwaitKw
@@ -774,7 +823,8 @@ fn can_start_expr(p: &Parser) -> bool {
 fn unary(p: &mut Parser) -> CompletedMarker {
     use SyntaxKind::*;
     match p.current() {
-        Minus | Bang => {
+        // `-`/`!`/`~` prefix unary (NUM §3.2 adds `~`, int bitwise NOT).
+        Minus | Bang | Tilde => {
             let m = p.start();
             p.bump();
             let _operand = unary(p);
@@ -1246,7 +1296,7 @@ fn type_primary(p: &mut Parser) -> CompletedMarker {
             if p.at(Lt) {
                 let args = p.start();
                 p.bump(); // <
-                while !p.at(Gt) && !p.at_end() {
+                while !p.at(Gt) && !p.at(Shr) && !p.at_end() {
                     type_ann(p);
                     if p.at(Comma) {
                         p.bump();
@@ -1254,6 +1304,11 @@ fn type_primary(p: &mut Parser) -> CompletedMarker {
                         break;
                     }
                 }
+                // `>>` in type position closes TWO nested generics: split the `Shr`
+                // into two `>` so the inner close consumes one and the outer the
+                // other (Rust/Java/C# technique). After the split the cursor is on a
+                // plain `Gt`.
+                p.split_shr_for_type();
                 if p.at(Gt) {
                     p.bump();
                 } else {

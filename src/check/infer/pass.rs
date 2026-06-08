@@ -714,6 +714,16 @@ impl<'a> Pass<'a> {
             }
             Some(EqEq | BangEq | Lt | Le | Gt | Ge | InstanceofKw) => CheckTy::Bool,
             Some(AmpAmp | PipePipe) => lt.join(&rt, self.table),
+            // Bitwise / shift / wrapping (NUM §3.2): int-only, always yield a number
+            // (an int subtype, which `CheckTy::Number` subsumes). A provably
+            // non-numeric operand is a `type-error`; a provable `T?` is possibly-nil.
+            // (Float-operand precision — `int`-vs-`float` narrowing — is left to a
+            // later checker pass; the gradual gate keeps the untyped corpus silent.)
+            Some(Amp | Caret | Shl | Shr | PlusPercent | MinusPercent | StarPercent) => {
+                self.flag_non_numeric(&operands, &[&lt, &rt]);
+                self.flag_possibly_nil_operands(&operands, &[&lt, &rt]);
+                CheckTy::Number
+            }
             _ => CheckTy::Any,
         }
     }
@@ -760,7 +770,7 @@ impl<'a> Pass<'a> {
             .children_with_tokens()
             .filter_map(|el| el.into_token())
             .map(|t| t.kind())
-            .find(|k| matches!(k, Minus | Bang));
+            .find(|k| matches!(k, Minus | Bang | Tilde));
         let operand = first_expr_child(expr);
         let ot = operand
             .as_ref()
@@ -768,12 +778,16 @@ impl<'a> Pass<'a> {
             .unwrap_or(CheckTy::Any);
         match op {
             Some(Bang) => CheckTy::Bool,
-            Some(Minus) => {
+            // `-x` and `~x` both require a number (`~` is int-only); a provably
+            // non-numeric operand is a `type-error`.
+            Some(Minus | Tilde) => {
                 if let (Some(node), true) = (&operand, is_provably_non_number(&ot)) {
-                    let msg = format!(
-                        "negation operand is `{}`, not a number",
-                        ot.display(self.table)
-                    );
+                    let what = if op == Some(Tilde) {
+                        "bitwise-not"
+                    } else {
+                        "negation"
+                    };
+                    let msg = format!("{what} operand is `{}`, not a number", ot.display(self.table));
                     self.emit("type-error", code_range(node), msg);
                 }
                 CheckTy::Number
@@ -1366,6 +1380,16 @@ fn binary_op(expr: &ResolvedNode) -> Option<SyntaxKind> {
                     | PipePipe
                     | QuestionQuestion
                     | InstanceofKw
+                    // Bitwise / shift / wrapping (NUM §3.2). `Pipe` is bitwise-OR in
+                    // a BinaryExpr (or-patterns/union types are different nodes).
+                    | Amp
+                    | Caret
+                    | Shl
+                    | Shr
+                    | Pipe
+                    | PlusPercent
+                    | MinusPercent
+                    | StarPercent
             )
         })
 }

@@ -645,6 +645,16 @@ impl Vm {
                 | Op::Eq
                 | Op::Ne
                 | Op::InstanceOf
+                // Bitwise/shift/wrapping (NUM §3.2) — int-only ops dispatched
+                // through the SAME shared `apply_binop` as everything else.
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::Shl
+                | Op::Shr
+                | Op::WrapAdd
+                | Op::WrapSub
+                | Op::WrapMul
                 | Op::Range => {
                     // The two operands were pushed lhs-then-rhs, so pop rhs first.
                     // The op's span anchors any Tier-2 panic so the VM's
@@ -765,7 +775,7 @@ impl Vm {
                     fiber.push(Value::Bool(ok));
                 }
 
-                Op::Neg | Op::Not => {
+                Op::Neg | Op::Not | Op::BitNot => {
                     let a = fiber.pop();
                     let span = fiber.frame().closure.proto.chunk.span_at(fault_ip);
                     let v = crate::interp::apply_unop(unop_of(op), a, span)?;
@@ -4304,6 +4314,14 @@ fn binop_of(op: Op) -> BinOp {
         Op::Ne => BinOp::Ne,
         Op::Range => BinOp::Range,
         Op::InstanceOf => BinOp::InstanceOf,
+        Op::BitAnd => BinOp::BitAnd,
+        Op::BitOr => BinOp::BitOr,
+        Op::BitXor => BinOp::BitXor,
+        Op::Shl => BinOp::Shl,
+        Op::Shr => BinOp::Shr,
+        Op::WrapAdd => BinOp::WrapAdd,
+        Op::WrapSub => BinOp::WrapSub,
+        Op::WrapMul => BinOp::WrapMul,
         _ => unreachable!("binop_of called with non-binary opcode {op:?}"),
     }
 }
@@ -4347,6 +4365,7 @@ fn unop_of(op: Op) -> UnOp {
     match op {
         Op::Neg => UnOp::Neg,
         Op::Not => UnOp::Not,
+        Op::BitNot => UnOp::BitNot,
         _ => unreachable!("unop_of called with non-unary opcode {op:?}"),
     }
 }

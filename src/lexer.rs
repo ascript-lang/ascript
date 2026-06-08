@@ -111,6 +111,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '%' {
+                    // `+%` — wrapping add (NUM §3.2).
+                    tokens.push(Token {
+                        tok: Tok::PlusPercent,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
                 } else {
                     tokens.push(Token {
                         tok: Tok::Plus,
@@ -123,6 +130,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token {
                         tok: Tok::MinusEq,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '%' {
+                    // `-%` — wrapping subtract (NUM §3.2).
+                    tokens.push(Token {
+                        tok: Tok::MinusPercent,
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
@@ -144,6 +158,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 } else if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token {
                         tok: Tok::StarEq,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '%' {
+                    // `*%` — wrapping multiply (NUM §3.2).
+                    tokens.push(Token {
+                        tok: Tok::StarPercent,
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
@@ -198,6 +219,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '<' {
+                    // `<<` — left shift (NUM §3.2). Longest-match before `<`.
+                    tokens.push(Token {
+                        tok: Tok::Shl,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
                 } else {
                     tokens.push(Token {
                         tok: Tok::Lt,
@@ -210,6 +238,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 if i + 1 < chars.len() && chars[i + 1] == '=' {
                     tokens.push(Token {
                         tok: Tok::Ge,
+                        span: Span::new(start, start + 2),
+                    });
+                    i += 2;
+                } else if i + 1 < chars.len() && chars[i + 1] == '>' {
+                    // `>>` — right shift (NUM §3.2). The lexer always emits a single
+                    // `Shr`; the TYPE parser splits a trailing `>>` into two closing
+                    // `>` (the Rust/Java/C# nested-generics technique).
+                    tokens.push(Token {
+                        tok: Tok::Shr,
                         span: Span::new(start, start + 2),
                     });
                     i += 2;
@@ -229,11 +266,29 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     });
                     i += 2;
                 } else {
-                    return Err(AsError::at(
-                        "unexpected character '&'",
-                        Span::new(start, start + 1),
-                    ));
+                    // `&` — bitwise AND (NUM §3.2). `&&` matched above (longest-match).
+                    tokens.push(Token {
+                        tok: Tok::Amp,
+                        span: Span::new(start, start + 1),
+                    });
+                    i += 1;
                 }
+            }
+            '^' => {
+                // `^` — bitwise XOR (NUM §3.2).
+                tokens.push(Token {
+                    tok: Tok::Caret,
+                    span: Span::new(start, start + 1),
+                });
+                i += 1;
+            }
+            '~' => {
+                // `~` — unary bitwise NOT (NUM §3.2).
+                tokens.push(Token {
+                    tok: Tok::Tilde,
+                    span: Span::new(start, start + 1),
+                });
+                i += 1;
             }
             '|' => {
                 if i + 1 < chars.len() && chars[i + 1] == '|' {
@@ -680,6 +735,69 @@ mod tests {
                 Tok::Gt,
                 Tok::Ident("c".into()),
                 Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_bitwise_and_wrapping_operators() {
+        // NUM §3.2: the new operator tokens, with longest-match disambiguation.
+        assert_eq!(
+            kinds("a & b ^ c ~ d << e >> f +% g -% h *% i"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Amp,
+                Tok::Ident("b".into()),
+                Tok::Caret,
+                Tok::Ident("c".into()),
+                Tok::Tilde,
+                Tok::Ident("d".into()),
+                Tok::Shl,
+                Tok::Ident("e".into()),
+                Tok::Shr,
+                Tok::Ident("f".into()),
+                Tok::PlusPercent,
+                Tok::Ident("g".into()),
+                Tok::MinusPercent,
+                Tok::Ident("h".into()),
+                Tok::StarPercent,
+                Tok::Ident("i".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn longest_match_keeps_logical_and_bitwise_distinct() {
+        // `&&`/`||` stay the logical tokens; a lone `&`/`|` are bitwise. `<<`/`>>`
+        // win over `<`/`>`; `+%`/`*%` win over `+`/`*`.
+        assert_eq!(kinds("&&"), vec![Tok::AmpAmp, Tok::Eof]);
+        assert_eq!(kinds("&"), vec![Tok::Amp, Tok::Eof]);
+        assert_eq!(kinds("||"), vec![Tok::PipePipe, Tok::Eof]);
+        assert_eq!(kinds("|"), vec![Tok::Pipe, Tok::Eof]);
+        assert_eq!(kinds("<<"), vec![Tok::Shl, Tok::Eof]);
+        assert_eq!(kinds("<"), vec![Tok::Lt, Tok::Eof]);
+        assert_eq!(kinds(">>"), vec![Tok::Shr, Tok::Eof]);
+        assert_eq!(kinds("+%"), vec![Tok::PlusPercent, Tok::Eof]);
+        assert_eq!(kinds("+"), vec![Tok::Plus, Tok::Eof]);
+        // `&` followed by `&` (with no space) is still `&&`, not two `&`.
+        assert_eq!(
+            kinds("a&&b"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::AmpAmp,
+                Tok::Ident("b".into()),
+                Tok::Eof
+            ]
+        );
+        // `a&b` (no space) is bitwise-AND.
+        assert_eq!(
+            kinds("a&b"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Amp,
+                Tok::Ident("b".into()),
+                Tok::Eof
             ]
         );
     }

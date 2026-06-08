@@ -524,12 +524,31 @@ pub enum BinOp {
     Coalesce,
     Range,
     InstanceOf,
+    /// `&` — int bitwise AND (NUM §3.2). A float operand is a Tier-2 panic.
+    BitAnd,
+    /// `|` — int bitwise OR (NUM §3.2). In value position only; in pattern/type
+    /// position `|` is an or-pattern / union (the parsers route around this tier).
+    BitOr,
+    /// `^` — int bitwise XOR (NUM §3.2).
+    BitXor,
+    /// `<<` — int left shift (NUM §3.2). Shift amount `< 0` or `>= 64` panics.
+    Shl,
+    /// `>>` — int arithmetic (sign-extending) right shift (NUM §3.2).
+    Shr,
+    /// `+%` — int two's-complement wrapping add (NUM §3.2). Never panics.
+    WrapAdd,
+    /// `-%` — int two's-complement wrapping subtract (NUM §3.2). Never panics.
+    WrapSub,
+    /// `*%` — int two's-complement wrapping multiply (NUM §3.2). Never panics.
+    WrapMul,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum UnOp {
     Neg,
     Not,
+    /// `~` — int bitwise NOT (NUM §3.2). A float operand is a Tier-2 panic.
+    BitNot,
 }
 
 impl fmt::Display for BinOp {
@@ -552,6 +571,14 @@ impl fmt::Display for BinOp {
             BinOp::Coalesce => "??",
             BinOp::Range => "..",
             BinOp::InstanceOf => "instanceof",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::WrapAdd => "+%",
+            BinOp::WrapSub => "-%",
+            BinOp::WrapMul => "*%",
         };
         write!(f, "{}", s)
     }
@@ -562,6 +589,7 @@ impl fmt::Display for UnOp {
         match self {
             UnOp::Neg => write!(f, "-"),
             UnOp::Not => write!(f, "!"),
+            UnOp::BitNot => write!(f, "~"),
         }
     }
 }

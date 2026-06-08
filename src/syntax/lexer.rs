@@ -274,6 +274,14 @@ fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
             ('/', '=') => Some(SlashEq),
             ('.', '.') => Some(DotDot),
             ('=', '>') => Some(FatArrow),
+            // Bitwise shift + wrapping (NUM §3.2). Longest-match before `<`/`>`/
+            // `+`/`-`/`*`. The lexer always emits `Shr` for `>>`; the type parser
+            // splits a trailing `>>` into two `>` for nested generics.
+            ('<', '<') => Some(Shl),
+            ('>', '>') => Some(Shr),
+            ('+', '%') => Some(PlusPercent),
+            ('-', '%') => Some(MinusPercent),
+            ('*', '%') => Some(StarPercent),
             // `#{` opens a map literal — one token (so `#` alone stays an Error).
             ('#', '{') => Some(HashLBrace),
             _ => None,
@@ -303,6 +311,9 @@ fn match_operator(chars: &[char], i: usize) -> Option<(SyntaxKind, usize)> {
         '<' => Lt,
         '>' => Gt,
         '|' => Pipe,
+        '&' => Amp,
+        '^' => Caret,
+        '~' => Tilde,
         '?' => Question,
         _ => return None,
     };

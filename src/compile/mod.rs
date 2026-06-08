@@ -250,6 +250,7 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
             let op = match un.op() {
                 Some(SyntaxKind::Minus) => UnOp::Neg,
                 Some(SyntaxKind::Bang) => UnOp::Not,
+                Some(SyntaxKind::Tilde) => UnOp::BitNot,
                 other => {
                     return Err(CompileError::new(
                         format!("unsupported unary operator {other:?} in field default"),
@@ -295,6 +296,14 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
                 SyntaxKind::PipePipe => BinOp::Or,
                 SyntaxKind::QuestionQuestion => BinOp::Coalesce,
                 SyntaxKind::InstanceofKw => BinOp::InstanceOf,
+                SyntaxKind::Amp => BinOp::BitAnd,
+                SyntaxKind::Pipe => BinOp::BitOr,
+                SyntaxKind::Caret => BinOp::BitXor,
+                SyntaxKind::Shl => BinOp::Shl,
+                SyntaxKind::Shr => BinOp::Shr,
+                SyntaxKind::PlusPercent => BinOp::WrapAdd,
+                SyntaxKind::MinusPercent => BinOp::WrapSub,
+                SyntaxKind::StarPercent => BinOp::WrapMul,
                 other => {
                     return Err(CompileError::new(
                         format!("unsupported binary operator {other:?} in field default"),
@@ -4443,6 +4452,17 @@ impl Compiler {
             // rhs is a Tier-2 panic anchored at this same trivia-trimmed span as the
             // tree-walker's `apply_binop`, so the message+span are byte-identical.
             SyntaxKind::InstanceofKw => Op::InstanceOf,
+            // Bitwise / shift / wrapping (NUM §3.2). All route through the SAME
+            // shared `apply_binop` at runtime (`binop_of`), so a float operand
+            // raises the byte-identical Tier-2 type panic.
+            SyntaxKind::Amp => Op::BitAnd,
+            SyntaxKind::Pipe => Op::BitOr,
+            SyntaxKind::Caret => Op::BitXor,
+            SyntaxKind::Shl => Op::Shl,
+            SyntaxKind::Shr => Op::Shr,
+            SyntaxKind::PlusPercent => Op::WrapAdd,
+            SyntaxKind::MinusPercent => Op::WrapSub,
+            SyntaxKind::StarPercent => Op::WrapMul,
             // `&&`/`||`/`??` are handled by the short-circuit path above (they
             // never reach this non-short-circuit dispatch).
             other => {
@@ -4759,6 +4779,8 @@ impl Compiler {
         let bytecode = match op {
             SyntaxKind::Minus => Op::Neg,
             SyntaxKind::Bang => Op::Not,
+            // `~` — int bitwise NOT (NUM §3.2). Routes through the shared `apply_unop`.
+            SyntaxKind::Tilde => Op::BitNot,
             other => {
                 return Err(CompileError::new(
                     format!("internal: unexpected unary operator {other:?} (compiler invariant)"),

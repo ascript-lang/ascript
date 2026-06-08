@@ -290,6 +290,15 @@ fn op_name(op: Op) -> &'static str {
         MatchRange => "MATCH_RANGE",
         MatchNoArm => "MATCH_NO_ARM",
         DefineExport => "DEFINE_EXPORT",
+        BitAnd => "BIT_AND",
+        BitOr => "BIT_OR",
+        BitXor => "BIT_XOR",
+        Shl => "SHL",
+        Shr => "SHR",
+        BitNot => "BIT_NOT",
+        WrapAdd => "WRAP_ADD",
+        WrapSub => "WRAP_SUB",
+        WrapMul => "WRAP_MUL",
     }
 }
 

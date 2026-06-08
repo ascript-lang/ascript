@@ -4932,6 +4932,15 @@ pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Contro
             _ => Err(AsError::at("cannot negate a non-number", span).into()),
         },
         UnOp::Not => Ok(Value::Bool(!v.is_truthy())),
+        // `~x` — int bitwise NOT (NUM §3.2). Int-only: a float (or any non-int)
+        // operand is a Tier-2 panic.
+        UnOp::BitNot => match v {
+            Value::Int(i) => Ok(Value::Int(!i)),
+            Value::Float(_) => {
+                Err(AsError::at("bitwise op requires int operands, got float", span).into())
+            }
+            _ => Err(AsError::at("cannot apply ~ to a non-int", span).into()),
+        },
     }
 }
 
@@ -5220,6 +5229,18 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
                     )
                     .into())
                 }
+                // Bitwise/shift/wrapping (NUM §3.2) are int-ONLY — not defined for
+                // decimal. A Tier-2 panic, consistent with the float-operand rejection.
+                BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::WrapAdd
+                | BinOp::WrapSub
+                | BinOp::WrapMul => {
+                    return Err(AsError::at(int_only_float_msg(op), span).into())
+                }
                 BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
                     unreachable!("handled above")
                 }
@@ -5231,6 +5252,19 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         }
         // One operand was not a number or decimal — fall through to the generic
         // "operator requires two numbers or decimals" error.
+    }
+
+    // Int-only operators (NUM §3.2): bitwise (`& | ^`), shift (`<< >>`), and
+    // wrapping (`+% -% *%`) reject a `float` operand BEFORE the promoting numeric
+    // dispatch — a float can never participate. A float operand → the Tier-2 type
+    // panic (`bitwise op requires int operands, got float` / the wrapping/shift
+    // equivalents). This runs ahead of the `(Int,Float)`/`(Float,_)` arms so those
+    // never see an int-only op. A non-number operand falls through to the generic
+    // "operator requires two numbers" error below.
+    if is_int_only_binop(op)
+        && (matches!(l, Value::Float(_)) || matches!(r, Value::Float(_)))
+    {
+        return Err(AsError::at(int_only_float_msg(op), span).into());
     }
 
     // Type-directed numeric dispatch (NUM §3.2):
@@ -5250,6 +5284,36 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
             span,
         )
         .into()),
+    }
+}
+
+/// `true` for the int-ONLY binary operators (NUM §3.2): bitwise (`& | ^`), shift
+/// (`<< >>`), and wrapping (`+% -% *%`). These reject a `float` operand outright —
+/// promotion never applies. Shared by `apply_binop`'s pre-dispatch guard.
+fn is_int_only_binop(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+    )
+}
+
+/// The Tier-2 panic message when an int-only operator (NUM §3.2) sees a `float`
+/// operand. Bitwise/shift use the spec's `bitwise op requires int operands, got
+/// float`; wrapping uses the parallel wrapping message. Shared by both engines so
+/// the diagnostic is byte-identical.
+fn int_only_float_msg(op: BinOp) -> String {
+    match op {
+        BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+            "wrapping op requires int operands, got float".to_string()
+        }
+        _ => "bitwise op requires int operands, got float".to_string(),
     }
 }
 
@@ -5290,6 +5354,20 @@ pub(crate) fn int_binop(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, 
         BinOp::Le => Value::Bool(a <= b),
         BinOp::Gt => Value::Bool(a > b),
         BinOp::Ge => Value::Bool(a >= b),
+        // Bitwise (NUM §3.2): int two's-complement. Never overflow-trap.
+        BinOp::BitAnd => Value::Int(a & b),
+        BinOp::BitOr => Value::Int(a | b),
+        BinOp::BitXor => Value::Int(a ^ b),
+        // Shifts (NUM §3.2): the rhs is the shift AMOUNT. `checked_shl`/`checked_shr`
+        // return `None` ONLY when the amount is out of range (`< 0` or `>= 64`) —
+        // bit-loss (e.g. `1 << 63 == i64::MIN`, `-1 << 1 == -2`) is a defined result,
+        // not an overflow. `>>` is arithmetic (sign-extending) since `a` is `i64`.
+        BinOp::Shl => Value::Int(int_shift(a, b, true, span)?),
+        BinOp::Shr => Value::Int(int_shift(a, b, false, span)?),
+        // Wrapping (NUM §3.2): two's-complement, never panic.
+        BinOp::WrapAdd => Value::Int(a.wrapping_add(b)),
+        BinOp::WrapSub => Value::Int(a.wrapping_sub(b)),
+        BinOp::WrapMul => Value::Int(a.wrapping_mul(b)),
         BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
             unreachable!("handled above apply_binop's numeric dispatch")
         }
@@ -5298,6 +5376,23 @@ pub(crate) fn int_binop(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, 
         }
     };
     Ok(result)
+}
+
+/// `int << amount` / `int >> amount` (NUM §3.2). The single source of truth shared
+/// by the tree-walker and the VM. The shift AMOUNT (`b`) must be `0..64`; an amount
+/// `< 0` or `>= 64` is a recoverable Tier-2 panic (`shift amount out of range: <n>`),
+/// matching `i64::checked_shl`/`checked_shr` semantics. Bit-loss does NOT trap:
+/// `1 << 63 == i64::MIN`, `-1 << 1 == -2`. `>>` is arithmetic (sign-extending)
+/// because `a` is a signed `i64`.
+pub(crate) fn int_shift(a: i64, b: i64, left: bool, span: Span) -> Result<i64, Control> {
+    // The amount must be a valid `u32` in `0..64`; `b < 0` (a negative amount) and
+    // `b >= 64` both fail the `u32::try_from` + `checked_sh*` guard.
+    let amount = u32::try_from(b).ok().filter(|n| *n < 64);
+    let shifted = amount.and_then(|n| if left { a.checked_shl(n) } else { a.checked_shr(n) });
+    match shifted {
+        Some(v) => Ok(v),
+        None => Err(AsError::at(format!("shift amount out of range: {b}"), span).into()),
+    }
 }
 
 /// `int ** int` (NUM §3.2): a non-negative exponent ≤ `u32::MAX` uses
@@ -5332,6 +5427,18 @@ fn float_binop(op: BinOp, a: f64, b: f64) -> Value {
         BinOp::Ge => Value::Bool(a >= b),
         BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
             unreachable!("handled above apply_binop's numeric dispatch")
+        }
+        // Int-only ops (bitwise/shift/wrapping) never reach the float path: a float
+        // operand is rejected by `apply_binop`'s int-only guard before dispatch.
+        BinOp::BitAnd
+        | BinOp::BitOr
+        | BinOp::BitXor
+        | BinOp::Shl
+        | BinOp::Shr
+        | BinOp::WrapAdd
+        | BinOp::WrapSub
+        | BinOp::WrapMul => {
+            unreachable!("int-only op rejected before the float path (apply_binop guard)")
         }
         BinOp::And | BinOp::Or | BinOp::Coalesce => {
             unreachable!("short-circuit ops are not dispatched through apply_binop")
@@ -9527,5 +9634,116 @@ print(n?.m())
         assert_eq!(eval_num("1 < 2").await, Value::Bool(true));
         assert_eq!(eval_num("2 == 2").await, Value::Bool(true));
         assert_eq!(eval_num("3 >= 4").await, Value::Bool(false));
+    }
+
+    // ---- NUM §3.2 bitwise / shift / wrapping operators --------------------
+
+    #[tokio::test]
+    async fn bitwise_and_or_xor() {
+        assert_eq!(eval_num("0xFF & 0b1010").await, Value::Int(10));
+        assert_eq!(eval_num("12 & 10").await, Value::Int(8));
+        assert_eq!(eval_num("12 | 10").await, Value::Int(14));
+        assert_eq!(eval_num("12 ^ 10").await, Value::Int(6));
+        // `|` in value position is bitwise-OR (not an or-pattern).
+        assert_eq!(eval_num("1 | 2").await, Value::Int(3));
+    }
+
+    #[tokio::test]
+    async fn bitwise_not() {
+        assert_eq!(eval_num("~0").await, Value::Int(-1));
+        assert_eq!(eval_num("~5").await, Value::Int(-6));
+    }
+
+    #[tokio::test]
+    async fn shifts_and_arithmetic_sign_extension() {
+        assert_eq!(eval_num("1 << 3").await, Value::Int(8));
+        assert_eq!(eval_num("(1 << 16) | 256").await, Value::Int(65792));
+        assert_eq!(eval_num("1 >> 0").await, Value::Int(1));
+        // `>>` is arithmetic (sign-extending): -8 >> 1 == -4.
+        assert_eq!(eval_num("(0 - 8) >> 1").await, Value::Int(-4));
+        // -1 << 1 == -2 (bit-loss into the sign bit does NOT trap).
+        assert_eq!(eval_num("(0 - 1) << 1").await, Value::Int(-2));
+    }
+
+    #[tokio::test]
+    async fn shift_boundaries() {
+        // 1 << 63 == i64::MIN (top bit set), a DEFINED result — not an overflow.
+        assert_eq!(eval_num("1 << 63").await, Value::Int(i64::MIN));
+        // 1 << 64 → amount >= 64 → panic.
+        assert_eq!(eval_panic_msg("1 << 64").await, "shift amount out of range: 64");
+        // A negative shift amount panics.
+        assert_eq!(
+            eval_panic_msg("1 << (0 - 1)").await,
+            "shift amount out of range: -1"
+        );
+        assert_eq!(eval_panic_msg("1 >> 64").await, "shift amount out of range: 64");
+    }
+
+    #[tokio::test]
+    async fn wrapping_never_panics() {
+        assert_eq!(eval_num("5 +% 3").await, Value::Int(8));
+        assert_eq!(eval_num("5 -% 8").await, Value::Int(-3));
+        assert_eq!(eval_num("6 *% 7").await, Value::Int(42));
+        // i64::MAX +% 1 wraps to i64::MIN (vs the checked `+` which panics).
+        assert_eq!(
+            eval_num("9223372036854775807 +% 1").await,
+            Value::Int(i64::MIN)
+        );
+        // i64::MAX * 2 wraps with `*%` (the checked `*` overflows).
+        assert_eq!(
+            eval_num("9223372036854775807 *% 2").await,
+            Value::Int(-2)
+        );
+    }
+
+    #[tokio::test]
+    async fn checked_vs_wrapping_overflow() {
+        // The checked `+`/`*` panic where the wrapping `+%`/`*%` do not.
+        assert_eq!(
+            eval_panic_msg("9223372036854775807 + 1").await,
+            "integer overflow in '+'"
+        );
+        assert_eq!(
+            eval_num("9223372036854775807 +% 1").await,
+            Value::Int(i64::MIN)
+        );
+    }
+
+    #[tokio::test]
+    async fn bitwise_on_float_is_type_error() {
+        assert_eq!(
+            eval_panic_msg("1 & 2.0").await,
+            "bitwise op requires int operands, got float"
+        );
+        assert_eq!(
+            eval_panic_msg("1.0 | 2").await,
+            "bitwise op requires int operands, got float"
+        );
+        assert_eq!(
+            eval_panic_msg("1 << 2.0").await,
+            "bitwise op requires int operands, got float"
+        );
+        assert_eq!(
+            eval_panic_msg("~1.0").await,
+            "bitwise op requires int operands, got float"
+        );
+        // Wrapping is int-only too.
+        assert_eq!(
+            eval_panic_msg("1 +% 2.0").await,
+            "wrapping op requires int operands, got float"
+        );
+    }
+
+    #[tokio::test]
+    async fn go_precedence_bitwise_vs_comparison_and_arithmetic() {
+        // `a & b == c` parses as `(a & b) == c` (Go's binding). 6 & 2 == 2 → 2 == 2 → true.
+        assert_eq!(eval_num("6 & 2 == 2").await, Value::Bool(true));
+        // `a | b == c` parses as `(a | b) == c`. 1 | 2 == 3 → 3 == 3 → true.
+        assert_eq!(eval_num("1 | 2 == 3").await, Value::Bool(true));
+        // `+ -` bind TIGHTER than `|`: `1 | 2 + 1` is `1 | (2+1)` = 1|3 = 3.
+        assert_eq!(eval_num("1 | 2 + 1").await, Value::Int(3));
+        // `<<`/`&` bind at the multiplicative tier (tighter than `+ -`):
+        // `1 + 1 << 2` is `1 + (1<<2)` = 1 + 4 = 5.
+        assert_eq!(eval_num("1 + 1 << 2").await, Value::Int(5));
     }
 }

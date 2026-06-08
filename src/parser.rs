@@ -6,13 +6,23 @@ use crate::span::Span;
 use crate::token::{is_ident_like, Tok, Token};
 
 pub fn parse(tokens: &[Token]) -> Result<Vec<Stmt>, AsError> {
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        pending_gt: 0,
+    };
     parser.program()
 }
 
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// Pending virtual `>` tokens produced by splitting a `Shr` (`>>`) in
+    /// type-argument position (NUM §3.4). When `> 0`, the next `eat_type_gt` /
+    /// `peek_type_gt` consumes a virtual `>` (the remainder of a `>>`) WITHOUT
+    /// advancing the cursor. Type-arg closings nest strictly, so a simple counter
+    /// suffices (the Rust/Java/C# nested-generics technique).
+    pending_gt: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -504,6 +514,39 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Consume a closing `>` for a type-argument list (NUM §3.4). A `>>` (`Shr`)
+    /// closes TWO nested generics: the first `eat_type_gt` consumes one `>` and
+    /// records a `pending_gt` for the second, which the enclosing close consumes
+    /// WITHOUT advancing. A `>=` (`Ge`) would split similarly, but `>=` never
+    /// follows a type argument in valid source, so only `Shr` is split here. A plain
+    /// `Gt` is consumed normally. Anything else is the usual "expected '>'" error.
+    fn eat_type_gt(&mut self) -> Result<(), AsError> {
+        if self.pending_gt > 0 {
+            // The remainder of a previously-split `>>` — consume virtually, no cursor
+            // advance (the `Shr` token was already advanced past when first split).
+            self.pending_gt -= 1;
+            return Ok(());
+        }
+        match self.peek() {
+            Tok::Gt => {
+                self.advance();
+                Ok(())
+            }
+            Tok::Shr => {
+                // Split `>>` into `> ` + a pending `>`. Advance past the single `Shr`
+                // token now (it covers both), and leave one virtual `>` for the
+                // enclosing close.
+                self.advance();
+                self.pending_gt += 1;
+                Ok(())
+            }
+            _ => Err(AsError::at(
+                format!("expected {:?}, found {:?}", Tok::Gt, self.peek()),
+                self.span(),
+            )),
+        }
+    }
+
     fn parse_type(&mut self) -> Result<crate::ast::Type, AsError> {
         let mut t = self.parse_type_atom()?;
         while *self.peek() == Tok::Pipe {
@@ -549,19 +592,19 @@ impl<'a> Parser<'a> {
                 "array" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
-                    self.eat(&Tok::Gt)?;
+                    self.eat_type_gt()?;
                     Type::Array(Box::new(inner))
                 }
                 "Result" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
-                    self.eat(&Tok::Gt)?;
+                    self.eat_type_gt()?;
                     Type::Result(Box::new(inner))
                 }
                 "future" => {
                     self.eat(&Tok::Lt)?;
                     let inner = self.parse_type()?;
-                    self.eat(&Tok::Gt)?;
+                    self.eat_type_gt()?;
                     Type::Future(Box::new(inner))
                 }
                 "map" => {
@@ -569,7 +612,7 @@ impl<'a> Parser<'a> {
                     let k = self.parse_type()?;
                     self.eat(&Tok::Comma)?;
                     let v = self.parse_type()?;
-                    self.eat(&Tok::Gt)?;
+                    self.eat_type_gt()?;
                     Type::Map(Box::new(k), Box::new(v))
                 }
                 _ => Type::Named(name),
@@ -1277,7 +1320,7 @@ impl<'a> Parser<'a> {
     }
 
     fn comparison(&mut self) -> Result<Expr, AsError> {
-        let mut left = self.range()?;
+        let mut left = self.bitor()?;
         loop {
             let op = match self.peek() {
                 Tok::Lt => BinOp::Lt,
@@ -1285,6 +1328,29 @@ impl<'a> Parser<'a> {
                 Tok::Gt => BinOp::Gt,
                 Tok::Ge => BinOp::Ge,
                 Tok::Instanceof => BinOp::InstanceOf,
+                _ => break,
+            };
+            self.advance();
+            let right = self.bitor()?;
+            left = Self::make_binary(left, op, right);
+        }
+        Ok(left)
+    }
+
+    /// Bitwise-OR tier (`| ^`), NUM §3.4 (Go's binding): TIGHTER than
+    /// comparison/equality, LOOSER than `+ -`/range — so `a | b == c` is `(a|b)==c`
+    /// and `a | b + c` is `a | (b + c)`. CRITICAL: this tier is reached ONLY in
+    /// value position (the full `coalesce → … → comparison → bitor → range` chain).
+    /// `parse_pattern` deliberately bypasses it (it calls `range()` directly) so a
+    /// bare `|` between match patterns stays an or-pattern, and `parse_type`'s `|`
+    /// loop stays a union — exactly as `|` was invisible to the expression chain
+    /// before NUM. `&` and `<< >>` bind one tier TIGHTER (multiplicative).
+    fn bitor(&mut self) -> Result<Expr, AsError> {
+        let mut left = self.range()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Pipe => BinOp::BitOr,
+                Tok::Caret => BinOp::BitXor,
                 _ => break,
             };
             self.advance();
@@ -1411,9 +1477,14 @@ impl<'a> Parser<'a> {
             self.eat(&Tok::RBrace)?;
             return Ok(Pattern::Object(entries, rest));
         }
-        // Otherwise parse a value-expression (at the match precedence level —
-        // `coalesce` excludes `|`, `if`, `=>`) and classify it.
-        let start = self.coalesce()?;
+        // Otherwise parse a value-expression and classify it. NUM §3.4: a match
+        // pattern enters at `range()` — the tier JUST BELOW the new `bitor()` — so a
+        // bare `|` between patterns is NEVER swallowed by the value-parser and stays
+        // owned by the arm loop (the or-pattern `|`). The layers above `bitor`
+        // (`??`/`||`/`&&`/`==`/`<`) are not valid leading forms inside a single
+        // pattern anyway, so dropping to `range()` loses nothing; the `Range`/
+        // `Ident`/`Value` classification below is unchanged.
+        let start = self.range()?;
         // A range pattern: `a..b`, `a..=b`, optionally `… step k`. The expression
         // parser (`range()`) produces a dedicated `ExprKind::Range` for both the
         // exclusive and inclusive forms and already consumed any trailing `step`.
@@ -1463,6 +1534,9 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Tok::Plus => BinOp::Add,
                 Tok::Minus => BinOp::Sub,
+                // Wrapping add/subtract (NUM §3.2/§3.4): additive peers.
+                Tok::PlusPercent => BinOp::WrapAdd,
+                Tok::MinusPercent => BinOp::WrapSub,
                 _ => break,
             };
             self.advance();
@@ -1479,6 +1553,15 @@ impl<'a> Parser<'a> {
                 Tok::Star => BinOp::Mul,
                 Tok::Slash => BinOp::Div,
                 Tok::Percent => BinOp::Mod,
+                // Wrapping multiply, shifts, and bitwise-AND (NUM §3.2/§3.4) bind at
+                // the multiplicative tier — Go's binding (so `a & b == c` is
+                // `(a&b)==c`, `a << b + c` is `(a<<b)+c` … wait: `+ -` are LOOSER
+                // than `<<`/`&`, so `a + b << c` is `a + (b<<c)` and `1 << 2 + 3` is
+                // `(1<<2) + 3` — matching Go).
+                Tok::StarPercent => BinOp::WrapMul,
+                Tok::Shl => BinOp::Shl,
+                Tok::Shr => BinOp::Shr,
+                Tok::Amp => BinOp::BitAnd,
                 _ => break,
             };
             self.advance();
@@ -1548,6 +1631,8 @@ impl<'a> Parser<'a> {
         let op = match self.peek() {
             Tok::Minus => Some(UnOp::Neg),
             Tok::Bang => Some(UnOp::Not),
+            // `~` — int bitwise NOT (NUM §3.2), prefix unary.
+            Tok::Tilde => Some(UnOp::BitNot),
             _ => None,
         };
         if let Some(op) = op {

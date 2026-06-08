@@ -398,21 +398,26 @@ fn bin_prec(op: BinOp) -> u8 {
         BinOp::Coalesce => 3,
         BinOp::Eq | BinOp::Ne => 4,
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::InstanceOf => 5,
-        // Range binds looser than additive but tighter than comparison
-        // (grammar PREC.range = 7, between compare = 6 and add = 8).
-        BinOp::Range => 6,
-        BinOp::Add | BinOp::Sub => 7,
-        BinOp::Mul | BinOp::Div | BinOp::Mod => 8,
-        BinOp::Pow => 9,
+        // Bitwise-OR tier (NUM §3.4): tighter than comparison, looser than range.
+        BinOp::BitOr | BinOp::BitXor => 6,
+        // Range binds looser than additive but tighter than bitor
+        // (grammar PREC.range, between bitor and add).
+        BinOp::Range => 7,
+        // Additive: `+ -` and wrapping `+% -%`.
+        BinOp::Add | BinOp::Sub | BinOp::WrapAdd | BinOp::WrapSub => 8,
+        // Multiplicative: `* / %`, wrapping `*%`, shifts `<< >>`, bitwise `&`.
+        BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::WrapMul | BinOp::Shl | BinOp::Shr
+        | BinOp::BitAnd => 9,
+        BinOp::Pow => 10,
     }
 }
 
 // A precedence floor for a context. An expression whose own precedence is below
 // `min_prec` must be parenthesized.
 const PREC_ASSIGN: u8 = 0;
-const PREC_UNARY: u8 = 10;
-const PREC_POSTFIX: u8 = 11;
-const PREC_ATOM: u8 = 12;
+const PREC_UNARY: u8 = 11;
+const PREC_POSTFIX: u8 = 12;
+const PREC_ATOM: u8 = 13;
 
 /// The natural precedence of an expression (how tightly it binds as a whole).
 fn expr_prec(e: &Expr) -> u8 {
@@ -867,6 +872,35 @@ mod tests {
         assert_eq!(once, twice, "fmt must be idempotent");
         // re-parses to an equivalent program (no parse error)
         assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn bitwise_and_wrapping_operators_round_trip() {
+        // NUM §3.2/§3.4: the legacy formatter renders the new operators and is
+        // idempotent, and the precedence renumbering keeps `(a&b)==c` parenthesis-free.
+        for src in [
+            "let a = 0xFF & 0b1010\n",
+            "let b = (1 << 16) | 256\n",
+            "let c = ~0\n",
+            "let d = 5 +% 3\n",
+            "let e = x -% y *% z\n",
+            "let f = a ^ b >> 1\n",
+            // Go precedence: `(a & b) == c` needs NO parens (bitwise binds tighter).
+            "a & b == c\n",
+            "a | b == c\n",
+        ] {
+            let once = format_source(src).unwrap();
+            let twice = format_source(&once).unwrap();
+            assert_eq!(once, twice, "fmt must be idempotent for {src:?}: {once:?}");
+            // Re-parses cleanly on the legacy front-end.
+            assert!(
+                crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok(),
+                "re-format must re-parse for {src:?}: {once:?}"
+            );
+        }
+        // The bitwise-vs-equality footgun must NOT gain parentheses (Go binding).
+        assert_eq!(format_source("a & b == c").unwrap(), "a & b == c\n");
+        assert_eq!(format_source("a | b == c").unwrap(), "a | b == c\n");
     }
 
     #[test]

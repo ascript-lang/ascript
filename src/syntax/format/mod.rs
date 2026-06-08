@@ -1111,6 +1111,17 @@ fn is_binary_op(kind: SyntaxKind) -> bool {
             | PipePipe
             | QuestionQuestion
             | InstanceofKw
+            // Bitwise / shift / wrapping (NUM §3.2). `Pipe` is bitwise-OR here (in a
+            // BinaryExpr); or-patterns/union types are different nodes, so this never
+            // mis-renders them.
+            | Amp
+            | Caret
+            | Shl
+            | Shr
+            | Pipe
+            | PlusPercent
+            | MinusPercent
+            | StarPercent
     )
 }
 

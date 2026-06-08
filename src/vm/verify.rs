@@ -218,11 +218,12 @@ fn stack_effect(op: Op, argc_or_n: usize) -> Effect {
         Swap => Effect::new(2, 2),
         Rot3 => Effect::new(3, 3),
 
-        // ---- binary arithmetic / comparison / range ----
+        // ---- binary arithmetic / comparison / range / bitwise / shift / wrapping ----
         Add | Sub | Mul | Div | Mod | Pow | Lt | Le | Gt | Ge | Eq | Ne | Range
-        | RangeInclusive => Effect::new(2, 1),
+        | RangeInclusive | BitAnd | BitOr | BitXor | Shl | Shr | WrapAdd | WrapSub
+        | WrapMul => Effect::new(2, 1),
         // ---- unary ----
-        Neg | Not => Effect::new(1, 1),
+        Neg | Not | BitNot => Effect::new(1, 1),
 
         // ---- jumps ----
         // JUMP/LOOP are unconditional, no stack effect. JUMP_IF_* pop the tested value.

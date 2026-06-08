@@ -491,6 +491,30 @@ pub enum Op {
     /// chunk is the entry program (not an imported module) the recorded exports are
     /// simply unused, exactly as the tree-walker discards a main program's exports.
     DefineExport,
+
+    // ---- bitwise / shift / wrapping (NUM §3.2) ----------------------------
+    // All int-only. They route through the SAME shared `apply_binop`/`apply_unop`
+    // as the tree-walker (`binop_of`/`unop_of`), so a float operand raises the
+    // byte-identical Tier-2 type panic. Appended at the end of the enum so existing
+    // opcode byte values are unchanged (`.aso` version is bumped regardless).
+    /// `a b -- (a & b)` — int bitwise AND.
+    BitAnd,
+    /// `a b -- (a | b)` — int bitwise OR.
+    BitOr,
+    /// `a b -- (a ^ b)` — int bitwise XOR.
+    BitXor,
+    /// `a b -- (a << b)` — int left shift (amount out of range → panic).
+    Shl,
+    /// `a b -- (a >> b)` — int arithmetic right shift (amount out of range → panic).
+    Shr,
+    /// `a -- (~a)` — int bitwise NOT.
+    BitNot,
+    /// `a b -- (a +% b)` — int wrapping add (never panics).
+    WrapAdd,
+    /// `a b -- (a -% b)` — int wrapping subtract (never panics).
+    WrapSub,
+    /// `a b -- (a *% b)` — int wrapping multiply (never panics).
+    WrapMul,
 }
 
 impl Op {
@@ -614,6 +638,16 @@ impl Op {
 
             x if x == DefineExport as u8 => DefineExport,
 
+            x if x == BitAnd as u8 => BitAnd,
+            x if x == BitOr as u8 => BitOr,
+            x if x == BitXor as u8 => BitXor,
+            x if x == Shl as u8 => Shl,
+            x if x == Shr as u8 => Shr,
+            x if x == BitNot as u8 => BitNot,
+            x if x == WrapAdd as u8 => WrapAdd,
+            x if x == WrapSub as u8 => WrapSub,
+            x if x == WrapMul as u8 => WrapMul,
+
             _ => return None,
         })
     }
@@ -695,7 +729,16 @@ impl Op {
             | MatchObject
             | NewMap
             | MapEntry
-            | MatchNoArm => 0,
+            | MatchNoArm
+            | BitAnd
+            | BitOr
+            | BitXor
+            | Shl
+            | Shr
+            | BitNot
+            | WrapAdd
+            | WrapSub
+            | WrapMul => 0,
         }
     }
 
@@ -813,6 +856,15 @@ mod tests {
         Op::MatchRange,
         Op::MatchNoArm,
         Op::DefineExport,
+        Op::BitAnd,
+        Op::BitOr,
+        Op::BitXor,
+        Op::Shl,
+        Op::Shr,
+        Op::BitNot,
+        Op::WrapAdd,
+        Op::WrapSub,
+        Op::WrapMul,
     ];
 
     #[test]
