@@ -4,7 +4,10 @@ use crate::span::Span;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
-    Number(f64),
+    /// An integer literal (NUM §3.1): no `.`, no exponent.
+    Int(i64),
+    /// A float literal (NUM §3.1): has a `.` or an exponent.
+    Float(f64),
     Str(String),
     Ident(String),
     Plus,

@@ -12,7 +12,11 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
-    Number(f64),
+    /// An integer literal (NUM §3.1): a digit sequence with no `.` and no
+    /// exponent (decimal / `0x` / `0b` / `0o`, underscores allowed).
+    Int(i64),
+    /// A float literal (NUM §3.1): contains a `.` or an exponent.
+    Float(f64),
     Str(String),
     Bool(bool),
     Nil,
@@ -571,7 +575,8 @@ impl fmt::Display for Expr {
 impl fmt::Display for ExprKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExprKind::Number(n) => write!(f, "{}", n),
+            ExprKind::Int(n) => write!(f, "{}", n),
+            ExprKind::Float(n) => write!(f, "{}", n),
             ExprKind::Str(s) => write!(f, "{:?}", s),
             ExprKind::Bool(b) => write!(f, "{}", b),
             ExprKind::Nil => write!(f, "nil"),
@@ -664,7 +669,7 @@ mod tests {
 
     fn num(n: f64) -> Box<Expr> {
         Box::new(Expr {
-            kind: ExprKind::Number(n),
+            kind: ExprKind::Float(n),
             span: Span::new(0, 0),
         })
     }

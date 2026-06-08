@@ -1662,7 +1662,8 @@ impl<'a> Parser<'a> {
     fn primary(&mut self) -> Result<Expr, AsError> {
         let tok_span = self.span();
         let kind = match self.advance() {
-            Tok::Number(n) => ExprKind::Number(n),
+            Tok::Int(n) => ExprKind::Int(n),
+            Tok::Float(n) => ExprKind::Float(n),
             Tok::Str(s) => ExprKind::Str(s),
             Tok::True => ExprKind::Bool(true),
             Tok::False => ExprKind::Bool(false),
@@ -1874,7 +1875,8 @@ impl<'a> Parser<'a> {
 fn starts_expression(tok: &Tok) -> bool {
     matches!(
         tok,
-        Tok::Number(_)
+        Tok::Int(_)
+            | Tok::Float(_)
             | Tok::Str(_)
             | Tok::Ident(_)
             | Tok::True

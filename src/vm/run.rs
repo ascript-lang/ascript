@@ -3777,6 +3777,14 @@ impl Vm {
         // path, on a miss DEOPT and fall to generic.
         if let Some(kind) = cache.specialized() {
             match (kind, &a, &b) {
+                (ArithKind::Int, Value::Int(x), Value::Int(y)) => {
+                    // SAME i64 arithmetic + checked-overflow/div-by-zero panics as
+                    // apply_binop's int arm — delegated to the shared `int_binop`
+                    // so the two paths cannot drift (NUM §7). The span is needed
+                    // for the panic message.
+                    let span = chunk.span_at(fault_ip);
+                    return crate::interp::int_binop(op, *x, *y, span);
+                }
                 (ArithKind::Number, Value::Float(x), Value::Float(y)) => {
                     // SAME f64 arithmetic as apply_binop's final numeric arm.
                     return Ok(number_fast(op, *x, *y));
@@ -3807,6 +3815,7 @@ impl Vm {
         // Not specialized yet: OBSERVE this execution's operand kinds (warmup),
         // then run the generic path (the result is identical regardless of warmup).
         let observed = match (&a, &b) {
+            (Value::Int(_), Value::Int(_)) => Some(ArithKind::Int),
             (Value::Float(_), Value::Float(_)) => Some(ArithKind::Number),
             (Value::Decimal(_), Value::Decimal(_)) if ArithCache::decimal_specializable(op) => {
                 Some(ArithKind::Decimal)

@@ -125,7 +125,14 @@ fn literal_number(node: &ResolvedNode) -> Option<f64> {
                 .filter_map(|el| el.into_token())
                 .find(|t| !t.kind().is_trivia())?;
             if tok.kind() == Number {
-                parse_number_text(tok.text())
+                // The rule only needs the magnitude/sign for direction & zero
+                // checks, so collapse the int/float subtype to f64 (NUM §3.1).
+                use crate::lex_literals::NumLit;
+                match parse_number_text(tok.text()) {
+                    Ok(NumLit::Int(i)) => Some(i as f64),
+                    Ok(NumLit::Float(f)) => Some(f),
+                    Err(_) => None,
+                }
             } else {
                 None // a string/bool/nil literal is not a number
             }

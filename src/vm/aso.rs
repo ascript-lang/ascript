@@ -102,7 +102,11 @@ pub const ASO_MAGIC: [u8; 4] = *b"ASO\0";
 /// - 18: the class template gained a `worker class` flag byte (Workers Spec B,
 ///   `Class.is_worker`), written by `write_class` before the field list. Drives
 ///   `ClassName.spawn(args)` actor routing on both engines.
-pub const ASO_FORMAT_VERSION: u32 = 18;
+/// - 19: NUM — the numeric model split `Value::Number(f64)` into the two kinds
+///   `Value::Int(i64)` and `Value::Float(f64)`. The constant pool gained
+///   `TAG_INT`, the field-default expr stream gained `EX_INT`, and the former
+///   `TAG_NUMBER`/`EX_NUMBER` tags now carry `Float` (value-identical bytes).
+pub const ASO_FORMAT_VERSION: u32 = 19;
 
 /// An error from decoding (or, for [`AsoError::NonLiteralConst`], encoding) an
 /// `.aso` byte stream.
@@ -177,10 +181,15 @@ impl std::error::Error for AsoError {}
 
 const TAG_NIL: u8 = 0;
 const TAG_BOOL: u8 = 1;
+/// `Value::Float` (the former `Value::Number`; tag value unchanged so existing
+/// float constants keep the same wire byte — NUM §8 "the `Float` tag is the
+/// former `Number` tag, value-identical").
 const TAG_NUMBER: u8 = 2;
 const TAG_STR: u8 = 3;
 const TAG_DECIMAL: u8 = 4;
 const TAG_ENUM: u8 = 5;
+/// `Value::Int` (NUM §8): a 64-bit signed integer constant. New tag.
+const TAG_INT: u8 = 7;
 /// An `Array` whose elements are themselves literal constants. Emitted by the
 /// compiler for the object-rest bound-key list (`let {a, ...rest} = obj` lowers
 /// to an `Op::ObjectRest` whose operand is a const-pool `Array` of key `Str`s).
@@ -209,6 +218,8 @@ const TY_OPTIONAL: u8 = 15;
 
 // ---- field-default expr tags (the subset `cst_default_expr` emits) -----------
 
+/// A `float` literal default (`ExprKind::Float`; the former `ExprKind::Number`
+/// tag, value-identical — NUM §8).
 const EX_NUMBER: u8 = 0;
 const EX_STR: u8 = 1;
 const EX_BOOL: u8 = 2;
@@ -241,6 +252,9 @@ const EX_REPARSE: u8 = 21;
 /// A `#{…}` map literal field default (`ExprKind::Map`, SP2 §3). Followed by a
 /// `len`-prefixed sequence of (key-expr, value-expr) pairs.
 const EX_MAP: u8 = 22;
+/// An `int` literal default (`ExprKind::Int`, NUM §3.1). New tag. The payload is
+/// the i64 stored as u64 bits.
+const EX_INT: u8 = 23;
 
 // Template-part tags (within an `EX_TEMPLATE`).
 const TP_LIT: u8 = 0;
@@ -498,6 +512,7 @@ fn literal_kind(v: &Value) -> Result<&'static str, &'static str> {
     match v {
         Value::Nil => Ok("nil"),
         Value::Bool(_) => Ok("bool"),
+        Value::Int(_) => Ok("int"),
         Value::Float(_) => Ok("number"),
         Value::Str(_) => Ok("string"),
         Value::Decimal(_) => Ok("decimal"),
@@ -644,6 +659,10 @@ fn write_value(w: &mut Writer, v: &Value) -> Result<(), AsoError> {
             w.u8(TAG_BOOL);
             w.u8(u8::from(*b));
         }
+        Value::Int(i) => {
+            w.u8(TAG_INT);
+            w.u64(*i as u64);
+        }
         Value::Float(n) => {
             w.u8(TAG_NUMBER);
             w.f64(*n);
@@ -701,6 +720,7 @@ fn read_value(r: &mut Reader) -> Result<Value, AsoError> {
     let v = match tag {
         TAG_NIL => Value::Nil,
         TAG_BOOL => Value::Bool(r.u8()? != 0),
+        TAG_INT => Value::Int(r.u64()? as i64),
         TAG_NUMBER => Value::Float(r.f64()?),
         TAG_STR => Value::Str(Rc::from(r.str()?.as_str())),
         TAG_DECIMAL => {
@@ -955,7 +975,11 @@ fn write_expr(w: &mut Writer, e: &Expr) -> Result<(), AsoError> {
     w.usize(e.span.start);
     w.usize(e.span.end);
     match &e.kind {
-        ExprKind::Number(n) => {
+        ExprKind::Int(i) => {
+            w.u8(EX_INT);
+            w.u64(*i as u64);
+        }
+        ExprKind::Float(n) => {
             w.u8(EX_NUMBER);
             w.f64(*n);
         }
@@ -1189,7 +1213,8 @@ fn read_expr(r: &mut Reader) -> Result<Expr, AsoError> {
 /// `EX_REPARSE` source before delegating here for the non-reparse forms.
 fn read_expr_kind(r: &mut Reader, tag: u8) -> Result<ExprKind, AsoError> {
     let kind = match tag {
-        EX_NUMBER => ExprKind::Number(r.f64()?),
+        EX_INT => ExprKind::Int(r.u64()? as i64),
+        EX_NUMBER => ExprKind::Float(r.f64()?),
         EX_STR => ExprKind::Str(r.str()?),
         EX_BOOL => ExprKind::Bool(r.u8()? != 0),
         EX_NIL => ExprKind::Nil,
@@ -2089,6 +2114,27 @@ run()
             Value::Decimal(d) => assert_eq!(d.to_string(), "1.50"),
             other => panic!("expected Decimal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn int_constants_roundtrip() {
+        // NUM §3.3: an `int` const pool entry round-trips exactly through
+        // `TAG_INT`, distinct from a same-magnitude `Float`.
+        let mut c = Chunk::new();
+        c.add_const(Value::Int(0));
+        c.add_const(Value::Int(42));
+        c.add_const(Value::Int(-7));
+        c.add_const(Value::Int(i64::MAX));
+        c.add_const(Value::Int(i64::MIN));
+        c.add_const(Value::Float(42.0));
+        let rt = Chunk::from_bytes(&c.to_bytes().expect("serialize")).expect("decode");
+        assert_eq!(rt.consts[0], Value::Int(0));
+        assert_eq!(rt.consts[1], Value::Int(42));
+        assert_eq!(rt.consts[2], Value::Int(-7));
+        assert_eq!(rt.consts[3], Value::Int(i64::MAX));
+        assert_eq!(rt.consts[4], Value::Int(i64::MIN));
+        // The Float(42.0) entry stays a Float, NOT folded into the Int(42).
+        assert!(matches!(rt.consts[5], Value::Float(n) if n == 42.0));
     }
 
     #[test]

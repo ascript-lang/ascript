@@ -1,9 +1,17 @@
 //! Hand-written lexer. Produces tokens with char-offset spans.
 
 use crate::error::AsError;
-use crate::lex_literals::{escape_char, parse_number_text};
+use crate::lex_literals::{escape_char, parse_number_text, NumLit};
 use crate::span::Span;
 use crate::token::{Tok, Token};
+
+/// Map a parsed numeric-literal subtype to its token (NUM §3.1).
+fn num_lit_token(lit: NumLit) -> Tok {
+    match lit {
+        NumLit::Int(i) => Tok::Int(i),
+        NumLit::Float(f) => Tok::Float(f),
+    }
+}
 
 /// Lexer error message raised when a quoted string scan runs off the end of
 /// input. Shared with `repl::is_unterminated_at_eof` so the message and the
@@ -428,11 +436,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                 // (A bare `0`, `0.5`, `0e1` fall through to the decimal scan.)
                 if chars[i] == '0'
                     && i + 1 < chars.len()
-                    && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B')
+                    && matches!(chars[i + 1], 'x' | 'X' | 'b' | 'B' | 'o' | 'O')
                 {
                     let radix_char = chars[i + 1];
                     let is_digit: fn(char) -> bool = match radix_char {
                         'x' | 'X' => |d| d.is_ascii_hexdigit(),
+                        'o' | 'O' => |d| ('0'..='7').contains(&d),
                         _ => |d| d == '0' || d == '1',
                     };
                     j = i + 2;
@@ -440,18 +449,20 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                         j += 1;
                     }
                     let span = Span::new(i, j);
-                    let label = if matches!(radix_char, 'x' | 'X') {
-                        "invalid hex number literal"
-                    } else {
-                        "invalid binary number literal"
+                    let label = match radix_char {
+                        'x' | 'X' => "invalid hex number literal",
+                        'o' | 'O' => "invalid octal number literal",
+                        _ => "invalid binary number literal",
                     };
-                    // Pass the full token text (incl. `0x`/`0b` prefix) to the
+                    // Pass the full token text (incl. `0x`/`0b`/`0o` prefix) to the
                     // shared parser; it strips underscores and dispatches on the
-                    // prefix. An empty/invalid radix body yields `None`.
+                    // prefix. Radix literals are always `int`; an empty body is
+                    // `Invalid`, an i64 overflow is `OutOfRange` (NUM §3.1).
                     let text: String = chars[i..j].iter().collect();
-                    let n = parse_number_text(&text).ok_or_else(|| AsError::at(label, span))?;
+                    let lit = parse_number_text(&text)
+                        .map_err(|e| AsError::at(e.message(label), span))?;
                     tokens.push(Token {
-                        tok: Tok::Number(n),
+                        tok: num_lit_token(lit),
                         span,
                     });
                     i = j;
@@ -491,10 +502,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, AsError> {
                     }
                     let span = Span::new(i, j);
                     let text: String = chars[i..j].iter().collect();
-                    let n = parse_number_text(&text)
-                        .ok_or_else(|| AsError::at("invalid number", span))?;
+                    let lit = parse_number_text(&text)
+                        .map_err(|e| AsError::at(e.message("invalid number"), span))?;
                     tokens.push(Token {
-                        tok: Tok::Number(n),
+                        tok: num_lit_token(lit),
                         span,
                     });
                     i = j;
@@ -612,11 +623,11 @@ mod tests {
         assert_eq!(
             kinds("1 + 2 * 3"),
             vec![
-                Tok::Number(1.0),
+                Tok::Int(1),
                 Tok::Plus,
-                Tok::Number(2.0),
+                Tok::Int(2),
                 Tok::Star,
-                Tok::Number(3.0),
+                Tok::Int(3),
                 Tok::Eof,
             ]
         );
@@ -834,20 +845,20 @@ mod tests {
     fn skips_line_comments() {
         assert_eq!(
             kinds("1 // ignored\n+ 2"),
-            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]
+            vec![Tok::Int(1), Tok::Plus, Tok::Int(2), Tok::Eof]
         );
         // line comment to EOF (no trailing newline) is fine
-        assert_eq!(kinds("42 // trailing"), vec![Tok::Number(42.0), Tok::Eof]);
+        assert_eq!(kinds("42 // trailing"), vec![Tok::Int(42), Tok::Eof]);
     }
 
     #[test]
     fn skips_block_comments() {
         assert_eq!(
             kinds("1 /* a * b / c */ + 2"),
-            vec![Tok::Number(1.0), Tok::Plus, Tok::Number(2.0), Tok::Eof]
+            vec![Tok::Int(1), Tok::Plus, Tok::Int(2), Tok::Eof]
         );
         // block comment spanning constructs
-        assert_eq!(kinds("/* x */ 7"), vec![Tok::Number(7.0), Tok::Eof]);
+        assert_eq!(kinds("/* x */ 7"), vec![Tok::Int(7), Tok::Eof]);
     }
 
     #[test]
@@ -880,38 +891,56 @@ mod tests {
 
     #[test]
     fn lexes_hex_literals() {
-        assert_eq!(kinds("0xFF"), vec![Tok::Number(255.0), Tok::Eof]);
-        assert_eq!(kinds("0xFF_FF"), vec![Tok::Number(65535.0), Tok::Eof]);
+        assert_eq!(kinds("0xFF"), vec![Tok::Int(255), Tok::Eof]);
+        assert_eq!(kinds("0xFF_FF"), vec![Tok::Int(65535), Tok::Eof]);
     }
 
     #[test]
     fn lexes_binary_literals() {
-        assert_eq!(kinds("0b1010"), vec![Tok::Number(10.0), Tok::Eof]);
+        assert_eq!(kinds("0b1010"), vec![Tok::Int(10), Tok::Eof]);
+    }
+
+    #[test]
+    fn lexes_octal_literals() {
+        assert_eq!(kinds("0o17"), vec![Tok::Int(15), Tok::Eof]);
+        assert_eq!(kinds("0O17"), vec![Tok::Int(15), Tok::Eof]);
     }
 
     #[test]
     fn lexes_scientific_literals() {
-        assert_eq!(kinds("1e9"), vec![Tok::Number(1e9), Tok::Eof]);
-        assert_eq!(kinds("1.5e-3"), vec![Tok::Number(0.0015), Tok::Eof]);
+        // An exponent makes the literal a float even when integral.
+        assert_eq!(kinds("1e9"), vec![Tok::Float(1e9), Tok::Eof]);
+        assert_eq!(kinds("1.5e-3"), vec![Tok::Float(0.0015), Tok::Eof]);
     }
 
     #[test]
     fn lexes_underscore_separators() {
-        assert_eq!(kinds("1_000"), vec![Tok::Number(1000.0), Tok::Eof]);
+        assert_eq!(kinds("1_000"), vec![Tok::Int(1000), Tok::Eof]);
     }
 
     #[test]
     fn lexes_plain_decimals_and_floats() {
-        assert_eq!(kinds("255"), vec![Tok::Number(255.0), Tok::Eof]);
-        assert_eq!(kinds("2.5"), vec![Tok::Number(2.5), Tok::Eof]);
+        assert_eq!(kinds("255"), vec![Tok::Int(255), Tok::Eof]);
+        assert_eq!(kinds("2.5"), vec![Tok::Float(2.5), Tok::Eof]);
+    }
+
+    #[test]
+    fn integer_literal_overflow_is_a_lex_error() {
+        let err = lex("9223372036854775808").unwrap_err();
+        assert!(
+            err.message
+                .contains("integer literal out of range for int (i64)"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
     fn range_operator_not_consumed_as_float() {
-        // `0..5` must lex as Number(0), DotDot, Number(5) — not `0.` float.
+        // `0..5` must lex as Int(0), DotDot, Int(5) — not `0.` float.
         assert_eq!(
             kinds("0..5"),
-            vec![Tok::Number(0.0), Tok::DotDot, Tok::Number(5.0), Tok::Eof]
+            vec![Tok::Int(0), Tok::DotDot, Tok::Int(5), Tok::Eof]
         );
     }
 

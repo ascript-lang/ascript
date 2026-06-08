@@ -458,7 +458,8 @@ fn write_expr(out: &mut String, e: &Expr, min_prec: u8) {
 
 fn write_expr_inner(out: &mut String, e: &Expr) {
     match &e.kind {
-        ExprKind::Number(n) => out.push_str(&format_number(*n)),
+        ExprKind::Int(n) => out.push_str(&n.to_string()),
+        ExprKind::Float(n) => out.push_str(&format_float_literal(*n)),
         ExprKind::Str(s) => {
             out.push('"');
             out.push_str(&escape_str_lit(s));
@@ -805,9 +806,14 @@ fn object_key(k: &str) -> String {
 
 /// Render an `f64` the way the lexer would tokenize it back to the same value:
 /// integers without a decimal point, others via Rust's shortest round-trip.
-fn format_number(n: f64) -> String {
-    if n.fract() == 0.0 && n.is_finite() && n.abs() < 1e15 {
-        format!("{}", n as i64)
+/// Render a `float` literal so it round-trips back through the lexer AS A FLOAT
+/// (NUM §3.1/§4): an integral float must keep a fractional part (`5.0`, not `5`),
+/// otherwise re-lexing it would produce an `int`. Non-finite values keep Rust's
+/// `inf`/`-inf`/`NaN` rendering (they are not literals, but the formatter never
+/// emits them in practice — a literal is always finite).
+fn format_float_literal(n: f64) -> String {
+    if n.fract() == 0.0 && n.is_finite() {
+        format!("{}.0", n)
     } else {
         format!("{}", n)
     }
@@ -861,6 +867,26 @@ mod tests {
         assert_eq!(once, twice, "fmt must be idempotent");
         // re-parses to an equivalent program (no parse error)
         assert!(crate::parser::parse(&crate::lexer::lex(&once).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn int_and_float_literals_round_trip() {
+        // NUM §3.1/§4: an int renders without a decimal; a float ALWAYS keeps a
+        // fractional part so it re-lexes as a float (not an int).
+        assert_eq!(format_source("5").unwrap(), "5\n");
+        assert_eq!(format_source("5.0").unwrap(), "5.0\n");
+        assert_eq!(format_source("1.5").unwrap(), "1.5\n");
+        // An integral float must NOT collapse to an int literal on re-format.
+        let once = format_source("let x = 5.0").unwrap();
+        assert!(once.contains("5.0"), "float must keep its .0, got: {once}");
+        let twice = format_source(&once).unwrap();
+        assert_eq!(once, twice, "float formatting must be idempotent");
+        // And the re-formatted float re-lexes as a Float, not an Int.
+        use crate::token::Tok;
+        let toks = crate::lexer::lex("5.0").unwrap();
+        assert!(matches!(toks[0].tok, Tok::Float(_)));
+        let toks2 = crate::lexer::lex(&format_source("5.0").unwrap()).unwrap();
+        assert!(matches!(toks2[0].tok, Tok::Float(_)));
     }
 
     #[test]

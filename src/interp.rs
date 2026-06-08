@@ -2948,7 +2948,8 @@ impl Interp {
         // (return / `?` / panic). A `Cell`, never held across an `.await`.
         let _expr_depth = DepthGuard::enter(&self.expr_depth, EXPR_NEST_LIMIT, expr.span)?;
         match &expr.kind {
-            ExprKind::Number(n) => Ok(Value::Float(*n)),
+            ExprKind::Int(i) => Ok(Value::Int(*i)),
+            ExprKind::Float(n) => Ok(Value::Float(*n)),
             ExprKind::Str(s) => Ok(Value::Str(s.as_str().into())),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Nil => Ok(Value::Nil),
@@ -4891,6 +4892,11 @@ pub(crate) fn check_not_frozen(v: &Value, span: Span) -> Result<(), Control> {
 pub(crate) fn apply_unop(op: UnOp, v: Value, span: Span) -> Result<Value, Control> {
     match op {
         UnOp::Neg => match v {
+            // `-int` is checked: `-i64::MIN` overflows → Tier-2 panic (NUM §3.2).
+            Value::Int(i) => match i.checked_neg() {
+                Some(n) => Ok(Value::Int(n)),
+                None => Err(AsError::at("integer overflow in '-'", span).into()),
+            },
             Value::Float(n) => Ok(Value::Float(-n)),
             Value::Decimal(d) => Ok(Value::Decimal(-d)),
             _ => Err(AsError::at("cannot negate a non-number", span).into()),
@@ -5170,17 +5176,93 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         // "operator requires two numbers or decimals" error.
     }
 
-    let (a, b) = match (&l, &r) {
-        (Value::Float(a), Value::Float(b)) => (*a, *b),
-        _ => {
-            return Err(AsError::at(
-                "operator requires two numbers (or two decimals, or number and decimal)",
-                span,
-            )
-            .into())
+    // Type-directed numeric dispatch (NUM §3.2):
+    //  - Int ⊕ Int      → the checked/truncating int table (`int_binop`).
+    //  - Int ⊕ Float    → promote the int to f64, result is Float (ordering exact).
+    //  - Float ⊕ Float  → the IEEE float path.
+    // Comparison across {Int,Float} is EXACT (no lossy cast) per NUM §3.3.
+    match (&l, &r) {
+        (Value::Int(a), Value::Int(b)) => int_binop(op, *a, *b, span),
+        // Mixed int/float: arithmetic promotes the int to float; ordering stays
+        // exact (compare i64 against f64 without precision loss).
+        (Value::Int(i), Value::Float(f)) => mixed_binop(op, *i, *f, false),
+        (Value::Float(f), Value::Int(i)) => mixed_binop(op, *i, *f, true),
+        (Value::Float(a), Value::Float(b)) => Ok(float_binop(op, *a, *b)),
+        _ => Err(AsError::at(
+            "operator requires two numbers (or two decimals, or number and decimal)",
+            span,
+        )
+        .into()),
+    }
+}
+
+/// `int ⊕ int` arithmetic and comparison (NUM §3.2/§3.3). This is the SINGLE
+/// source of truth shared by the tree-walker and (via the generic `apply_binop`
+/// fallback) the VM; the VM's specialized `ArithKind::Int` fast path MUST be
+/// byte-identical to it, including which inputs panic.
+///
+/// Arithmetic overflow / division-or-remainder-by-zero are recoverable Tier-2
+/// panics raised through the same `AsError::at(..).into()` path every other
+/// `apply_binop` panic uses.
+pub(crate) fn int_binop(op: BinOp, a: i64, b: i64, span: Span) -> Result<Value, Control> {
+    let overflow =
+        |o: &str| -> Control { AsError::at(format!("integer overflow in '{o}'"), span).into() };
+    let result = match op {
+        BinOp::Add => Value::Int(a.checked_add(b).ok_or_else(|| overflow("+"))?),
+        BinOp::Sub => Value::Int(a.checked_sub(b).ok_or_else(|| overflow("-"))?),
+        BinOp::Mul => Value::Int(a.checked_mul(b).ok_or_else(|| overflow("*"))?),
+        BinOp::Div => {
+            if b == 0 {
+                return Err(AsError::at("integer division by zero", span).into());
+            }
+            // `checked_div` is `None` only for `i64::MIN / -1` (overflow). Truncates
+            // toward zero (NUM §3.2): `7/2==3`, `-7/2==-3`.
+            Value::Int(a.checked_div(b).ok_or_else(|| overflow("/"))?)
+        }
+        BinOp::Mod => {
+            if b == 0 {
+                return Err(AsError::at("integer remainder by zero", span).into());
+            }
+            // `checked_rem` is `None` only for `i64::MIN % -1` (overflow). Sign
+            // follows the dividend (`-7 % 2 == -1`).
+            Value::Int(a.checked_rem(b).ok_or_else(|| overflow("%"))?)
+        }
+        BinOp::Pow => int_pow(a, b, span)?,
+        // Comparison: int vs int is trivially exact.
+        BinOp::Lt => Value::Bool(a < b),
+        BinOp::Le => Value::Bool(a <= b),
+        BinOp::Gt => Value::Bool(a > b),
+        BinOp::Ge => Value::Bool(a >= b),
+        BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
+            unreachable!("handled above apply_binop's numeric dispatch")
+        }
+        BinOp::And | BinOp::Or | BinOp::Coalesce => {
+            unreachable!("short-circuit ops are not dispatched through apply_binop")
         }
     };
-    let result = match op {
+    Ok(result)
+}
+
+/// `int ** int` (NUM §3.2): a non-negative exponent ≤ `u32::MAX` uses
+/// `i64::checked_pow` (overflow → panic); a negative exponent or an exponent
+/// `> u32::MAX` computes as `float` via `powf` (the result is defined, never a
+/// truncated-exponent wrong int).
+fn int_pow(base: i64, exp: i64, span: Span) -> Result<Value, Control> {
+    if (0..=i64::from(u32::MAX)).contains(&exp) {
+        match base.checked_pow(exp as u32) {
+            Some(v) => Ok(Value::Int(v)),
+            None => Err(AsError::at("integer overflow in '**'", span).into()),
+        }
+    } else {
+        // Negative exponent OR exponent > u32::MAX → float result.
+        Ok(Value::Float((base as f64).powf(exp as f64)))
+    }
+}
+
+/// `float ⊕ float` arithmetic and comparison (the IEEE path; unchanged from the
+/// pre-NUM behavior). Never panics — IEEE handles `/0`, `NaN`, `inf`.
+fn float_binop(op: BinOp, a: f64, b: f64) -> Value {
+    match op {
         BinOp::Add => Value::Float(a + b),
         BinOp::Sub => Value::Float(a - b),
         BinOp::Mul => Value::Float(a * b),
@@ -5192,13 +5274,53 @@ pub(crate) fn apply_binop(op: BinOp, l: Value, r: Value, span: Span) -> Result<V
         BinOp::Gt => Value::Bool(a > b),
         BinOp::Ge => Value::Bool(a >= b),
         BinOp::Eq | BinOp::Ne | BinOp::Range | BinOp::InstanceOf => {
-            unreachable!("handled above")
+            unreachable!("handled above apply_binop's numeric dispatch")
         }
         BinOp::And | BinOp::Or | BinOp::Coalesce => {
             unreachable!("short-circuit ops are not dispatched through apply_binop")
         }
+    }
+}
+
+/// Mixed `int`/`float` (NUM §3.2/§3.3). For arithmetic, the int is promoted to
+/// f64 and the float path runs (result is Float). For ORDERING, the comparison is
+/// EXACT (no lossy `i as f64`): `int_cmp_float` compares the i64 against the f64
+/// without precision loss. `int_first` is `true` when the float was the left
+/// operand (so the operand order — and thus `<`/`>` direction — is preserved).
+fn mixed_binop(op: BinOp, i: i64, f: f64, float_first: bool) -> Result<Value, Control> {
+    use std::cmp::Ordering;
+    // Exact ordering for the comparison operators. `ord` is the ordering of the
+    // INT relative to the FLOAT; flip it when the float was the left operand.
+    let cmp = |want_lt: bool, want_eq: bool, want_gt: bool| -> Value {
+        match crate::value::int_cmp_float(i, f) {
+            None => Value::Bool(false), // NaN is unordered: every `<`,`<=`,`>`,`>=` is false.
+            Some(mut ord) => {
+                if float_first {
+                    ord = ord.reverse();
+                }
+                let hit = match ord {
+                    Ordering::Less => want_lt,
+                    Ordering::Equal => want_eq,
+                    Ordering::Greater => want_gt,
+                };
+                Value::Bool(hit)
+            }
+        }
     };
-    Ok(result)
+    match op {
+        BinOp::Lt => Ok(cmp(true, false, false)),
+        BinOp::Le => Ok(cmp(true, true, false)),
+        BinOp::Gt => Ok(cmp(false, false, true)),
+        BinOp::Ge => Ok(cmp(false, true, true)),
+        // Arithmetic: promote int → float, preserving operand order. The
+        // resulting `float_binop` cannot reach its `unreachable!` arms — Eq/Ne/
+        // Range/InstanceOf and the short-circuit ops are handled before the
+        // numeric dispatch, and the comparison ops are handled above.
+        _ => {
+            let (a, b) = if float_first { (f, i as f64) } else { (i as f64, f) };
+            Ok(float_binop(op, a, b))
+        }
+    }
 }
 
 /// Validate that a value is a usable array index (a non-negative integer).
@@ -9145,5 +9267,164 @@ print(n?.m())
             interp.classify_specifier("other"),
             SpecifierKind::UnknownPackage("other".into())
         );
+    }
+
+    // ---- NUM §3.2/§3.3: int/float arithmetic, comparison, panics --------------
+
+    /// Evaluate a single expression, returning the Value or the propagated
+    /// `Control` (so a Tier-2 panic can be asserted on). Uses the tree-walker
+    /// directly — `apply_binop`/`apply_unop` are the shared source of truth, so
+    /// the VM path is byte-identical by construction.
+    async fn try_eval(src: &str) -> Result<Value, Control> {
+        let stmts = parse(&lex(src).unwrap()).unwrap();
+        let interp = Interp::new();
+        let env = global_env();
+        let (last, rest) = stmts.split_last().expect("at least one statement");
+        interp.exec(rest, &env).await?;
+        match last {
+            Stmt::Expr(e) => interp.eval_expr(e, &env).await,
+            _ => panic!("last statement must be an expression"),
+        }
+    }
+
+    async fn eval_num(src: &str) -> Value {
+        try_eval(src).await.expect("expected a value, got a panic")
+    }
+
+    async fn eval_panic_msg(src: &str) -> String {
+        match try_eval(src).await {
+            Ok(v) => panic!("expected a panic, got value {v:?}"),
+            Err(Control::Panic(e)) => e.message,
+            Err(other) => panic!("expected a Panic, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn int_literals_eval_to_int() {
+        assert_eq!(eval_num("5").await, Value::Int(5));
+        assert_eq!(eval_num("0xFF").await, Value::Int(255));
+        assert_eq!(eval_num("0b1010").await, Value::Int(10));
+        assert_eq!(eval_num("0o17").await, Value::Int(15));
+        assert_eq!(eval_num("1_000").await, Value::Int(1000));
+    }
+
+    #[tokio::test]
+    async fn float_literals_eval_to_float() {
+        assert_eq!(eval_num("5.0").await, Value::Float(5.0));
+        assert_eq!(eval_num("1.5").await, Value::Float(1.5));
+        assert_eq!(eval_num("1e3").await, Value::Float(1000.0));
+    }
+
+    #[tokio::test]
+    async fn int_add_sub_mul_are_int() {
+        assert_eq!(eval_num("2 + 3").await, Value::Int(5));
+        assert_eq!(eval_num("7 - 10").await, Value::Int(-3));
+        assert_eq!(eval_num("6 * 7").await, Value::Int(42));
+    }
+
+    #[tokio::test]
+    async fn int_div_truncates_toward_zero() {
+        assert_eq!(eval_num("7 / 2").await, Value::Int(3));
+        assert_eq!(eval_num("-7 / 2").await, Value::Int(-3));
+        assert_eq!(eval_num("1 / 2").await, Value::Int(0));
+    }
+
+    #[tokio::test]
+    async fn int_mod_sign_follows_dividend() {
+        assert_eq!(eval_num("7 % 2").await, Value::Int(1));
+        assert_eq!(eval_num("-7 % 2").await, Value::Int(-1));
+    }
+
+    #[tokio::test]
+    async fn int_pow_int_and_negative_exponent() {
+        assert_eq!(eval_num("2 ** 10").await, Value::Int(1024));
+        assert_eq!(eval_num("0 ** 0").await, Value::Int(1));
+        assert_eq!(eval_num("(0 - 2) ** 3").await, Value::Int(-8));
+        assert_eq!(eval_num("2 ** 4").await, Value::Int(16));
+        // Negative exponent → float.
+        assert_eq!(eval_num("2 ** (0 - 1)").await, Value::Float(0.5));
+    }
+
+    #[tokio::test]
+    async fn int_division_and_remainder_by_zero_panic() {
+        assert_eq!(eval_panic_msg("1 / 0").await, "integer division by zero");
+        assert_eq!(eval_panic_msg("1 % 0").await, "integer remainder by zero");
+    }
+
+    #[tokio::test]
+    async fn int_overflow_panics() {
+        // 2**62 + 2**62 overflows i64 on '+'.
+        assert_eq!(
+            eval_panic_msg("4611686018427387904 + 4611686018427387904").await,
+            "integer overflow in '+'"
+        );
+        // i64::MAX * 2 overflows on '*'.
+        assert_eq!(
+            eval_panic_msg("9223372036854775807 * 2").await,
+            "integer overflow in '*'"
+        );
+        // 2**63 overflows on '**'.
+        assert_eq!(eval_panic_msg("2 ** 63").await, "integer overflow in '**'");
+    }
+
+    #[tokio::test]
+    async fn int_min_div_neg_one_overflows() {
+        // i64::MIN is -9223372036854775808; -9223372036854775808 / -1 overflows.
+        // Build i64::MIN as -(i64::MAX) - 1 to avoid an out-of-range literal.
+        let src = "(0 - 9223372036854775807 - 1) / (0 - 1)";
+        assert_eq!(eval_panic_msg(src).await, "integer overflow in '/'");
+    }
+
+    #[tokio::test]
+    async fn unary_neg_of_int_min_overflows() {
+        let src = "0 - 9223372036854775807 - 1"; // i64::MIN
+        assert_eq!(eval_num(src).await, Value::Int(i64::MIN));
+        assert_eq!(
+            eval_panic_msg("-(0 - 9223372036854775807 - 1)").await,
+            "integer overflow in '-'"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_int_float_promotes_to_float() {
+        assert_eq!(eval_num("1 + 1.0").await, Value::Float(2.0));
+        assert_eq!(eval_num("1.0 + 1").await, Value::Float(2.0));
+        assert_eq!(eval_num("7.0 / 2").await, Value::Float(3.5));
+        assert_eq!(eval_num("2 * 1.5").await, Value::Float(3.0));
+    }
+
+    #[tokio::test]
+    async fn exact_cross_subtype_equality() {
+        assert_eq!(eval_num("1 == 1.0").await, Value::Bool(true));
+        assert_eq!(eval_num("1 != 1.0").await, Value::Bool(false));
+        // Near 2^53, an int not exactly representable as f64 is NOT equal to the
+        // rounded float: 9007199254740993 (2^53+1) vs 9007199254740992.0 (2^53).
+        assert_eq!(
+            eval_num("9007199254740993 == 9007199254740992.0").await,
+            Value::Bool(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_cross_subtype_ordering() {
+        assert_eq!(eval_num("2 < 2.5").await, Value::Bool(true));
+        assert_eq!(eval_num("2.5 > 2").await, Value::Bool(true));
+        assert_eq!(eval_num("3 <= 3.0").await, Value::Bool(true));
+        assert_eq!(eval_num("3 >= 3.0").await, Value::Bool(true));
+        // Exact boundary: 2^53+1 > 2^53.0 (the int is strictly greater).
+        assert_eq!(
+            eval_num("9007199254740993 > 9007199254740992.0").await,
+            Value::Bool(true)
+        );
+        // NaN comparisons are all false.
+        assert_eq!(eval_num("1 < (0.0 / 0.0)").await, Value::Bool(false));
+        assert_eq!(eval_num("1 > (0.0 / 0.0)").await, Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn int_int_comparison_is_int_typed() {
+        assert_eq!(eval_num("1 < 2").await, Value::Bool(true));
+        assert_eq!(eval_num("2 == 2").await, Value::Bool(true));
+        assert_eq!(eval_num("3 >= 4").await, Value::Bool(false));
     }
 }

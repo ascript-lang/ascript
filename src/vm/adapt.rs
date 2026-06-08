@@ -47,6 +47,12 @@ pub const WARMUP_THRESHOLD: u16 = 8;
 /// single guarded fast path in the run loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArithKind {
+    /// Both operands `Value::Int` ⇒ inline i64 arithmetic with the SAME
+    /// checked-overflow + division-by-zero panic behavior as `apply_binop`'s int
+    /// arm (NUM §3.2/§7). The fast path delegates to `crate::interp::int_binop`,
+    /// the single source of truth, so the specialized and generic paths are
+    /// byte-identical (including which inputs panic).
+    Int,
     /// Both operands `Value::Float` ⇒ inline `f64` arithmetic.
     Number,
     /// Both operands `Value::Decimal` ⇒ inline `rust_decimal` arithmetic.

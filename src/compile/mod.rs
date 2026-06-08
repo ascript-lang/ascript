@@ -220,7 +220,8 @@ fn cst_default_expr(expr: &Expr) -> Result<crate::ast::Expr, CompileError> {
     let span = node_span(expr);
     let kind = match expr {
         Expr::Literal(lit) => match literal_const_value(lit)? {
-            Value::Float(n) => ExprKind::Number(n),
+            Value::Int(i) => ExprKind::Int(i),
+            Value::Float(n) => ExprKind::Float(n),
             Value::Str(s) => ExprKind::Str(s.to_string()),
             Value::Bool(b) => ExprKind::Bool(b),
             Value::Nil => ExprKind::Nil,
@@ -5022,12 +5023,27 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
         .ok_or_else(|| CompileError::new("malformed literal (no token text)", span))?;
     let value = match kind {
         SyntaxKind::Number => {
-            let n = parse_number_text(&text).ok_or_else(|| {
-                // The lexer already validated the token, so this is a
-                // compiler bug rather than a user error if it ever fires.
-                CompileError::new(format!("malformed number literal {text:?}"), span)
-            })?;
-            Value::Float(n)
+            // NUM §3.1: the literal's subtype (int vs float) is decided from its
+            // text. An out-of-range integer literal is a user error surfaced as a
+            // `CompileError` (the CST lexer accepts the digit run but does not
+            // range-check); a malformed token is a compiler-invariant bug.
+            use crate::lex_literals::{NumLit, NumLitError};
+            match parse_number_text(&text) {
+                Ok(NumLit::Int(i)) => Value::Int(i),
+                Ok(NumLit::Float(f)) => Value::Float(f),
+                Err(NumLitError::OutOfRange) => {
+                    return Err(CompileError::new(
+                        "integer literal out of range for int (i64)".to_string(),
+                        span,
+                    ))
+                }
+                Err(NumLitError::Invalid) => {
+                    return Err(CompileError::new(
+                        format!("malformed number literal {text:?}"),
+                        span,
+                    ))
+                }
+            }
         }
         SyntaxKind::Str => Value::Str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str())),
         SyntaxKind::TrueKw => Value::Bool(true),

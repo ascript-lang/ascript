@@ -737,6 +737,55 @@ fn int_eq_float(i: i64, f: f64) -> bool {
         && f as i64 == i
 }
 
+/// Exact `int`-vs-`float` ordering (NUM §3.3): returns `Some(Ordering)` for the
+/// mathematical comparison of `i` and `f`, or `None` iff `f` is `NaN` (which is
+/// unordered, exactly like IEEE-754). The comparison is **exact** — it never casts
+/// `i as f64` (which would lose precision past 2^53). Strategy: if `f` is integral
+/// and within i64 range, compare as integers; otherwise compare `i as f64` vs `f`
+/// — but bias by the fractional part / out-of-range magnitude so no precision is
+/// lost at the boundary.
+pub(crate) fn int_cmp_float(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    if f == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if f == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    // `f` is finite. If it is below the i64 range, every i64 is greater; above the
+    // range, every i64 is smaller. The bounds `i64::MIN as f64` (= -2^63, exact)
+    // and `i64::MAX as f64` (= 2^63, since 2^63-1 rounds up) frame the range:
+    // `f < -2^63` ⇒ i > f; `f >= 2^63` ⇒ i < f (no i64 reaches 2^63).
+    if f < i64::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+    if f >= -(i64::MIN as f64) {
+        // -(i64::MIN as f64) == 2^63; no i64 is >= 2^63.
+        return Some(Ordering::Less);
+    }
+    // Now `-2^63 <= f < 2^63`, so `f.trunc()` fits in i64 exactly.
+    let trunc = f.trunc() as i64;
+    match i.cmp(&trunc) {
+        // Same integer part: the fraction decides. `f.fract()` is in (-1, 1); a
+        // positive fraction makes `f` larger than its truncation, a negative one
+        // smaller. `i == trunc` so compare against the fraction's sign.
+        Ordering::Equal => {
+            let frac = f.fract();
+            if frac > 0.0 {
+                Some(Ordering::Less) // i == trunc < f
+            } else if frac < 0.0 {
+                Some(Ordering::Greater) // i == trunc > f
+            } else {
+                Some(Ordering::Equal)
+            }
+        }
+        other => Some(other),
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -1077,6 +1126,36 @@ mod tests {
             crate::interp::type_name(&Value::Decimal(Decimal::from(1))),
             "decimal"
         );
+    }
+
+    #[test]
+    fn num_int_cmp_float_is_exact_at_boundaries() {
+        use std::cmp::Ordering;
+        // Trivial integral cases.
+        assert_eq!(int_cmp_float(2, 2.5), Some(Ordering::Less));
+        assert_eq!(int_cmp_float(3, 2.5), Some(Ordering::Greater));
+        assert_eq!(int_cmp_float(2, 2.0), Some(Ordering::Equal));
+        // NaN is unordered.
+        assert_eq!(int_cmp_float(1, f64::NAN), None);
+        // Infinities.
+        assert_eq!(int_cmp_float(i64::MAX, f64::INFINITY), Some(Ordering::Less));
+        assert_eq!(
+            int_cmp_float(i64::MIN, f64::NEG_INFINITY),
+            Some(Ordering::Greater)
+        );
+        // 2^53 boundary: 2^53+1 (exact i64) vs 2^53.0 — the int is strictly
+        // greater, despite (2^53+1) as f64 rounding back to 2^53.
+        let two53_plus1 = (1i64 << 53) + 1;
+        let two53_f = (1u64 << 53) as f64;
+        assert_eq!(int_cmp_float(two53_plus1, two53_f), Some(Ordering::Greater));
+        assert!(int_eq_float(1i64 << 53, two53_f)); // exactly equal at 2^53
+        assert!(!int_eq_float(two53_plus1, two53_f)); // 2^53+1 != 2^53.0
+        // Far out-of-range floats: every i64 is below 1e300 and above -1e300.
+        assert_eq!(int_cmp_float(i64::MAX, 1e300), Some(Ordering::Less));
+        assert_eq!(int_cmp_float(i64::MIN, -1e300), Some(Ordering::Greater));
+        // Negative fractional near an int.
+        assert_eq!(int_cmp_float(-3, -3.5), Some(Ordering::Greater));
+        assert_eq!(int_cmp_float(-4, -3.5), Some(Ordering::Less));
     }
 
     #[test]
