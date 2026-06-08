@@ -153,6 +153,11 @@ fn unsendable_kind(v: &Value) -> Option<(&'static str, Option<&'static str>)> {
         Value::Generator(_) => Some(("generator", None)),
 
         Value::Class(_) => Some(("class", None)),
+        // IFACE (C5): an interface descriptor is code, non-sendable as a VALUE. This
+        // arm makes `check_sendable` reject it with a field path, so `encode_value`'s
+        // catch-all `unreachable!` is never reached. (Interfaces cross isolates via
+        // code-shipping, Task 8 — not the value serializer.)
+        Value::Interface(_) => Some(("interface", None)),
         Value::Enum(_) => Some(("enum", None)),
         Value::Super(_) => Some(("super", None)),
     }

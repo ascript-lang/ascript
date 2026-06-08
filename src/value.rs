@@ -417,6 +417,38 @@ pub struct SuperRef {
     pub start: Option<Rc<Class>>,
 }
 
+/// IFACE §4: a structural interface — an immutable, acyclic conformance descriptor
+/// naming a method set. An interface name resolves to a `Value::Interface(Rc<InterfaceDef>)`.
+/// It is never a receiver, has no vtable, holds no `Value`/`Cc` edges, and its GC
+/// `Trace` is a no-op (like `Regex`/`Native`). Identity-equal (`Rc::ptr_eq`).
+pub struct InterfaceDef {
+    pub name: String,
+    /// This interface's OWN requirements (the body's `fn` signatures), keyed by name.
+    pub own_methods: IndexMap<String, MethodReq>,
+    /// The names of the interfaces this one `extends` (composition). Stored as NAMES,
+    /// resolved LAZILY (interfaces forward-reference as late-bound module-globals) —
+    /// NOT pre-flattened at declaration time (IFACE §4, C4).
+    pub extends: Vec<String>,
+    /// MEMOIZED flattened method set (own + every transitively-extended interface's),
+    /// deduplicated by name. `None` until the first `conforms`/contract check; filled
+    /// on first use via the engine's `flatten()` lazy builder, then reused. Never
+    /// invalidated within a run (descriptors are load-time-immortal, IFACE §5.3).
+    pub flat: RefCell<Option<Rc<IndexMap<String, MethodReq>>>>,
+}
+
+/// IFACE §4: a single required method on an interface — name keys it in the map, this
+/// carries the call-shape. v1 is arity-only (type-erased, runtime-permissive); TYPE
+/// later adds param/ret `CheckTy` slots here for the strict static check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodReq {
+    /// The number of parameters the interface signature declares.
+    pub arity: usize,
+    /// Whether the requirement itself declares a rest param (`...xs`) — only then must
+    /// the conforming method also be variadic (IFACE §5.1).
+    pub has_rest: bool,
+    // TYPE later adds param/ret CheckTy signatures here.
+}
+
 /// A compiled regular expression (spec §11.2). Immutable; identity equality.
 /// Gated on the `data` feature because `regex::Regex` only exists with it.
 #[cfg(feature = "data")]
@@ -738,6 +770,11 @@ pub enum Value {
     Enum(Rc<EnumDef>),
     EnumVariant(Rc<EnumVariant>),
     Class(Rc<Class>),
+    /// IFACE §4: a structural interface — an immutable, acyclic conformance descriptor
+    /// (`Rc<InterfaceDef>`) naming a method set. Identity-equal like `Class`; the RHS
+    /// of `instanceof Reader`, the resolved target of a `Reader` annotation. No vtable,
+    /// no GC edges (no-op `Trace`).
+    Interface(Rc<InterfaceDef>),
     Instance(Cc<RefCell<Instance>>),
     BoundMethod(Rc<BoundMethod>),
     Super(Rc<SuperRef>),
@@ -955,6 +992,8 @@ impl PartialEq for Value {
             }
             // Classes/instances/bound-methods/super compare by identity.
             (Value::Class(a), Value::Class(b)) => Rc::ptr_eq(a, b),
+            // Interfaces compare by identity (immutable descriptors, IFACE §4).
+            (Value::Interface(a), Value::Interface(b)) => Rc::ptr_eq(a, b),
             (Value::Instance(a), Value::Instance(b)) => crate::gc::cc_ptr_eq(a, b),
             (Value::BoundMethod(a), Value::BoundMethod(b)) => Rc::ptr_eq(a, b),
             (Value::Super(a), Value::Super(b)) => Rc::ptr_eq(a, b),
@@ -1009,6 +1048,7 @@ impl fmt::Debug for Value {
                 Some(_) => write!(f, "EnumVariant({}.{}(..))", v.enum_name, v.name),
             },
             Value::Class(c) => write!(f, "Class({})", c.name),
+            Value::Interface(i) => write!(f, "Interface({})", i.name),
             Value::Instance(i) => write!(f, "Instance({})", i.borrow().class.name),
             Value::BoundMethod(b) => write!(f, "BoundMethod({})", b.name),
             Value::Super(_) => write!(f, "Super"),
@@ -1188,6 +1228,7 @@ impl Value {
                 }
             },
             Value::Class(c) => write!(f, "<class {}>", c.name),
+            Value::Interface(i) => write!(f, "<interface {}>", i.name),
             Value::Instance(i) => write!(f, "<{} instance>", i.borrow().class.name),
             Value::BoundMethod(b) => write!(f, "<method {}>", b.name),
             Value::Super(_) => write!(f, "<super>"),
@@ -1444,6 +1485,34 @@ mod tests {
         let b = MapKey::from_value(&Value::Decimal(Decimal::from(1)));
         assert!(a == b);
         assert_eq!(dec_key.to_value(), Value::Decimal(Decimal::from(1)));
+    }
+
+    // ---- IFACE Task 1: Value::Interface descriptor ----
+
+    fn iface(name: &str) -> Rc<InterfaceDef> {
+        Rc::new(InterfaceDef {
+            name: name.to_string(),
+            own_methods: IndexMap::new(),
+            extends: Vec::new(),
+            flat: RefCell::new(None),
+        })
+    }
+
+    #[test]
+    fn iface_value_basics() {
+        let r = iface("Reader");
+        let v = Value::Interface(r.clone());
+        // type_name → "interface"
+        assert_eq!(crate::interp::type_name(&v), "interface");
+        // truthy (a descriptor is truthy)
+        assert!(v.is_truthy());
+        // Display → "<interface Reader>" (mirrors "<class Foo>")
+        assert_eq!(format!("{}", v), "<interface Reader>");
+        // same Rc → equal (identity)
+        assert_eq!(v.clone(), v);
+        assert_eq!(Value::Interface(r.clone()), Value::Interface(r));
+        // two distinct Rcs of the same name → NOT equal (identity, not structural)
+        assert_ne!(Value::Interface(iface("Reader")), Value::Interface(iface("Reader")));
     }
 
     // ---- NUM Task 1: int subtype, truthiness, MapKey fold, cross-subtype eq ----

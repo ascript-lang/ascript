@@ -6337,6 +6337,7 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Enum(_) => "enum",
         Value::EnumVariant(_) => "enum variant",
         Value::Class(_) => "class",
+        Value::Interface(_) => "interface",
         Value::Instance(_) => "instance",
         Value::BoundMethod(_) | Value::Super(_) => "function",
         Value::Future(_) => "future",
