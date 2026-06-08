@@ -104,6 +104,8 @@ fn collect_chain<'a>(class: &'a Class, out: &mut Vec<&'a Class>) {
 fn type_to_json_schema(ty: &Type, resolve_named: &dyn Fn(&str) -> Option<J>) -> (J, bool) {
     match ty {
         Type::Number => (json!({"type": "number"}), true),
+        Type::Int => (json!({"type": "integer"}), true),
+        Type::Float => (json!({"type": "number"}), true),
         Type::String => (json!({"type": "string"}), true),
         Type::Bool => (json!({"type": "boolean"}), true),
         Type::Nil => (json!({"type": "null"}), false),

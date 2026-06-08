@@ -144,7 +144,12 @@ pub enum CallArg {
 /// A type annotation (spec §5). Checked at runtime as a contract.
 #[derive(Clone, Debug)]
 pub enum Type {
+    /// `number` — the union `int | float`; accepts either numeric subtype.
     Number,
+    /// `int` (NUM) — accepts only `Value::Int`.
+    Int,
+    /// `float` (NUM) — accepts only `Value::Float`.
+    Float,
     String,
     Bool,
     Nil,
@@ -198,6 +203,8 @@ impl std::fmt::Display for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Type::Number => write!(f, "number"),
+            Type::Int => write!(f, "int"),
+            Type::Float => write!(f, "float"),
             Type::String => write!(f, "string"),
             Type::Bool => write!(f, "bool"),
             Type::Nil => write!(f, "nil"),

@@ -269,6 +269,8 @@ fn type_to_schema(
     use crate::ast::Type;
     match ty {
         Type::Number => make_schema("number"),
+        Type::Int => make_schema("int"),
+        Type::Float => make_schema("float"),
         Type::String => make_schema("string"),
         Type::Bool => make_schema("bool"),
         Type::Nil => make_schema("nil"),

@@ -221,6 +221,8 @@ const TY_NAMED: u8 = 12;
 const TY_MAP: u8 = 13;
 const TY_FUTURE: u8 = 14;
 const TY_OPTIONAL: u8 = 15;
+const TY_INT: u8 = 16;
+const TY_FLOAT: u8 = 17;
 
 // ---- field-default expr tags (the subset `cst_default_expr` emits) -----------
 
@@ -889,6 +891,8 @@ fn read_opt_type(r: &mut Reader) -> Result<Option<Type>, AsoError> {
 fn write_type(w: &mut Writer, t: &Type) {
     match t {
         Type::Number => w.u8(TY_NUMBER),
+        Type::Int => w.u8(TY_INT),
+        Type::Float => w.u8(TY_FLOAT),
         Type::String => w.u8(TY_STRING),
         Type::Bool => w.u8(TY_BOOL),
         Type::Nil => w.u8(TY_NIL),
@@ -940,6 +944,8 @@ fn read_type(r: &mut Reader) -> Result<Type, AsoError> {
     let tag = r.u8()?;
     let t = match tag {
         TY_NUMBER => Type::Number,
+        TY_INT => Type::Int,
+        TY_FLOAT => Type::Float,
         TY_STRING => Type::String,
         TY_BOOL => Type::Bool,
         TY_NIL => Type::Nil,

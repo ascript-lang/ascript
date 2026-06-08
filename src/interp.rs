@@ -6017,9 +6017,11 @@ pub(crate) fn check_type(value: &Value, ty: &crate::ast::Type) -> bool {
     use crate::ast::Type;
     match ty {
         Type::Any => true,
-        // NUM §4: the `number` contract accepts BOTH numeric subtypes (`Int` and
-        // `Float`). `Int`/`Float` are not yet separate annotations (a later unit).
+        // NUM §4/§5: `number` is the union `int | float`; `int`/`float` accept only
+        // their own subtype.
         Type::Number => value.is_number(),
+        Type::Int => matches!(value, Value::Int(_)),
+        Type::Float => matches!(value, Value::Float(_)),
         Type::String => matches!(value, Value::Str(_)),
         Type::Bool => matches!(value, Value::Bool(_)),
         Type::Nil => matches!(value, Value::Nil),
@@ -6667,6 +6669,22 @@ print(y)
             err.message,
             "type contract violated: expected future<number>, got int (5)"
         );
+    }
+
+    #[test]
+    fn check_type_int_float_number_contracts() {
+        use crate::ast::Type;
+        // NUM §5: `int` accepts only Int, `float` only Float, `number` both. This is
+        // the runtime contract enforced on class fields / params / returns. Regression
+        // for the bug where `int`/`float` parsed as Type::Named and `class C { x: int }`
+        // panicked "expected int, got int".
+        assert!(check_type(&Value::Int(5), &Type::Int));
+        assert!(!check_type(&Value::Float(5.0), &Type::Int));
+        assert!(check_type(&Value::Float(2.5), &Type::Float));
+        assert!(!check_type(&Value::Int(5), &Type::Float));
+        assert!(check_type(&Value::Int(5), &Type::Number));
+        assert!(check_type(&Value::Float(2.5), &Type::Number));
+        assert!(!check_type(&Value::Str("x".into()), &Type::Int));
     }
 
     #[test]

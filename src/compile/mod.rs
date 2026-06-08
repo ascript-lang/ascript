@@ -124,6 +124,8 @@ fn cst_type(node: &crate::syntax::cst::ResolvedNode) -> Option<crate::ast::Type>
             let name = cst_first_ident(node)?;
             Some(match name.as_str() {
                 "number" => Type::Number,
+                "int" => Type::Int,
+                "float" => Type::Float,
                 "string" => Type::String,
                 "bool" => Type::Bool,
                 "any" => Type::Any,

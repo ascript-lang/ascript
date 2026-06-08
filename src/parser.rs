@@ -584,6 +584,8 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident(name) => match name.as_str() {
                 "number" => Type::Number,
+                "int" => Type::Int,
+                "float" => Type::Float,
                 "string" => Type::String,
                 "bool" => Type::Bool,
                 "any" => Type::Any,
