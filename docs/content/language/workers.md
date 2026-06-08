@@ -222,6 +222,10 @@ The semantics that make actors safe:
 - **Owns in-isolate resources.** A resource (a file, a connection, an in-memory store) opened in
   `init` or a method lives and dies inside the isolate; it never crosses the boundary. Only data
   returned from methods crosses.
+- **Methods may use other top-level classes/enums.** An actor method can construct or reference
+  any other top-level `class` (its full method table + superclass chain) or `enum` — the actor
+  code slice ships those definitions into the isolate (transitively: a shipped class whose own
+  method constructs yet another class pulls that one in too), exactly like a `worker fn` body.
 - **`close()` / program-exit teardown.** Call `close()` to shut the actor down explicitly and
   reclaim its isolate thread. Like other native resources (sockets, DB connections), an actor whose
   handle simply goes out of scope is *not* eagerly reclaimed — it lives in the runtime resource

@@ -444,6 +444,109 @@ await main()
 }
 
 // ---------------------------------------------------------------------------
+// Actor method dependency-closure on OTHER top-level classes/enums. An actor
+// method that constructs / references another top-level class (or enum) must
+// ship that class/enum into the actor isolate — the same class-pulling closure
+// the worker-fn slice already does.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn actor_method_constructs_other_class() {
+    // The reported bug: an actor method constructing another top-level class must
+    // ship that class into the isolate (previously `undefined variable 'Point'`).
+    let src = r#"
+class Point { x: number = 0
+  y: number = 0 }
+worker class Maker {
+  fn make(a: number, b: number): Point { return Point.from({x: a, y: b}) }
+}
+async fn main() {
+  let m = await Maker.spawn()
+  let p = await m.make(3, 4)
+  print(p.x + p.y)
+  m.close()
+}
+await main()
+"#;
+    assert_both_engines("maker_point", src, "7\n");
+}
+
+#[test]
+fn actor_method_uses_enum() {
+    // An actor method referencing a top-level ENUM ships the enum into the isolate.
+    let src = r#"
+enum Color { Red, Green, Blue }
+worker class Painter {
+  fn pick(n: number): string {
+    if (n == 0) { return Color.Red.name }
+    if (n == 1) { return Color.Green.name }
+    return Color.Blue.name
+  }
+}
+async fn main() {
+  let p = await Painter.spawn()
+  print(await p.pick(0))
+  print(await p.pick(2))
+  p.close()
+}
+await main()
+"#;
+    assert_both_engines("painter_enum", src, "Red\nBlue\n");
+}
+
+#[test]
+fn actor_method_constructs_class_transitively() {
+    // An actor method constructs class A, whose own method constructs class B —
+    // the transitive class closure must ship BOTH A and B.
+    let src = r#"
+class Inner { v: number = 0
+  fn init(v) { self.v = v } }
+class Outer {
+  inner: Inner?
+  fn init(n) { self.inner = Inner(n * 2) }
+  fn total(): number { return self.inner.v + 1 }
+}
+worker class Factory {
+  fn build(n: number): number { let o = Outer(n); return o.total() }
+}
+async fn main() {
+  let f = await Factory.spawn()
+  print(await f.build(5))
+  f.close()
+}
+await main()
+"#;
+    assert_both_engines("factory_transitive", src, "11\n");
+}
+
+#[test]
+fn actor_method_constructs_class_with_superclass() {
+    // An actor method constructs a subclass; its superclass chain must ship too.
+    let src = r#"
+class Shape {
+  kind: string = ""
+  fn init(k) { self.kind = k }
+  fn label(): string { return self.kind }
+}
+class Circle extends Shape {
+  r: number = 0
+  fn init(r) { super.init("circle"); self.r = r }
+  fn describe(): string { return `${self.label()}:${self.r}` }
+}
+worker class Drawer {
+  fn draw(r: number): string { let c = Circle(r); return c.describe() }
+}
+async fn main() {
+  let d = await Drawer.spawn()
+  print(await d.draw(3))
+  d.close()
+}
+await main()
+"#;
+    assert_both_engines("drawer_super", src, "circle:3\n");
+}
+
+// ---------------------------------------------------------------------------
 // Task 11 — the 4th execution mode: a `worker class` actor AND a `worker fn*`
 // streaming generator must work when run from a COMPILED `.aso` file (no source
 // available). The slice is rebuilt from the stored `.aso` bytes
@@ -525,6 +628,30 @@ await main()
     let (ok, out, err) = build_then_run_aso("greeter", src);
     assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
     assert_eq!(out, "Hi, Ada\nHi, Bob\n", "[.aso run] stdout mismatch (stderr={err:?})");
+}
+
+#[test]
+fn aso_mode_actor_method_constructs_other_class() {
+    // The actor class-slice's class closure must survive the `.aso` rebuild path:
+    // an actor method constructing another top-level class works from a compiled
+    // `.aso` (slice rebuilt from the stored `.aso` bytes, no source).
+    let src = r#"
+class Point { x: number = 0
+  y: number = 0 }
+worker class Maker {
+  fn make(a: number, b: number): Point { return Point.from({x: a, y: b}) }
+}
+async fn main() {
+  let m = await Maker.spawn()
+  let p = await m.make(3, 4)
+  print(p.x + p.y)
+  m.close()
+}
+await main()
+"#;
+    let (ok, out, err) = build_then_run_aso("maker_point", src);
+    assert!(ok, "[.aso run] failed: stdout={out:?} stderr={err:?}");
+    assert_eq!(out, "7\n", "[.aso run] stdout mismatch (stderr={err:?})");
 }
 
 #[test]
