@@ -1165,6 +1165,8 @@ impl Vm {
                                 args,
                                 call_span,
                                 what,
+                                None,
+                                None,
                             )?;
                             // Build a NOT-STARTED one-frame Fiber for the closure and
                             // place the bound params into its slots (cell slot → cell,
@@ -1268,6 +1270,8 @@ impl Vm {
                                 args,
                                 call_span,
                                 what,
+                                None,
+                                None,
                             )?;
                             // The args/rest array are gone from the stack; the new
                             // frame's window starts where the callee value was.
@@ -3433,7 +3437,7 @@ impl Vm {
                 if closure.proto.is_generator {
                     let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
                     let bound =
-                        crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                        crate::interp::check_call_args(&closure.proto.params, args, span, what, None, None)?;
                     let mut gfiber = Fiber::new(closure);
                     gfiber.frame_mut().ret_span = span;
                     gfiber.frame_mut().argc = bound.supplied;
@@ -3456,7 +3460,7 @@ impl Vm {
                 // Arity + per-param contracts + rest collection, shared verbatim
                 // with the tree-walker and the `Op::Call` arm.
                 let bound =
-                    crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what, None, None)?;
                 // Build a one-frame Fiber whose sole frame is the closure, then
                 // place the bound params into its slots (cell slot → cell, plain
                 // slot → stack). `Fiber::new` already reserved `slot_count` Nil
@@ -3846,7 +3850,7 @@ impl Vm {
             if !closure.proto.is_async && !closure.proto.is_generator {
                 let what = closure.proto.chunk.name.as_deref().unwrap_or("method");
                 let bound =
-                    crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+                    crate::interp::check_call_args(&closure.proto.params, args, span, what, None, None)?;
                 let slot_base = fiber.stack.len();
                 let slot_count = closure.proto.chunk.slot_count as usize;
                 let cells = super::fiber::alloc_cells(slot_count, &closure.proto.chunk.cell_slots);
@@ -4166,6 +4170,16 @@ impl Vm {
         use crate::vm::adapt::{ArithCache, ArithKind};
 
         let chunk = &fiber.frame().closure.proto.chunk;
+        // IFACE §5.2: `instanceof` routes through the shared `&self`
+        // `Interp::eval_instanceof` (class → nominal `is_instance_of`; interface →
+        // structural `conforms`) — the SAME path the tree-walker takes. It needs the
+        // engine state (verdict cache) the free `apply_binop` cannot reach, so it is
+        // intercepted here ahead of BOTH the kill-switch and the arithmetic fast path
+        // (a pure memo, active in specialized AND generic modes → byte-identical).
+        if let BinOp::InstanceOf = op {
+            let span = chunk.span_at(fault_ip);
+            return self.interp.eval_instanceof(a, b, span);
+        }
         // KILL SWITCH (V11-T5): with specialization OFF, never observe/specialize/
         // deopt — go straight through the shared generic `apply_binop`. The result
         // and every panic message are identical to the specialized fast path (which
@@ -4482,7 +4496,7 @@ impl Vm {
         // Bind the user args (arity + per-param contracts + rest) against the
         // method's declared params (which EXCLUDE self) — shared with every call
         // path. The bound values land in slots 1.. (self is slot 0).
-        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, None, None)?;
         // A generator method (`fn*` / `async fn*`) is NOT run inline: it binds `self`
         // and args into a NOT-STARTED fiber and wraps it in a VM-backed
         // `GeneratorHandle`, returning a `Value::Generator` immediately — exactly like
@@ -4585,7 +4599,7 @@ impl Vm {
             return Ok(Value::Future(fut));
         }
         let what = closure.proto.chunk.name.as_deref().unwrap_or("function");
-        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what)?;
+        let bound = crate::interp::check_call_args(&closure.proto.params, args, span, what, None, None)?;
         // `static fn*` / `static async fn*`: build a NOT-STARTED fiber, bind args
         // into slots 0.., wrap in a VM `GeneratorHandle`. No receiver/self slot.
         if closure.proto.is_generator {
