@@ -14,4 +14,4 @@ languages = ["AScript"]
 # Standalone grammar, published from ascript-lang/ascript (the tree-sitter-ascript/ subtree).
 # Zed's grammar table requires `rev` (the git revision), not `commit`.
 repository = "https://github.com/ascript-lang/tree-sitter-ascript"
-rev = "a075a12ad120e21fc6df6b5e6b7f4ff40fd99c74"
+rev = "3fa2d380c101fd0f1ec8a31210712ef6af55f0b7"
