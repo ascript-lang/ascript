@@ -360,6 +360,11 @@ fn type_to_schema(
         },
         // Result<T>, Tuple, Future — accept-all (no clean schema mapping)
         Type::Result(_) | Type::Tuple(_) | Type::Future(_) => make_schema("any"),
+        // TYPE: generics are runtime-erased. A `Type::Param("T")` is accept-anything
+        // (= `any`) at runtime; a `Type::FnSig` is checked as a plain callable.
+        // Neither has a structural shape to validate, so both map to the accept-all
+        // schema.
+        Type::Param(_) | Type::FnSig(_, _) => make_schema("any"),
     }
 }
 

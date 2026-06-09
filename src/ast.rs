@@ -171,6 +171,16 @@ pub enum Type {
     /// `T?` — nullable type, sugar for `T | nil`. The class-field marker
     /// `name?:` will also lower to this node once class fields land (Phase 3).
     Optional(Box<Type>),
+    /// TYPE §5.4: a generic type PARAMETER reference (`T` inside a `fn f<T>(...)` /
+    /// `class Box<T>` etc.). Generics are RUNTIME-ERASED — this carries NO runtime
+    /// obligation: `check_type` treats it as accept-anything (exactly like `Any`).
+    /// The static checker (`src/check/infer/`) is what enforces a `T`'s consistency.
+    Param(String),
+    /// TYPE §5.4: a parameterized FUNCTION type (`fn(A) -> B`) — a strict extension
+    /// of the bare `Fn`. Also runtime-erased: a value of this type is checked as a
+    /// plain callable (`Fn`) at runtime; the param/return signature is advisory and
+    /// consumed only by the static checker.
+    FnSig(Vec<Type>, Box<Type>),
 }
 
 /// A function parameter: a name with an optional type annotation.
@@ -233,6 +243,17 @@ impl std::fmt::Display for Type {
             Type::Map(k, v) => write!(f, "map<{}, {}>", k, v),
             Type::Future(t) => write!(f, "future<{}>", t),
             Type::Optional(t) => write!(f, "{}?", t),
+            Type::Param(name) => write!(f, "{}", name),
+            Type::FnSig(params, ret) => {
+                write!(f, "fn(")?;
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", p)?;
+                }
+                write!(f, ") -> {}", ret)
+            }
         }
     }
 }
@@ -857,5 +878,56 @@ mod tests {
             step: None,
         };
         assert_eq!(pat.to_string(), "1..5");
+    }
+
+    // ----- TYPE Task 3: generics surface (runtime-erased) ------------------
+
+    #[test]
+    fn type_param_display_renders_bare_name() {
+        assert_eq!(Type::Param("T".into()).to_string(), "T");
+        assert_eq!(Type::Param("Elem".into()).to_string(), "Elem");
+    }
+
+    #[test]
+    fn type_fnsig_display_renders_arrow_signature() {
+        // fn(int) -> string
+        let sig = Type::FnSig(vec![Type::Int], Box::new(Type::String));
+        assert_eq!(sig.to_string(), "fn(int) -> string");
+        // zero-arg: fn() -> bool
+        let sig0 = Type::FnSig(vec![], Box::new(Type::Bool));
+        assert_eq!(sig0.to_string(), "fn() -> bool");
+        // multi-arg: fn(int, string) -> nil
+        let sig2 = Type::FnSig(vec![Type::Int, Type::String], Box::new(Type::Nil));
+        assert_eq!(sig2.to_string(), "fn(int, string) -> nil");
+        // nested params: fn(fn(int) -> int, array<T>) -> T
+        let inner = Type::FnSig(vec![Type::Int], Box::new(Type::Int));
+        let nested = Type::FnSig(
+            vec![inner, Type::Array(Box::new(Type::Param("T".into())))],
+            Box::new(Type::Param("T".into())),
+        );
+        assert_eq!(nested.to_string(), "fn(fn(int) -> int, array<T>) -> T");
+    }
+
+    #[test]
+    fn type_param_and_fnsig_round_trip_through_formatter() {
+        // `render_type` (fmt.rs) delegates to Display, so Display IS the canonical
+        // round-trip. Confirm idempotence of the rendered text.
+        let t = Type::Param("T".into());
+        assert_eq!(t.to_string(), "T");
+        let sig = Type::FnSig(vec![Type::Param("A".into())], Box::new(Type::Param("B".into())));
+        assert_eq!(sig.to_string(), "fn(A) -> B");
+    }
+
+    #[test]
+    fn check_type_param_accepts_any_value_runtime_erased() {
+        use crate::interp::check_type;
+        use crate::value::Value;
+        let t = Type::Param("T".into());
+        // Runtime-erased: a `T`-annotated slot accepts EVERY value (accept-anything),
+        // exactly like `any`. No runtime obligation.
+        assert!(check_type(&Value::Int(5), &t));
+        assert!(check_type(&Value::Str("hi".into()), &t));
+        assert!(check_type(&Value::Bool(true), &t));
+        assert!(check_type(&Value::Nil, &t));
     }
 }
