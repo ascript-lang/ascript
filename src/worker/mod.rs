@@ -37,6 +37,8 @@ pub use dispatch::{
     build_stream_slice_for_interp,
 };
 pub use pool::pool_is_initialized;
+#[cfg(feature = "net")]
+pub(crate) use isolate::with_inline_dispatch;
 
 /// The shippable bytecode payload for one worker fn: its compiled chunk plus its
 /// transitive top-level dependency closure (other top-level `fn`s and literal

@@ -42,6 +42,12 @@ ariadne = "0.6"
 rustyline = "14"
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.150", features = ["preserve_order"], optional = true }
+# SRV Part A — direct dep (transitive today via tokio/hyper/reqwest) so the
+# multi-isolate server can set SO_REUSEPORT before bind (tokio's TcpListener::bind
+# doesn't expose the option). Gated to `net` (where the HTTP server lives); the
+# `set_reuse_port` call is itself `#[cfg(unix)]`-gated. Pinned to 0.6 to reuse the
+# version already resolved transitively (no duplicate copy).
+socket2 = { version = "0.6", optional = true }
 regex = { version = "1.12.3", optional = true }
 base64 = { version = "0.22", optional = true }
 hex = { version = "0.4", optional = true }
@@ -172,7 +178,7 @@ postgres = ["dep:tokio-postgres", "tokio/net"]
 redis = ["dep:redis", "tokio/net"]
 # M14 networking. Task 1 (std/net/tcp) needs only tokio's net + io-util; later
 # tasks (http/ws) ADD dep:reqwest/dep:hyper/etc. to this feature.
-net = ["dep:reqwest", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "dep:http", "dep:tokio-util", "dep:tokio-tungstenite", "dep:base64", "tokio/net", "tokio/io-util"]
+net = ["dep:reqwest", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "dep:http", "dep:tokio-util", "dep:tokio-tungstenite", "dep:base64", "dep:socket2", "tokio/net", "tokio/io-util"]
 # §11.5 deferral: HTTP/3 (default-OFF, opt-in). Enables reqwest's http3 backend so
 # `httpVersion:"3"` pins http3; without it that path returns a clean Tier-1 error.
 # reqwest's http3 is UNSTABLE: building with this feature ALSO requires

@@ -32,6 +32,30 @@ pub(crate) fn in_isolate() -> bool {
     IN_ISOLATE.with(|c| c.get())
 }
 
+/// Run `f` (producing a future) with the `IN_ISOLATE` flag forced TRUE for the
+/// duration of the future, restoring the prior value afterward. SRV Part A uses this
+/// for the single-isolate `serve` fallback (Windows / non-REUSEPORT): a `setup`
+/// `worker fn` must run INLINE on the current interp's VM (so it builds the server
+/// handle in THIS resource table) rather than dispatching to the pool. The flag is
+/// thread-local and the runtime is single-threaded, so set-run-restore is sound; the
+/// guard restores even if the future is dropped mid-flight.
+#[cfg(feature = "net")]
+pub(crate) async fn with_inline_dispatch<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_ISOLATE.with(|c| c.set(self.0));
+        }
+    }
+    let prev = IN_ISOLATE.with(|c| c.replace(true));
+    let _restore = Restore(prev);
+    f().await
+}
+
 /// One unit of work shipped to an isolate. Every field is `Send` (bytes / plain
 /// scalars / channels) — no `Value`, no `Interp`, no `Rc<Chunk>` crosses.
 pub struct WorkerRequest {
