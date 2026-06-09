@@ -366,7 +366,9 @@ This is the shape used to re-stream LLM/SSE tokens through transformations to a 
   fire-and-forget. `race` cancels losers; `timeout` cancels the timed-out work. Memory is
   bounded by construction.
 - **HTTP server** handles each connection on its own task with a bounded concurrency cap, so a
-  slow handler does not block other clients.
+  slow handler does not block other clients. For **multi-core** serving, `server.serve({ workers:
+  N })` spreads the accept loop across N `SO_REUSEPORT` isolates — see [Multi-core servers & the
+  shared heap](../language/workers) and the zero-copy [shared read-only heap](shared).
 - **Not provided** (deliberate architectural non-goals — see the design spec §7): durable /
   serializable continuations, robust unbounded deep recursion, and deterministic / replayable
   scheduling.

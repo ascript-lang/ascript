@@ -435,5 +435,71 @@ What is still **not** shipped:
 
 ---
 
+## Multi-core servers & the shared heap
+
+The HTTP server (`std/http/server`) can spread its accept loop across **N isolates** that
+each bind the same port via `SO_REUSEPORT`, so the kernel load-balances incoming connections
+across cores. This is the **server tier**: the nginx / Envoy / Node-`cluster` worker model,
+applied to AScript.
+
+```ascript
+import * as server from "std/http/server"
+import * as shared from "std/shared"
+import * as postgres from "std/postgres"
+
+// Build the big read-only state ONCE, on the main isolate, then freeze it.
+let routes = shared.freeze(loadRouteTable())     // immutable, Send, zero-copy
+
+// The per-isolate setup runs IN each isolate at boot: open this isolate's OWN
+// connection pool, register handlers. `routes` crosses as an Arc pointer bump.
+worker fn boot(routes) {
+  let app = server.create()
+  let db = postgres.connect(env.get("DATABASE_URL"))   // per-isolate, never crosses
+  app.route("GET", "/users/:id", worker fn (req) {
+    let route = routes[req.path]    // zero-copy read of the shared table
+    return db.query("select ...", [req.params.id])
+  })
+  return app                        // this isolate's OWN server handle
+}
+
+// Spread the accept loop across N isolates, each binding the same port.
+await server.serve({ port: 8080, workers: 0, setup: boot, args: [routes] })
+//                                       ^ 0 = num_cpus
+```
+
+How it works:
+
+- **`workers` absent or `1`** → today's single-isolate accept loop, unchanged.
+- **`workers: N` (N>1, or `0` = `num_cpus`)** → spawn N shared-nothing isolates. Each runs
+  `setup(...args)` at boot to build its **own** server handle and open its **own** per-isolate
+  resources (a DB pool, prepared statements — these never cross the airlock), then accepts on
+  its own `SO_REUSEPORT` socket. A connection that lands on isolate *k* is accepted, dispatched,
+  and answered entirely on isolate *k*'s core — **no cross-isolate hop per request**.
+- **`setup`** is a `worker fn`; its `args` are sendable (typically the frozen
+  [`shared`](../stdlib/shared) state). Handlers are `worker fn`s too.
+- **`maxRequests`** across N isolates bounds the **total** number of connections served (a
+  shared budget + coordinated stop); the per-isolate split is OS scheduling and is not
+  asserted.
+
+### The shared config pattern
+
+Per-isolate `setup` opens this isolate's *mutable* resources (a DB pool). But large
+**read-only** state — a routing table, a feature-flag snapshot, a geo-IP database — should
+**not** be re-opened or re-copied per isolate. Build it once on the main isolate,
+[`shared.freeze`](../stdlib/shared) it, and pass the `Shared` as a `setup` argument: it crosses
+to each isolate as one `Arc` pointer bump, read zero-copy, never duplicated. This is what makes
+multi-core serving practical — see [Shared read-only heap](../stdlib/shared).
+
+### The Windows caveat
+
+`SO_REUSEPORT` (kernel connection load-balancing) is available on **Linux, macOS, and the
+BSDs**. On **Windows** there is no equivalent, so `workers: N > 1` transparently **falls back to
+a single isolate** and emits a one-time `warn`: *"workers: N requested but SO_REUSEPORT is
+unavailable on this platform; serving single-isolate."* This is honest degradation — correct,
+just single-core on Windows — never a silent drop.
+
+---
+
 See also: [Modules & async](modules-async) for the single-isolate `async`/`await`/generator
-model and [`std/task`](../stdlib/async) for `gather`/`race`/`pipe`.
+model, [`std/task`](../stdlib/async) for `gather`/`race`/`pipe`, and [Shared read-only
+heap](../stdlib/shared) for `shared.freeze`.

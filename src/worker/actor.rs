@@ -32,14 +32,16 @@ pub(crate) use crate::worker::isolate::{spawn_isolate, IsolateHandle};
 
 /// The reply an actor sends back for one `Call` (over a `oneshot`). `Send` bytes only.
 pub enum ActorReply {
-    /// The structured-clone-encoded result `Value`.
-    Ok(Vec<u8>),
+    /// The structured-clone-encoded result `Value` + the SRV §3.7(b) frozen-`Arc`
+    /// side-vector (a method may return a `shared.freeze`d value).
+    Ok(Vec<u8>, Vec<std::sync::Arc<crate::value::SharedNode>>),
     /// An uncaught Tier-2 panic message raised inside the method (or a sendability
     /// failure encoding the result). Re-raised as a recoverable panic on the caller.
     Panic(String),
 }
 
-/// One message in an actor's FIFO mailbox. Every field is `Send`.
+/// One message in an actor's FIFO mailbox. Every field is `Send` (incl. the SRV
+/// §3.7(b) frozen-`Arc` side-vector that carries any `Value::Shared` args).
 pub enum ActorMsg {
     /// Construct the instance: decode `args`, look up the class global, run `init`
     /// IN the isolate, store the instance. `reply` acks success (`Ok`) or the
@@ -51,6 +53,8 @@ pub enum ActorMsg {
         slice_bytes: Vec<u8>,
         /// Structured-clone-encoded ARRAY of the positional `init` args.
         args: Vec<u8>,
+        /// The frozen-`Arc` side-vector for `Value::Shared` args (SRV §3.7b).
+        shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
         reply: oneshot::Sender<ActorReply>,
     },
     /// Invoke `method` on the in-isolate instance with the decoded `args`.
@@ -58,6 +62,8 @@ pub enum ActorMsg {
         method: String,
         /// Structured-clone-encoded ARRAY of the positional method args.
         args: Vec<u8>,
+        /// The frozen-`Arc` side-vector for `Value::Shared` args (SRV §3.7b).
+        shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
         reply: oneshot::Sender<ActorReply>,
     },
 }
@@ -133,9 +139,11 @@ async fn actor_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Actor
                 class_name,
                 slice_bytes,
                 args,
+                shared,
                 reply,
             } => {
-                let result = init_instance(&vm, &interp, &class_name, &slice_bytes, &args).await;
+                let result =
+                    init_instance(&vm, &interp, &class_name, &slice_bytes, &args, &shared).await;
                 match result {
                     Ok(inst) => {
                         instance = Some(inst);
@@ -151,6 +159,7 @@ async fn actor_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Actor
             ActorMsg::Call {
                 method,
                 args,
+                shared,
                 reply,
             } => {
                 let Some(inst) = instance.clone() else {
@@ -159,7 +168,7 @@ async fn actor_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Actor
                     ));
                     continue;
                 };
-                let r = call_method(&vm, &interp, &inst, &method, &args).await;
+                let r = call_method(&vm, &interp, &inst, &method, &args, &shared).await;
                 let _ = reply.send(r);
             }
         }
@@ -169,7 +178,7 @@ async fn actor_loop(vm: Rc<crate::vm::Vm>, mut rx: mpsc::UnboundedReceiver<Actor
 /// An `Ok` ack carrying an encoded nil.
 fn ack_ok() -> ActorReply {
     match crate::worker::serialize::encode(&Value::Nil) {
-        Ok(b) => ActorReply::Ok(b),
+        Ok((b, shared)) => ActorReply::Ok(b, shared),
         Err(e) => ActorReply::Panic(e.message()),
     }
 }
@@ -182,6 +191,7 @@ async fn init_instance(
     class_name: &str,
     slice_bytes: &[u8],
     args: &[u8],
+    shared: &[std::sync::Arc<crate::value::SharedNode>],
 ) -> Result<Value, String> {
     // Define the class (and its deps) on this isolate's Vm.
     crate::worker::isolate::load_slice(vm, Some(slice_bytes)).await?;
@@ -189,7 +199,7 @@ async fn init_instance(
         .user_global(class_name)
         .ok_or_else(|| format!("worker class '{class_name}' was not defined by its code slice"))?;
     // Decode the init args against THIS isolate's interp.
-    let arg_values = crate::worker::isolate::decode_args(args, interp)?;
+    let arg_values = crate::worker::isolate::decode_args_with_shared(args, shared, interp)?;
     // Constructing the class value runs `init` synchronously (a class call returns an
     // instance, not a future). Any construction panic → its message.
     match vm.call_value(class, arg_values, crate::span::Span::new(0, 0)).await {
@@ -213,8 +223,9 @@ async fn call_method(
     instance: &Value,
     method: &str,
     args: &[u8],
+    shared: &[std::sync::Arc<crate::value::SharedNode>],
 ) -> ActorReply {
-    let arg_values = match crate::worker::isolate::decode_args(args, interp) {
+    let arg_values = match crate::worker::isolate::decode_args_with_shared(args, shared, interp) {
         Ok(vs) => vs,
         Err(msg) => return ActorReply::Panic(msg),
     };
@@ -231,7 +242,7 @@ async fn call_method(
         .await;
     match value {
         Ok(v) => match crate::worker::serialize::encode(&v) {
-            Ok(bytes) => ActorReply::Ok(bytes),
+            Ok((bytes, shared)) => ActorReply::Ok(bytes, shared),
             // A non-sendable return (e.g. a raw native resource) is a sendability
             // panic with a field path ("resource lives in the actor").
             Err(e) => ActorReply::Panic(e.message()),
@@ -240,7 +251,7 @@ async fn call_method(
         Err(crate::interp::Control::Propagate(_)) => {
             // A top-level `?` propagation inside the method ends with nil.
             match crate::worker::serialize::encode(&Value::Nil) {
-                Ok(bytes) => ActorReply::Ok(bytes),
+                Ok((bytes, shared)) => ActorReply::Ok(bytes, shared),
                 Err(e) => ActorReply::Panic(e.message()),
             }
         }

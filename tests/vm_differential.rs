@@ -988,6 +988,18 @@ const EXAMPLE_SKIPS: &[(&str, SkipReason)] = &[
         "examples/advanced/ws_server.as",
         SkipReason::LongRunningServer,
     ),
+    // SRV multi-core server: `server.serve({ workers: 0, setup })` runs N REUSEPORT
+    // accept loops forever, awaiting a client in a separate process. It does not
+    // terminate on its own and hangs even the tree-walker — the same headless-
+    // impossible situation as http_server.as. The shared-heap DATA examples
+    // (shared_config.as, shared_routing_table.as) ARE four-mode byte-identical and
+    // run in the gate; only this port-binding server example is excluded. The
+    // REUSEPORT/Windows-fallback behavior it demonstrates is covered by the
+    // tests/server_multicore.rs integration test.
+    (
+        "examples/advanced/server_multicore.as",
+        SkipReason::LongRunningServer,
+    ),
 ];
 
 /// Enumerate EVERY `examples/*.as` and `examples/advanced/*.as` file, paths
@@ -3534,6 +3546,17 @@ async fn vm_class_basic_method_and_fields() {
 }
 
 #[tokio::test]
+async fn vm_class_semicolon_member_separators() {
+    // `;` is an optional separator between class members. The CST parser used to
+    // reject it (the legacy tree-walker accepted it) — a legacy-vs-CST divergence
+    // where the tree-walker RAN a program the VM refused to compile. All four modes
+    // must now agree: typed fields, defaulted fields, and methods, separated by `;`
+    // (incl. doubled separators).
+    let src = "class Cfg { x: number = 1; y: number = 2;; fn sum() { return self.x + self.y } }\nlet c = Cfg()\nprint(c.sum())";
+    assert_vm_run_matches_treewalker(src).await;
+}
+
+#[tokio::test]
 async fn vm_class_field_read_via_member() {
     // Read a field directly off the instance (not through a method).
     let src = "class Point {\n  x: number\n  y: number\n  fn init(x, y) { self.x = x\n self.y = y }\n}\nlet p = Point(10, 20)\nprint(p.x)\nprint(p.y)";
@@ -5457,6 +5480,49 @@ async fn assert_three_way_matches(src: &str) {
         "VM (generic / --no-specialize) diverged from the tree-walker.\n  src: {src:?}\n  \
          tree-walker: {tw_n:?}\n  vm:          {gen_n:?}"
     );
+}
+
+#[tokio::test]
+async fn srv_shared_freeze_reads_and_mutation_panic_three_way() {
+    // SRV §5 (the data half): `shared.freeze` + reads + the mutation panic are pure
+    // Value-layer logic shared by both engines, so they MUST be byte-identical across
+    // tree-walker == specialized VM == generic VM.
+    // Reads: scalar / descend (Shared view) / index / read-only method / iterate / len.
+    assert_three_way_matches(
+        "import { freeze } from \"std/shared\"\n\
+         let cfg = freeze({ region: \"us\", flags: { beta: true }, limits: [10, 100] })\n\
+         print(cfg.region)\n\
+         print(cfg.flags.beta)\n\
+         print(cfg.limits[0])\n\
+         print(cfg[\"region\"])\n\
+         print(len(cfg.limits))\n\
+         print(cfg.has(\"region\"))\n\
+         print(cfg.get(\"missing\", \"dflt\"))\n\
+         print(type(cfg.flags))\n\
+         let s = 0\n\
+         for (l of cfg.limits) { s = s + l }\n\
+         print(s)\n\
+         print(cfg.missing)\n",
+    )
+    .await;
+    // Idempotence: freeze(freeze(x)) is the SAME Arc → `==` is true.
+    assert_three_way_matches(
+        "import { freeze } from \"std/shared\"\n\
+         let c = freeze({ x: 1 })\n\
+         print(freeze(c) == c)\n",
+    )
+    .await;
+    // Mutation panics (order-deterministic), caught by recover — the SHIPPED
+    // `cannot mutate a frozen {kind}` wording, byte-identical on all three modes.
+    assert_three_way_matches(
+        "import { freeze } from \"std/shared\"\n\
+         let cfg = freeze({ region: \"us\", limits: [10, 100] })\n\
+         print(recover(() => { cfg.region = \"eu\" })[1])\n\
+         print(recover(() => { cfg[\"region\"] = \"eu\" })[1])\n\
+         print(recover(() => { cfg.limits[0] = 5 })[1])\n\
+         print(recover(() => cfg.limits.push(3))[1])\n",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -7561,6 +7627,11 @@ async fn worker_examples_all_modes_byte_identical() {
     // the `.aso` mode — the gap that let a real four-mode divergence through.
     let worker_examples: Vec<String> = all_corpus_examples()
         .into_iter()
+        // A worker example on the corpus SKIP list (e.g. a forever-blocking REUSEPORT
+        // server like `server_multicore.as`, which uses `worker fn boot` but never
+        // terminates) cannot be run to completion here — honor the same skip the
+        // whole-corpus gate uses, so a worker-using server doesn't hang this test.
+        .filter(|p| skip_reason(p).is_none())
         .filter(|p| {
             let path = std::path::Path::new(root).join(p);
             let src = std::fs::read_to_string(&path).unwrap_or_default();

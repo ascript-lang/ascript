@@ -29,6 +29,7 @@ const NAV = [
     ['stdlib/overview', 'Overview'],
     ['stdlib/collections', 'Core & collections'],
     ['stdlib/data', 'Data & serialization'],
+    ['stdlib/shared', 'Shared read-only heap'],
     ['stdlib/schema', 'Validation & schemas'],
     ['stdlib/system', 'System & files'],
     ['stdlib/db', 'Databases (SQLite, Postgres & Redis)'],

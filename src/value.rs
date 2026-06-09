@@ -10,6 +10,7 @@ use rust_decimal::Decimal;
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// The heap payload behind `Value::Object`. Wraps the insertion-ordered key→value
 /// map together with a `shape` id (V11-T2 hidden classes). The `shape` identifies
@@ -259,6 +260,11 @@ pub fn frozen_kind(v: &Value) -> Option<&'static str> {
         Value::Map(m) if m.is_frozen() => Some("map"),
         Value::Set(s) if s.is_frozen() => Some("set"),
         Value::Instance(i) if i.borrow().frozen.get() => Some("instance"),
+        // SRV §3.8: a frozen `Shared` reports its underlying CONTAINER kind so the
+        // shipped `cannot mutate a frozen {kind}` message applies (a frozen-shared
+        // object → "object", array → "array", …). A frozen scalar / regex /
+        // enum-variant is not a mutable container → `None`.
+        Value::Shared(n) => n.mutable_container_kind(),
         _ => None,
     }
 }
@@ -286,6 +292,8 @@ pub fn is_frozen_value(v: &Value) -> bool {
         Value::Map(m) => m.is_frozen(),
         Value::Set(s) => s.is_frozen(),
         Value::Instance(i) => i.borrow().frozen.get(),
+        // SRV §3.5: a `Shared` is frozen by construction.
+        Value::Shared(_) => true,
         _ => false,
     }
 }
@@ -832,6 +840,239 @@ pub struct Function {
     pub is_worker: bool,
 }
 
+/// SRV §3.3 — an immutable, `Send + Sync`, `Arc`-shared node. A frozen DAG of
+/// these is built once by `shared.freeze` and read zero-copy by any isolate.
+///
+/// **Send-safety invariant (Gate 0):** every field is itself `Send + Sync`
+/// (`Arc<str>`, `Arc<[u8]>`, `Arc<[SharedValue]>`, `Decimal`/`i64`/`f64`/`bool` —
+/// all `Send`, and recursively `SharedValue = Arc<SharedNode>`; map/set keys use the
+/// `Send` `SharedKey`, NOT the `Rc<str>`-bearing `MapKey`). There is **no `Rc`, no
+/// `Cc`, no `RefCell`/`Cell`, no `Native`** anywhere in the graph. This makes
+/// `Value::Shared(Arc<SharedNode>)` the runtime's FIRST `Send` value. A compile-time
+/// `assert_send_sync::<SharedNode>` below makes a future edit that smuggles in a
+/// non-`Send` field fail to compile.
+///
+/// The graph is an immutable, **acyclic** DAG by construction (`shared.freeze`
+/// rejects input cycles), so plain `Arc` reference-counting reclaims it — no cycle
+/// collector, and the GC traces it as a NO-OP (SRV §3.6).
+pub enum SharedNode {
+    Nil,
+    Bool(bool),
+    /// A 64-bit signed integer (NUM §3.1). Frozen from `Value::Int`.
+    Int(i64),
+    /// A 64-bit IEEE-754 float (NUM §3.1). Frozen from `Value::Float`.
+    Float(f64),
+    Decimal(Decimal),
+    Str(Arc<str>),
+    /// An immutable byte slice (vs the mutable `Rc<RefCell<Vec<u8>>>` of `Bytes`).
+    Bytes(Arc<[u8]>),
+    /// An immutable array slice; children are themselves shared sub-trees.
+    Array(Arc<[SharedValue]>),
+    /// An ordered, immutable object: insertion-ordered `key -> SharedValue`.
+    Object(Arc<SharedMap>),
+    /// A `SharedKey -> SharedValue` map, keys canonicalized at freeze time (per
+    /// NUM's post-split `MapKey` rule).
+    Map(Arc<SharedMapKeyed>),
+    /// An insertion-ordered set of canonical `SharedKey`s.
+    Set(Arc<SharedSet>),
+    /// ADT: a frozen enum variant. `enum_name` + `name` identify it; `value` is the
+    /// frozen payload (a unit variant freezes with `value: Nil`).
+    EnumVariant {
+        enum_name: Arc<str>,
+        name: Arc<str>,
+        value: SharedValue,
+    },
+    /// A frozen regex — only the source is retained (recompiled per-isolate on use,
+    /// matching the airlock's regex story).
+    Regex { source: Arc<str> },
+    /// A frozen instance: class NAME + frozen fields. Reads expose fields;
+    /// cross-isolate method dispatch is out of scope (SRV §3.8).
+    Instance {
+        class_name: Arc<str>,
+        fields: Arc<SharedMap>,
+    },
+}
+
+/// An `Arc`-shared, reference-counted frozen node (SRV §3.3).
+pub type SharedValue = Arc<SharedNode>;
+
+/// A `Send`-safe frozen map/set key (SRV §3.3). Mirrors [`MapKey`] EXACTLY in
+/// canonicalization (NUM's post-split rule: an integral in-range `Float` folds to
+/// `Int`, all NaNs unify, −0.0→+0.0), but uses `Arc<str>` for the string case so
+/// the whole frozen graph stays `Send + Sync` (a `MapKey`'s `Rc<str>` is `!Send`).
+/// Converts to/from `MapKey` at the freeze / read boundary.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum SharedKey {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    Num(u64),
+    Str(Arc<str>),
+    Decimal(Decimal),
+}
+
+impl SharedKey {
+    /// Freeze a `MapKey` (drawn from a `Map`/`Set`'s already-canonical keys) into a
+    /// `Send` `SharedKey`. The `MapKey` is already canonical, so this is a faithful
+    /// re-tagging (only the string `Rc`→`Arc`).
+    pub fn from_map_key(k: &MapKey) -> SharedKey {
+        match k {
+            MapKey::Nil => SharedKey::Nil,
+            MapKey::Bool(b) => SharedKey::Bool(*b),
+            MapKey::Int(i) => SharedKey::Int(*i),
+            MapKey::Num(bits) => SharedKey::Num(*bits),
+            MapKey::Str(s) => SharedKey::Str(Arc::from(&**s)),
+            MapKey::Decimal(d) => SharedKey::Decimal(*d),
+        }
+    }
+
+    /// Recover a `MapKey` (for reads / membership tests against a live `Map`).
+    pub fn to_map_key(&self) -> MapKey {
+        match self {
+            SharedKey::Nil => MapKey::Nil,
+            SharedKey::Bool(b) => MapKey::Bool(*b),
+            SharedKey::Int(i) => MapKey::Int(*i),
+            SharedKey::Num(bits) => MapKey::Num(*bits),
+            SharedKey::Str(s) => MapKey::Str(Rc::from(&**s)),
+            SharedKey::Decimal(d) => MapKey::Decimal(*d),
+        }
+    }
+
+    /// The value form of a frozen key (for display / `keys()`).
+    pub fn to_value(&self) -> Value {
+        self.to_map_key().to_value()
+    }
+}
+
+/// An ordered, immutable string-keyed map (Object / Instance fields). A `Vec` of
+/// pairs preserves insertion order; lookups are linear, acceptable for the
+/// read-only frozen surface (objects are small; large keyed lookups use `Map`).
+pub type SharedMap = Vec<(Arc<str>, SharedValue)>;
+
+/// An ordered, immutable `SharedKey`-keyed map (frozen `Map`).
+pub type SharedMapKeyed = Vec<(SharedKey, SharedValue)>;
+
+/// An ordered, immutable set of canonical `SharedKey`s (frozen `Set`).
+pub type SharedSet = Vec<SharedKey>;
+
+impl SharedNode {
+    /// The underlying container/scalar kind name a frozen node reports — a frozen
+    /// array `type_name`s `"array"`, a frozen object `"object"`, etc. (SRV §3.5: a
+    /// `Shared` reads as the data it froze).
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            SharedNode::Nil => "nil",
+            SharedNode::Bool(_) => "bool",
+            SharedNode::Int(_) => "int",
+            SharedNode::Float(_) => "float",
+            SharedNode::Decimal(_) => "decimal",
+            SharedNode::Str(_) => "string",
+            SharedNode::Bytes(_) => "bytes",
+            SharedNode::Array(_) => "array",
+            SharedNode::Object(_) => "object",
+            SharedNode::Map(_) => "map",
+            SharedNode::Set(_) => "set",
+            SharedNode::EnumVariant { .. } => "enum variant",
+            SharedNode::Regex { .. } => "regex",
+            SharedNode::Instance { .. } => "instance",
+        }
+    }
+
+    /// Render a frozen node the way its underlying kind prints (SRV §3.5). The
+    /// frozen DAG is acyclic by construction, so no cycle guard is needed.
+    fn write_display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SharedNode::Nil => write!(f, "nil"),
+            SharedNode::Bool(b) => write!(f, "{}", b),
+            SharedNode::Int(i) => write!(f, "{}", i),
+            SharedNode::Float(n) => write!(f, "{}", format_float(*n)),
+            SharedNode::Decimal(d) => write!(f, "{}", d),
+            SharedNode::Str(s) => write!(f, "{}", s),
+            SharedNode::Bytes(b) => write!(f, "<bytes len {}>", b.len()),
+            SharedNode::Array(a) => {
+                write!(f, "[")?;
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    v.write_element(f)?;
+                }
+                write!(f, "]")
+            }
+            SharedNode::Object(o) => {
+                write!(f, "{{")?;
+                for (i, (k, v)) in o.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: ", k)?;
+                    v.write_element(f)?;
+                }
+                write!(f, "}}")
+            }
+            SharedNode::Map(m) => {
+                write!(f, "map {{")?;
+                for (i, (k, v)) in m.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", k.to_value())?;
+                    write!(f, ": ")?;
+                    v.write_element(f)?;
+                }
+                write!(f, "}}")
+            }
+            SharedNode::Set(s) => {
+                write!(f, "set {{")?;
+                for (i, k) in s.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", k.to_value())?;
+                }
+                write!(f, "}}")
+            }
+            SharedNode::EnumVariant {
+                enum_name, name, ..
+            } => write!(f, "{}.{}", enum_name, name),
+            SharedNode::Regex { source } => write!(f, "<regex {}>", source),
+            SharedNode::Instance { class_name, .. } => write!(f, "<{} instance>", class_name),
+        }
+    }
+
+    /// Quote bare strings for nested elements (mirrors `Value::write_element`).
+    fn write_element(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SharedNode::Str(s) => write!(f, "{:?}", s),
+            _ => self.write_display(f),
+        }
+    }
+
+    /// The container kind a frozen MUTATION targets (`frozen_kind`): only the
+    /// mutable container kinds report a name (so `cannot mutate a frozen {kind}`
+    /// applies), mirroring `frozen_kind` for the `!Send` `object.freeze` story.
+    /// Scalars/regex/enum-variant are not mutable containers → `None`.
+    pub(crate) fn mutable_container_kind(&self) -> Option<&'static str> {
+        match self {
+            SharedNode::Array(_) => Some("array"),
+            SharedNode::Object(_) => Some("object"),
+            SharedNode::Map(_) => Some("map"),
+            SharedNode::Set(_) => Some("set"),
+            SharedNode::Instance { .. } => Some("instance"),
+            _ => None,
+        }
+    }
+}
+
+// SRV §3.4 (Gate 0): a compile-time proof that the frozen graph is `Send + Sync`.
+// If a future edit smuggles a non-`Send` field (an `Rc`, a `Cc`, a `RefCell`) into
+// `SharedNode`, THIS fails to compile — the structural Send-safety guarantee. The
+// NEGATIVE counterpart `assert_not_impl_any!(Value: Send)` lives in `gc.rs`.
+const _: fn() = || {
+    fn is_send_sync<T: Send + Sync>() {}
+    is_send_sync::<SharedNode>();
+};
+
 #[derive(Clone)]
 pub enum Value {
     Nil,
@@ -902,6 +1143,12 @@ pub enum Value {
     /// name; `call_value` resolves it against `static_methods` (chain-walked),
     /// then the built-in `from`.
     ClassMethod(Rc<Class>, Rc<str>),
+    /// SRV §3.2 — an immutable, `Arc`-backed frozen value (`shared.freeze`). The
+    /// runtime's FIRST and ONLY `Send`-carrying variant (the union as a whole stays
+    /// `!Send` — see the `assert_not_impl_any!(Value: Send)` guard in `gc.rs`).
+    /// Reads dispatch like the underlying kind (SRV §3.5); mutation is a Tier-2
+    /// panic (SRV §3.8); crosses the worker airlock by `Arc` clone (zero copy).
+    Shared(Arc<SharedNode>),
 }
 
 impl Value {
@@ -1112,6 +1359,12 @@ impl PartialEq for Value {
                 Rc::ptr_eq(a, b) && an == bn
             }
             (Value::ClassMethod(a, an), Value::ClassMethod(b, bn)) => Rc::ptr_eq(a, b) && an == bn,
+            // SRV §3.5: a frozen `Shared` compares by `Arc` IDENTITY (like every
+            // other container's identity-equality). Two `Shared`s wrapping the SAME
+            // `Arc` are equal (idempotent `freeze` returns the same `Arc`); distinct
+            // `Arc`s are NOT equal even if structurally identical; a `Shared` never
+            // equals a non-frozen container (a distinct value kind → `_`).
+            (Value::Shared(a), Value::Shared(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -1163,6 +1416,7 @@ impl fmt::Debug for Value {
             Value::Generator(_) => write!(f, "Generator"),
             Value::GeneratorMethod(_, m) => write!(f, "GeneratorMethod({})", m),
             Value::ClassMethod(c, m) => write!(f, "ClassMethod({}.{})", c.name, m),
+            Value::Shared(n) => write!(f, "Shared({})", n.kind_name()),
         }
     }
 }
@@ -1343,6 +1597,9 @@ impl Value {
             Value::Generator(_) => write!(f, "<generator>"),
             Value::GeneratorMethod(_, m) => write!(f, "<generator method {}>", m),
             Value::ClassMethod(c, m) => write!(f, "<class method {}.{}>", c.name, m),
+            // SRV §3.5: a frozen `Shared` prints like the value it froze (a frozen
+            // object as `{...}`, a frozen array as `[...]`, a scalar bare).
+            Value::Shared(n) => n.write_display(f),
         }
     }
 
@@ -1832,5 +2089,101 @@ mod tests {
         assert_eq!(o.to_string(), "{a: 1.0, b: \"x\"}");
         assert_eq!(o.clone(), o);
         assert!(o.is_truthy());
+    }
+
+    // ---- SRV: the shared read-only heap (Task 1 — core value layer) ----
+
+    fn shared_obj() -> Arc<SharedNode> {
+        Arc::new(SharedNode::Object(Arc::new(vec![
+            ("region".into(), Arc::new(SharedNode::Str("us".into()))),
+            (
+                "limits".into(),
+                Arc::new(SharedNode::Array(Arc::from(vec![
+                    Arc::new(SharedNode::Int(10)),
+                    Arc::new(SharedNode::Int(100)),
+                ]))),
+            ),
+        ])))
+    }
+
+    #[test]
+    fn shared_node_is_send_sync() {
+        fn is_send_sync<T: Send + Sync>() {}
+        is_send_sync::<SharedNode>();
+        is_send_sync::<Arc<SharedNode>>();
+    }
+
+    #[test]
+    fn shared_frozen_helpers_report_underlying_kind() {
+        let obj = Value::Shared(shared_obj());
+        assert_eq!(frozen_kind(&obj), Some("object"));
+        let arr = Value::Shared(Arc::new(SharedNode::Array(Arc::from(vec![Arc::new(
+            SharedNode::Int(1),
+        )]))));
+        assert_eq!(frozen_kind(&arr), Some("array"));
+        let map = Value::Shared(Arc::new(SharedNode::Map(Arc::new(vec![(
+            SharedKey::Str("k".into()),
+            Arc::new(SharedNode::Int(1)),
+        )]))));
+        assert_eq!(frozen_kind(&map), Some("map"));
+        // A frozen SCALAR is not a mutable container → not a frozen-mutation target.
+        let scalar = Value::Shared(Arc::new(SharedNode::Int(5)));
+        assert_eq!(frozen_kind(&scalar), None);
+        // But every Shared is frozen; freeze_value of it is a no-op.
+        assert!(is_frozen_value(&obj));
+        assert!(is_frozen_value(&scalar));
+        freeze_value(&obj); // no panic, no change
+        assert!(is_frozen_value(&obj));
+    }
+
+    #[test]
+    fn shared_type_name_is_underlying_kind() {
+        assert_eq!(
+            crate::interp::type_name(&Value::Shared(shared_obj())),
+            "object"
+        );
+        assert_eq!(
+            crate::interp::type_name(&Value::Shared(Arc::new(SharedNode::Array(Arc::from(
+                Vec::<Arc<SharedNode>>::new()
+            ))))),
+            "array"
+        );
+        assert_eq!(
+            crate::interp::type_name(&Value::Shared(Arc::new(SharedNode::Str("x".into())))),
+            "string"
+        );
+    }
+
+    #[test]
+    fn shared_is_truthy() {
+        assert!(Value::Shared(shared_obj()).is_truthy());
+        // Even a "scalar" frozen node is truthy as a Shared wrapper (it is a
+        // container value to the user). Spec §3.5: a Shared is truthy.
+        assert!(Value::Shared(Arc::new(SharedNode::Int(0))).is_truthy());
+    }
+
+    #[test]
+    fn shared_equality_is_arc_identity() {
+        let a = shared_obj();
+        let v1 = Value::Shared(a.clone());
+        let v2 = Value::Shared(a.clone()); // SAME Arc
+        assert_eq!(v1, v2, "two clones of one Arc are equal (Arc identity)");
+        // A structurally-identical but DISTINCT Arc is NOT equal.
+        let other = Value::Shared(shared_obj());
+        assert_ne!(v1, other, "distinct Arcs are not equal even if structural");
+        // A Shared never equals a non-frozen container.
+        use indexmap::IndexMap;
+        let plain = Value::Object(ObjectCell::new(IndexMap::new()));
+        assert_ne!(v1, plain);
+    }
+
+    #[test]
+    fn shared_displays_like_underlying_kind() {
+        let v = Value::Shared(shared_obj());
+        assert_eq!(v.to_string(), "{region: \"us\", limits: [10, 100]}");
+        assert_eq!(
+            Value::Shared(Arc::new(SharedNode::Str("hi".into()))).to_string(),
+            "hi"
+        );
     }
 }

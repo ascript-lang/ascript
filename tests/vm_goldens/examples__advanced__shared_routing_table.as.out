@@ -1,0 +1,8 @@
+# exit: none
+GET / -> home
+GET /users -> listUsers
+GET /users/:id -> getUser
+POST /orders -> createOrder
+404 GET /nope
+DELETE /users/:id -> deleteUser
+cannot mutate a frozen object

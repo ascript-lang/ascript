@@ -32,6 +32,30 @@ pub(crate) fn in_isolate() -> bool {
     IN_ISOLATE.with(|c| c.get())
 }
 
+/// Run `f` (producing a future) with the `IN_ISOLATE` flag forced TRUE for the
+/// duration of the future, restoring the prior value afterward. SRV Part A uses this
+/// for the single-isolate `serve` fallback (Windows / non-REUSEPORT): a `setup`
+/// `worker fn` must run INLINE on the current interp's VM (so it builds the server
+/// handle in THIS resource table) rather than dispatching to the pool. The flag is
+/// thread-local and the runtime is single-threaded, so set-run-restore is sound; the
+/// guard restores even if the future is dropped mid-flight.
+#[cfg(feature = "net")]
+pub(crate) async fn with_inline_dispatch<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_ISOLATE.with(|c| c.set(self.0));
+        }
+    }
+    let prev = IN_ISOLATE.with(|c| c.replace(true));
+    let _restore = Restore(prev);
+    f().await
+}
+
 /// One unit of work shipped to an isolate. Every field is `Send` (bytes / plain
 /// scalars / channels) — no `Value`, no `Interp`, no `Rc<Chunk>` crosses.
 pub struct WorkerRequest {
@@ -48,6 +72,11 @@ pub struct WorkerRequest {
     pub entry_name: String,
     /// Structured-clone-encoded positional args (see `serialize::encode`).
     pub args: Vec<u8>,
+    /// SRV §3.7(b) — the frozen `Arc<SharedNode>` side-vector that travels alongside
+    /// `args`. A `Value::Shared` arg is encoded as a `TAG_SHARED` index into this
+    /// vector (a `Send` field; the frozen graph crosses by `Arc` pointer, NOT a
+    /// structured-clone copy). Empty when no arg is a `Shared`.
+    pub shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
     /// FFI §4.5a — the dispatching isolate's `CapSet` (a `Send` side-channel field, NOT
     /// a `Value`, so it never touches the structured-clone serializer). The pooled
     /// isolate installs this FRESH at the top of each request (so request B is
@@ -65,10 +94,13 @@ pub struct WorkerRequest {
     pub abort: oneshot::Receiver<()>,
 }
 
-/// The isolate's response. `Send` bytes / a message string only.
+/// The isolate's response. `Send` bytes / a message string only — plus the SRV
+/// §3.7(b) frozen-`Arc` side-vector for a `Value::Shared` result (also `Send`).
 pub enum WorkerReply {
-    /// The structured-clone-encoded result `Value`.
-    Ok(Vec<u8>),
+    /// The structured-clone-encoded result `Value`, plus the frozen `Arc<SharedNode>`
+    /// side-vector (a worker may RETURN a `shared.freeze`d value — it crosses back by
+    /// `Arc` pointer, zero copy).
+    Ok(Vec<u8>, Vec<std::sync::Arc<crate::value::SharedNode>>),
     /// An uncaught Tier-2 panic message raised inside the worker body.
     Panic(String),
     /// The run was cancelled (the caller dropped the future before it resolved).
@@ -258,6 +290,7 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
             class_name: _,
             entry_name,
             args,
+            shared,
             caps,
             reply,
             abort,
@@ -289,7 +322,7 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
 
         // Decode the args against THIS isolate's interp (cycles + class reconstruction
         // resolve against the isolate's own globals).
-        let arg_values = match decode_args(&args, &interp) {
+        let arg_values = match decode_args_with_shared(&args, &shared, &interp) {
             Ok(vs) => vs,
             Err(msg) => {
                 let _ = reply.send(WorkerReply::Panic(msg));
@@ -315,14 +348,14 @@ async fn isolate_loop(vm: Rc<Vm>, mut rx: mpsc::UnboundedReceiver<WorkerRequest>
             _ = abort => WorkerReply::Cancelled,
             result = &mut run => match result {
                 Ok(v) => match crate::worker::serialize::encode(&v) {
-                    Ok(bytes) => WorkerReply::Ok(bytes),
+                    Ok((bytes, shared)) => WorkerReply::Ok(bytes, shared),
                     Err(e) => WorkerReply::Panic(e.message()),
                 },
                 Err(crate::interp::Control::Panic(e)) => WorkerReply::Panic(e.message),
                 // A top-level `?` propagation inside the worker body ends with nil.
                 Err(crate::interp::Control::Propagate(_)) => {
                     match crate::worker::serialize::encode(&Value::Nil) {
-                        Ok(bytes) => WorkerReply::Ok(bytes),
+                        Ok((bytes, shared)) => WorkerReply::Ok(bytes, shared),
                         Err(e) => WorkerReply::Panic(e.message()),
                     }
                 }
@@ -370,11 +403,16 @@ pub(crate) async fn load_slice(vm: &Rc<Vm>, slice_bytes: Option<&[u8]>) -> Resul
 /// Decode the structured-clone arg payload into the isolate's `Value`s. The payload is
 /// an encoded ARRAY of the positional args (the caller wraps them so one decode call
 /// reconstructs the whole arg list, preserving cross-arg shared references / cycles).
-pub(crate) fn decode_args(
+/// Resolves any `TAG_SHARED` index against the frozen-`Arc` side-vector (SRV §3.7b
+/// — a `Value::Shared` arg crosses by `Arc` clone, zero copy). Callers with no shared
+/// values pass `&[]`.
+pub(crate) fn decode_args_with_shared(
     bytes: &[u8],
+    shared: &[std::sync::Arc<crate::value::SharedNode>],
     interp: &crate::interp::Interp,
 ) -> Result<Vec<Value>, String> {
-    let decoded = crate::worker::serialize::decode(bytes, interp).map_err(|e| e.message())?;
+    let decoded =
+        crate::worker::serialize::decode_with_shared(bytes, shared, interp).map_err(|e| e.message())?;
     match decoded {
         Value::Array(a) => Ok(a.borrow().clone()),
         other => Err(format!(
@@ -422,7 +460,7 @@ mod tests {
         .expect("dedicated isolate should spawn");
 
         // Ship a trivial value as bytes; expect the doubled result back.
-        let payload = crate::worker::serialize::encode(&Value::Float(21.0))
+        let (payload, _shared) = crate::worker::serialize::encode(&Value::Float(21.0))
             .expect("encode sendable number");
         handle.tx.send(payload).expect("isolate inbound channel open");
         let got = result_rx

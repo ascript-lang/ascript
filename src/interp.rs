@@ -2133,7 +2133,7 @@ impl Interp {
         let slice = crate::worker::build_class_slice_for_interp(self, &class.name)?;
         // Encode the init args as one array (preserving cross-arg sharing).
         let args_array = Value::Array(crate::value::ArrayCell::new(args));
-        let encoded = crate::worker::serialize::encode(&args_array)
+        let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
         // Spawn the dedicated actor isolate + its mailbox.
@@ -2151,6 +2151,7 @@ impl Interp {
             class_name: class.name.clone(),
             slice_bytes: slice.entry_aso.to_vec(),
             args: encoded,
+            shared: encoded_shared,
             reply: init_reply_tx,
         };
         if tx.send(init_msg).is_err() {
@@ -2182,7 +2183,7 @@ impl Interp {
         let native_for_task = native.clone();
         let bridge = tokio::task::spawn_local(async move {
             let result = match init_reply_rx.await {
-                Ok(crate::worker::actor::ActorReply::Ok(_)) => Ok(native_for_task),
+                Ok(crate::worker::actor::ActorReply::Ok(..)) => Ok(native_for_task),
                 Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
                     Err(Control::Panic(AsError::at(msg, span)))
                 }
@@ -2222,7 +2223,7 @@ impl Interp {
                 .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
         }
         let args_array = Value::Array(crate::value::ArrayCell::new(args));
-        let encoded = crate::worker::serialize::encode(&args_array)
+        let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
         // SP9 determinism (Spec B Task 12) — REPLAY: if a determinism context is active
@@ -2264,6 +2265,7 @@ impl Interp {
         let call_msg = crate::worker::actor::ActorMsg::Call {
             method: method.to_string(),
             args: encoded,
+            shared: encoded_shared,
             reply: reply_tx,
         };
         if tx.send(call_msg).is_err() {
@@ -2286,7 +2288,11 @@ impl Interp {
             // a SHORT sync borrow AFTER the `.await`, never held across it.
             if let Ok(ref r) = reply {
                 let outcome = match r {
-                    crate::worker::actor::ActorReply::Ok(bytes) => {
+                    // SRV: the determinism log is byte-only; an actor returning a
+                    // `Value::Shared` records its bytes (the `Arc` side-vector is not
+                    // event-sourced — a frozen graph is not replayable bytes, an
+                    // accepted determinism limitation for shared results).
+                    crate::worker::actor::ActorReply::Ok(bytes, _shared) => {
                         crate::det::BoundaryOutcome::Bytes(bytes.clone())
                     }
                     crate::worker::actor::ActorReply::Panic(msg) => {
@@ -2300,8 +2306,8 @@ impl Interp {
                 });
             }
             let result = match reply {
-                Ok(crate::worker::actor::ActorReply::Ok(bytes)) => {
-                    crate::worker::serialize::decode(&bytes, &interp_rc)
+                Ok(crate::worker::actor::ActorReply::Ok(bytes, shared)) => {
+                    crate::worker::serialize::decode_with_shared(&bytes, &shared, &interp_rc)
                         .map_err(|e| Control::Panic(e.into()))
                 }
                 Ok(crate::worker::actor::ActorReply::Panic(msg)) => {
@@ -2380,7 +2386,7 @@ impl Interp {
         let slice = crate::worker::build_stream_slice_for_interp(self, entry_name)?;
         // Encode the call args as one array (preserving cross-arg sharing).
         let args_array = Value::Array(crate::value::ArrayCell::new(args));
-        let encoded = crate::worker::serialize::encode(&args_array)
+        let (encoded, encoded_shared) = crate::worker::serialize::encode(&args_array)
             .map_err(|e| Control::Panic(AsError::at(e.message(), span)))?;
 
         // Spawn the dedicated isolate + build the producer (awaits the Init ack).
@@ -2388,6 +2394,7 @@ impl Interp {
             entry_name.to_string(),
             slice.entry_aso.to_vec(),
             encoded,
+            encoded_shared,
         )
         .await
         .map_err(|msg| Control::Panic(AsError::at(msg, span)))?;
@@ -2947,6 +2954,18 @@ impl Interp {
                         .chars()
                         .map(|c| Value::Str(c.to_string().into()))
                         .collect(),
+                    // SRV §3.5: iterate a frozen array/string/set zero-copy (children
+                    // yield as `Shared` views or scalars).
+                    Value::Shared(ref node) => match shared_iter_values(node) {
+                        Some(items) => items,
+                        None => {
+                            return Err(AsError::at(
+                                format!("value of type {} is not iterable", type_name(&iterable)),
+                                iter.span,
+                            )
+                            .into())
+                        }
+                    },
                     other => {
                         return Err(AsError::at(
                             format!("value of type {} is not iterable", type_name(&other)),
@@ -3933,6 +3952,19 @@ impl Interp {
                             return Ok((self.spawn_actor(c, values, expr.span).await?, false));
                         }
                     }
+                    // SRV §3.5: a member-CALL on a frozen `Value::Shared` routes to
+                    // the read-only `call_shared` dispatcher (mirroring the schema /
+                    // workflow-ctx call-site hook). A read-only method reads the frozen
+                    // tree; a mutating-method name or a frozen-instance user-method is
+                    // the Tier-2 panic of §3.8. Call-position only (a bare `s.field`
+                    // member-read still reads the frozen field via `read_member`).
+                    if let Value::Shared(node) = &recv {
+                        let values = self.eval_call_args(args, env).await?;
+                        return Ok((
+                            call_shared(node, name, &values, expr.span)?,
+                            false,
+                        ));
+                    }
                     // Actor-handle async method dispatch: a member-CALL on a
                     // `Value::Native(WorkerActor)` sends an `ActorMsg::Call` and
                     // returns `future<T>`. Intercept here (call-position) so the
@@ -4252,6 +4284,10 @@ impl Interp {
                     ))
                 }
             }
+            // SRV §3.5: a frozen `Shared` reads a named field of a frozen
+            // object/instance → the child (as a `Shared` view or scalar); a missing
+            // field → nil (matching `Object`). A frozen regex exposes `.source`.
+            Value::Shared(node) => shared_read_member(node, name, span),
             Value::Nil => Err(AsError::at(
                 format!("cannot read property '{}' of nil", name),
                 span,
@@ -5973,6 +6009,21 @@ impl Interp {
                     Value::Map(m) => m.borrow().len(),
                     Value::Set(s) => s.borrow().len(),
                     Value::Bytes(b) => b.borrow().len(),
+                    // SRV §3.5: `len()` of a frozen `Shared` reads the frozen
+                    // container's length (zero-copy).
+                    Value::Shared(node) => match shared_len(node) {
+                        Some(n) => n,
+                        None => {
+                            return Err(AsError::at(
+                                format!(
+                                    "len() expects a string, array, object, map, set, or bytes, got {}",
+                                    type_name(&v)
+                                ),
+                                span,
+                            )
+                            .into())
+                        }
+                    },
                     _ => {
                         return Err(AsError::at(
                             format!(
@@ -6207,6 +6258,21 @@ impl Interp {
                     .fields
                     .insert(name.to_string(), value.clone());
                 Ok(value)
+            }
+            // SRV §3.8: a member-assign to a frozen `Shared` is the shipped
+            // `cannot mutate a frozen {kind}` panic (reusing `frozen_kind` via
+            // `check_not_frozen`, NOT a bespoke string) — byte-identical to the VM
+            // `store_property` guard. (`check_not_frozen` always errors here since a
+            // Shared object/array reports a frozen kind.)
+            Value::Shared(_) => {
+                check_not_frozen(obj, value_span)?;
+                // A Shared scalar reports no frozen kind → fall through to the
+                // generic "cannot set property" (a scalar was never assignable).
+                Err(AsError::at(
+                    format!("cannot set property '{}' on this value", name),
+                    obj_span,
+                )
+                .into())
             }
             _ => Err(AsError::at(
                 format!("cannot set property '{}' on this value", name),
@@ -6932,7 +6998,401 @@ pub(crate) fn index_get(
                 .unwrap_or(Value::Nil)),
             _ => Err(AsError::at("object index must be a string", index_span)),
         },
+        // SRV §3.5: a frozen `Shared` indexes like the data it froze — an array by
+        // int → the child sub-node (re-wrapped as `Shared` if a container, else a
+        // materialized scalar); an object/map by key → the child; OOB/missing → nil.
+        // Descending stays zero-copy (a sub-container reads as a `Shared` view).
+        Value::Shared(node) => shared_index_get(node, idx, obj_span, index_span),
         _ => Err(AsError::at("cannot index this value", obj_span)),
+    }
+}
+
+/// Materialize a frozen child node as a `Value`: a scalar is cloned out cheaply, a
+/// container stays zero-copy by re-wrapping its `Arc` as a fresh `Value::Shared`.
+pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value {
+    use crate::value::SharedNode;
+    match &**child {
+        SharedNode::Nil => Value::Nil,
+        SharedNode::Bool(b) => Value::Bool(*b),
+        SharedNode::Int(i) => Value::Int(*i),
+        SharedNode::Float(f) => Value::Float(*f),
+        SharedNode::Decimal(d) => Value::Decimal(*d),
+        SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
+        // Containers (and the opaque Regex/EnumVariant/Instance frozen nodes) stay
+        // shared — re-wrap the SAME `Arc` (a pointer bump, no copy).
+        _ => Value::Shared(child.clone()),
+    }
+}
+
+/// Materialize ONE level of a frozen `SharedNode` into a LIVE `Value` whose children
+/// are `Value::Shared` views (an `Arc` bump per child, never a deep copy). The std
+/// serializers (json / msgpack / cbor / log's `to_json_lossy`) walk `Value`, so a raw
+/// `Value::Shared` otherwise hits their catch-all and a frozen container fails to
+/// serialize (and poisons any live container that holds it). With this, a serializer
+/// detects `Value::Shared`, materializes one level, and recurses — re-materializing
+/// each deeper level on demand (frozen graphs are acyclic by construction, so this
+/// terminates without a `seen` guard).
+///
+/// Returns `None` for the node kinds that have no live-container analogue we can
+/// faithfully rebuild — `Instance` (needs its `Class`), `EnumVariant`, `Regex` — so
+/// the caller can fall back to its OWN live-value semantics for those (e.g. json's
+/// `from_ascript` errors on a live instance, while `to_json_lossy` renders its
+/// fields). This keeps a frozen value serializing byte-identically to its live kind.
+///
+/// Gated on `data` (json/yaml/toml + the log `to_json_lossy`); `binary` (msgpack/cbor)
+/// depends on `data`, so this matches the union of all callers — no dead code under
+/// `--no-default-features`.
+#[cfg(feature = "data")]
+pub(crate) fn shared_to_value_shallow(node: &crate::value::SharedNode) -> Option<Value> {
+    use crate::value::{ArrayCell, MapCell, ObjectCell, SetCell, SharedNode};
+    Some(match node {
+        SharedNode::Nil => Value::Nil,
+        SharedNode::Bool(b) => Value::Bool(*b),
+        SharedNode::Int(i) => Value::Int(*i),
+        SharedNode::Float(f) => Value::Float(*f),
+        SharedNode::Decimal(d) => Value::Decimal(*d),
+        SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
+        SharedNode::Bytes(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
+        SharedNode::Array(a) => {
+            Value::Array(ArrayCell::new(a.iter().map(shared_child_to_value).collect()))
+        }
+        SharedNode::Object(o) => {
+            let mut m = indexmap::IndexMap::with_capacity(o.len());
+            for (k, v) in o.iter() {
+                m.insert(k.to_string(), shared_child_to_value(v));
+            }
+            Value::Object(ObjectCell::new(m))
+        }
+        SharedNode::Map(mp) => {
+            let mut m = indexmap::IndexMap::with_capacity(mp.len());
+            for (k, v) in mp.iter() {
+                m.insert(k.to_map_key(), shared_child_to_value(v));
+            }
+            Value::Map(MapCell::new(m))
+        }
+        SharedNode::Set(s) => {
+            let mut set = indexmap::IndexSet::with_capacity(s.len());
+            for k in s.iter() {
+                set.insert(k.to_map_key());
+            }
+            Value::Set(SetCell::new(set))
+        }
+        SharedNode::Instance { .. }
+        | SharedNode::EnumVariant { .. }
+        | SharedNode::Regex { .. } => return None,
+    })
+}
+
+/// Index-read into a frozen `Shared` node (SRV §3.5). Returns a scalar `Value` or a
+/// `Value::Shared` sub-view; an out-of-range/missing key is `nil` (matching the live
+/// Array/Object/Map semantics).
+pub(crate) fn shared_index_get(
+    node: &crate::value::SharedNode,
+    idx: &Value,
+    obj_span: Span,
+    index_span: Span,
+) -> Result<Value, AsError> {
+    use crate::value::{SharedKey, SharedNode};
+    match node {
+        SharedNode::Array(arr) => {
+            let i = array_index(idx, index_span)?;
+            arr.get(i).map(shared_child_to_value).ok_or_else(|| {
+                AsError::at(
+                    format!("index {} out of bounds (len {})", i, arr.len()),
+                    index_span,
+                )
+            })
+        }
+        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match idx {
+            Value::Str(key) => Ok(map
+                .iter()
+                .find(|(k, _)| &**k == key.as_ref())
+                .map(|(_, v)| shared_child_to_value(v))
+                .unwrap_or(Value::Nil)),
+            _ => Err(AsError::at("object index must be a string", index_span)),
+        },
+        SharedNode::Map(map) => {
+            let Some(key) = crate::value::MapKey::from_value(idx) else {
+                return Ok(Value::Nil);
+            };
+            let skey = SharedKey::from_map_key(&key);
+            Ok(map
+                .iter()
+                .find(|(k, _)| *k == skey)
+                .map(|(_, v)| shared_child_to_value(v))
+                .unwrap_or(Value::Nil))
+        }
+        _ => Err(AsError::at("cannot index this value", obj_span)),
+    }
+}
+
+/// Member-read into a frozen `Shared` node (SRV §3.5). A frozen object/instance
+/// field → its child (Shared view / scalar); a frozen regex `.source` → the source
+/// string; a missing field on an object/instance → nil (matching `Object`). A
+/// member read on a frozen scalar/array/map/set is an error (no fields).
+pub(crate) fn shared_read_member(
+    node: &crate::value::SharedNode,
+    name: &str,
+    span: Span,
+) -> Result<Value, AsError> {
+    use crate::value::SharedNode;
+    match node {
+        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => Ok(map
+            .iter()
+            .find(|(k, _)| &**k == name)
+            .map(|(_, v)| shared_child_to_value(v))
+            .unwrap_or(Value::Nil)),
+        SharedNode::EnumVariant {
+            enum_name,
+            name: variant,
+            value,
+        } => match name {
+            "name" => Ok(Value::Str(Rc::from(&**variant))),
+            "value" => Ok(shared_child_to_value(value)),
+            // Named-payload field-access sugar: read the field off the frozen payload
+            // object (mirroring the live `EnumVariant` `.field` sugar).
+            other => {
+                if let SharedNode::Object(fields) = &**value {
+                    if let Some((_, fv)) = fields.iter().find(|(k, _)| &**k == other) {
+                        return Ok(shared_child_to_value(fv));
+                    }
+                }
+                Err(AsError::at(
+                    format!("enum variant {} has no property '{}'", enum_name, other),
+                    span,
+                ))
+            }
+        },
+        SharedNode::Regex { source } => match name {
+            "source" => Ok(Value::Str(Rc::from(&**source))),
+            other => Err(AsError::at(
+                format!("frozen regex has no property '{}' (try 'source')", other),
+                span,
+            )),
+        },
+        _ => Err(AsError::at(
+            format!("cannot read property '{}' of this value", name),
+            span,
+        )),
+    }
+}
+
+/// The element count of a frozen container (`len()` of a `Shared`), or `None` if the
+/// frozen node is not a lengthed kind (scalar/regex/enum-variant). SRV §3.5.
+pub(crate) fn shared_len(node: &crate::value::SharedNode) -> Option<usize> {
+    use crate::value::SharedNode;
+    match node {
+        SharedNode::Str(s) => Some(s.chars().count()),
+        SharedNode::Bytes(b) => Some(b.len()),
+        SharedNode::Array(a) => Some(a.len()),
+        SharedNode::Object(o) => Some(o.len()),
+        SharedNode::Map(m) => Some(m.len()),
+        SharedNode::Set(s) => Some(s.len()),
+        SharedNode::Instance { fields, .. } => Some(fields.len()),
+        _ => None,
+    }
+}
+
+/// The set of MUTATING method names that are a Tier-2 panic on a frozen `Shared`
+/// (SRV §3.8). A frozen value is immutable, so any of these → `cannot mutate a
+/// frozen {kind}` (the shipped `frozen_kind` message, NO bespoke string).
+fn is_shared_mutating_method(name: &str) -> bool {
+    matches!(
+        name,
+        "push"
+            | "pop"
+            | "shift"
+            | "unshift"
+            | "set"
+            | "insert"
+            | "delete"
+            | "remove"
+            | "clear"
+            | "sort"
+            | "reverse"
+            | "add"
+            | "extend"
+            | "splice"
+            | "fill"
+    )
+}
+
+/// SRV §3.5/§3.8 — dispatch a member-CALL on a frozen `Value::Shared`. The
+/// read-only method surface (`has`/`get`/`keys`/`values`/`contains`/`len`) reads the
+/// frozen tree; a MUTATING method name is the shipped `cannot mutate a frozen {kind}`
+/// Tier-2 panic (§3.8); a frozen-INSTANCE user-method call gets the DISTINCT
+/// `method '<name>' is not available on a frozen instance ...` diagnostic (§3.8).
+pub(crate) fn call_shared(
+    node: &crate::value::SharedNode,
+    name: &str,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, Control> {
+    use crate::value::{MapKey, SharedKey, SharedNode};
+
+    // §3.8: a mutating method on ANY frozen container → the shipped frozen-mutation
+    // panic (reusing `frozen_kind`'s `{kind}`, no divergent wording).
+    if is_shared_mutating_method(name) {
+        let kind = node.mutable_container_kind().unwrap_or("value");
+        return Err(AsError::at(format!("cannot mutate a frozen {}", kind), span).into());
+    }
+
+    // The read-only structural method set works on the frozen container's data.
+    match name {
+        "len" | "size" => {
+            if let Some(n) = shared_len(node) {
+                return Ok(Value::Int(n as i64));
+            }
+        }
+        "has" => {
+            let key = args.first().cloned().unwrap_or(Value::Nil);
+            return Ok(Value::Bool(shared_has_key(node, &key)));
+        }
+        "contains" => {
+            let key = args.first().cloned().unwrap_or(Value::Nil);
+            // Set membership (or array containment).
+            return Ok(Value::Bool(shared_contains(node, &key)));
+        }
+        "get" => {
+            // `get(k, default?)` — frozen object/map field, else the default (nil).
+            let key = args.first().cloned().unwrap_or(Value::Nil);
+            let default = args.get(1).cloned().unwrap_or(Value::Nil);
+            let found = match node {
+                SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match &key {
+                    Value::Str(s) => map
+                        .iter()
+                        .find(|(k, _)| &**k == s.as_ref())
+                        .map(|(_, v)| shared_child_to_value(v)),
+                    _ => None,
+                },
+                SharedNode::Map(map) => MapKey::from_value(&key).and_then(|mk| {
+                    let sk = SharedKey::from_map_key(&mk);
+                    map.iter()
+                        .find(|(k, _)| *k == sk)
+                        .map(|(_, v)| shared_child_to_value(v))
+                }),
+                _ => None,
+            };
+            return Ok(found.unwrap_or(default));
+        }
+        "keys" => {
+            if let Some(keys) = shared_keys(node) {
+                return Ok(Value::Array(crate::value::ArrayCell::new(keys)));
+            }
+        }
+        "values" => {
+            if let Some(vals) = shared_values(node) {
+                return Ok(Value::Array(crate::value::ArrayCell::new(vals)));
+            }
+        }
+        _ => {}
+    }
+
+    // §3.8: a user-method call on a frozen INSTANCE (methods are not shared across
+    // isolates; freeze exposes fields only) — a DISTINCT diagnostic, NOT the mutation
+    // panic (the user didn't try to write anything).
+    if let SharedNode::Instance { .. } = node {
+        return Err(AsError::at(
+            format!(
+                "method '{}' is not available on a frozen instance (methods are not \
+                 shared across isolates; freeze exposes fields only)",
+                name
+            ),
+            span,
+        )
+        .into());
+    }
+
+    Err(AsError::at(
+        format!(
+            "frozen {} has no method '{}'",
+            node.kind_name(),
+            name
+        ),
+        span,
+    )
+    .into())
+}
+
+/// Whether a frozen object/map/instance has `key` (the `.has(k)` method).
+fn shared_has_key(node: &crate::value::SharedNode, key: &Value) -> bool {
+    use crate::value::{MapKey, SharedKey, SharedNode};
+    match node {
+        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => match key {
+            Value::Str(s) => map.iter().any(|(k, _)| &**k == s.as_ref()),
+            _ => false,
+        },
+        SharedNode::Map(map) => MapKey::from_value(key)
+            .map(|mk| {
+                let sk = SharedKey::from_map_key(&mk);
+                map.iter().any(|(k, _)| *k == sk)
+            })
+            .unwrap_or(false),
+        SharedNode::Set(set) => MapKey::from_value(key)
+            .map(|mk| {
+                let sk = SharedKey::from_map_key(&mk);
+                set.contains(&sk)
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Whether a frozen set/array contains `key` (the `.contains(x)` method).
+fn shared_contains(node: &crate::value::SharedNode, key: &Value) -> bool {
+    use crate::value::{MapKey, SharedKey, SharedNode};
+    match node {
+        SharedNode::Set(set) => MapKey::from_value(key)
+            .map(|mk| {
+                let sk = SharedKey::from_map_key(&mk);
+                set.contains(&sk)
+            })
+            .unwrap_or(false),
+        SharedNode::Array(arr) => arr
+            .iter()
+            .any(|child| shared_child_to_value(child) == *key),
+        _ => false,
+    }
+}
+
+/// The `.keys()` of a frozen object/map (as a fresh `array`), or `None`.
+fn shared_keys(node: &crate::value::SharedNode) -> Option<Vec<Value>> {
+    use crate::value::SharedNode;
+    match node {
+        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => {
+            Some(map.iter().map(|(k, _)| Value::Str(Rc::from(&**k))).collect())
+        }
+        SharedNode::Map(map) => Some(map.iter().map(|(k, _)| k.to_value()).collect()),
+        _ => None,
+    }
+}
+
+/// The `.values()` of a frozen object/map (as a fresh `array` of Shared/scalars).
+fn shared_values(node: &crate::value::SharedNode) -> Option<Vec<Value>> {
+    use crate::value::SharedNode;
+    match node {
+        SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => {
+            Some(map.iter().map(|(_, v)| shared_child_to_value(v)).collect())
+        }
+        SharedNode::Map(map) => Some(map.iter().map(|(_, v)| shared_child_to_value(v)).collect()),
+        _ => None,
+    }
+}
+
+/// The `for ... of` element sequence over a frozen container (SRV §3.5): a frozen
+/// array yields its elements (as `Shared`/scalar), a frozen string its chars, a
+/// frozen set its elements. Returns `None` for a non-iterable frozen node.
+pub(crate) fn shared_iter_values(node: &crate::value::SharedNode) -> Option<Vec<Value>> {
+    use crate::value::SharedNode;
+    match node {
+        SharedNode::Array(a) => Some(a.iter().map(shared_child_to_value).collect()),
+        SharedNode::Str(s) => Some(
+            s.chars()
+                .map(|c| Value::Str(c.to_string().into()))
+                .collect(),
+        ),
+        SharedNode::Set(s) => Some(s.iter().map(|k| k.to_value()).collect()),
+        _ => None,
     }
 }
 
@@ -7076,6 +7536,10 @@ pub(crate) fn type_name(v: &Value) -> &'static str {
         Value::Generator(_) => "generator",
         Value::GeneratorMethod(..) => "function",
         Value::ClassMethod(..) => "function",
+        // SRV §3.5: a frozen `Shared` reports its UNDERLYING kind (a frozen routing
+        // object is an `"object"`, a frozen array an `"array"`) — user code +
+        // `instanceof` see it as the data it froze, not as a distinct "shared" type.
+        Value::Shared(n) => n.kind_name(),
     }
 }
 
@@ -12353,5 +12817,177 @@ print(many([File(), File()]))
             assert_eq!(interp.conforms(&inst, &reader).unwrap(), cold);
         }
         assert!(cold);
+    }
+
+    // ---- SRV Task 4/5: read dispatch + mutation panic on a frozen `Shared` ----
+
+    fn frozen_cfg() -> Value {
+        use crate::value::{SharedKey, SharedNode};
+        use std::sync::Arc;
+        // { region: "us", limits: [10, 100], m: map{"a": 1} }
+        let limits = Arc::new(SharedNode::Array(Arc::from(vec![
+            Arc::new(SharedNode::Int(10)),
+            Arc::new(SharedNode::Int(100)),
+        ])));
+        let m = Arc::new(SharedNode::Map(Arc::new(vec![(
+            SharedKey::Str("a".into()),
+            Arc::new(SharedNode::Int(1)),
+        )])));
+        Value::Shared(Arc::new(SharedNode::Object(Arc::new(vec![
+            ("region".into(), Arc::new(SharedNode::Str("us".into()))),
+            ("limits".into(), limits),
+            ("m".into(), m),
+        ]))))
+    }
+
+    fn node_of(v: &Value) -> std::sync::Arc<crate::value::SharedNode> {
+        match v {
+            Value::Shared(n) => n.clone(),
+            _ => panic!("not shared"),
+        }
+    }
+
+    #[test]
+    fn shared_index_and_member_reads() {
+        let cfg = frozen_cfg();
+        let n = node_of(&cfg);
+        let sp = Span::new(0, 0);
+        // member: scalar
+        assert_eq!(
+            shared_read_member(&n, "region", sp).unwrap(),
+            Value::Str("us".into())
+        );
+        // member: descend → Shared view (stays zero-copy → type "array")
+        let limits = shared_read_member(&n, "limits", sp).unwrap();
+        assert!(matches!(limits, Value::Shared(_)));
+        assert_eq!(type_name(&limits), "array");
+        // member missing → nil
+        assert_eq!(shared_read_member(&n, "nope", sp).unwrap(), Value::Nil);
+        // index: array by int
+        let lnode = node_of(&limits);
+        assert_eq!(
+            shared_index_get(&lnode, &Value::Int(0), sp, sp).unwrap(),
+            Value::Int(10)
+        );
+        // index: OOB → error (matches live array)
+        assert!(shared_index_get(&lnode, &Value::Int(9), sp, sp).is_err());
+        // index: object by string key
+        assert_eq!(
+            shared_index_get(&n, &Value::Str("region".into()), sp, sp).unwrap(),
+            Value::Str("us".into())
+        );
+        // index: map by key
+        let mnode = node_of(&shared_read_member(&n, "m", sp).unwrap());
+        assert_eq!(
+            shared_index_get(&mnode, &Value::Str("a".into()), sp, sp).unwrap(),
+            Value::Int(1)
+        );
+    }
+
+    #[test]
+    fn shared_read_only_methods() {
+        let cfg = frozen_cfg();
+        let n = node_of(&cfg);
+        let sp = Span::new(0, 0);
+        assert_eq!(
+            call_shared(&n, "has", &[Value::Str("region".into())], sp).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            call_shared(&n, "has", &[Value::Str("nope".into())], sp).unwrap(),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            call_shared(&n, "get", &[Value::Str("region".into())], sp).unwrap(),
+            Value::Str("us".into())
+        );
+        assert_eq!(
+            call_shared(
+                &n,
+                "get",
+                &[Value::Str("x".into()), Value::Int(7)],
+                sp
+            )
+            .unwrap(),
+            Value::Int(7)
+        );
+        assert_eq!(call_shared(&n, "len", &[], sp).unwrap(), Value::Int(3));
+        // keys
+        match call_shared(&n, "keys", &[], sp).unwrap() {
+            Value::Array(a) => assert_eq!(a.borrow().len(), 3),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn shared_mutation_methods_panic_with_shipped_wording() {
+        let cfg = frozen_cfg();
+        let n = node_of(&cfg);
+        let sp = Span::new(0, 0);
+        // A mutating method → the SHIPPED `cannot mutate a frozen {kind}` message.
+        let err = call_shared(&n, "push", &[Value::Int(1)], sp).unwrap_err();
+        match err {
+            Control::Panic(e) => assert_eq!(e.message, "cannot mutate a frozen object"),
+            _ => panic!("expected panic"),
+        }
+        // On a frozen ARRAY, the same method names the array kind.
+        let arr = node_of(&shared_read_member(&n, "limits", sp).unwrap());
+        let err = call_shared(&arr, "push", &[Value::Int(1)], sp).unwrap_err();
+        assert!(
+            matches!(err, Control::Panic(ref e) if e.message == "cannot mutate a frozen array")
+        );
+    }
+
+    #[test]
+    fn shared_index_assign_panics_via_frozen_kind() {
+        // index_set already calls frozen_kind → a Shared write is rejected with the
+        // shipped wording, NO new code (Task 5).
+        let cfg = frozen_cfg();
+        let sp = Span::new(0, 0);
+        let err = index_set(
+            &cfg,
+            &Value::Str("region".into()),
+            Value::Str("eu".into()),
+            sp,
+            sp,
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "cannot mutate a frozen object");
+        // check_not_frozen likewise rejects it.
+        let err2 = check_not_frozen(&cfg, sp).unwrap_err();
+        assert!(matches!(err2, Control::Panic(ref e) if e.message == "cannot mutate a frozen object"));
+    }
+
+    #[test]
+    fn shared_frozen_instance_method_has_distinct_diagnostic() {
+        use crate::value::SharedNode;
+        use std::sync::Arc;
+        let inst = Arc::new(SharedNode::Instance {
+            class_name: "User".into(),
+            fields: Arc::new(vec![("id".into(), Arc::new(SharedNode::Int(1)))]),
+        });
+        let sp = Span::new(0, 0);
+        // A read-only structural method still works on the instance's fields.
+        assert_eq!(
+            call_shared(&inst, "has", &[Value::Str("id".into())], sp).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            shared_read_member(&inst, "id", sp).unwrap(),
+            Value::Int(1)
+        );
+        // A user-method call → the DISTINCT diagnostic (NOT the mutation panic).
+        let err = call_shared(&inst, "promote", &[], sp).unwrap_err();
+        match err {
+            Control::Panic(e) => {
+                assert!(
+                    e.message.contains("not available on a frozen instance"),
+                    "{}",
+                    e.message
+                );
+                assert_ne!(e.message, "cannot mutate a frozen instance");
+            }
+            _ => panic!(),
+        }
     }
 }

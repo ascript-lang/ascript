@@ -37,6 +37,8 @@ pub use dispatch::{
     build_stream_slice_for_interp,
 };
 pub use pool::pool_is_initialized;
+#[cfg(feature = "net")]
+pub(crate) use isolate::with_inline_dispatch;
 
 /// The shippable bytecode payload for one worker fn: its compiled chunk plus its
 /// transitive top-level dependency closure (other top-level `fn`s and literal
@@ -102,7 +104,7 @@ pub fn dispatch_worker(
         })?;
     }
     let args_array = Value::Array(crate::value::ArrayCell::new(args));
-    let encoded = serialize::encode(&args_array).map_err(|e| {
+    let (encoded, encoded_shared) = serialize::encode(&args_array).map_err(|e| {
         Control::Panic(crate::error::AsError::at(e.message(), span))
     })?;
 
@@ -119,6 +121,10 @@ pub fn dispatch_worker(
         class_name: slice.class_name.as_deref().map(|s| s.to_string()),
         entry_name: slice.entry_name.to_string(),
         args: encoded,
+        // SRV §3.7(b): the frozen `Arc<SharedNode>` side-vector travels alongside the
+        // bytes (a `Send` field, NOT structured-clone). A `Value::Shared` among the
+        // args is shipped by `Arc` pointer — zero copy of the frozen graph.
+        shared: encoded_shared,
         // FFI §4.5a: ship the dispatching isolate's caps as the pooled worker's
         // read-only floor (a `Send` side-channel field, not a `Value`). The isolate
         // installs it fresh per request + refuses a drop there.
@@ -139,6 +145,7 @@ pub fn dispatch_worker(
                 req.slice_bytes.as_deref(),
                 &req.entry_name,
                 &req.args,
+                &req.shared,
                 *req.caps,
                 span,
             );
@@ -157,8 +164,9 @@ pub fn dispatch_worker(
         let _inflight_guard = InflightGuard(inflight);
         let reply = reply_rx.await;
         let result = match reply {
-            Ok(isolate::WorkerReply::Ok(bytes)) => {
-                serialize::decode(&bytes, &interp_rc).map_err(|e| Control::Panic(e.into()))
+            Ok(isolate::WorkerReply::Ok(bytes, shared)) => {
+                serialize::decode_with_shared(&bytes, &shared, &interp_rc)
+                    .map_err(|e| Control::Panic(e.into()))
             }
             Ok(isolate::WorkerReply::Panic(msg)) => {
                 Err(Control::Panic(crate::error::AsError::at(msg, span)))
@@ -239,6 +247,7 @@ fn run_slice_inline(
     slice_bytes: Option<&[u8]>,
     entry_name: &str,
     encoded_args: &[u8],
+    encoded_shared: &[std::sync::Arc<crate::value::SharedNode>],
     caps: crate::stdlib::caps::CapSet,
     span: Span,
 ) -> Result<Value, Control> {
@@ -254,7 +263,7 @@ fn run_slice_inline(
 
     // Decode the args against the fresh interp (cycles / class reconstruction resolve
     // against its own globals once the slice is loaded — same as the isolate).
-    let args = isolate::decode_args(encoded_args, &iso_interp)
+    let args = isolate::decode_args_with_shared(encoded_args, encoded_shared, &iso_interp)
         .map_err(|msg| Control::Panic(crate::error::AsError::at(msg, span)))?;
 
     let slice_owned: Option<Vec<u8>> = slice_bytes.map(|b| b.to_vec());
@@ -326,7 +335,7 @@ pub fn dispatch_worker_dedicated(
             .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
     }
     let args_array = Value::Array(crate::value::ArrayCell::new(args));
-    let encoded = serialize::encode(&args_array)
+    let (encoded, encoded_shared) = serialize::encode(&args_array)
         .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
 
     let slice_bytes: Vec<u8> = slice.entry_aso.to_vec();
@@ -353,13 +362,18 @@ pub fn dispatch_worker_dedicated(
         let Some(args_bytes) = rx.recv().await else {
             return; // handle dropped before we got args (cancelled).
         };
-        let arg_values = match isolate::decode_args(&args_bytes, &iso_interp) {
-            Ok(vs) => vs,
-            Err(msg) => {
-                let _ = reply_tx.send(isolate::WorkerReply::Panic(msg));
-                return;
-            }
-        };
+        // SRV §3.7: the dedicated isolate's inbound channel is `Vec<u8>` only, so the
+        // frozen-`Arc` side-vector is CAPTURED directly in this `Send` closure (path-a
+        // style) rather than riding the byte channel — a `Value::Shared` arg crosses by
+        // `Arc` pointer (zero copy), reconstructed here against this isolate.
+        let arg_values =
+            match isolate::decode_args_with_shared(&args_bytes, &encoded_shared, &iso_interp) {
+                Ok(vs) => vs,
+                Err(msg) => {
+                    let _ = reply_tx.send(isolate::WorkerReply::Panic(msg));
+                    return;
+                }
+            };
         let entry = match vm.user_global(&entry_name) {
             Some(v) => v,
             None => {
@@ -371,12 +385,12 @@ pub fn dispatch_worker_dedicated(
         };
         let reply = match vm.call_value(entry, arg_values, crate::span::Span::new(0, 0)).await {
             Ok(v) => match serialize::encode(&v) {
-                Ok(bytes) => isolate::WorkerReply::Ok(bytes),
+                Ok((bytes, shared)) => isolate::WorkerReply::Ok(bytes, shared),
                 Err(e) => isolate::WorkerReply::Panic(e.message()),
             },
             Err(Control::Panic(e)) => isolate::WorkerReply::Panic(e.message),
             Err(Control::Propagate(_)) => match serialize::encode(&Value::Nil) {
-                Ok(bytes) => isolate::WorkerReply::Ok(bytes),
+                Ok((bytes, shared)) => isolate::WorkerReply::Ok(bytes, shared),
                 Err(e) => isolate::WorkerReply::Panic(e.message()),
             },
             Err(Control::Exit(_)) => {
@@ -420,8 +434,9 @@ pub fn dispatch_worker_dedicated(
         .ok()
         .flatten();
         let result = match reply {
-            Some(isolate::WorkerReply::Ok(bytes)) => {
-                serialize::decode(&bytes, &interp_rc).map_err(|e| Control::Panic(e.into()))
+            Some(isolate::WorkerReply::Ok(bytes, shared)) => {
+                serialize::decode_with_shared(&bytes, &shared, &interp_rc)
+                    .map_err(|e| Control::Panic(e.into()))
             }
             Some(isolate::WorkerReply::Panic(msg)) => {
                 Err(Control::Panic(crate::error::AsError::at(msg, span)))

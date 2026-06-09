@@ -93,6 +93,8 @@ use crate::span::Span;
 use crate::value::{NativeKind, NativeMethod, Value};
 use indexmap::IndexMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -208,7 +210,15 @@ impl HttpServerState {
 }
 
 pub fn exports() -> Vec<(&'static str, Value)> {
-    vec![("create", bi("http_server.create"))]
+    vec![
+        ("create", bi("http_server.create")),
+        // SRV Part A — the module-level multi-isolate entry. `server.serve(opts)` with
+        // `workers > 1` + a `setup` worker fn spreads the accept loop across N
+        // shared-nothing REUSEPORT isolates (each builds its own handle in `setup`);
+        // `workers` absent/1 runs setup single-isolate. Distinct from the handle method
+        // `s.serve(opts)` (which serves a pre-bound single handle).
+        ("serve", bi("http_server.serve")),
+    ]
 }
 
 fn err_pair(msg: String) -> Value {
@@ -217,6 +227,231 @@ fn err_pair(msg: String) -> Value {
 
 fn obj(map: IndexMap<String, Value>) -> Value {
     Value::Object(crate::value::ObjectCell::new(map))
+}
+
+// ── SRV Part A — multi-isolate REUSEPORT serve helpers ────────────────────────
+
+/// Parsed `serve` options, shared by the handle method `s.serve(opts)` and the
+/// module-level `server.serve(opts)`. The per-request limits (`maxBodySize`,
+/// `requestTimeout`, `maxConcurrent`) and `maxRequests` shutdown were always here; SRV
+/// Part A adds the multi-isolate fields (`workers`/`setup`/`args`/`host`/`port`).
+struct ServeOpts {
+    max_requests: Option<usize>,
+    max_body: usize,
+    timeout_ms: u64,
+    max_concurrent: usize,
+    workers: Option<usize>,
+    setup_fn: Option<Value>,
+    setup_args: Vec<Value>,
+    host: String,
+    port: Option<u16>,
+}
+
+impl ServeOpts {
+    /// Parse the (optional) opts object — the first positional arg. Numbers may be
+    /// `Int` or `Float` (NUM §4); a missing/non-object arg yields all defaults.
+    fn parse(args: &[Value]) -> ServeOpts {
+        let mut o = ServeOpts {
+            max_requests: None,
+            max_body: DEFAULT_MAX_BODY_BYTES,
+            timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            workers: None,
+            setup_fn: None,
+            setup_args: Vec::new(),
+            host: String::from("127.0.0.1"),
+            port: None,
+        };
+        if let Value::Object(obj) = arg(args, 0) {
+            let obj = obj.borrow();
+            if let Some(n) = obj.get("maxRequests").and_then(|v| v.as_f64()) {
+                if n >= 0.0 {
+                    o.max_requests = Some(n as usize);
+                }
+            }
+            if let Some(n) = obj.get("maxBodySize").and_then(|v| v.as_f64()) {
+                if n >= 0.0 {
+                    o.max_body = n as usize;
+                }
+            }
+            if let Some(n) = obj.get("requestTimeout").and_then(|v| v.as_f64()) {
+                if n > 0.0 {
+                    o.timeout_ms = n as u64;
+                }
+            }
+            if let Some(n) = obj.get("maxConcurrent").and_then(|v| v.as_f64()) {
+                if n >= 1.0 {
+                    o.max_concurrent = n as usize;
+                }
+            }
+            if let Some(n) = obj.get("workers").and_then(|v| v.as_f64()) {
+                if n >= 0.0 {
+                    o.workers = Some(n as usize);
+                }
+            }
+            if let Some(s) = obj.get("setup") {
+                if !matches!(s, Value::Nil) {
+                    o.setup_fn = Some(s.clone());
+                }
+            }
+            if let Some(Value::Array(a)) = obj.get("args") {
+                o.setup_args = a.borrow().clone();
+            }
+            if let Some(Value::Str(h)) = obj.get("host") {
+                o.host = h.to_string();
+            }
+            if let Some(n) = obj.get("port").and_then(|v| v.as_f64()) {
+                if (0.0..=65535.0).contains(&n) && n.fract() == 0.0 {
+                    o.port = Some(n as u16);
+                }
+            }
+        }
+        o
+    }
+
+    /// The effective isolate count: `workers: 0` resolves to `num_cpus`, any `N>=1`
+    /// verbatim; `None` (absent) when the multi-isolate path is not requested.
+    fn effective_workers(&self) -> Option<usize> {
+        self.workers
+            .map(|w| if w == 0 { num_cpus_for_serve() } else { w })
+    }
+}
+
+/// The effective worker count for `workers: 0` (= `num_cpus`), mirroring the worker
+/// pool's `$ASCRIPT_WORKERS`-or-`num_cpus` rule so the server tier and the pool agree.
+fn num_cpus_for_serve() -> usize {
+    std::env::var("ASCRIPT_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(num_cpus::get)
+        .max(1)
+}
+
+/// Whether SO_REUSEPORT (kernel connection load-balancing across N sockets bound to
+/// the same addr) is available on this platform. Unix-only (Linux/macOS/BSD); Windows
+/// has no equivalent (SO_REUSEADDR is last-binder-wins, not balanced — SRV §2.2). A
+/// failed `set_reuse_port` at bind time also degrades, so this is the static gate and
+/// `bind_reuseport` is the runtime probe.
+fn reuseport_available() -> bool {
+    cfg!(unix)
+}
+
+/// Build ONE listening socket with `SO_REUSEPORT` (+ `SO_REUSEADDR`) set BEFORE bind,
+/// so N of these on the same `host:port` form one kernel load-balancing group. Returns
+/// a blocking `std::net::TcpListener` (it is `Send`, so it crosses into an isolate's
+/// closure; the isolate re-wraps it with tokio's `TcpListener::from_std`). The
+/// `set_reuse_port` call is `#[cfg(unix)]`-gated so the non-Unix build never references
+/// the Unix-only socket2 API (this fn is only called on a REUSEPORT platform anyway).
+#[cfg(unix)]
+fn bind_reuseport(host: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let addr: std::net::SocketAddr = format!("{host}:{port}")
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+    let domain = if addr.is_ipv6() { Domain::IPV6 } else { Domain::IPV4 };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    // REUSEADDR + REUSEPORT must be set BEFORE bind. REUSEPORT is the load-balancing
+    // group; REUSEADDR avoids a stale-TIME_WAIT bind refusal.
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    Ok(sock.into())
+}
+
+/// Non-Unix fallback — never actually called (the caller gates on `reuseport_available`
+/// which is false off-Unix), present only so the module compiles on Windows without
+/// referencing the Unix-only `set_reuse_port`.
+#[cfg(not(unix))]
+fn bind_reuseport(_host: &str, _port: u16) -> std::io::Result<std::net::TcpListener> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "SO_REUSEPORT is not available on this platform",
+    ))
+}
+
+/// Extract the entry name of a `worker fn` value (the named top-level fn to ship to
+/// each isolate). Works for BOTH engines: a tree-walker `Value::Function` (reads
+/// `func.name` + `func.is_worker`) and a VM `Value::Closure` (reads
+/// `proto.chunk.name` + `proto.is_worker`). Returns `None` for a non-worker fn or an
+/// anonymous one.
+fn worker_fn_entry_name(v: &Value) -> Option<String> {
+    match v {
+        Value::Function(f) if f.is_worker => f.name.clone(),
+        Value::Closure(c) if c.proto.is_worker => c.proto.chunk.name.clone(),
+        _ => None,
+    }
+}
+
+/// Extract the resource id from a server handle `Value::Native(HttpServer)` (what
+/// `server.create()` returns). `None` for any other value.
+fn server_handle_id(v: &Value) -> Option<u64> {
+    match v {
+        Value::Native(n) if n.kind == NativeKind::HttpServer => Some(n.id),
+        _ => None,
+    }
+}
+
+/// The body each multi-isolate REUSEPORT isolate runs (SRV §3.7a): load the `setup`
+/// slice into this isolate's Vm, decode the args (reconstructing any frozen
+/// `Value::Shared` by `Arc` bump), run `setup(...args)` to build THIS isolate's server
+/// handle, wrap the REUSEPORT listener with tokio, and run the shared `accept_loop`
+/// against the group-wide budget/stop. Returns `Ok(())` on a clean stop or an error
+/// string (reported back to the main isolate over the `Send` completion channel).
+#[allow(clippy::too_many_arguments)]
+async fn run_isolate_server(
+    vm: &Rc<crate::vm::Vm>,
+    iso: &Rc<Interp>,
+    slice_bytes: &[u8],
+    entry_name: &str,
+    encoded_args: &[u8],
+    encoded_shared: &[std::sync::Arc<crate::value::SharedNode>],
+    std_listener: std::net::TcpListener,
+    budget: Arc<AtomicUsize>,
+    stop: Arc<tokio::sync::Notify>,
+    bounded: bool,
+    max_body: usize,
+    timeout_ms: u64,
+    max_concurrent: usize,
+) -> Result<(), String> {
+    // Define the setup slice's globals on this isolate's Vm (entry + transitive deps).
+    crate::worker::isolate::load_slice(vm, Some(slice_bytes)).await?;
+    // Decode the setup args against THIS isolate's interp (Shared args reconstruct by
+    // Arc bump from the side-vector — zero copy of the frozen graph).
+    let args =
+        crate::worker::isolate::decode_args_with_shared(encoded_args, encoded_shared, iso)?;
+    // Resolve + run the setup entry to build this isolate's OWN server handle.
+    let entry = vm
+        .user_global(entry_name)
+        .ok_or_else(|| format!("setup entry '{entry_name}' is not defined in the shipped slice"))?;
+    let span = Span::new(0, 0);
+    let handle_val = vm
+        .call_value(entry, args, span)
+        .await
+        .map_err(|c| match c {
+            Control::Panic(e) => e.message,
+            _ => "setup failed".to_string(),
+        })?;
+    let id = server_handle_id(&handle_val).ok_or_else(|| {
+        "server.serve: `setup` must return a server handle (from server.create())".to_string()
+    })?;
+    // Wrap the pre-bound REUSEPORT std listener with tokio (it was set nonblocking at
+    // bind time). Each isolate accepts on its OWN socket in the shared kernel group.
+    let listener = TcpListener::from_std(std_listener)
+        .map_err(|e| format!("server.serve: could not register listener with tokio: {e}"))?;
+    // Run the shared accept loop on this isolate, against the group budget/stop.
+    match iso
+        .accept_loop(
+            listener, id, max_body, timeout_ms, max_concurrent, budget, stop, bounded, span,
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(Control::Panic(e)) => Err(e.message),
+        Err(_) => Err("server.serve: accept loop ended abnormally".to_string()),
+    }
 }
 
 /// A parsed HTTP/1 request read off the socket.
@@ -642,7 +877,7 @@ impl Interp {
     pub(crate) async fn call_http_server(
         &self,
         func: &str,
-        _args: &[Value],
+        args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
         match func {
@@ -653,6 +888,32 @@ impl Interp {
                     ResourceState::HttpServer(HttpServerState::new()),
                 );
                 Ok(handle)
+            }
+            // SRV Part A — the module-level multi-isolate entry. Unlike the handle method
+            // `s.serve(opts)` (which serves ONE pre-bound handle), `server.serve(opts)`
+            // builds every isolate's handle via `setup`: `workers > 1` fans out across N
+            // REUSEPORT isolates; `workers` absent/<=1 runs `setup` single-isolate.
+            "serve" => {
+                let opts = ServeOpts::parse(args);
+                let n = opts.effective_workers().unwrap_or(1);
+                if n > 1 {
+                    self.http_server_serve_multi(n, opts, span).await
+                } else {
+                    // Single-isolate, but still `setup`-driven (no pre-bound handle on the
+                    // module path) — reuse the fallback, which runs setup on this interp.
+                    self.http_server_serve_single_fallback(
+                        opts.setup_fn,
+                        opts.setup_args,
+                        &opts.host,
+                        opts.port,
+                        opts.max_requests,
+                        opts.max_body,
+                        opts.timeout_ms,
+                        opts.max_concurrent,
+                        span,
+                    )
+                    .await
+                }
             }
             // Internal terminal "handler" used when no route matched: returns a 404.
             // (Runs after any middleware, so middleware still sees unmatched requests.)
@@ -839,37 +1100,25 @@ impl Interp {
         args: &[Value],
         span: Span,
     ) -> Result<Value, Control> {
-        // Optional serve opts: `maxRequests` (test/shutdown stop), `maxBodySize`
-        // (413 limit), `requestTimeout` (ms, 408 on expiry), `maxConcurrent` (cap on
-        // concurrently-handled connections).
-        let mut max_requests: Option<usize> = None;
-        let mut max_body = DEFAULT_MAX_BODY_BYTES;
-        let mut timeout_ms = DEFAULT_REQUEST_TIMEOUT_MS;
-        let mut max_concurrent = DEFAULT_MAX_CONCURRENT;
-        if let Value::Object(o) = arg(args, 0) {
-            let o = o.borrow();
-            // NUM §4: config numbers may be `Int` or `Float`.
-            if let Some(n) = o.get("maxRequests").and_then(|v| v.as_f64()) {
-                if n >= 0.0 {
-                    max_requests = Some(n as usize);
-                }
-            }
-            if let Some(n) = o.get("maxBodySize").and_then(|v| v.as_f64()) {
-                if n >= 0.0 {
-                    max_body = n as usize;
-                }
-            }
-            if let Some(n) = o.get("requestTimeout").and_then(|v| v.as_f64()) {
-                if n > 0.0 {
-                    timeout_ms = n as u64;
-                }
-            }
-            if let Some(n) = o.get("maxConcurrent").and_then(|v| v.as_f64()) {
-                if n >= 1.0 {
-                    max_concurrent = n as usize;
-                }
+        let opts = ServeOpts::parse(args);
+
+        // SRV Part A — multi-isolate: when `workers > 1` (0 = num_cpus) the request is
+        // fanned out across N shared-nothing REUSEPORT isolates, each building its OWN
+        // server handle via `setup`. Otherwise the single-isolate path below runs on
+        // THIS pre-bound handle, byte-for-byte unchanged.
+        if let Some(n) = opts.effective_workers() {
+            if n > 1 {
+                return self.http_server_serve_multi(n, opts, span).await;
             }
         }
+
+        let ServeOpts {
+            max_requests,
+            max_body,
+            timeout_ms,
+            max_concurrent,
+            ..
+        } = opts;
 
         // Take the listener out of the resource so we own it across awaits (the
         // resource table can't lend `&mut TcpListener` across a `call_value`).
@@ -885,6 +1134,61 @@ impl Interp {
             None => return Ok(err_pair("server.serve: server is closed".into())),
         };
 
+        // Seed the SHARED accept budget + stop signal that `accept_loop` runs against.
+        // For the single-isolate path these are private to this one loop: the budget
+        // is `maxRequests` (or `usize::MAX` = unbounded), and the stop `Notify` is
+        // never fired by anyone but this loop reaching budget 0. The multi-isolate
+        // path (SRV Part A, Task 8) clones the SAME `Arc<AtomicUsize>` budget +
+        // `Arc<Notify>` into every isolate's `accept_loop`, which is exactly why the
+        // body is factored out here. Single-isolate behavior is byte-for-byte the same
+        // as the prior inline loop (budget reproduces `served`/`maxRequests`).
+        let budget = Arc::new(AtomicUsize::new(max_requests.unwrap_or(usize::MAX)));
+        let stop = Arc::new(tokio::sync::Notify::new());
+        // `bounded` mirrors the old `max_requests.is_some()` — when set, the loop
+        // retains + drains in-flight handler tasks and observes the shared stop.
+        let bounded = max_requests.is_some();
+
+        self.accept_loop(
+            listener,
+            id,
+            max_body,
+            timeout_ms,
+            max_concurrent,
+            budget,
+            stop,
+            bounded,
+            span,
+        )
+        .await
+    }
+
+    /// The per-listener accept + dispatch loop, factored out of `http_server_serve`
+    /// so the single-isolate path AND each multi-isolate REUSEPORT isolate (SRV
+    /// Part A) run the SAME body on their own listener (`listener` by value), their
+    /// own per-isolate handle `id`, sharing one `budget`/`stop` across the group.
+    ///
+    /// `budget` is the remaining global request count (`usize::MAX` = unbounded);
+    /// each accepted connection does a saturating `fetch_sub` and, when the budget
+    /// is exhausted, fires `stop` so sibling isolates blocked on `accept()` also
+    /// halt. `bounded` (true iff `maxRequests` was set) toggles the deterministic
+    /// drain: when set, in-flight handler tasks are retained and awaited before
+    /// returning, and the loop also wakes on `stop` so a sibling reaching the global
+    /// budget stops this loop too. When unset (`serve` with no `maxRequests`), this
+    /// is an unbounded server: tasks are detached and the loop runs forever (the old
+    /// behavior exactly — `stop` is never fired and `accept()` is awaited directly).
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_loop(
+        &self,
+        listener: TcpListener,
+        id: u64,
+        max_body: usize,
+        timeout_ms: u64,
+        max_concurrent: usize,
+        budget: Arc<AtomicUsize>,
+        stop: Arc<tokio::sync::Notify>,
+        bounded: bool,
+        span: Span,
+    ) -> Result<Value, Control> {
         // Bounds the number of connections handled at once. Each spawned handler
         // task holds an `OwnedSemaphorePermit` for its lifetime; the permit is
         // released (returned to the semaphore) when the task finishes. This caps
@@ -893,25 +1197,84 @@ impl Interp {
         // the resulting `OwnedSemaphorePermit` is `'static` and can move into the
         // spawned handler task. Arc is fine in this `!Send` single-threaded runtime —
         // the permit never crosses a thread (every task stays on the LocalSet).
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-        // In-flight handler tasks, retained ONLY when `maxRequests` is set so the
-        // shutdown path can DRAIN them (await completion) before returning —
+        let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+        // In-flight handler tasks, retained ONLY when bounded (`maxRequests` set) so
+        // the shutdown path can DRAIN them (await completion) before returning —
         // otherwise an accepted-but-not-yet-finished slow handler's response could be
         // lost. Without `maxRequests` (an unbounded `serve`) tasks are detached; the
         // semaphore alone bounds concurrency and finished tasks free themselves, so
         // we don't accumulate join handles forever.
         let mut inflight: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let mut served = 0usize;
         loop {
-            if let Some(max) = max_requests {
-                if served >= max {
+            // Accept the next connection. On the bounded path we race `accept()` against
+            // the shared `stop` so a sibling reaching the global budget wakes THIS loop
+            // out of a blocking `accept()` (otherwise it would hang). On the unbounded
+            // path `stop` is never fired, so we await `accept()` directly (byte-identical
+            // to the old loop).
+            let accepted = if bounded {
+                // LOST-WAKEUP FIX: `Notify::notify_waiters` only wakes ALREADY-registered
+                // waiters (it stores no permit). So we REGISTER the `stop` waiter FIRST,
+                // then re-check the budget. A sibling that drove the budget to 0 and fired
+                // `notify_waiters` BEFORE we registered is caught by this budget re-check
+                // (it set budget=0 before notifying); one that fires AFTER is delivered to
+                // our already-registered `notified`. Either way an idle isolate can no
+                // longer miss the shutdown and park in `accept()` forever (which would hang
+                // its thread → `serve` never returns). Reading 0 here means this loop or a
+                // sibling claimed the global total — wake every sibling, then drain+return.
+                let notified = stop.notified();
+                tokio::pin!(notified);
+                // `Notified` registers its waiter on first POLL, not on creation — so we
+                // `enable()` it to register NOW, BEFORE the budget re-check. Without this
+                // the register-before-check is a no-op (the select would register only
+                // after the check, re-opening the lost-wakeup window). With it: a sibling
+                // that fired `notify_waiters` after this `enable()` reaches our registered
+                // waiter; one that fired before set budget=0 first, caught by the re-check.
+                notified.as_mut().enable();
+                if budget.load(Ordering::SeqCst) == 0 {
+                    stop.notify_waiters();
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    r = listener.accept() => Some(r),
+                    _ = &mut notified => None,
+                }
+            } else {
+                Some(listener.accept().await)
+            };
+            let (stream, _peer) = match accepted {
+                Some(Ok(pair)) => pair,
+                Some(Err(e)) => {
+                    return Ok(err_pair(format!("server.serve accept failed: {}", e)))
+                }
+                // Woken by `stop` (a sibling hit the global budget) — drain + return.
+                None => break,
+            };
+            // We have a connection in hand — now CLAIM one unit of the shared budget.
+            // The claim is the source of truth for "exactly `maxRequests` total" (a
+            // saturating `fetch_update`: an exhausted budget stays at 0, never wraps).
+            // A claimed unit is ALWAYS served — we never race `stop` after claiming —
+            // so the group serves exactly the budget total. If the claim fails (a
+            // sibling took the last unit between our accept and here), we drop this
+            // connection (it closes cleanly, the client sees a reset) and stop. This
+            // is the documented OS-scheduling nondeterminism: the TOTAL is exact, the
+            // per-isolate split is not (§4.1/§5). On the single-isolate path there are
+            // no siblings, so the claim never fails before the budget is spent and the
+            // behavior reproduces the old `served >= max` exactly.
+            if bounded {
+                let claimed = budget
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                        cur.checked_sub(1)
+                    })
+                    .is_ok();
+                if !claimed {
+                    // A sibling claimed the last unit first; release this connection
+                    // and stop. (`stream` drops here → the socket closes.)
+                    drop(stream);
+                    stop.notify_waiters();
                     break;
                 }
             }
-            let (stream, _peer) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => return Ok(err_pair(format!("server.serve accept failed: {}", e))),
-            };
             // Acquire a permit BEFORE spawning so we never spawn more than
             // `max_concurrent` handler tasks at once. (Bounded by the semaphore; the
             // accept loop parks here when the cap is reached, applying backpressure.)
@@ -932,9 +1295,13 @@ impl Interp {
                 vm.handle_connection(id, stream, max_body, timeout_ms, span)
                     .await;
             });
-            served += 1;
-            if max_requests.is_some() {
+            if bounded {
                 inflight.push(handle);
+                // If that claim drove the budget to 0, signal every sibling to stop
+                // (and stop ourselves on the next iteration's budget==0 check).
+                if budget.load(Ordering::SeqCst) == 0 {
+                    stop.notify_waiters();
+                }
             }
             // (Unbounded serve: the handle is dropped — the task is detached and runs
             // to completion on the LocalSet; the semaphore bounds concurrency.)
@@ -955,6 +1322,346 @@ impl Interp {
         }
 
         Ok(make_pair(Value::Nil, Value::Nil))
+    }
+
+    /// SRV Part A — the multi-isolate REUSEPORT serve path. Spawns `n` shared-nothing
+    /// isolates (each a full `!Send` `Interp`/`Vm` on its OWN OS thread, sharing NO
+    /// memory), each binding the SAME `host:port` via `SO_REUSEPORT` so the kernel
+    /// load-balances incoming connections across them. The `setup` worker fn runs once
+    /// inside each isolate at boot to build that isolate's OWN server handle (open its
+    /// own DB pool, register handlers); only the sendable `args` (incl. any frozen
+    /// `Value::Shared` — an `Arc` pointer bump, zero copy) cross into the isolate, via
+    /// direct capture in the `Send` `make_loop` closure (SRV §3.7a).
+    ///
+    /// A shared `Arc<AtomicUsize>` budget plus an `Arc<Notify>` stop coordinate
+    /// `maxRequests` and graceful shutdown across the N threads: each accepted
+    /// connection claims one unit of the SHARED budget; reaching 0 fires the stop so
+    /// every isolate halts. Only the TOTAL is bounded — the per-isolate split is
+    /// OS-scheduling nondeterminism (§4.1/§5). `serve` resolves once all N isolates'
+    /// accept loops have stopped.
+    ///
+    /// **Windows / non-REUSEPORT platforms:** `SO_REUSEPORT` is Unix-only, so this is
+    /// only reached on Unix — the caller (`http_server_serve`) routes Windows / a
+    /// non-REUSEPORT platform to the single-isolate fallback + a one-time warn (see
+    /// `reuseport_available`). Bind failures (EADDRINUSE, etc.) surface here as a clean
+    /// recoverable `[nil, err]` pair, never a panic; on any spawn/bind error already
+    /// spawned isolates are torn down (their `IsolateHandle` drops join the threads).
+    async fn http_server_serve_multi(
+        &self,
+        n: usize,
+        opts: ServeOpts,
+        span: Span,
+    ) -> Result<Value, Control> {
+        let ServeOpts {
+            setup_fn,
+            setup_args,
+            ref host,
+            port,
+            max_requests,
+            max_body,
+            timeout_ms,
+            max_concurrent,
+            ..
+        } = opts;
+        let host = host.as_str();
+        // Platform gate (SRV §2.2): SO_REUSEPORT is Unix-only. On Windows / any platform
+        // without it, fall back to the single-isolate path + a one-time warn — honest
+        // degradation (correct, just single-core), never a silent wrong behavior.
+        if !reuseport_available() {
+            self.warn_reuseport_unavailable(n).await;
+            return self
+                .http_server_serve_single_fallback(
+                    setup_fn,
+                    setup_args,
+                    host,
+                    port,
+                    max_requests,
+                    max_body,
+                    timeout_ms,
+                    max_concurrent,
+                    span,
+                )
+                .await;
+        }
+
+        // The `setup` worker fn is required for the multi-isolate path: each isolate is
+        // a fresh, shared-nothing runtime that must build its OWN server handle (the
+        // main-isolate `id` means nothing in another isolate's resource table).
+        let setup = match &setup_fn {
+            Some(v) => v,
+            None => {
+                return Ok(err_pair(
+                    "server.serve: workers>1 requires a `setup` worker fn (each isolate \
+                     builds its own server)"
+                        .into(),
+                ))
+            }
+        };
+        let entry_name = match worker_fn_entry_name(setup) {
+            Some(name) => name,
+            None => {
+                return Ok(err_pair(
+                    "server.serve: `setup` must be a named `worker fn` (it ships to each \
+                     isolate and runs there at boot)"
+                        .into(),
+                ))
+            }
+        };
+        // Build the shippable code slice for `setup` from the program source/.aso
+        // (the same path a `worker fn` call uses). Its `.aso` bytes are `Send`.
+        let slice = crate::worker::build_code_slice_for_interp(self, &entry_name)?;
+        let slice_bytes: Vec<u8> = slice.entry_aso.to_vec();
+        let entry_name_owned = slice.entry_name.to_string();
+
+        // Gate sendability of the setup args + encode them ONCE (bytes + frozen-`Arc`
+        // side-vector, both `Send`); each isolate clones this to reconstruct its args.
+        for a in &setup_args {
+            crate::worker::serialize::check_sendable(a)
+                .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
+        }
+        let args_array = Value::Array(crate::value::ArrayCell::new(setup_args));
+        let (encoded_args, encoded_shared) = crate::worker::serialize::encode(&args_array)
+            .map_err(|e| Control::Panic(crate::error::AsError::at(e.message(), span)))?;
+
+        // Bind N REUSEPORT listeners on THIS thread so a bind error (EADDRINUSE, a bad
+        // host) surfaces synchronously as a clean recoverable pair — BEFORE any isolate
+        // is spawned. A `std::net::TcpListener` is `Send`, so each is moved into its
+        // isolate's closure and re-wrapped with tokio's `TcpListener::from_std` there.
+        // All N share one kernel load-balancing group (same addr + SO_REUSEPORT).
+        let bind_port = port.unwrap_or(0);
+        // Port 0 = an ephemeral port: bind the FIRST socket to discover the kernel's
+        // chosen port, then bind the rest to THAT same port (so all N join one group).
+        let mut std_listeners: Vec<std::net::TcpListener> = Vec::with_capacity(n);
+        let mut chosen_port = bind_port;
+        for i in 0..n {
+            let p = if i == 0 { bind_port } else { chosen_port };
+            let l = match bind_reuseport(host, p) {
+                Ok(l) => l,
+                Err(e) => {
+                    return Ok(err_pair(format!(
+                        "server.serve: REUSEPORT bind on {host}:{p} failed: {e}"
+                    )))
+                }
+            };
+            if i == 0 {
+                chosen_port = l.local_addr().map(|a| a.port()).unwrap_or(bind_port);
+            }
+            std_listeners.push(l);
+        }
+
+        // The SHARED coordination state: one budget (remaining global request count;
+        // usize::MAX = unbounded) + one stop signal, cloned into every isolate.
+        let budget = Arc::new(AtomicUsize::new(max_requests.unwrap_or(usize::MAX)));
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let bounded = max_requests.is_some();
+
+        // Spawn N dedicated isolates. Each captures (a CLONE of) the slice bytes, the
+        // encoded args + frozen-`Arc` side-vector, ITS listener, the shared budget/stop
+        // — all `Send` — directly in the `Send` `make_loop` closure (SRV §3.7a path-a:
+        // the accept-loop isolate's inbound `Vec<u8>` channel is unused; no
+        // `WorkerRequest` is built). A completion is reported back over a `Send`
+        // `std::mpsc` channel so `serve` can await all N.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let mut handles: Vec<crate::worker::isolate::IsolateHandle> = Vec::with_capacity(n);
+        for std_listener in std_listeners.into_iter() {
+            let slice_bytes = slice_bytes.clone();
+            let entry_name = entry_name_owned.clone();
+            let encoded_args = encoded_args.clone();
+            let encoded_shared = encoded_shared.clone();
+            let budget = budget.clone();
+            let stop_iso = stop.clone();
+            let done_tx = done_tx.clone();
+            let caps = self.caps();
+
+            let spawned = crate::worker::isolate::spawn_isolate(move |vm, _inbound| async move {
+                // Inside the fresh, shared-nothing isolate (its own thread + Interp/Vm).
+                let iso = vm.interp().clone();
+                // Mirror the pooled-worker authority floor (FFI §4.5a): install the
+                // caller's caps; an accept-loop isolate is server-lifetime, single-
+                // tenant — a `caps.drop` inside `setup` is durable there (default).
+                iso.set_caps(caps);
+
+                let result = run_isolate_server(
+                    &vm,
+                    &iso,
+                    &slice_bytes,
+                    &entry_name,
+                    &encoded_args,
+                    &encoded_shared,
+                    std_listener,
+                    budget,
+                    stop_iso,
+                    bounded,
+                    max_body,
+                    timeout_ms,
+                    max_concurrent,
+                )
+                .await;
+                let _ = done_tx.send(result);
+                // The inbound channel is unused; the closure returns here, ending the
+                // isolate's run-loop, so its thread exits and `IsolateHandle::drop`
+                // joins it cleanly (no zombie thread).
+            });
+
+            match spawned {
+                Ok(h) => handles.push(h),
+                Err(e) => {
+                    // A spawn failure: fire the stop so any already-running isolate
+                    // halts, drop the handles (joins their threads), and report.
+                    stop.notify_waiters();
+                    drop(handles);
+                    return Ok(err_pair(format!(
+                        "server.serve: could not spawn worker isolate: {e}"
+                    )));
+                }
+            }
+        }
+        // Drop our extra sender so `done_rx` closes once every isolate has reported.
+        drop(done_tx);
+
+        // Await all N isolates' accept loops on a blocking helper (the `std::mpsc`
+        // recv would otherwise stall this current-thread runtime). The handles are
+        // moved in so the isolate threads stay alive until they finish, then drop →
+        // join (no zombie thread). A non-empty error is surfaced as the serve result.
+        let first_err = tokio::task::spawn_blocking(move || {
+            let _handles = handles; // keep isolates alive until all report
+            let mut first_err: Option<String> = None;
+            for _ in 0..n {
+                match done_rx.recv() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                    // A sender dropped without reporting (isolate thread died): treat
+                    // as a clean stop of that isolate (the others still coordinate).
+                    Err(_) => break,
+                }
+            }
+            // `_handles` drops here → each `IsolateHandle::drop` joins its thread.
+            first_err
+        })
+        .await
+        .unwrap_or(None);
+
+        match first_err {
+            Some(e) => Ok(err_pair(e)),
+            None => Ok(make_pair(Value::Nil, Value::Nil)),
+        }
+    }
+
+    /// The single-isolate fallback for `workers>1` on a non-REUSEPORT platform: run the
+    /// `setup` worker fn INLINE on this interp (building one server handle here), bind a
+    /// plain listener, and serve single-isolate. Behavior matches today's single-core
+    /// server exactly (correct, just not parallel) — the documented Windows degradation.
+    #[allow(clippy::too_many_arguments)]
+    async fn http_server_serve_single_fallback(
+        &self,
+        setup_fn: Option<Value>,
+        setup_args: Vec<Value>,
+        host: &str,
+        port: Option<u16>,
+        max_requests: Option<usize>,
+        max_body: usize,
+        timeout_ms: u64,
+        max_concurrent: usize,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // If a `setup` was supplied, run it on THIS interp to build the server handle
+        // (it returns a server `Native`); else there is nothing to serve.
+        let setup = match setup_fn {
+            Some(v) => v,
+            None => {
+                return Ok(err_pair(
+                    "server.serve: workers>1 requires a `setup` worker fn".into(),
+                ))
+            }
+        };
+        // Run setup inline. A `worker fn` called from outside an isolate would dispatch
+        // to the pool; here we want it to build the handle IN this interp, so we resolve
+        // the entry and call it directly as an ordinary function on this interp's VM.
+        let handle_val = self.run_setup_inline(&setup, setup_args, span).await?;
+        let id = match server_handle_id(&handle_val) {
+            Some(id) => id,
+            None => {
+                return Ok(err_pair(
+                    "server.serve: `setup` must return a server handle (from server.create())"
+                        .into(),
+                ))
+            }
+        };
+        // Bind a plain listener on this interp's resource and serve single-isolate.
+        let bind_port = port.unwrap_or(0);
+        let addr = format!("{host}:{bind_port}");
+        let listener = match TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => return Ok(err_pair(format!("server.serve bind on {addr} failed: {e}"))),
+        };
+        let budget = Arc::new(AtomicUsize::new(max_requests.unwrap_or(usize::MAX)));
+        let stop = Arc::new(tokio::sync::Notify::new());
+        let bounded = max_requests.is_some();
+        self.accept_loop(
+            listener, id, max_body, timeout_ms, max_concurrent, budget, stop, bounded, span,
+        )
+        .await
+    }
+
+    /// Run a `setup` worker fn inline on THIS interp (for the single-isolate fallback):
+    /// resolve its entry global and call it as an ordinary function so it builds its
+    /// server handle in this interp's resource table. Returns the handle value.
+    async fn run_setup_inline(
+        &self,
+        setup: &Value,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Control> {
+        // A worker fn value is callable directly; calling it via `call_value` while NOT
+        // in an isolate would route to the pool. To run it locally we look up the entry
+        // by name on the VM (if present) or call the closure with the worker flag
+        // bypassed. Simplest correct path: temporarily treat it as a normal call by
+        // invoking the underlying function body. We rely on the entry being a global.
+        let name = worker_fn_entry_name(setup);
+        if let (Some(name), Some(vm)) = (name.as_ref(), self.vm()) {
+            if let Some(entry) = vm.user_global(name) {
+                // Calling the resolved global routes through the worker path again; to
+                // avoid the pool we mark ourselves "in isolate" for this one call so the
+                // dispatch runs inline on this VM (the entry global is already defined).
+                return crate::worker::with_inline_dispatch(|| vm.call_value(entry, args, span))
+                    .await;
+            }
+        }
+        // Tree-walker (no VM) or unresolved: call the value directly under the inline
+        // guard so a worker fn runs locally rather than dispatching to the pool.
+        let setup = setup.clone();
+        let interp = self.rc();
+        crate::worker::with_inline_dispatch(|| interp.call_value(setup, args, span)).await
+    }
+
+    /// Emit the ONE-TIME `warn` that `workers:N` requested REUSEPORT but the platform
+    /// lacks it, so the server is degrading to single-isolate (SRV §2.2). Best-effort,
+    /// `warn`-level: routed through `std/log` when the `log` feature is on (stderr/Live
+    /// or the test capture buffer), else a plain stderr line. Guarded by a process-wide
+    /// atomic so it fires at most once even across many `serve` calls.
+    async fn warn_reuseport_unavailable(&self, n: usize) {
+        static WARNED: AtomicUsize = AtomicUsize::new(0);
+        if WARNED.swap(1, Ordering::SeqCst) != 0 {
+            return;
+        }
+        let msg = format!(
+            "workers: {n} requested but SO_REUSEPORT is unavailable on this platform; \
+             serving single-isolate"
+        );
+        #[cfg(feature = "log")]
+        {
+            let _ = self
+                .call_log("warn", &[Value::Str(msg.into())], Span::new(0, 0))
+                .await;
+        }
+        #[cfg(not(feature = "log"))]
+        {
+            eprintln!("warning: {msg}");
+        }
     }
 
     /// Handle one accepted connection end-to-end on a spawned task: read the request
@@ -1842,6 +2549,53 @@ await s.serve({{ maxRequests: 1 }})
             "in-flight slow handler must be drained before serve returns"
         );
         assert_eq!(body, "drained-ok");
+    }
+
+    #[tokio::test]
+    async fn max_requests_serves_exactly_n_then_returns() {
+        // SRV Task 7 parity: the refactored `accept_loop` must reproduce the old
+        // `served >= max` semantics EXACTLY — `maxRequests: 3` serves exactly three
+        // sequential requests then `serve` returns. The 4th connection (sent after
+        // serve has returned) must FAIL to get an HTTP response (the listener is gone).
+        let port = reserve_port().await;
+        let src = format!(
+            r#"
+import {{ create }} from "std/http/server"
+let s = create()
+s.route("GET", "/n", (req) => "ok")
+await s.bind("127.0.0.1", {port})
+await s.serve({{ maxRequests: 3 }})
+"#
+        );
+        let url = format!("http://127.0.0.1:{port}/n");
+        let (served, fourth_failed) = with_server(&src, move || async move {
+            let mut served = 0usize;
+            // Three sequential requests — each must succeed.
+            for _ in 0..3 {
+                let (status, body) = client_request("GET", &url, None).await;
+                if status == "HTTP/1.1 200 OK" && body == "ok" {
+                    served += 1;
+                }
+            }
+            // A 4th connection after serve has returned: the listener is closed, so a
+            // connect/request attempt must NOT yield a 200 (it errors or is refused).
+            let fourth = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                client_request("GET", &url, None),
+            )
+            .await;
+            let fourth_failed = match fourth {
+                Err(_) => true, // timed out — nothing listening
+                Ok((status, _)) => status != "HTTP/1.1 200 OK",
+            };
+            (served, fourth_failed)
+        })
+        .await;
+        assert_eq!(served, 3, "exactly maxRequests=3 connections must be served");
+        assert!(
+            fourth_failed,
+            "the 4th connection must fail — serve returned after exactly 3"
+        );
     }
 
     #[tokio::test]

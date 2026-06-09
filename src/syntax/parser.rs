@@ -1812,6 +1812,12 @@ fn class_decl(p: &mut Parser) {
     }
     while !p.at(RBrace) && !p.at_end() {
         let before = p.pos;
+        // `;` is an optional separator between class members (matches the legacy
+        // parser + the tree-sitter `class_body` rule + the interface-body loop).
+        if p.at(Semicolon) {
+            p.bump();
+            continue;
+        }
         if p.at(AsyncKw) || p.at(FnKw) || at_static_method(p) || at_worker_modifier(p) {
             method_decl(p);
         } else if p.at(Ident) {

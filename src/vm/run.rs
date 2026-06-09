@@ -2138,6 +2138,21 @@ impl Vm {
                             .chars()
                             .map(|c| Value::Str(c.to_string().into()))
                             .collect(),
+                        // SRV §3.5: a frozen `Shared` array/string/set iterates
+                        // zero-copy, byte-identical to the tree-walker's `ForOf`.
+                        Value::Shared(ref node) => match crate::interp::shared_iter_values(node) {
+                            Some(items) => items,
+                            None => {
+                                return Err(self.panic_at(
+                                    fiber,
+                                    fault_ip,
+                                    format!(
+                                        "value of type {} is not iterable",
+                                        crate::interp::type_name(&iterable)
+                                    ),
+                                ))
+                            }
+                        },
                         other => {
                             return Err(self.panic_at(
                                 fiber,
@@ -3884,6 +3899,15 @@ impl Vm {
                 fiber.push(v);
                 return Ok(());
             }
+        }
+        // (1a''') SRV §3.5/§3.8: a member-CALL on a frozen `Value::Shared` routes to
+        // the read-only `call_shared` dispatcher (read-only methods; mutating-method
+        // names + frozen-instance user-methods → the Tier-2 panics). Mirrors the
+        // tree-walker `eval_chain` hook byte-for-byte (same `crate::interp::call_shared`).
+        if let Value::Shared(node) = &recv {
+            let v = crate::interp::call_shared(node, name, &args, span)?;
+            fiber.push(v);
+            return Ok(());
         }
         // (1b) STATIC method call `C.name(args)` (SP1 §3): the receiver is a VM
         // class whose `name` resolves (up the chain) to a compiled STATIC closure.

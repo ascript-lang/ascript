@@ -64,6 +64,9 @@ fn required_args(module: &str, name: &str) -> Option<usize> {
         ("std/caps", "list") => 0,
         ("std/caps", "drop") => 1,
         ("std/caps", "dropAll") => 0,
+        // SRV §4: std/shared — `freeze`/`isShared` each take exactly one value.
+        ("std/shared", "freeze") => 1,
+        ("std/shared", "isShared") => 1,
         // std/ffi — the FFI surface (FFI §5.1). `open`/`cstr`/`read_cstr`/`struct`/
         // `alloc` take one required arg; `get` takes (layout, buf, name); `set` takes
         // (layout, buf, name, value). The handle METHODS `symbol` (name + argtypes +

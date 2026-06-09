@@ -78,6 +78,23 @@ fn both_frontends_accept_static_methods() {
     both_accept("class C { fn m() { return 1 }\n static fn s() { return 2 } }");
 }
 
+/// `;` is an OPTIONAL separator between class members on BOTH front-ends (the
+/// legacy parser + the tree-sitter `class_body` rule already allow it; this guards
+/// the CST hand-parser, which used to reject it — a legacy-vs-CST divergence where
+/// the tree-walker ran a program the VM refused to compile). The catalog above only
+/// exercised the LEGACY parser via `accepts`, so this `both_accept` battery is the
+/// real cross-front-end guard.
+#[test]
+fn both_frontends_accept_semicolon_between_class_members() {
+    both_accept("class P { x: number; y: number }");
+    both_accept("class Q { x: number = 1; y: number = 2 }");
+    both_accept("class R { x: number = 5; fn f() { return self.x } }");
+    both_accept("class S { fn f() { return 1 }; fn g() { return 2 } }");
+    // leading / trailing / doubled separators are all tolerated (repeat(';'))
+    both_accept("class T { ; x: number; }");
+    both_accept("class U { x: number;; y: number }");
+}
+
 /// `static` is a CONTEXTUAL/soft keyword — it must remain usable as an ordinary
 /// identifier where unambiguous (variable, fn name, member, field name).
 #[test]
@@ -91,6 +108,11 @@ fn cst_keeps_static_as_a_plain_identifier() {
 
 #[test]
 fn interpreter_parses_each_grammar_construct() {
+    // Each snippet must parse on BOTH front-ends (legacy precedence-climbing + CST
+    // hand-parser). Originally this checked only the legacy parser (`accepts`),
+    // which let a CST-only divergence slip through (`;` between class members — the
+    // CST rejected what the legacy parser + tree-sitter accept). `both_accept` makes
+    // this the standing cross-front-end parse guard for every catalogued construct.
     let snippets = [
         // --- let / const declarations (with and without init, typed) ---
         "let a = 1",
@@ -247,7 +269,7 @@ fn interpreter_parses_each_grammar_construct() {
         "fn f(...rest: array<number>) { return rest }",
     ];
     for s in snippets {
-        accepts(s);
+        both_accept(s);
     }
 }
 

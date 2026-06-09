@@ -98,6 +98,13 @@ const TAG_REF: u8 = 13;
 /// A 64-bit integer (NUM §3.1). A scalar wire kind, distinct from `TAG_NUMBER`
 /// (float) so an `int` round-trips as an `int` (no lossy float fold).
 const TAG_INT: u8 = 14;
+/// SRV §3.7(b) — a frozen `Value::Shared`, encoded as a u32 INDEX into the encode
+/// side-vector `Writer.shared` (a `Vec<Arc<SharedNode>>` shipped alongside the byte
+/// buffer). Encoding pushes `arc.clone()` (an atomic bump) + writes the index — NO
+/// deep walk of the frozen graph. Decode reconstructs `Value::Shared` from the
+/// side-vector by index. WORKER-WIRE ONLY — never an `.aso` constant (no
+/// `ASO_FORMAT_VERSION` bump). The next free tag after `TAG_INT = 14`.
+const TAG_SHARED: u8 = 15;
 
 // ---------------------------------------------------------------------------
 // Sendability gate
@@ -127,6 +134,9 @@ fn unsendable_kind(v: &Value) -> Option<(&'static str, Option<&'static str>)> {
         | Value::Set(_)
         | Value::EnumVariant(_)
         | Value::Instance(_) => None,
+        // SRV §3.7: a frozen `Shared` is THE sendable-by-pointer value — it crosses
+        // by an `Arc` clone (zero copy), never a structured-clone walk. Sendable leaf.
+        Value::Shared(_) => None,
         #[cfg(feature = "data")]
         Value::Regex(_) => None,
 
@@ -311,11 +321,18 @@ fn display_key(k: &MapKey) -> String {
 
 struct Writer {
     buf: Vec<u8>,
+    /// SRV §3.7(b) — the shared-table side-vector. A frozen `Value::Shared` is
+    /// encoded as a `TAG_SHARED` + a u32 index into this vector (`shared.push(
+    /// arc.clone())`, an atomic bump, NO graph walk). Shipped alongside `buf`.
+    shared: Vec<std::sync::Arc<crate::value::SharedNode>>,
 }
 
 impl Writer {
     fn new() -> Self {
-        Writer { buf: Vec::new() }
+        Writer {
+            buf: Vec::new(),
+            shared: Vec::new(),
+        }
     }
     fn u8(&mut self, b: u8) {
         self.buf.push(b);
@@ -398,15 +415,18 @@ fn truncated_err() -> SendError {
 // Encode
 // ---------------------------------------------------------------------------
 
-/// Serialize `v` to a structured-clone byte payload, rejecting non-sendable values
-/// (a bad value never produces a half-written payload — `check_sendable` runs first).
-pub fn encode(v: &Value) -> Result<Vec<u8>, SendError> {
+/// Serialize `v` to a structured-clone byte payload PLUS a side-vector of frozen
+/// `Arc<SharedNode>`s (SRV §3.7b — a `Value::Shared` crosses by an `Arc` clone, NOT
+/// a deep copy). Rejects non-sendable values (a bad value never produces a
+/// half-written payload — `check_sendable` runs first). The two members travel
+/// together (`WorkerRequest.args` + `WorkerRequest.shared`, etc.).
+pub fn encode(v: &Value) -> Result<(Vec<u8>, Vec<std::sync::Arc<crate::value::SharedNode>>), SendError> {
     check_sendable(v)?;
     let mut w = Writer::new();
     // Maps a container's identity pointer to its assigned serial id.
     let mut ids: HashMap<usize, u32> = HashMap::new();
     encode_value(v, &mut w, &mut ids);
-    Ok(w.buf)
+    Ok((w.buf, w.shared))
 }
 
 /// Assign the next serial id for a container pointer, or `Some(existing)` if it has
@@ -557,6 +577,15 @@ fn encode_value(v: &Value, w: &mut Writer, ids: &mut HashMap<usize, u32>) {
             }
             Err(existing) => emit_ref(w, existing),
         },
+        // SRV §3.7(b): a frozen `Shared` crosses by an `Arc` clone — push it into the
+        // side-vector and write its index. NO deep walk of the frozen graph (the whole
+        // point: a 5 MB frozen table costs one atomic bump, independent of size).
+        Value::Shared(arc) => {
+            let idx = w.shared.len() as u32;
+            w.shared.push(arc.clone());
+            w.u8(TAG_SHARED);
+            w.u32(idx);
+        }
         // Non-sendable kinds are rejected by `check_sendable` before we get here.
         // Encode is total over sendable values; reaching this arm is a bug.
         other => unreachable!("encode reached non-sendable value: {:?}", other),
@@ -577,16 +606,29 @@ fn emit_ref(w: &mut Writer, id: u32) {
 /// (by name + cloned fields). `interp` is the destination isolate (its class table is
 /// consulted for instance reconstruction; for this task that is the same interp).
 pub fn decode(bytes: &[u8], interp: &Interp) -> Result<Value, SendError> {
+    decode_with_shared(bytes, &[], interp)
+}
+
+/// Deserialize a payload, resolving any `TAG_SHARED` index against the `shared`
+/// side-vector (SRV §3.7b). A frozen `Value::Shared` is reconstructed by an `Arc`
+/// clone from the side-vector — ZERO graph copy. Callers that carry no shared values
+/// pass `&[]` (the plain [`decode`] wrapper).
+pub fn decode_with_shared(
+    bytes: &[u8],
+    shared: &[std::sync::Arc<crate::value::SharedNode>],
+    interp: &Interp,
+) -> Result<Value, SendError> {
     let mut r = Reader::new(bytes);
     // Indexed by serial id: each container's reconstructed handle. Populated BEFORE
     // a container's contents are read, so forward `Ref`s resolve to the same handle.
     let mut table: Vec<Value> = Vec::new();
-    decode_value(&mut r, &mut table, interp)
+    decode_value(&mut r, &mut table, shared, interp)
 }
 
 fn decode_value(
     r: &mut Reader<'_>,
     table: &mut Vec<Value>,
+    shared: &[std::sync::Arc<crate::value::SharedNode>],
     interp: &Interp,
 ) -> Result<Value, SendError> {
     let tag = r.u8()?;
@@ -626,7 +668,7 @@ fn decode_value(
             // still errors on the first short read.
             let mut elems = Vec::with_capacity(len.min(r.remaining()));
             for _ in 0..len {
-                elems.push(decode_value(r, table, interp)?);
+                elems.push(decode_value(r, table, shared, interp)?);
             }
             *cell.borrow_mut() = elems;
             Ok(value)
@@ -639,7 +681,7 @@ fn decode_value(
             let len = r.u32()? as usize;
             for _ in 0..len {
                 let k = r.str()?;
-                let v = decode_value(r, table, interp)?;
+                let v = decode_value(r, table, shared, interp)?;
                 cell.borrow_mut().insert(k, v);
             }
             Ok(value)
@@ -651,8 +693,8 @@ fn decode_value(
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             for _ in 0..len {
-                let key_val = decode_value(r, table, interp)?;
-                let v = decode_value(r, table, interp)?;
+                let key_val = decode_value(r, table, shared, interp)?;
+                let v = decode_value(r, table, shared, interp)?;
                 // Reapply canonicalization on the far side (−0.0→+0.0, NaN unified).
                 let key = MapKey::from_value(&key_val).ok_or_else(|| SendError {
                     kind: "decode",
@@ -670,7 +712,7 @@ fn decode_value(
             register(table, id, value.clone())?;
             let len = r.u32()? as usize;
             for _ in 0..len {
-                let key_val = decode_value(r, table, interp)?;
+                let key_val = decode_value(r, table, shared, interp)?;
                 let key = MapKey::from_value(&key_val).ok_or_else(|| SendError {
                     kind: "decode",
                     path: "<set-elem>".to_string(),
@@ -683,7 +725,7 @@ fn decode_value(
         TAG_ENUM => {
             let enum_name = r.str()?;
             let name = r.str()?;
-            let backing = decode_value(r, table, interp)?;
+            let backing = decode_value(r, table, shared, interp)?;
             // ADT §6: the payload tag — 0 (unit), 1 (positional), 2 (named).
             let payload_tag = r.u8()?;
             match payload_tag {
@@ -713,7 +755,7 @@ fn decode_value(
                     // POSITIONAL payload: decode the Array (cycle-safe via the ref
                     // table) and rebuild a constructed variant. Compares STRUCTURALLY,
                     // so a fresh allocation is correct (no re-interning needed).
-                    let arr = decode_value(r, table, interp)?;
+                    let arr = decode_value(r, table, shared, interp)?;
                     let cell = match arr {
                         Value::Array(a) => a,
                         _ => {
@@ -737,7 +779,7 @@ fn decode_value(
                 }
                 2 => {
                     // NAMED payload: decode the Object and rebuild a constructed variant.
-                    let obj = decode_value(r, table, interp)?;
+                    let obj = decode_value(r, table, shared, interp)?;
                     let cell = match obj {
                         Value::Object(o) => o,
                         _ => {
@@ -796,7 +838,7 @@ fn decode_value(
             let len = r.u32()? as usize;
             for _ in 0..len {
                 let k = r.str()?;
-                let v = decode_value(r, table, interp)?;
+                let v = decode_value(r, table, shared, interp)?;
                 cell.borrow_mut().fields.insert(k, v);
             }
             Ok(value)
@@ -808,6 +850,18 @@ fn decode_value(
                 path: format!("<ref {id}>"),
                 hint: None,
             })
+        }
+        // SRV §3.7(b): reconstruct a frozen `Value::Shared` from the side-vector by
+        // index — another `Arc` clone (atomic bump), ZERO graph copy. A bounds-checked
+        // index guards a corrupt/mismatched payload.
+        TAG_SHARED => {
+            let idx = r.u32()? as usize;
+            let arc = shared.get(idx).cloned().ok_or_else(|| SendError {
+                kind: "decode",
+                path: format!("<shared {idx}>"),
+                hint: None,
+            })?;
+            Ok(Value::Shared(arc))
         }
         other => Err(SendError {
             kind: "decode",
@@ -916,7 +970,8 @@ mod tests {
 
     fn rt(v: &Value) -> Value {
         let interp = Interp::new();
-        decode(&encode(v).unwrap(), &interp).unwrap()
+        let (bytes, shared) = encode(v).unwrap();
+        decode_with_shared(&bytes, &shared, &interp).unwrap()
     }
 
     #[test]
@@ -1143,7 +1198,7 @@ mod tests {
         }));
         arr.borrow_mut().push(v.clone());
         // Encoding must terminate (cycle handled) and decode to a live cyclic value.
-        let bytes = encode(&v).expect("cyclic payload encodes");
+        let (bytes, _shared) = encode(&v).expect("cyclic payload encodes");
         let interp = Interp::new();
         let back = decode(&bytes, &interp).expect("cyclic payload decodes");
         // The decoded variant carries a positional payload whose first element is the
@@ -1285,7 +1340,7 @@ mod tests {
     #[test]
     fn decode_rejects_truncated_buffer() {
         // A valid array payload cut short mid-element.
-        let full = encode(&arr(vec![num(1.0), num(2.0), num(3.0)])).unwrap();
+        let (full, _shared) = encode(&arr(vec![num(1.0), num(2.0), num(3.0)])).unwrap();
         for cut in 1..full.len() {
             let interp = Interp::new();
             // Truncating anywhere inside must Err, never panic.
@@ -1333,5 +1388,78 @@ mod tests {
         let mut b3 = vec![TAG_STR];
         b3.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode(&b3, &Interp::new()).is_err());
+    }
+
+    // ---- SRV Task 6: the airlock zero-copy path (b) ----
+
+    fn shared_val() -> Value {
+        use crate::value::SharedNode;
+        use std::sync::Arc;
+        Value::Shared(Arc::new(SharedNode::Object(Arc::new(vec![
+            ("k".into(), Arc::new(SharedNode::Int(42))),
+        ]))))
+    }
+
+    #[test]
+    fn shared_is_a_sendable_leaf() {
+        // `unsendable_kind` says sendable; `check_inner` treats it as a LEAF (no
+        // recursion into the frozen graph).
+        let s = shared_val();
+        assert!(unsendable_kind(&s).is_none());
+        assert!(check_sendable(&s).is_ok());
+    }
+
+    #[test]
+    fn shared_round_trips_by_arc_bump_not_copy() {
+        let s = shared_val();
+        let arc_before = match &s {
+            Value::Shared(a) => a.clone(),
+            _ => unreachable!(),
+        };
+        // Encode: one TAG_SHARED + index; the side-vector holds the SAME Arc (no walk).
+        let (bytes, shared) = encode(&s).unwrap();
+        assert_eq!(shared.len(), 1, "exactly one Arc in the side-vector");
+        assert!(std::sync::Arc::ptr_eq(&shared[0], &arc_before), "Arc preserved (no copy)");
+        // The byte buffer is TINY (a tag + a u32) — NOT the size of the frozen graph.
+        assert_eq!(bytes.len(), 1 + 4, "TAG_SHARED + u32 index only");
+        // Decode (same-thread inline path): the OUTGOING Arc pointer is PRESERVED.
+        let interp = Interp::new();
+        let back = decode_with_shared(&bytes, &shared, &interp).unwrap();
+        match back {
+            Value::Shared(a) => assert!(
+                std::sync::Arc::ptr_eq(&a, &arc_before),
+                "inline path preserves Arc identity (zero copy)"
+            ),
+            _ => panic!("expected Shared"),
+        }
+    }
+
+    #[test]
+    fn shared_nested_in_object_crosses() {
+        // A Shared nested inside a normal sendable object round-trips correctly.
+        let mut m = IndexMap::new();
+        m.insert("cfg".to_string(), shared_val());
+        m.insert("n".to_string(), Value::Int(1));
+        let obj = Value::Object(ObjectCell::new(m));
+        let (bytes, shared) = encode(&obj).unwrap();
+        assert_eq!(shared.len(), 1);
+        let interp = Interp::new();
+        let back = decode_with_shared(&bytes, &shared, &interp).unwrap();
+        match back {
+            Value::Object(o) => {
+                let b = o.borrow();
+                assert!(matches!(b.get("cfg"), Some(Value::Shared(_))));
+                assert_eq!(b.get("n"), Some(&Value::Int(1)));
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn decode_shared_out_of_range_index_errors() {
+        // A TAG_SHARED with an index past the (empty) side-vector → clean Err, no panic.
+        let mut b = vec![TAG_SHARED];
+        b.extend_from_slice(&0u32.to_le_bytes());
+        assert!(decode_with_shared(&b, &[], &Interp::new()).is_err());
     }
 }
