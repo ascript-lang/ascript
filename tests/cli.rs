@@ -2754,3 +2754,123 @@ fn worker_generator_fn_streams_on_both_engines() {
     );
     assert_eq!(out_tw, "10\n20\n30\n", "tree-walker streamed sequence");
 }
+
+// ─────────────────────────── FFI capability CLI flags ────────────────────────
+// FFI §4.2/§4.5: `--deny`/`--sandbox` opt-out flags, the `[capabilities]` manifest
+// table, and their composition. Hermetic (no network — the denied call is caught
+// by `recover`, and ambient `os.platform()` is asserted to still work).
+
+fn run_with_args(src: &str, name: &str, extra: &[&str]) -> (bool, String, String) {
+    let file = std::env::temp_dir().join(name);
+    std::fs::write(&file, src).unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    let mut cmd = Command::new(bin);
+    cmd.arg("run");
+    for a in extra {
+        cmd.arg(a);
+    }
+    cmd.arg(&file);
+    let output = cmd.output().unwrap();
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[cfg(feature = "sys")] // program imports std/env; only valid with the sys feature.
+#[test]
+fn deny_flag_denies_env_capability_recoverably() {
+    // `--deny env` → env.get raises `capability 'env' denied`, caught by recover.
+    let src = "import * as env from \"std/env\"\n\
+               let r = recover(() => env.get(\"PATH\"))\n\
+               print(r[0])\n\
+               print(r[1].message)\n";
+    let (ok, out, err) = run_with_args(src, "caps_deny_env.as", &["--deny", "env"]);
+    assert!(ok, "program should run (denial is recoverable); stderr: {err}");
+    assert_eq!(out, "nil\ncapability 'env' denied\n");
+}
+
+#[test]
+fn deny_flag_comma_list_denies_multiple() {
+    // `--deny ffi,process` denies both; `caps.has` reflects it.
+    let src = "import * as caps from \"std/caps\"\n\
+               print(caps.has(\"ffi\"))\n\
+               print(caps.has(\"process\"))\n\
+               print(caps.has(\"net\"))\n";
+    let (ok, out, err) = run_with_args(src, "caps_deny_multi.as", &["--deny", "ffi,process"]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(out, "false\nfalse\ntrue\n");
+}
+
+#[cfg(feature = "sys")] // program imports std/os; only valid with the sys feature.
+#[test]
+fn sandbox_flag_denies_all_but_keeps_ambient_os() {
+    // `--sandbox` denies all five, but ambient os introspection still works.
+    let src = "import * as caps from \"std/caps\"\n\
+               import * as os from \"std/os\"\n\
+               print(caps.list())\n\
+               print(type(os.platform()))\n";
+    let (ok, out, err) = run_with_args(src, "caps_sandbox.as", &["--sandbox"]);
+    assert!(ok, "stderr: {err}");
+    // Every dangerous cap denied → empty list; os.platform (ambient) still works.
+    assert_eq!(out, "[]\nstring\n");
+}
+
+#[test]
+fn unknown_deny_cap_is_clean_cli_error() {
+    // A bogus cap name to `--deny` is a clean error (non-zero exit, no panic).
+    let src = "print(1)\n";
+    let (ok, _out, err) = run_with_args(src, "caps_bad.as", &["--deny", "bogus"]);
+    assert!(!ok, "unknown cap should fail the CLI");
+    assert!(
+        err.contains("unknown capability") && err.contains("bogus"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn no_deny_flags_is_byte_identical_default() {
+    // No flags → all granted → existing behavior unchanged.
+    let src = "import * as caps from \"std/caps\"\nprint(caps.list())\n";
+    let (ok, out, err) = run_with_args(src, "caps_default.as", &[]);
+    assert!(ok, "stderr: {err}");
+    assert_eq!(out, "[\"fs\", \"net\", \"process\", \"ffi\", \"env\"]\n");
+}
+
+// Manifest [capabilities] composition only happens under the `pkg` feature
+// (manifest loading is pkg-side). Caps deny is core, but the manifest floor isn't.
+#[cfg(feature = "pkg")]
+#[test]
+fn manifest_capabilities_table_denies_and_composes_with_cli() {
+    // A project dir with an [capabilities] manifest denying ffi; the CLI adds env.
+    let dir = std::env::temp_dir().join("ascript_caps_manifest_test");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("ascript.toml"),
+        "[capabilities]\ndeny = [\"ffi\"]\n",
+    )
+    .unwrap();
+    let prog = dir.join("app.as");
+    std::fs::write(
+        &prog,
+        "import * as caps from \"std/caps\"\n\
+         print(caps.has(\"ffi\"))\n\
+         print(caps.has(\"env\"))\n\
+         print(caps.has(\"net\"))\n",
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_ascript");
+    // Manifest denies ffi; CLI denies env; union → both gone, net remains.
+    let output = Command::new(bin)
+        .arg("run")
+        .arg("--deny")
+        .arg("env")
+        .arg(&prog)
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(out, "false\nfalse\ntrue\n", "manifest+CLI denials union");
+    std::fs::remove_dir_all(&dir).ok();
+}
