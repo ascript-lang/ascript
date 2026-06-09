@@ -5460,6 +5460,49 @@ async fn assert_three_way_matches(src: &str) {
 }
 
 #[tokio::test]
+async fn srv_shared_freeze_reads_and_mutation_panic_three_way() {
+    // SRV §5 (the data half): `shared.freeze` + reads + the mutation panic are pure
+    // Value-layer logic shared by both engines, so they MUST be byte-identical across
+    // tree-walker == specialized VM == generic VM.
+    // Reads: scalar / descend (Shared view) / index / read-only method / iterate / len.
+    assert_three_way_matches(
+        "import { freeze } from \"std/shared\"\n\
+         let cfg = freeze({ region: \"us\", flags: { beta: true }, limits: [10, 100] })\n\
+         print(cfg.region)\n\
+         print(cfg.flags.beta)\n\
+         print(cfg.limits[0])\n\
+         print(cfg[\"region\"])\n\
+         print(len(cfg.limits))\n\
+         print(cfg.has(\"region\"))\n\
+         print(cfg.get(\"missing\", \"dflt\"))\n\
+         print(type(cfg.flags))\n\
+         let s = 0\n\
+         for (l of cfg.limits) { s = s + l }\n\
+         print(s)\n\
+         print(cfg.missing)\n",
+    )
+    .await;
+    // Idempotence: freeze(freeze(x)) is the SAME Arc → `==` is true.
+    assert_three_way_matches(
+        "import { freeze } from \"std/shared\"\n\
+         let c = freeze({ x: 1 })\n\
+         print(freeze(c) == c)\n",
+    )
+    .await;
+    // Mutation panics (order-deterministic), caught by recover — the SHIPPED
+    // `cannot mutate a frozen {kind}` wording, byte-identical on all three modes.
+    assert_three_way_matches(
+        "import { freeze } from \"std/shared\"\n\
+         let cfg = freeze({ region: \"us\", limits: [10, 100] })\n\
+         print(recover(() => { cfg.region = \"eu\" })[1])\n\
+         print(recover(() => { cfg[\"region\"] = \"eu\" })[1])\n\
+         print(recover(() => { cfg.limits[0] = 5 })[1])\n\
+         print(recover(() => cfg.limits.push(3))[1])\n",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn three_way_whole_corpus_generic_equals_specialized_equals_treewalker() {
     // THE central safety net over the WHOLE corpus (same non-skipped set as oracle
     // #1). For every non-skipped example, all three engines must agree byte-for-byte.

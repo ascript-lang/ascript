@@ -6252,6 +6252,21 @@ impl Interp {
                     .insert(name.to_string(), value.clone());
                 Ok(value)
             }
+            // SRV §3.8: a member-assign to a frozen `Shared` is the shipped
+            // `cannot mutate a frozen {kind}` panic (reusing `frozen_kind` via
+            // `check_not_frozen`, NOT a bespoke string) — byte-identical to the VM
+            // `store_property` guard. (`check_not_frozen` always errors here since a
+            // Shared object/array reports a frozen kind.)
+            Value::Shared(_) => {
+                check_not_frozen(obj, value_span)?;
+                // A Shared scalar reports no frozen kind → fall through to the
+                // generic "cannot set property" (a scalar was never assignable).
+                Err(AsError::at(
+                    format!("cannot set property '{}' on this value", name),
+                    obj_span,
+                )
+                .into())
+            }
             _ => Err(AsError::at(
                 format!("cannot set property '{}' on this value", name),
                 obj_span,
