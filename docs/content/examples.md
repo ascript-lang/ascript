@@ -68,6 +68,8 @@ Short, single-concept programs in `examples/`:
 | `stdlib.as` | stdlib sampler: string, array, object, map, math, convert |
 | `stdlib_completeness.as` | exercices a broad cross-section of stdlib APIs for regression coverage |
 | `deep_recursion.as` | SP9 robust recursion — heap-backed stack growth under deep native re-entry |
+| `ffi_libm.as` | `std/ffi` — call `pow`/`sqrt`/`cos` from the platform's libm across the C ABI |
+| `caps_sandbox.as` | `std/caps` — sandbox a plugin in a capability-restricted `run_in_worker({caps})` isolate |
 | `all_features.as` | deterministic showcase exercising most of the language in one file |
 
 ## Advanced examples
@@ -100,6 +102,7 @@ These run on their own with no external services:
 | `typed_api.as` | schema-validated HTTP API server — `std/schema` request/response contracts |
 | `typed_http.as` | `resp.json(Class)` — fused HTTP decode + shape validation in one Tier-1 pair |
 | `workflow_signup.as` | durable execution via `std/workflow` — event-sourced replay, activities, `ctx.sleep` |
+| `ffi_struct.as` | `std/ffi` — C structs over `Bytes` (layout/offset/alignment) + a real `memset` out-param round-trip |
 | `telemetry.as` | `std/telemetry` — OTLP / Sentry / PostHog observability (opt-in `telemetry` feature) |
 | `ai_chat.as` | `std/ai` multi-provider LLM chat (opt-in `ai` feature; exits cleanly without a key) |
 | `ai_tools.as` | `std/ai` tool calling and structured output (opt-in `ai` feature) |
