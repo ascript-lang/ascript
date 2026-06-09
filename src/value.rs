@@ -640,6 +640,71 @@ impl NativeKind {
             NativeKind::WorkerActor => "workerActor",
         }
     }
+
+    /// FFI §4 (BLOCKER 3): the capability that governs OPERATING an already-open
+    /// handle of this kind, or `None` for a pure in-memory native that touches no OS
+    /// resource. Consulted at the top of `Interp::call_native_method` so that
+    /// dropping a capability HOLDS for handles opened before the drop (e.g.
+    /// `socket.read()` / `listener.accept()` are denied after `caps.drop("net")`).
+    ///
+    /// - `Net`: every networking handle (TCP, UDP, HTTP body/server/response/SSE,
+    ///   WebSocket, HTTP cancel/next) plus the network DB connections (postgres/redis).
+    /// - `Process`: a child process and its stdio reader/writer.
+    /// - `Fs`: a sqlite connection/statement (an open DB FILE handle).
+    /// - `None`: pure in-memory natives (channel, semaphore, timers, rate limiter,
+    ///   stream, lru, events, telemetry, ai-config, worker actor, terminal) — they
+    ///   acquire no OS effect at method time, so gating them would over-deny.
+    pub fn governing_cap(self) -> Option<crate::stdlib::caps::Cap> {
+        use crate::stdlib::caps::Cap;
+        match self {
+            // Networking handles — operating them is live network I/O.
+            NativeKind::TcpListener
+            | NativeKind::TcpStream
+            | NativeKind::HttpResponse
+            | NativeKind::HttpBody
+            | NativeKind::SseStream
+            | NativeKind::HttpServer
+            | NativeKind::WsConnection
+            | NativeKind::WsListener
+            | NativeKind::UdpSocket => Some(Cap::Net),
+            NativeKind::PostgresConnection | NativeKind::RedisConnection => Some(Cap::Net),
+            // A cancel token (`http.cancelToken()`) is a pure in-memory `Notify` —
+            // cancelling acquires no network, so gating it would over-deny a cleanup
+            // (you typically cancel an in-flight request even after dropping `net`).
+            // The HTTP-next middleware advancer drives already-accepted server work;
+            // the accept itself (HttpServer) is gated. Both stay ungated to avoid
+            // over-deny on the default path's request-lifecycle handles.
+            NativeKind::CancelHandle | NativeKind::HttpNext => None,
+            // A child process + its stdio: operating them is subprocess control.
+            NativeKind::ChildProcess | NativeKind::Reader | NativeKind::Writer => {
+                Some(Cap::Process)
+            }
+            // An open DB file handle (sqlite): operating it is filesystem I/O.
+            NativeKind::SqliteConnection | NativeKind::SqliteStatement => Some(Cap::Fs),
+            // Pure in-memory natives — no OS effect at method time → ungated.
+            NativeKind::Terminal
+            | NativeKind::Channel
+            | NativeKind::Semaphore
+            | NativeKind::Interval
+            | NativeKind::DebounceWrapper
+            | NativeKind::ThrottleWrapper
+            | NativeKind::RateLimiter
+            | NativeKind::Stream
+            | NativeKind::Lru
+            | NativeKind::Events
+            | NativeKind::WorkerActor => None,
+            #[cfg(feature = "telemetry")]
+            NativeKind::TelemetrySpan
+            | NativeKind::TelemetryInstrument
+            | NativeKind::TelemetryNoop => None,
+            #[cfg(feature = "ai")]
+            NativeKind::AiProvider
+            | NativeKind::AiModel
+            | NativeKind::AiStream
+            | NativeKind::AiTextStream
+            | NativeKind::AiTool => None,
+        }
+    }
 }
 
 /// A method bound to a native handle (e.g. `child.wait`), dispatched async.

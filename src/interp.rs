@@ -4551,6 +4551,19 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Control> {
         let _ = &args;
+        // FFI §4 (BLOCKER 3): re-check the capability governing this handle BEFORE
+        // operating it, so a `caps.drop` HOLDS for handles opened before the drop
+        // (e.g. `socket.read()`/`listener.accept()` denied after `drop("net")`).
+        // Gate-12: a single `Copy` bitset compare on the default all-granted path —
+        // zero per-op cost, byte-identical. The denial uses the same recoverable
+        // Tier-2 panic the central gate raises (naming the capability). A handle whose
+        // kind maps to NO cap (a pure in-memory native) stays ungated.
+        let cap_bits = self.caps_bits(); // Copy snapshot — no borrow across the awaits below.
+        if !cap_bits.all_granted() {
+            if let Some(cap) = m.receiver.kind.governing_cap() {
+                self.require_cap(cap, m.receiver.kind.type_name(), &m.method, &args, span)?;
+            }
+        }
         #[cfg(feature = "sql")]
         {
             use crate::value::NativeKind::*;
@@ -7682,6 +7695,90 @@ mod tests {
                     Err(Control::Panic(e)) => denied(&e.message, "0.0.0.0"),
                     other => panic!("expected server bind net denial, got {other:?}"),
                 }
+            })
+            .await;
+    }
+
+    /// BLOCKER 3: operating an ALREADY-OPEN native handle must re-check the governing
+    /// capability — `call_native_method` had ZERO cap checks, so a socket opened while
+    /// `net` was granted kept working (and `accept()` even acquired NEW connections)
+    /// after `caps.drop("net")`. Here: open a TCP listener (net granted), drop net,
+    /// then `accept()` must be denied — "the drop holds".
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn open_handle_rechecks_dropped_cap() {
+        use crate::stdlib::caps::{Cap, CapSet};
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Open a listener while net is granted (hermetic loopback bind).
+                let pair = interp
+                    .call_stdlib(
+                        "net_tcp",
+                        "listen",
+                        &[Value::Str("127.0.0.1".into()), Value::Int(0)],
+                        Span::new(0, 0),
+                    )
+                    .await
+                    .unwrap();
+                let listener = if let Value::Array(a) = &pair {
+                    assert_eq!(a.borrow()[1], Value::Nil, "listen should succeed");
+                    a.borrow()[0].clone()
+                } else {
+                    panic!("listen should return a pair");
+                };
+                // Drop net AFTER the handle is open.
+                let mut cs = CapSet::all_granted();
+                cs.deny(Cap::Net);
+                interp.set_caps(cs);
+                // accept() on the open listener must now be denied — the per-handle
+                // re-check fires before any new connection is acquired.
+                let m = std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: match &listener {
+                        Value::Native(n) => n.clone(),
+                        _ => panic!("expected a native listener"),
+                    },
+                    method: "accept".into(),
+                });
+                match interp.call_native_method(m, vec![], Span::new(0, 0)).await {
+                    Err(Control::Panic(e)) => assert_eq!(e.message, "capability 'net' denied"),
+                    other => panic!("expected net denial on accept after drop, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// BLOCKER 3: a handle whose `NativeKind` maps to NO capability (a pure in-memory
+    /// native — e.g. an `events` emitter) stays UNGATED even after every cap is
+    /// dropped, so dropping caps never breaks pure-compute handles (no over-deny).
+    #[tokio::test]
+    async fn ungated_handle_unaffected_by_drops() {
+        let interp = std::rc::Rc::new(Interp::new());
+        interp.install_self();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // An events emitter is an in-memory handle (no OS resource).
+                let emitter = interp
+                    .call_stdlib("events", "new", &[], Span::new(0, 0))
+                    .await
+                    .unwrap();
+                // Drop ALL caps.
+                interp.caps_deny_all();
+                // listenerCount() still works — the handle has no governing cap.
+                let m = std::rc::Rc::new(crate::value::NativeMethod {
+                    receiver: match &emitter {
+                        Value::Native(n) => n.clone(),
+                        _ => panic!("expected a native emitter"),
+                    },
+                    method: "listenerCount".into(),
+                });
+                let r = interp
+                    .call_native_method(m, vec![Value::Str("x".into())], Span::new(0, 0))
+                    .await;
+                assert!(r.is_ok(), "ungated handle must stay usable after dropAll: {r:?}");
             })
             .await;
     }
