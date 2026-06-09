@@ -12,6 +12,148 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// VAL Stage 3 / Task 9 — a **thin** (single-word) interned string handle.
+///
+/// `Value::Str(Rc<str>)` was a *fat* pointer (data ptr + length = 16-byte payload),
+/// the widest variant, which — together with the inline scalar variants blocking
+/// niche-elision — pinned `size_of::<Value>()` at 24 (`round_up(16) + 8` tag). The
+/// only safe way to a single-word string payload is a **thin `Rc` to an inner owner
+/// that itself stores its own length on the heap**: `Rc<Box<str>>` is 8 bytes (the
+/// `Rc` is thin because `Box<str>` is `Sized`, and the `Box<str>` carries the length
+/// inside the allocation). With `Str` thinned to 8 bytes the enum drops to
+/// `round_up(8) + 8 = 16` — the VAL Stage-3 floor.
+///
+/// **NO new ownership `unsafe`** (the explicit selling point of this fallback path —
+/// the Stage-2 NaN-box was deferred for needing `Cc::into_raw`/`from_raw`). Clone is a
+/// pure `Rc` strong-count bump (the `Box<str>` is shared, never re-allocated). Reads
+/// `Deref` to `&str` through the two indirections (`Value → Rc → Box<str> → bytes`);
+/// the double-indirect access is the documented tradeoff of the safe thin form.
+///
+/// This newtype encapsulates the `Rc<Box<str>>` encoding so the rest of the tree never
+/// names it: `AStr` is byte-for-byte interchangeable with the old `Rc<str>` payload for
+/// Display / Debug / equality / hashing / ordering / `Borrow<str>`, and constructs from
+/// the SAME `.into()` sources (`&str`, `String`, `Rc<str>`). `Value::trace`'s `Str` arm
+/// stays a no-op (strings are acyclic, not GC-traced). `!Send`/`!Sync` is preserved
+/// (`Rc` is neither), upholding `assert_not_impl_any!(Value: Send, Sync)`.
+#[derive(Clone)]
+pub struct AStr(Rc<Box<str>>);
+
+impl AStr {
+    /// Borrow the logical UTF-8 contents. The decode-first accessor: every read of a
+    /// string value goes through here (or `Deref`), so an inline-built and a
+    /// heap-built `"hi"` are indistinguishable.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for AStr {
+    type Target = str;
+    #[inline]
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for AStr {
+    #[inline]
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for AStr {
+    #[inline]
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for AStr {
+    #[inline]
+    fn from(s: &str) -> Self {
+        AStr(Rc::new(Box::from(s)))
+    }
+}
+
+impl From<String> for AStr {
+    #[inline]
+    fn from(s: String) -> Self {
+        AStr(Rc::new(s.into_boxed_str()))
+    }
+}
+
+impl From<Box<str>> for AStr {
+    #[inline]
+    fn from(s: Box<str>) -> Self {
+        AStr(Rc::new(s))
+    }
+}
+
+impl From<Rc<str>> for AStr {
+    #[inline]
+    fn from(s: Rc<str>) -> Self {
+        AStr(Rc::new(Box::from(&*s)))
+    }
+}
+
+impl From<&String> for AStr {
+    #[inline]
+    fn from(s: &String) -> Self {
+        AStr(Rc::new(Box::from(s.as_str())))
+    }
+}
+
+impl PartialEq for AStr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl Eq for AStr {}
+
+impl PartialEq<str> for AStr {
+    #[inline]
+    fn eq(&self, other: &str) -> bool {
+        &**self == other
+    }
+}
+
+impl std::hash::Hash for AStr {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+impl PartialOrd for AStr {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for AStr {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl fmt::Display for AStr {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", &**self)
+    }
+}
+
+impl fmt::Debug for AStr {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", &**self)
+    }
+}
+
 /// The heap payload behind `Value::Object`. Wraps the insertion-ordered key→value
 /// map together with a `shape` id (V11-T2 hidden classes). The `shape` identifies
 /// the object's key-LAYOUT in the VM's per-VM `ShapeRegistry`; V11-T3 inline caches
@@ -193,7 +335,11 @@ pub enum MapKey {
     /// FOLDS into this variant so `Int(1)` and `Float(1.0)` are the SAME key.
     Int(i64),
     Num(u64), // canonicalized f64 bits (−0.0→+0.0, all NaNs→one canonical NaN)
-    Str(Rc<str>),
+    // VAL Task 9: shares the thin `AStr` (`Rc<Box<str>>`) encoding with `Value::Str`
+    // so the `Value::Str(s) ↔ MapKey::Str(s.clone())` round-trip stays a single `Rc`
+    // bump (never a re-allocation). `MapKey` width does not gate `Value`'s 16-byte
+    // floor, but the shared type keeps the fold cheap and the codebase consistent.
+    Str(AStr),
     /// Exact decimal key. Distinct from `Num`/`Int` — `Decimal("0.1")` ≠ `Num(0.1f64)`,
     /// `Decimal("1")` ≠ `Int(1)` (Decimal is exact and opt-in; never folded).
     Decimal(Decimal),
@@ -936,7 +1082,7 @@ impl SharedKey {
             SharedKey::Bool(b) => MapKey::Bool(*b),
             SharedKey::Int(i) => MapKey::Int(*i),
             SharedKey::Num(bits) => MapKey::Num(*bits),
-            SharedKey::Str(s) => MapKey::Str(Rc::from(&**s)),
+            SharedKey::Str(s) => MapKey::Str(AStr::from(&**s)),
             SharedKey::Decimal(d) => MapKey::Decimal(*d),
         }
     }
@@ -1116,9 +1262,19 @@ pub enum Value {
     /// Map-key fold). (The enum reaches 16 only once `Str` is ALSO thinned —
     /// Stage 3 / Task 9; see `value_size_is_documented`.)
     Decimal(Rc<Decimal>),
-    Str(Rc<str>),
+    /// VAL Stage 3 / Task 9: the payload is now the THIN `AStr` (`Rc<Box<str>>`, a
+    /// single word) instead of the fat `Rc<str>` (data ptr + length). Thinning the
+    /// widest payload drops `size_of::<Value>()` from 24 to the 16-byte floor. The
+    /// change is INVISIBLE: `AStr` decodes to `&str` (Display/Debug/eq/hash/ordering/
+    /// `Borrow<str>`) byte-identically to the old `Rc<str>`, constructs from the same
+    /// `.into()` sources, and traces as a no-op (strings are acyclic).
+    Str(AStr),
     /// A native built-in function, dispatched by name in the interpreter.
-    Builtin(Rc<str>),
+    ///
+    /// VAL Task 9: also thinned to `AStr` — a remaining fat `Rc<str>` variant would
+    /// itself pin the enum at 24 (the floor is set by the WIDEST payload), so every
+    /// `Rc<str>`-carrying `Value` variant must be thinned to reach 16.
+    Builtin(AStr),
     /// A user-defined function carrying its closure environment.
     Function(Rc<Function>),
     /// A bytecode-VM closure: a function prototype plus its captured upvalue
@@ -1755,16 +1911,118 @@ mod tests {
         // (a hand-tagged machine word, not a Rust enum), which is a separate, gated
         // stage.
         //
+        // VAL Task 9 (thin-`Str`): `Value::Str` and `Value::Builtin` — the two
+        // `Rc<str>`-carrying variants — are now the **thin** `AStr` (`Rc<Box<str>>`,
+        // a single 8-byte word; the `Box<str>` holds its own length INSIDE the
+        // allocation, so the `Rc` is a thin pointer). Both had to be thinned: the
+        // enum floor is set by the WIDEST payload, so a single remaining fat
+        // `Rc<str>` (16 bytes) would have re-pinned it at 24. With the widest
+        // payload now 8 bytes and `Decimal` already boxed (Task 2), the layout is
+        // `round_up(8) + 8-byte tag` = **16** — the VAL Stage-3 floor reachable
+        // WITHOUT any new ownership `unsafe` (the deferred NaN-box's selling point).
+        // The encoding is INVISIBLE: `AStr` decodes to `&str` byte-identically for
+        // Display/Debug/eq/hash/ordering and round-trips the same `.into()` sources.
+        //
         // Size progression: 32 → 24 [Task 1: fat method bindings boxed] → 24
-        // [Task 2: Decimal boxed, now fat-`Str`-limited] → 16 [thin-`Str`] → 8
-        // [NaN-box, gated].
-        assert_eq!(std::mem::size_of::<Value>(), 24);
+        // [Task 2: Decimal boxed, now fat-`Str`-limited] → **16** [Task 9: thin-`Str`
+        // + thin-`Builtin`] → 8 [NaN-box, DEFERRED — needs `Cc::into_raw`].
+        assert_eq!(std::mem::size_of::<Value>(), 16);
     }
 
     #[test]
     #[ignore]
     fn value_size_print() {
         eprintln!("size_of::<Value>() = {}", std::mem::size_of::<Value>());
+    }
+
+    // VAL Task 9 — property: the thin `AStr` (`Rc<Box<str>>`) is INDISTINGUISHABLE
+    // from the old fat `Rc<str>` payload at every observable seam. Two `"hi"` strings
+    // built from DIFFERENT sources (a short `&str` literal vs a heap `String` vs an
+    // `Rc<str>`) must be byte-identical for Display, Debug, equality, hash,
+    // ordering, the `MapKey::Str` fold (key + recovered value), and JSON-shaped
+    // iteration over the bytes. If any of these diverged, the encoding would leak.
+    #[test]
+    fn thin_str_indistinguishable_from_fat() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let from_lit: AStr = "hi".into();
+        let from_string: AStr = String::from("hi").into();
+        let rc: Rc<str> = Rc::from("hi");
+        let from_rc: AStr = rc.into();
+        let cloned = from_lit.clone(); // a pure Rc bump
+
+        let all = [&from_lit, &from_string, &from_rc, &cloned];
+
+        // Display + Debug + decoded bytes are identical regardless of source.
+        for a in all {
+            assert_eq!(format!("{a}"), "hi");
+            assert_eq!(format!("{a:?}"), "\"hi\"");
+            assert_eq!(a.as_str(), "hi");
+            assert_eq!(a.as_bytes(), b"hi");
+            assert_eq!(&**a, "hi");
+        }
+
+        // Equality across every pair (and against `str`).
+        for a in all {
+            for b in all {
+                assert_eq!(a, b);
+            }
+            assert!(*a == *"hi");
+        }
+        // Inequality is by CONTENT, not pointer.
+        let other: AStr = "ho".into();
+        assert_ne!(from_lit, other);
+
+        // Hash equality (content-hash, not pointer-hash).
+        let h = |a: &AStr| {
+            let mut s = DefaultHasher::new();
+            a.hash(&mut s);
+            s.finish()
+        };
+        let h0 = h(&from_lit);
+        for a in all {
+            assert_eq!(h(a), h0);
+        }
+
+        // Ordering is lexicographic over the bytes.
+        assert!(from_lit < other);
+        assert_eq!(from_lit.cmp(&from_string), std::cmp::Ordering::Equal);
+
+        // Value-level: `Value::Str` equality / Display / truthiness / type_name all
+        // agree across sources, and the `MapKey::Str` fold round-trips the SAME key.
+        let v_lit = Value::Str(from_lit.clone());
+        let v_str = Value::Str(from_string.clone());
+        let v_rc = Value::Str(from_rc.clone());
+        assert_eq!(v_lit, v_str);
+        assert_eq!(v_lit, v_rc);
+        assert_eq!(v_lit.to_string(), "hi");
+        assert!(v_lit.is_truthy());
+        assert_eq!(
+            crate::interp::type_name(&v_lit),
+            crate::interp::type_name(&v_rc)
+        );
+
+        let k_lit = MapKey::from_value(&v_lit).unwrap();
+        let k_rc = MapKey::from_value(&v_rc).unwrap();
+        assert!(k_lit == k_rc);
+        assert_eq!(hk(&k_lit), hk(&k_rc));
+        // The recovered value is content-equal to the original.
+        assert_eq!(k_lit.to_value(), v_lit);
+
+        // `Value::Builtin` is also the thin `AStr` — same-content builtins are equal.
+        assert_eq!(
+            Value::Builtin("print".into()),
+            Value::Builtin(String::from("print").into())
+        );
+    }
+
+    fn hk(k: &MapKey) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut s = DefaultHasher::new();
+        k.hash(&mut s);
+        s.finish()
     }
 
     // VAL Task 0 — accessor round-trip: the thin, zero-cost constructor/extractor

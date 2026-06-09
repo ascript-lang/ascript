@@ -411,7 +411,7 @@ mod tests {
     #[test]
     fn disasm_string_const_is_quoted() {
         let mut c = Chunk::new();
-        let i = c.add_const(Value::Str(Rc::from("hi")));
+        let i = c.add_const(Value::Str(crate::value::AStr::from("hi")));
         c.emit_u16(Op::GetGlobal, i, s());
         let text = disasm(&c);
         let line = text.lines().find(|l| l.contains("GET_GLOBAL")).unwrap();

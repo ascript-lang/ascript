@@ -825,8 +825,8 @@ mod tests {
         let b = c.add_const(Value::Float(1.0));
         assert_eq!(a, b, "equal numbers dedup to the same slot");
 
-        let s1 = c.add_const(Value::Str(Rc::from("hi")));
-        let s2 = c.add_const(Value::Str(Rc::from("hi")));
+        let s1 = c.add_const(Value::Str(crate::value::AStr::from("hi")));
+        let s2 = c.add_const(Value::Str(crate::value::AStr::from("hi")));
         assert_eq!(s1, s2, "equal strings dedup");
 
         let n = c.add_const(Value::Float(2.0));

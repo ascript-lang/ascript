@@ -1149,7 +1149,7 @@ impl Compiler {
             // actually evaluated (so an unreferenced free name in dead code is not a
             // compile error, matching the tree-walker's deferred semantics).
             Some(Resolution::Global(name)) => {
-                let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetGlobal, idx, span);
                 Ok(())
             }
@@ -1290,7 +1290,7 @@ impl Compiler {
                     Some(Resolution::Global(name)) => {
                         // SET_GLOBAL anchors any error (immutable / undefined) at the
                         // TARGET's span, matching the tree-walker's `target.span`.
-                        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                        let idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                         self.chunk
                             .emit_u16(Op::SetGlobal, idx, node_code_span(name_ref));
                     }
@@ -1819,7 +1819,7 @@ impl Compiler {
                     // case): read it via `GET_GLOBAL`, late-bound exactly like the
                     // tree-walker's `env.get(sup_name)`. (A non-class value here is
                     // caught by `Op::Class` at run time.)
-                    let idx = self.chunk.add_const(Value::Str(Rc::from(gname.as_str())));
+                    let idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(gname.as_str())));
                     self.chunk.emit_u16(Op::GetGlobal, idx, sup_span);
                 }
                 Some(Resolution::Unresolved) | None => {
@@ -2412,11 +2412,11 @@ impl Compiler {
             match slot {
                 Some(slot) => self.emit_get_local(slot, span),
                 None => {
-                    let gidx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    let gidx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                     self.chunk.emit_u16(Op::GetGlobal, gidx, span);
                 }
             }
-            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
             self.chunk.emit_u16(Op::DefineExport, name_idx, span);
         }
         Ok(())
@@ -3509,7 +3509,7 @@ impl Compiler {
             .ident_token()
             .map(|t| t.text().to_string())
             .unwrap_or_default();
-        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        let idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
         self.chunk
             .emit_u16(Op::ImmutableError, idx, node_code_span(name_ref));
     }
@@ -3519,7 +3519,7 @@ impl Compiler {
     /// `SET_GLOBAL` reject a cross-chunk reassignment of an immutable global.
     fn emit_define_global(&mut self, name: &str, span: Span) {
         let mutable = self.global_mutable(name);
-        let idx = self.chunk.add_const(Value::Str(Rc::from(name)));
+        let idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name)));
         self.chunk
             .emit_u16_u8(Op::DefineGlobal, idx, u8::from(mutable), span);
     }
@@ -3671,8 +3671,8 @@ impl Compiler {
                     let key = bind_entry_key(entry).ok_or_else(|| {
                         CompileError::new("destructuring entry has no key", espan)
                     })?;
-                    let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
-                    bound_keys.push(Value::Str(Rc::from(key.as_str())));
+                    let key_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(key.as_str())));
+                    bound_keys.push(Value::Str(crate::value::AStr::from(key.as_str())));
                     self.chunk.emit_u16(Op::GetLocal, temp, span);
                     self.chunk.emit_u16(Op::ObjectKey, key_idx, span);
                     self.emit_pattern_store(entry, espan)?;
@@ -4043,8 +4043,8 @@ impl Compiler {
             let key = bind_entry_key(entry).ok_or_else(|| {
                 CompileError::new("object pattern entry has no key", range_span(entry))
             })?;
-            bound_keys.push(Value::Str(Rc::from(key.as_str())));
-            let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+            bound_keys.push(Value::Str(crate::value::AStr::from(key.as_str())));
+            let key_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(key.as_str())));
 
             // Presence test: `MATCH_HAS_KEY key` (pops the subject, pushes bool).
             self.emit_get_local_temp(subj_temp, span);
@@ -4118,9 +4118,9 @@ impl Compiler {
         };
         // Tag-test const: `[variantName, enumNameOrNil]`.
         let tag = Value::Array(crate::value::ArrayCell::new(vec![
-            Value::Str(Rc::from(variant.as_str())),
+            Value::Str(crate::value::AStr::from(variant.as_str())),
             match &enum_name {
-                Some(e) => Value::Str(Rc::from(e.as_str())),
+                Some(e) => Value::Str(crate::value::AStr::from(e.as_str())),
                 None => Value::Nil,
             },
         ]));
@@ -4145,7 +4145,7 @@ impl Compiler {
                     .ok_or_else(|| {
                         CompileError::new("variant field entry has no name", range_span(entry))
                     })?;
-                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                let key_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(key.as_str())));
                 // Presence test.
                 self.emit_get_local_temp(subj_temp, span);
                 self.chunk.emit_u16(Op::MatchVariantHasField, key_idx, span);
@@ -4219,7 +4219,7 @@ impl Compiler {
             // `GET_GLOBAL` (builtin value, or the byte-identical `undefined variable`
             // panic at evaluation), mirroring `compile_name_ref`'s `uses` arm.
             Resolution::Global(name) => {
-                let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetGlobal, idx, span);
                 Ok(())
             }
@@ -4374,7 +4374,7 @@ impl Compiler {
                 let obj_span = node_code_span(&object);
                 self.compile_chain(&object, sink)?;
                 self.emit_chain_nil_guard(sink, obj_span);
-                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
                 Ok(())
             }
@@ -4410,7 +4410,7 @@ impl Compiler {
                 // variant constructor) then `CALL_NAMED`, mirroring the plain
                 // `compile_call` named path.
                 if self.arg_list_has_named(call) {
-                    let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                     self.chunk.emit_u16(Op::GetProp, name_idx, span);
                     return self.compile_named_call(call, span);
                 }
@@ -4462,7 +4462,7 @@ impl Compiler {
                     .to_string();
                 let obj_span = node_code_span(&object);
                 self.compile_chain(&object, sink)?;
-                let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                 self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
                 Ok(())
             }
@@ -4512,7 +4512,7 @@ impl Compiler {
         name: &str,
         span: Span,
     ) -> Result<(), CompileError> {
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name)));
+        let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name)));
         if self.arg_list_has_spread(call) {
             self.compile_spread_args(call, span)?;
             self.chunk.emit_u16(Op::CallMethodSpread, name_idx, span);
@@ -4660,7 +4660,7 @@ impl Compiler {
                             CompileError::new("named call arg missing value expression", span)
                         })?;
                     self.compile_expr(&value)?;
-                    names.push(Value::Str(Rc::from(name.as_str())));
+                    names.push(Value::Str(crate::value::AStr::from(name.as_str())));
                 } else if let Some(arg) = Expr::cast(child.clone()) {
                     self.compile_expr(&arg)?;
                     names.push(Value::Nil);
@@ -4710,7 +4710,7 @@ impl Compiler {
                             CompileError::new("named call arg missing value expression", span)
                         })?;
                     self.compile_expr(&value)?;
-                    let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                    let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                     self.chunk.emit_u16(Op::AppendNamedArg, name_idx, span);
                 } else if let Some(spread) = SpreadElem::cast(child.clone()) {
                     let operand = spread.expr().ok_or_else(|| {
@@ -4794,7 +4794,7 @@ impl Compiler {
         // `super` is a `Value::Super` whose `read_member` walks from
         // `defining_class.superclass`, and the resulting BoundMethod runs on `self`.
         if is_super_receiver(&object) {
-            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
             self.chunk.emit_u16(Op::GetSuper, name_idx, span);
             // `GET_SUPER` leaves the BoundMethod callee on the stack, so a spread
             // argument list is the same dynamic-arity build + `CALL_SPREAD` as a
@@ -4827,7 +4827,7 @@ impl Compiler {
         if self.arg_list_has_spread(call) {
             self.compile_expr(&object)?;
             self.compile_spread_args(call, span)?;
-            let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+            let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
             self.chunk.emit_u16(Op::CallMethodSpread, name_idx, span);
             return Ok(());
         }
@@ -4843,7 +4843,7 @@ impl Compiler {
                     .ok_or_else(|| CompileError::new("too many call arguments (max 255)", span))?;
             }
         }
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
         self.chunk.emit_u16_u8(Op::CallMethod, name_idx, argc, span);
         Ok(())
     }
@@ -4910,7 +4910,7 @@ impl Compiler {
                 if let Some(name) = name_ref.ident_token().map(|t| t.text().to_string()) {
                     if crate::interp::is_reserved_instanceof_type_name(&name) {
                         self.compile_expr(&lhs)?;
-                        let idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+                        let idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
                         self.chunk.emit_u16(Op::InstanceOfType, idx, span);
                         return Ok(());
                     }
@@ -5104,7 +5104,7 @@ impl Compiler {
                 let value = field
                     .value()
                     .ok_or_else(|| CompileError::new("object field has no value", fspan))?;
-                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                let key_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(key.as_str())));
                 self.chunk.emit_u16(Op::Const, key_idx, fspan);
                 self.compile_expr(&value)?;
                 n = n
@@ -5132,7 +5132,7 @@ impl Compiler {
                 let value = field
                     .value()
                     .ok_or_else(|| CompileError::new("object field has no value", fspan))?;
-                let key_idx = self.chunk.add_const(Value::Str(Rc::from(key.as_str())));
+                let key_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(key.as_str())));
                 self.chunk.emit_u16(Op::Const, key_idx, fspan);
                 self.compile_expr(&value)?;
                 self.chunk.emit(Op::AppendObject, fspan);
@@ -5214,7 +5214,7 @@ impl Compiler {
         // bare `a.foo` statement's nil-receiver panic matches byte-for-byte (#132).
         let obj_span = node_code_span(&object);
         self.compile_expr(&object)?;
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
         self.chunk.emit_u16(Op::GetProp, name_idx, obj_span);
         Ok(())
     }
@@ -5240,7 +5240,7 @@ impl Compiler {
         // identically on a non-nil receiver and anchors its panic at the receiver.
         let obj_span = node_code_span(&object);
         self.compile_expr(&object)?;
-        let name_idx = self.chunk.add_const(Value::Str(Rc::from(name.as_str())));
+        let name_idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(name.as_str())));
         self.chunk.emit_u16(Op::GetPropOpt, name_idx, obj_span);
         Ok(())
     }
@@ -5384,7 +5384,7 @@ impl Compiler {
                     | SyntaxKind::TemplateMiddle
                     | SyntaxKind::TemplateEnd => {
                         let chunk = unescape_template_body(strip_template_delims(tok.text()));
-                        let idx = self.chunk.add_const(Value::Str(Rc::from(chunk.as_str())));
+                        let idx = self.chunk.add_const(Value::Str(crate::value::AStr::from(chunk.as_str())));
                         self.chunk.emit_u16(Op::Const, idx, span);
                     }
                     // Trivia (whitespace/comments) never appears between template
@@ -5568,7 +5568,7 @@ fn literal_const_value(lit: &Literal) -> Result<Value, CompileError> {
                 }
             }
         }
-        SyntaxKind::Str => Value::Str(Rc::from(unescape_str_body(strip_quotes(&text)).as_str())),
+        SyntaxKind::Str => Value::Str(crate::value::AStr::from(unescape_str_body(strip_quotes(&text)).as_str())),
         SyntaxKind::TrueKw => Value::Bool(true),
         SyntaxKind::FalseKw => Value::Bool(false),
         SyntaxKind::NilKw => Value::Nil,

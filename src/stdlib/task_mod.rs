@@ -369,7 +369,7 @@ impl Interp {
             };
 
             // Extract e.kind — must be a string field on an Object.
-            let kind: std::rc::Rc<str> = match &item {
+            let kind: crate::value::AStr = match &item {
                 Value::Object(o) => match o.borrow().get("kind") {
                     Some(Value::Str(s)) => s.clone(),
                     Some(other) => {

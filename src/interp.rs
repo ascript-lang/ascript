@@ -1085,7 +1085,7 @@ impl Interp {
             .cli_args
             .borrow()
             .iter()
-            .map(|s| Value::Str(s.clone()))
+            .map(|s| Value::Str(crate::value::AStr::from(s.clone())))
             .collect();
         Value::Array(crate::value::ArrayCell::new(args))
     }
@@ -7032,7 +7032,7 @@ pub(crate) fn shared_child_to_value(child: &crate::value::SharedValue) -> Value 
         SharedNode::Int(i) => Value::Int(*i),
         SharedNode::Float(f) => Value::Float(*f),
         SharedNode::Decimal(d) => Value::Decimal(Rc::new(*d)),
-        SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
+        SharedNode::Str(s) => Value::Str(crate::value::AStr::from(&**s)),
         // Containers (and the opaque Regex/EnumVariant/Instance frozen nodes) stay
         // shared — re-wrap the SAME `Arc` (a pointer bump, no copy).
         _ => Value::Shared(child.clone()),
@@ -7066,7 +7066,7 @@ pub(crate) fn shared_to_value_shallow(node: &crate::value::SharedNode) -> Option
         SharedNode::Int(i) => Value::Int(*i),
         SharedNode::Float(f) => Value::Float(*f),
         SharedNode::Decimal(d) => Value::Decimal(Rc::new(*d)),
-        SharedNode::Str(s) => Value::Str(Rc::from(&**s)),
+        SharedNode::Str(s) => Value::Str(crate::value::AStr::from(&**s)),
         SharedNode::Bytes(b) => Value::Bytes(Rc::new(RefCell::new(b.to_vec()))),
         SharedNode::Array(a) => {
             Value::Array(ArrayCell::new(a.iter().map(shared_child_to_value).collect()))
@@ -7162,7 +7162,7 @@ pub(crate) fn shared_read_member(
             name: variant,
             value,
         } => match name {
-            "name" => Ok(Value::Str(Rc::from(&**variant))),
+            "name" => Ok(Value::Str(crate::value::AStr::from(&**variant))),
             "value" => Ok(shared_child_to_value(value)),
             // Named-payload field-access sugar: read the field off the frozen payload
             // object (mirroring the live `EnumVariant` `.field` sugar).
@@ -7179,7 +7179,7 @@ pub(crate) fn shared_read_member(
             }
         },
         SharedNode::Regex { source } => match name {
-            "source" => Ok(Value::Str(Rc::from(&**source))),
+            "source" => Ok(Value::Str(crate::value::AStr::from(&**source))),
             other => Err(AsError::at(
                 format!("frozen regex has no property '{}' (try 'source')", other),
                 span,
@@ -7375,7 +7375,7 @@ fn shared_keys(node: &crate::value::SharedNode) -> Option<Vec<Value>> {
     use crate::value::SharedNode;
     match node {
         SharedNode::Object(map) | SharedNode::Instance { fields: map, .. } => {
-            Some(map.iter().map(|(k, _)| Value::Str(Rc::from(&**k))).collect())
+            Some(map.iter().map(|(k, _)| Value::Str(crate::value::AStr::from(&**k))).collect())
         }
         SharedNode::Map(map) => Some(map.iter().map(|(k, _)| k.to_value()).collect()),
         _ => None,

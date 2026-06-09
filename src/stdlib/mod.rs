@@ -870,7 +870,7 @@ pub(crate) fn want_number(v: &Value, span: Span, ctx: &str) -> Result<f64, Contr
     }
 }
 
-pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<Rc<str>, Control> {
+pub(crate) fn want_string(v: &Value, span: Span, ctx: &str) -> Result<crate::value::AStr, Control> {
     match v {
         Value::Str(s) => Ok(s.clone()),
         _ => Err(AsError::at(
